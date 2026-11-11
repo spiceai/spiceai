@@ -2241,6 +2241,27 @@ type TestSchemaStatisticsLockProbe = (
 #[cfg(test)]
 type TestPostCaptureHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
+/// What a hybrid `retention_sql` scan read: compared before and after the scan
+/// (see `CayenneTableProvider::hybrid_resident_retention_keys`). The `Arc`s are
+/// held, so a pointer comparison cannot be fooled by a freed-and-reused address.
+struct ResidentFileGeneration {
+    protected: Arc<HashMap<String, i64>>,
+    listing: Arc<ListingTable>,
+    current_snapshot_id: String,
+    scan_input_version: u64,
+    inlined_generation: u64,
+}
+
+impl ResidentFileGeneration {
+    fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.protected, &other.protected)
+            && Arc::ptr_eq(&self.listing, &other.listing)
+            && self.current_snapshot_id == other.current_snapshot_id
+            && self.scan_input_version == other.scan_input_version
+            && self.inlined_generation == other.inlined_generation
+    }
+}
+
 /// Test-only probe of the writer-concurrent full rewrite's capture: the first
 /// sender fires once the rewrite holds `write_lock` to capture, the second once it
 /// has taken its cutoff. See `CayenneTableProvider::test_rewrite_capture_probe`.
@@ -2576,6 +2597,18 @@ pub struct CayenneTableProvider {
     /// that window. Consumed on first fire.
     #[cfg(test)]
     test_pre_inline_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired inside a hybrid retention scan, after the deletion
+    /// sink captured the protected set and before it scans the current listing.
+    /// Consumed on first fire.
+    #[cfg(test)]
+    test_hybrid_retention_mid_scan_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only count of hybrid retention scan attempts.
+    #[cfg(test)]
+    test_hybrid_retention_captures: Arc<AtomicU64>,
+    /// Test-only seam fired by the retention maintenance pass once it holds
+    /// `write_lock`, before it reads anything. Consumed on first fire.
+    #[cfg(test)]
+    test_retention_pass_entered_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired by a statement write after its validation checked out
     /// the primary-key index and before it reads its first batch, so a test can land
     /// a checkpoint in that window. Consumed on first fire.
@@ -10493,6 +10526,12 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_hybrid_retention_mid_scan_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_hybrid_retention_captures: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_retention_pass_entered_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_prepare_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_seal_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -12953,6 +12992,14 @@ impl CayenneTableProvider {
             test_post_inline_publish_hook: Arc::clone(&self.test_post_inline_publish_hook),
             #[cfg(test)]
             test_pre_inline_publish_hook: Arc::clone(&self.test_pre_inline_publish_hook),
+            #[cfg(test)]
+            test_hybrid_retention_mid_scan_hook: Arc::clone(
+                &self.test_hybrid_retention_mid_scan_hook,
+            ),
+            #[cfg(test)]
+            test_hybrid_retention_captures: Arc::clone(&self.test_hybrid_retention_captures),
+            #[cfg(test)]
+            test_retention_pass_entered_hook: Arc::clone(&self.test_retention_pass_entered_hook),
             #[cfg(test)]
             test_post_prepare_hook: Arc::clone(&self.test_post_prepare_hook),
             #[cfg(test)]
@@ -30645,6 +30692,8 @@ impl CayenneTableProvider {
             }
         };
         let write_guard = self.write_lock.lock().await;
+        #[cfg(test)]
+        self.run_test_retention_pass_entered_hook().await;
         self.checkpoint_mem_tier_for_delete()
             .await
             .map_err(|err| retention_failed(Box::new(err)))?;
@@ -31690,6 +31739,24 @@ impl CayenneTableProvider {
 
     /// Fire (and consume) the test-only pre-inline-publish hook, if one is
     /// installed. See [`Self::test_pre_inline_publish_hook`].
+    /// Fire (and consume) the test-only retention-pass entry hook.
+    #[cfg(test)]
+    async fn run_test_retention_pass_entered_hook(&self) {
+        let hook = self.test_retention_pass_entered_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only hybrid retention mid-scan hook.
+    #[cfg(test)]
+    async fn run_test_hybrid_retention_mid_scan_hook(&self) {
+        let hook = self.test_hybrid_retention_mid_scan_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     #[cfg(test)]
     async fn run_test_pre_inline_publish_hook(&self) {
         let hook = self.test_pre_inline_publish_hook.lock().take();
@@ -35930,15 +35997,6 @@ impl CayenneTableProvider {
         .await
     }
 
-    /// Append a CDC batch to ONE PK-shard's sub-tier. Takes `locks[shard_id]`,
-    /// reserves the (delete, data) sequence under it (the §2.3d {reserve ⇔
-    /// snapshot-membership} coupling — the reservation MUST be under the shard lock,
-    /// never a lock-free `fetch_add`, or an append could own a sequence below the
-    /// checkpoint's `snapshot_sequence` yet not be in the captured snapshot), then
-    /// swaps only `shard(shard_id)`'s `ArcSwap<MemTier>`. Disjoint shards run fully
-    /// in parallel. The shared monotonic allocator keeps one flat sequence domain,
-    /// so the merge-on-read filter + durable encoder are unchanged (§2.3d).
-    #[expect(clippy::too_many_arguments)]
     /// `cdc_durability: memory` (durable files + RAM tier): the keys of the
     /// resident rows the publication's `retention_sql` matches, over the logical
     /// view this CDC apply publishes. Returned as key tombstones for the apply's
@@ -35957,6 +36015,17 @@ impl CayenneTableProvider {
     /// apply's swap, so no write, checkpoint or seal moves rows between the files,
     /// the catalog-inlined corpus and the tier in between. Durable rows are read
     /// from both the files (deletion sink) and the inlined corpus.
+    ///
+    /// Coherent capture: the tier cannot change under those locks, but a
+    /// compaction (or an inline-corpus fold) can publish a new file generation
+    /// while the scan runs — the protected set is captured when the deletion sink
+    /// is built and the current listing when it is scanned, so a commit between
+    /// them could pair two generations (a missed row, or a reinsert judged by the
+    /// wrong rule). The resident file generation is captured before the scan and
+    /// compared after it; on any change the whole evaluation is discarded and
+    /// rerun. A commit after the comparison is harmless: these are key tombstones
+    /// taking this apply's later delete sequence, which apply to any run holding
+    /// the key, merged or not.
     pub(crate) async fn hybrid_resident_retention_keys(
         &self,
         incoming: &[RecordBatch],
@@ -35971,12 +36040,70 @@ impl CayenneTableProvider {
         if filters.is_empty() {
             return Ok(None);
         }
+        const MAX_CAPTURES: usize = 16;
+        for _ in 0..MAX_CAPTURES {
+            // The structural seqlock discards a capture that raced (or began
+            // inside) a forced structural event; the resident generation catches
+            // the ordinary file publications it does not cover.
+            let validated = self
+                .structural_version
+                .read_validated_async(|| async {
+                    let before = self.resident_file_generation();
+                    #[cfg(test)]
+                    self.test_hybrid_retention_captures
+                        .fetch_add(1, Ordering::SeqCst);
+                    let keys = self
+                        .hybrid_resident_retention_keys_once(&filters, incoming, deletions)
+                        .await;
+                    (before, keys)
+                })
+                .await;
+            if let Some((_, (before, keys))) = validated {
+                let keys = keys?;
+                if self.resident_file_generation().same_as(&before) {
+                    return Ok(keys);
+                }
+            }
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                "Resident file generation changed during the retention scan; re-evaluating"
+            );
+        }
+        Err(Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message: format!(
+                "retention_sql could not capture a stable resident generation in {MAX_CAPTURES} attempts"
+            ),
+        })
+    }
+
+    /// The resident file generation a hybrid retention scan reads: the protected
+    /// set, the current listing and snapshot, the inline corpus generation, and
+    /// the scan-input version every other file publication bumps. Forced
+    /// structural events are covered by the caller's structural seqlock.
+    fn resident_file_generation(&self) -> ResidentFileGeneration {
+        ResidentFileGeneration {
+            protected: self.protected_snapshots.load_full(),
+            listing: self.listing_table.load_full(),
+            current_snapshot_id: self.get_current_snapshot_id(),
+            scan_input_version: self.scan_input_version.load(Ordering::Acquire),
+            inlined_generation: self.inlined_generation.load(Ordering::Acquire),
+        }
+    }
+
+    /// One evaluation of [`Self::hybrid_resident_retention_keys`].
+    async fn hybrid_resident_retention_keys_once(
+        &self,
+        filters: &[Expr],
+        incoming: &[RecordBatch],
+        deletions: &crate::provider::on_conflict::OnConflictDeletions,
+    ) -> Result<Option<super::delete::SkipKeys>> {
         let df = |source: datafusion_common::DataFusionError| Error::DataFusion { source };
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(None);
         };
         let sink = self
-            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
+            .build_deletion_vector_sink(filters, None, DeletionRequestSource::User)
             .await
             .map_err(df)?;
 
@@ -36005,7 +36132,7 @@ impl CayenneTableProvider {
         let physical = self
             .build_physical_filters_for_inlined_delete(
                 &self
-                    .coerce_filters_for_inlined_delete(&filters)
+                    .coerce_filters_for_inlined_delete(filters)
                     .map_err(df)?,
             )
             .map_err(df)?;
@@ -36064,6 +36191,10 @@ impl CayenneTableProvider {
                 }
             }
         }
+
+        // The protected set is captured; the current listing is captured below.
+        #[cfg(test)]
+        self.run_test_hybrid_retention_mid_scan_hook().await;
 
         // Durable file rows: the tier's keys and this apply's are superseded there.
         let durable = sink
@@ -36207,6 +36338,15 @@ impl CayenneTableProvider {
         )
     }
 
+    /// Append a CDC batch to ONE PK-shard's sub-tier. Takes `locks[shard_id]`,
+    /// reserves the (delete, data) sequence under it (the §2.3d {reserve ⇔
+    /// snapshot-membership} coupling — the reservation MUST be under the shard lock,
+    /// never a lock-free `fetch_add`, or an append could own a sequence below the
+    /// checkpoint's `snapshot_sequence` yet not be in the captured snapshot), then
+    /// swaps only `shard(shard_id)`'s `ArcSwap<MemTier>`. Disjoint shards run fully
+    /// in parallel. The shared monotonic allocator keeps one flat sequence domain,
+    /// so the merge-on-read filter + durable encoder are unchanged (§2.3d).
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn append_to_shard(
         &self,
         shard_id: usize,
@@ -83994,6 +84134,7 @@ mod tests {
         }
     }
 
+    mod hybrid_retention;
     mod layered_upsert_state;
     mod repeated_keys;
     mod update_visibility;

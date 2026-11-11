@@ -2279,10 +2279,21 @@ async fn maintenance_pass_and_append_are_serialized_impl(
                 .await
                 .map_err(|e| e.to_string())
         });
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // No wall-clock wait: the pass is parked at its entry handshake (inside
+        // its predicate, holding `write_lock`), so the append cannot publish however
+        // long it runs. The lock-level proof is the library test
+        // `maintenance_pass_and_hybrid_apply_serialize_by_entry_handshake`.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
         assert!(
             !append.is_finished(),
             "{name}: the append waits while the maintenance pass holds its generation"
+        );
+        assert_eq!(
+            ids(&t).await?,
+            vec![1, 2],
+            "{name}: nothing published while the pass is parked"
         );
         release_tx.send(())?;
         let pass = racer.join().expect("racer thread");
@@ -2842,10 +2853,18 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
             "{label}: (2,2), (4,1) gone"
         );
         t.checkpoint_mem_tier().await?;
-        // The merge folds the snapshots holding the deleted rows together with
-        // their tombstones: rows physically dropped, tombstones at or below the
-        // merged fence no longer applied. Nothing may come back.
-        let compacted = t.compact_protected_snapshots_subset(usize::MAX).await?;
+        // Compaction variants (inline off): the merge folds the snapshots holding
+        // the deleted rows together with their tombstones: rows physically
+        // dropped, tombstones at or below the merged fence no longer applied.
+        // Nothing may come back. The merge must really run. The inline variants
+        // prove the inlined-corpus arm and do not claim compaction coverage (their
+        // folded snapshot sizes need not share a size tier, so no merge is forced).
+        if !inline {
+            assert!(
+                t.compact_protected_snapshots_subset(usize::MAX).await?,
+                "{label}: the compaction ran"
+            );
+        }
         assert_eq!(
             keys(Arc::clone(&t)).await?,
             final_rows,
@@ -2872,14 +2891,7 @@ async fn hybrid_cdc_composite_retention_across_versions_shards_and_compaction_im
             again,
             "{label}: reinsert durable"
         );
-        eprintln!(
-            "{label}: compacted={compacted} inlined_generation {inline_gen_before}->{inline_gen_after}"
-        );
-        // With the inline corpus folded in, the snapshot sizes need not share a
-        // size tier, so the merge may decline there; the file-only runs must merge.
-        if !inline {
-            assert!(compacted, "{label}: the compaction ran");
-        }
+        eprintln!("{label}: inlined_generation {inline_gen_before}->{inline_gen_after}");
     }
     Ok(())
 }

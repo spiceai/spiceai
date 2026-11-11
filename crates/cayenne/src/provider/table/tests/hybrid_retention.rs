@@ -1,0 +1,630 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! `cdc_durability: memory` (durable files + RAM tier) `retention_sql` in the
+//! apply's own tier swap, against the other mutators, with deterministic
+//! barriers (test seams that hold a mutator at a known point) rather than
+//! timing: checkpoint, compaction and the retention maintenance pass.
+//!
+//! Predicate `aged(value)`, switched by the test: OFF matches nothing, ON
+//! matches a negative value ("archived"), BROKEN fails on a negative value.
+
+use super::*;
+use crate::metadata::DeletionMode;
+use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
+use datafusion::prelude::col;
+use std::sync::atomic::AtomicU8;
+
+const OFF: u8 = 0;
+const ON: u8 = 1;
+const BROKEN: u8 = 2;
+
+fn schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+fn aged(mode: Arc<AtomicU8>) -> ScalarUDF {
+    create_udf(
+        "aged",
+        vec![DataType::Int64],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(move |args: &[ColumnarValue]| {
+            let array = args[0].clone().into_array(1)?;
+            let values = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("int64");
+            let mode = mode.load(Ordering::SeqCst);
+            let mut out = Vec::with_capacity(values.len());
+            for v in values.iter() {
+                let archived = v.is_some_and(|v| v < 0);
+                if archived && mode == BROKEN {
+                    return Err(datafusion_common::DataFusionError::Execution(
+                        "aged() cannot evaluate this row".to_string(),
+                    ));
+                }
+                out.push(Some(archived && mode == ON));
+            }
+            Ok(ColumnarValue::Array(Arc::new(
+                arrow::array::BooleanArray::from(out),
+            )))
+        }),
+    )
+}
+
+fn config(shards: usize) -> VortexConfig {
+    VortexConfig {
+        cdc_durability: crate::metadata::CdcDurability::Memory,
+        deletion_mode: DeletionMode::Key,
+        cdc_mem_tier_shards: shards,
+        cdc_mem_tier_min_flush_bytes: 0,
+        cdc_mem_tier_checkpoint_interval_ms: 0,
+        cdc_mem_tier_max_age_ms: 0,
+        cdc_mem_tier_seal_age_ms: 0,
+        compaction_background_interval_ms: 3_600_000,
+        compaction_trigger_protected_snapshots: 2,
+        inline_max_rows: 0,
+        inline_max_bytes: 0,
+        ..VortexConfig::default()
+    }
+}
+
+type Seen = Arc<ParkingMutex<Vec<Vec<(i64, i64)>>>>;
+
+/// Records, at every source acknowledgement, the rows a freshly opened provider
+/// reads from the catalog: what is durable at the moment the source is told.
+struct DurableAtAck {
+    catalog: Arc<dyn MetadataCatalog>,
+    name: String,
+    seen: Seen,
+}
+
+#[async_trait::async_trait]
+impl crate::provider::mem_tier::SlotAdvancer for DurableAtAck {
+    async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+        let reopened = open(&self.catalog, &self.name, 1, vec![]).await;
+        let rows = rows(&reopened).await;
+        self.seen.lock().push(rows);
+    }
+}
+
+async fn open(
+    catalog: &Arc<dyn MetadataCatalog>,
+    name: &str,
+    shards: usize,
+    filters: Vec<Expr>,
+) -> CayenneTableProvider {
+    let runtime_env = SessionContext::new().runtime_env();
+    CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(&runtime_env))
+        .with_context(crate::CayenneContext::new(
+            &config(shards),
+            runtime_env,
+            name,
+        ))
+        .with_retention_filters(filters)
+        .open(name)
+        .await
+        .expect("table reopened")
+}
+
+struct Fixture {
+    name: String,
+    shards: usize,
+    provider: CayenneTableProvider,
+    catalog: Arc<dyn MetadataCatalog>,
+    mode: Arc<AtomicU8>,
+    udf: ScalarUDF,
+    acks: Seen,
+    _dir: TempDir,
+}
+
+impl Fixture {
+    fn retention(&self) -> Vec<Expr> {
+        vec![self.udf.call(vec![col("value")])]
+    }
+
+    fn set(&self, mode: u8) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
+
+    fn arm(&self, provider: &CayenneTableProvider) {
+        provider.install_slot_advancer(Arc::new(DurableAtAck {
+            catalog: Arc::clone(&self.catalog),
+            name: self.name.clone(),
+            seen: Arc::clone(&self.acks),
+        }));
+    }
+
+    /// The table as a restarted process opens it: retention configured, armed.
+    async fn restart(&self) -> CayenneTableProvider {
+        let provider = open(&self.catalog, &self.name, self.shards, self.retention()).await;
+        self.arm(&provider);
+        provider
+    }
+}
+
+async fn hybrid(name: &str, shards: usize) -> Fixture {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let metadata_dir = format!("{}/metadata", dir.path().to_str().expect("path"));
+    let data_dir = format!("{}/data", dir.path().to_str().expect("path"));
+    std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+    let catalog = Arc::new(
+        crate::CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
+    ) as Arc<dyn MetadataCatalog>;
+    catalog.init().await.expect("catalog init");
+    let mode = Arc::new(AtomicU8::new(OFF));
+    let udf = aged(Arc::clone(&mode));
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(
+            datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                "id".to_string(),
+            ]),
+        )),
+        base_path: data_dir,
+        partition_column: None,
+        vortex_config: config(shards),
+    };
+    let runtime_env = SessionContext::new().runtime_env();
+    let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+        .with_context(crate::CayenneContext::new(
+            &config(shards),
+            runtime_env,
+            name,
+        ))
+        .with_retention_filters(vec![udf.call(vec![col("value")])])
+        .create(options)
+        .await
+        .expect("table created");
+    assert!(provider.is_cdc_memory_mode() && !provider.is_memory_resident_mode());
+    assert_eq!(provider.mem_tier_shard_count(), shards.max(1));
+    let fixture = Fixture {
+        name: name.to_string(),
+        shards,
+        provider,
+        catalog,
+        mode,
+        udf,
+        acks: Arc::new(ParkingMutex::new(Vec::new())),
+        _dir: dir,
+    };
+    fixture.arm(&fixture.provider);
+    fixture
+}
+
+async fn apply(
+    provider: &CayenneTableProvider,
+    rows: &[(i64, i64)],
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    let values: Vec<i64> = rows.iter().map(|(_, v)| *v).collect();
+    let ctx = SessionContext::new();
+    let write = provider
+        .write_cdc_append_stream(
+            single_batch_stream(id_value_batch(schema(), &ids, &values)),
+            &ctx.task_ctx(),
+        )
+        .await?;
+    if write.has_pending_finalize() {
+        write.finish().await?;
+    }
+    Ok(())
+}
+
+async fn rows(provider: &CayenneTableProvider) -> Vec<(i64, i64)> {
+    use arrow::array::Int64Array;
+    let ctx = SessionContext::new();
+    let plan = provider
+        .scan(&ctx.state(), None, &[], None)
+        .await
+        .expect("scan plan");
+    let batches = collect(plan, ctx.task_ctx()).await.expect("scan");
+    let mut out = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id");
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value");
+        out.extend((0..batch.num_rows()).map(|r| (ids.value(r), values.value(r))));
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Retention OFF while seeding. Durable: two checkpoint snapshots (two
+/// protected runs of one size tier). Tier: newer versions of keys 2 (retained
+/// -> archived) and 3 (archived -> retained).
+async fn seed(f: &Fixture) {
+    let p = &f.provider;
+    f.set(OFF);
+    apply(p, &[(1, -1), (2, 2), (3, -3)]).await.expect("seed a");
+    p.checkpoint_mem_tier().await.expect("checkpoint a");
+    apply(p, &[(4, 4), (5, -5)]).await.expect("seed b");
+    p.checkpoint_mem_tier().await.expect("checkpoint b");
+    apply(p, &[(2, -2), (3, 3)]).await.expect("seed tier");
+    settle(p).await;
+    assert_eq!(rows(p).await, SEEDED.to_vec(), "{}: seeded", f.name);
+}
+
+/// [`seed`] with the newer versions of keys 2 and 3 checkpointed too: three
+/// protected runs and no pending mem-tier delete, so the delete fence is the
+/// durable maximum and every run is at or below it. With the newer versions
+/// still in the tier their key deletes are pending and the fence sits below
+/// both runs' thresholds, so a merge is declined
+/// (`DeclinedAboveDeleteFence`) unless something else checkpoints them first,
+/// which made a compaction barrier on [`seed`] state nondeterministic.
+async fn seed_durable(f: &Fixture) {
+    let p = &f.provider;
+    f.set(OFF);
+    apply(p, &[(1, -1), (2, 2), (3, -3)]).await.expect("seed a");
+    p.checkpoint_mem_tier().await.expect("checkpoint a");
+    apply(p, &[(4, 4), (5, -5)]).await.expect("seed b");
+    p.checkpoint_mem_tier().await.expect("checkpoint b");
+    apply(p, &[(2, -2), (3, 3)]).await.expect("seed c");
+    p.checkpoint_mem_tier().await.expect("checkpoint c");
+    settle(p).await;
+    assert_eq!(rows(p).await, SEEDED.to_vec(), "{}: seeded", f.name);
+}
+
+/// Wait until no maintenance the writes armed is scheduled or running: the
+/// post-checkpoint retention/statistics loop and every flagged detached pass
+/// (post-write compaction, orphan-DV sweep, snapshot cleanup, inline
+/// checkpoint). Unlike [`quiesce`] it does not finish with a `compaction_lock`
+/// barrier, so it is safe while the test holds [`CayenneTableProvider::hold_compaction`]
+/// (a compaction pass declines a busy lock with `try_write` and clears its flag).
+async fn settle(provider: &CayenneTableProvider) {
+    loop {
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("maintenance flushed");
+        while provider.post_write_compaction_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE
+            || provider.orphan_dv_sweep_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE
+            || provider.snapshot_cleanup_scheduled.load(Ordering::Acquire)
+            || provider.inline_checkpoint_scheduled.load(Ordering::Acquire)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        if !provider
+            .post_write_maintenance
+            .scheduled
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
+    }
+}
+
+/// Let the post-checkpoint maintenance and post-write compaction the seeding
+/// armed finish, so nothing runs behind the barriers below.
+async fn quiesce(provider: &CayenneTableProvider) {
+    provider
+        .drain_in_flight_maintenance()
+        .await
+        .expect("maintenance drained");
+}
+
+const SEEDED: [(i64, i64); 5] = [(1, -1), (2, -2), (3, 3), (4, 4), (5, -5)];
+/// After an apply of `(6, 6)` with retention ON: 1 and 5 (durable) and 2
+/// (tier over a retained durable version) are gone; 3 (tier over an archived
+/// durable version) stays.
+const RETAINED: [(i64, i64); 3] = [(3, 3), (4, 4), (6, 6)];
+
+/// Run a protected-subset compaction; `"true"` when it merged, otherwise
+/// `"false"` with the merge inputs (protected thresholds, the delete fence and
+/// the pending mem-tier delete floor) so a declined merge says why.
+async fn compaction_outcome(probe: &CayenneTableProvider) -> String {
+    let protected: Vec<i64> = {
+        let mut t: Vec<i64> = probe.protected_snapshots.load().values().copied().collect();
+        t.sort_unstable();
+        t
+    };
+    let durable_max = probe
+        .pk_deletion_snapshot()
+        .max_sequence_number()
+        .unwrap_or(0);
+    let (fence, floor) = probe.protected_snapshot_merge_fence_and_floor(durable_max);
+    let merged = probe
+        .compact_protected_snapshots_subset(usize::MAX)
+        .await
+        .expect("compaction");
+    if merged {
+        "true".to_string()
+    } else {
+        format!(
+            "false (thresholds {protected:?}, durable max {durable_max}, fence {fence}, floor {floor:?})"
+        )
+    }
+}
+
+/// A held mid-scan hook: returns once the scan reaches it, runs `during`
+/// there, and records its outcome.
+fn hold_mid_scan<F>(provider: &CayenneTableProvider, during: F) -> Arc<ParkingMutex<Option<String>>>
+where
+    F: FnOnce(CayenneTableProvider) -> futures::future::BoxFuture<'static, String> + Send + 'static,
+{
+    let outcome = Arc::new(ParkingMutex::new(None));
+    let probe = provider.clone_for_write();
+    let outcome_in_hook = Arc::clone(&outcome);
+    *provider.test_hybrid_retention_mid_scan_hook.lock() = Some(Box::new(move || {
+        Box::pin(async move {
+            let result = during(probe).await;
+            *outcome_in_hook.lock() = Some(result);
+        })
+    }));
+    outcome
+}
+
+/// The checkpoint cannot interleave with a hybrid apply's scan and swap: held
+/// inside the scan, a checkpoint attempt is refused because its lock is held.
+/// The checkpoint that runs afterwards persists the retention deletes before
+/// the acknowledgement: the ack observer reopens the table from the catalog and
+/// already reads the post-apply rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_apply_excludes_the_checkpoint_and_acks_only_durable_deletes() {
+    for shards in [1_usize, 4] {
+        Box::pin(async move {
+            let f = hybrid(&format!("hy_ckpt_{shards}"), shards).await;
+            let p = &f.provider;
+            seed(&f).await;
+            let probe = hold_mid_scan(p, |probe| {
+                Box::pin(async move {
+                    match probe.try_checkpoint_mem_tier().await.expect("attempt") {
+                        CheckpointAttempt::Completed(rows) => format!("ran ({rows} rows)"),
+                        CheckpointAttempt::Busy => "busy".to_string(),
+                    }
+                })
+            });
+            f.set(ON);
+            apply(p, &[(6, 6)]).await.expect("apply");
+            assert_eq!(
+                probe.lock().take().as_deref(),
+                Some("busy"),
+                "shards={shards}"
+            );
+            assert_eq!(
+                rows(p).await,
+                RETAINED.to_vec(),
+                "shards={shards}: in the apply"
+            );
+            let acks_before = f.acks.lock().len();
+            p.checkpoint_mem_tier().await.expect("checkpoint");
+            let acks = f.acks.lock().clone();
+            assert!(acks.len() > acks_before, "shards={shards}: acked");
+            assert_eq!(
+                acks.last().cloned(),
+                Some(RETAINED.to_vec()),
+                "shards={shards}: durable when acked"
+            );
+        })
+        .await;
+    }
+}
+
+/// A compaction that commits while the scan runs (between the sink's capture of
+/// the protected set and its scan of the current listing) changes the resident
+/// file generation; the scan is discarded and rerun against the new generation,
+/// so it neither misses a row nor pairs two generations. The compaction really
+/// runs (asserted), the scan runs exactly twice, and the rows are exact. Then
+/// the same with an evaluation error: the apply fails after its retry and
+/// nothing is published, in memory or durably.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_apply_rescans_when_a_compaction_commits_mid_scan() {
+    for shards in [1_usize, 4] {
+        Box::pin(async move {
+            let f = hybrid(&format!("hy_compact_{shards}"), shards).await;
+            let p = &f.provider;
+            // No post-write compaction may merge the seeded runs before the barrier.
+            let held = p.hold_compaction().await;
+            seed_durable(&f).await;
+            drop(held);
+            assert!(
+                p.protected_snapshots.load().len() >= 2,
+                "shards={shards}: two protected runs to merge"
+            );
+            assert_eq!(
+                p.min_pending_mem_tier_delete_sequence(),
+                None,
+                "shards={shards}: no pending delete holds the merge fence down"
+            );
+
+            let compacted = hold_mid_scan(p, |probe| {
+                Box::pin(async move { compaction_outcome(&probe).await })
+            });
+            p.test_hybrid_retention_captures.store(0, Ordering::SeqCst);
+            f.set(ON);
+            apply(p, &[(6, 6)]).await.expect("apply");
+            assert_eq!(
+                compacted.lock().take().as_deref(),
+                Some("true"),
+                "shards={shards}: merged"
+            );
+            assert_eq!(
+                p.test_hybrid_retention_captures.load(Ordering::SeqCst),
+                2,
+                "shards={shards}: the scan straddling the commit was rerun once"
+            );
+            assert_eq!(
+                rows(p).await,
+                RETAINED.to_vec(),
+                "shards={shards}: exact rows"
+            );
+            p.checkpoint_mem_tier().await.expect("checkpoint");
+            assert_eq!(
+                rows(&f.restart().await).await,
+                RETAINED.to_vec(),
+                "shards={shards}: durable"
+            );
+
+            // Error after a mid-scan commit: two more protected runs to merge, an
+            // archived resident row, then BROKEN.
+            f.set(OFF);
+            quiesce(p).await;
+            let held = p.hold_compaction().await;
+            apply(p, &[(7, -7)]).await.expect("archived resident row");
+            p.checkpoint_mem_tier().await.expect("checkpoint c");
+            apply(p, &[(8, 8)]).await.expect("filler");
+            p.checkpoint_mem_tier().await.expect("checkpoint d");
+            settle(p).await;
+            drop(held);
+            assert!(
+                p.protected_snapshots.load().len() >= 2,
+                "shards={shards}: two protected runs to merge"
+            );
+            assert_eq!(
+                p.min_pending_mem_tier_delete_sequence(),
+                None,
+                "shards={shards}: no pending delete holds the merge fence down"
+            );
+            let before = rows(p).await;
+            let compacted = hold_mid_scan(p, |probe| {
+                Box::pin(async move { compaction_outcome(&probe).await })
+            });
+            f.set(BROKEN);
+            assert!(apply(p, &[(9, 9)]).await.is_err(), "shards={shards}: fails");
+            f.set(OFF);
+            assert_eq!(
+                compacted.lock().take().as_deref(),
+                Some("true"),
+                "shards={shards}: merged"
+            );
+            assert_eq!(rows(p).await, before, "shards={shards}: nothing published");
+            p.checkpoint_mem_tier().await.expect("checkpoint e");
+            assert_eq!(
+                rows(&f.restart().await).await,
+                before,
+                "shards={shards}: nothing durable"
+            );
+        })
+        .await;
+    }
+}
+
+/// The retention maintenance pass and a hybrid apply are serialized, proven by
+/// an entry handshake rather than a timeout: the pass signals once it holds
+/// `write_lock` and waits there; while it waits `write_lock` is held, the apply
+/// started meanwhile has published nothing, and it publishes after the pass
+/// releases, against the state the pass left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_pass_and_hybrid_apply_serialize_by_entry_handshake() {
+    let f = hybrid("hy_maint", 1).await;
+    let p = &f.provider;
+    seed(&f).await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    *p.test_retention_pass_entered_hook.lock() = Some(Box::new(move || {
+        Box::pin(async move {
+            entered_tx.send(()).expect("test waits for entry");
+            release_rx.await.expect("test releases the pass");
+        })
+    }));
+    f.set(ON);
+    let pass_table = p.clone_for_write();
+    let pass = tokio::spawn(async move { pass_table.apply_retention_filters().await });
+    entered_rx.await.expect("the pass entered");
+    assert!(
+        p.write_lock.try_lock().is_err(),
+        "the pass holds write_lock at its entry"
+    );
+    let apply_table = p.clone_for_write();
+    let applied = tokio::spawn(async move { apply(&apply_table, &[(6, 6)]).await });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!applied.is_finished(), "the apply waits for the pass");
+    assert_eq!(
+        rows(p).await,
+        SEEDED.to_vec(),
+        "nothing published while the pass holds"
+    );
+    release_tx.send(()).expect("pass waiting");
+    pass.await.expect("pass task").expect("pass");
+    applied.await.expect("apply task").expect("apply");
+    assert_eq!(rows(p).await, RETAINED.to_vec(), "pass then apply");
+}
+
+/// Replay after a crash. Staged but uncommitted (no checkpoint): a restart
+/// reads the previous durable generation and nothing was acknowledged, so the
+/// source replays the apply, which publishes the same rows. Committed but
+/// unacknowledged (the checkpoint committed, the ack was lost): a restart
+/// reads the retention deletes, and replaying the same apply again is a no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_replay_after_staged_uncommitted_and_committed_unacked_crashes() {
+    for shards in [1_usize, 4] {
+        Box::pin(async move {
+            let f = hybrid(&format!("hy_replay_{shards}"), shards).await;
+            let p = &f.provider;
+            seed(&f).await;
+            p.checkpoint_mem_tier().await.expect("seed durable");
+            quiesce(p).await;
+            let acked = f.acks.lock().len();
+            f.set(ON);
+            apply(p, &[(6, 6)]).await.expect("apply");
+            assert_eq!(rows(p).await, RETAINED.to_vec(), "shards={shards}");
+            assert_eq!(f.acks.lock().len(), acked, "shards={shards}: not acked yet");
+
+            // Crash before the checkpoint.
+            let restarted = f.restart().await;
+            assert_eq!(
+                rows(&restarted).await,
+                SEEDED.to_vec(),
+                "shards={shards}: previous generation"
+            );
+            apply(&restarted, &[(6, 6)]).await.expect("replay");
+            assert_eq!(
+                rows(&restarted).await,
+                RETAINED.to_vec(),
+                "shards={shards}: replayed"
+            );
+
+            // The checkpoint commits; treat its ack as lost and crash.
+            restarted.checkpoint_mem_tier().await.expect("checkpoint");
+            let restarted = f.restart().await;
+            assert_eq!(
+                rows(&restarted).await,
+                RETAINED.to_vec(),
+                "shards={shards}: committed"
+            );
+            apply(&restarted, &[(6, 6)])
+                .await
+                .expect("replay of the unacked apply");
+            restarted.checkpoint_mem_tier().await.expect("checkpoint");
+            assert_eq!(
+                rows(&restarted).await,
+                RETAINED.to_vec(),
+                "shards={shards}: idempotent"
+            );
+            assert_eq!(
+                rows(&f.restart().await).await,
+                RETAINED.to_vec(),
+                "shards={shards}: durable"
+            );
+        })
+        .await;
+    }
+}
