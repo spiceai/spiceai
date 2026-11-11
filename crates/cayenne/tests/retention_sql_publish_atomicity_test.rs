@@ -184,7 +184,9 @@ async fn append_hides_matching_rows_at_publish_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t = table(&fixture, "rsql_pub_append", false, archived()).await?;
-    common::insert_batch(t.as_ref(), batch(0..70)).await?;
+    // The append still reports every row it inserted, as when the retention
+    // delete ran after it.
+    assert_eq!(common::insert_batch(t.as_ref(), batch(0..70)).await?, 70);
     assert_eq!(counts(&t).await?, (60, 0, 10), "right after the append");
     common::insert_batch(t.as_ref(), batch(70..140)).await?;
     assert_eq!(counts(&t).await?, (120, 0, 20), "right after a second append");
@@ -220,7 +222,11 @@ async fn upsert_to_matching_version_removes_key_at_publish_impl(
     .await?;
     t.flush_pending_maintenance().await?;
     assert_eq!(ids(&t).await?, vec![1, 2, 3]);
-    common::insert_batch(t.as_ref(), rows(&[(1, Some("archived"))])).await?;
+    assert_eq!(
+        common::insert_batch(t.as_ref(), rows(&[(1, Some("archived"))])).await?,
+        1,
+        "the upsert reports the row it inserted"
+    );
     assert_eq!(ids(&t).await?, vec![2, 3], "right after the upsert");
     // A later insert of the removed key is not dropped as a duplicate.
     common::insert_batch(t.as_ref(), rows(&[(1, Some("active"))])).await?;
@@ -488,7 +494,7 @@ async fn memory_append_hides_matching_rows_at_publish_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t = memory_table(&fixture, "rsql_pub_mem_append", archived()).await?;
-    common::insert_batch(t.as_ref(), batch(0..70)).await?;
+    assert_eq!(common::insert_batch(t.as_ref(), batch(0..70)).await?, 70);
     assert_eq!(counts(&t).await?, (60, 0, 10), "right after the first append");
     // Key 1 active -> archived: gone at publish; later re-insert is not refused.
     common::insert_batch(t.as_ref(), rows(&[(1, Some("archived"))])).await?;

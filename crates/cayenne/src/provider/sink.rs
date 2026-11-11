@@ -240,15 +240,19 @@ impl DataSink for CayenneDataSink {
                 .table
                 .collapse_buffered_write(batches)
                 .map_err(datafusion_common::DataFusionError::from)?;
-            let mut retention_dropped = 0_usize;
+            let retention_dropped: usize;
             let (batches, post_validation) = if overwrite {
                 // An overwrite replaces the tier in one swap: apply `retention_sql` to
                 // the replacement first, so the swap publishes the write and its
                 // retention delete together.
+                let collapsed_rows: usize =
+                    batches.iter().map(arrow::record_batch::RecordBatch::num_rows).sum();
                 let batches = self
                     .table
                     .drop_retention_matches(batches)
                     .map_err(datafusion_common::DataFusionError::from)?;
+                retention_dropped = collapsed_rows
+                    - batches.iter().map(arrow::record_batch::RecordBatch::num_rows).sum::<usize>();
                 (batches, None)
             } else {
                 let raw: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
@@ -309,7 +313,9 @@ impl DataSink for CayenneDataSink {
             // Memory mode arms retention here — see the method's own doc for why nowhere
             // else can (#14045).
             self.table.arm_retention_after_memory_resident_write();
-            return Ok(rows);
+            // The rows inserted, including those the retention delete published
+            // with them removed, as when that delete ran after the write.
+            return Ok(rows.saturating_add(retention_dropped as u64));
         }
 
         if self.overwrite == InsertOp::Append

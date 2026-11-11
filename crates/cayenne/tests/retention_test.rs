@@ -20,7 +20,7 @@ limitations under the License.
 
 use crate::common;
 
-use arrow::array::{Array, Int64Array, RecordBatch, TimestampMicrosecondArray, UInt64Array};
+use arrow::array::{Array, Int64Array, RecordBatch, TimestampMicrosecondArray};
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
@@ -90,45 +90,18 @@ async fn test_retention_filters_apply_on_insert_impl(
     let inserted = common::insert_batch(table_provider.as_ref(), batch).await?;
     assert_eq!(inserted, 5, "Should insert all rows");
 
-    // Retention runs asynchronously via the post-write maintenance scheduler;
-    // drain it before asserting on the delete file.
+    // The append reports every row it inserted, but the rows `retention_sql`
+    // deletes never reach a published file: with no primary key nothing is
+    // superseded, so they are dropped before the write instead of written and
+    // then hidden by a delete file, which served them until it committed.
     table_provider.flush_pending_maintenance().await?;
-
-    // Retention should have created a delete file containing row IDs 0 and 1.
     let delete_files = table_provider
         .catalog()
         .get_table_delete_files(&table_provider.metadata().table_id)
         .await?;
-    assert_eq!(
-        delete_files.len(),
-        1,
-        "Expected a single deletion file created by retention"
-    );
-
-    let delete_file = &delete_files[0];
-    assert_eq!(
-        delete_file.delete_count, 2,
-        "Expected two rows to be marked as deleted"
-    );
-
-    let file = std::fs::File::open(&delete_file.path)?;
-    let reader = arrow::ipc::reader::FileReader::try_new(file, None)?;
-    let mut deleted_row_ids = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let row_id_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("row_id column (UInt64)");
-        for idx in 0..row_id_array.len() {
-            deleted_row_ids.push(row_id_array.value(idx));
-        }
-    }
-    assert_eq!(
-        deleted_row_ids,
-        vec![0u64, 1],
-        "Retention should delete the first two logical rows"
+    assert!(
+        delete_files.is_empty(),
+        "retention left no rows to delete: {delete_files:?}"
     );
 
     // Query via DataFusion to ensure only rows >= 3 remain.

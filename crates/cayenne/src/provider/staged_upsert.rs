@@ -516,6 +516,14 @@ impl CayenneTableProvider {
                 .await;
         }
 
+        // A table without a primary key supersedes nothing, so `retention_sql`
+        // drops its matches from the stream before the write, and the commit
+        // publishes the append and its retention delete together.
+        let data = if self.primary_key_indices()?.is_none() {
+            self.drop_retention_matches_from_stream(data)?.0
+        } else {
+            data
+        };
         let prepared = self.prepare_stream_for_insert_offlock(data).await?;
         let post_validation = prepared.post_validation();
 
@@ -560,6 +568,7 @@ impl CayenneTableProvider {
             row_count,
             superseded,
             first_load_pk_bloom: None,
+            retention_folded: 0,
         })
     }
 }

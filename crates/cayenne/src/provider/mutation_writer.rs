@@ -1305,10 +1305,10 @@ impl<'a> AppendMutationWriter<'a> {
         // A table without a primary key: an append supersedes nothing, so
         // `retention_sql` is applied by not writing the rows it deletes (see
         // `drop_retention_matches_from_stream`), and no publication carries them.
-        let data = if self.table.primary_key_indices()?.is_none() {
+        let (data, retention_dropped) = if self.table.primary_key_indices()?.is_none() {
             self.table.drop_retention_matches_from_stream(data)?
         } else {
-            data
+            (data, Arc::default())
         };
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         #[cfg(test)]
@@ -1317,14 +1317,18 @@ impl<'a> AppendMutationWriter<'a> {
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
         let prepared_stream = prepared.stream;
 
-        self.write_prepared_stream(
-            prepared_stream,
-            post_validation,
-            pending_pk_deletions,
-            may_have_on_conflict_deletions,
-            HeldWriteGuards::new(write_guard, checkpoint_guard),
-        )
-        .await
+        let written = self
+            .write_prepared_stream(
+                prepared_stream,
+                post_validation,
+                pending_pk_deletions,
+                may_have_on_conflict_deletions,
+                HeldWriteGuards::new(write_guard, checkpoint_guard),
+            )
+            .await?;
+        // Report the rows inserted, including those its retention delete removed
+        // in the same publication, as when that delete ran after it.
+        Ok(written.saturating_add(retention_dropped.load(std::sync::atomic::Ordering::Relaxed)))
     }
 
     /// Write a streaming append once, then resolve the keys it repeats across
@@ -1379,15 +1383,19 @@ impl<'a> AppendMutationWriter<'a> {
             row_count: rows,
             superseded: superseded_rows,
             first_load_pk_bloom,
+            retention_folded,
         } = self
             .table
             .stage_resolved_append(data, resolver, write, scope)
             .await?;
 
-        if rows == 0 {
+        // Nothing to publish only when no row was kept AND none is superseded:
+        // `retention_sql` can drop every row an upsert adds while the old versions
+        // of its keys still have to go in the same commit.
+        if rows == 0 && on_conflict_deletions.total_superseded() == 0 {
             self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
                 .await;
-            return Ok(0);
+            return Ok(retention_folded);
         }
         super::append_commit::PreparedResolvedAppend {
             table: self.table.clone_for_write(),
@@ -1406,6 +1414,7 @@ impl<'a> AppendMutationWriter<'a> {
         }
         .commit()
         .await
+        .map(|written| written.saturating_add(retention_folded))
     }
 
     async fn cleanup_layered_append_dirs(&self, snapshot_ids: &[String]) {

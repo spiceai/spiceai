@@ -130,6 +130,9 @@ pub(super) struct StagedAppend {
     pub row_count: u64,
     pub superseded: usize,
     pub first_load_pk_bloom: Option<FirstLoadPkFilter>,
+    /// Rows `retention_sql` folded out of the staged files, so neither in
+    /// `row_count` nor in `superseded`. The append still reports them inserted.
+    pub retention_folded: u64,
 }
 
 type ResolvedFiles = (u64, Arc<ColumnStatsAccumulator>, HashMap<String, Vec<u32>>);
@@ -222,6 +225,7 @@ impl CayenneTableProvider {
             })
             .transpose()?;
         let start = Instant::now();
+        let mut retention_folded = 0_u64;
         let written: Result<ResolvedFiles> = async {
             let (rows, _, stats) = self
                 .write_to_snapshot_with_schema(
@@ -250,12 +254,14 @@ impl CayenneTableProvider {
             // its retention delete, never the matching rows. It used to run as a pass
             // after the publish, which served them until it committed. A predicate
             // that fails fails the append, which discards the snapshot.
+            let repeats: u64 = superseded.values().map(|rows| rows.len() as u64).sum();
             let superseded = self
                 .hide_retention_matches_in_snapshot(&new_snapshot_id, superseded)
                 .await?;
             match file_stats.as_deref() {
                 Some(file_stats) if !superseded.is_empty() => {
                     let dropped: u64 = superseded.values().map(|rows| rows.len() as u64).sum();
+                    retention_folded = dropped.saturating_sub(repeats);
                     let stats = self
                         .fold_superseded_copies(
                             &new_snapshot_id,
@@ -312,6 +318,7 @@ impl CayenneTableProvider {
             row_count,
             superseded,
             first_load_pk_bloom,
+            retention_folded,
         })
     }
 }

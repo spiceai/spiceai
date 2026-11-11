@@ -106,7 +106,7 @@ impl PreparedResolvedAppend {
     }
 
     async fn commit_inner(&mut self) -> std::result::Result<u64, Failure> {
-        if self.rows == 0 {
+        if self.rows == 0 && self.deletions.total_superseded() == 0 {
             super::staged_upsert::cleanup_orphan_snapshot_dir(&self.table, &self.snapshot_id).await;
             return Ok(0);
         }

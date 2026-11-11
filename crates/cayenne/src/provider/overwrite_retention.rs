@@ -148,7 +148,9 @@ impl CayenneTableProvider {
     /// the predicate is TRUE for; dropping them before the write means the
     /// publication never carries them. The predicate is prepared once, with one
     /// `now()`, for the whole stream, and evaluated once per row. An error fails
-    /// the append before anything is published.
+    /// the append before anything is published. The counter it returns holds the
+    /// rows dropped once the stream is drained, so the append can still report
+    /// every row it inserted, as it did when the delete ran after it.
     ///
     /// # Errors
     ///
@@ -156,10 +158,15 @@ impl CayenneTableProvider {
     pub(crate) fn drop_retention_matches_from_stream(
         &self,
         stream: datafusion::execution::SendableRecordBatchStream,
-    ) -> super::Result<datafusion::execution::SendableRecordBatchStream> {
+    ) -> super::Result<(
+        datafusion::execution::SendableRecordBatchStream,
+        Arc<std::sync::atomic::AtomicU64>,
+    )> {
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         if !self.has_retention_delete_filters() {
-            return Ok(stream);
+            return Ok((stream, dropped));
         }
+        let counter = Arc::clone(&dropped);
         let message = self.retention_failed_message();
         let failed = move |error: datafusion_common::DataFusionError| {
             datafusion_common::DataFusionError::Execution(format!(
@@ -177,10 +184,19 @@ impl CayenneTableProvider {
             let batch = batch?;
             let deleted = deleted_rows(&physical, &batch).map_err(&failed)?;
             let keep: BooleanArray = deleted.iter().map(|d| Some(d != Some(true))).collect();
-            arrow::compute::filter_record_batch(&batch, &keep).map_err(|e| failed(e.into()))
+            let kept =
+                arrow::compute::filter_record_batch(&batch, &keep).map_err(|e| failed(e.into()))?;
+            counter.fetch_add(
+                (batch.num_rows() - kept.num_rows()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(kept)
         });
-        Ok(Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, filtered),
+        Ok((
+            Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, filtered),
+            ),
+            dropped,
         ))
     }
 
