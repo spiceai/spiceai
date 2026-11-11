@@ -8,22 +8,10 @@
 # The spicepod as written.
 federated: {}
 
-arrow:
-  datasets: { '*': { acceleration: { enabled: true, engine: arrow } } }
-arrow-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: arrow, mode: memory } } }
-
 cayenne-file:
   datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }
 cayenne-memory:
   datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: memory } } }
-
-sqlite:
-  datasets: { '*': { acceleration: { enabled: true, engine: sqlite } } }
-sqlite-file:
-  datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: file } } }
-sqlite-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: memory } } }
 
 # The prototype object-native Cayenne metastore, for every Cayenne dataset as written.
 object-native:

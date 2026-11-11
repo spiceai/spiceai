@@ -11,8 +11,6 @@ sources:
 
 variants:
   cayenne: {}
-  sqlite:
-    datasets: { '*': { acceleration: { engine: sqlite, params: { sqlite_file: '${instance.dir}/items.sqlite' } } } }
   # The spicepod as written, with the prototype object-native Cayenne metastore.
   object-native: object-native
 

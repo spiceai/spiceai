@@ -4,6 +4,7 @@ description: >
   reached, rejects its credentials, or lacks the table is reported in Error
   with a message naming the dataset and its connector — MySQL, ClickHouse,
   S3, MongoDB and Kafka — while a healthy dataset of each connector serves.
+  A Debezium topic whose messages carry no key is refused on every engine.
   (Gaps: known-failing/api-and-errors/connector-errors-gaps.yaml.)
 
 sources:
@@ -49,11 +50,21 @@ spicepod:
     - { from: 'mongodb:no_such_collection', name: mg_bad_table, params: { mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false' } }
     - { from: 'snowflake:DB.PUBLIC.T', name: sf_keypair_bad_account, params: { snowflake_account: no-such-account, snowflake_username: spice, snowflake_warehouse: wh, snowflake_role: r, snowflake_private_key_path: '${script.dir}/../tls/spiced_key.pem' } }
     - { from: 'kafka:no_such_host_topic', name: kf_bad_host, params: { kafka_bootstrap_servers: 'no-such-host.invalid:9092', kafka_security_protocol: PLAINTEXT }, acceleration: { enabled: true, engine: cayenne, refresh_mode: append } }
+    # A Debezium topic whose messages carry no Kafka key cannot have its updates
+    # and deletes applied, so it fails to load on every engine. `schema_evolution`
+    # works around #15495, which otherwise fails a fresh topic before this check.
+    - { from: 'debezium:dbz_keyless_${sources.kafka.namespace}', name: dbz_keyless_cayenne, params: { kafka_bootstrap_servers: '127.0.0.1:${sources.kafka.port.19092}', kafka_security_protocol: plaintext, schema_evolution: 'true' }, acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: changes } }
+    - { from: 'debezium:dbz_keyless_${sources.kafka.namespace}', name: dbz_keyless_arrow, params: { kafka_bootstrap_servers: '127.0.0.1:${sources.kafka.port.19092}', kafka_security_protocol: plaintext, schema_evolution: 'true' }, acceleration: { enabled: true, engine: arrow, mode: memory, refresh_mode: changes } }
 
 steps:
   - source-exec: { my: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
   - source-exec: { ch: "CREATE TABLE t (id Int32, v String) ENGINE = MergeTree ORDER BY id; INSERT INTO t VALUES (1, 'a')" }
   - source-exec: { mongo: "mongosh --quiet ${sources.mongo.namespace} --eval 'db.t.insertOne({id: 1, v: \"a\"})'" }
+  - source-exec:
+      kafka: >-
+        rpk topic create dbz_keyless_${sources.kafka.namespace} -p 1 &&
+        echo '{"schema":{"type":"struct","name":"dbz.public.keyless.Envelope","optional":false,"fields":[{"type":"struct","name":"dbz.public.keyless.Value","optional":true,"field":"before","fields":[{"type":"int64","optional":false,"field":"id"},{"type":"string","optional":true,"field":"name"}]},{"type":"struct","name":"dbz.public.keyless.Value","optional":true,"field":"after","fields":[{"type":"int64","optional":false,"field":"id"},{"type":"string","optional":true,"field":"name"}]},{"type":"string","optional":false,"field":"op"},{"type":"int64","optional":true,"field":"ts_ms"}]},"payload":{"before":null,"after":{"id":1,"name":"a"},"op":"c","ts_ms":1760000000000}}'
+        | rpk topic produce dbz_keyless_${sources.kafka.namespace}
   - generate:
       lake: { table: t, rows: 1, seed: 1, files: 1, format: parquet, columns: [{ name: id, sequence: 1 }] }
   - start: { ready: false }
@@ -93,6 +104,10 @@ steps:
   - assert-status: { dataset: mg_bad_table, status: Error, message-contains: "Failed to load the dataset mg_bad_table (mongodb). Unable to infer schema. Collection empty or non-existent: no_such_collection" }
     eventually: 30s
   - assert-status: { dataset: kf_bad_host, status: Error, message-contains: "Failed to load the dataset kf_bad_host (kafka)" }
+    eventually: 30s
+  - assert-status: { dataset: dbz_keyless_cayenne, status: Error, message-contains: "The Debezium messages for this dataset carry no Kafka message key" }
+    eventually: 30s
+  - assert-status: { dataset: dbz_keyless_arrow, status: Error, message-contains: "The Debezium messages for this dataset carry no Kafka message key" }
     eventually: 30s
   # Key-pair auth signs a JWT before connecting, so a fake account still exercises signing.
   - assert-status: { dataset: sf_keypair_bad_account, status: Error, message-contains: "Failed to authenticate with Snowflake" }

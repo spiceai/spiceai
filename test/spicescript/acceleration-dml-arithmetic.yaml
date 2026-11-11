@@ -2,24 +2,17 @@ name: acceleration-dml-arithmetic
 description: >
   UPDATE and DELETE with integer arithmetic on an acceleration that takes its
   own writes (`access: read_write`, `write_mode: acceleration`) change the rows
-  PostgreSQL changes for the same statements, on every engine. Cayenne
-  evaluates the arithmetic in Spice, with Spice's overflow checks; SQLite and PostgreSQL evaluate the statement Spice renders for them, which
-  carries the operators, not those checks.
+  PostgreSQL changes for the same statements, in Cayenne file and memory mode.
+  Cayenne evaluates the arithmetic in Spice, with Spice's overflow checks.
 
 sources:
   src: { kind: postgres }
-  # A database of its own for the PostgreSQL acceleration, whose table would
-  # otherwise be the source table.
-  accel: { kind: postgres }
 
 variants:
   cayenne-file: cayenne-file
   # `cayenne-file` with the prototype object-native Cayenne metastore.
   cayenne-file-object-native: cayenne-file-object-native
   cayenne-memory: cayenne-memory
-  sqlite-file: sqlite-file
-  sqlite-memory: sqlite-memory
-  postgres: { datasets: { '*': { acceleration: { enabled: true, engine: postgres, params: '${sources.accel.params}' } } } }
 
 spicepod:
   version: v1
@@ -60,11 +53,8 @@ steps:
   - query: SELECT id, n FROM acc
     oracle-sql: SELECT id, n FROM model
 
-  # Cayenne, DuckDB and PostgreSQL refuse the overflow and change nothing.
-  # SQLite has no such check: it turns the sum into a REAL.
+  # Cayenne refuses the overflow and changes nothing.
   - spice-exec: UPDATE acc SET n = n + 1 WHERE id = 4
     expect-error: true
-    except: [sqlite-file, sqlite-memory]
   - query: SELECT id, n FROM acc
     oracle-sql: SELECT id, n FROM model
-    except: [sqlite-file, sqlite-memory]

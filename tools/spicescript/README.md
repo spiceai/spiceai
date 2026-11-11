@@ -236,9 +236,9 @@ A variant may name a shared variant instead of writing the patch:
 `cayenne: cayenne-file`. Shared variants are defined, each as its full patch, in
 the `variants.yaml` in the script's directory or the nearest directory above it
 ([`test/spicescript/variants.yaml`](../../test/spicescript/variants.yaml) for the
-suite): `federated` (the spicepod as written), and an engine and mode that set
-`acceleration: { enabled: true, engine, mode }` on every dataset, such as
-`cayenne-file`, `duckdb-memory` or `arrow`. A name the file does not define
+suite): `federated` (the spicepod as written), and `cayenne-file` and
+`cayenne-memory`, which set `acceleration: { enabled: true, engine: cayenne,
+mode }` on every dataset. A name the file does not define
 fails `--check`. A variant used by one script only is written in that script.
 
 `$merge: '${…}'` spreads a mapping placeholder into a mapping, with the

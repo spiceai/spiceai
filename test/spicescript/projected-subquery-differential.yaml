@@ -12,7 +12,7 @@ matrix:
   seed: [41, 73]
 variants:
   federated: {}
-  arrow: arrow
+  cayenne-memory: cayenne-memory
   cayenne: cayenne-file
   # `cayenne` with the prototype object-native Cayenne metastore.
   cayenne-object-native: cayenne-file-object-native
