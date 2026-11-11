@@ -1082,6 +1082,18 @@ impl CayenneTableProvider {
                 }
             }
         };
+        // An append that writes rows moves the sequence high water before it
+        // publishes, as every other append route does (#13685): a transaction
+        // that falls back to the per-table `current_high_water != stage_seq`
+        // check must see it. The deletion vectors above already drew one; an
+        // append that writes no rows draws nothing.
+        if row_count > 0
+            && delete_files.is_empty()
+            && let Err(error) = self.reserve_sequences_local(1).await
+        {
+            self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+            return Err(error.into());
+        }
         Ok(PreparedOverwrite {
             table: self.clone_for_write(),
             write_guard: Some(write_guard),
