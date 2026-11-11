@@ -3655,7 +3655,9 @@ async fn a_placed_table_writes_flat_keys() {
             }
             Some(name)
                 if name.starts_with("deletions/delete_")
-                    && name.ends_with(".arrow")
+                    && std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext == "arrow")
                     && name.matches('/').count() == 1 =>
             {
                 deletions.insert(name.to_string());
@@ -3867,7 +3869,7 @@ async fn failed_operation_fixture(
     SessionContext,
     HeldCompaction,
 ) {
-    if let FailedOperation::KeyedBurst = operation {
+    if matches!(operation, FailedOperation::KeyedBurst) {
         let (setup, catalog, table, ctx) = create_keyed_with_config(
             "changes",
             &["id"],

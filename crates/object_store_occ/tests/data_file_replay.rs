@@ -846,12 +846,12 @@ impl Replay {
                     receipt,
                     applied: false,
                 });
-                let held = self.send(index, Some(log)).await?;
+                let (held_request, call) = self.send(index, Some(log)).await?;
                 self.clients[writer].pending = Some((index, false));
-                self.clients[writer].call = held.1;
+                self.clients[writer].call = call;
                 self.net.push(Wire {
                     attempt: index,
-                    held: held.0,
+                    held: held_request,
                 });
             }
             DataFileOp::CommitApplied {

@@ -1056,17 +1056,19 @@ async fn a_late_append_during_compaction_is_carried_without_a_copy() {
             .open(NAME)
             .await
             .expect("reopen the placed table");
+    let hook_taken = provider.test_pre_rewrite_commit_hook.lock().is_none();
+    let reopened_rows = scan_sorted_ids(&reopened).await;
     assert_eq!(
         (
             committed,
-            provider.test_pre_rewrite_commit_hook.lock().is_none(),
+            hook_taken,
             copies,
             late.len(),
             late.iter().all(|name| named.contains(name)),
             unpicked.iter().all(|name| named.contains(*name)),
             current != listed.snapshot_id,
             rows,
-            scan_sorted_ids(&reopened).await,
+            reopened_rows,
         ),
         (
             true,

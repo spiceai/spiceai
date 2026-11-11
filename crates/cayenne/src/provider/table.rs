@@ -10228,7 +10228,8 @@ impl CayenneTableProvider {
                     };
                     let waited = now.duration_since(observed);
                     if waited < crate::metastore_layout::DATA_FILE_RETENTION {
-                        let left = crate::metastore_layout::DATA_FILE_RETENTION - waited;
+                        let left =
+                            crate::metastore_layout::DATA_FILE_RETENTION.saturating_sub(waited);
                         next_due = Some(next_due.map_or(left, |due| due.min(left)));
                         return false;
                     }
@@ -26007,13 +26008,13 @@ impl CayenneTableProvider {
         // Wait for any acceleration snapshot archiving this table; held until the
         // catalog rows are removed, so a snapshot sees both the file and its row or
         // neither.
-        let _reclaim = self.file_deletion_fence.write().await;
+        let reclaim_fence = self.file_deletion_fence.write().await;
 
         if self.data_in_object_native_location() {
             let pass = self
                 .reclaim_orphaned_deletion_vectors_record_first(&orphaned, max_batch, floor)
                 .await;
-            drop(_reclaim);
+            drop(reclaim_fence);
             // The retirement sweep starts the removed files' retention and
             // deletes them once it has passed.
             self.sweep_retired_snapshot_dirs();
@@ -44469,7 +44470,7 @@ impl CayenneTableProvider {
                     .file_path
                     .split('/')
                     .filter(|part| !part.is_empty())
-                    .fold(prefix.clone(), |location, part| location.join(part));
+                    .fold(prefix.clone(), object_store::path::Path::join);
                 // `synthetic_object_meta` stamps the epoch mtime the Vortex
                 // write path also stamps on its footer-cache entries, so
                 // `is_valid_for` matches and post-write scans reuse the

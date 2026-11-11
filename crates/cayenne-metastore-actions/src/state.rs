@@ -1508,12 +1508,12 @@ mod tests {
             .map(|(snapshot, path)| (snapshot.as_str(), path.as_str()))
             .collect();
         assert_eq!(entries, [("s", "b"), ("s2", "c")]);
-        let stats: Vec<(&str, &str)> = table
+        let stat_keys: Vec<(&str, &str)> = table
             .file_stats
             .keys()
             .map(|(snapshot, path)| (snapshot.as_str(), path.as_str()))
             .collect();
-        assert_eq!(stats, [("s", "b"), ("s2", "c")]);
+        assert_eq!(stat_keys, [("s", "b"), ("s2", "c")]);
 
         // A checkpoint carries the retired set, and the forget after it too.
         let mut rebuilt = DatasetState::default();
