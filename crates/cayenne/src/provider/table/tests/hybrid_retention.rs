@@ -856,3 +856,89 @@ async fn armed_tier_transaction_view_survives_checkpoint_and_restart() {
 async fn armed_tier_sql_insert_view_survives_checkpoint_and_restart() {
     assert_armed_view_after_checkpoint_and_restart(DurableRoute::SqlInsert).await;
 }
+
+/// A user write (no `retention_sql` involved: retention stays OFF) that changes
+/// a key whose newest version lives only in the armed RAM tier.
+#[derive(Clone, Copy, Debug)]
+enum UserWrite {
+    /// `DELETE ... WHERE id = 3`.
+    SqlDelete,
+    /// `UPDATE ... SET value = 30 WHERE id = 3`.
+    SqlUpdate,
+    /// A transaction upserting `(3, 30)`.
+    TransactionUpsert,
+}
+
+/// Independent reproducer for the user-write question: does a committed user
+/// DELETE/UPDATE of a tier-only version survive a crash before the next
+/// checkpoint and the source's replay of every unacknowledged event? The
+/// source replays from its last acknowledgement: if the write's own path made
+/// the tier durable (and so acknowledged it), nothing is replayed; otherwise
+/// the tier seed is re-delivered. Either way the committed write must hold.
+async fn assert_user_write_survives_crash_and_replay(write: UserWrite) {
+    use datafusion::prelude::lit;
+    let f = hybrid(&format!("hyb_user_{write:?}").to_lowercase(), 1).await;
+    let hold = seed_keeping_tier(&f).await;
+    let acks_before = f.acks.lock().len();
+    let p = &f.provider;
+    let ctx = SessionContext::new();
+    match write {
+        UserWrite::SqlDelete => {
+            let plan = p
+                .delete_from(&ctx.state(), vec![col("id").eq(lit(3_i64))])
+                .await
+                .expect("delete plan");
+            collect(plan, ctx.task_ctx()).await.expect("delete");
+        }
+        UserWrite::SqlUpdate => {
+            let plan = p
+                .update(
+                    &ctx.state(),
+                    vec![("value".to_string(), lit(30_i64))],
+                    vec![col("id").eq(lit(3_i64))],
+                )
+                .await
+                .expect("update plan");
+            collect(plan, ctx.task_ctx()).await.expect("update");
+        }
+        UserWrite::TransactionUpsert => {
+            durable_write(p, DurableRoute::Transaction, &[(3, 30)]).await;
+        }
+    }
+    let expected: Vec<(i64, i64)> = match write {
+        UserWrite::SqlDelete => vec![(1, -1), (2, -2), (4, 4), (5, -5)],
+        UserWrite::SqlUpdate | UserWrite::TransactionUpsert => {
+            vec![(1, -1), (2, -2), (3, 30), (4, 4), (5, -5)]
+        }
+    };
+    assert_eq!(rows(p).await, expected, "{write:?}: live");
+    // Whether the write's path acknowledged the tier seed (made it durable).
+    let tier_acked = f.acks.lock().len() > acks_before;
+    drop(hold);
+
+    // Crash: no further checkpoint. Replay every unacknowledged event.
+    let restarted = f.restart().await;
+    if !tier_acked {
+        apply(&restarted, &TIER_SEED).await.expect("replay");
+    }
+    assert_eq!(
+        rows(&restarted).await,
+        expected,
+        "{write:?}: after a crash and the source's replay (tier acked by the write: {tier_acked})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_sql_delete_of_a_tier_only_version_survives_crash_and_replay() {
+    assert_user_write_survives_crash_and_replay(UserWrite::SqlDelete).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_sql_update_of_a_tier_only_version_survives_crash_and_replay() {
+    assert_user_write_survives_crash_and_replay(UserWrite::SqlUpdate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_transaction_upsert_over_a_tier_only_version_survives_crash_and_replay() {
+    assert_user_write_survives_crash_and_replay(UserWrite::TransactionUpsert).await;
+}
