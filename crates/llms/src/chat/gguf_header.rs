@@ -343,11 +343,9 @@ pub(crate) mod tests {
             local_string(&path, GENERAL_TYPE).await.expect("readable"),
             Some("adapter".to_string())
         );
-        assert!(
-            local_string(&dir.path().join("absent.gguf"), GENERAL_TYPE)
-                .await
-                .is_err()
-        );
+        local_string(&dir.path().join("absent.gguf"), GENERAL_TYPE)
+            .await
+            .expect_err("a missing file cannot be read");
     }
 
     #[test]

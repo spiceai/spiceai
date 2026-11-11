@@ -921,7 +921,7 @@ mod tests {
         assert!(matches!(err, Error::NoAdapterGguf { .. }), "{err}");
     }
 
-    fn request(questions: serde_json::Value) -> EvaluateRequest {
+    fn request(questions: &serde_json::Value) -> EvaluateRequest {
         serde_json::from_value(json!({
             "model": "triage",
             "state": "Help! My payouts have been failing for 3 days! ",
@@ -932,7 +932,7 @@ mod tests {
 
     #[test]
     fn questions_map_to_the_deciders() {
-        let asked = DeciderRequest::new(&request(json!({
+        let asked = DeciderRequest::new(&request(&json!({
             "urgent": {"type": "noul", "instructions": "Does this convey urgency?"},
             "team": {
                 "type": "choice",
@@ -1013,7 +1013,7 @@ mod tests {
             ..=strands_decider::MAX_CHOICE_OPTIONS)
             .map(|i| (format!("option{i}"), json!(null)))
             .collect();
-        let err = DeciderRequest::new(&request(json!({
+        let err = DeciderRequest::new(&request(&json!({
             "many": {"type": "choice", "criteria": options}
         })))
         .expect_err("too many options");
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn answers_map_back_with_the_requests_levels_and_usage() {
-        let asked = DeciderRequest::new(&request(json!({
+        let asked = DeciderRequest::new(&request(&json!({
             "mood": {"type": "score", "criteria": ["calm", {"level": "upset"}]},
             "only": {"type": "choice", "criteria": {"one": null}},
         })))
