@@ -55,6 +55,7 @@ use futures::TryStreamExt;
 use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use url::Url;
 #[cfg(not(windows))]
 use {
@@ -109,6 +110,7 @@ pub struct ListingTableTemplate {
     object_store: Arc<dyn ObjectStore>,
     /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
     extension: String,
+    dataset_name: String,
 }
 
 impl ListingTableTemplate {
@@ -163,17 +165,168 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        if has_location_metadata(table.options()) {
+        let pruning = has_location_metadata(table.options()).then(|| {
             Arc::new(LocationPruningListingTable::new(
-                table,
+                Arc::clone(&table),
                 Arc::clone(&self.object_store),
-                table_path,
+                table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
-        } else {
-            table
+        });
+        // A missing or emptied source lists as success with zero rows today, so a
+        // full refresh can persist an empty acceleration. Reject that listing
+        // (dataset and path named in the error and a warn log). An existing
+        // header-only or zero-row file still matches and scans as zero rows.
+        reject_empty_listing(
+            table,
+            pruning,
+            table_path,
+            self.dataset_name.clone(),
+            self.extension.clone(),
+        )
+    }
+}
+
+/// Fails a scan whose listing has no data file, so a full refresh cannot persist
+/// an empty result over a deleted or emptied source.
+#[derive(Debug)]
+struct RejectEmptyListingLayer {
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+    /// The `_location` pruning table beneath, when there is one. A scan it answers by
+    /// `head()`ing the named objects skips the listing here, so it needs no list call
+    /// (or list permission) it did not need before.
+    pruning: Option<Arc<LocationPruningListingTable>>,
+}
+
+/// Stacks the empty-listing guard over `table`, or over `pruning` when the dataset
+/// has `_location` metadata.
+fn reject_empty_listing(
+    table: Arc<ListingTable>,
+    pruning: Option<Arc<LocationPruningListingTable>>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    let below: Arc<dyn TableProvider> = match &pruning {
+        Some(pruning) => Arc::clone(pruning) as Arc<dyn TableProvider>,
+        None => table,
+    };
+    SpiceTable::over(
+        Arc::new(RejectEmptyListingLayer {
+            table_path,
+            dataset_name,
+            extension,
+            pruning,
+        }),
+        below,
+    )
+}
+
+/// Stacks the empty-listing guard over a single-object table that does not go
+/// through [`ListingTableTemplate::wrap`] (the S3 single-file version cache). A
+/// deleted object (`404 NoSuchKey`) lists nothing, so the scan fails rather than
+/// refreshing the acceleration to zero rows.
+fn reject_empty_single_object(
+    below: Arc<dyn TableProvider>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    SpiceTable::over(
+        Arc::new(RejectEmptyListingLayer {
+            table_path,
+            dataset_name,
+            extension,
+            pruning: None,
+        }),
+        below,
+    )
+}
+
+impl RejectEmptyListingLayer {
+    fn forget_listing(&self, state: &dyn Session) {
+        let Some(cache) = state.runtime_env().cache_manager.get_list_files_cache() else {
+            return;
+        };
+        // `ListingTable` caches under the path prefix; drop it so a later restore
+        // is visible to the inner scan (not only to this emptiness check).
+        let _ = cache.remove(&TableScopedPath {
+            table: None,
+            path: self.table_path.prefix().clone(),
+        });
+    }
+
+    async fn ensure_data_files(&self, state: &dyn Session) -> DFResult<()> {
+        self.forget_listing(state);
+        let store = state.runtime_env().object_store(&self.table_path)?;
+        let files = list_matching_listing_files(
+            state,
+            &self.table_path,
+            store.as_ref(),
+            &self.extension,
+            1,
+        )
+        .await?;
+        if !files.is_empty() {
+            return Ok(());
         }
+        let display_path =
+            sanitize_url(<ListingTableUrl as AsRef<url::Url>>::as_ref(&self.table_path).clone());
+        tracing::warn!(
+            dataset = %self.dataset_name,
+            path = %display_path,
+            "No data files are yet available for dataset {} at {}. The source path is missing or has no matching files.",
+            self.dataset_name,
+            display_path
+        );
+        Err(DataFusionError::External(Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "No data files are yet available for dataset {} at {}. The source path is missing or has no matching files.",
+                self.dataset_name, display_path
+            ),
+        ))))
+    }
+}
+
+#[async_trait]
+impl TableLayer for RejectEmptyListingLayer {
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind for this
+        // layer without anyone deciding what it should say.
+        match walk {
+            // Rejecting an empty listing changes no row, column, or type a scan of
+            // the same files returns, so every walk sees past this layer.
+            LayerWalk::Read
+            | LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => Some(below),
+        }
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        below: &Arc<dyn TableProvider>,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DFResult<datafusion::catalog::ScanResult> {
+        let skips_listing = self.pruning.as_ref().is_some_and(|pruning| {
+            pruning.answers_without_listing(args.filters().unwrap_or_default())
+        });
+        if !skips_listing {
+            self.ensure_data_files(state).await?;
+        }
+        below.scan_with_args(state, args).await
     }
 }
 
@@ -222,6 +375,17 @@ impl LocationPruningListingTable {
     /// through to `inner`.
     fn has_location_column(&self) -> bool {
         self.inner.schema().field_with_name("_location").is_ok()
+    }
+
+    /// Whether [`TableProvider::scan`] answers `filters` without listing the prefix:
+    /// an unsatisfiable pushed-down filter, or `_location` predicates it `head()`s.
+    fn answers_without_listing(&self, filters: &[datafusion_expr::Expr]) -> bool {
+        filters.iter().any(|filter| {
+            matches!(
+                filter,
+                datafusion_expr::Expr::Literal(ScalarValue::Boolean(None | Some(false)), _)
+            )
+        }) || (self.has_location_column() && extract_location_predicates(filters).is_some())
     }
 
     fn partition_column_types(&self) -> &[(String, datafusion::arrow::datatypes::DataType)] {
@@ -1572,7 +1736,14 @@ pub trait ListingTableConnector: DataConnector {
                 "Enabled single-file ETag/Version caching for {}",
                 dataset.name
             );
-            return Ok(Arc::new(cached_table));
+            // This table skips `template.wrap`, so it needs the same guard: a deleted
+            // object must fail the refresh, not replace the acceleration with zero rows.
+            return Ok(reject_empty_single_object(
+                Arc::new(cached_table),
+                table_path,
+                dataset.name.to_string(),
+                template.extension.clone(),
+            ));
         }
 
         Ok(template.wrap(table_arc, table_path))
@@ -1788,6 +1959,7 @@ pub trait ListingTableConnector: DataConnector {
             schema: final_schema,
             object_store,
             extension: extension.to_string(),
+            dataset_name: dataset.name.to_string(),
         })
     }
 
@@ -4459,17 +4631,27 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = LocationPruningListingTable::new(
-            Arc::new(listing),
+        let listing = Arc::new(listing);
+        let pruning = Arc::new(LocationPruningListingTable::new(
+            Arc::clone(&listing),
             ctx.runtime_env()
                 .object_store(&table_path)
                 .expect("object store"),
             table_path.clone(),
             file_schema,
             ".parquet",
+        ));
+        // The stack `wrap` registers: the empty-listing guard over the pruning table
+        // must not list for a `_location`-pruned scan either.
+        let provider = reject_empty_listing(
+            listing,
+            Some(pruning),
+            table_path.clone(),
+            "test_table".to_string(),
+            ".parquet".to_string(),
         );
 
-        ctx.register_table("test_table", Arc::new(provider))
+        ctx.register_table("test_table", provider)
             .expect("register table");
 
         let df = ctx
@@ -4501,6 +4683,200 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "Listing should not be invoked when location predicates are present"
         );
+    }
+
+    fn write_id_file(path: &std::path::Path, ids: &[i64]) {
+        if path.extension().is_some_and(|ext| ext == "csv") {
+            let body = ids.iter().fold(String::new(), |mut body, id| {
+                use std::fmt::Write as _;
+                let _ = writeln!(body, "{id}");
+                body
+            });
+            std::fs::write(path, format!("id\n{body}")).expect("write csv");
+            return;
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(
+                ids.to_vec(),
+            ))],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(path).expect("create parquet file");
+        let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(file, schema, None)
+            .expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet file");
+    }
+
+    async fn id_rows(ctx: &SessionContext) -> DFResult<usize> {
+        let batches = ctx.sql("SELECT id FROM facts").await?.collect().await?;
+        Ok(batches
+            .iter()
+            .map(datafusion::arrow::record_batch::RecordBatch::num_rows)
+            .sum())
+    }
+
+    /// The guard `wrap` stacks over a file listing, for CSV and Parquet: removing
+    /// every matching file fails the scan with the missing-source error instead of
+    /// answering zero rows, an existing zero-row file still scans as zero rows, and
+    /// restored files are read again.
+    #[tokio::test]
+    async fn reject_empty_listing_errors_on_a_removed_source_and_reads_restored_files() {
+        for extension in [".csv", ".parquet"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file = dir.path().join(format!("part-0{extension}"));
+            write_id_file(&file, &[1, 2, 3]);
+
+            let table_path = ListingTableUrl::parse(format!("{}/", dir.path().display()))
+                .expect("listing table url");
+            let format: Arc<dyn FileFormat> = if extension == ".csv" {
+                Arc::new(CsvFormat::default().with_has_header(true))
+            } else {
+                Arc::new(ParquetFormat::default())
+            };
+            let options = ListingOptions::new(format).with_file_extension(extension);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )]));
+            let listing = Arc::new(
+                ListingTable::try_new(
+                    ListingTableConfig::new(table_path.clone())
+                        .with_listing_options(options)
+                        .with_schema(schema),
+                )
+                .expect("create listing table"),
+            );
+            let provider = reject_empty_listing(
+                listing,
+                None,
+                table_path,
+                "facts".to_string(),
+                extension.to_string(),
+            );
+            let ctx = SessionContext::new();
+            ctx.register_table("facts", provider)
+                .expect("register table");
+
+            assert_eq!(id_rows(&ctx).await.expect("initial scan"), 3, "{extension}");
+
+            std::fs::remove_file(&file).expect("remove the only data file");
+            let err = id_rows(&ctx)
+                .await
+                .expect_err("a removed source is an error, not zero rows")
+                .to_string();
+            assert!(
+                err.contains("No data files are yet available for dataset facts"),
+                "{extension}: {err}"
+            );
+
+            write_id_file(&file, &[]);
+            assert_eq!(
+                id_rows(&ctx)
+                    .await
+                    .expect("an existing zero-row file scans"),
+                0,
+                "{extension}"
+            );
+
+            write_id_file(&file, &[1, 2, 3, 4]);
+            assert_eq!(
+                id_rows(&ctx).await.expect("a restored file is read"),
+                4,
+                "{extension}"
+            );
+        }
+    }
+
+    /// The S3 single-object table (`S3SingleFileCached`) does not go through `wrap`,
+    /// so it gets the guard from `reject_empty_single_object`: a deleted key
+    /// (`404 NoSuchKey`, which lists nothing) fails the scan instead of answering
+    /// zero rows, and the refresh-skip check still reaches the cached table beneath.
+    #[tokio::test]
+    async fn reject_empty_single_object_errors_on_a_deleted_s3_key() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(
+            &Url::parse("s3://bucket").expect("store url"),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        );
+        let key = Path::from("one/orders.parquet");
+        let parquet = |ids: &[i64]| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file = dir.path().join("part.parquet");
+            write_id_file(&file, ids);
+            object_store::PutPayload::from(std::fs::read(&file).expect("read parquet"))
+        };
+        store
+            .put(&key, parquet(&[1, 2, 3]))
+            .await
+            .expect("put object");
+
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/one/orders.parquet").expect("listing table url");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let listing = Arc::new(
+            ListingTable::try_new(
+                ListingTableConfig::new(table_path.clone())
+                    .with_listing_options(
+                        ListingOptions::new(Arc::new(ParquetFormat::default()))
+                            .with_file_extension(".parquet"),
+                    )
+                    .with_schema(schema),
+            )
+            .expect("create listing table"),
+        );
+        let cached = data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+            listing,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "facts".to_string(),
+        )
+        .expect("a single object is cached");
+        let provider = reject_empty_single_object(
+            Arc::new(cached),
+            table_path,
+            "facts".to_string(),
+            ".parquet".to_string(),
+        );
+        assert!(
+            data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                provider.as_ref()
+            )
+            .await
+            .expect("skip check")
+            .is_some(),
+            "the refresh-skip check must still reach the cached table under the guard"
+        );
+        ctx.register_table("facts", provider)
+            .expect("register table");
+        assert_eq!(id_rows(&ctx).await.expect("initial scan"), 3);
+
+        store.delete(&key).await.expect("delete object");
+        let err = id_rows(&ctx)
+            .await
+            .expect_err("a deleted key is an error, not zero rows")
+            .to_string();
+        assert!(
+            err.contains("No data files are yet available for dataset facts"),
+            "{err}"
+        );
+
+        store
+            .put(&key, parquet(&[1, 2, 3, 4]))
+            .await
+            .expect("restore object");
+        assert_eq!(id_rows(&ctx).await.expect("a restored key is read"), 4);
     }
 
     #[tokio::test]
