@@ -1063,6 +1063,32 @@ async fn unkeyed_retention_generation_recovers_old_before_and_new_after_its_flip
         let mut reopened = reopen(&catalog, &runtime_env).await;
         if crash_after_commit {
             assert_eq!(visible(&reopened).await, new, "{label}: recovered");
+            // Local disk: the carried data files are hard links of the previous
+            // generation's, not copies. Measure apparent vs unique bytes.
+            use std::os::unix::fs::MetadataExt;
+            let mut stack = vec![temp_dir.path().join("data")];
+            let (mut apparent, mut unique, mut linked) = (0_u64, 0_u64, 0_usize);
+            let mut seen = std::collections::HashSet::new();
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+                    let meta = entry.metadata().expect("metadata");
+                    if meta.is_dir() {
+                        stack.push(entry.path());
+                    } else if entry.path().extension().is_some_and(|e| e == "vortex") {
+                        apparent += meta.len();
+                        if meta.nlink() > 1 {
+                            linked += 1;
+                        }
+                        if seen.insert(meta.ino()) {
+                            unique += meta.len();
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "AMPLIFICATION local: vortex apparent={apparent} unique={unique} linked_names={linked}"
+            );
+            assert!(linked >= 2, "{label}: carried files are hard links");
         } else {
             assert_eq!(visible(&reopened).await, old, "{label}: recovered");
             // The append was never acknowledged, so its source replays it.
