@@ -379,7 +379,7 @@ For large tables, memory usage is bounded by:
    ```yaml
    acceleration:
      enabled: true
-     engine: duckdb
+     engine: cayenne
    ```
 
 2. **Use appropriate batch sizes** for your workload
@@ -451,7 +451,7 @@ datasets:
       scylladb_keyspace: catalog
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_interval: 1h
 ```
 

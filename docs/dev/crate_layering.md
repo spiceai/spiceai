@@ -569,7 +569,7 @@ depends on it** — else it is the upward edge the guard rejects.
   plus a trait per shape, so the typed, relationally-queryable offset table survives —
   the trade-off feared here (collapsing everything into a keyed blob and losing
   per-column queryability) was avoided by keeping a shape per connector.
-- Each engine implements every shape in `runtime-checkpoint-{duckdb,sqlite,postgres}`,
+- Each engine implements every shape in `runtime-checkpoint-{sqlite,postgres}`,
   and bundles them behind `runtime_acceleration::sidecar::AcceleratorSidecar`.
 - `DataAccelerator::sidecar` hands that bundle back, so the runtime resolves a dataset
   to its stores without naming an engine — which is what lets the engine crates sit

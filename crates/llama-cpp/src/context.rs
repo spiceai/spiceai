@@ -42,15 +42,13 @@ pub enum Truncation {
 }
 
 /// How a context is created.
-#[expect(
-    clippy::struct_field_names,
-    reason = "the names are llama.cpp's own context parameters"
-)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContextParams {
     n_ctx: Option<NonZeroU32>,
     n_batch: Option<u32>,
     n_rs_seq: u32,
+    n_seq_max: Option<u32>,
+    kv_unified: Option<bool>,
 }
 
 impl ContextParams {
@@ -76,6 +74,21 @@ impl ContextParams {
         self
     }
 
+    /// How many sequences the context holds at once; one when unset.
+    #[must_use]
+    pub fn with_n_seq_max(mut self, n_seq_max: u32) -> Self {
+        self.n_seq_max = Some(n_seq_max);
+        self
+    }
+
+    /// Whether the sequences share one KV cache of `n_ctx` cells, as llama.cpp's `--kv-unified`
+    /// makes them, rather than each holding `n_ctx / n_seq_max` cells of its own.
+    #[must_use]
+    pub fn with_kv_unified(mut self, kv_unified: bool) -> Self {
+        self.kv_unified = Some(kv_unified);
+        self
+    }
+
     /// The C parameters; `draft_of` makes a draft context that reads that target, an MTP
     /// context for an MTP head.
     pub(crate) fn raw(
@@ -91,6 +104,12 @@ impl ContextParams {
             raw.n_batch = n_batch;
         }
         raw.n_rs_seq = self.n_rs_seq;
+        if let Some(n_seq_max) = self.n_seq_max {
+            raw.n_seq_max = n_seq_max;
+        }
+        if let Some(kv_unified) = self.kv_unified {
+            raw.kv_unified = kv_unified;
+        }
         if let Some((target, kind)) = draft_of {
             if kind == DraftKind::Mtp {
                 raw.ctx_type = sys::llama_context_type_LLAMA_CONTEXT_TYPE_MTP;
@@ -110,6 +129,9 @@ impl ContextParams {
 pub struct Context<'m> {
     raw: NonNull<sys::llama_context>,
     _model: PhantomData<&'m crate::Model>,
+    /// Whether the decodes that follow output each row's greedy pick instead of its logits
+    /// ([`Context::set_argmax_output`]).
+    argmax: bool,
 }
 
 // SAFETY: a context is used by one thread at a time, which `&mut self` on every call that
@@ -121,6 +143,7 @@ impl Context<'_> {
         Self {
             raw,
             _model: PhantomData,
+            argmax: false,
         }
     }
 
@@ -133,6 +156,26 @@ impl Context<'_> {
     pub fn n_ctx(&self) -> u32 {
         // SAFETY: the context is live.
         unsafe { sys::llama_n_ctx(self.raw.as_ptr()) }
+    }
+
+    /// How many sequences the context holds.
+    #[must_use]
+    pub fn n_seq_max(&self) -> u32 {
+        // SAFETY: the context is live.
+        unsafe { sys::llama_n_seq_max(self.raw.as_ptr()) }
+    }
+
+    /// How many tokens one sequence can hold: the whole context with a unified cache.
+    #[must_use]
+    pub fn n_ctx_seq(&self) -> u32 {
+        // SAFETY: the context is live.
+        unsafe { sys::llama_n_ctx_seq(self.raw.as_ptr()) }
+    }
+
+    /// Whether `seq` is one of the context's sequences; llama.cpp asserts, ending the process,
+    /// on any other.
+    fn holds(&self, seq: i32) -> bool {
+        u32::try_from(seq).is_ok_and(|seq| seq < self.n_seq_max())
     }
 
     /// Decodes `batch`, computing the logits of the tokens it marks for output.
@@ -179,6 +222,38 @@ impl Context<'_> {
         Some(unsafe { std::slice::from_raw_parts(row.as_ptr(), n_vocab) })
     }
 
+    /// Turns the argmax output on or off for the decodes that follow. With it on, a model whose
+    /// output head a tensor split divides by rows (DeepSeek-V4.1) computes each output row's
+    /// greedy pick on the devices that hold the head and sends back only the picks, instead of
+    /// gathering every row's logits. Those decodes have no logits: [`Context::argmax`] gives the
+    /// pick. Any other model computes its logits as before, and [`Context::argmax`] takes their
+    /// first maximum. The pick ignores samplers, so only a request that samples greedily alone
+    /// may use it. Changing the mode rebuilds the model's graph, so this calls llama.cpp only
+    /// when the mode changes.
+    pub fn set_argmax_output(&mut self, on: bool) {
+        if on != self.argmax {
+            // SAFETY: the context is live.
+            unsafe { sys::llama_set_argmax_output(self.raw.as_ptr(), on) };
+            self.argmax = on;
+        }
+    }
+
+    /// Whether the argmax output is on ([`Context::set_argmax_output`]).
+    #[must_use]
+    pub fn argmax_output(&self) -> bool {
+        self.argmax
+    }
+
+    /// The greedy pick of output row `index` of the last decoded batch: the token with the
+    /// largest logit, the first on a tie, token 0 when the row's first logit is a NaN, as
+    /// llama.cpp's greedy sampler picks it. `None` when the last decode did not output that row,
+    /// or when a backend sampler sampled it.
+    pub(crate) fn argmax(&self, index: i32) -> Option<Token> {
+        // SAFETY: the context is live; the call waits for the last decode to finish.
+        let token = unsafe { sys::llama_get_argmax_ith(self.raw.as_ptr(), index) };
+        (token >= 0).then_some(Token(token))
+    }
+
     /// Waits for the computation queued by earlier decodes to finish: a decode returns once
     /// its computation is queued, and a time taken without waiting would leave it out.
     pub fn synchronize(&mut self) {
@@ -195,8 +270,17 @@ impl Context<'_> {
     /// Removes sequence 0's entries from position `from` on. Returns false when the context
     /// cannot roll back that far, as when a recurrent layer keeps too few state snapshots.
     pub fn truncate(&mut self, from: i32) -> bool {
-        // SAFETY: as above; -1 means "to the end".
-        unsafe { sys::llama_memory_seq_rm(sys::llama_get_memory(self.raw.as_ptr()), 0, from, -1) }
+        self.truncate_seq(0, from)
+    }
+
+    /// Removes sequence `seq`'s entries from position `from` on. Returns false for a sequence
+    /// the context does not hold, or one it cannot roll back that far.
+    pub fn truncate_seq(&mut self, seq: i32, from: i32) -> bool {
+        if !self.holds(seq) {
+            return false;
+        }
+        // SAFETY: the context is live, and `seq` is one of its sequences; -1 means "to the end".
+        unsafe { sys::llama_memory_seq_rm(sys::llama_get_memory(self.raw.as_ptr()), seq, from, -1) }
     }
 
     /// How far this context's cache can be cut back, found as llama.cpp's server finds it: a
@@ -227,9 +311,20 @@ impl Context<'_> {
     /// full-attention cache. `None` when llama.cpp writes less than it sized.
     #[must_use]
     pub fn partial_state(&self) -> Option<Vec<u8>> {
-        // SAFETY: `raw` is live while `self` is (see `Context`), and sizing a sequence's state
-        // reads the context without changing it.
-        let size = unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), 0, PARTIAL_ONLY) };
+        self.partial_state_seq(0)
+    }
+
+    /// Sequence `seq`'s state that a truncation cannot restore; see [`Context::partial_state`].
+    /// `None` for a sequence the context does not hold.
+    #[must_use]
+    pub fn partial_state_seq(&self, seq: i32) -> Option<Vec<u8>> {
+        if !self.holds(seq) {
+            return None;
+        }
+        // SAFETY: `raw` is live while `self` is (see `Context`), `seq` is one of its sequences,
+        // and sizing a sequence's state reads the context without changing it.
+        let size =
+            unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, PARTIAL_ONLY) };
         let mut state = vec![0u8; size];
         // SAFETY: `raw` is live (see `Context`), and llama.cpp writes at most `size` bytes into
         // `state`, which holds `size` writable bytes.
@@ -238,7 +333,7 @@ impl Context<'_> {
                 self.raw.as_ptr(),
                 state.as_mut_ptr(),
                 size,
-                0,
+                seq,
                 PARTIAL_ONLY,
             )
         };
@@ -248,15 +343,24 @@ impl Context<'_> {
     /// Restores a state `partial_state` saved, leaving the full-attention cache as it is.
     /// Returns false when llama.cpp does not read all of it.
     pub fn restore_partial_state(&mut self, state: &[u8]) -> bool {
-        // SAFETY: `raw` is live (see `Context`), `&mut self` keeps every other call off the
-        // context while its state is replaced, and llama.cpp reads at most `state.len()` bytes
-        // from `state`, which holds that many.
+        self.restore_partial_state_seq(0, state)
+    }
+
+    /// Restores a state [`Context::partial_state_seq`] saved into sequence `seq`. Returns false
+    /// for a sequence the context does not hold, or when llama.cpp does not read all of it.
+    pub fn restore_partial_state_seq(&mut self, seq: i32, state: &[u8]) -> bool {
+        if !self.holds(seq) {
+            return false;
+        }
+        // SAFETY: `raw` is live (see `Context`), `seq` is one of its sequences, `&mut self`
+        // keeps every other call off the context while its state is replaced, and llama.cpp
+        // reads at most `state.len()` bytes from `state`, which holds that many.
         let read = unsafe {
             sys::llama_state_seq_set_data_ext(
                 self.raw.as_ptr(),
                 state.as_ptr(),
                 state.len(),
-                0,
+                seq,
                 PARTIAL_ONLY,
             )
         };
@@ -272,7 +376,7 @@ impl Drop for Context<'_> {
     }
 }
 
-/// Tokens to decode in one call, all in sequence 0.
+/// Tokens to decode in one call, each in one sequence.
 #[derive(Debug)]
 pub struct Batch {
     raw: sys::llama_batch,
@@ -298,6 +402,11 @@ impl Batch {
 
     /// Appends `token` at `pos` in sequence 0; `output` computes its logits.
     pub fn add(&mut self, token: Token, pos: i32, output: bool) -> Result<()> {
+        self.add_seq(token, pos, 0, output)
+    }
+
+    /// Appends `token` at `pos` in sequence `seq`; `output` computes its logits.
+    pub fn add_seq(&mut self, token: Token, pos: i32, seq: i32, output: bool) -> Result<()> {
         let index = usize::try_from(self.raw.n_tokens).unwrap_or(usize::MAX);
         ensure!(
             index < self.capacity,
@@ -311,7 +420,7 @@ impl Batch {
             *self.raw.token.add(index) = token.0;
             *self.raw.pos.add(index) = pos;
             *self.raw.n_seq_id.add(index) = 1;
-            **self.raw.seq_id.add(index) = 0;
+            **self.raw.seq_id.add(index) = seq;
             *self.raw.logits.add(index) = i8::from(output);
         }
         self.raw.n_tokens += 1;

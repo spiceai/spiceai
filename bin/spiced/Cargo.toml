@@ -47,7 +47,6 @@ connector-oracle = { path = "../../crates/data-connectors/connector-oracle", opt
 accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
 accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
 llms-llamacpp = { path = "../../crates/llms-llamacpp", optional = true }
-accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb", optional = true }
 accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
@@ -141,7 +140,7 @@ tonic.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 
 [features]
-adbc = ["dep:connector-adbc", "runtime/adbc"]
+adbc = ["dep:connector-adbc", "dep:connector-duckdb", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 # Builds jemalloc with `--enable-prof`, without which `_RJEM_MALLOC_CONF=prof:true`
 # is silently ignored. Reports as `jemalloc-profiling`, not `jemalloc`.
@@ -162,7 +161,6 @@ databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
     "adbc",
-    "duckdb",
     "postgres",
     "sqlite",
     "mysql",
@@ -198,7 +196,6 @@ delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
 elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
-duckdb = ["accelerator-duckdb", "connector-duckdb", "runtime/duckdb"]
 dynamodb = ["connector-dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]

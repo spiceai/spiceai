@@ -583,8 +583,15 @@ assert_silent_about 'Model returned expected response'
 # token with no newline until the answer is complete (#14967). Tokens arriving
 # for longer than the bound, behind the real spinner, are progress: each one
 # restarts the wait.
+#
+# The spinner does not restart the wait, so the first token's wait is the
+# spinner (up to about 1.2s, since it ends on a whole-second `date` tick) plus
+# one token delay. The bound leaves about 2.8s over that, not 0.8s: with a 4s
+# bound, a slow shared macOS runner failed this case in the merge queue,
+# reporting a stall before the first token. The six tokens still stream for
+# 12s, twice the bound.
 script_case 'chat_01_simple.exp when a one-line answer streams for longer than the bound' chat_01_simple.exp \
-  SPICE_REPL_IDLE_TIMEOUT=4 \
+  SPICE_REPL_IDLE_TIMEOUT=6 \
   SPICE_FAKE_SPINNER_SECONDS=1 \
   SPICE_FAKE_STREAM_TOKENS=6 \
   SPICE_FAKE_TOKEN_DELAY_SECONDS=2

@@ -1138,7 +1138,7 @@ fn accelerator_is_ephemeral(
         // `memory_mode` branch), so nothing about it survives a restart. Only its
         // file modes (local disk or S3 Express One Zone, both of which require a
         // file mode) persist independently of this process.
-        Engine::DuckDB | Engine::Sqlite | Engine::Cayenne => {
+        Engine::Sqlite | Engine::Cayenne => {
             matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
         }
         // External storage (another Postgres) persists independently of this
@@ -1614,12 +1614,16 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         assert!(!ephemeral(Engine::Cayenne, Mode::File));
         assert!(!ephemeral(Engine::Cayenne, Mode::FileUpdate));
 
-        for engine in [Engine::DuckDB, Engine::Sqlite] {
-            assert!(ephemeral(engine, Mode::Memory), "{engine} memory");
-            assert!(ephemeral(engine, Mode::FileCreate), "{engine} file_create");
-            assert!(!ephemeral(engine, Mode::File), "{engine} file");
-            assert!(!ephemeral(engine, Mode::FileUpdate), "{engine} file_update");
-        }
+        assert!(ephemeral(Engine::Sqlite, Mode::Memory), "sqlite memory");
+        assert!(
+            ephemeral(Engine::Sqlite, Mode::FileCreate),
+            "sqlite file_create"
+        );
+        assert!(!ephemeral(Engine::Sqlite, Mode::File), "sqlite file");
+        assert!(
+            !ephemeral(Engine::Sqlite, Mode::FileUpdate),
+            "sqlite file_update"
+        );
 
         // Arrow is in-memory whatever `mode` says; Postgres is external storage.
         for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {

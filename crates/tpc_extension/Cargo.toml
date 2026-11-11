@@ -9,10 +9,12 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+adbc_core.workspace = true
 async-trait.workspace = true
-duckdb.workspace = true
+data_components = { path = "../data_components", features = ["adbc"] }
 runtime = { path = "../runtime" }
 snafu.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [lints]

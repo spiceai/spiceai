@@ -91,6 +91,17 @@ steps:
   # restart below).
   - background: { id: wa, concurrency: 4, source-exec: { src: "INSERT INTO ta VALUES (10000 + ${round}, 'busy')" } }
   - background: { id: wb, concurrency: 4, source-exec: { src: "INSERT INTO tb VALUES (10000 + ${round}, 'busy', 1)" } }
+  # The writers go at the source's pace: on a loaded runner a MySQL INSERT
+  # has taken over a second, and four writers then need about two minutes
+  # for 1000 rows. Wait for the source to hold them first, so the 120s below
+  # bounds only how far each dataset lags its table, not how fast the
+  # source accepts writes.
+  - source-query: { src: "SELECT count(*) >= 1000 FROM ta WHERE id > 10000" }
+    expect: { rows: [['1']] }
+    eventually: 300s
+  - source-query: { src: "SELECT count(*) >= 1000 FROM tb WHERE id > 10000" }
+    expect: { rows: [['1']] }
+    eventually: 300s
   - query: SELECT count(*) >= 1000 AS written FROM a WHERE id > 10000
     expect: { rows: [['true']] }
     eventually: 120s

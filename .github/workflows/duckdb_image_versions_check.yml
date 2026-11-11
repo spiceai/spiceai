@@ -1,0 +1,60 @@
+---
+name: DuckDB Image Versions Check
+
+# `duckdb:` and `ducklake:` datasets load the DuckDB library installed on the
+# host, so every spiced image ships libduckdb. This gate fails when a root
+# Dockerfile drops it or pins a DuckDB other than the newest release
+# test/duckdb_versions.json lists. See #15871.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - 'Dockerfile*'
+      - 'test/duckdb_versions.json'
+      - 'scripts/check_duckdb_image_versions.py'
+      - 'scripts/test_check_duckdb_image_versions.py'
+      # Self-referencing so an edit to this file is exercised by the gate it
+      # defines, rather than only when one of the paths above also changes.
+      - '.github/workflows/duckdb_image_versions_check.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'Dockerfile*'
+      - 'test/duckdb_versions.json'
+      - 'scripts/check_duckdb_image_versions.py'
+      - 'scripts/test_check_duckdb_image_versions.py'
+      - '.github/workflows/duckdb_image_versions_check.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-duckdb-image-versions:
+    environment: secret-free
+    name: Check the DuckDB version every image ships
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Its parser is exercised first: a regex that stopped matching any ARG
+      # would report every Dockerfile as missing libduckdb, but one that
+      # matched the wrong text could pass a drifted image.
+      - name: Run tests
+        run: python3 scripts/test_check_duckdb_image_versions.py -v
+
+      - name: Check the DuckDB version every image ships
+        run: python3 scripts/check_duckdb_image_versions.py
