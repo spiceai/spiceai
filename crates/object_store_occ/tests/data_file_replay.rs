@@ -7,23 +7,47 @@
 //! independent invariants (committed files exist; a read returns exactly the
 //! committed set) must hold.
 //!
-//! The `data-files-retire` traces add snapshot retirement: each record is a
-//! snapshot (which may retire the snapshots live at its base), a prepared
-//! transaction, its resolve, or a forget of retired snapshots, and the replay
-//! folds the real records into the live and retired sets. The sweep's rules are
-//! checked against that real state when the trace plans, deletes, and forgets:
-//! a sweep plans only snapshots the committed head retired, by the lease holder
-//! with no commit of its own outstanding, while no transaction is prepared and
-//! no restore point holds deletions, skipping snapshots a scan pins and files a
-//! live snapshot keeps; it forgets only after its deletes returned. Deletes go
-//! through `delete_stream` on the fault store, and a failed delete is a `Fail`
-//! fault on that path. Added invariants: a pinned scan's files, a restore
-//! point's files and a prepared transaction's files exist, and a forgotten
-//! snapshot's files are gone unless a live or another retired snapshot names
-//! them. The
-//! retirement records here are this test's own encoding; the Cayenne state
-//! machine that applies the engine's `RetireSnapshots`/`ForgetRetired` actions
-//! is not driven.
+//! The `data-files-retire` traces add per-file retirement. Each record is one of
+//! this test's own encoding: `AddFiles`, `RemoveFiles`, `ReplaceFiles` (which
+//! removes its inputs, adds its outputs and names the files it carries in
+//! place), a prepared `ReplaceFiles`, its resolve, or `ForgetRetired{files}`.
+//! A removing record lists the files it retires; the safe writer retires
+//! exactly the files it removes, so a carried file is never retired. The replay
+//! folds the real records into the live set and the retired set (each retired
+//! file with the model version of the record that removed it), and compares
+//! both with the model after every action. The sweep's rules are checked
+//! against that real state when the trace plans, deletes and forgets: a sweep
+//! plans only files the committed head retired, by the lease holder with no
+//! commit of its own outstanding, while no transaction is prepared and no
+//! restore point holds deletions; it keeps every file removed after the commit
+//! a scan pins and, in the `remote` runs, every file whose retention timer (the
+//! holder's, in memory, lost at a crash or takeover) has not run T; it forgets
+//! only after its deletes returned. Deletes go through `delete_stream` on the
+//! fault store, and a failed delete is a `Fail` fault on that path. Added
+//! invariants: a pinned scan's files, a restore point's files and a prepared
+//! transaction's files exist, a forgotten file is gone, and a reader on
+//! another instance finds every file it fetches within T - S of its query's
+//! start.
+//!
+//! `Tick` and `RemoteStart` reach no storage: the real store has no clock and a
+//! remote query's start sends nothing, so they only advance the replay's clock
+//! (which the sweep's timers and the remote bound read) or record the start.
+//! `RemoteConfirm` and `RemoteFetch` are real head and data GETs.
+//!
+//! Each model control's counterexample is replayed twice: the safe
+//! implementation must refuse the unsafe step by its rule, and the
+//! implementation with that rule removed must reach a state where an
+//! independent invariant fails. The controls: whole-snapshot retirement,
+//! retiring a carried file, ignoring pins, ignoring T (the remote reader),
+//! forgetting early, ignoring the restore hold, sweeping from the uncommitted
+//! local view, and the orphan sweep ignoring a prepared transaction's
+//! reservation. A record that retires a file it keeps live (whole-snapshot,
+//! retires-carried) is refused when the replay compares its fold with the
+//! model's retired set, since the safe writer never writes one.
+//!
+//! The retirement records here are this test's own encoding; the Cayenne state
+//! machine that applies the engine's records is not driven, a scan's pin is the
+//! replay's own bookkeeping, and deletes go one key per request.
 #![expect(clippy::expect_used, reason = "integration setup and trace assertions")]
 
 use bytes::Bytes;
@@ -59,8 +83,13 @@ fn require(condition: bool, message: impl FnOnce() -> String) -> TestResult {
 const LOG: &str = "dataset/log";
 const DATA: &str = "dataset/data";
 const WAIT: Duration = Duration::from_secs(10);
+/// The retention T and a remote reader's staleness bound S, in clock ticks, of
+/// the `remote` runs. The other runs have no clock and take T as zero.
+const RETENTION: u8 = 2;
+const STALENESS: u8 = 1;
 
-/// A data file as (generation, id, the byte stored under its key).
+/// A data file as (generation, id, the byte stored under its key). The order is
+/// the model's: the oldest file first.
 type File = (u8, u8, u8);
 fn file(f: DataFile) -> File {
     (f.0.generation, f.0.id, f.1)
@@ -71,6 +100,12 @@ fn key_of(f: File) -> (u8, u8) {
 fn model_key(k: DataFileKey) -> (u8, u8) {
     (k.generation, k.id)
 }
+fn keys_of(files: &[File]) -> Vec<(u8, u8)> {
+    files.iter().map(|f| key_of(*f)).collect()
+}
+fn model_keys(keys: &[DataFileKey]) -> Vec<(u8, u8)> {
+    keys.iter().map(|k| model_key(*k)).collect()
+}
 fn data_path(generation: u8, id: u8) -> Path {
     Path::from(format!("{DATA}/{generation}-{id}"))
 }
@@ -79,36 +114,53 @@ fn is_head(path: &Path) -> bool {
 }
 
 /// A head-log record's payload: the committed file set it adds (`data-files`
-/// traces) or one retirement record (`data-files-retire` traces).
+/// traces) or one per-file record (`data-files-retire` traces).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum Payload {
     Files(Vec<File>),
     Record(Record),
 }
+/// The per-file records. A removing record lists the files it retires: the
+/// safe writer retires exactly the files it removes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 enum Record {
-    /// A new snapshot that retires the snapshots `retire` in the same record.
-    Snapshot {
-        id: u8,
-        files: Vec<File>,
-        retire: Vec<u8>,
+    /// The uploaded files join the live set.
+    AddFiles { files: Vec<File> },
+    /// The files leave the live set.
+    RemoveFiles { files: Vec<File>, retire: Vec<File> },
+    /// `remove` leave the live set, `add` join it, and `carry` stay in place.
+    ReplaceFiles {
+        remove: Vec<File>,
+        carry: Vec<File>,
+        add: Vec<File>,
+        retire: Vec<File>,
     },
-    /// A prepared transaction: applied as a snapshot only by a committing resolve.
+    /// A prepared `ReplaceFiles`, applied only by a committing resolve.
     Prepare {
         id: u8,
-        files: Vec<File>,
-        retire: Vec<u8>,
+        remove: Vec<File>,
+        add: Vec<File>,
+        retire: Vec<File>,
     },
-    Resolve {
-        commit: bool,
-    },
-    /// Retired snapshots whose files are deleted.
-    Forget {
-        snapshots: Vec<u8>,
-    },
+    Resolve { commit: bool },
+    /// Retired files whose deletes returned.
+    ForgetRetired { files: Vec<File> },
 }
+impl Record {
+    /// The live files this record removes.
+    fn removes(&self) -> &[File] {
+        match self {
+            Self::RemoveFiles { files, .. } => files,
+            Self::ReplaceFiles { remove, .. } | Self::Prepare { remove, .. } => remove,
+            _ => &[],
+        }
+    }
+}
+
+/// An unresolved prepared transaction: id, added, removed and retired files.
+type Prepared = (u8, Vec<File>, Vec<File>, Vec<File>);
 
 /// The committed state folded from the real head log's records.
 #[derive(Debug, Default, Clone)]
@@ -117,46 +169,57 @@ struct Head {
     version: u64,
     lease: u64,
     /// The committed file set: every named file (`data-files`), or the live
-    /// snapshots' files (`data-files-retire`).
+    /// set (`data-files-retire`).
     files: Vec<File>,
-    live: BTreeMap<u8, Vec<File>>,
-    retired: BTreeMap<u8, Vec<File>>,
-    prepared: Option<(u8, Vec<File>, Vec<u8>)>,
+    live: BTreeSet<File>,
+    /// Each retired file and the model version of the record that retired it.
+    retired: BTreeMap<File, u64>,
+    prepared: Option<Prepared>,
 }
 impl Head {
-    fn apply_snapshot(&mut self, id: u8, files: Vec<File>, retire: &[u8]) {
-        for snapshot in retire {
-            if let Some(files) = self.live.remove(snapshot) {
-                self.retired.insert(*snapshot, files);
-            }
+    fn replace(&mut self, remove: &[File], add: &[File], retire: &[File], version: u64) {
+        for f in remove {
+            self.live.remove(f);
         }
-        self.live.insert(id, files);
+        self.live.extend(add.iter().copied());
+        for f in retire {
+            self.retired.entry(*f).or_insert(version);
+        }
     }
-    fn apply(&mut self, payload: Payload) {
+    /// Apply one accepted record at model version `version`.
+    fn apply(&mut self, payload: Payload, version: u64) {
         match payload {
             Payload::Files(named) => self.files.extend(named),
-            Payload::Record(Record::Snapshot { id, files, retire }) => {
-                self.apply_snapshot(id, files, &retire);
+            Payload::Record(Record::AddFiles { files }) => self.replace(&[], &files, &[], version),
+            Payload::Record(Record::RemoveFiles { files, retire }) => {
+                self.replace(&files, &[], &retire, version);
             }
-            Payload::Record(Record::Prepare { id, files, retire }) => {
-                self.prepared = Some((id, files, retire));
-            }
+            // A carried file is named and stays live.
+            Payload::Record(Record::ReplaceFiles {
+                remove,
+                add,
+                retire,
+                ..
+            }) => self.replace(&remove, &add, &retire, version),
+            Payload::Record(Record::Prepare {
+                id,
+                remove,
+                add,
+                retire,
+            }) => self.prepared = Some((id, add, remove, retire)),
             Payload::Record(Record::Resolve { commit }) => {
-                if let Some((id, files, retire)) = self.prepared.take()
+                if let Some((_, add, remove, retire)) = self.prepared.take()
                     && commit
                 {
-                    self.apply_snapshot(id, files, &retire);
+                    self.replace(&remove, &add, &retire, version);
                 }
             }
-            Payload::Record(Record::Forget { snapshots }) => {
-                for snapshot in snapshots {
-                    self.retired.remove(&snapshot);
+            Payload::Record(Record::ForgetRetired { files }) => {
+                for f in files {
+                    self.retired.remove(&f);
                 }
             }
         }
-    }
-    fn live_files(&self) -> BTreeSet<File> {
-        self.live.values().flatten().copied().collect()
     }
 }
 
@@ -197,15 +260,20 @@ enum Control {
     CommitBeforeUpload,
     /// A reader lists the data prefix instead of reading the head.
     ListingReader,
-    /// The sweep reads its process's view, with its own compaction in flight
+    /// A removing record retires every file live at its base, and the sweep
+    /// keeps the files the live set names.
+    WholeSnapshot,
+    /// A compaction also retires the file it carries in place.
+    RetiresCarried,
+    /// The sweep reads its process's view, with its own removal in flight
     /// applied before the record commits.
     SweepUncommitted,
-    /// The sweep deletes snapshots a scan pins.
+    /// The sweep deletes files a scan's pinned commit needs.
     IgnoresPins,
+    /// The sweep deletes a retired file as soon as it observes the removal.
+    IgnoresRetention,
     /// The sweep forgets before its deletes return.
     ForgetEarly,
-    /// The sweep deletes retired files a live snapshot keeps in place.
-    IgnoresLiveReferences,
     /// The sweep runs while a restore point holds deletions.
     IgnoresRestoreHold,
     /// The orphan sweep runs while a prepared transaction reserves the table.
@@ -221,6 +289,9 @@ struct Client {
     /// The outstanding attempt and whether its response was given up on.
     pending: Option<(usize, bool)>,
     call: Option<JoinHandle<object_store_occ::headlog::Result<Outcome>>>,
+    /// The sweep's retention timers: each retired file it has seen, with the
+    /// tick it first saw it. In memory, so a crash or takeover loses them.
+    timers: BTreeMap<File, u8>,
 }
 impl Client {
     async fn stop(&mut self) {
@@ -233,6 +304,8 @@ impl Client {
 
 struct Attempt {
     generation: u8,
+    /// The head version (model numbering) the attempt commits on.
+    base: u64,
     /// The new uploads the attempt names.
     files: Vec<File>,
     /// The record it publishes (`data-files-retire` traces).
@@ -240,6 +313,8 @@ struct Attempt {
     /// `None` when the head log refused to prepare because the writer is fenced:
     /// no request reaches the store, so every delivery is a refusal.
     receipt: Option<PreparedAttempt>,
+    /// Whether the store accepted it.
+    applied: bool,
 }
 
 /// A commit request in flight: the captured CAS, or a locally refused one.
@@ -259,10 +334,20 @@ struct Upload {
 struct Sweep {
     writer: usize,
     generation: u8,
-    snapshots: Vec<u8>,
+    files: Vec<File>,
     /// Deletes sent and not yet returned.
     outstanding: Vec<File>,
     failed: bool,
+}
+
+/// A query on another instance: the head version and files its confirming GET
+/// read, the tick of that GET, the tick the query started, and the next file.
+struct Remote {
+    version: u64,
+    files: Vec<File>,
+    confirmed: u8,
+    started: Option<u8>,
+    next: usize,
 }
 
 struct Replay {
@@ -276,8 +361,8 @@ struct Replay {
     puts: Vec<Upload>,
     snapshot: Vec<(u8, u8)>,
     fetched: usize,
-    /// Snapshots the scan pins, and the files it read.
-    pins: Vec<u8>,
+    /// The commit the scan pins, and the files of that commit.
+    pin: Option<u64>,
     pinned_files: Vec<File>,
     /// A restore point holding deletions: the files it copies, and the next.
     restore: Option<(Vec<File>, usize)>,
@@ -285,17 +370,21 @@ struct Replay {
     /// Deletes in flight: file, the sweeping process's generation, and whether
     /// the running sweep waits for it.
     deletes: Vec<(File, u8, bool)>,
-    /// Files of forgotten snapshots.
+    /// Files whose forget committed.
     forgotten: BTreeSet<File>,
+    remote: Option<Remote>,
+    /// The logical clock, and the retention T it times (zero without a clock).
+    now: u8,
+    retention: u8,
     /// Whether the trace is a `data-files-retire` one: its records are
-    /// retirement records rather than file sets.
+    /// per-file records rather than file sets.
     retire: bool,
     /// How often each real path ran, so a replay cannot pass vacuously.
     coverage: BTreeMap<&'static str, usize>,
 }
 
 impl Replay {
-    async fn new(inner: Arc<dyn ObjectStore>, control: Control) -> TestResult<Self> {
+    async fn new(inner: Arc<dyn ObjectStore>, control: Control, run: &str) -> TestResult<Self> {
         let store = Arc::new(FaultStore::new(Arc::clone(&inner)));
         let object: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
         let config = HeadLogConfig::default();
@@ -303,6 +392,7 @@ impl Replay {
         result(Writer::take_over(object, Path::from(LOG), config, 1).await)?;
         let mut clients: Vec<Client> = (0..2).map(|_| Client::default()).collect();
         clients[0].generation = Some(1);
+        let retire = run.contains("retire");
         Ok(Self {
             inner,
             store,
@@ -314,13 +404,20 @@ impl Replay {
             puts: vec![],
             snapshot: vec![],
             fetched: 0,
-            pins: vec![],
+            pin: None,
             pinned_files: vec![],
             restore: None,
             sweep: None,
             deletes: vec![],
             forgotten: BTreeSet::new(),
-            retire: false,
+            remote: None,
+            now: 0,
+            retention: if retire && run.contains("remote") {
+                RETENTION
+            } else {
+                0
+            },
+            retire,
             coverage: BTreeMap::new(),
         })
     }
@@ -352,12 +449,16 @@ impl Replay {
             result(Reader::open(Arc::clone(&self.inner), Path::from(LOG)).await)?;
         let mut state = Head::default();
         for record in opened.records {
-            state.apply(result(serde_json::from_slice::<Payload>(
-                &record.record.payload,
-            ))?);
+            // A record accepted at commit `c` under lease `g` is model version
+            // `c + g - 1`: a takeover raises the lease without a commit.
+            let version = record.commit + record.record.generation - 1;
+            state.apply(
+                result(serde_json::from_slice::<Payload>(&record.record.payload))?,
+                version,
+            );
         }
-        if !state.live.is_empty() || !state.retired.is_empty() || state.prepared.is_some() {
-            state.files = state.live_files().into_iter().collect();
+        if self.retire {
+            state.files = state.live.iter().copied().collect();
         }
         state.files.sort_unstable();
         state.files.dedup();
@@ -389,11 +490,20 @@ impl Replay {
         Ok(files)
     }
 
+    /// GET one data file; `None` when the store does not have it.
+    async fn get(&self, f: (u8, u8)) -> TestResult<Option<Bytes>> {
+        match self.store.get(&data_path(f.0, f.1)).await {
+            Ok(answer) => Ok(Some(result(answer.bytes().await)?)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Independent invariants first, then equality with the model's state.
     async fn check(&self, step: &DataFileStep) -> TestResult {
         let head = self.state().await?;
         let stored = self.stored().await?;
-        let prepared = head.prepared.iter().flat_map(|(_, files, _)| files);
+        let prepared = head.prepared.iter().flat_map(|(_, add, _, _)| add);
         for f in head.files.iter().chain(prepared) {
             require(stored.contains(f), || {
                 format!("committed file missing from the store: {f:?}; stored {stored:?}")
@@ -401,7 +511,7 @@ impl Replay {
         }
         for f in &self.pinned_files {
             require(stored.contains(f), || {
-                format!("file of a pinned snapshot missing from the store: {f:?}")
+                format!("file of a pinned scan's commit missing from the store: {f:?}")
             })?;
         }
         if let Some((files, next)) = &self.restore {
@@ -411,18 +521,11 @@ impl Replay {
                 })?;
             }
         }
-        // Unless a live snapshot or another retired one (whose own sweep
-        // deletes it) still names it.
-        let named: BTreeSet<File> = head
-            .live
-            .values()
-            .chain(head.retired.values())
-            .flatten()
-            .copied()
-            .collect();
+        // A file leaves the live set once and is never named again, so a
+        // forgotten file must be gone.
         for f in &self.forgotten {
-            require(named.contains(f) || !stored.contains(f), || {
-                format!("forgotten snapshot's file still stored: {f:?}")
+            require(!stored.contains(f), || {
+                format!("forgotten file still stored: {f:?}")
             })?;
         }
         let model_head: Vec<File> = step.head.iter().copied().map(file).collect();
@@ -442,35 +545,42 @@ impl Replay {
         require(stored == model_store, || {
             format!("stored files: model {model_store:?}; real {stored:?}")
         })?;
-        let snapshots = |set: &[(u8, Vec<DataFile>)]| -> BTreeMap<u8, Vec<File>> {
-            set.iter()
-                .map(|(id, files)| (*id, files.iter().copied().map(file).collect()))
-                .collect()
-        };
-        require(head.live == snapshots(&step.live), || {
+        let model_retired: BTreeMap<File, u64> = step
+            .retired
+            .iter()
+            .map(|(f, by)| (file(*f), u64::from(by.version)))
+            .collect();
+        // The safe writer retires only the files a record removes: a trace
+        // that retires a file its record keeps live cannot be followed.
+        for f in model_retired.keys() {
+            require(head.retired.contains_key(f) || !head.live.contains(f), || {
+                format!(
+                    "the trace retires {f:?}, which stays live: a record retires only the files it removes"
+                )
+            })?;
+        }
+        require(head.retired == model_retired, || {
             format!(
-                "live snapshots: model {:?}; real {:?}",
-                step.live, head.live
-            )
-        })?;
-        require(head.retired == snapshots(&step.retired), || {
-            format!(
-                "retired snapshots: model {:?}; real {:?}",
-                step.retired, head.retired
+                "retired files: model {model_retired:?}; real {:?}",
+                head.retired
             )
         })?;
         let model_prepared = step.prepared.as_ref().map(|tx| {
             (
                 tx.id,
                 tx.files.iter().copied().map(file).collect::<Vec<_>>(),
-                tx.retire.clone(),
+                tx.remove.iter().copied().map(file).collect::<Vec<_>>(),
             )
         });
-        require(head.prepared == model_prepared, || {
-            format!(
-                "prepared: model {model_prepared:?}; real {:?}",
-                head.prepared
-            )
+        let real_prepared = head
+            .prepared
+            .as_ref()
+            .map(|(id, add, remove, _)| (*id, add.clone(), remove.clone()));
+        require(real_prepared == model_prepared, || {
+            format!("prepared: model {model_prepared:?}; real {real_prepared:?}")
+        })?;
+        require(self.now == step.now, || {
+            format!("clock: model {}; replay {}", step.now, self.now)
         })
     }
 
@@ -522,6 +632,75 @@ impl Replay {
             answer,
             Ok(_) | Err(object_store::Error::NotFound { .. })
         ))
+    }
+
+    /// The record a `retire` commit publishes, from the head it commits on.
+    fn record(
+        &self,
+        head: &Head,
+        attempt: u8,
+        kind: DataFileCommitKind,
+        files: &[File],
+        model_carry: &[DataFileKey],
+        model_remove: &[DataFileKey],
+    ) -> TestResult<Record> {
+        // The live set is sorted, so the oldest file is first.
+        let live: Vec<File> = head.live.iter().copied().collect();
+        let (carry, remove): (Vec<File>, Vec<File>) = match kind {
+            DataFileCommitKind::Append => (vec![], vec![]),
+            DataFileCommitKind::Compact | DataFileCommitKind::Prepare => (vec![], live.clone()),
+            DataFileCommitKind::CompactCarry => (
+                live.get(..1).ok_or("carry from an empty live set")?.to_vec(),
+                live[1..].to_vec(),
+            ),
+            DataFileCommitKind::Remove => (
+                vec![],
+                live.get(..1)
+                    .ok_or("removal from an empty live set")?
+                    .to_vec(),
+            ),
+        };
+        require(
+            keys_of(&carry) == model_keys(model_carry)
+                && keys_of(&remove) == model_keys(model_remove),
+            || {
+                format!(
+                    "commit carries {carry:?} removes {remove:?}; model {model_carry:?} {model_remove:?}"
+                )
+            },
+        )?;
+        let retire: Vec<File> = match self.control {
+            Control::WholeSnapshot if !remove.is_empty() => live,
+            Control::RetiresCarried => {
+                let mut retire = remove.clone();
+                retire.extend(carry.iter().copied());
+                retire.sort_unstable();
+                retire
+            }
+            _ => remove.clone(),
+        };
+        let add = files.to_vec();
+        Ok(match kind {
+            DataFileCommitKind::Append => Record::AddFiles { files: add },
+            DataFileCommitKind::Remove => Record::RemoveFiles {
+                files: remove,
+                retire,
+            },
+            DataFileCommitKind::Compact | DataFileCommitKind::CompactCarry => {
+                Record::ReplaceFiles {
+                    remove,
+                    carry,
+                    add,
+                    retire,
+                }
+            }
+            DataFileCommitKind::Prepare => Record::Prepare {
+                id: attempt,
+                remove,
+                add,
+                retire,
+            },
+        })
     }
 
     #[expect(clippy::too_many_lines, reason = "one arm per operation")]
@@ -597,8 +776,8 @@ impl Replay {
                 generation,
                 files: model_files,
                 kind,
-                keep: model_keep,
-                retire: model_retire,
+                carry: model_carry,
+                remove: model_remove,
                 ..
             } => {
                 require(usize::from(attempt) == self.attempts.len(), || {
@@ -608,60 +787,28 @@ impl Replay {
                 require(client.generation == Some(generation), || {
                     "commit generation".into()
                 })?;
-                let mut files = std::mem::take(&mut client.finished);
+                // A removal names no uploads; the writer keeps them for a later
+                // commit.
+                let mut files = if kind == DataFileCommitKind::Remove {
+                    vec![]
+                } else {
+                    std::mem::take(&mut client.finished)
+                };
                 if self.control == Control::CommitBeforeUpload {
                     files.extend(client.started.iter().copied());
                 }
                 files.sort_unstable();
+                // The writer reads the head it commits on, as the model does.
+                let head = self.state().await?;
                 let (payload, record) = if self.retire {
-                    // The writer reads the head it commits on: a compaction or
-                    // a transaction retires every snapshot live there.
-                    let head = self.state().await?;
-                    let uploaded: Vec<(u8, u8)> = files.iter().map(|f| key_of(*f)).collect();
-                    let expected: Vec<(u8, u8)> =
-                        model_files.iter().map(|k| model_key(*k)).collect();
-                    require(uploaded == expected, || {
-                        format!("commit files: model {expected:?}; client {uploaded:?}")
-                    })?;
-                    let live: Vec<u8> = head.live.keys().copied().collect();
-                    let (retire, keep): (Vec<u8>, Vec<File>) = match kind {
-                        DataFileCommitKind::Append => (vec![], vec![]),
-                        DataFileCommitKind::Compact | DataFileCommitKind::Prepare => (live, vec![]),
-                        DataFileCommitKind::CompactKeep => (
-                            live,
-                            head.live
-                                .values()
-                                .next()
-                                .and_then(|files| files.first())
-                                .copied()
-                                .into_iter()
-                                .collect(),
-                        ),
-                    };
-                    let kept: Vec<(u8, u8)> = keep.iter().map(|f| key_of(*f)).collect();
-                    let model_kept: Vec<(u8, u8)> =
-                        model_keep.iter().map(|k| model_key(*k)).collect();
-                    require(retire == model_retire && kept == model_kept, || {
+                    require(keys_of(&files) == model_keys(&model_files), || {
                         format!(
-                            "commit retires {retire:?} keeps {kept:?}; model {model_retire:?} {model_kept:?}"
+                            "commit files: model {model_files:?}; client {:?}",
+                            keys_of(&files)
                         )
                     })?;
-                    let record = if kind == DataFileCommitKind::Prepare {
-                        Record::Prepare {
-                            id: attempt,
-                            files: files.clone(),
-                            retire,
-                        }
-                    } else {
-                        let mut named = files.clone();
-                        named.extend(keep);
-                        named.sort_unstable();
-                        Record::Snapshot {
-                            id: attempt,
-                            files: named,
-                            retire,
-                        }
-                    };
+                    let record =
+                        self.record(&head, attempt, kind, &files, &model_carry, &model_remove)?;
                     (
                         result(serde_json::to_vec(&Payload::Record(record.clone())))?,
                         Some(record),
@@ -669,7 +816,6 @@ impl Replay {
                 } else {
                     (result(serde_json::to_vec(&files))?, None)
                 };
-                // The writer reads the head it commits on, as the model does.
                 let mut log = self.writer(generation).await?;
                 let receipt = match log.prepare(Bytes::from(payload)).await {
                     Ok(receipt) => Some(receipt),
@@ -680,9 +826,11 @@ impl Replay {
                 let index = self.attempts.len();
                 self.attempts.push(Attempt {
                     generation,
+                    base: head.version,
                     files,
                     record,
                     receipt,
+                    applied: false,
                 });
                 let held = self.send(index, Some(log)).await?;
                 self.clients[writer].pending = Some((index, false));
@@ -717,13 +865,28 @@ impl Replay {
                     (Some(_), false) => "commit CAS refused by the store",
                     (None, _) => "commit refused before I/O (fenced)",
                 });
-                if landed
-                    && matches!(
-                        self.attempts[wire.attempt].record,
-                        Some(Record::Snapshot { ref retire, .. }) if !retire.is_empty()
-                    )
-                {
-                    self.cover("snapshot retired by a record");
+                if landed {
+                    self.attempts[wire.attempt].applied = true;
+                    let covered: &[&'static str] = match &self.attempts[wire.attempt].record {
+                        Some(Record::AddFiles { .. }) => &["AddFiles committed"],
+                        Some(Record::RemoveFiles { .. }) => {
+                            &["RemoveFiles committed", "file retired by the record that removed it"]
+                        }
+                        Some(Record::ReplaceFiles { carry, .. }) if !carry.is_empty() => &[
+                            "ReplaceFiles committed",
+                            "file carried in place",
+                            "file retired by the record that removed it",
+                        ],
+                        Some(Record::ReplaceFiles { .. }) => &[
+                            "ReplaceFiles committed",
+                            "file retired by the record that removed it",
+                        ],
+                        Some(Record::Prepare { .. }) => &["transaction prepared"],
+                        _ => &[],
+                    };
+                    for path in covered {
+                        self.cover(path);
+                    }
                 }
                 let client = &mut self.clients[writer];
                 let waiting = client.pending == Some((wire.attempt, false));
@@ -749,17 +912,14 @@ impl Replay {
                         },
                     )?;
                     client.pending = None;
-                    self.coverage
-                        .entry(if real_fenced {
-                            "answered fenced"
-                        } else {
-                            "answered"
-                        })
-                        .and_modify(|n| *n += 1)
-                        .or_insert(1);
+                    self.cover(if real_fenced {
+                        "answered fenced"
+                    } else {
+                        "answered"
+                    });
                     if real_fenced {
                         // The refusal tells the writer it lost the lease.
-                        *client = Client::default();
+                        self.clients[writer] = Client::default();
                         self.end_sweep(writer);
                     }
                 }
@@ -854,36 +1014,33 @@ impl Replay {
             DataFileOp::ReadHead {
                 version,
                 files,
-                pins,
+                pinned,
             } => {
                 let head = self.state().await?;
-                let committed: Vec<(u8, u8)> = head.files.iter().map(|f| key_of(*f)).collect();
+                let committed = keys_of(&head.files);
                 let read: Vec<(u8, u8)> = if self.control == Control::ListingReader {
-                    self.stored().await?.iter().map(|f| key_of(*f)).collect()
+                    keys_of(&self.stored().await?)
                 } else {
                     committed.clone()
                 };
                 require(read == committed, || {
                     format!("read returned {read:?}; committed set {committed:?}")
                 })?;
-                let model: Vec<(u8, u8)> = files.iter().map(|k| model_key(*k)).collect();
+                let model = model_keys(&files);
                 require(read == model && head.version == u64::from(version), || {
                     format!(
                         "read: model v{version} {model:?}; real v{} {read:?}",
                         head.version
                     )
                 })?;
-                // A scan pins the snapshots it reads in the same step.
-                let pinned: Vec<u8> = head.live.keys().copied().collect();
-                require(pinned == pins, || {
-                    format!("scan pins: model {pins:?}; real {pinned:?}")
+                // A scan pins the commit it captured in the same step.
+                require(pinned == self.retire, || {
+                    format!("scan pins: model {pinned}; retire run {}", self.retire)
                 })?;
-                self.pins = pinned;
-                self.pinned_files = if self.pins.is_empty() {
-                    vec![]
-                } else {
-                    head.files.clone()
-                };
+                if pinned {
+                    self.pin = Some(head.version);
+                    self.pinned_files.clone_from(&head.files);
+                }
                 self.snapshot = read;
                 self.fetched = 0;
             }
@@ -894,17 +1051,13 @@ impl Replay {
                     .ok_or("fetch past snapshot")?;
                 self.fetched += 1;
                 require((generation, id) == model_key(key), || "fetch order".into())?;
-                let got = match self.store.get(&data_path(generation, id)).await {
-                    Ok(answer) => Some(result(answer.bytes().await)?),
-                    Err(object_store::Error::NotFound { .. }) => None,
-                    Err(e) => return Err(e.to_string()),
-                };
+                let got = self.get((generation, id)).await?;
                 require(got.is_some(), || {
                     format!("committed file {generation}-{id} not found")
                 })?;
                 require(got.is_some() == found, || "fetch found".into())?;
                 self.cover("fetch of a committed file");
-                if !self.pins.is_empty()
+                if self.pin.is_some()
                     && !self
                         .state()
                         .await?
@@ -912,11 +1065,11 @@ impl Replay {
                         .iter()
                         .any(|f| key_of(*f) == (generation, id))
                 {
-                    self.cover("scan read a retired snapshot's file");
+                    self.cover("scan read a file removed after its pin");
                 }
             }
             DataFileOp::Unpinned => {
-                self.pins.clear();
+                self.pin = None;
                 self.pinned_files.clear();
                 self.snapshot.clear();
                 self.fetched = 0;
@@ -926,14 +1079,13 @@ impl Replay {
                 let head = self.state().await?;
                 let key = model_key(key);
                 if self.retire {
-                    // The lease holder's orphan sweep: unnamed by any live or
-                    // retired snapshot, not held by its own writes, and never
+                    // The lease holder's orphan sweep: unnamed by the live or
+                    // the retired set, not held by its own writes, and never
                     // while a prepared transaction reserves the table.
                     let named = head
                         .live
-                        .values()
-                        .chain(head.retired.values())
-                        .flatten()
+                        .iter()
+                        .chain(head.retired.keys())
                         .any(|f| key_of(*f) == key);
                     require(!named, || format!("orphan sweep of a named file {key:?}"))?;
                     if self.control != Control::OrphanIgnoresReservation {
@@ -987,10 +1139,10 @@ impl Replay {
             DataFileOp::SweepPlanned {
                 writer,
                 generation,
-                snapshots,
+                observed,
                 deletes,
             } => {
-                self.plan(writer, generation, &snapshots, &deletes).await?;
+                self.plan(writer, generation, &observed, &deletes).await?;
             }
             DataFileOp::DeleteLanded { key, acknowledged }
             | DataFileOp::DeleteFailed { key, acknowledged } => {
@@ -1028,20 +1180,20 @@ impl Replay {
             DataFileOp::Forgotten {
                 writer,
                 generation,
-                snapshots,
+                files,
                 committed,
             } => {
                 let sweep = self.sweep.take().ok_or("forget without a sweep")?;
                 require(
                     sweep.writer == writer
                         && sweep.generation == generation
-                        && sweep.snapshots == snapshots,
+                        && keys_of(&sweep.files) == model_keys(&files),
                     || "forget of another sweep".into(),
                 )?;
                 if self.control != Control::ForgetEarly {
                     require(sweep.outstanding.is_empty() && !sweep.failed, || {
                         format!(
-                            "forget of {snapshots:?} before its deletes returned: {:?} outstanding, failed={}",
+                            "forget of {files:?} before its deletes returned: {:?} outstanding, failed={}",
                             sweep.outstanding, sweep.failed
                         )
                     })?;
@@ -1055,9 +1207,10 @@ impl Replay {
                 let real = if head.prepared.is_some() {
                     false
                 } else {
-                    let payload = result(serde_json::to_vec(&Payload::Record(Record::Forget {
-                        snapshots: snapshots.clone(),
-                    })))?;
+                    let payload =
+                        result(serde_json::to_vec(&Payload::Record(Record::ForgetRetired {
+                            files: sweep.files.clone(),
+                        })))?;
                     let mut log = self.writer(generation).await?;
                     match log.prepare(Bytes::from(payload)).await {
                         Ok(receipt) => matches!(
@@ -1072,11 +1225,10 @@ impl Replay {
                     format!("forget committed: model {committed}; real {real}")
                 })?;
                 if real {
-                    for snapshot in &snapshots {
-                        if let Some(files) = head.retired.get(snapshot) {
-                            self.forgotten.extend(files.iter().copied());
-                        }
-                    }
+                    self.forgotten.extend(sweep.files.iter().copied());
+                    self.clients[writer]
+                        .timers
+                        .retain(|f, _| !sweep.files.contains(f));
                 }
                 self.cover(if real {
                     "forget committed"
@@ -1087,12 +1239,12 @@ impl Replay {
             DataFileOp::RestoreStarted { version, files } => {
                 if self.control != Control::IgnoresRestoreHold {
                     require(self.sweep.is_none(), || {
-                        "restore point while a sweep holds deletions".into()
+                        "restore point while a sweep runs: the sweep holds deletions".into()
                     })?;
                 }
                 let head = self.state().await?;
-                let listed: Vec<(u8, u8)> = head.files.iter().map(|f| key_of(*f)).collect();
-                let model: Vec<(u8, u8)> = files.iter().map(|k| model_key(*k)).collect();
+                let listed = keys_of(&head.files);
+                let model = model_keys(&files);
                 require(
                     listed == model && head.version == u64::from(version),
                     || format!("restore point reads {listed:?}; model {model:?}"),
@@ -1104,27 +1256,111 @@ impl Replay {
                 let f = *files.get(*next).ok_or("copy past the restore point")?;
                 *next += 1;
                 require(key_of(f) == model_key(key), || "copy order".into())?;
-                let got = match self.store.get(&data_path(f.0, f.1)).await {
-                    Ok(answer) => Some(result(answer.bytes().await)?),
-                    Err(object_store::Error::NotFound { .. }) => None,
-                    Err(e) => return Err(e.to_string()),
-                };
+                let got = self.get(key_of(f)).await?;
                 require(got.is_some() && found, || {
                     format!("restore point copy of {f:?} not found")
                 })?;
                 self.cover("restore point copied a file");
+                if !self.state().await?.live.contains(&f) {
+                    self.cover("restore point copied a file removed after it started");
+                }
             }
             DataFileOp::RestoreEnded => self.restore = None,
+            // The real store has no clock: a tick advances only the replay's
+            // logical clock, which the sweep's timers and the remote reader's
+            // bound read.
+            DataFileOp::Ticked { now } => {
+                require(now == self.now + 1, || {
+                    format!("tick to {now} from {}", self.now)
+                })?;
+                self.now = now;
+                self.cover("clock ticked");
+            }
+            DataFileOp::RemoteConfirmed { version, files, at } => {
+                // A reader on another instance confirms the head with a real
+                // head GET; it writes and pins nothing.
+                let head = self.state().await?;
+                let model = model_keys(&files);
+                require(
+                    keys_of(&head.files) == model
+                        && head.version == u64::from(version)
+                        && at == self.now,
+                    || {
+                        format!(
+                            "remote confirm: model v{version} {model:?} at {at}; real v{} {:?} at {}",
+                            head.version, head.files, self.now
+                        )
+                    },
+                )?;
+                self.remote = Some(Remote {
+                    version: head.version,
+                    files: head.files,
+                    confirmed: self.now,
+                    started: None,
+                    next: 0,
+                });
+                self.cover("remote reader confirmed the head");
+            }
+            // The query's start sends nothing; the reader records the tick.
+            DataFileOp::RemoteStarted { at } => {
+                let remote = self.remote.as_mut().ok_or("remote start without a confirm")?;
+                require(
+                    remote.started.is_none() && at == self.now && self.now <= remote.confirmed + STALENESS,
+                    || {
+                        format!(
+                            "remote start at {at} (clock {}), confirmed at {} for v{}",
+                            self.now, remote.confirmed, remote.version
+                        )
+                    },
+                )?;
+                remote.started = Some(self.now);
+            }
+            DataFileOp::RemoteFetched {
+                key,
+                found,
+                within_bound,
+            } => {
+                let (f, started, last) = {
+                    let remote = self.remote.as_ref().ok_or("remote fetch without a query")?;
+                    let f = *remote.files.get(remote.next).ok_or("remote fetch past its files")?;
+                    let started = remote.started.ok_or("remote fetch before its start")?;
+                    (f, started, remote.next + 1 == remote.files.len())
+                };
+                require(key_of(f) == model_key(key), || "remote fetch order".into())?;
+                let within = self.now < started + RETENTION - STALENESS;
+                require(within == within_bound, || {
+                    format!("remote bound: model {within_bound}; replay {within}")
+                })?;
+                let got = self.get(key_of(f)).await?;
+                if within {
+                    require(got.is_some(), || {
+                        format!("remote reader within T - S missing a file: {f:?}")
+                    })?;
+                }
+                require(got.is_some() == found, || "remote fetch found".into())?;
+                let live = self.state().await?.live.contains(&f);
+                self.cover(match (got.is_some(), live) {
+                    (true, true) => "remote reader fetched a live file",
+                    (true, false) => "remote reader fetched a file removed after its confirm",
+                    (false, _) => "remote fetch past T - S found the file deleted",
+                });
+                if last {
+                    self.remote = None;
+                } else if let Some(remote) = &mut self.remote {
+                    remote.next += 1;
+                }
+            }
         }
         Ok(())
     }
 
-    /// The sweep's rules, from real state, then its deletes sent.
+    /// The sweep's rules, from real state, then its timers started and its
+    /// deletes sent.
     async fn plan(
         &mut self,
         writer: usize,
         generation: u8,
-        snapshots: &[u8],
+        model_observed: &[DataFileKey],
         model_deletes: &[DataFileKey],
     ) -> TestResult {
         let head = self.state().await?;
@@ -1147,66 +1383,92 @@ impl Replay {
                 "sweep while a restore point holds deletions".into()
             })?;
         }
-        let (mut live, mut retired) = (head.live, head.retired);
+        let mut retired = head.retired.clone();
         if self.control == Control::SweepUncommitted
             && let Some((index, _)) = client.pending
-            && let Some(Record::Snapshot { id, files, retire }) = &self.attempts[index].record
-            && !live.contains_key(id)
+            && let Attempt {
+                base,
+                record: Some(record),
+                applied: false,
+                ..
+            } = &self.attempts[index]
+            && !matches!(record, Record::Prepare { .. })
         {
-            for snapshot in retire {
-                if let Some(files) = live.remove(snapshot) {
-                    retired.insert(*snapshot, files);
-                }
+            for f in record.removes() {
+                retired.entry(*f).or_insert(base + 1);
             }
-            live.insert(*id, files.clone());
         }
-        for snapshot in snapshots {
-            require(retired.contains_key(snapshot), || {
-                format!("sweep of snapshot {snapshot}, which the committed head does not retire")
+        let mut observe = vec![];
+        let mut due = vec![];
+        let mut refusal = BTreeMap::new();
+        for (f, by) in &retired {
+            let timer = client.timers.get(f).copied();
+            if self.retention > 0 && timer.is_none() {
+                observe.push(*f);
+            }
+            // A scan pinned at commit `p` reads the files live at `p`; a file
+            // the record at version `by` removed was live at `p` when `by > p`.
+            let pinned = self.pin.is_some_and(|p| *by > p);
+            let waited = self.retention == 0
+                || timer.is_some_and(|since| self.now >= since + self.retention);
+            // A snapshot-level rule keeps the files the live set names.
+            let live = self.control == Control::WholeSnapshot && head.live.contains(f);
+            let keep = if pinned && self.control != Control::IgnoresPins {
+                Some("removed after the commit a scan pins")
+            } else if !waited && self.control != Control::IgnoresRetention {
+                Some("before T has passed since the sweep observed its removal")
+            } else if live {
+                Some("which the live set names")
+            } else {
+                None
+            };
+            match keep {
+                Some(reason) => {
+                    refusal.insert(key_of(*f), reason);
+                }
+                None => due.push(*f),
+            }
+        }
+        // The rule the model's plan breaks, named, before the equality check.
+        let model = model_keys(model_deletes);
+        for key in &model {
+            require(retired.keys().any(|f| key_of(*f) == *key), || {
+                format!("sweep deletes {key:?}, which the committed head does not retire")
             })?;
-            if self.control != Control::IgnoresPins {
-                require(!self.pins.contains(snapshot), || {
-                    format!("sweep of snapshot {snapshot}, which a scan pins")
-                })?;
+            if let Some(reason) = refusal.get(key) {
+                return Err(format!("sweep deletes {key:?} {reason}"));
             }
         }
-        // Files a live snapshot or a pinned scan references stay.
-        let mut referenced: BTreeSet<File> = live.values().flatten().copied().collect();
-        if self.control != Control::IgnoresPins {
-            referenced.extend(self.pinned_files.iter().copied());
-        }
-        let mut doomed: BTreeSet<File> = BTreeSet::new();
-        for snapshot in snapshots {
-            for f in &retired[snapshot] {
-                if self.control == Control::IgnoresLiveReferences || !referenced.contains(f) {
-                    doomed.insert(*f);
-                }
-            }
-        }
-        let planned: Vec<(u8, u8)> = doomed.iter().map(|f| key_of(*f)).collect();
-        let model: Vec<(u8, u8)> = model_deletes.iter().map(|k| model_key(*k)).collect();
-        if self.control != Control::IgnoresLiveReferences {
-            let live_files: BTreeSet<File> = live.values().flatten().copied().collect();
-            for key in &model {
-                require(!live_files.iter().any(|f| key_of(*f) == *key), || {
-                    format!("sweep deletes {key:?}, which a live snapshot keeps")
-                })?;
-            }
-        }
-        require(planned == model, || {
-            format!("sweep deletes: model {model:?}; real {planned:?}")
+        require(keys_of(&due) == model, || {
+            format!("sweep deletes: model {model:?}; real {:?}", keys_of(&due))
         })?;
-        for f in &doomed {
-            self.deletes.push((*f, generation, true));
+        require(keys_of(&observe) == model_keys(model_observed), || {
+            format!(
+                "sweep observes: model {model_observed:?}; real {:?}",
+                keys_of(&observe)
+            )
+        })?;
+        let now = self.now;
+        let timers = &mut self.clients[writer].timers;
+        for f in &observe {
+            timers.insert(*f, now);
         }
-        self.sweep = Some(Sweep {
-            writer,
-            generation,
-            snapshots: snapshots.to_vec(),
-            outstanding: doomed.into_iter().collect(),
-            failed: false,
-        });
-        self.cover("sweep planned");
+        if !observe.is_empty() {
+            self.cover("sweep started a retention timer");
+        }
+        if !due.is_empty() {
+            for f in &due {
+                self.deletes.push((*f, generation, true));
+            }
+            self.sweep = Some(Sweep {
+                writer,
+                generation,
+                files: due.clone(),
+                outstanding: due,
+                failed: false,
+            });
+            self.cover("sweep planned");
+        }
         Ok(())
     }
 
@@ -1262,8 +1524,7 @@ async fn replay(
     require(trace.initial_index == 0, || "initial state".into())?;
     let steps = data_file_steps(&trace.run, &trace.actions)
         .ok_or_else(|| format!("{}: the model rejects the trace", label(trace)))?;
-    let mut replay = Replay::new(inner, control).await?;
-    replay.retire = trace.run.contains("retire");
+    let mut replay = Replay::new(inner, control, &trace.run).await?;
     let mut outcome = Ok(steps.len());
     for (n, step) in steps.iter().enumerate() {
         let checked = match replay.apply(step).await {
@@ -1387,9 +1648,9 @@ async fn broken_implementations_are_caught() {
     }
 }
 
-/// The `data-files-retire` witnesses and walks replay through real storage:
-/// each sweep plans, deletes and forgets only as the rules allow from the real
-/// head, and the added invariants hold after every action.
+/// The `data-files-retire*` witnesses and walks replay through real storage:
+/// each sweep observes, plans, deletes and forgets only as the rules allow
+/// from the real head, and the added invariants hold after every action.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retirement_traces_replay_on_real_storage() {
     let traces = retire_traces();
@@ -1412,23 +1673,7 @@ async fn retirement_traces_replay_on_real_storage() {
             "REPLAY retire {backend}: traces={} steps={steps} coverage={coverage:?}",
             traces.len()
         );
-        for path in [
-            "snapshot retired by a record",
-            "sweep planned",
-            "delete landed, acknowledged",
-            "delete landed after its sweep ended",
-            "delete landed after a takeover",
-            "delete failed",
-            "forget committed",
-            "scan read a retired snapshot's file",
-            "restore point copied a file",
-            "transaction committed",
-            "transaction aborted",
-            "orphan swept",
-            "resolved committed",
-            "resolved aborted",
-            "commit refused before I/O (fenced)",
-        ] {
+        for path in RETIRE_COVERAGE {
             assert!(
                 coverage.contains_key(path),
                 "{backend}: no trace reached {path}"
@@ -1439,8 +1684,37 @@ async fn retirement_traces_replay_on_real_storage() {
 
 /// Witnesses in `data-files-retire.jsonl` and walks in
 /// `data-files-retire-walk.jsonl` (see `traces/README.md`).
-const RETIRE_WITNESSES: usize = 34;
-const RETIRE_WALKS: usize = 40;
+const RETIRE_WITNESSES: usize = 64;
+const RETIRE_WALKS: usize = 80;
+/// Real paths the retirement traces must reach.
+const RETIRE_COVERAGE: &[&str] = &[
+    "AddFiles committed",
+    "RemoveFiles committed",
+    "ReplaceFiles committed",
+    "file carried in place",
+    "file retired by the record that removed it",
+    "transaction prepared",
+    "transaction committed",
+    "transaction aborted",
+    "sweep planned",
+    "sweep started a retention timer",
+    "delete landed, acknowledged",
+    "delete landed after its sweep ended",
+    "delete landed after a takeover",
+    "delete failed",
+    "forget committed",
+    "scan read a file removed after its pin",
+    "restore point copied a file",
+    "restore point copied a file removed after it started",
+    "clock ticked",
+    "remote reader confirmed the head",
+    "remote reader fetched a file removed after its confirm",
+    "remote fetch past T - S found the file deleted",
+    "orphan swept",
+    "resolved committed",
+    "resolved aborted",
+    "commit refused before I/O (fenced)",
+];
 
 /// Each model control's counterexample, replayed on real storage: the safe
 /// implementation refuses the unsafe step by its rule, and the implementation
@@ -1451,34 +1725,46 @@ async fn retirement_counterexamples_are_refused_and_caught() {
     let traces = traces(include_str!("traces/data-files-retire-controls.jsonl"));
     for (run, control, refusal, invariant) in [
         (
-            "data-files-retire-sweep-uncommitted",
-            Control::SweepUncommitted,
-            "sweep while the holder's own commit is outstanding",
+            "data-files-retire-whole-snapshot",
+            Control::WholeSnapshot,
+            "which stays live",
+            "file of a pinned scan's commit missing from the store",
+        ),
+        (
+            "data-files-retire-3-retires-carried",
+            Control::RetiresCarried,
+            "which stays live",
             "committed file missing from the store",
         ),
         (
             "data-files-retire-ignores-pins",
             Control::IgnoresPins,
-            "which a scan pins",
-            "file of a pinned snapshot missing from the store",
+            "removed after the commit a scan pins",
+            "file of a pinned scan's commit missing from the store",
+        ),
+        (
+            "data-files-retire-remote-ignores-retention",
+            Control::IgnoresRetention,
+            "before T has passed",
+            "remote reader within T - S missing a file",
         ),
         (
             "data-files-retire-forget-early",
             Control::ForgetEarly,
             "before its deletes returned",
-            "forgotten snapshot's file still stored",
-        ),
-        (
-            "data-files-retire-ignores-live-references",
-            Control::IgnoresLiveReferences,
-            "which a live snapshot keeps",
-            "committed file missing from the store",
+            "forgotten file still stored",
         ),
         (
             "data-files-retire-ignores-restore-hold",
             Control::IgnoresRestoreHold,
-            "sweep while a restore point holds deletions",
+            "holds deletions",
             "restore point's file missing from the store",
+        ),
+        (
+            "data-files-retire-sweep-uncommitted",
+            Control::SweepUncommitted,
+            "sweep while the holder's own commit is outstanding",
+            "committed file missing from the store",
         ),
         (
             "data-files-retire-prepared-orphan-ignores-reservation",
