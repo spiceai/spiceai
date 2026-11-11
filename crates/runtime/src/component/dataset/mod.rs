@@ -32,7 +32,7 @@ mod moved_tests;
 // (`crate::component::dataset::{DatasetSpec, Acceleration, acceleration, ...}`).
 pub use runtime_component::dataset::{
     CheckAvailability, DatasetSpec, Error, FullTextSearchDatasetConfig, InvalidColumnTypeSnafu,
-    InvalidConfigurationSnafu, OnSchemaChange, ReadyState, Result, TimeFormat,
+    InvalidConfigurationSnafu, OnSchemaChange, ReadyState, ResolvedTimeColumns, Result, TimeFormat,
     UnsupportedTypeAction, acceleration, declared_schema, declared_type, metadata, replication,
     schema_inference,
 };

@@ -2,7 +2,8 @@ name: Configure apt mirrors and timeouts
 description: >-
   Configures apt to fail over quickly from an unresponsive mirror and
   switches to Ubuntu mirrors geographically close to our self-hosted runners (Pittsburgh Teraswitch
-  datacenter) to avoid transient archive.ubuntu.com mirror-sync failures.
+  datacenter) to avoid transient archive.ubuntu.com mirror-sync failures,
+  and gives security.ubuntu.com fallback mirrors for the same reason.
   Safe no-op on non-Linux runners.
 
 runs:
@@ -69,20 +70,41 @@ runs:
           printf '%s\tpriority:%d\n' "${ARCHIVE_MIRRORS[$i]}" "$((i + 1))"
         done | sudo tee "${MIRROR_LIST}" > /dev/null
 
+        # The security pocket gets its own list, which keeps
+        # security.ubuntu.com first. archive.ubuntu.com serves the same
+        # -security suites from the same master, so its files match an index
+        # security.ubuntu.com signed moments earlier; that covers a
+        # security.ubuntu.com node caught mid-sync. mirrors.edge.kernel.org
+        # lags by hours but is run by someone else, so it answers when
+        # Canonical's hosts (both names resolve into one address pool) are
+        # unreachable. Every file is still checked against the signed
+        # InRelease, so a fallback can only serve what Canonical signed.
+        SECURITY_MIRRORS=(
+          "http://security.ubuntu.com/ubuntu/"
+          "http://archive.ubuntu.com/ubuntu/"
+          "http://mirrors.edge.kernel.org/ubuntu/"
+        )
+        SECURITY_MIRROR_LIST=/etc/apt/spice-ubuntu-security-mirrors.txt
+        SECURITY_MIRROR_URI="mirror+file:${SECURITY_MIRROR_LIST}"
+        for i in "${!SECURITY_MIRRORS[@]}"; do
+          printf '%s\tpriority:%d\n' "${SECURITY_MIRRORS[$i]}" "$((i + 1))"
+        done | sudo tee "${SECURITY_MIRROR_LIST}" > /dev/null
+
         # Ubuntu 24.04 (noble) ships sources in deb822 format at
         # /etc/apt/sources.list.d/ubuntu.sources; older releases use
-        # /etc/apt/sources.list. Handle both. Entries for security.ubuntu.com
-        # stay as they are.
+        # /etc/apt/sources.list. Handle both. Only the amd64 hosts above are
+        # rewritten; ports.ubuntu.com (arm64) stays as it is.
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
           sudo cp /etc/apt/sources.list.d/ubuntu.sources \
                   /etc/apt/sources.list.d/ubuntu.sources.bak
           # Ubuntu's default deb822 file has separate archive and security
-          # stanzas. Replace only the archive URIs line and leave the
-          # security stanza untouched. The archive line is either Ubuntu's
-          # own single URI or, on a runner an earlier version of this action
-          # already configured, the space-separated mirror list it wrote.
+          # stanzas, and each URIs line moves to its own mirror list. The
+          # archive line is either Ubuntu's own single URI or, on a runner an
+          # earlier version of this action already configured, the
+          # space-separated mirror list it wrote.
           sudo sed -i -E \
             -e "/^URIs:.*https?:\/\/archive\.ubuntu\.com\/ubuntu\/?([[:space:]]|$)/s|^URIs:.*$|URIs: ${MIRROR_URI}|" \
+            -e "/^URIs:[[:space:]]*https?:\/\/security\.ubuntu\.com\/ubuntu\/?[[:space:]]*$/s|^URIs:.*$|URIs: ${SECURITY_MIRROR_URI}|" \
             /etc/apt/sources.list.d/ubuntu.sources
           # If the substitution had no effect, surface diagnostics but do not
           # fail the action.
@@ -91,20 +113,27 @@ runs:
             echo "--- current ubuntu.sources URIs ---" >&2
             grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
           fi
+          if grep -Eq '^URIs:.*security\.ubuntu\.com' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo "::warning::configure-apt: a security.ubuntu.com URIs line in ubuntu.sources has no mirror failover"
+            grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
+          fi
         fi
         if [ -f /etc/apt/sources.list ]; then
           sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
           # Point every archive.ubuntu.com / us.archive.ubuntu.com entry
           # (http or https) at the same mirror list, as well as the primary
-          # mirror an earlier version of this action wrote there.
+          # mirror an earlier version of this action wrote there, and every
+          # security.ubuntu.com entry at the security list.
           sudo sed -i -E \
             -e "s|https?://archive\.ubuntu\.com/ubuntu/?|${MIRROR_URI}|g" \
             -e "s|https?://us\.archive\.ubuntu\.com/ubuntu/?|${MIRROR_URI}|g" \
             -e "s|https?://mirror\.pit\.teraswitch\.com/ubuntu/?|${MIRROR_URI}|g" \
+            -e "s|https?://security\.ubuntu\.com/ubuntu/?|${SECURITY_MIRROR_URI}|g" \
             /etc/apt/sources.list
         fi
 
         echo "apt mirror list ${MIRROR_LIST}, in failover order: ${ARCHIVE_MIRRORS[*]}"
+        echo "apt security mirror list ${SECURITY_MIRROR_LIST}, in failover order: ${SECURITY_MIRRORS[*]}"
         echo "apt acquire policy installed at /etc/apt/apt.conf.d/zz-spice-acquire"
 
     - name: Verify apt mirror configuration (Linux)
@@ -117,6 +146,13 @@ runs:
         echo "=== Archive mirror list ==="
         if [ -f /etc/apt/spice-ubuntu-mirrors.txt ]; then
           cat /etc/apt/spice-ubuntu-mirrors.txt
+        else
+          echo "not present"
+        fi
+
+        echo "=== Security mirror list ==="
+        if [ -f /etc/apt/spice-ubuntu-security-mirrors.txt ]; then
+          cat /etc/apt/spice-ubuntu-security-mirrors.txt
         else
           echo "not present"
         fi
