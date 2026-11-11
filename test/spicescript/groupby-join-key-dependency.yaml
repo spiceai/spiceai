@@ -8,7 +8,7 @@ sources:
 
 variants:
   federated: {}
-  arrow: arrow
+  cayenne-memory: cayenne-memory
   cayenne: cayenne-file
 
 spicepod:

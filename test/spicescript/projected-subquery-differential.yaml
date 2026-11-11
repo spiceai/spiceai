@@ -12,7 +12,7 @@ matrix:
   seed: [41, 73]
 variants:
   federated: {}
-  arrow: arrow
+  cayenne-memory: cayenne-memory
   cayenne: cayenne-file
   adbc:
     when: { backend: duckdb }

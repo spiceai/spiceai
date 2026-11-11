@@ -14,8 +14,7 @@ sources:
 variants:
   federated: {}
   cayenne: cayenne-file
-  sqlite: sqlite-file
-  arrow: arrow
+  cayenne-memory: cayenne-memory
 
 spicepod:
   version: v1

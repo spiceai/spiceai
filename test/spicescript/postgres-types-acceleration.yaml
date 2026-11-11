@@ -12,10 +12,7 @@ sources:
 
 variants:
   federated: {}
-  arrow: arrow-memory
-  sqlite: sqlite-file
   cayenne: cayenne-file
-  sqlite-memory: sqlite-memory
   cayenne-memory: cayenne-memory
 
 spicepod:

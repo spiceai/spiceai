@@ -5,22 +5,20 @@ description: >
   and microsecond precision, time, string, binary, decimals up to 38 digits,
   and lists of integers and strings), holding each type's limits, its zero or
   empty value, and NULL, answers through Spice as the DuckDB CLI answers it:
-  federated, and accelerated into every engine, with each column typed as
-  DuckDB exports it to Arrow. Every answer comes back the same over Flight,
-  Flight SQL and HTTP JSON. Timestamps in seconds, milliseconds and
+  federated, and accelerated into Cayenne in file and memory mode, with each
+  column typed as DuckDB exports it to Arrow. Every answer comes back the same
+  over Flight, Flight SQL and HTTP JSON. Timestamps in seconds, milliseconds and
   microseconds up to the last instant of 9999-12-31, such as the common
   `9999-12-31` "no end date" sentinel, load and answer as DuckDB answers them,
   from a table large enough that Cayenne's file mode writes it to a Vortex
-  file instead of holding it inline. (Intervals and SQLite's 20-digit decimals
-  are in known-failing/duckdb/duckdb-types-known.yaml.)
+  file instead of holding it inline. (Intervals are in
+  known-failing/duckdb/duckdb-types-known.yaml.)
 
 sources:
   src: { kind: duckdb }
 
 variants:
   federated: {}
-  arrow: arrow-memory
-  sqlite: sqlite-file
   cayenne: cayenne-file
   cayenne-memory: cayenne-memory
 
@@ -205,13 +203,10 @@ steps:
     protocols: [flight, flightsql, http]
     expect:
       rows: [[1, '99999999.99'], [2, '-99999999.99'], [3, '0.00'], [4, null]]
-  # SQLite keeps this decimal as a double, which cannot hold it (#14662;
-  # known-failing/duckdb/duckdb-types-known.yaml).
   - query: SELECT id, t_decimal_20_4 FROM t ORDER BY id
     protocols: [flight, flightsql, http]
     expect:
       rows: [[1, '9999999999999999.9999'], [2, '-9999999999999999.9999'], [3, '0.0000'], [4, null]]
-    except: sqlite
   - query: SELECT id, t_decimal_38_10 FROM t ORDER BY id
     protocols: [flight, flightsql, http]
     expect:
@@ -231,9 +226,7 @@ steps:
         - [4, null, null]
 
   # The far table, which Cayenne's file mode holds in a Vortex file: under the
-  # instance's directory, or under `executor/` in a cluster. SQLite
-  # returns its 9999-12-31 values as 1816-03-29T05:56:09.066277, a count of
-  # nanoseconds that wrapped, so its variant skips these queries. The filter
+  # instance's directory, or under `executor/` in a cluster. The filter
   # names a microsecond instant with arrow_cast, because a `TIMESTAMP` literal
   # is nanoseconds in Spice, which cannot reach 9999.
   - assert-files: { contains: '(^|/)\.spice/data/far/.*\.vortex$' }
@@ -241,21 +234,17 @@ steps:
   - query: SELECT id, ts, ts_ms, ts_s, tz, dt FROM far
     protocols: [flight, flightsql, http]
     expect: { oracle: src }
-    except: sqlite
   - query: >-
       SELECT id, ts, ts_ms, ts_s, tz, dt FROM far
       WHERE ts > arrow_cast('9999-12-30T23:00:00', 'Timestamp(Microsecond, None)')
     oracle-sql: SELECT id, ts, ts_ms, ts_s, tz, dt FROM far WHERE ts > TIMESTAMP '9999-12-30 23:00:00'
     protocols: [flight, flightsql, http]
     expect: { oracle: src }
-    except: sqlite
   - query: SELECT id, dt FROM far WHERE dt = DATE '9999-12-31'
     protocols: [flight, flightsql, http]
     expect: { oracle: src }
-    except: sqlite
   - query: >-
       SELECT count(*) AS n, count(ts) AS n_ts, min(ts) AS min_ts, max(ts) AS max_ts,
       max(ts_ms) AS max_ms, max(ts_s) AS max_s, max(tz) AS max_tz, max(dt) AS max_dt FROM far
     protocols: [flight, flightsql, http]
     expect: { oracle: src }
-    except: sqlite

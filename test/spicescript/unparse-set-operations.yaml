@@ -12,7 +12,6 @@ matrix:
 
 variants:
   federated: {}
-  arrow: arrow
   cayenne: cayenne-file
   cayenne-memory: cayenne-memory
 

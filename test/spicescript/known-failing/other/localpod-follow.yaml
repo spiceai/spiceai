@@ -4,7 +4,7 @@ description: >
   in four cases (Cayenne, results cache off):
   a grandchild (`localpod:child`) never takes a refresh that reached its
   parent; after the parent's spicepod entry changes its refresh SQL, the
-  children keep the old rows (with an Arrow parent they follow); a
+  children keep the old rows; a
   passthrough child keeps answering the old rows after the parent is
   removed from the spicepod; and once it is added back, the children keep
   the rows from before.
