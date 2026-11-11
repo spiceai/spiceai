@@ -1133,10 +1133,25 @@ async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
 
     // `aged(status)` is TRUE for "old" once `aged` is set (a cutoff passing),
     // and errors on "old" once `broken` is set.
-    for (name, partitioned, keyed) in [
-        ("rsql_res_keyed", false, true),
-        ("rsql_res_partitioned", true, true),
-        ("rsql_res_unkeyed", false, false),
+    // (name, partition column, primary key, on_conflict upsert, deletion mode)
+    for (name, partitioned, keyed, upsert, mode) in [
+        ("rsql_res_keyed", false, true, true, None),
+        ("rsql_res_partitioned", true, true, true, None),
+        ("rsql_res_unkeyed", false, false, false, None),
+        (
+            "rsql_res_key_no_conflict_key",
+            false,
+            true,
+            false,
+            Some(DeletionMode::Key),
+        ),
+        (
+            "rsql_res_key_no_conflict_position",
+            false,
+            true,
+            false,
+            Some(DeletionMode::Position),
+        ),
     ] {
         let aged = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
@@ -1174,11 +1189,14 @@ async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
             } else {
                 vec![]
             },
-            on_conflict: keyed
+            on_conflict: upsert
                 .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
             base_path: dir.to_string_lossy().to_string(),
             partition_column: partitioned.then(|| "status".to_string()),
-            vortex_config: file_tier_config(),
+            vortex_config: VortexConfig {
+                deletion_mode: mode.unwrap_or(file_tier_config().deletion_mode),
+                ..file_tier_config()
+            },
         };
         let t = Arc::new(
             CayenneTableProvider::create_table_with_retention(

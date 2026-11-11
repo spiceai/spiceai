@@ -533,16 +533,6 @@ impl CayenneCatalog {
                 message: "Deferred retention delete spans multiple tables".to_string(),
             });
         }
-        for replaced in &payload.retention_replaced_delete_file_ids {
-            txn.execute(ExecuteParams {
-                sql: "DELETE FROM cayenne_delete_file WHERE table_id = ?1 AND delete_file_id = ?2",
-                params: vec![
-                    MetastoreValue::Text(table_id.to_string()),
-                    MetastoreValue::Text(replaced.clone()),
-                ],
-            })
-            .await?;
-        }
         for chunk in payload.retention_delete_files.chunks(MAX_PARAMS / 10) {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
@@ -8428,7 +8418,6 @@ mod tests {
             }),
             pending_durable_flips: Vec::new(),
             retention_delete_files: Vec::new(),
-            retention_replaced_delete_file_ids: Vec::new(),
         };
 
         for _ in 0..2 {

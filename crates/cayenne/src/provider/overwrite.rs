@@ -968,9 +968,10 @@ impl CayenneTableProvider {
             table: self.table_name().to_string(),
             message,
         };
-        if self.primary_key_indices()?.is_some() || !self.pk_deletion_strategy.is_position_based() {
+        if self.key_resolver()?.is_some() || !self.pk_deletion_strategy.is_position_based() {
             return Err(internal(
-                "a carried retention generation is only for tables without a primary key"
+                "a carried retention generation is only for tables whose appends supersede nothing \
+                 and whose deletes are per file"
                     .to_string(),
             ));
         }

@@ -64,10 +64,6 @@ pub(super) struct PreparedResolvedAppend {
     /// The `retention_sql` delete over the resident rows this publication
     /// keeps, committed in its transaction and published under its fence.
     pub resident_retention: Option<super::delete::PreparedDeletionPublish>,
-    /// The vectors `resident_retention` replaces, and the sink that removes
-    /// their files once the replacement is published (no primary key only).
-    pub resident_replaced: Vec<crate::metadata::DeleteFile>,
-    pub resident_sink: Option<super::delete::CayenneDeletionSink>,
 }
 
 /// A failed publication, and whether its snapshot's files must be kept because
@@ -169,11 +165,6 @@ impl PreparedResolvedAppend {
                 }));
             };
             payload.retention_delete_files = resident.delete_files().to_vec();
-            payload.retention_replaced_delete_file_ids = self
-                .resident_replaced
-                .iter()
-                .map(|file| file.delete_file_id.clone())
-                .collect();
             // From here the catalog may reference these files whatever the
             // commit reports; a rolled-back commit leaves them unreferenced.
             resident.mark_catalog_committed();
@@ -202,9 +193,6 @@ impl PreparedResolvedAppend {
                 %error,
                 "failed to publish the committed retention delete to the in-memory caches"
             );
-        }
-        if let Some(sink) = self.resident_sink.take() {
-            sink.remove_replaced_deletion_vector_files(std::mem::take(&mut self.resident_replaced));
         }
         self.table.feed_staged_ivm_under_fence(None);
         let published_delta = reserved_delta.published();

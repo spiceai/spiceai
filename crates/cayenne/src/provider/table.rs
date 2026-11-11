@@ -19051,7 +19051,6 @@ impl CayenneTableProvider {
                 inline_tombstone: inline_tombstone.take(),
                 pending_durable_flips: drained_flips.clone(),
                 retention_delete_files: Vec::new(),
-                retention_replaced_delete_file_ids: Vec::new(),
             })
         } else {
             None

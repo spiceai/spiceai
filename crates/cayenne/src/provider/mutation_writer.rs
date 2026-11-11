@@ -1416,10 +1416,17 @@ impl<'a> AppendMutationWriter<'a> {
         // A table without a primary key whose `retention_sql` must also reach
         // its resident rows publishes a carried generation
         // (`write_unkeyed_retention_generation`).
-        let carried_generation = self.table.has_retention_delete_filters()
-            && self.table.primary_key_indices()?.is_none()
+        // So does a keyed table without `on_conflict` (its appends supersede
+        // nothing; a repeated key fails validation): by the carried generation
+        // when its deletes are per file, otherwise by a staged snapshot whose
+        // transaction carries the retention delete over the resident rows.
+        let resident_generation = self.table.has_retention_delete_filters()
+            && self.table.key_resolver()?.is_none()
             && self.table.metadata().partition_column.is_none()
             && !self.table.is_memory_resident_mode();
+        let carried_generation =
+            resident_generation && self.table.pk_deletion_strategy().is_position_based();
+        let keyed_generation = resident_generation && !carried_generation;
         let (prepared_stream, retention_dropped) =
             if collapsed_for_retention || self.table.key_resolver()?.is_none() {
                 match &publication_filters {
@@ -1445,6 +1452,24 @@ impl<'a> AppendMutationWriter<'a> {
         let written = if carried_generation {
             let write = self.write_unkeyed_retention_generation(
                 prepared_stream,
+                write_guard,
+                checkpoint_guard,
+            );
+            let written = match publication_filters {
+                Some(filters) => {
+                    super::overwrite_retention::with_publication_retention(filters, write).await?
+                }
+                None => write.await?,
+            };
+            // The flip replaced the generation the key caches describe.
+            if self.table.primary_key_indices()?.is_some() {
+                self.table.clear_cached_pk_keyset();
+            }
+            written
+        } else if keyed_generation {
+            let write = self.write_keyed_retention_generation(
+                prepared_stream,
+                &post_validation,
                 write_guard,
                 checkpoint_guard,
             );
@@ -1599,8 +1624,6 @@ impl<'a> AppendMutationWriter<'a> {
             into_empty_table: self.into_empty_table,
             first_load_pk_bloom,
             resident_retention,
-            resident_replaced: Vec::new(),
-            resident_sink: None,
         }
         .commit()
         .await
@@ -1639,6 +1662,106 @@ impl<'a> AppendMutationWriter<'a> {
             return Err(super::Error::Catalog { source });
         }
         prepared.finish().await
+    }
+
+    /// Publish an append to a keyed table without `on_conflict` on a
+    /// `retention_sql` table whose deletes are by key: its rows in a staged
+    /// snapshot, and the retention delete over every resident row (the append
+    /// supersedes none), committed in one metastore transaction
+    /// (`PreparedResolvedAppend`) and published under one fence.
+    async fn write_keyed_retention_generation(
+        &self,
+        data: SendableRecordBatchStream,
+        post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+        write_guard: OwnedMutexGuard<()>,
+        checkpoint_guard: OwnedMutexGuard<()>,
+    ) -> Result<u64> {
+        let filters = match super::overwrite_retention::publication_retention_filters() {
+            Some(filters) => filters,
+            None => self
+                .table
+                .coerced_retention_filters()
+                .map_err(|source| super::Error::DataFusion { source })?,
+        };
+        let snapshot_id = uuid::Uuid::now_v7().to_string();
+        let staged = self
+            .table
+            .write_to_snapshot(
+                data,
+                self.context.target_file_size_bytes(),
+                &snapshot_id,
+                self.task_context.session_config().target_partitions(),
+                None,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
+            )
+            .await;
+        let (rows, _writer_ops, stats) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let PostValidationState {
+            on_conflict_deletions,
+            validated_keys,
+        } = take_post_validation(post_validation);
+        let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
+            source: datafusion_common::DataFusionError::Execution(format!(
+                "{} The write was not published. {error}",
+                self.table.retention_failed_message()
+            )),
+        };
+        let resident: Result<_> = async {
+            let sink = self
+                .table
+                .build_deletion_vector_sink(
+                    &filters,
+                    None,
+                    super::table::DeletionRequestSource::User,
+                )
+                .await
+                .map_err(failed)?;
+            Ok(sink
+                .prepare_delete()
+                .await?
+                .filter(|prepared| !prepared.delete_files().is_empty()))
+        }
+        .await;
+        let resident_retention = match resident {
+            Ok(resident) => resident,
+            Err(error) => {
+                self.table.clear_cached_pk_keyset();
+                self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
+                    .await;
+                return Err(error);
+            }
+        };
+        let superseded = on_conflict_deletions.total_superseded();
+        if rows == 0 && superseded == 0 && resident_retention.is_none() {
+            self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
+                .await;
+            return Ok(0);
+        }
+        super::append_commit::PreparedResolvedAppend {
+            table: self.table.clone_for_write(),
+            context: Arc::clone(self.context),
+            _write_guard: write_guard,
+            _held_write_lock: super::write_lock_held::held_guard(),
+            _checkpoint_guard: Some(checkpoint_guard),
+            snapshot_id,
+            rows,
+            stats,
+            deletions: on_conflict_deletions,
+            validated_keys,
+            superseded,
+            into_empty_table: false,
+            first_load_pk_bloom: None,
+            resident_retention,
+        }
+        .commit()
+        .await
     }
 
     async fn cleanup_layered_append_dirs(&self, snapshot_ids: &[String]) {
