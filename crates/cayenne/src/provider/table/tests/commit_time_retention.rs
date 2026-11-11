@@ -148,6 +148,11 @@ impl Fixture {
 /// background retention pass held for the whole test so it neither evaluates
 /// the predicate nor deletes behind the assertions.
 async fn table(name: &str, shape: Shape) -> Fixture {
+    table_with(name, shape, None).await
+}
+
+/// [`table`] with `compaction_trigger_protected_snapshots` set.
+async fn table_with(name: &str, shape: Shape, trigger: Option<usize>) -> Fixture {
     let dir = tempfile::tempdir().expect("temp dir");
     let metadata_dir = format!("{}/metadata", dir.path().to_str().expect("path"));
     std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
@@ -180,6 +185,9 @@ async fn table(name: &str, shape: Shape) -> Fixture {
             base_path: format!("{}/data", dir.path().to_str().expect("path")),
             partition_column: None,
             vortex_config: VortexConfig {
+                compaction_trigger_protected_snapshots: trigger.unwrap_or_else(|| {
+                    VortexConfig::default().compaction_trigger_protected_snapshots
+                }),
                 deletion_mode: if matches!(shape, Shape::KeyedFold | Shape::PkNoConflictKey) {
                     DeletionMode::Key
                 } else {
@@ -763,5 +771,134 @@ async fn the_commit_now_is_taken_after_the_checkpoint_lock_wait() {
             seen.iter().all(|&t| t >= released_at),
             "{shape:?}: now() {seen:?} predates the end of the lock wait {released_at}"
         );
+    }
+}
+
+/// Stage `rows` and commit; the error text of whichever step refused.
+async fn stage_and_commit(f: &Fixture, rows: &[(i64, i64)]) -> std::result::Result<(), String> {
+    let p = &f.provider;
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    let values: Vec<i64> = rows.iter().map(|(_, v)| *v).collect();
+    let txn = CayenneTransaction::new();
+    let token = p.transaction_write_token().await;
+    txn.register(
+        p.table_id().to_string(),
+        token,
+        p.clone_for_write_operations(),
+    );
+    let staged = p
+        .begin_staged_upsert_occ(
+            token,
+            single_batch_stream(id_value_batch(schema(), &ids, &values)),
+            1,
+        )
+        .await
+        .map_err(|e| format!("staging: {e}"))?;
+    txn.set_staged(p.table_id(), staged);
+    txn.commit()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("commit: {e}"))
+}
+
+/// OBSERVED semantics, pinned (run-99, 2026-11-11 09:22 PST): a transaction
+/// on a primary key without `on_conflict` does NOT refuse a repeated key.
+/// The premise that it fails validation (true on the non-transactional append
+/// route) is false here; whether the routes should agree is an open decision,
+/// and the 9aa41988c baseline for this route is not yet measured. What holds:
+/// - within the statement the FIRST copy is kept and published, the later copy
+///   is hidden and never evaluated; the kept copy is the published row, so
+///   `retention_sql` evaluates it (an error on it fails the commit and
+///   publishes nothing);
+/// - over a resident row the staged copy is hidden, never evaluated, and the
+///   resident row is not hidden;
+/// - the table accepts the next valid commit (nothing held).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_no_conflict_key_transaction_keeps_the_first_copy_and_never_evaluates_hidden_ones() {
+    for shape in [Shape::PkNoConflictKey, Shape::PkNoConflictPosition] {
+        // Within the statement, retention OFF: the first copy is published.
+        let f = table(
+            &format!("ctr_nc_within_off_{shape:?}").to_lowercase(),
+            shape,
+        )
+        .await;
+        stage_and_commit(&f, &[(5, 13), (5, 7)])
+            .await
+            .unwrap_or_else(|e| panic!("{shape:?}: accepted: {e}"));
+        assert_eq!(
+            rows(&f.provider).await,
+            vec![(1, 1), (5, 13)],
+            "{shape:?}: first copy"
+        );
+        assert_eq!(
+            rows(&f.reopen().await).await,
+            vec![(1, 1), (5, 13)],
+            "{shape:?}: reopened"
+        );
+
+        // Within the statement, MIXED: only the kept copy is evaluated; its
+        // error fails the commit and nothing is published.
+        let f = table(
+            &format!("ctr_nc_within_mixed_{shape:?}").to_lowercase(),
+            shape,
+        )
+        .await;
+        f.set(MIXED);
+        let refused = stage_and_commit(&f, &[(5, 13), (5, 7)])
+            .await
+            .expect_err("the kept copy fails retention");
+        assert!(
+            refused.contains("aged() cannot evaluate 13"),
+            "{shape:?}: {refused}"
+        );
+        assert_eq!(
+            f.take_seen(),
+            vec![13],
+            "{shape:?}: the hidden copy is never evaluated"
+        );
+        assert_eq!(
+            rows(&f.provider).await,
+            vec![(1, 1)],
+            "{shape:?}: nothing published"
+        );
+        assert_eq!(
+            rows(&f.reopen().await).await,
+            vec![(1, 1)],
+            "{shape:?}: reopened"
+        );
+
+        // Over a resident row: the staged copy is hidden and never evaluated,
+        // the resident row stays.
+        for (case, staged) in [("resident", (1, 13)), ("resident_matching", (1, -1))] {
+            let f = table(&format!("ctr_nc_{case}_{shape:?}").to_lowercase(), shape).await;
+            f.set(MIXED);
+            stage_and_commit(&f, &[staged])
+                .await
+                .unwrap_or_else(|e| panic!("{shape:?}/{case}: accepted: {e}"));
+            assert_eq!(
+                f.take_seen(),
+                Vec::<i64>::new(),
+                "{shape:?}/{case}: nothing evaluated"
+            );
+            assert_eq!(
+                rows(&f.provider).await,
+                vec![(1, 1)],
+                "{shape:?}/{case}: resident kept"
+            );
+            assert_eq!(
+                rows(&f.reopen().await).await,
+                vec![(1, 1)],
+                "{shape:?}/{case}: reopened"
+            );
+            f.set(OFF);
+            stage_and_commit(&f, &[(6, 6)])
+                .await
+                .unwrap_or_else(|e| panic!("{shape:?}/{case}: next commit: {e}"));
+            assert_eq!(
+                rows(&f.provider).await,
+                vec![(1, 1), (6, 6)],
+                "{shape:?}/{case}: next commit"
+            );
+        }
     }
 }

@@ -62,6 +62,10 @@ test_with_backends!(redelivery_unacked_after_user_transaction_impl);
 test_with_backends!(redelivery_resume_lag_after_user_delete_impl);
 test_with_backends!(redelivery_resume_lag_after_user_update_impl);
 test_with_backends!(redelivery_resume_lag_after_user_transaction_impl);
+test_with_backends!(newer_source_event_after_user_write_wins_impl);
+test_with_backends!(newer_source_event_after_identical_redelivery_still_applies_impl);
+test_with_backends!(write_back_echo_of_the_user_write_is_idempotent_impl);
+test_with_backends!(blocked_identical_redelivery_mixed_with_newer_events_impl);
 
 /// Source history: two checkpointed batches, then one RAM-only batch.
 const DURABLE_A: [(i64, i64); 2] = [(1, 1), (3, -3)];
@@ -295,4 +299,201 @@ async fn redelivery_resume_lag_after_user_transaction_impl(
     f: common::TestFixture,
 ) -> TestResult<()> {
     probe(f, Write::Transaction, Window::ResumeLag).await
+}
+
+/// Creates the probe table and seeds the probe history (two checkpointed
+/// batches, one RAM-only tier batch).
+async fn seeded(
+    fixture: &common::TestFixture,
+    name: &str,
+) -> TestResult<(Arc<dyn MetadataCatalog>, Arc<CayenneTableProvider>)> {
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    // One directory per table: a fixture here seeds several tables.
+    let mut opts = options(fixture, name);
+    let dir = fixture.data_path.join(name);
+    std::fs::create_dir_all(&dir)?;
+    opts.base_path = dir.to_string_lossy().to_string();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog),
+            opts,
+            SessionContext::new().runtime_env(),
+        )
+        .await?,
+    );
+    table.install_slot_advancer(Arc::new(CountingAdvancer(Arc::new(AtomicUsize::new(0)))));
+    cdc(&table, &DURABLE_A).await?;
+    table.checkpoint_mem_tier().await?;
+    cdc(&table, &DURABLE_B).await?;
+    table.checkpoint_mem_tier().await?;
+    cdc(&table, &TIER).await?;
+    assert_eq!(
+        rows(&table).await?,
+        vec![(1, 1), (2, 2), (3, 3)],
+        "{name}: seeded"
+    );
+    Ok((catalog, table))
+}
+
+async fn user_write(table: &Arc<CayenneTableProvider>, write: Write, value: i64) -> TestResult<()> {
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)?;
+    match write {
+        Write::Delete => {
+            ctx.sql("DELETE FROM t WHERE id = 3")
+                .await?
+                .collect()
+                .await?;
+        }
+        Write::Update => {
+            ctx.sql(&format!("UPDATE t SET value = {value} WHERE id = 3"))
+                .await?
+                .collect()
+                .await?;
+        }
+        Write::Transaction => {
+            let txn = CayenneTransaction::new();
+            let token = table.transaction_write_token().await;
+            txn.register(
+                table.table_id().to_string(),
+                token,
+                table.clone_for_write_operations(),
+            );
+            let staged = table
+                .begin_staged_upsert_occ(token, stream(&[(3, value)]), 1)
+                .await?;
+            txn.set_staged(table.table_id(), staged);
+            txn.commit().await?;
+        }
+    }
+    Ok(())
+}
+
+async fn reopen(
+    catalog: &Arc<dyn MetadataCatalog>,
+    name: &str,
+) -> TestResult<Arc<CayenneTableProvider>> {
+    let t = Arc::new(
+        CayenneTableProviderBuilder::new(Arc::clone(catalog), SessionContext::new().runtime_env())
+            .open(name)
+            .await?,
+    );
+    t.install_slot_advancer(Arc::new(CountingAdvancer(Arc::new(AtomicUsize::new(0)))));
+    Ok(t)
+}
+
+/// Target (policy: a genuinely NEW source event is source-authoritative): a
+/// source change made after the local write (a value the source never sent
+/// before) wins over the local write, live and after a crash. Holds today for
+/// every write kind; any future replay mechanism must keep it (no
+/// over-suppression of the key the user wrote).
+async fn newer_source_event_after_user_write_wins_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    for write in [Write::Delete, Write::Update, Write::Transaction] {
+        let name = format!("newer_{write:?}").to_lowercase();
+        let (catalog, table) = seeded(&fixture, &name).await?;
+        user_write(&table, write, 30).await?;
+        cdc(&table, &[(3, 40)]).await?;
+        assert_eq!(
+            rows(&table).await?,
+            vec![(1, 1), (2, 2), (3, 40)],
+            "{name}: the newer source event wins, live"
+        );
+        let restarted = reopen(&catalog, &name).await?;
+        cdc(&restarted, &[(3, 41)]).await?;
+        assert_eq!(
+            rows(&restarted).await?,
+            vec![(1, 1), (2, 2), (3, 41)],
+            "{name}: a newer source event after a crash wins"
+        );
+    }
+    Ok(())
+}
+
+/// After a crash and the identical re-delivery of the unacknowledged tier
+/// event (whose outcome today is the known red the probe above records), a
+/// genuinely NEW event, for the written key and for a new key, still applies.
+/// This only asserts the state after the new events, so it holds today and
+/// guards any future identical-replay suppression against swallowing new
+/// events.
+async fn newer_source_event_after_identical_redelivery_still_applies_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let name = "newer_after_redelivery";
+    let (catalog, table) = seeded(&fixture, name).await?;
+    user_write(&table, Write::Transaction, 30).await?;
+    let restarted = reopen(&catalog, name).await?;
+    cdc(&restarted, &TIER).await?;
+    cdc(&restarted, &[(3, 40), (4, 4)]).await?;
+    assert_eq!(
+        rows(&restarted).await?,
+        vec![(1, 1), (2, 2), (3, 40), (4, 4)],
+        "{name}: new events apply after an identical re-delivery"
+    );
+    Ok(())
+}
+
+/// The write-back echo of a user write, modelled at the table: the source
+/// sends back exactly the image the user write committed, right after it.
+/// Applying it is idempotent (the view is the user write's), live and after a
+/// later checkpoint and reopen. The runtime suppresses true echoes by source
+/// xid before they reach the table (data_components postgres_replication
+/// shared.rs tests, e.g. registered_xid_drops_arbitrated_relation_and_delivers_others,
+/// reconnect_replay_without_prune_drops_echo_again,
+/// resumed_member_suppresses_replay_below_recorded_position); this test does
+/// not depend on that suppression. A STALE echo (an earlier write's image
+/// re-delivered after a later local write) is indistinguishable here from an
+/// identical re-delivery: it is the blocked class the probe records.
+async fn write_back_echo_of_the_user_write_is_idempotent_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    for write in [Write::Update, Write::Transaction] {
+        let name = format!("echo_{write:?}").to_lowercase();
+        let (catalog, table) = seeded(&fixture, &name).await?;
+        user_write(&table, write, 30).await?;
+        cdc(&table, &[(3, 30)]).await?;
+        let want = vec![(1, 1), (2, 2), (3, 30)];
+        assert_eq!(
+            rows(&table).await?,
+            want,
+            "{name}: echo is idempotent, live"
+        );
+        table.checkpoint_mem_tier().await?;
+        assert_eq!(
+            rows(&reopen(&catalog, &name).await?).await?,
+            want,
+            "{name}: echo is idempotent, checkpointed and reopened"
+        );
+    }
+    Ok(())
+}
+
+/// BLOCKED expectation (architecture decision pending; no mechanism coded):
+/// one re-delivered batch mixes the identical tier event for the key the user
+/// wrote with a genuinely new event for another key. Target: the new event
+/// applies (asserted first; holds today) AND the identical event does not
+/// overwrite the user write (fails today: the same pre-existing behaviour as
+/// redelivery_unacked_after_user_transaction). Distinguishes a correct fix
+/// from one that suppresses the whole replayed batch.
+async fn blocked_identical_redelivery_mixed_with_newer_events_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let name = "blocked_mixed_redelivery";
+    let (catalog, table) = seeded(&fixture, name).await?;
+    user_write(&table, Write::Transaction, 30).await?;
+    let restarted = reopen(&catalog, name).await?;
+    cdc(&restarted, &[TIER[0], (4, 4)]).await?;
+    let got = rows(&restarted).await?;
+    assert!(
+        got.contains(&(4, 4)),
+        "{name}: the new event applies: {got:?}"
+    );
+    assert_eq!(
+        got,
+        vec![(1, 1), (2, 2), (3, 30), (4, 4)],
+        "{name}: BLOCKED target: the identical event must not overwrite the user write"
+    );
+    Ok(())
 }

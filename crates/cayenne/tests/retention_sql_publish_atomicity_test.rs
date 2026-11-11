@@ -67,6 +67,8 @@ test_with_backends!(transaction_staged_across_a_retention_append_commits_or_abor
 test_with_backends!(transaction_commit_retires_newly_matching_resident_rows_impl);
 test_with_backends!(transaction_commit_skips_hidden_versions_before_resident_retention_impl);
 test_with_backends!(transaction_commit_with_failing_resident_retention_publishes_nothing_impl);
+test_with_backends!(durable_cdc_concurrent_reader_never_sees_matching_rows_impl);
+test_with_backends!(durable_cdc_route_switch_keeps_order_and_single_publication_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -3522,6 +3524,148 @@ async fn transaction_commit_with_failing_resident_retention_publishes_nothing_im
             vec![1, 2],
             "{name}: durable"
         );
+    }
+    Ok(())
+}
+
+/// The durable CDC route (CTO option A): readers running while CDC batches are
+/// applied — inserts, upserts that archive a key, upserts that revive one — never
+/// see a matching row, and every row is published exactly once.
+async fn durable_cdc_concurrent_reader_never_sees_matching_rows_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let t = durable_cdc_table(&fixture, "rsql_pub_cdc_concurrent", archived()).await?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let hits = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let (t, stop, hits, reads) = (
+            Arc::clone(&t),
+            Arc::clone(&stop),
+            Arc::clone(&hits),
+            Arc::clone(&reads),
+        );
+        readers.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let (_, archived, _) = counts(&t).await.expect("read");
+                reads.fetch_add(1, Ordering::Relaxed);
+                if archived > 0 {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                }
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+    for round in 0..30_i64 {
+        let base = round * 10;
+        let mut batch_rows: Vec<(i64, Option<&'static str>)> = (base..base + 10)
+            .map(|id| (id, Some(if id % 3 == 0 { "archived" } else { "active" })))
+            .collect();
+        if round > 0 {
+            // Archive one earlier key, revive another.
+            batch_rows.push((base - 9, Some("archived")));
+            batch_rows.push((base - 7, Some("active")));
+        }
+        cdc_apply(&t, rows(&batch_rows)).await?;
+        tokio::task::yield_now().await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        r.await?;
+    }
+    assert!(reads.load(Ordering::Relaxed) > 0, "readers ran");
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        0,
+        "reads that saw archived rows"
+    );
+    let ids = ids(&t).await?;
+    let mut dedup = ids.clone();
+    dedup.dedup();
+    assert_eq!(ids, dedup, "no key published twice");
+    assert_eq!(
+        count_star(&t).await?,
+        i64::try_from(ids.len())?,
+        "COUNT(*) matches"
+    );
+    Ok(())
+}
+
+/// Adjacent CDC applies that switch routes — the pipelined staged route (no
+/// retention) and the synchronous retention route (`retention_sql` configured on
+/// reopen) — keep source order, publish each row once, and only the pipelined
+/// route leaves a finalize (its acknowledgement) owed after the apply returns.
+async fn durable_cdc_route_switch_keeps_order_and_single_publication_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = "rsql_pub_cdc_route_switch";
+    let plain = durable_cdc_table(&fixture, name, lit(false)).await?;
+    // `lit(false)` matches nothing; reopen without any filter for the plain route.
+    drop(plain);
+    let open = |retention: Option<Expr>| {
+        let catalog = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+        async move {
+            let mut b =
+                CayenneTableProviderBuilder::new(catalog, SessionContext::new().runtime_env());
+            if let Some(r) = retention {
+                b = b.with_retention_filters(vec![r]);
+            }
+            Ok::<_, Box<dyn std::error::Error>>(Arc::new(b.open(name).await?))
+        }
+    };
+    let apply_pending = |t: Arc<CayenneTableProvider>, batch: RecordBatch| async move {
+        let ctx = SessionContext::new();
+        let schema = batch.schema();
+        let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter([Ok(batch)]),
+            ),
+        );
+        let write = t.write_cdc_append_stream(stream, &ctx.task_ctx()).await?;
+        let pending = write.has_pending_finalize();
+        if pending {
+            write.finish().await?;
+        }
+        Ok::<_, Box<dyn std::error::Error>>(pending)
+    };
+    let mut expected: std::collections::BTreeMap<i64, &'static str> = Default::default();
+    for round in 0..4_i64 {
+        let retained = round % 2 == 1;
+        let t = open(retained.then(archived)).await?;
+        for step in 0..3_i64 {
+            let id = round * 3 + step;
+            // Each batch also rewrites key 0, so source order decides its value.
+            let status = if retained { "active" } else { "archived" };
+            let batch = rows(&[(id, Some("active")), (0, Some(status))]);
+            let pending = apply_pending(Arc::clone(&t), batch).await?;
+            assert!(
+                !(retained && pending),
+                "round {round}: the retention route completes synchronously; no ack is owed later"
+            );
+            expected.insert(id, "active");
+            if retained {
+                expected.insert(0, "active");
+            } else {
+                expected.insert(0, "archived");
+            }
+            if retained {
+                expected.retain(|_, s| *s != "archived");
+            }
+        }
+        let got = ids(&t).await?;
+        let want: Vec<i64> = expected.keys().copied().collect();
+        assert_eq!(
+            got, want,
+            "round {round}: contents in source order, once each"
+        );
+        assert_eq!(
+            count_star(&t).await?,
+            i64::try_from(want.len())?,
+            "round {round}: COUNT(*)"
+        );
+        t.drain_in_flight_maintenance().await?;
     }
     Ok(())
 }
