@@ -1729,3 +1729,159 @@ async fn memory_mode_resident_retention_in_the_append_swap_impl(
     }
     Ok(())
 }
+
+/// `mode: memory` CDC (`write_cdc_append_stream`): each applied batch applies
+/// `retention_sql` to the incoming rows and the resident tier rows in its one
+/// tier swap, under one `now()`. A resident row whose predicate errors fails
+/// the batch and keeps the previous tier; a superseded version is never
+/// evaluated; replaying an applied batch leaves the same rows.
+#[test]
+fn memory_mode_cdc_resident_retention_in_the_apply_swap_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        memory_mode_cdc_resident_retention_in_the_apply_swap_impl,
+    )
+}
+
+async fn memory_mode_cdc_resident_retention_in_the_apply_swap_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use arrow::array::TimestampNanosecondArray;
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use std::sync::Mutex;
+    let aged = Arc::new(AtomicBool::new(false));
+    let broken = Arc::new(AtomicBool::new(false));
+    let nows: Arc<Mutex<std::collections::BTreeSet<i64>>> = Arc::default();
+    let calls = Arc::new(AtomicU64::new(0));
+    let (a, b, n, c) = (
+        Arc::clone(&aged),
+        Arc::clone(&broken),
+        Arc::clone(&nows),
+        Arc::clone(&calls),
+    );
+    let udf = create_udf(
+        "aged_at",
+        vec![
+            DataType::Utf8,
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Nanosecond,
+                Some("+00:00".into()),
+            ),
+        ],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(move |args: &[ColumnarValue]| {
+            let array = args[0].clone().into_array(1)?;
+            let values = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+            let ts = args[1].clone().into_array(values.len())?;
+            let ts = ts
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("ts");
+            c.fetch_add(1, Ordering::SeqCst);
+            n.lock().expect("lock").extend(ts.iter().flatten());
+            let mut out = Vec::with_capacity(values.len());
+            for v in values.iter() {
+                let old = v == Some("old");
+                if old && b.load(Ordering::SeqCst) {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "aged_at() cannot evaluate this row".to_string(),
+                    ));
+                }
+                out.push(Some(old && a.load(Ordering::SeqCst)));
+            }
+            Ok(ColumnarValue::Array(Arc::new(
+                arrow::array::BooleanArray::from(out),
+            )))
+        }),
+    );
+    let name = "rsql_mem_cdc";
+    let dir = fixture.data_path.join(name);
+    std::fs::create_dir_all(&dir)?;
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: common::lookup_index::memory_mode_config(),
+    };
+    let t = Arc::new(
+        CayenneTableProvider::create_table_with_retention(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            options,
+            vec![udf.call(vec![col("status"), now()])],
+            SessionContext::new().runtime_env(),
+        )
+        .await?,
+    );
+    assert!(t.is_memory_resident_mode());
+    let apply = |pairs: Vec<(i64, Option<&'static str>)>| {
+        let t = Arc::clone(&t);
+        async move {
+            let batch = rows(&pairs);
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                futures::stream::iter([Ok(batch)]),
+            ));
+            let ctx = SessionContext::new();
+            let write = t.write_cdc_append_stream(stream, &ctx.task_ctx()).await?;
+            if write.has_pending_finalize() {
+                write.finish().await?;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+    };
+
+    apply(vec![(1, Some("old")), (2, Some("new"))]).await?;
+    assert_eq!(ids(&t).await?, vec![1, 2]);
+
+    broken.store(true, Ordering::SeqCst);
+    assert!(
+        apply(vec![(3, Some("new"))]).await.is_err(),
+        "an erroring resident row fails the batch"
+    );
+    assert_eq!(ids(&t).await?, vec![1, 2], "previous tier kept");
+
+    broken.store(false, Ordering::SeqCst);
+    aged.store(true, Ordering::SeqCst);
+    nows.lock().expect("lock").clear();
+    let before = calls.load(Ordering::SeqCst);
+    apply(vec![(3, Some("new"))]).await?;
+    let evaluations = calls.load(Ordering::SeqCst) - before;
+    let seen = nows.lock().expect("lock").clone();
+    assert!(
+        evaluations >= 2,
+        "incoming and resident evaluated ({evaluations})"
+    );
+    assert_eq!(seen.len(), 1, "one now() per applied batch: {seen:?}");
+    assert_eq!(
+        ids(&t).await?,
+        vec![2, 3],
+        "aged resident row gone in the apply swap"
+    );
+
+    aged.store(false, Ordering::SeqCst);
+    apply(vec![(4, Some("old"))]).await?;
+    apply(vec![(4, Some("new"))]).await?;
+    broken.store(true, Ordering::SeqCst);
+    apply(vec![(5, Some("new"))]).await?;
+    assert_eq!(
+        ids(&t).await?,
+        vec![2, 3, 4, 5],
+        "superseded version not evaluated"
+    );
+
+    // Replay of an applied batch (at-least-once delivery) leaves the same rows.
+    apply(vec![(5, Some("new"))]).await?;
+    assert_eq!(
+        ids(&t).await?,
+        vec![2, 3, 4, 5],
+        "replay leaves the same rows"
+    );
+    Ok(())
+}

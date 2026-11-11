@@ -1001,8 +1001,23 @@ impl<'a> AppendMutationWriter<'a> {
         // retention delete together. Measured before the budget reservation, so it
         // reserves only the rows kept. An error fails the batch before anything is
         // published or reserved.
+        //
+        // `mode: memory`: one predicate context (one `now()`) for these rows and
+        // the resident tier rows the append swap below evaluates.
+        let publication: Option<Arc<Vec<datafusion::logical_expr::Expr>>> =
+            if self.table.is_memory_resident_mode() && self.table.has_retention_delete_filters() {
+                Some(Arc::new(self.table.coerced_retention_filters()?))
+            } else {
+                None
+            };
         let validated_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let batches = self.table.drop_retention_matches(batches)?;
+        let batches = match &publication {
+            Some(filters) => super::overwrite_retention::with_publication_retention_sync(
+                Arc::clone(filters),
+                || self.table.drop_retention_matches(batches),
+            ),
+            None => self.table.drop_retention_matches(batches),
+        }?;
         let retention_dropped =
             validated_rows - batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         let incoming_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
@@ -1085,11 +1100,20 @@ impl<'a> AppendMutationWriter<'a> {
         // Append to the RAM tier under the listing fence. The reserved bytes stay
         // held (released by the checkpoint that flushes this epoch). On append
         // error, release the reservation so the budget doesn't leak.
-        let epoch = match self
-            .table
-            .append_to_mem_tier(batches, &on_conflict_deletions, incoming_bytes, superseded)
-            .await
-        {
+        let append = self.table.append_to_mem_tier(
+            batches,
+            &on_conflict_deletions,
+            incoming_bytes,
+            superseded,
+        );
+        let appended = match &publication {
+            Some(filters) => {
+                super::overwrite_retention::with_publication_retention(Arc::clone(filters), append)
+                    .await
+            }
+            None => append.await,
+        };
+        let epoch = match appended {
             Ok(epoch) => epoch,
             Err(e) => {
                 // Memory mode skipped the reservation above, so must not release.
