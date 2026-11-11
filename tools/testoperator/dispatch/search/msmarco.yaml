@@ -1,5 +1,7 @@
 tests:
-  # The 1.7 GB corpus now downloads from Hugging Face inside the ready wait, so allow 1 hour.
+  # The workflow downloads the 1.7 GB of files before spiced starts (see
+  # test/spicepods/search/mteb/msmarco/data-files.tsv). spiced still has to embed and index 8.8
+  # million passages before it is ready, so allow 1 hour.
   search:
     - spicepod_path: test/spicepods/search/mteb/msmarco/full_text_search-cayenne[file].yaml
       runner_type: spiceai-dev-runners

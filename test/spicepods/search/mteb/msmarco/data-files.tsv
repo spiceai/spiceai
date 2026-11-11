@@ -1,0 +1,22 @@
+# Files that testoperator_run_search.yml downloads before spiced starts, one per line:
+# <path under the data directory><TAB><URL>
+#
+# The spicepods in this directory read them as `file:data/<path>`. MS MARCO is read from local
+# files, not over HTTP, because its Hugging Face Parquet has about 9,500 row groups of 0.2 MB. A
+# Parquet read over HTTP makes about one range request per row group, and the Hub allows an
+# anonymous client 500 `/api/` requests in 5 minutes. A load therefore never finished. Downloading
+# a whole file is one request. See README.md, "Large datasets".
+#
+# These are the `refs/convert/parquet` files that
+# https://huggingface.co/api/datasets/mteb/msmarco/parquet lists (`0.parquet` there is `0000.parquet`
+# here). The branch name is used, not a commit, because the Hub deletes the commits of that branch
+# when it regenerates it.
+msmarco/corpus/0000.parquet	https://huggingface.co/datasets/mteb/msmarco/resolve/refs%2Fconvert%2Fparquet/corpus/corpus/0000.parquet
+msmarco/corpus/0001.parquet	https://huggingface.co/datasets/mteb/msmarco/resolve/refs%2Fconvert%2Fparquet/corpus/corpus/0001.parquet
+msmarco/corpus/0002.parquet	https://huggingface.co/datasets/mteb/msmarco/resolve/refs%2Fconvert%2Fparquet/corpus/corpus/0002.parquet
+msmarco/corpus/0003.parquet	https://huggingface.co/datasets/mteb/msmarco/resolve/refs%2Fconvert%2Fparquet/corpus/corpus/0003.parquet
+msmarco/corpus/0004.parquet	https://huggingface.co/datasets/mteb/msmarco/resolve/refs%2Fconvert%2Fparquet/corpus/corpus/0004.parquet
+msmarco/corpus/0005.parquet	https://huggingface.co/datasets/mteb/msmarco/resolve/refs%2Fconvert%2Fparquet/corpus/corpus/0005.parquet
+msmarco/corpus/0006.parquet	https://huggingface.co/datasets/mteb/msmarco/resolve/refs%2Fconvert%2Fparquet/corpus/corpus/0006.parquet
+msmarco/queries.parquet	https://huggingface.co/datasets/mteb/msmarco/resolve/refs%2Fconvert%2Fparquet/queries/queries/0000.parquet
+msmarco/test.parquet	https://huggingface.co/datasets/mteb/msmarco/resolve/refs%2Fconvert%2Fparquet/default/test/0000.parquet

@@ -75,6 +75,23 @@ as its own dataset (`corpus_0`, `corpus_1`, ...) and make `corpus` an accelerate
 them with `UNION ALL`. Put the acceleration and the search columns on the view, so that one refresh
 of the view reads every shard and builds the search indexes.
 
+### Large datasets
+
+A Parquet read over HTTP makes about one range request per row group, and every request to a
+`https://huggingface.co/api/...` URL counts against the Hub's `api` rate limit: 500 requests in 5
+minutes for an anonymous client. A file with thousands of small row groups cannot load within that
+limit. `mteb/msmarco` has 9,542 row groups of about 0.2 MB in 1.7 GB. Every attempt to read it
+over HTTP failed with `429 Too Many Requests` until the ready wait ran out.
+
+For a dataset like that, list its files in a `data-files.tsv` beside the spicepods, one
+`<path><TAB><URL>` per line, and read them as `file:data/<path>`. `testoperator_run_search.yml`
+downloads each file whole, in one request (with the `SPICE_SECRET_HF_TOKEN` token for
+`https://huggingface.co/` URLs), and passes the directory to `testoperator run search --data-dir`.
+To run such a spicepod locally, download the same files into a directory and pass it as
+`--data-dir`. Use `resolve/refs%2Fconvert%2Fparquet/...` URLs in the manifest: `curl` sends them as
+written, and they count against the larger `resolvers` limit. See
+[`mteb/msmarco/data-files.tsv`](./mteb/msmarco/data-files.tsv).
+
 ### ConTEB
 
 [ConTEB](https://huggingface.co/blog/manu/conteb) has a `documents` config (`chunk_id`, `chunk`)

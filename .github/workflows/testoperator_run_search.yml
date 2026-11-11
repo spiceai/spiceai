@@ -129,6 +129,58 @@ jobs:
           SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
+      # A spicepod whose source files are too large to read over HTTP lists them in a
+      # `data-files.tsv` beside it (see test/spicepods/search/README.md, "Large datasets"). Each file
+      # downloads whole, in one request, and the spicepod reads it as `file:data/<path>`.
+      - name: Download the spicepod's data files
+        id: data_files
+        env:
+          SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+          HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          manifest="$(dirname "$SPICEPOD_PATH")/data-files.tsv"
+          if [ ! -f "$manifest" ]; then
+            echo "No $manifest, so the spicepod reads its own data."
+            exit 0
+          fi
+          data_dir="$RUNNER_TEMP/search-data"
+          rm -rf "$data_dir"
+          count=0
+          while IFS=$'\t' read -r path url || [ -n "$path" ]; do
+            url="${url%$'\r'}"
+            case "$path" in
+              ''|'#'*) continue ;;
+              /*|*..*)
+                echo "::error::$manifest: '$path' must be a relative path inside the data directory."
+                exit 1 ;;
+            esac
+            if [ -z "$url" ]; then
+              echo "::error::$manifest: '$path' has no URL. Separate the path and the URL with a tab."
+              exit 1
+            fi
+            # The token goes only to the Hub. curl drops it when the Hub redirects to its CDN.
+            auth=()
+            if [ -n "${HF_TOKEN:-}" ] && [[ "$url" == https://huggingface.co/* ]]; then
+              auth=(-H "Authorization: Bearer $HF_TOKEN")
+            fi
+            mkdir -p "$data_dir/$(dirname "$path")"
+            # `--retry` retries timeouts, 408, 429 (after its Retry-After) and 5xx, not a 404 or 401.
+            # A transfer below 100 kB/s for 2 minutes counts as a timeout.
+            if ! curl --fail --location --silent --show-error \
+                --retry 5 --connect-timeout 30 --speed-limit 102400 --speed-time 120 \
+                "${auth[@]}" --output "$data_dir/$path" "$url"; then
+              echo "::error::Could not download $url for $manifest. The search test needs every file it lists."
+              exit 1
+            fi
+            echo "$path: $(stat -c %s "$data_dir/$path") bytes from $url"
+            count=$((count + 1))
+          done < "$manifest"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::$manifest lists no files."
+            exit 1
+          fi
+          echo "data_dir=$data_dir" >> "$GITHUB_OUTPUT"
+
       # Short-lived AWS credentials, kept out of the job's environment and passed to the step below.
       - name: Assume the S3 Vectors role
         id: aws-s3-vectors
@@ -153,6 +205,7 @@ jobs:
           AWS_S3_VECTORS_SESSION_TOKEN: ${{ steps.aws-s3-vectors.outputs.aws-session-token }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          DATA_DIR: ${{ steps.data_files.outputs.data_dir }}
         run: |
           rm -rf .spice/data
           # The spicepod loads its own data and names it in `metadata.benchmark_dataset`.
@@ -162,9 +215,15 @@ jobs:
           if [ -n "$SQL_PIPELINE" ]; then
             sql_pipeline_args=(--sql-pipeline "$SQL_PIPELINE")
           fi
+          # The downloaded files, if the spicepod lists any, appear as `data/` in spiced's directory.
+          data_dir_args=()
+          if [ -n "$DATA_DIR" ]; then
+            data_dir_args=(--data-dir "$DATA_DIR")
+          fi
           testoperator run search \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --concurrency 10 \
             "${sql_pipeline_args[@]}" \
+            "${data_dir_args[@]}" \
             --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"
