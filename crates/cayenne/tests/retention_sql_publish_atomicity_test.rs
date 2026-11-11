@@ -1216,6 +1216,21 @@ async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
             vec![2, 3],
             "{name}: resident row gone at the publish"
         );
+        assert_eq!(count_star(&t).await?, 2, "{name}: COUNT(*) at the publish");
+        drop(t);
+
+        // The resident delete is durable with the append: reopened without any
+        // retention filter, the table holds exactly the published generation.
+        let reopened = Arc::new(
+            CayenneTableProviderBuilder::new(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                SessionContext::new().runtime_env(),
+            )
+            .open(name)
+            .await?,
+        );
+        assert_eq!(ids(&reopened).await?, vec![2, 3], "{name}: after reopening");
+        assert_eq!(count_star(&reopened).await?, 2, "{name}: COUNT(*) after reopening");
     }
     Ok(())
 }
