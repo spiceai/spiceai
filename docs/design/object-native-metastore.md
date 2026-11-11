@@ -42,8 +42,10 @@ runs unchanged on a local directory.
   external coordination service or database.
 - **Durability is the destination's.** With an object store, acknowledged
   state survives losing any instance and its disk, and any instance can
-  recover or read it. With a local directory, state is as durable as that
-  disk.
+  recover or read it. A local directory is for development, testing and
+  getting started: it needs no object store or credentials and runs the same
+  code path as a bucket. Its state survives a process crash or kill; survival
+  of an OS crash or power loss is not promised.
 - **The data moves too.** Today a file-mode dataset keeps its Vortex and
   deletion files on the instance's disk, or in S3 Express where configured.
   Here every file a commit references is in the destination before the
@@ -51,16 +53,17 @@ runs unchanged on a local directory.
   instance's disk could not be recovered without that disk. And because a file
   is invisible until a record references it, one conditional write of the
   record commits both; no commit spans local disk and the destination.
+  Decisions 1.11 to 1.14 say how data files are written and found, and
+  decision 1.10 reclaims them like every other object.
 - **Every existing guarantee holds.** Guarded commits are atomic, and so are a
   write across a dataset's partitions and a transaction across tables.
 - **One new guarantee.** A CDC source position commits in the same record as
   the state it covers. Today the two are written separately.
 
-**Scope.** How Cayenne stores data (Vortex files and deletions) is a separate
-design, whose direction is local disk as a cache in front of durable,
-object-backed tiers. This document covers data only where the metastore
-depends on it: a file is durable before a commit references it, and the
-metastore records where each file lives.
+**Scope.** This document covers data files only where the metastore depends on
+them: a file is durable before a commit references it, the metastore records
+where each file lives and which files are live, and files leave storage only by
+rules the metastore can enforce (decisions 1.10 to 1.14).
 
 ### Consistency
 
@@ -162,6 +165,11 @@ reload.
   acknowledgement point.
 - The small-write tier inside the database, once its replacement is measured
   (decision 1.5).
+- The staging directory, its write-ahead file and the copy of every written
+  file (decision 1.11), and every listing of a dataset's files on writes,
+  scans and maintenance (decision 1.12).
+- A second code path for local data: local directories and buckets use one
+  store interface (decision 1.13).
 
 **Delivers, beyond the metastore itself:**
 
@@ -389,7 +397,7 @@ replacement resumes without the old instance's disk. A backfill beside live
 CDC adds one rule: a live change after the backfill's snapshot position wins.
 *Details:* [Source positions and backfill](object-native-metastore-technical.md#source-positions-and-backfill).
 
-**1.10 GC deletes removed objects after a fixed retention, collects uploads
+**1.10 GC deletes removed objects, data files included, after a fixed retention, collects uploads
 that never committed by age on the store's clock, and readers never write.**
 A read returns the object it references or fails the query, so GC's timing
 decides only which long queries can fail, never which rows a query returns.
@@ -440,6 +448,199 @@ deleted object or a query within the retention fails.
   delete an upload the writer thinks young.
 - *Alternative: GC times candidates from the first LIST that saw them.*
   Rejected: GC would remember listings, and a restart restarts every wait.
+
+**Data files follow the same rule.**
+
+- *A record that removes a file retires it.* `RemoveFiles` and `ReplaceFiles`
+  name exactly the files that leave the live set, and `apply` adds them to the
+  retired set, which checkpoint roots carry. A file that a compaction carries is
+  never removed, so files shared between snapshots need no extra rule, as in
+  Delta Lake, DuckLake and Iceberg. T after the sweep first observes a removal,
+  timed in memory, it deletes the file by name, never by a listing or a prefix,
+  then forgets it in one record with its entry and statistics. A restart or
+  takeover restarts every timer from the retired set, which only delays a
+  delete, and finishes an interrupted sweep. No durable timer is needed: the
+  retired set is the durable part.
+- *Every instance polls its heads* about every 10 s ([#16238](https://github.com/spiceai/spiceai/issues/16238)), so S bounds
+  the staleness of a query on any instance, the writer's or another's, and T
+  is sized from it.
+- *One delete path.* No write, rollback or cleanup deletes a data prefix: a
+  failed write deletes its own uploads by name or leaves them to the orphan
+  sweep. Every data delete first checks that no committed entry not yet
+  forgotten names the key. Only a drop and `mode: file_create` delete a folder,
+  the dataset's own.
+- *Batches.* Deletes go up to 1,000 keys per request, and each batch is
+  forgotten in one record.
+- *Drop.* A dropped dataset's folder, and the previous folder after
+  `mode: file_create`, is deleted T after the drop, once no local scan of it
+  runs, by the instance that dropped it or, if that instance stops first, by
+  the next instance that opens the catalog. That fallback ages the drop marker
+  on the opening instance's clock, the one place a machine's clock is used; it
+  is an [open decision](object-native-metastore-technical.md#open-decisions).
+- *Orphans* follow decision 1.12, not T_O: a listing with a one-hour floor,
+  aged against the dataset head's store time. The sweep runs after a commit,
+  so the head is fresh, and no clock object or empty commit is needed. Data files need
+  no writer age check: only the lease holder sweeps, its own record protects
+  its writes, and the lease fences every other writer's commit.
+- *Alternative: local pins and a short grace only.* Rejected: it protects only scans on the writing instance, so a query
+  on another instance, such as the old one during a rolling restart, could
+  lose its files at once.
+
+*Details:* [Data files: retirement and orphans](object-native-metastore-technical.md#data-files-retirement-and-orphans).
+
+**1.11 Staged writes are removed: data files are written once, at their final
+keys, and the commit names them, in one record.** Today an append or a keyed
+write puts its files in a staging folder with a write-ahead file, then copies
+them into the snapshot folder. This decision removes the staging folder, the
+write-ahead file, the copy and the recovery code that finishes an interrupted
+move. Every write puts each data file and deletion vector at a unique key in
+its table's folder, flat, not in a folder per snapshot. The record that names the file is its
+commit. A retry after an unknown outcome writes new keys, so no key is written
+twice.
+Delta Lake, Iceberg, Hudi, Lance, DuckLake and SlateDB all write data files
+this way.
+*Details:* [Writing at final keys](object-native-metastore-technical.md#writing-at-final-keys).
+
+- *A keyed write commits once.* A write that replaces rows, such as an upsert
+  or a CDC burst that updates keys, goes into a new protected snapshot. One
+  record registers the snapshot, its file names, the deletes that hide the rows
+  it replaces, and its source position. Nothing the write does is committed
+  before that record. A crash leaves the whole write or none of it, so recovery
+  has nothing to finish. Its rows become visible to queries only after the
+  record commits, and the source is acknowledged only after it.
+- *A change stream keeps its pipeline.* The next burst writes its files and
+  prepares its record while the current burst commits. It commits only after
+  the current burst's record is accepted, so records commit in source order.
+- *Flat per table; snapshots share files.* Data files are at
+  `data/<table_id>/<write_id>_<n>.vortex` and deletion vectors under
+  `data/<table_id>/deletions/`. A manifest row stores the path relative to the
+  table, and a compaction names the files it carries unchanged in place, in its
+  `ReplaceFiles`, as Iceberg, Delta Lake, DuckLake and Lance do. Nothing needs a
+  snapshot to be a folder: pins, retirement, the writer's record and holds are
+  keyed by commit, file or snapshot id, and the orphan sweep lists the whole
+  data path once either way. The record that removes a file from the live set
+  retires it, and a carried file is never removed (decision 1.10). A
+  partitioned dataset's child tables are proposed under
+  `data/<parent_table_id>/<child_table_id>/`, to be settled in [#16137](https://github.com/spiceai/spiceai/issues/16137). A
+  row written by an earlier build as
+  `<snapshot_id>/<name>` keeps resolving.
+- *Alternative: a folder per snapshot,* as Cayenne keeps today. Rejected,
+  because the folder makes compaction copy data it does not change. Each
+  subset compaction copies:
+  - every file it does not rewrite into the new snapshot's folder, so a pass
+    costs about one copy per file in the table, not per file it compacts;
+  - the files it picked into a scratch folder, only because a scan reads a
+    folder;
+  - the files appended while it encoded, while writers wait.
+
+  On S3 the copies run one request at a time. A server-side copy of 128 MB
+  measured P99 2,235 ms on S3 Standard and 808 ms on S3 Express (n = 1,000 per
+  class, from a client outside the region). Copied files get new keys, so their
+  cached footers and segments go cold, and their statistics are dropped and
+  read again from their footers. Position deletes name their file, so they do
+  not survive a copy: the folder blocks subset compaction of tables with
+  position deletes, and rewriting only the files with deleted rows. Today an
+  append to a partitioned table clones the whole snapshot. Time
+  travel, clones and branching all need files shared by reference, which a
+  folder per snapshot cannot express. The folder's one strength, that a prefix
+  delete removes exactly what one write created, is replaced by deleting by
+  name. Nothing else needs it: no rule that protects a file depends on a
+  folder. None of Iceberg, Delta Lake, DuckLake, Lance, Hudi or Paimon puts
+  data in a folder per version; all share files by reference and delete per
+  file.
+- *Alternative: keep staging and copying.* Correct, but every staged file costs
+  three listings, a write-ahead file, a server-side copy, two deletes and about
+  eight sequential round trips after the upload. The copy time increases with
+  the file size, and it adds to the CDC lag of keyed tables, because the source
+  acknowledgement waits for it. One S3 `CopyObject` request copies at most
+  5 GB; a larger file needs a multipart copy. Rejected.
+- *Alternative: final keys with two commits for a keyed write,* the first for
+  the snapshot and its deletes, the second for its file names. A crash between
+  the two leaves the deletes without their replacement rows, so queries miss
+  those rows until the source sends them again. A fault-injection test showed
+  this. The two commits were needed only while the source was acknowledged after
+  the first one. Rejected.
+- *Alternative: declare each key in the log before its upload,* as Hudi's
+  markers do. It finds orphans without a listing, but adds a head write to
+  every write, and the head is what CDC commits contend on. Rejected:
+  decision 1.12 protects writes in flight without it.
+- *Alternative: S3 Express One Zone `RenameObject`.* It is atomic, it can
+  refuse to replace an existing destination, it takes milliseconds, and it moves
+  no data. It is one request with no per-GB charge, and it has no 5 GB limit.
+  But it works only in S3 Express One Zone directory buckets, not in
+  general-purpose S3 buckets or other stores. It would be a third move protocol
+  for one storage class, and nothing needs a rename once files are written at
+  their final keys. Rejected.
+- *Alternative: final keys on object stores, staging in Cayenne on local
+  disk.* Two protocols to prove, where the local store already writes a temp
+  file and renames it. Rejected.
+- *Alternative: the writer's lease generation in each key,* so a sweep can
+  recognize a fenced writer's upload without a clock. Not adopted: the lease
+  already keeps such an upload out of every commit, and the orphan sweep
+  reclaims it (decision 1.12).
+
+**1.12 The metastore is the only record of a dataset's live files; a listing
+only finds garbage.** Scans, compaction's choice of inputs, sizing, and every
+file list a write records take their files from committed state or from the
+files the writer itself wrote. A manifest that cannot be read is an error,
+never a reason to list. A listing treats "under the prefix" as "committed": with
+files at their final keys, any path that lists would adopt a crashed or fenced
+upload into committed state. Listing also costs requests on every write.
+*Details:* [The live set is committed state](object-native-metastore-technical.md#the-live-set-is-committed-state).
+
+- *Orphans.* An upload that no commit names is an orphan: it never becomes
+  visible. One periodic sweep lists the dataset's data path and deletes an
+  object only when no committed state names it, no write of this process holds
+  it, and it is older than a floor of one hour on the store's clock: the
+  head's `LastModified` against the object's own. It also
+  aborts multipart uploads left unfinished for longer than the floor, because a
+  listing does not show them and S3 Express directory buckets have no lifecycle
+  rule that would.
+- *What protects a write in flight is the writer's record, not the floor.* The
+  writer keeps, in its process, the keys it has written and not committed, and
+  only the lease holder sweeps. The floor is a backstop.
+- *Alternative: the manifest as a mirror of a listing,* rebuilt after each
+  write. Rejected: the listing decides what is live.
+- *Alternative: a floor alone,* as Delta Lake, Iceberg and Lance use. Rejected:
+  an upload that stalls longer than any floor is deleted before its commit, the
+  failure SlateDB documents.
+- *Alternative: intent records in the log.* Rejected in decision 1.11.
+
+**1.13 One object-store interface for every data operation, with a store per
+dataset.** Every read, write, copy, rename, delete and list of a data file goes
+through an `ObjectStore`, for a local directory as for a bucket. Each dataset
+has its own store, scoped to its data path and registered under a URL of its
+own. A local directory is also given to the few host features that need a
+filesystem path: the free-space probe, storage-class detection, snapshot
+export, the `mode: file_create` safety checks and page-cache hints. Local data
+files are flushed as the metastore's local writes are; a local directory is for
+development and testing, so power-loss durability is not qualified. One path removes a class
+of defects in which the object-store branch is the one less tested, and the
+interface itself adds no measurable cost.
+*Details:* [Storage: one store per dataset](object-native-metastore-technical.md#storage-one-store-per-dataset).
+
+- *Alternative: the filesystem on local disk, a store on S3.* Two
+  implementations of every write and lifecycle step. Rejected.
+- *Alternative: one process-wide store router keyed by bucket or by
+  `file://`.* A dataset in the same bucket as a source would share or replace
+  the source's store, and replacing the session's `file://` store changes it
+  for every other reader of local files. Rejected.
+- *Alternative: no local directory on the handle.* A host feature would have
+  to ask a store for free space or a folder to archive, which a bucket does not
+  have. Rejected.
+
+**1.14 The table path in the metastore is the placement record, stored
+relative to the location.** A dataset in the location records
+`datasets/<folder>/data`, which is resolved against `runtime.state.location`
+when it opens, so a copied or restored location stays self-contained. A data
+path outside the location is recorded as given and keeps working where it is;
+it is never moved. Every table entry already holds its path, and a second field
+could disagree with it.
+
+- *Alternative: a location id on each file reference.* Needed only for several
+  data locations, which are out of scope. Rejected for Milestone 1.
+- *Alternative: absolute URLs.* A copy of the location at another URL would
+  read the original's files. Rejected.
 
 ## Milestones 2 and 3
 
@@ -542,5 +743,46 @@ list in the
 
 The surface (the flag, the `cayenne/v1/` folder, defaults, deprecations,
 errors, logs and metrics) is in
-[Enhancement #15760](https://github.com/spiceai/spiceai/issues/15760). Nothing
-in this design adds a user decision beyond `runtime.state.location`.
+[Enhancement #15760](https://github.com/spiceai/spiceai/issues/15760), and the
+surface for data files in the location is in
+[Enhancement #15818](https://github.com/spiceai/spiceai/issues/15818). Nothing
+in this design adds a user decision beyond `runtime.state.location`. With the
+flag (`runtime.params.cayenne_vnext`):
+
+- **With the flag off, Spice behaves as it does without this work.** Every
+  file-mode dataset uses the SQLite metastore, with no other lookup, and Spice
+  never reads the state location for it. A dataset created with the flag on
+  reloads from its source; its folder in the location is left as it is.
+- **With the flag on, a dataset accelerated in the SQLite metastore is
+  refused,** with an error that says to turn the flag off, or to start the
+  dataset once with `mode: file_create`, which reloads it into the
+  object-native metastore. Otherwise a copy left in the location while the flag
+  was off could be served stale. Switching the flag on, off and on again is not
+  supported.
+- **Commit outcomes.** A commit whose outcome is unknown is logged as a warning
+  that names the dataset; the dataset accepts no change until it has read its
+  state back, and the source is not acknowledged meanwhile. A dataset that
+  another instance took over stops writing and keeps answering queries, and
+  this is logged as information, not as an error: it is normal with several
+  instances. A change the dataset's state refuses is a bug; the dataset stops
+  until Spice restarts, with an error line that names it.
+  [Details](object-native-metastore-technical.md#uncertain-writes).
+- **A missing or unreadable data file fails the query** with an error that
+  names the dataset, the file and its data path, and says to start the dataset
+  once with `acceleration.mode: file_create` to reload it from its source.
+  Spice does not reload it on its own.
+  [Details](object-native-metastore-technical.md#readers).
+- **Metrics.** No new metric. Requests to the location are reported in the
+  existing `state_store_*` metrics, with the logs and the data files apart:
+
+  | `feature` | Requests | Series |
+  |---|---|---|
+  | `cayenne_metastore` | The metastore's logs, checkpoints and markers | `state_store_request_duration_ms`, `state_store_conflicts_total`, `state_store_cleanup_deleted_total` |
+  | `cayenne_data` | Data files and deletion vectors of datasets in the location | `state_store_request_duration_ms` only |
+
+  Data and log requests differ in size and number, so one value would let data
+  requests set the latency tail and hide a slow commit. Data files are written
+  once under unique keys, so there is no conflict series, and their
+  reclamation is counted per table in `cayenne_maintenance_reclaimed_*`, so
+  there is no cleanup series either; a constant `0` would read as a
+  measurement. Data outside the location is not counted in `state_store_*`.
