@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::util::pretty::pretty_format_batches;
 use futures::StreamExt;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
@@ -31,6 +32,7 @@ use spicepod::component::runtime::{
     TaskHistoryCapturedContext, TaskHistoryCapturedOutput, TaskHistoryCapturedPlan,
 };
 
+use datafusion_ddl::component_options::{recorded_call_arguments, redact_values};
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 
 use super::{TaskSpan, correlation::TRACE_JOIN_ANCHOR};
@@ -190,10 +192,14 @@ impl TaskHistoryExporter {
         ) || task.starts_with("tool_use::")
     }
 
+    /// `value`, a field of a row of `task`, as task history keeps it. `removed`
+    /// holds the values the row's fields recorded before it took out, and
+    /// gains those this one takes out.
     fn process_context_payload(
         captured_context: &TaskHistoryCapturedContext,
         task: &str,
         value: Arc<str>,
+        removed: &mut Vec<String>,
     ) -> Arc<str> {
         if value.is_empty() || !Self::is_context_task(task) {
             return value;
@@ -201,8 +207,35 @@ impl TaskHistoryExporter {
 
         match captured_context {
             TaskHistoryCapturedContext::Redacted => Arc::clone(&REDACTED_TASK_HISTORY_VALUE_ARC),
-            TaskHistoryCapturedContext::Truncated => Self::truncate_context_payload(value),
-            TaskHistoryCapturedContext::Full => value,
+            TaskHistoryCapturedContext::Truncated => {
+                Self::truncate_context_payload(Self::with_recorded_calls(task, value, removed))
+            }
+            TaskHistoryCapturedContext::Full => Self::with_recorded_calls(task, value, removed),
+        }
+    }
+
+    /// `value`, a field of a row of `task`, without the values in `removed`,
+    /// and with each statement in it that may define a component recorded as
+    /// the `sql` tool records one: in each tool call of a conversation's
+    /// payload, whatever tools the conversation's model has, since a client
+    /// sends a whole conversation back on each turn, and anywhere in a tool's
+    /// input or result. `removed` gains the values that takes out.
+    fn with_recorded_calls(task: &str, value: Arc<str>, removed: &mut Vec<String>) -> Arc<str> {
+        let value: Arc<str> = match redact_values(&value, removed) {
+            Cow::Borrowed(_) => value,
+            Cow::Owned(text) => text.into(),
+        };
+        let recorded = if task.starts_with("tool_use::") {
+            recorded_call_arguments(&value)
+        } else {
+            crate::model::recorded_calls::recorded_by_name(&value)
+        };
+        match recorded {
+            Some((text, taken_out)) => {
+                removed.extend(taken_out);
+                text.into()
+            }
+            None => value,
         }
     }
 
@@ -354,16 +387,22 @@ impl TaskHistoryExporter {
                 Some(span.parent_span_id.to_string().into())
             };
         let task: Arc<str> = extract_attr!(span, "task_override").unwrap_or(span.name.into());
+        // The values the row's input takes out, which its result and error
+        // may repeat.
+        let mut removed = Vec::new();
         let input: Arc<str> = Self::process_context_payload(
             &self.captured_context,
             task.as_ref(),
+            // The last value recorded: a query that fails to parse records
+            // its input again, fail-closed.
             span.attributes
                 .iter()
-                .position(|kv| kv.key.as_str() == "input")
+                .rposition(|kv| kv.key.as_str() == "input")
                 .map_or_else(
                     || "".into(),
                     |idx| span.attributes[idx].value.as_str().into(),
                 ),
+            &mut removed,
         );
 
         // Validated the same way the header that supplies it is, so one id is
@@ -442,8 +481,17 @@ impl TaskHistoryExporter {
         let captured_output: Option<Arc<str>> = extract_attr!(span, "captured_output")
             .map(|output| self.process_output(output, plan_capture))
             .map(|output| {
-                Self::process_context_payload(&self.captured_context, task.as_ref(), output)
+                Self::process_context_payload(
+                    &self.captured_context,
+                    task.as_ref(),
+                    output,
+                    &mut removed,
+                )
             });
+        let error_message = error_message.map(|message| match redact_values(&message, &removed) {
+            Cow::Borrowed(_) => message,
+            Cow::Owned(redacted) => redacted.into(),
+        });
 
         // Remove trace_id and parent_id from `labels`, if they exist (no issue if they don't).
         labels.remove(&Into::<Arc<str>>::into("trace_id"));
@@ -604,6 +652,7 @@ mod tests {
                 &TaskHistoryCapturedContext::Truncated,
                 "nsql",
                 payload,
+                &mut Vec::new(),
             ),
             Arc::<str>::from(format!(
                 "{}{TRUNCATED_TASK_HISTORY_CONTEXT_SUFFIX}",
@@ -622,6 +671,7 @@ mod tests {
                 &TaskHistoryCapturedContext::Full,
                 "nsql",
                 Arc::clone(&payload),
+                &mut Vec::new(),
             ),
             payload
         );
@@ -634,6 +684,7 @@ mod tests {
                 &TaskHistoryCapturedContext::Redacted,
                 "tool_use::table_schema",
                 "{}".into(),
+                &mut Vec::new(),
             ),
             Arc::<str>::from(REDACTED_TASK_HISTORY_VALUE)
         );
@@ -648,8 +699,79 @@ mod tests {
                 &TaskHistoryCapturedContext::Redacted,
                 "sql_query",
                 Arc::clone(&payload),
+                &mut Vec::new(),
             ),
             payload
+        );
+    }
+
+    /// A conversation a client sends back holds the `sql` calls of its earlier
+    /// turns: task history records each as the tool does, in every mode that
+    /// keeps the payload.
+    #[test]
+    fn process_context_payload_records_sql_calls_as_the_tool_does() {
+        let payload: Arc<str> = serde_json::json!({"messages": [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "sql",
+                "arguments": "{\"query\":\"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = 'hunter2')\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "password 'hunter2' refused"},
+        ]})
+        .to_string()
+        .into();
+        let recorded = serde_json::json!({"messages": [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "sql",
+                "arguments": "{\"query\":\"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '<redacted>')\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "password <redacted> refused"},
+        ]});
+
+        for context in [
+            TaskHistoryCapturedContext::Full,
+            TaskHistoryCapturedContext::Truncated,
+        ] {
+            let value = TaskHistoryExporter::process_context_payload(
+                &context,
+                "ai_chat",
+                Arc::clone(&payload),
+                &mut Vec::new(),
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&value)
+                    .expect("the recorded payload is JSON"),
+                recorded,
+                "{context:?}"
+            );
+        }
+    }
+
+    /// A tool's input is recorded by what it holds, whatever the tool's name,
+    /// and its result is kept without the values the input gave up.
+    #[test]
+    fn process_context_payload_records_a_tools_input_and_its_result() {
+        let mut removed = Vec::new();
+        let input = TaskHistoryExporter::process_context_payload(
+            &TaskHistoryCapturedContext::Full,
+            "tool_use::peer2__query",
+            Arc::from(
+                r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = 'hunter2')"}"#,
+            ),
+            &mut removed,
+        );
+        assert_eq!(
+            input,
+            Arc::<str>::from(
+                r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '<redacted>')"}"#
+            )
+        );
+        let output = TaskHistoryExporter::process_context_payload(
+            &TaskHistoryCapturedContext::Full,
+            "tool_use::peer2__query",
+            Arc::from(r#"[{"type":"text","text":"refused: the password hunter2"}]"#),
+            &mut removed,
+        );
+        assert_eq!(
+            output,
+            Arc::<str>::from(r#"[{"type":"text","text":"refused: the password <redacted>"}]"#)
         );
     }
 
@@ -668,6 +790,7 @@ mod tests {
                 &TaskHistoryCapturedContext::Redacted,
                 "ai_decision",
                 payload,
+                &mut Vec::new(),
             ),
             Arc::<str>::from(REDACTED_TASK_HISTORY_VALUE),
             "an evaluation request must not reach task history unredacted"

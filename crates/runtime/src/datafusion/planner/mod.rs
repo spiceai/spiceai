@@ -109,6 +109,10 @@ pub struct PlannerContext {
     /// Used to produce a [`datafusion_ddl::DdlExtensionNode`] for the LIKE path,
     /// bypassing the standard analyzer rule.
     pub ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
+
+    /// Applies the statements that define, change, and remove Spicepod
+    /// datasets and catalogs, once the runtime installed it.
+    pub component_ddl: Option<Arc<dyn datafusion_ddl::component_ddl::ComponentDdlHandler>>,
 }
 
 impl PlannerContext {
@@ -272,6 +276,14 @@ pub async fn create_logical_plan_from_statement(
     ctx: &PlannerContext,
 ) -> DFResult<LogicalPlan> {
     if let Statement::Statement(ref sql_stmt) = statement {
+        // A statement naming a table of the `spice` catalog defines a dataset.
+        if let Some(handler) = &ctx.component_ddl
+            && let Some(plan) =
+                crate::datafusion::component_planner::plan_dataset_statement(sql_stmt, handler)
+                    .await?
+        {
+            return Ok(plan);
+        }
         match sql_stmt.as_ref() {
             SQLStatement::CreateTable(ct) if ct.like.is_some() => {
                 let has_columns = !ct.columns.is_empty();

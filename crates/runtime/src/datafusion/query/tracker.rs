@@ -51,6 +51,12 @@ pub(crate) struct QueryTracker {
     pub(crate) query_duration_timer: Instant,
     pub(crate) query_execution_duration_timer: Instant,
     pub(crate) datasets: Arc<HashSet<TableReference>>,
+    /// The values the query's recorded text took out of its SQL, which the
+    /// error it is recorded with must not hold either.
+    pub(crate) redacted_values: Arc<[String]>,
+    /// The query's SQL, when it has one: recorded again, fail-closed, when it
+    /// does not parse.
+    pub(crate) sql: Option<Arc<str>>,
 }
 
 impl QueryTracker {
@@ -63,7 +69,41 @@ impl QueryTracker {
         // The failure is named by `finish` below, which collapses the message to
         // one record and picks the level from `error_code`. Naming it here too
         // would log a memory-pool breakdown across as many lines as it has
-        // consumers, which a collector cannot group.
+        // consumers, which a collector cannot group. A parser error quotes the
+        // token it stopped at, which can be a value the recorded text took out.
+        let mut error_message = match datafusion_ddl::component_options::redact_values(
+            &error_message,
+            &self.redacted_values,
+        ) {
+            std::borrow::Cow::Borrowed(_) => error_message,
+            std::borrow::Cow::Owned(redacted) => redacted,
+        };
+        // SQL that does not parse may be a mistyped definition, `CRATE TABLE`,
+        // whose credentials the recorded text kept: whatever its first word,
+        // it is recorded again as one that may define a component is.
+        if error_code == ErrorCode::SyntaxError
+            && let Some(sql) = &self.sql
+        {
+            let recorded = datafusion_ddl::component_options::recorded_unparsed_statement(
+                sql,
+                &datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
+                &|_| false,
+            );
+            if let std::borrow::Cow::Owned(text) = &recorded.text {
+                let span = tracing::Span::current();
+                if span
+                    .metadata()
+                    .is_some_and(|metadata| metadata.name() == "sql_query")
+                {
+                    span.record("input", text.as_str());
+                }
+            }
+            if let std::borrow::Cow::Owned(redacted) =
+                datafusion_ddl::component_options::redact_values(&error_message, &recorded.removed)
+            {
+                error_message = redacted;
+            }
+        }
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
         self.finish(request_context, "");
@@ -369,6 +409,8 @@ mod tests {
                     .map(|name| TableReference::bare(*name))
                     .collect(),
             ),
+            redacted_values: Arc::from(Vec::new()),
+            sql: None,
         };
 
         tracing::subscriber::with_default(subscriber, || match error {

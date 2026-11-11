@@ -33,6 +33,7 @@ use tokio::time::Instant;
 use tracing_futures::Instrument;
 
 use crate::model::metrics::{handle_metrics, handle_token_metrics, request_labels_responses};
+use crate::model::recorded_calls;
 use crate::model::responses_tool_history::replay_spice_tool_calls;
 
 use std::sync::{Arc, Mutex};
@@ -129,7 +130,9 @@ impl Responses for ResponsesWrapper {
                 "Model ID must be specified in the request".into(),
             ));
         };
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=true, model = %model_id, input = %serde_json::to_string(&req).unwrap_or_default());
+        let tools = recorded_calls::current_tools();
+        let input = recorded_calls::recorded(&req, tools.as_ref()).unwrap_or_default();
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=true, model = %model_id, input = %input);
 
         if let Some(metadata) = &req.metadata {
             tracing::info!(target: "task_history", metadata = ?metadata);
@@ -151,6 +154,7 @@ impl Responses for ResponsesWrapper {
                     span.clone(),
                     self.public_name.clone(),
                     labels,
+                    tools,
                 )))
             }
             Err(e) => {
@@ -176,7 +180,9 @@ impl Responses for ResponsesWrapper {
         };
 
         let req = self.prepare_req(req);
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=false, model = %model_id, input = %serde_json::to_string(&req).unwrap_or_default());
+        let tools = recorded_calls::current_tools();
+        let input = recorded_calls::recorded(&req, tools.as_ref()).unwrap_or_default();
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=false, model = %model_id, input = %input);
 
         let labels = request_labels_responses(&req);
         if let Some(metadata) = &req.metadata {
@@ -197,7 +203,7 @@ impl Responses for ResponsesWrapper {
                     handle_token_metrics(usage.input_tokens, usage.output_tokens, &labels);
                 }
 
-                match serde_json::to_string(&captured_output) {
+                match recorded_calls::recorded(&captured_output, tools.as_ref()) {
                     Ok(output) => {
                         tracing::info!(target: "task_history", parent: &span, captured_output = %output);
                     }
@@ -232,6 +238,8 @@ struct TracedResponseStream<S> {
     model_public_name: String,
     started: Instant,
     labels: Vec<KeyValue>,
+    /// The tools the call's tool calls are recorded with.
+    tools: Option<recorded_calls::ConversationTools>,
 }
 
 impl<S> TracedResponseStream<S>
@@ -243,6 +251,7 @@ where
         span: tracing::Span,
         model_public_name: String,
         labels: Vec<KeyValue>,
+        tools: Option<recorded_calls::ConversationTools>,
     ) -> Self {
         Self {
             inner,
@@ -251,6 +260,7 @@ where
             model_public_name,
             started: Instant::now(),
             labels,
+            tools,
         }
     }
 }
@@ -325,7 +335,7 @@ impl<S> Drop for TracedResponseStream<S> {
         if let Ok(output) = self.accumulated_response.lock() {
             let _guard = self.span.enter();
             if let Some(response) = &*output
-                && let Ok(resp_str) = serde_json::to_string(response)
+                && let Ok(resp_str) = recorded_calls::recorded(response, self.tools.as_ref())
             {
                 tracing::info!(target: "task_history", captured_output = %resp_str);
             }

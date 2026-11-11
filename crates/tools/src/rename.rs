@@ -71,6 +71,10 @@ impl SpiceModelTool for RenamedTool {
         self.tool.call(arg).await
     }
 
+    fn recorded_arguments<'a>(&self, arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
+        self.tool.recorded_arguments(arg)
+    }
+
     #[cfg(feature = "mcp")]
     async fn as_mcp_proxy(&self) -> Option<&dyn crate::McpProxy> {
         self.tool.as_mcp_proxy().await
@@ -100,6 +104,8 @@ mod tests {
 
     struct InnerTool {
         strict: Option<bool>,
+        /// Whether the tool records its arguments without their credential.
+        redacts: bool,
         #[cfg(feature = "mcp")]
         proxy: Option<StubProxy>,
     }
@@ -111,6 +117,7 @@ mod tests {
         fn answering(strict: bool) -> Arc<dyn SpiceModelTool> {
             Arc::new(Self {
                 strict: Some(strict),
+                redacts: true,
                 #[cfg(feature = "mcp")]
                 proxy: Some(StubProxy),
             })
@@ -122,6 +129,7 @@ mod tests {
         fn silent() -> Arc<dyn SpiceModelTool> {
             Arc::new(Self {
                 strict: None,
+                redacts: false,
                 #[cfg(feature = "mcp")]
                 proxy: None,
             })
@@ -148,6 +156,17 @@ mod tests {
 
         async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Value::String(format!("inner called with {arg}")))
+        }
+
+        fn recorded_arguments<'a>(&self, arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
+            if self.redacts {
+                (
+                    Cow::Owned(arg.replace("hunter2", "<redacted>")),
+                    vec!["hunter2".to_string()],
+                )
+            } else {
+                (Cow::Borrowed(arg), Vec::new())
+            }
         }
 
         #[cfg(feature = "mcp")]
@@ -179,6 +198,11 @@ mod tests {
             renamed.call("x").await.expect("the inner call succeeds"),
             inner.call("x").await.expect("the inner call succeeds")
         );
+        assert_eq!(
+            renamed.recorded_arguments("pg_pass = hunter2"),
+            inner.recorded_arguments("pg_pass = hunter2"),
+            "recorded_arguments() must forward the inner tool's recording, not the arguments as sent"
+        );
         #[cfg(feature = "mcp")]
         assert_eq!(
             renamed.as_mcp_proxy().await.is_some(),
@@ -200,6 +224,7 @@ mod tests {
         // while the fixture's answers differ from the defaults a non-forwarding
         // wrapper would return; assert that here so it cannot pass vacuously.
         assert_eq!(inner.strict(), Some(true));
+        assert_eq!(inner.recorded_arguments("hunter2").0, "<redacted>");
         #[cfg(feature = "mcp")]
         assert!(inner.as_mcp_proxy().await.is_some());
 

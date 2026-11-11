@@ -94,7 +94,7 @@ use datafusion::execution::SessionState;
 use datafusion::prelude::SessionContext;
 
 use async_stream::stream;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 
 use super::{
     SPICE_RUNTIME_SCHEMA,
@@ -103,6 +103,7 @@ use super::{
 };
 
 use super::managed_runtime;
+use crate::component_ddl::RunningStatement;
 use crate::datafusion::{
     DataFusion,
     query::cache::RequestCacheManager,
@@ -285,6 +286,9 @@ pub struct Query {
     planning_session: Option<Box<SessionState>>,
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
+    /// The SQL as task history and the list of running queries record it,
+    /// when the query has SQL: see [`DataFusion::recorded_statement`].
+    recorded_text: Option<Arc<str>>,
     tracker: Option<QueryTracker>,
     #[expect(
         clippy::struct_field_names,
@@ -499,10 +503,7 @@ impl Query {
             }
             _ => (QueryTimeoutState::default(), None),
         };
-        let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => Arc::clone(sql),
-            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
-        };
+        let sql_preview = Self::sql_preview(self.recorded_text.as_ref());
         let active_query_guard = self.df.query_cancel_registry().register(
             self.query_id,
             sql_preview.as_ref(),
@@ -519,8 +520,25 @@ impl Query {
         }
     }
 
+    /// The query as task history records it: SQL that may define a component
+    /// has every value that may be a secret taken out.
+    fn recorded_input(&self) -> std::borrow::Cow<'_, str> {
+        match &self.recorded_text {
+            Some(text) => std::borrow::Cow::Borrowed(text),
+            None => std::borrow::Cow::Owned(self.sql.to_string()),
+        }
+    }
+
+    /// The query as the list of running queries shows it, given its
+    /// `recorded_text`: a function of the field alone, so it can be read after
+    /// other fields have moved out of the query.
+    fn sql_preview(recorded_text: Option<&Arc<str>>) -> Arc<str> {
+        recorded_text.map_or_else(|| Arc::from("<logical plan>"), Arc::clone)
+    }
+
     fn query_spans(&self, request_context: &RequestContext) -> QuerySpans {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+        let input = self.recorded_input();
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %input, runtime_query = false);
         let trace_span = correlation::begin_task_trace(&span, request_context);
         QuerySpans { span, trace_span }
     }
@@ -877,7 +895,7 @@ impl Query {
             target: "task_history",
             tracing::Level::INFO,
             "sql_query",
-            input = %self.sql,
+            input = %self.recorded_input(),
             runtime_query = false,
             distributed = true,
             job_id = %job_id,
@@ -918,7 +936,7 @@ impl Query {
             target: "task_history",
             tracing::Level::INFO,
             "sql_query",
-            input = %self.sql,
+            input = %self.recorded_input(),
             runtime_query = false,
             distributed = true,
             job_id = %job_id,
@@ -961,10 +979,7 @@ impl Query {
         let tracker = self.tracker;
         let results_cache_mode = self.results_cache_mode;
         let query_start = std::time::Instant::now();
-        let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => Arc::clone(sql),
-            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
-        };
+        let sql_preview = Self::sql_preview(self.recorded_text.as_ref());
 
         // Create session for this job. The
         // `SpiceRequestContextConfig` extension propagates the originating
@@ -1407,10 +1422,7 @@ impl Query {
 
         // Registered in `run` before the results-cache probe. The SQL preview
         // is owned here before moving `self.sql` into the planning match.
-        let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => Arc::clone(sql),
-            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
-        };
+        let sql_preview = Self::sql_preview(self.recorded_text.as_ref());
         let skip_query_admission = matches!(
             self.runtime_binding,
             QueryRuntimeBinding::CurrentRuntimeUngated | QueryRuntimeBinding::QueryRuntimeUngated
@@ -2022,16 +2034,49 @@ impl Query {
                     inner_span.clone(),
                 );
 
+                // A statement that defines, changes, or removes a dataset or
+                // catalog cannot stop partway once it runs, so neither the
+                // query timeout nor a cancel request stops it: its client gets
+                // its real outcome, and a cancel request is told it cannot
+                // cancel it. A cancel, a timeout, or a client that left before
+                // this point stops it here, before it runs.
+                let running_statement = RunningStatement::of(&plan);
+                let (stream_cancel_token, stream_timeout_state, timeout_timer_guard) =
+                    match running_statement {
+                        Some(_) => {
+                            active_query_guard.refuse_cancellation();
+                            drop(timeout_timer_guard);
+                            Self::ensure_not_cancelled(
+                                &query_cancel_token,
+                                &query_id_str,
+                                &timeout_state,
+                            )?;
+                            (
+                                tokio_util::sync::CancellationToken::new(),
+                                QueryTimeoutState::default(),
+                                None,
+                            )
+                        }
+                        None => (
+                            query_cancel_token.clone(),
+                            timeout_state.clone(),
+                            timeout_timer_guard,
+                        ),
+                    };
+
                 // Wrap with cancellation observation so that cancelling the
                 // query (via HTTP `/v1/sql/{id}/cancel`, the custom Flight
                 // `CancelQuery` action, or client disconnect) terminates the
-                // stream with a clear error. The active-query registry guard is held by the
-                // wrapped stream so deregistration occurs on drop.
+                // stream with a clear error; a statement that runs to its end
+                // passes a token nothing cancels and no deadline, which the
+                // stream would otherwise enforce itself. The active-query
+                // registry guard is held by the wrapped stream so
+                // deregistration occurs on drop.
                 let final_stream = attach_cancellation_to_stream(
                     final_stream,
-                    query_cancel_token.clone(),
+                    stream_cancel_token,
                     Arc::clone(&query_id_str),
-                    timeout_state.clone(),
+                    stream_timeout_state,
                     // Bundle the admission permit and the timeout-timer guard
                     // with the active-query guard so ALL release exactly when
                     // the result stream is fully drained (completion, error, or
@@ -2043,16 +2088,20 @@ impl Query {
                     (active_query_guard, admission_permit, timeout_timer_guard),
                 );
 
-                Ok(QueryResult::new(
-                    attach_query_tracker_to_stream(
-                        inner_span,
-                        Arc::clone(&request_context),
-                        tracker,
-                        final_stream,
-                    ),
-                    cache_manager.cache_status,
-                )
-                .with_physical_plan(physical_plan_for_result))
+                let stream = attach_query_tracker_to_stream(
+                    inner_span,
+                    Arc::clone(&request_context),
+                    tracker,
+                    final_stream,
+                );
+                let stream = match running_statement {
+                    Some(statement) => {
+                        run_to_end(stream, statement, Arc::clone(&request_context))
+                    }
+                    None => stream,
+                };
+                Ok(QueryResult::new(stream, cache_manager.cache_status)
+                    .with_physical_plan(physical_plan_for_result))
             }
             .instrument(span.clone())
             .instrument(trace_span.clone());
@@ -2113,6 +2162,7 @@ impl Query {
             planning_session: None,
             df: Arc::clone(df),
             sql: QueryMethod::Plan(Box::new(plan)),
+            recorded_text: None,
             tracker: None,
             query_id: builder::new_query_id(),
             cancellation_token: None,
@@ -2267,7 +2317,8 @@ impl Query {
 
     fn handle_schema_error(self, request_context: &RequestContext, e: &DataFusionError) {
         // If there is an error getting the schema, we still want to track it in task history
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+        let input = self.recorded_input();
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %input, runtime_query = false);
         let trace_span = correlation::begin_task_trace(&span, request_context);
         let error_code = ErrorCode::from(e);
         let _trace = trace_span.enter();
@@ -2394,6 +2445,40 @@ fn attach_query_tracker_to_stream(
         schema,
         updated_stream.instrument(span),
     ))
+}
+
+/// Reads `stream`, the result of `statement`, to its end on a task of its own,
+/// started by the first read of the stream returned. The statement changes a
+/// dataset or catalog and cannot stop partway, so a client that leaves does not
+/// stop it, and its record holds what it did; a client that left before it
+/// ended is not told, so its outcome is logged. The task runs as the request,
+/// on the runtime the statement was planned on, rather than on whichever
+/// runtime reads the result first, such as the HTTP server's. The result, one
+/// row, is held until it is read.
+fn run_to_end(
+    stream: SendableRecordBatchStream,
+    statement: RunningStatement,
+    request_context: Arc<RequestContext>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let runtime = Handle::current();
+    let result = futures::stream::once(async move {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        runtime.spawn(request_context.scope(async move {
+            let result = stream.try_collect::<Vec<RecordBatch>>().await;
+            if let Err(unread) = sender.send(result) {
+                statement.log_unread_outcome(&unread);
+            }
+        }));
+        receiver.await.unwrap_or_else(|_| {
+            Err(DataFusionError::Execution(
+                "The statement stopped before it finished; the Spice log says why.".to_string(),
+            ))
+        })
+    })
+    .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)))
+    .try_flatten();
+    Box::pin(RecordBatchStreamAdapter::new(schema, result))
 }
 
 /// Batch view used by [`QueryTrackerStream`] for owned and Arc-shared items.
@@ -4326,7 +4411,10 @@ mod tests {
             .find(|info| info.query_id == query_id)
             .map(|info| info.owner)
             .expect("the registered query should expose its owning scope");
-        assert!(registry.cancel_owned(query_id, &owner));
+        assert_eq!(
+            registry.cancel_owned(query_id, &owner),
+            super::registry::CancelOutcome::Cancelled
+        );
         assert!(cancel_token.is_cancelled());
         let cancellation = cached_query
             .data
@@ -5898,6 +5986,8 @@ mod tests {
             query_duration_timer: tokio::time::Instant::now(),
             query_execution_duration_timer: tokio::time::Instant::now(),
             datasets: Arc::new(HashSet::new()),
+            redacted_values: Arc::from(Vec::new()),
+            sql: None,
         };
         let mut result = assemble_cached_query_result(
             QueryResult::new(
@@ -5959,6 +6049,8 @@ mod tests {
             query_duration_timer: tokio::time::Instant::now(),
             query_execution_duration_timer: tokio::time::Instant::now(),
             datasets: Arc::new(HashSet::new()),
+            redacted_values: Arc::from(Vec::new()),
+            sql: None,
         };
         let result = assemble_cached_query_result(
             QueryResult::from_cached_raw(
@@ -6027,6 +6119,8 @@ mod tests {
             query_duration_timer: tokio::time::Instant::now(),
             query_execution_duration_timer: tokio::time::Instant::now(),
             datasets: Arc::new(HashSet::new()),
+            redacted_values: Arc::from(Vec::new()),
+            sql: None,
         };
         let mut result = assemble_cached_query_result(
             QueryResult::from_cached_raw(
@@ -6160,6 +6254,8 @@ mod tests {
             query_duration_timer: tokio::time::Instant::now(),
             query_execution_duration_timer: tokio::time::Instant::now(),
             datasets: Arc::new(HashSet::new()),
+            redacted_values: Arc::from(Vec::new()),
+            sql: None,
         };
         let stream = attach_query_tracker_to_stream(
             tracing::info_span!("sql_query"),

@@ -187,6 +187,9 @@ async fn api_key_auth(secrets: &Secrets, api_key_auth: &SpicepodApiKeyAuth) -> A
             ApiKey::ReadWrite { key: _ } => ApiKey::ReadWrite {
                 key: secret_key.to_string(),
             },
+            ApiKey::Admin { key: _ } => ApiKey::Admin {
+                key: secret_key.to_string(),
+            },
         };
 
         keys.push(key);

@@ -15,24 +15,41 @@ limitations under the License.
 */
 
 //! The connection string of a `DuckLake` metadata database, with its password
-//! held apart.
+//! held apart. `DuckDB`'s `postgres` and `mysql` extensions repeat the path
+//! they attach in every error that connecting to the database raises, whether
+//! a statement attaches it or a query reconnects later, so the password goes
+//! to the database through a `DuckDB` secret, which they read but never print.
 
 use std::ops::Range;
 
-/// The database a metadata connection string reaches.
+/// The database a metadata connection string reaches, whose extension reads a
+/// password from a `DuckDB` secret of the same type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataDatabase {
     Postgres,
     Mysql,
 }
 
+impl MetadataDatabase {
+    /// The `DuckDB` extension that attaches the database, which is also the
+    /// type of the secret it reads.
+    #[must_use]
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Mysql => "mysql",
+        }
+    }
+}
+
 /// A `DuckLake` metadata connection string, as `ducklake_connection_string`
 /// sets it, with its password held apart.
 #[derive(PartialEq, Eq)]
 pub struct MetadataConnection {
-    /// The connection string without its password.
+    /// What `ATTACH 'ducklake:…'` names: the connection string without its
+    /// password.
     pub path: String,
-    /// The password, and the database it is for.
+    /// The password, and the database whose extension reads it from a secret.
     pub password: Option<(MetadataDatabase, String)>,
 }
 
@@ -53,7 +70,7 @@ impl std::fmt::Debug for MetadataConnection {
 }
 
 /// Why a `PostgreSQL` or `MySQL` metadata connection string cannot be read:
-/// its password could not be held apart from the rest of it.
+/// its password could not be held apart, so it is not attached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unreadable {
     pub database: MetadataDatabase,
@@ -65,7 +82,8 @@ impl MetadataConnection {
     /// Split `connection_string`. The prefix that names the database is read
     /// as `DuckDB` reads it: in any case, by the extension's name or alias. A
     /// `PostgreSQL` string may be `key = value` pairs or a URI, which is
-    /// rewritten as pairs; a `MySQL` string may be pairs. Any other string,
+    /// rewritten as pairs, since the extension puts a secret's fields in front
+    /// of the path as pairs; a `MySQL` string may be pairs. Any other string,
     /// and one without a password, is kept whole.
     ///
     /// # Errors
@@ -434,7 +452,7 @@ mod tests {
 
     /// A password emptied by a later password pair leaves the string with
     /// neither: the database reads the empty one, and the earlier one is no
-    /// less a secret. With no password to hold apart, none is given.
+    /// less a secret. With no secret to give, none is given.
     #[test]
     fn a_password_emptied_later_leaves_the_string() {
         for (s, path) in [
@@ -512,7 +530,7 @@ mod tests {
     }
 
     /// A `PostgreSQL` or `MySQL` string that cannot be read is refused, saying
-    /// why, rather than kept whole, password included.
+    /// why, rather than attached whole, password included.
     #[test]
     fn an_unreadable_string_is_refused() {
         for (s, database, reason) in [

@@ -45,6 +45,15 @@ pub trait SpiceModelTool: Sync + Send {
     fn parameters(&self) -> Option<Value>;
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
+    /// `arg`, this tool's arguments, as task history may record them, with the
+    /// values taken out of them, which are taken out of an error a call fails
+    /// with too. Arguments that can carry a credential, as a SQL statement that
+    /// defines a dataset does, are recorded without it; others as sent. A tool
+    /// that calls another records that tool's arguments as that tool does.
+    fn recorded_arguments<'a>(&self, arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
+        (Cow::Borrowed(arg), Vec::new())
+    }
+
     /// If the tool is a proxy around an MCP tool, this method should return the proxy. Otherwise, it should return None.
     ///
     /// This enables direct pass through of MCP tool calls.

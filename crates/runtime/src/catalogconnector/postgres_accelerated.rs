@@ -175,7 +175,8 @@ fn synthesized_dataset_name(catalog_name: &str, schema_name: &str, table_name: &
     // (see `escape_name_component`) -- that, not the escaping alone, is what
     // makes the name injective.
     format!(
-        "__catalog_accel_{}__{}__{}",
+        "{}{}__{}__{}",
+        runtime_datafusion::CATALOG_ACCELERATION_DATASET_PREFIX,
         escape_name_component(catalog_name),
         escape_name_component(schema_name),
         escape_name_component(table_name)

@@ -216,6 +216,18 @@ impl QueryBuilder {
 
     #[must_use]
     pub fn build(self) -> Query {
+        // The text task history and the list of running queries record, once
+        // for every place that records it.
+        let sql = match &self.method {
+            SqlOrPlan::Sql(sql) | SqlOrPlan::Plan(_, sql) => sql,
+        };
+        let recorded = self.df.recorded_statement(sql);
+        let recorded_text: Arc<str> = match recorded.text {
+            std::borrow::Cow::Borrowed(_) => Arc::clone(sql),
+            std::borrow::Cow::Owned(text) => Arc::from(text),
+        };
+        let redacted_values: Arc<[String]> = Arc::from(recorded.removed);
+
         // The tracker is the only emitter of the query metrics. Background
         // cache warming skips it so replay does not inflate query_count.
         // `runtime.task_history.enabled` only controls what a built tracker reports.
@@ -234,6 +246,8 @@ impl QueryBuilder {
             query_duration_timer: Instant::now(),
             query_execution_duration_timer: Instant::now(),
             datasets: Arc::new(HashSet::default()),
+            redacted_values,
+            sql: Some(Arc::clone(sql)),
         });
 
         let query_method = match self.method {
@@ -254,6 +268,7 @@ impl QueryBuilder {
         Query {
             df: Arc::clone(&self.df),
             sql: query_method,
+            recorded_text: Some(recorded_text),
             tracker,
             query_id: self.query_id,
             cancellation_token: self.cancellation_token,

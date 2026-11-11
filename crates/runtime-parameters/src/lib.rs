@@ -74,15 +74,27 @@ pub enum Diagnostics {
     Suppress,
 }
 
+/// How a component reads one of its user's parameter keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParameterKey {
+    /// The component reads the parameter under this name.
+    Accepted(String),
+    /// A parameter that is no longer read, which the component that owns it
+    /// reports.
+    Retired,
+    /// No parameter has this name; `suggestion` is the closest one.
+    Unsupported { suggestion: Option<String> },
+    /// The parameter exists, but only with the component's prefix.
+    MustBePrefixed { full_prefix: String },
+    /// The parameter exists, but only without the component's prefix.
+    MustNotBePrefixed { full_prefix: String },
+}
+
 impl Parameters {
-    fn validate_and_format_key(
-        all_params: &[ParameterSpec],
-        prefix: &'static str,
-        key: &str,
-        component_name: &str,
-        diagnostics: Diagnostics,
-    ) -> Option<String> {
-        let report = diagnostics == Diagnostics::Report;
+    /// How a component with `all_params` and `prefix` reads the user's
+    /// parameter `key`: under which name, or why it ignores it.
+    #[must_use]
+    pub fn classify_key(all_params: &[ParameterSpec], prefix: &str, key: &str) -> ParameterKey {
         let full_prefix = format!("{prefix}_");
         let mut key_to_use = key;
         let mut prefix_removed = false;
@@ -98,7 +110,7 @@ impl Parameters {
             .iter()
             .any(|p| p.is_retired() && (p.display_name(prefix) == key || p.name == key))
         {
-            return None;
+            return ParameterKey::Retired;
         }
 
         // Find the non-deprecated spec matching the unprefixed key name
@@ -114,48 +126,72 @@ impl Parameters {
 
         // If no match found for unprefixed key, check for exact match on full key
         if spec.is_none() && all_params.iter().any(|p| p.name == key) {
-            return Some(key.to_string());
+            return ParameterKey::Accepted(key.to_string());
         }
 
         let Some(spec) = spec else {
-            if report {
-                let suggestion = closest_param_suggestion(all_params, prefix, key);
-                if let Some(candidate) = suggestion {
-                    tracing::warn!(
-                        "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
-                    );
-                } else {
-                    tracing::warn!(
-                        "Ignoring parameter `{key}`: not supported for {component_name}."
-                    );
-                }
-            }
-            return None;
+            return ParameterKey::Unsupported {
+                suggestion: closest_param_suggestion(all_params, prefix, key),
+            };
         };
 
         if !prefix_removed && spec.r#type.is_prefixed() {
-            if report {
-                tracing::warn!(
-                    "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
-                );
-            }
-            return None;
+            return ParameterKey::MustBePrefixed { full_prefix };
         }
 
         if prefix_removed && !spec.r#type.is_prefixed() {
             // Allow if there's a deprecated spec for backwards compat
             if deprecated_spec.is_some() {
-                return Some(key_to_use.to_string());
+                return ParameterKey::Accepted(key_to_use.to_string());
             }
-            if report {
-                tracing::warn!(
-                    "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
-                );
-            }
-            return None;
+            return ParameterKey::MustNotBePrefixed { full_prefix };
         }
 
-        Some(key_to_use.to_string())
+        ParameterKey::Accepted(key_to_use.to_string())
+    }
+
+    fn validate_and_format_key(
+        all_params: &[ParameterSpec],
+        prefix: &'static str,
+        key: &str,
+        component_name: &str,
+        diagnostics: Diagnostics,
+    ) -> Option<String> {
+        let report = diagnostics == Diagnostics::Report;
+        match Self::classify_key(all_params, prefix, key) {
+            ParameterKey::Accepted(name) => Some(name),
+            ParameterKey::Retired => None,
+            ParameterKey::Unsupported { suggestion } => {
+                if report {
+                    if let Some(candidate) = suggestion {
+                        tracing::warn!(
+                            "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Ignoring parameter `{key}`: not supported for {component_name}."
+                        );
+                    }
+                }
+                None
+            }
+            ParameterKey::MustBePrefixed { full_prefix } => {
+                if report {
+                    tracing::warn!(
+                        "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
+                    );
+                }
+                None
+            }
+            ParameterKey::MustNotBePrefixed { full_prefix } => {
+                if report {
+                    tracing::warn!(
+                        "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// # Errors

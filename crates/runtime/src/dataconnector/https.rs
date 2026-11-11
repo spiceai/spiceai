@@ -2008,8 +2008,10 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
         ParameterSpec::component(TLS_CLIENT_KEY).secret()
             .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
+        // Secret: headers carry credentials, such as an `Authorization` header.
         ParameterSpec::runtime("http_headers")
-            .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers."),
+            .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers.")
+            .secret(),
         // Validation happens via `ErrorResponseAction::parse`, which trims and is
         // case-insensitive. `one_of` would match in `Parameters::try_new` and reject
         // " error " before the parser ever saw it, so we don't use it here.

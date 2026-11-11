@@ -136,13 +136,15 @@ impl StateStoreMetrics {
     }
 
     fn publish_counters_at_zero(&self) {
-        for feature in StateFeature::ALL
-            .into_iter()
-            .filter_map(StateFeature::metric_label)
-        {
-            let labels = feature_labels(feature);
+        for feature in StateFeature::ALL {
+            let Some(label) = feature.metric_label() else {
+                continue;
+            };
+            let labels = feature_labels(label);
             self.conflicts.add(0, &labels);
-            self.cleanup_deleted.add(0, &labels);
+            if feature.reports_cleanup() {
+                self.cleanup_deleted.add(0, &labels);
+            }
         }
     }
 
@@ -600,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn both_counters_are_published_at_zero_for_every_metered_feature() {
+    fn counters_are_published_at_zero_for_every_metered_feature() {
         let recorded = Recorded::new();
         recorded.metrics.publish_counters_at_zero();
 
@@ -622,7 +624,16 @@ mod tests {
                 );
             }
         }
-        assert_eq!(series.len(), 8, "no series for an unmetered feature");
+        assert_eq!(
+            series.get("state_store_conflicts_total{feature=sql_definitions}"),
+            Some(&0)
+        );
+        assert_eq!(
+            series.get("state_store_cleanup_deleted_total{feature=sql_definitions}"),
+            None,
+            "cleanup never deletes the SQL definitions"
+        );
+        assert_eq!(series.len(), 9, "no series for an unmetered feature");
     }
 
     #[test]

@@ -24,5 +24,6 @@ target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spic
 | `live/` | Scripts that call a real provider with a static credential (`openai_api_key`, `anthropic_auth_token`, `databricks_token`) from the environment. The default run skips them; E2E Test CI's `spicescript: live` job mints each token from its GitHub OIDC token right before running them, since the token expires about 5 minutes later. |
 | `corpus/` | SQL corpora that `corpus` steps run, and the Python scripts that generate the literal matrices. |
 | `seed/` | Source fixtures loaded by `source-exec: { file }`. |
+| `mcp/` | MCP servers that a script starts as a tool (`from: mcp:python3`, `mcp_args: ${script.dir}/mcp/<file>`), standing in for another service. |
 | `slt/`, `slt-sqlite/` | sqllogictest files. |
 | `recordings/` | Run times per script (`durations.json`), in every directory with scripts, and the expected failures (`expected-failures.json`). |

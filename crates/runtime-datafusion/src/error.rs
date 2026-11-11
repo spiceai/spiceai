@@ -35,6 +35,12 @@ pub enum SpiceExternalError {
     PartitionsUnavailable {
         message: String,
     },
+    /// Spice is shutting down, so it does not start the work asked of it.
+    /// Retrying once it has started again, or on another instance, can
+    /// succeed.
+    ShuttingDown {
+        message: String,
+    },
 }
 
 impl SpiceExternalError {
@@ -49,6 +55,11 @@ impl SpiceExternalError {
     pub fn partitions_unavailable(message: String) -> Box<dyn std::error::Error + Send + Sync> {
         Box::new(Self::PartitionsUnavailable { message })
     }
+
+    #[must_use]
+    pub fn shutting_down(message: String) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(Self::ShuttingDown { message })
+    }
 }
 
 impl std::error::Error for SpiceExternalError {}
@@ -60,7 +71,8 @@ impl Display for SpiceExternalError {
                 f,
                 "Acceleration not ready; loading initial data for {dataset_name}"
             ),
-            SpiceExternalError::PartitionsUnavailable { message } => write!(f, "{message}"),
+            SpiceExternalError::PartitionsUnavailable { message }
+            | SpiceExternalError::ShuttingDown { message } => write!(f, "{message}"),
         }
     }
 }
@@ -83,6 +95,30 @@ pub fn get_spice_df_error(e: &DataFusionError) -> Option<&SpiceExternalError> {
             }
         }
         _ => None,
+    }
+}
+
+/// Whether `e`, or an error it wraps, says Spice cannot serve the request now
+/// and a retry can succeed: [`SpiceExternalError::PartitionsUnavailable`] or
+/// [`SpiceExternalError::ShuttingDown`].
+#[must_use]
+pub fn is_unavailable(e: &DataFusionError) -> bool {
+    match e {
+        DataFusionError::External(source) => source
+            .downcast_ref::<SpiceExternalError>()
+            .is_some_and(|e| {
+                matches!(
+                    e,
+                    SpiceExternalError::PartitionsUnavailable { .. }
+                        | SpiceExternalError::ShuttingDown { .. }
+                )
+            }),
+        DataFusionError::Context(_, source) | DataFusionError::Diagnostic(_, source) => {
+            is_unavailable(source)
+        }
+        DataFusionError::Shared(source) => is_unavailable(source),
+        DataFusionError::Collection(errors) => errors.first().is_some_and(is_unavailable),
+        _ => false,
     }
 }
 

@@ -12,7 +12,12 @@ version.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 spicepod = { path = "../spicepod" }
+util = { path = "../util" }
+yaml = { path = "../yaml" }
 
 [lints]
 workspace = true

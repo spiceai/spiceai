@@ -406,7 +406,8 @@ fn is_table_not_ready_error(e: &DataFusionError) -> bool {
     {
         match e {
             SpiceExternalError::AccelerationNotReady { .. } => return true,
-            SpiceExternalError::PartitionsUnavailable { .. } => {}
+            SpiceExternalError::PartitionsUnavailable { .. }
+            | SpiceExternalError::ShuttingDown { .. } => {}
         }
     }
     false

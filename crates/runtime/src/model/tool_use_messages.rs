@@ -43,6 +43,7 @@ use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
 use crate::model::messages_tool_history::{mcp_tool_result, mcp_tool_use, tool_result};
+use crate::model::recorded_calls;
 use crate::model::responses_tool_history::ToolOutcome;
 use crate::model::tool_use::{
     MAX_SPICE_TOOL_CALLS_PER_RESPONSE, encode_tool_name, tool_call_not_run_message,
@@ -380,7 +381,7 @@ fn stop_after_tools(called_client_tools: bool, last_round: bool) -> Option<&'sta
 impl Messages for ToolUsingMessages {
     async fn create(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
         if self.recursion_limit == 0 {
-            return self.inner.create(request).await;
+            return recorded_calls::with_tools(&self.tools.tools, self.inner.create(request)).await;
         }
         let MessagesRequest {
             mut body,
@@ -394,14 +395,15 @@ impl Messages for ToolUsingMessages {
         let mut usage = Value::Object(Map::new());
         let mut id: Option<Value> = None;
         for round in 1..=self.recursion_limit {
-            let mut response = self
-                .inner
-                .create(MessagesRequest {
+            let mut response = recorded_calls::with_tools(
+                &self.tools.tools,
+                self.inner.create(MessagesRequest {
                     body: body.clone(),
                     betas: betas.clone(),
                     version: version.clone(),
-                })
-                .await?;
+                }),
+            )
+            .await?;
             if let Some(round_usage) = response.get("usage") {
                 add_usage(&mut usage, round_usage);
             }
@@ -481,7 +483,11 @@ impl Messages for ToolUsingMessages {
         request: MessagesRequest,
     ) -> Result<MessageStream, MessagesError> {
         if self.recursion_limit == 0 {
-            return self.inner.create_stream(request).await;
+            return recorded_calls::with_tools(
+                &self.tools.tools,
+                self.inner.create_stream(request),
+            )
+            .await;
         }
         let MessagesRequest {
             mut body,
@@ -489,14 +495,15 @@ impl Messages for ToolUsingMessages {
             version,
         } = request;
         let spice = self.tools.offer(&mut body);
-        let events = self
-            .inner
-            .create_stream(MessagesRequest {
+        let events = recorded_calls::with_tools(
+            &self.tools.tools,
+            self.inner.create_stream(MessagesRequest {
                 body: body.clone(),
                 betas: betas.clone(),
                 version: version.clone(),
-            })
-            .await?;
+            }),
+        )
+        .await?;
         let request_context = RequestContext::current(AsyncMarker::new().await);
         let state = StreamLoop {
             inner: Arc::clone(&self.inner),
@@ -819,15 +826,16 @@ impl StreamLoop {
         add_round(&mut self.body, content, &outcomes);
         self.round += 1;
         self.offset = self.next_index;
-        match self
-            .inner
-            .create_stream(MessagesRequest {
+        match recorded_calls::with_tools(
+            &self.tools.tools,
+            self.inner.create_stream(MessagesRequest {
                 body: self.body.clone(),
                 betas: self.betas.clone(),
                 version: self.version.clone(),
-            })
-            .instrument(self.span.clone())
-            .await
+            }),
+        )
+        .instrument(self.span.clone())
+        .await
         {
             Ok(events) => self.events = Some(events),
             Err(error) => {

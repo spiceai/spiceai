@@ -76,6 +76,7 @@ impl AuthPrincipal for ApiKey {
         match self {
             ApiKey::ReadOnly { .. } => &["read"],
             ApiKey::ReadWrite { .. } => &["read_write"],
+            ApiKey::Admin { .. } => &["read_write", "admin"],
         }
     }
 
@@ -87,7 +88,9 @@ impl AuthPrincipal for ApiKey {
     /// Format: `apikey:<32-hex-chars>`.
     fn stable_id(&self) -> Option<Cow<'_, str>> {
         let key_bytes = match self {
-            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.as_bytes(),
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } | ApiKey::Admin { key } => {
+                key.as_bytes()
+            }
         };
         let digest = Sha256::digest(key_bytes);
         let mut id = String::with_capacity("apikey:".len() + 32);

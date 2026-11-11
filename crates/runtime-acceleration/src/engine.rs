@@ -56,6 +56,22 @@ impl Engine {
             other => *other,
         }
     }
+
+    /// Whether the engine keeps every memory-mode dataset in one in-process
+    /// instance, whose tables outlive the dataset that loaded them until Spice
+    /// stops: `SQLite` shares one connection pool in memory mode, while Arrow
+    /// and Cayenne end a memory table with its dataset.
+    #[must_use]
+    pub fn shares_memory_instance(&self) -> bool {
+        matches!(self, Engine::Sqlite)
+    }
+
+    /// Whether the engine reads table names that differ only in case as one
+    /// table in a store: `SQLite` then keeps two such datasets in one table.
+    #[must_use]
+    pub fn reads_case_variant_names_as_one_table(&self) -> bool {
+        matches!(self, Engine::Sqlite)
+    }
 }
 
 impl Display for Engine {

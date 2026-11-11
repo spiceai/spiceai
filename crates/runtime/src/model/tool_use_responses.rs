@@ -42,6 +42,7 @@ use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
+use crate::model::recorded_calls;
 use crate::model::responses_tool_history::{ToolOutcome, mcp_call, replayed_call};
 use crate::model::tool_use::{
     MAX_SPICE_TOOL_CALLS_PER_RESPONSE, encode_tool_name, tool_call_not_run_message,
@@ -416,14 +417,22 @@ impl ToolUsingResponses {
             .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
         {
             tracing::debug!("User asked for no tools, calling inner chat model");
-            return self.inner_responses.responses_request(req).await;
+            return recorded_calls::with_tools(
+                &self.tools,
+                self.inner_responses.responses_request(req),
+            )
+            .await;
         }
 
         if recursion_limit.is_some_and(|f| f == 0) {
             tracing::debug!(
                 "Tool-use recursion limit reached. Will call model, but not process further"
             );
-            return self.inner_responses.responses_request(req).await;
+            return recorded_calls::with_tools(
+                &self.tools,
+                self.inner_responses.responses_request(req),
+            )
+            .await;
         }
 
         // Append spiced runtime tools to the request.
@@ -435,7 +444,11 @@ impl ToolUsingResponses {
         let mut earlier_usage = None;
 
         loop {
-            let response = self.inner_responses.responses_request(req.clone()).await?;
+            let response = recorded_calls::with_tools(
+                &self.tools,
+                self.inner_responses.responses_request(req.clone()),
+            )
+            .await?;
 
             if tool_rounds_left != Some(0) {
                 let outcomes = self
@@ -477,20 +490,32 @@ impl ToolUsingResponses {
             .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
         {
             tracing::debug!("User asked for no tools, calling inner responses model");
-            return self.inner_responses.responses_stream(req).await;
+            return recorded_calls::with_tools(
+                &self.tools,
+                self.inner_responses.responses_stream(req),
+            )
+            .await;
         }
 
         if recursion_limit.is_some_and(|f| f == 0) {
             tracing::debug!(
                 "Tool-use recursion limit reached. Will call model, but not process further"
             );
-            return self.inner_responses.responses_stream(req).await;
+            return recorded_calls::with_tools(
+                &self.tools,
+                self.inner_responses.responses_stream(req),
+            )
+            .await;
         }
 
         // Append spiced runtime tools to the request.
         let req = self.add_runtime_tools(&req);
 
-        let s = self.inner_responses.responses_stream(req.clone()).await?;
+        let s = recorded_calls::with_tools(
+            &self.tools,
+            self.inner_responses.responses_stream(req.clone()),
+        )
+        .await?;
 
         Ok(make_responses_stream(
             Span::current(),
@@ -1008,7 +1033,12 @@ fn make_responses_stream(
                     if tool_rounds_left == Some(0) {
                         req = model.without_runtime_tools(req);
                     }
-                    s = match model.inner_responses.responses_stream(req.clone()).await {
+                    s = match recorded_calls::with_tools(
+                        &model.tools,
+                        model.inner_responses.responses_stream(req.clone()),
+                    )
+                    .await
+                    {
                         Ok(s) => s,
                         Err(e) => {
                             let _ = sender.send(Err(e)).await;

@@ -50,6 +50,7 @@ use super::tool_trace::{
     CallerScope, PendingTurn, StreamedReply, ToolTraceStore, returned_message,
 };
 use crate::model::ModelContextExtension;
+use crate::model::recorded_calls;
 use crate::tools::utils::tool_call_error_response;
 use llms::progress::Progress;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -364,7 +365,8 @@ impl ToolUsingChat {
             }) {
                 tracing::debug!("User asked for no tools, calling inner chat model");
                 return Ok(ToolLoopResponse::without_tools(
-                    self.inner_chat.chat_request(req).await?,
+                    recorded_calls::with_tools(&self.tools, self.inner_chat.chat_request(req))
+                        .await?,
                 ));
             }
 
@@ -373,14 +375,19 @@ impl ToolUsingChat {
                     "Tool-use recursion limit reached. Will call model, but not process further"
                 );
                 return Ok(ToolLoopResponse::without_tools(
-                    self.inner_chat.chat_request(req).await?,
+                    recorded_calls::with_tools(&self.tools, self.inner_chat.chat_request(req))
+                        .await?,
                 ));
             }
 
             // Append spiced runtime tools to the request.
             let inner_req = self.add_runtime_tools(&req);
 
-            let resp = self.inner_chat.chat_request(inner_req.clone()).await?;
+            let resp = recorded_calls::with_tools(
+                &self.tools,
+                self.inner_chat.chat_request(inner_req.clone()),
+            )
+            .await?;
             let usage = resp.usage.clone();
 
             // ChatCompletionMessageToolCall
@@ -473,19 +480,23 @@ impl ToolUsingChat {
             .as_ref()
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None))
         {
-            return self.inner_chat.chat_stream(req).await;
+            return recorded_calls::with_tools(&self.tools, self.inner_chat.chat_stream(req)).await;
         }
 
         if self.recursion_limit.is_some_and(|f| f == 0) {
             tracing::debug!(
                 "Tool-use recursion limit reached. Will call model, but not process further"
             );
-            return self.inner_chat.chat_stream(req).await;
+            return recorded_calls::with_tools(&self.tools, self.inner_chat.chat_stream(req)).await;
         }
 
         // Append spiced runtime tools to the request. Avoid clone if no runtime tools.
         let updated_req = self.add_runtime_tools(&req);
-        let s = self.inner_chat.chat_stream(updated_req.clone()).await?;
+        let s = recorded_calls::with_tools(
+            &self.tools,
+            self.inner_chat.chat_stream(updated_req.clone()),
+        )
+        .await?;
 
         Ok(make_a_stream(
             Span::current(),

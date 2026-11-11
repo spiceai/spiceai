@@ -56,9 +56,15 @@ pub fn validate_sql_query_operations(
         // Data Definition Language (DDL): CREATE / DROP TABLES / VIEWS / SCHEMAS
         LogicalPlan::Ddl(_) if sidecar => Err(sidecar_ddl_error()),
         // Spice's planner can also represent DDL as an extension node, for
-        // example `CREATE TABLE ... LIKE`.
+        // example `CREATE TABLE ... LIKE`, and the statements that define,
+        // change, and remove datasets and catalogs.
         LogicalPlan::Extension(extension)
-            if sidecar && extension.node.as_any().is::<datafusion_ddl::DdlExtensionNode>() =>
+            if sidecar
+                && (extension.node.as_any().is::<datafusion_ddl::DdlExtensionNode>()
+                    || extension
+                        .node
+                        .as_any()
+                        .is::<datafusion_ddl::component_ddl::ComponentDdlNode>()) =>
         {
             Err(sidecar_ddl_error())
         }
@@ -171,7 +177,7 @@ pub fn validate_sql_query_operations(
 /// The error for DDL sent to a sidecar. A sidecar's catalog is its
 /// application's view of data the cluster owns, so tables and schemas are
 /// created and dropped on the cluster instead.
-fn sidecar_ddl_error() -> DataFusionError {
+pub(crate) fn sidecar_ddl_error() -> DataFusionError {
     DataFusionError::Plan(
         "DDL is not allowed on a sidecar. Run CREATE and DROP statements on the Spice runtime \
          the sidecar reads from, or start Spice without `--role sidecar`."

@@ -34,6 +34,7 @@ datafusion = { workspace = true, optional = true }
 # feature, which datafusion-proto enables.
 datafusion-proto = { workspace = true, optional = true }
 parking_lot.workspace = true
+percent-encoding.workspace = true
 
 [features]
 default = ["datafusion"]
