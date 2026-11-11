@@ -130,7 +130,7 @@ jobs:
               }
               core.warning(
                 `${issueOwner} cannot be assigned issues in ${context.repo.owner}/${context.repo.repo} ` +
-                `(GitHub returned 404), so advisory issue #${issueNumber} is left unassigned. ` +
+                `(GitHub returned 404), so it was not added as an assignee of advisory issue #${issueNumber}. ` +
                 'Change issueOwner in .github/workflows/cargo_deny_advisories.yml to an account that can be assigned.'
               );
               return;
