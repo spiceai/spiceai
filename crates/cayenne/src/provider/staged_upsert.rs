@@ -224,6 +224,14 @@ impl CayenneStagedUpsert {
             ),
         )
         .await?;
+        #[cfg(test)]
+        if let Some(pause) =
+            super::append_commit::test_seams::take_pause_after_commit_time_retention(
+                self.table.table_id(),
+            )
+        {
+            pause().await;
+        }
         Ok((Some(checkpoint_guard), prepared))
     }
 

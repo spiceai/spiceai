@@ -1147,6 +1147,11 @@ async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
     for (name, partitioned, keyed, upsert, mode) in [
         ("rsql_res_keyed", false, true, true, None),
         ("rsql_res_partitioned", true, true, true, None),
+        // CTO full-path scope (F1, review-mwcexlrx-43ulgp): partitioned tables
+        // without a key resolver. Expected red until their resident retention
+        // publishes with the append.
+        ("rsql_res_partitioned_no_conflict", true, true, false, None),
+        ("rsql_res_partitioned_unkeyed", true, false, false, None),
         ("rsql_res_unkeyed", false, false, false, None),
         (
             "rsql_res_key_no_conflict_key",
@@ -3592,19 +3597,21 @@ async fn durable_cdc_concurrent_reader_never_sees_matching_rows_impl(
     Ok(())
 }
 
-/// Adjacent CDC applies that switch routes — the pipelined staged route (no
-/// retention) and the synchronous retention route (`retention_sql` configured on
-/// reopen) — keep source order, publish each row once, and only the pipelined
-/// route leaves a finalize (its acknowledgement) owed after the apply returns.
+/// Adjacent CDC applies that switch routes (the pipelined staged route without
+/// retention, the synchronous retention route with `retention_sql` configured
+/// on reopen) keep source order, publish each row once, and only the pipelined
+/// route can leave a finalize (its acknowledgement) owed after the apply
+/// returns. Every apply writes key 0 with a DISTINCT value, and the FULL rows
+/// (id, status) are compared after every apply and after each reopen, so a
+/// stale, reordered or doubled value fails.
 async fn durable_cdc_route_switch_keeps_order_and_single_publication_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let name = "rsql_pub_cdc_route_switch";
-    let plain = durable_cdc_table(&fixture, name, lit(false)).await?;
-    // `lit(false)` matches nothing; reopen without any filter for the plain route.
-    drop(plain);
+    drop(durable_cdc_table(&fixture, name, lit(false)).await?);
+    let catalog = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let open = |retention: Option<Expr>| {
-        let catalog = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+        let catalog = Arc::clone(&catalog);
         async move {
             let mut b =
                 CayenneTableProviderBuilder::new(catalog, SessionContext::new().runtime_env());
@@ -3614,58 +3621,109 @@ async fn durable_cdc_route_switch_keeps_order_and_single_publication_impl(
             Ok::<_, Box<dyn std::error::Error>>(Arc::new(b.open(name).await?))
         }
     };
-    let apply_pending = |t: Arc<CayenneTableProvider>, batch: RecordBatch| async move {
+    let full_rows = |t: Arc<CayenneTableProvider>| async move {
         let ctx = SessionContext::new();
-        let schema = batch.schema();
-        let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                schema,
-                futures::stream::iter([Ok(batch)]),
-            ),
-        );
-        let write = t.write_cdc_append_stream(stream, &ctx.task_ctx()).await?;
-        let pending = write.has_pending_finalize();
-        if pending {
-            write.finish().await?;
+        ctx.register_table("t", t as Arc<dyn TableProvider>)?;
+        let batches = ctx
+            .sql("SELECT id, status FROM t ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        let mut out = Vec::new();
+        for b in &batches {
+            let ids = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id");
+            let st = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("status");
+            for r in 0..b.num_rows() {
+                out.push((
+                    ids.value(r),
+                    st.is_valid(r).then(|| st.value(r).to_string()),
+                ));
+            }
         }
-        Ok::<_, Box<dyn std::error::Error>>(pending)
+        Ok::<_, Box<dyn std::error::Error>>(out)
     };
-    let mut expected: std::collections::BTreeMap<i64, &'static str> = Default::default();
+    let mut expected: std::collections::BTreeMap<i64, String> = Default::default();
+    let mut plain_pending = 0_usize;
     for round in 0..4_i64 {
         let retained = round % 2 == 1;
         let t = open(retained.then(archived)).await?;
         for step in 0..3_i64 {
-            let id = round * 3 + step;
-            // Each batch also rewrites key 0, so source order decides its value.
-            let status = if retained { "active" } else { "archived" };
-            let batch = rows(&[(id, Some("active")), (0, Some(status))]);
-            let pending = apply_pending(Arc::clone(&t), batch).await?;
+            let id = 100 + round * 3 + step;
+            // Key 0 gets a distinct value per apply; on the plain route every
+            // other apply archives it (kept: no retention there).
+            let zero = if !retained && step == 1 {
+                "archived".to_string()
+            } else {
+                format!("active-r{round}s{step}")
+            };
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![id, 0])),
+                    Arc::new(StringArray::from(vec![Some("active"), Some(zero.as_str())])),
+                ],
+            )?;
+            let ctx = SessionContext::new();
+            let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    batch.schema(),
+                    futures::stream::iter([Ok(batch)]),
+                ),
+            );
+            let write = t.write_cdc_append_stream(stream, &ctx.task_ctx()).await?;
+            let pending = write.has_pending_finalize();
             assert!(
                 !(retained && pending),
-                "round {round}: the retention route completes synchronously; no ack is owed later"
+                "round {round} step {step}: the retention route owes no later finalize"
             );
-            expected.insert(id, "active");
-            if retained {
-                expected.insert(0, "active");
-            } else {
-                expected.insert(0, "archived");
+            if pending {
+                plain_pending += 1;
+                write.finish().await?;
             }
+            expected.insert(id, "active".to_string());
+            expected.insert(0, zero);
             if retained {
-                expected.retain(|_, s| *s != "archived");
+                expected.retain(|_, s| s != "archived");
             }
+            let want: Vec<(i64, Option<String>)> = expected
+                .iter()
+                .map(|(k, v)| (*k, Some(v.clone())))
+                .collect();
+            assert_eq!(
+                full_rows(Arc::clone(&t)).await?,
+                want,
+                "round {round} step {step}: full rows after the apply"
+            );
+            assert_eq!(
+                count_star(&t).await?,
+                i64::try_from(want.len())?,
+                "round {round} step {step}: COUNT(*)"
+            );
         }
-        let got = ids(&t).await?;
-        let want: Vec<i64> = expected.keys().copied().collect();
-        assert_eq!(
-            got, want,
-            "round {round}: contents in source order, once each"
-        );
-        assert_eq!(
-            count_star(&t).await?,
-            i64::try_from(want.len())?,
-            "round {round}: COUNT(*)"
-        );
         t.drain_in_flight_maintenance().await?;
+        drop(t);
+        let reopened = open(None).await?;
+        let want: Vec<(i64, Option<String>)> = expected
+            .iter()
+            .map(|(k, v)| (*k, Some(v.clone())))
+            .collect();
+        assert_eq!(
+            full_rows(Arc::clone(&reopened)).await?,
+            want,
+            "round {round}: after reopen"
+        );
+        reopened.drain_in_flight_maintenance().await?;
     }
+    // Recorded, not assumed: whether the plain route actually deferred a
+    // finalize in this run (the contrast the retention-route assertion relies on).
+    println!("plain-route applies that owed a finalize: {plain_pending}");
     Ok(())
 }

@@ -902,3 +902,147 @@ async fn a_no_conflict_key_transaction_keeps_the_first_copy_and_never_evaluates_
         }
     }
 }
+
+/// T4: a protected-run compaction run INLINE at a deterministic point inside a
+/// transaction commit (after its resident retention delete is prepared over
+/// the runs it captured; the commit holds `write_lock` only, its visibility
+/// lock and listing fence come later). A position-serialized table declines
+/// (try-locked writer); a key-delete table must actually merge there
+/// (acceptance gate). Either way the commit's rows are exact, live and reopened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_protected_run_compaction_inside_the_commit_keeps_it_exact() {
+    for shape in [Shape::KeyedPosition, Shape::KeyedFold] {
+        let f = table_with(
+            &format!("ctr_compact_{shape:?}").to_lowercase(),
+            shape,
+            Some(2),
+        )
+        .await;
+        let p = &f.provider;
+        f.set(OFF);
+        // Seed two protected runs with no merge. Never flush maintenance here:
+        // the fixture holds the retention pass gate, so a flushed retention pass
+        // would wait on this test forever (the v1 hang).
+        let held = p.hold_compaction().await;
+        stage(&f, &[(2, -2)]).await.commit().await.expect("seed a");
+        stage(&f, &[(3, 3)]).await.commit().await.expect("seed b");
+        while p.post_write_compaction_state.load(Ordering::Acquire) != COALESCED_TASK_IDLE {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        let runs = p.protected_snapshots.load().len();
+        assert!(runs >= 2, "{shape:?}: two protected runs to merge ({runs})");
+        assert_eq!(
+            rows(p).await,
+            vec![(1, 1), (2, -2), (3, 3)],
+            "{shape:?}: seeded"
+        );
+
+        let outcome: Arc<ParkingMutex<Option<String>>> = Arc::new(ParkingMutex::new(None));
+        let probe = p.clone_for_write();
+        let recorded = Arc::clone(&outcome);
+        crate::provider::append_commit::test_seams::pause_after_commit_time_retention(
+            p.table_id(),
+            Box::new(move || {
+                Box::pin(async move {
+                    let locks = format!(
+                        "write_lock free {}, visibility free {}, listing_fence readable {}, compaction_lock readable {}",
+                        probe.write_lock.try_lock().is_ok(),
+                        probe.visibility_lock.try_lock().is_ok(),
+                        probe.listing_fence.try_read().is_ok(),
+                        probe.compaction_lock.try_read().is_ok(),
+                    );
+                    let before = probe.protected_snapshots.load().len();
+                    let merged = probe.compact_protected_snapshots_subset(usize::MAX).await;
+                    let after = probe.protected_snapshots.load().len();
+                    *recorded.lock() = Some(format!("{merged:?} runs {before}->{after}; {locks}"));
+                })
+            }),
+        );
+        f.set(ON);
+        let commit = stage(&f, &[(4, 4)]).await.commit();
+        tokio::time::timeout(std::time::Duration::from_secs(60), commit)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{shape:?}: commit did not finish (hook: {:?})",
+                    outcome.lock()
+                )
+            })
+            .expect("commit");
+        let outcome = outcome
+            .lock()
+            .take()
+            .expect("the compaction ran inside the commit");
+        println!("{shape:?}: {outcome}");
+        let gate = if shape == Shape::KeyedFold {
+            "Ok(true)"
+        } else {
+            "Ok(false)"
+        };
+        assert!(
+            outcome.starts_with(gate),
+            "{shape:?}: compaction inside the commit: {outcome}"
+        );
+        let want = vec![(1, 1), (3, 3), (4, 4)];
+        assert_eq!(rows(p).await, want, "{shape:?}: exact after the commit");
+        f.set(OFF);
+        assert_eq!(rows(&f.reopen().await).await, want, "{shape:?}: reopened");
+    }
+}
+
+/// T2: a caller cancelled at the checkpoint-lock wait inside the commit (the
+/// transaction holds `write_lock`, no catalog transaction yet) publishes
+/// nothing, releases the lock, and leaves the table accepting the next commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_cancelled_before_the_commit_publishes_nothing_and_releases_locks() {
+    let f = table("txn_cancel_before", Shape::KeyedFold).await;
+    let p = &f.provider;
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+    let (never_tx, never_rx) = tokio::sync::oneshot::channel::<()>();
+    crate::provider::append_commit::test_seams::pause_at_checkpoint_wait(
+        p.table_id(),
+        Box::new(move || {
+            Box::pin(async move {
+                let _ = reached_tx.send(());
+                let _ = never_rx.await; // parked until the task is aborted
+            })
+        }),
+    );
+    let txn = stage(&f, &[(7, 7)]).await;
+    let task = tokio::spawn(async move { txn.commit().await.map(|_| ()) });
+    reached_rx
+        .await
+        .expect("the commit reached the checkpoint wait");
+    assert!(
+        p.write_lock.try_lock().is_err(),
+        "the commit holds write_lock at the barrier"
+    );
+    task.abort();
+    let joined = task.await;
+    assert!(
+        joined.as_ref().err().is_some_and(|e| e.is_cancelled()),
+        "aborted: {joined:?}"
+    );
+    drop(never_tx);
+    assert!(
+        p.write_lock.try_lock().is_ok(),
+        "write_lock released by the cancelled commit"
+    );
+    assert_eq!(rows(p).await, vec![(1, 1)], "nothing published");
+    assert_eq!(
+        rows(&f.reopen().await).await,
+        vec![(1, 1)],
+        "nothing durable"
+    );
+    stage(&f, &[(8, 8)])
+        .await
+        .commit()
+        .await
+        .expect("the next commit");
+    assert_eq!(
+        rows(p).await,
+        vec![(1, 1), (8, 8)],
+        "the table accepts the next commit"
+    );
+}

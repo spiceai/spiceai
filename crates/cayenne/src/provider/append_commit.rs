@@ -412,6 +412,21 @@ pub(crate) mod test_seams {
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static PAUSES_AT_CHECKPOINT_WAIT: LazyLock<Mutex<HashMap<String, Pause>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    static PAUSES_AFTER_COMMIT_TIME_RETENTION: LazyLock<Mutex<HashMap<String, Pause>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Run `pause` in the next transaction commit on `table_id` with
+    /// `retention_sql`, after its resident retention delete is prepared and
+    /// before anything is published (the commit holds `write_lock` only).
+    pub(crate) fn pause_after_commit_time_retention(table_id: &str, pause: Pause) {
+        PAUSES_AFTER_COMMIT_TIME_RETENTION
+            .lock()
+            .insert(table_id.to_string(), pause);
+    }
+
+    pub(crate) fn take_pause_after_commit_time_retention(table_id: &str) -> Option<Pause> {
+        PAUSES_AFTER_COMMIT_TIME_RETENTION.lock().remove(table_id)
+    }
 
     /// Run `pause` in the next transaction commit on `table_id` with
     /// `retention_sql`, immediately before it waits for the mem-tier
