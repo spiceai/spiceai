@@ -904,3 +904,96 @@ async fn partitioned_upsert_hides_matching_rows_at_publish_impl(
     assert_eq!(count_star(&t).await?, 3);
     Ok(())
 }
+
+/// Pending (reported as a constraint): CTO C's `DELETE` runs over the whole
+/// post-conflict generation once per publication, so a resident row that comes
+/// to match between writes (a time cutoff passing, `random()`) must be gone when
+/// the next append publishes, and a predicate that fails on a resident row must
+/// fail that append. Appends evaluate only their own rows today and leave
+/// resident rows to the pass after the publish; these record that gap and are
+/// run with `--ignored`.
+#[test]
+#[ignore = "pending: resident rows are not evaluated at an append's publish"]
+fn resident_row_newly_matching_is_gone_at_next_publish_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        resident_row_newly_matching_is_gone_at_next_publish_impl,
+    )
+}
+
+async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+
+    // `aged(status)` is TRUE for "old" once `aged` is set (a cutoff passing),
+    // and errors on "old" once `broken` is set.
+    for (name, partitioned, keyed) in [
+        ("rsql_res_keyed", false, true),
+        ("rsql_res_partitioned", true, true),
+        ("rsql_res_unkeyed", false, false),
+    ] {
+        let aged = Arc::new(AtomicBool::new(false));
+        let broken = Arc::new(AtomicBool::new(false));
+        let (a, b) = (Arc::clone(&aged), Arc::clone(&broken));
+        let udf = create_udf(
+            "aged",
+            vec![DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args: &[ColumnarValue]| {
+                let array = args[0].clone().into_array(1)?;
+                let values = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+                let mut out = Vec::with_capacity(values.len());
+                for v in values.iter() {
+                    let old = v == Some("old");
+                    if old && b.load(Ordering::SeqCst) {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "aged() cannot evaluate this row".to_string(),
+                        ));
+                    }
+                    out.push(Some(old && a.load(Ordering::SeqCst)));
+                }
+                Ok(ColumnarValue::Array(Arc::new(arrow::array::BooleanArray::from(out))))
+            }),
+        );
+        let dir = fixture.data_path.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let options = CreateTableOptions {
+            table_name: name.to_string(),
+            schema: schema(),
+            primary_key: if keyed { vec!["id".to_string()] } else { vec![] },
+            on_conflict: keyed
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: dir.to_string_lossy().to_string(),
+            partition_column: partitioned.then(|| "status".to_string()),
+            vortex_config: file_tier_config(),
+        };
+        let t = Arc::new(
+            CayenneTableProvider::create_table_with_retention(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                options,
+                vec![udf.call(vec![col("status")])],
+                SessionContext::new().runtime_env(),
+            )
+            .await?,
+        );
+        common::insert_batch(t.as_ref(), rows(&[(1, Some("old")), (2, Some("new"))])).await?;
+        t.flush_pending_maintenance().await?;
+        assert_eq!(ids(&t).await?, vec![1, 2], "{name}: nothing matches yet");
+
+        // Failure first: the predicate fails on resident row 1, so the append
+        // fails and the previous generation stays.
+        broken.store(true, Ordering::SeqCst);
+        let failed = common::insert_batch(t.as_ref(), rows(&[(3, Some("new"))])).await;
+        assert!(failed.is_err(), "{name}: a predicate failing on a resident row fails the append");
+        assert_eq!(ids(&t).await?, vec![1, 2], "{name}: previous generation kept");
+        broken.store(false, Ordering::SeqCst);
+
+        // Row 1 ages into retention; the next append's publication removes it.
+        aged.store(true, Ordering::SeqCst);
+        common::insert_batch(t.as_ref(), rows(&[(3, Some("new"))])).await?;
+        assert_eq!(ids(&t).await?, vec![2, 3], "{name}: resident row gone at the publish");
+    }
+    Ok(())
+}

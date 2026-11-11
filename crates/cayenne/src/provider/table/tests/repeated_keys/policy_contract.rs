@@ -921,3 +921,48 @@ async fn a_write_counts_the_rows_it_does_not_keep_by_reason() {
         assert_eq!(counted(&rows), 0, "{mode:?}: nothing received was dropped");
     }
 }
+
+/// `retention_sql` deletes commit in the same catalog transaction as the
+/// append they are owed. A process that stops after that transaction commits
+/// but before the in-memory publish (the `CommittedUnreadable` fault leaves
+/// exactly that: committed, unpublished, the table refusing writes) reloads to
+/// the append AND its retention delete — never the rows retention removed, and
+/// never the version the upsert superseded. A transaction that rolls back
+/// leaves the prior generation, both live and after reloading.
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_deletes_commit_with_the_append_through_a_crash_before_publish() {
+    use crate::provider::append_commit::test_seams::{self, CommitFault};
+
+    let retention = vec![datafusion_expr::col("value").eq(datafusion_expr::lit("gone"))];
+    for mode in [DeletionMode::Key, DeletionMode::Position] {
+        for fault in [CommitFault::CommittedUnreadable, CommitFault::RolledBack] {
+            let label = format!("{mode:?}/{fault:?}");
+            let (mut provider, catalog, runtime_env, _dir) = seeded_streaming_table(mode).await;
+            provider.retention_filters.clone_from(&retention);
+            // Seeded with (9, "old"). Key 9 moves to a matching version, key 10
+            // arrives matching, key 11 arrives kept.
+            test_seams::inject(provider.table_id(), fault);
+            let result = write(
+                &provider,
+                InsertOp::Append,
+                vec![batch(&[(9, "gone"), (10, "gone"), (11, "kept")])],
+            )
+            .await;
+            assert!(result.is_err(), "{label}: the injected fault fails the write");
+            let durable = match fault {
+                CommitFault::CommittedUnreadable => (owned(&[(11, "kept")]), 1),
+                _ => {
+                    assert_eq!(
+                        visible(&provider).await,
+                        (owned(&[(9, "old")]), 1),
+                        "{label}: a rolled-back append leaves the prior rows"
+                    );
+                    (owned(&[(9, "old")]), 1)
+                }
+            };
+            drop(provider);
+            let reopened = reopen(&catalog, &runtime_env).await;
+            assert_eq!(visible(&reopened).await, durable, "{label}: reopened");
+        }
+    }
+}

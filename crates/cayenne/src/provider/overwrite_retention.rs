@@ -107,8 +107,27 @@ impl CayenneTableProvider {
         &self,
         batches: Vec<RecordBatch>,
     ) -> super::Result<Vec<RecordBatch>> {
-        if !self.has_retention_delete_filters() || batches.is_empty() {
-            return Ok(batches);
+        let mut groups = self.drop_retention_matches_in_groups(vec![batches])?;
+        Ok(groups.pop().unwrap_or_default())
+    }
+
+    /// [`Self::drop_retention_matches`] over the groups one publication carries,
+    /// such as the shards of one sharded CDC apply: the predicate is prepared
+    /// once, with one `now()`, for every group, and every group is evaluated
+    /// before the caller publishes any of them. An error drops them all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the predicate cannot be prepared or evaluated.
+    pub(crate) fn drop_retention_matches_in_groups(
+        &self,
+        groups: Vec<Vec<RecordBatch>>,
+    ) -> super::Result<Vec<Vec<RecordBatch>>> {
+        let Some(schema) = groups.iter().flatten().next().map(RecordBatch::schema) else {
+            return Ok(groups);
+        };
+        if !self.has_retention_delete_filters() {
+            return Ok(groups);
         }
         let failed = |error: datafusion_common::DataFusionError| super::Error::Internal {
             table: self.table_name().to_string(),
@@ -118,19 +137,22 @@ impl CayenneTableProvider {
             ),
         };
         let filters = self.coerced_retention_filters().map_err(failed)?;
-        let schema = batches[0].schema();
         let physical = physical_filters(&filters, &schema).map_err(failed)?;
-        let mut kept = Vec::with_capacity(batches.len());
         let mut matched = 0_usize;
-        for batch in batches {
-            let deleted = deleted_rows(&physical, &batch).map_err(failed)?;
-            let keep: BooleanArray = deleted.iter().map(|d| Some(d != Some(true))).collect();
-            let batch = arrow::compute::filter_record_batch(&batch, &keep)
-                .map_err(|e| failed(e.into()))?;
-            matched += keep.len() - batch.num_rows();
-            if batch.num_rows() > 0 {
-                kept.push(batch);
+        let mut out = Vec::with_capacity(groups.len());
+        for batches in groups {
+            let mut kept = Vec::with_capacity(batches.len());
+            for batch in batches {
+                let deleted = deleted_rows(&physical, &batch).map_err(failed)?;
+                let keep: BooleanArray = deleted.iter().map(|d| Some(d != Some(true))).collect();
+                let batch = arrow::compute::filter_record_batch(&batch, &keep)
+                    .map_err(|e| failed(e.into()))?;
+                matched += keep.len() - batch.num_rows();
+                if batch.num_rows() > 0 {
+                    kept.push(batch);
+                }
             }
+            out.push(kept);
         }
         if matched > 0 {
             tracing::info!(
@@ -139,7 +161,7 @@ impl CayenneTableProvider {
                 self.table_name()
             );
         }
-        Ok(kept)
+        Ok(out)
     }
 
     /// `stream` without the rows `retention_sql` deletes, for an append to a table

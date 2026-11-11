@@ -17726,13 +17726,19 @@ impl CayenneTableProvider {
         // appended: the buffered changes were collapsed to one row per key, and
         // the stored versions those rows supersede are already among the shard's
         // deletions, so the append publishes the upsert and its retention delete
-        // together. An error fails the apply before anything is published; the
+        // together. One predicate context (one `now()`) serves every shard, and
+        // every shard is evaluated before any is appended. An error fails the
+        // apply before anything is published; the
         // checked-out index is dropped, as on a validation error. The dropped rows'
         // keys stay in the existence filter, which only costs a false positive.
         if self.has_retention_delete_filters() {
-            for (filtered_batches, _, _) in &mut per_shard_validated {
-                *filtered_batches =
-                    self.drop_retention_matches(std::mem::take(filtered_batches))?;
+            let groups = per_shard_validated
+                .iter_mut()
+                .map(|(filtered_batches, _, _)| std::mem::take(filtered_batches))
+                .collect();
+            let kept = self.drop_retention_matches_in_groups(groups)?;
+            for ((filtered_batches, _, _), kept) in per_shard_validated.iter_mut().zip(kept) {
+                *filtered_batches = kept;
             }
         }
         let validated_capacity: usize = per_shard_validated
