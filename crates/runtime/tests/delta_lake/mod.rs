@@ -522,6 +522,29 @@ async fn query_delta_lake_column_mapping_mode_name() -> Result<(), String> {
                         "+----+-----+",
                     ],
                 ),
+                // Filter on a nested struct field: pushed down under the field's physical name
+                (
+                    "SELECT IntegerType FROM col_mapping_name WHERE nested_struct['aa'] = '2'",
+                    vec![
+                        "+-------------+",
+                        "| IntegerType |",
+                        "+-------------+",
+                        "| 2           |",
+                        "+-------------+",
+                    ],
+                ),
+                // Filter on a struct field two levels deep
+                (
+                    "SELECT IntegerType FROM col_mapping_name WHERE nested_struct['ac']['aca'] > 2 ORDER BY IntegerType",
+                    vec![
+                        "+-------------+",
+                        "| IntegerType |",
+                        "+-------------+",
+                        "| 3           |",
+                        "| 4           |",
+                        "+-------------+",
+                    ],
+                ),
             ];
 
             for (query, expected_results) in &test_cases {
@@ -623,6 +646,29 @@ async fn query_delta_lake_column_mapping_mode_id() -> Result<(), String> {
                         "| 1  | 1   |",
                         "| 2  | 2   |",
                         "+----+-----+",
+                    ],
+                ),
+                // Filter on a nested struct field: pushed down under the field's physical name
+                (
+                    "SELECT IntegerType FROM col_mapping_id WHERE nested_struct['aa'] = '2'",
+                    vec![
+                        "+-------------+",
+                        "| IntegerType |",
+                        "+-------------+",
+                        "| 2           |",
+                        "+-------------+",
+                    ],
+                ),
+                // Filter on a struct field two levels deep
+                (
+                    "SELECT IntegerType FROM col_mapping_id WHERE nested_struct['ac']['aca'] > 2 ORDER BY IntegerType",
+                    vec![
+                        "+-------------+",
+                        "| IntegerType |",
+                        "+-------------+",
+                        "| 3           |",
+                        "| 4           |",
+                        "+-------------+",
                     ],
                 ),
             ];
