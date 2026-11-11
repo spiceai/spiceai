@@ -1403,7 +1403,6 @@ impl<'a> AppendMutationWriter<'a> {
     async fn materialize_inline_corpus_for_retention(&self) -> Result<()> {
         if !self.table.has_retention_delete_filters()
             || self.table.is_memory_resident_mode()
-            || self.table.is_cdc_memory_mode()
             || self.table.primary_key_indices()?.is_none()
             || self.table.cached_inlined_row_count() == 0
         {
