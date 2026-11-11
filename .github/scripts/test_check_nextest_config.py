@@ -31,6 +31,9 @@ retries = 0
 SMALL_TIER_TEST = (
     "provider::table::tests::small_tier_merge_runs_while_large_tier_merge_is_in_flight"
 )
+FILE_MODE_TEST = (
+    "lookup_index_widening_test::file_mode_widened_keys_return_the_rows_of_an_unindexed_table"
+)
 SLOW_SIGN_OFF_TESTS = f"""
 [[profile.default.overrides]]
 filter = '(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))'
@@ -269,6 +272,33 @@ class BinaryFilterTest(unittest.TestCase):
         self.assertNotIn("cayenne::integration::b_test", matched)
 
 
+class ContainedInTest(unittest.TestCase):
+    def test_an_exact_test_is_in_its_module_and_its_binary(self):
+        exact = f"cayenne::integration#{FILE_MODE_TEST}"
+        contained = check_nextest_config.contained_in
+        self.assertTrue(contained(exact, "cayenne::integration::lookup_index_widening_test"))
+        self.assertTrue(contained(exact, "integration"))
+        self.assertTrue(contained(f"cayenne#{SMALL_TIER_TEST}", "cayenne"))
+
+    def test_a_module_is_in_its_binary(self):
+        contained = check_nextest_config.contained_in
+        self.assertTrue(contained("cayenne::integration::lookup_index_widening_test", "integration"))
+
+    def test_unrelated_and_identical_sets_are_not_contained(self):
+        contained = check_nextest_config.contained_in
+        module = "cayenne::integration::lookup_index_widening_test"
+        # A same-prefix module, another binary, and the set itself.
+        self.assertFalse(
+            contained(
+                "cayenne::integration#lookup_index_widening_test_extra::t",
+                module,
+            )
+        )
+        self.assertFalse(contained(f"runtime::integration#{FILE_MODE_TEST}", module))
+        self.assertFalse(contained(module, module))
+        self.assertFalse(contained(module, f"cayenne#{SMALL_TIER_TEST}"))
+
+
 class ResolveTest(unittest.TestCase):
     def test_first_matching_override_wins_per_setting(self):
         """nextest evaluates precedence separately for each setting."""
@@ -453,6 +483,42 @@ class CheckConfigTest(unittest.TestCase):
             problems = check_nextest_config.check_config(write(tmp, undersized))
         self.assertEqual(len(problems), 1, problems)
         self.assertIn(f"cayenne#{SMALL_TIER_TEST} is killed after 600s", problems[0])
+
+    def test_rejects_a_narrower_override_that_lowers_a_measured_test(self):
+        """An exact test placed ahead of its measured module's override is held to it.
+
+        nextest gives `file_mode_widened_keys…` the first override it matches, so
+        a 120s exact-test override ahead of the module's 840s one kills the
+        module's slowest test at 120s, while the module key still resolves to
+        840s. The same holds for a module of a measured binary.
+        """
+        narrower = (
+            "\n[[profile.default.overrides]]\n"
+            f"filter = '(binary_id(=cayenne::integration) & test(={FILE_MODE_TEST}))'\n"
+            'slow-timeout = { period = "120s", terminate-after = 1 }\n'
+        )
+        head, _, tail = FIXED_CONFIG.partition("[[profile.default.overrides]]")
+        config = head + narrower.lstrip("\n") + "\n[[profile.default.overrides]]" + tail
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(
+            f"cayenne::integration#{FILE_MODE_TEST} is killed after 120s", problems[0]
+        )
+        self.assertIn("the slowest test measured in the test set holding it", problems[0])
+        self.assertIn("needs 140.9s", problems[0])
+
+    def test_accepts_a_narrower_override_that_clears_its_set(self):
+        """The negative case: a narrower override sized for the set passes."""
+        narrower = (
+            "\n[[profile.default.overrides]]\n"
+            f"filter = '(binary_id(=cayenne::integration) & test(={FILE_MODE_TEST}))'\n"
+            'slow-timeout = { period = "120s", terminate-after = 7 }\n'
+        )
+        head, _, tail = FIXED_CONFIG.partition("[[profile.default.overrides]]")
+        config = head + narrower.lstrip("\n") + "\n[[profile.default.overrides]]" + tail
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check_nextest_config.check_config(write(tmp, config)), [])
 
     def test_rejects_raising_the_global_ceiling_instead(self):
         """The tempting one-line 'fix' hides slowness across the whole workspace."""

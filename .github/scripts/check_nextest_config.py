@@ -324,6 +324,52 @@ def selected(key: str, filter_expr: str) -> bool:
     return len(parts) == 3 and parts[1] in selectors
 
 
+def contained_in(selector: str, key: str) -> bool:
+    """Return whether every test `selector` names is in the larger test set `key`.
+
+    An exact test `binary_id#module::…` is in the module key
+    `binary_id::module` and in the binary key naming its binary; a module key
+    `package::binary::module` is in the binary key `binary`. A set is not
+    counted as contained in itself.
+    """
+    if "#" in key or selector == key:
+        return False
+    if "#" in selector:
+        binary_id, path = selector.split("#", 1)
+        if key.count("::") == 2:
+            key_binary, _, module = key.rpartition("::")
+            return key_binary == binary_id and path.startswith(f"{module}::")
+        return "::" not in key and binary_id.split("::")[-1] == key
+    parts = selector.split("::")
+    return len(parts) == 3 and "::" not in key and parts[1] == key
+
+
+def baselines_to_check(config: dict) -> dict[str, float]:
+    """Return every test set whose ceiling must clear a baseline, with that baseline.
+
+    That is each key of QUIET_BASELINE_SECONDS, plus each narrower set an override
+    names inside one of them: an exact test in a measured module, or a module of a
+    measured binary. nextest gives such a test the first override it matches, so
+    a narrower override placed ahead of the measured set's own one would lower
+    that test's ceiling while the set's key still resolves to the set's ceiling.
+    The narrower set is held to the baseline of the set holding it, which is its
+    slowest test and so an upper bound on the narrower set's own.
+    """
+    baselines = dict(QUIET_BASELINE_SECONDS)
+    for override in config.get("profile", {}).get("default", {}).get("overrides", []):
+        for selector in selectors_matched(override.get("filter", "")):
+            if selector in baselines:
+                continue
+            holding = [
+                baseline
+                for key, baseline in QUIET_BASELINE_SECONDS.items()
+                if contained_in(selector, key)
+            ]
+            if holding:
+                baselines[selector] = max(holding)
+    return baselines
+
+
 def resolve(config: dict, binary: str, setting: str) -> object | None:
     """Resolve `setting` for the test set `binary` the way nextest does.
 
@@ -377,7 +423,7 @@ def check_config(config_path: Path, repo_root: Path | None = None) -> list[str]:
             "the affected binaries their own override and record why."
         )
 
-    for binary, baseline in sorted(QUIET_BASELINE_SECONDS.items()):
+    for binary, baseline in sorted(baselines_to_check(config).items()):
         required = baseline * CONTENTION_FACTOR * CONTENTION_HEADROOM
         try:
             ceiling = ceiling_seconds(resolve(config, binary, "slow-timeout"))
@@ -387,8 +433,13 @@ def check_config(config_path: Path, repo_root: Path | None = None) -> list[str]:
         if ceiling is None:
             continue  # No ceiling at all cannot be breached by contention.
         if ceiling < required:
+            measured = (
+                "its slowest test"
+                if binary in QUIET_BASELINE_SECONDS
+                else "the slowest test measured in the test set holding it"
+            )
             problems.append(
-                f"{name}: {binary} is killed after {ceiling:.0f}s, but its slowest test "
+                f"{name}: {binary} is killed after {ceiling:.0f}s, but {measured} "
                 f"needs {baseline:.1f}s on a quiet pool and contention has been measured "
                 f"multiplying runtimes by {CONTENTION_FACTOR}x, so with {CONTENTION_HEADROOM}x "
                 f"headroom for the next increment it needs at least {required:.0f}s. As "
