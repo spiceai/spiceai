@@ -64,6 +64,9 @@ test_with_backends!(failing_retention_over_a_preexisting_inline_corpus_publishes
 test_with_backends!(unkeyed_retention_append_carries_a_preexisting_inline_corpus_impl);
 test_with_backends!(unkeyed_retention_append_keeps_committed_transaction_rows_impl);
 test_with_backends!(transaction_staged_across_a_retention_append_commits_or_aborts_cleanly_impl);
+test_with_backends!(transaction_commit_retires_newly_matching_resident_rows_impl);
+test_with_backends!(transaction_commit_skips_hidden_versions_before_resident_retention_impl);
+test_with_backends!(transaction_commit_with_failing_resident_retention_publishes_nothing_impl);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -3315,6 +3318,208 @@ async fn transaction_staged_across_a_retention_append_commits_or_aborts_cleanly_
         assert_eq!(
             ids(&reopen_plain(&fixture, name).await?).await?,
             after,
+            "{name}: durable"
+        );
+    }
+    Ok(())
+}
+
+/// A table created and filled without `retention_sql` (so no write evaluated a
+/// predicate over the seed), then reopened with `retention`.
+async fn seeded_then_reopened(
+    fixture: &common::TestFixture,
+    name: &str,
+    keyed: bool,
+    seed: RecordBatch,
+    retention: Vec<Expr>,
+) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    let plain = table_with(fixture, name, keyed, vec![]).await?;
+    common::insert_batch(plain.as_ref(), seed).await?;
+    drop(plain);
+    Ok(Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            SessionContext::new().runtime_env(),
+        )
+        .with_retention_filters(retention)
+        .open(name)
+        .await?,
+    ))
+}
+
+async fn table_with(
+    fixture: &common::TestFixture,
+    name: &str,
+    keyed: bool,
+    retention: Vec<Expr>,
+) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    let dir = fixture.data_path.join(name);
+    std::fs::create_dir_all(&dir)?;
+    let key = if keyed {
+        vec!["id".to_string()]
+    } else {
+        vec![]
+    };
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: key.clone(),
+        on_conflict: keyed.then(|| OnConflict::Upsert(ColumnReference::new(key))),
+        base_path: dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: file_tier_config(),
+    };
+    Ok(Arc::new(
+        CayenneTableProvider::create_table_with_retention(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            options,
+            retention,
+            SessionContext::new().runtime_env(),
+        )
+        .await?,
+    ))
+}
+
+/// A transaction's publication applies `retention_sql` to the whole logical
+/// view it publishes: the incoming rows and the resident rows it keeps. A
+/// resident row that newly matches is gone the moment the commit returns, in
+/// the same catalog transaction (no later DELETE), keyed and unkeyed; a reader
+/// planned before the commit keeps the old rows; a reopen agrees.
+async fn transaction_commit_retires_newly_matching_resident_rows_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    for keyed in [true, false] {
+        let name = if keyed {
+            "rsql_txn_resident_keyed"
+        } else {
+            "rsql_txn_resident_unkeyed"
+        };
+        let on = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&on);
+        let udf = create_udf(
+            "aged",
+            vec![DataType::Int64],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args: &[ColumnarValue]| {
+                let array = args[0].clone().into_array(1)?;
+                let ids = array.as_any().downcast_ref::<Int64Array>().expect("int64");
+                let on = flag.load(Ordering::SeqCst);
+                Ok(ColumnarValue::Array(Arc::new(
+                    arrow::array::BooleanArray::from_iter(
+                        ids.iter()
+                            .map(|id| Some(on && matches!(id, Some(1) | Some(11)))),
+                    ),
+                )))
+            }),
+        );
+        let t = table_with(&fixture, name, keyed, vec![udf.call(vec![col("id")])]).await?;
+        common::insert_batch(
+            t.as_ref(),
+            rows(&[(1, Some("active")), (2, Some("active"))]),
+        )
+        .await?;
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::clone(&t) as Arc<dyn TableProvider>)?;
+        let old_plan = ctx
+            .sql("SELECT id FROM t ORDER BY id")
+            .await?
+            .create_physical_plan()
+            .await?;
+        on.store(true, Ordering::SeqCst);
+        commit_in_txn(&t, rows(&[(10, Some("active")), (11, Some("active"))])).await?;
+        assert_eq!(
+            ids(&t).await?,
+            vec![2, 10],
+            "{name}: the commit retired the aged resident row and the matching incoming row with it"
+        );
+        assert_eq!(
+            collect_ids(old_plan, &ctx).await?,
+            vec![1, 2],
+            "{name}: a reader planned before the commit keeps the old rows"
+        );
+        drop(ctx);
+        drop(t);
+        assert_eq!(
+            ids(&reopen_plain(&fixture, name).await?).await?,
+            vec![2, 10],
+            "{name}: durable"
+        );
+    }
+    Ok(())
+}
+
+/// The resident rows a transaction supersedes are skipped before its resident
+/// retention predicate runs: a hidden version on which the predicate fails
+/// neither fails nor is counted, and a resident row that matches is retired in
+/// the same publication.
+async fn transaction_commit_skips_hidden_versions_before_resident_retention_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = "rsql_txn_hidden_version";
+    // Fails on a non-integer status; matches status "1".
+    let failing = cast(col("status"), DataType::Int32).eq(lit(1_i32));
+    let t = seeded_then_reopened(
+        &fixture,
+        name,
+        true,
+        rows(&[(1, Some("x")), (2, Some("3")), (3, Some("1"))]),
+        vec![failing],
+    )
+    .await?;
+    commit_in_txn(&t, rows(&[(1, Some("4"))])).await?;
+    assert_eq!(
+        ids(&t).await?,
+        vec![1, 2],
+        "superseded copy skipped, matching resident retired"
+    );
+    drop(t);
+    assert_eq!(
+        ids(&reopen_plain(&fixture, name).await?).await?,
+        vec![1, 2],
+        "durable"
+    );
+    Ok(())
+}
+
+/// A resident row on which the predicate fails fails the whole transaction:
+/// nothing it staged becomes visible, no resident row is deleted, a reopen
+/// agrees, and the table takes a later write once the row is gone.
+async fn transaction_commit_with_failing_resident_retention_publishes_nothing_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for keyed in [true, false] {
+        let name = if keyed {
+            "rsql_txn_fail_keyed"
+        } else {
+            "rsql_txn_fail_unkeyed"
+        };
+        let failing = cast(col("status"), DataType::Int32).eq(lit(1_i32));
+        let t = seeded_then_reopened(
+            &fixture,
+            name,
+            keyed,
+            rows(&[(1, Some("x")), (2, Some("3"))]),
+            vec![failing],
+        )
+        .await?;
+        for attempt in 0..2 {
+            let result = commit_in_txn(&t, rows(&[(5, Some("4"))])).await;
+            assert!(
+                result.is_err(),
+                "{name} attempt {attempt}: retention cannot evaluate the resident row"
+            );
+            assert_eq!(
+                ids(&t).await?,
+                vec![1, 2],
+                "{name} attempt {attempt}: nothing published"
+            );
+        }
+        drop(t);
+        assert_eq!(
+            ids(&reopen_plain(&fixture, name).await?).await?,
+            vec![1, 2],
             "{name}: durable"
         );
     }
