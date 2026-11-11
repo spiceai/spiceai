@@ -1649,6 +1649,7 @@ impl<'a> AppendMutationWriter<'a> {
             superseded: superseded_rows,
             first_load_pk_bloom,
             retention_folded,
+            fold: _,
         } = match &publication_filters {
             Some(filters) => {
                 super::overwrite_retention::with_publication_retention(

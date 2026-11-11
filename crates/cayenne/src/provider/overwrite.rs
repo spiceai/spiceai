@@ -1195,6 +1195,13 @@ impl CayenneTableProvider {
         self.sync_local_snapshot_dir(new_snapshot_id)
             .await
             .map_err(|source| super::Error::Catalog { source })?;
+        // A listing taken before the carry (the evaluation of the staged rows
+        // lists this directory through the shared list-files cache) would
+        // publish the generation without the carried files.
+        Self::invalidate_list_files_cache(
+            self.context().runtime_env(),
+            &Self::snapshot_dir_url(&self.metadata().path, self.table_id(), new_snapshot_id),
+        );
         Ok(deletions)
     }
 
@@ -1205,19 +1212,30 @@ impl CayenneTableProvider {
     /// transaction's held `write_lock`, so the deletion vectors draw the
     /// sequence that moves the high water (or one is drawn for them). Holds no
     /// lock of its own: the transaction owns `write_lock` and the fences.
-    /// Abandons the snapshot on error.
+    /// Under `retention_sql` (the caller's publication context) the staged
+    /// rows and the carried rows are evaluated in it; returns the generation
+    /// and how many staged rows it hides. Abandons the snapshot on error.
     pub(crate) async fn prepare_transaction_generation(
         &self,
         new_snapshot_id: String,
         row_count: u64,
         write_stats_acc: Arc<ColumnStatsAccumulator>,
-    ) -> Result<PreparedOverwrite> {
+    ) -> Result<(PreparedOverwrite, u64)> {
+        // The staged rows first, while they are the only files of the staged
+        // snapshot, then the carried runs: one retention context (the
+        // caller's), each row evaluated once.
         let carried = async {
+            let staged = self
+                .hide_retention_matches_in_snapshot(&new_snapshot_id, HashMap::new())
+                .await?;
+            let staged_matches: u64 = staged.values().map(|rows| rows.len() as u64).sum();
             self.materialize_inline_rows_for_carry().await?;
-            self.carry_published_runs_into(&new_snapshot_id).await
+            let mut deletions = self.carry_published_runs_into(&new_snapshot_id).await?;
+            deletions.extend(staged);
+            Ok::<_, super::Error>((deletions, staged_matches))
         }
         .await;
-        let position_deletions = match carried {
+        let (position_deletions, staged_matches) = match carried {
             Ok(deletions) => deletions,
             Err(error) => {
                 self.abandon_overwrite_snapshot(&new_snapshot_id).await;
@@ -1246,19 +1264,22 @@ impl CayenneTableProvider {
             self.abandon_overwrite_snapshot(&new_snapshot_id).await;
             return Err(error.into());
         }
-        Ok(PreparedOverwrite {
-            table: self.clone_for_write(),
-            write_guard: None,
-            checkpoint_guard: None,
-            new_snapshot_id,
-            row_count,
-            write_stats_acc,
-            carries_resident_files: true,
-            inlined: None,
-            _inline_admission: None,
-            delete_files,
-            position_deletions,
-        })
+        Ok((
+            PreparedOverwrite {
+                table: self.clone_for_write(),
+                write_guard: None,
+                checkpoint_guard: None,
+                new_snapshot_id,
+                row_count,
+                write_stats_acc,
+                carries_resident_files: true,
+                inlined: None,
+                _inline_admission: None,
+                delete_files,
+                position_deletions,
+            },
+            staged_matches,
+        ))
     }
 
     /// Move the inline corpus of a table without a primary key into its current

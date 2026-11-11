@@ -89,10 +89,13 @@ pub struct CayenneStagedUpsert {
     stats: Arc<ColumnStatsAccumulator>,
     row_count: u64,
     superseded: usize,
-    /// The publication's `retention_sql` conjuncts, coerced once at staging (one
-    /// `now()`): staging drops the incoming matches with them, and the commit
-    /// evaluates the resident rows it keeps with the same ones.
-    publication_filters: Option<Arc<Vec<datafusion::logical_expr::Expr>>>,
+    /// The table has `retention_sql`: staging evaluated nothing, and the commit
+    /// evaluates the staged candidates and the resident rows it keeps in ONE
+    /// retention context created after its lock waits and optimistic check.
+    retention_deferred: bool,
+    /// The superseded copies a folding table has not yet folded out of the
+    /// staged files (see [`super::append_stage::StagedAppend::fold`]).
+    fold: Option<super::append_stage::PendingFold>,
 }
 
 impl std::fmt::Debug for CayenneStagedUpsert {
@@ -111,7 +114,7 @@ impl CayenneStagedUpsert {
         table: CayenneTableProvider,
         token: TransactionWriteToken,
         staged: StagedAppend,
-        publication_filters: Option<Arc<Vec<datafusion::logical_expr::Expr>>>,
+        retention_deferred: bool,
     ) -> Self {
         Self {
             table,
@@ -122,7 +125,8 @@ impl CayenneStagedUpsert {
             stats: staged.stats,
             row_count: staged.row_count,
             superseded: staged.superseded,
-            publication_filters,
+            retention_deferred,
+            fold: staged.fold,
         }
     }
 
@@ -147,25 +151,46 @@ impl CayenneStagedUpsert {
             && self.on_conflict_deletions.reinserted_over_tombstone == 0
     }
 
+    /// The commit's one `retention_sql` context: the conjuncts coerced now,
+    /// after the commit's lock waits and optimistic check (one `now()` for the
+    /// whole publication: staged candidates, resident rows). `None` without
+    /// `retention_sql`.
+    fn commit_retention_context(&self) -> Result<Option<Arc<Vec<datafusion::logical_expr::Expr>>>> {
+        if !self.retention_deferred {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            self.table
+                .coerced_retention_filters()
+                .map_err(|source| Error::DataFusion { source })?,
+        )))
+    }
+
     /// Under the commit's held `write_lock` (the optimistic check passed): take
-    /// the mem-tier checkpoint lock, as a durable write does, and prepare the
-    /// `retention_sql` delete over the resident rows this publication keeps,
-    /// with the conjuncts staging used. Prepared before the snapshot sequence is
-    /// reserved, so its key deletes precede the staged rows. An error publishes
-    /// nothing.
-    async fn prepare_resident_retention_for_commit(
-        &self,
+    /// the mem-tier checkpoint lock, as a durable write does, then, in the
+    /// commit's one retention context, evaluate the staged candidates (each
+    /// winning copy once; superseded copies never) and prepare the delete over
+    /// the resident rows this publication keeps. Prepared before the snapshot
+    /// sequence is reserved, so resident key deletes precede the staged rows.
+    /// An error publishes nothing.
+    async fn prepare_commit_time_retention(
+        &mut self,
     ) -> Result<(
         Option<tokio::sync::OwnedMutexGuard<()>>,
         Option<super::delete::PreparedDeletionPublish>,
     )> {
-        let Some(filters) = self.publication_filters.clone() else {
+        let Some(filters) = self.commit_retention_context()? else {
             return Ok((None, None));
         };
         let checkpoint_guard = self
             .table
             .lock_mem_tier_checkpoint_for_durable_write()
             .await;
+        super::overwrite_retention::with_publication_retention(
+            Arc::clone(&filters),
+            self.retain_staged_candidates(),
+        )
+        .await?;
         let prepared = super::overwrite_retention::with_publication_retention(
             Arc::clone(&filters),
             self.table
@@ -173,6 +198,84 @@ impl CayenneStagedUpsert {
         )
         .await?;
         Ok((Some(checkpoint_guard), prepared))
+    }
+
+    /// Evaluate `retention_sql` (the caller's context) over the staged rows the
+    /// statement's own repeated keys left visible, and hide the matches: a
+    /// folding table folds them out with the pending superseded copies in one
+    /// rewrite (counted out of `row_count`, as a fold at staging was); any other
+    /// hides them by position in the staged files (counted as superseded).
+    async fn retain_staged_candidates(&mut self) -> Result<()> {
+        // Only a folding table or one hiding by position can hide a staged row;
+        // any other shape never evaluated its staged rows (unchanged).
+        if self.fold.is_none() && !self.table.hides_repeated_keys_with_position_deletes() {
+            return Ok(());
+        }
+        let marker = format!("/{}/", self.new_snapshot_id);
+        let already_hidden: std::collections::HashMap<String, Vec<u32>> = match &self.fold {
+            Some(fold) => fold.superseded.clone(),
+            None => self
+                .on_conflict_deletions
+                .delete_specs
+                .iter()
+                .filter(|(path, _)| path.contains(&marker))
+                .map(|(path, rows)| {
+                    let mut rows: Vec<u32> = rows
+                        .iter()
+                        .filter_map(|&row| u32::try_from(row).ok())
+                        .collect();
+                    rows.sort_unstable();
+                    rows.dedup();
+                    (path.to_string(), rows)
+                })
+                .collect(),
+        };
+        let hidden = self
+            .table
+            .hide_retention_matches_in_snapshot(&self.new_snapshot_id, already_hidden.clone())
+            .await?;
+        match self.fold.take() {
+            Some(fold) => {
+                if hidden.is_empty() {
+                    return Ok(());
+                }
+                let dropped: u64 = hidden.values().map(|rows| rows.len() as u64).sum();
+                self.stats = self
+                    .table
+                    .fold_superseded_copies(
+                        &self.new_snapshot_id,
+                        &hidden,
+                        fold.write,
+                        &fold.file_stats,
+                        &self.stats,
+                    )
+                    .await?;
+                self.row_count = self.row_count.saturating_sub(dropped);
+            }
+            None => {
+                for (path, rows) in hidden {
+                    let before: std::collections::HashSet<u32> = already_hidden
+                        .get(&path)
+                        .map(|rows| rows.iter().copied().collect())
+                        .unwrap_or_default();
+                    let new: Vec<u64> = rows
+                        .into_iter()
+                        .filter(|row| !before.contains(row))
+                        .map(u64::from)
+                        .collect();
+                    if new.is_empty() {
+                        continue;
+                    }
+                    self.superseded = self.superseded.saturating_add(new.len());
+                    self.on_conflict_deletions
+                        .delete_specs
+                        .entry(Arc::from(path.as_str()))
+                        .or_default()
+                        .extend(new);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Prepare this staged upsert's durable payload for an atomic multi-table
@@ -188,6 +291,15 @@ impl CayenneStagedUpsert {
     /// snapshot directory cannot be synced, or if reserving sequences / writing
     /// deletion vectors fails.
     pub async fn prepare_commit(mut self) -> Result<PreparedTxnCommit> {
+        if self.publishes_carried_generation()? {
+            self.table
+                .sync_local_snapshot_dir(&self.new_snapshot_id)
+                .await?;
+            return self.prepare_generation_commit().await;
+        }
+        // The commit's retention context first: a fold rewrites staged files,
+        // so the directory barrier below follows it.
+        let (checkpoint_guard, resident_retention) = self.prepare_commit_time_retention().await?;
         // Directory barrier for the staged rows, before the shared transaction
         // makes them visible. The non-transactional publish takes this barrier
         // in `record_written_snapshot_sequence`; the fused path commits the
@@ -201,12 +313,6 @@ impl CayenneStagedUpsert {
             .sync_local_snapshot_dir(&self.new_snapshot_id)
             .await?;
 
-        if self.publishes_carried_generation()? {
-            return self.prepare_generation_commit().await;
-        }
-
-        let (checkpoint_guard, resident_retention) =
-            self.prepare_resident_retention_for_commit().await?;
         let on_conflict_deletions = std::mem::take(&mut self.on_conflict_deletions);
         // Reserve sequences + write deletion-vector files + build the inline
         // tombstone, WITHOUT committing the catalog metadata — `defer_catalog_commit`
@@ -280,28 +386,33 @@ impl CayenneStagedUpsert {
             .table
             .lock_mem_tier_checkpoint_for_durable_write()
             .await;
+        let filters = self.commit_retention_context()?;
         let prepare = self.table.prepare_transaction_generation(
             self.new_snapshot_id.clone(),
             self.row_count,
             Arc::clone(&self.stats),
         );
-        let generation = match self.publication_filters.clone() {
+        // The staged candidates and every carried resident row are evaluated
+        // in this one context.
+        let (generation, staged_matches) = match filters {
             Some(filters) => {
                 super::overwrite_retention::with_publication_retention(filters, prepare).await?
             }
             None => prepare.await?,
         };
+        // Accepted rows, as when staging dropped the matches from the stream.
+        let row_count = self.row_count.saturating_sub(staged_matches);
         Ok(PreparedTxnCommit {
             table: self.table,
             new_snapshot_id: self.new_snapshot_id,
             validated_keys: self.validated_keys,
             stats: self.stats,
-            row_count: self.row_count,
             superseded: self.superseded,
             publication: TxnPublication::Generation {
                 generation: Some(generation),
                 committed: false,
             },
+            row_count,
             _checkpoint_guard: Some(checkpoint_guard),
         })
     }
@@ -321,10 +432,22 @@ impl CayenneStagedUpsert {
     /// error if applying the deletions, reserving the sequence, or the durable
     /// snapshot-sequence write fails. Uncommitted staged files are removed on error.
     pub async fn commit(
-        self,
+        mut self,
         footprint: std::collections::HashSet<u128>,
         footprint_complete: bool,
     ) -> Result<u64> {
+        // A table without a primary key publishes a carried generation, whose
+        // in-memory flip must run under the listing fence the fused
+        // `CayenneTransaction::commit` holds; this single-table path holds no
+        // fence, so it refuses rather than publish a protected snapshot that a
+        // reopen does not load.
+        if self.publishes_carried_generation()? {
+            cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
+            return Err(Error::Unsupported {
+                operation: "committing a staged write to a table without a primary key outside a \
+                            CayenneTransaction",
+            });
+        }
         // Acquire the write lock now (staging ran off-lock), then re-check the
         // transaction's read footprint + write-set per-key before touching
         // anything visible: if any of those keys was committed after this
@@ -350,7 +473,7 @@ impl CayenneStagedUpsert {
         }
 
         let (checkpoint_guard, resident_retention) =
-            match self.prepare_resident_retention_for_commit().await {
+            match self.prepare_commit_time_retention().await {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     drop(write_guard);
@@ -739,27 +862,20 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         target_partitions: usize,
     ) -> Result<CayenneStagedUpsert> {
-        let publication_filters = if self.has_retention_delete_filters() {
-            Some(Arc::new(
-                self.coerced_retention_filters()
-                    .map_err(|source| Error::DataFusion { source })?,
-            ))
-        } else {
-            None
-        };
+        // `retention_sql` is not evaluated while staging: the commit evaluates
+        // the staged candidates in its own context (see `retention_deferred`).
+        let retention_deferred = self.has_retention_delete_filters();
         let stage = self.stage_upsert_data(data, target_partitions);
-        let staged = match &publication_filters {
-            Some(filters) => {
-                super::overwrite_retention::with_publication_retention(Arc::clone(filters), stage)
-                    .await?
-            }
-            None => stage.await?,
+        let staged = if retention_deferred {
+            super::overwrite_retention::with_staged_retention_deferred(stage).await?
+        } else {
+            stage.await?
         };
         Ok(CayenneStagedUpsert::new(
             self.clone_for_write(),
             token,
             staged,
-            publication_filters,
+            retention_deferred,
         ))
     }
 
@@ -794,14 +910,8 @@ impl CayenneTableProvider {
                 .await;
         }
 
-        // A table without a primary key supersedes nothing, so `retention_sql`
-        // drops its matches from the stream before the write, and the commit
-        // publishes the append and its retention delete together.
-        let data = if self.primary_key_indices()?.is_none() {
-            self.drop_retention_matches_from_stream(data)?.0
-        } else {
-            data
-        };
+        // A table without a primary key supersedes nothing; its staged rows are
+        // all candidates, evaluated with the carried generation at commit.
         let prepared = self.prepare_stream_for_insert_offlock(data).await?;
         let post_validation = prepared.post_validation();
 
@@ -847,6 +957,7 @@ impl CayenneTableProvider {
             superseded,
             first_load_pk_bloom: None,
             retention_folded: 0,
+            fold: None,
         })
     }
 }

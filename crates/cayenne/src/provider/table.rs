@@ -9112,7 +9112,7 @@ impl CayenneTableProvider {
     /// * `table_path` - The base path for the table (local path or S3 URL)
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
-    fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
+    pub(crate) fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
         if table_path.starts_with("s3://") {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
@@ -84356,6 +84356,7 @@ mod tests {
         }
     }
 
+    mod commit_time_retention;
     mod hybrid_retention;
     mod layered_upsert_state;
     mod repeated_keys;

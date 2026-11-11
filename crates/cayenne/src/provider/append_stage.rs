@@ -133,9 +133,22 @@ pub(super) struct StagedAppend {
     /// Rows `retention_sql` folded out of the staged files, so neither in
     /// `row_count` nor in `superseded`. The append still reports them inserted.
     pub retention_folded: u64,
+    /// For a transaction staged with `retention_sql` deferred to its commit, on
+    /// a table that folds hidden rows out of its staged files (rather than
+    /// hiding them by position): the write shape, the per-file statistics, and
+    /// the superseded copies NOT yet folded. The commit evaluates the predicate
+    /// over the rows they leave and folds both out in one rewrite.
+    pub fold: Option<PendingFold>,
 }
 
 type ResolvedFiles = (u64, Arc<ColumnStatsAccumulator>, HashMap<String, Vec<u32>>);
+
+/// See [`StagedAppend::fold`].
+pub(super) struct PendingFold {
+    pub write: WriteShape,
+    pub file_stats: Arc<FileStatsObserver>,
+    pub superseded: HashMap<String, Vec<u32>>,
+}
 
 impl CayenneTableProvider {
     /// Write `data` to the staging snapshot `staging_snapshot_id`, then fold the
@@ -226,6 +239,8 @@ impl CayenneTableProvider {
             .transpose()?;
         let start = Instant::now();
         let mut retention_folded = 0_u64;
+        let defer_fold = super::overwrite_retention::staged_retention_deferred();
+        let mut pending_fold = HashMap::new();
         let written: Result<ResolvedFiles> = async {
             let (rows, _, stats) = self
                 .write_to_snapshot_with_schema(
@@ -259,6 +274,12 @@ impl CayenneTableProvider {
                 .hide_retention_matches_in_snapshot(&new_snapshot_id, superseded)
                 .await?;
             match file_stats.as_deref() {
+                // A transaction folds once, at its commit, with the predicate's
+                // matches (`StagedAppend::fold`).
+                Some(_) if defer_fold => {
+                    pending_fold = superseded;
+                    Ok((rows, stats, HashMap::new()))
+                }
                 Some(file_stats) if !superseded.is_empty() => {
                     let dropped: u64 = superseded.values().map(|rows| rows.len() as u64).sum();
                     retention_folded = dropped.saturating_sub(repeats);
@@ -319,6 +340,13 @@ impl CayenneTableProvider {
             superseded,
             first_load_pk_bloom,
             retention_folded,
+            fold: file_stats
+                .filter(|_| defer_fold)
+                .map(|file_stats| PendingFold {
+                    write,
+                    file_stats,
+                    superseded: pending_fold,
+                }),
         })
     }
 }

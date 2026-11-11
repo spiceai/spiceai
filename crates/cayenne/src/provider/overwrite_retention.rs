@@ -70,7 +70,7 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         mut position_deletions: HashMap<String, Vec<u32>>,
     ) -> super::Result<HashMap<String, Vec<u32>>> {
-        if !self.has_retention_delete_filters() {
+        if !self.has_retention_delete_filters() || staged_retention_deferred() {
             return Ok(position_deletions);
         }
         let matches = self
@@ -476,6 +476,26 @@ pub(crate) async fn with_publication_retention<F: std::future::Future>(
     work: F,
 ) -> F::Output {
     PUBLICATION_RETENTION.scope(filters, work).await
+}
+
+tokio::task_local! {
+    /// Set while a transaction stages its rows: `retention_sql` is not evaluated
+    /// then. The staged candidates are kept unfiltered and evaluated once, in
+    /// the commit's own retention context, after its lock waits and optimistic
+    /// check, so no staging-time verdict (an aged row, a volatile draw) is
+    /// irreversibly applied to a publication that happens later.
+    static STAGED_RETENTION_DEFERRED: ();
+}
+
+/// Run a transaction's staging `work` with `retention_sql` deferred to commit.
+pub(crate) async fn with_staged_retention_deferred<F: std::future::Future>(work: F) -> F::Output {
+    STAGED_RETENTION_DEFERRED.scope((), work).await
+}
+
+/// Whether the work in progress is a transaction's staging (see
+/// [`with_staged_retention_deferred`]).
+pub(crate) fn staged_retention_deferred() -> bool {
+    STAGED_RETENTION_DEFERRED.try_with(|()| ()).is_ok()
 }
 
 /// The publication's `retention_sql` conjuncts, when one is in progress.
