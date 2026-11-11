@@ -381,7 +381,9 @@ jobs:
         env:
           AWS_S3_BUCKET: ${{ env.WAL_BUCKET }}
           AWS_S3_PREFIX: ${{ env.WAL_PREFIX }}/s3_integration
-        run: cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture s3_integration::
+        # A block scalar: YAML reads a plain value ending in `:` as a mapping key.
+        run: |
+          cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture s3_integration::
       - name: Run process histories against ${{ matrix.store }}
         timeout-minutes: 30
         env:
