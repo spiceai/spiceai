@@ -759,13 +759,6 @@ flag (`runtime.params.cayenne_vnext`):
   object-native metastore. Otherwise a copy left in the location while the flag
   was off could be served stale. Switching the flag on, off and on again is not
   supported.
-- **Commit outcomes.** A commit whose outcome is unknown is logged as a warning
-  that names the dataset; the dataset accepts no change until it has read its
-  state back, and the source is not acknowledged meanwhile. A dataset that
-  another instance took over stops writing and keeps answering queries, and
-  this is logged as information, not as an error: it is normal with several
-  instances. A change the dataset's state refuses is a bug; the dataset stops
-  until Spice restarts, with an error line that names it.
   [Details](object-native-metastore-technical.md#uncertain-writes).
 - **A missing or unreadable data file fails the query** with an error that
   names the dataset, the file and its data path, and says to start the dataset
