@@ -46,7 +46,7 @@ jobs:
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
@@ -126,7 +126,7 @@ jobs:
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
