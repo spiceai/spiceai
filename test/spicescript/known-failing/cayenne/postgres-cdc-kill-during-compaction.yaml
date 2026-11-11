@@ -6,9 +6,11 @@ description: >
   compaction commits again. Each run kills at the first moment a compaction
   holds a permit, after a different amount of change. Waits for compaction
   keep writing new data rather than waiting for time, since compaction needs
-  new data to trigger. A full refresh killed while it overwrites a table
-  leaves it with every row from before or every row from after, never part of
-  either. With object-native data (#16133), the files the compactions and the
+  new data to trigger. A full refresh killed while it overwrites a table,
+  timed from the moment the overwrite starts writing and at a different
+  offset into it each run, leaves it with every row from before or every row
+  from after, never part of either or a mix, and it then matches the source.
+  With object-native data (#16133), the files the compactions and the
   overwrite retired are deleted from the state location after the grace.
 
 sources:
@@ -113,24 +115,63 @@ steps:
 
   # A full refresh killed while it overwrites the table: after the restart the
   # dataset holds one whole batch, the one from before or the one from after,
-  # and the source's rows once it refreshes again. Whether the kill lands in
-  # the middle of the overwrite is not controlled; the load is large enough
-  # that it usually does.
+  # never a mix, and the source's rows once it refreshes again. Batch 2 differs
+  # from batch 1 in size, ids and payload, so one query tells a whole old
+  # batch, a whole new batch and a mix apart.
+  #
+  # The kill is timed from `cayenne_write_phase_duration_ms{phase="encode_permit_wait"}`,
+  # which an overwrite records once, after it takes its encode permits and
+  # before it writes its first data file, so when recorded the overwrite has
+  # started and not committed (the harness polls `/metrics` every 50 ms). Each of the five matrix runs
+  # then waits a different time before the kill (none, then 100 ms to 1.5 s),
+  # so the kills land at different points of the write. Nothing marks the
+  # commit, so a run whose wait outlasts the overwrite kills after it; it then
+  # must hold the whole new batch. The waits are `sleep`s because the offset
+  # into the write is what varies.
+  #
+  # Known-failing: this script's entries in `recordings/expected-failures.json`
+  # do not cover these steps yet; they are recorded (`--record-failures`) on
+  # the first run against `spiced`.
   - source-exec:
       src: |
         BEGIN;
         DELETE FROM snap;
-        INSERT INTO snap SELECT i, 2, repeat('b', 64) FROM generate_series(1, 300000) AS i;
+        INSERT INTO snap SELECT i, 2, repeat('b', 64) FROM generate_series(100001, 350000) AS i;
         COMMIT;
+  - mark-metrics: before-overwrite
   - refresh: { dataset: snap_full, wait: false }
-  - sleep: 500ms
+  - wait-metric:
+      name: cayenne_write_phase_duration_ms_count
+      labels: { table: snap_full, phase: encode_permit_wait }
+      increased-by: 1
+      since: before-overwrite
+      timeout: 60s
+  - sleep: 100ms
+    when: { run: 2 }
+  - sleep: 300ms
+    when: { run: 3 }
+  - sleep: 700ms
+    when: { run: 4 }
+  - sleep: 1500ms
+    when: { run: 5 }
   - kill-spiced: {}
   - start: {}
-  - query: SELECT count(DISTINCT batch) AS batches, count(*) AS n, count(DISTINCT id) AS ids FROM snap_full
-    expect: { rows: [['1', '300000', '300000']] }
+  # Exactly one batch, no repeated id, one payload, and the batch whole: its
+  # row count and id range are batch 1's (1..300000) or batch 2's
+  # (100001..350000), and with no repeated id that is every id in the range.
+  - query: |
+      SELECT count(DISTINCT batch) AS batches,
+             count(*) - count(DISTINCT id) AS repeated_ids,
+             count(DISTINCT payload) AS payloads,
+             (min(batch) = 1 AND count(*) = 300000 AND min(id) = 1 AND max(id) = 300000)
+               OR (min(batch) = 2 AND count(*) = 250000 AND min(id) = 100001 AND max(id) = 350000) AS whole_batch
+      FROM snap_full
+    expect: { rows: [['1', '0', '1', 'true']] }
   - refresh: snap_full
-  - query: SELECT batch, count(*) AS n FROM snap_full GROUP BY batch
-    oracle-sql: SELECT batch, count(*) AS n FROM snap GROUP BY batch
+  - query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, min(id) AS lo, max(id) AS hi, min(payload) AS payload FROM snap_full GROUP BY batch
+    oracle-sql: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, min(id) AS lo, max(id) AS hi, min(payload) AS payload FROM snap GROUP BY batch
+  - query: SELECT id, batch, payload FROM snap_full WHERE id % 997 = 0
+    oracle-sql: SELECT id, batch, payload FROM snap WHERE id % 997 = 0
 
   # What the compactions and the overwrite retired stays for the data-file
   # retention (an hour), so a query on another instance still finds it: the
