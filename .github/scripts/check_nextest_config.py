@@ -162,6 +162,9 @@ _TEST_TERM = re.compile(
     r"\s*&\s*test\(=([A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*)\)\s*\)"
 )
 _OTHER_BINARY_TERM = re.compile(r"binary(?:-id|_id)?\((?!=[A-Za-z0-9_]+\))")
+# What may remain once every resolved term is removed: union operators and
+# whitespace, nothing that could narrow or negate the terms.
+_UNION_ONLY = re.compile(r"\s+|\||\+|\bor\b")
 
 
 def parse_duration(text: str) -> float:
@@ -294,7 +297,18 @@ def selectors_matched(filter_expr: str) -> set[str]:
         raise ValueError(
             f"unsupported binary filter spelling, cannot resolve a ceiling: {filter_expr!r}"
         )
-    return selectors | set(_BINARY_EQ_TERM.findall(rest))
+    selectors |= set(_BINARY_EQ_TERM.findall(rest))
+    # The terms above are read as a plain union. Anything else around them —
+    # `not`, `!`, `-`, `&`, `and`, `none()`, another predicate — can exclude the
+    # very tests a term names (`not (binary_id(=x) & test(=t))` selects every
+    # test but `t`), so it is refused rather than read as selecting them.
+    operators = _UNION_ONLY.sub("", _BINARY_EQ_TERM.sub("", rest))
+    if selectors and operators:
+        raise ValueError(
+            "unsupported operator around a binary filter term; only a union "
+            f"(`|`, `or`, `+`) of them can be resolved: {filter_expr!r}"
+        )
+    return selectors
 
 
 def selected(key: str, filter_expr: str) -> bool:

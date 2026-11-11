@@ -263,6 +263,36 @@ class BinaryFilterTest(unittest.TestCase):
         self.assertTrue(check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}", "binary(=cayenne)"))
         self.assertFalse(check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}", "binary(=runtime)"))
 
+    def test_refuses_operators_that_could_exclude_the_named_tests(self):
+        """A negated or intersected term does not select its tests; refuse to read it so."""
+        exact = f"(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))"
+        module = "(binary_id(=cayenne::integration) & test(/^a_test::/))"
+        for expr in (
+            f"not {exact}",
+            f"!{exact}",
+            f"{exact} & none()",
+            f"{exact} and test(/x/)",
+            f"all() - {module}",
+            f"not {module}",
+            "not binary(=retention_oom)",
+        ):
+            with self.subTest(expr=expr):
+                with self.assertRaisesRegex(ValueError, "unsupported"):
+                    check_nextest_config.selectors_matched(expr)
+
+    def test_a_union_of_terms_is_still_read(self):
+        """The negative case: unions, in every spelling nextest accepts, resolve."""
+        exact = f"(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))"
+        module = "(binary_id(=cayenne::integration) & test(/^a_test::/))"
+        for expr in (f"{exact} | {module}", f"{exact} or {module}", f"{exact} + {module}"):
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    check_nextest_config.selectors_matched(expr),
+                    {f"cayenne#{SMALL_TIER_TEST}", "cayenne::integration::a_test"},
+                )
+        # A filter on test names alone still resolves to no test set at all.
+        self.assertEqual(check_nextest_config.selectors_matched("not test(/^github::/)"), set())
+
     def test_a_module_selector_does_not_match_the_whole_binary(self):
         """Selecting one module must not stand in for the binary, or its siblings."""
         matched = check_nextest_config.selectors_matched(
