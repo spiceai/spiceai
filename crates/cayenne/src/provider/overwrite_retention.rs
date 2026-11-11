@@ -565,10 +565,13 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
         filters: &[Expr],
+        superseding: Option<Vec<RecordBatch>>,
     ) -> super::Result<Option<super::delete::PreparedDeletionPublish>> {
         self.move_inline_corpus_to_files_for_retention().await?;
         if self.primary_key_indices()?.is_some() {
-            return self.prepare_resident_retention(snapshot_id, filters).await;
+            return self
+                .prepare_resident_retention(snapshot_id, filters, superseding)
+                .await;
         }
         let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
             source: datafusion_common::DataFusionError::Execution(format!(
@@ -590,10 +593,39 @@ impl CayenneTableProvider {
     /// first: the predicate never sees them, so a hidden version cannot fail or
     /// be counted. Nothing is
     /// committed; the append's transaction takes the returned delete files.
+    /// The primary-key columns of the rows staged in `snapshot_id`, or `None`
+    /// for a table without a primary key: the keys the write supersedes.
+    pub(crate) async fn staged_key_columns(
+        &self,
+        snapshot_id: &str,
+    ) -> super::Result<Option<Vec<RecordBatch>>> {
+        let schema = self.table_schema();
+        let Some(indices) = self.primary_key_indices()? else {
+            return Ok(None);
+        };
+        let keys: Vec<String> = indices
+            .into_iter()
+            .map(|index| schema.field(index).name().clone())
+            .collect();
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.read_staged_columns(snapshot_id, &keys)
+                .await
+                .map_err(|source| super::Error::DataFusion { source })?,
+        ))
+    }
+
+    /// `superseding`: the write's keys captured before `retention_sql` folded
+    /// any replacement out of the staged files (a fold removes the row, not
+    /// its supersession). `None` re-reads them from the staged files, which is
+    /// exact when nothing was folded out.
     pub(crate) async fn prepare_resident_retention(
         &self,
         snapshot_id: &str,
         filters: &[Expr],
+        superseding: Option<Vec<RecordBatch>>,
     ) -> super::Result<Option<super::delete::PreparedDeletionPublish>> {
         let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
             source: datafusion_common::DataFusionError::Execution(format!(
@@ -621,10 +653,13 @@ impl CayenneTableProvider {
         // and records positions beside it. So the sink below always deletes by
         // key, and the write's superseded keys are what it skips.
         debug_assert!(!self.is_position_based());
-        let incoming = self
-            .read_staged_columns(snapshot_id, &keys)
-            .await
-            .map_err(failed)?;
+        let incoming = match superseding {
+            Some(incoming) => incoming,
+            None => self
+                .read_staged_columns(snapshot_id, &keys)
+                .await
+                .map_err(failed)?,
+        };
         let sink = self
             .build_deletion_vector_sink(filters, None, super::table::DeletionRequestSource::User)
             .await

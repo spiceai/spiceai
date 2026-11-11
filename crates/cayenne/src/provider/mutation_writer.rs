@@ -1649,6 +1649,7 @@ impl<'a> AppendMutationWriter<'a> {
             superseded: superseded_rows,
             first_load_pk_bloom,
             retention_folded,
+            superseding_keys,
             fold: _,
         } = match &publication_filters {
             Some(filters) => {
@@ -1667,7 +1668,7 @@ impl<'a> AppendMutationWriter<'a> {
         let resident_retention = match (&publication_filters, self.into_empty_table) {
             (Some(filters), false) => match self
                 .table
-                .prepare_resident_retention(&snapshot_id, filters)
+                .prepare_resident_retention(&snapshot_id, filters, superseding_keys)
                 .await
             {
                 Ok(prepared) => prepared,

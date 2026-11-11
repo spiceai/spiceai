@@ -410,6 +410,21 @@ pub(crate) mod test_seams {
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static PAUSES_AFTER_COMMIT: LazyLock<Mutex<HashMap<String, Pause>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    static PAUSES_AT_CHECKPOINT_WAIT: LazyLock<Mutex<HashMap<String, Pause>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Run `pause` in the next transaction commit on `table_id` with
+    /// `retention_sql`, immediately before it waits for the mem-tier
+    /// checkpoint lock.
+    pub(crate) fn pause_at_checkpoint_wait(table_id: &str, pause: Pause) {
+        PAUSES_AT_CHECKPOINT_WAIT
+            .lock()
+            .insert(table_id.to_string(), pause);
+    }
+
+    pub(crate) fn take_pause_at_checkpoint_wait(table_id: &str) -> Option<Pause> {
+        PAUSES_AT_CHECKPOINT_WAIT.lock().remove(table_id)
+    }
 
     /// Run `pause` in the next catalog commit keyed on `table_id`, after the
     /// transaction durably committed and before the commit returns: the point

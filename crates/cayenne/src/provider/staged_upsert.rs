@@ -183,13 +183,30 @@ impl CayenneStagedUpsert {
         Option<tokio::sync::OwnedMutexGuard<()>>,
         Option<super::delete::PreparedDeletionPublish>,
     )> {
-        let Some(filters) = self.commit_retention_context()? else {
+        if !self.retention_deferred {
             return Ok((None, None));
-        };
+        }
+        #[cfg(test)]
+        if let Some(pause) =
+            super::append_commit::test_seams::take_pause_at_checkpoint_wait(self.table.table_id())
+        {
+            pause().await;
+        }
         let checkpoint_guard = self
             .table
             .lock_mem_tier_checkpoint_for_durable_write()
             .await;
+        // The publication's one `now()`, taken after its last lock wait (the
+        // caller already holds every write lock and fence and has validated),
+        // so no wait can leave it in the past.
+        let Some(filters) = self.commit_retention_context()? else {
+            return Ok((Some(checkpoint_guard), None));
+        };
+        // Every staged key supersedes its resident version, a replacement the
+        // predicate is about to fold out of the staged files included: capture
+        // them before the fold, so resident retention still skips (never
+        // evaluates) that superseded version.
+        let superseding = self.table.staged_key_columns(&self.new_snapshot_id).await?;
         super::overwrite_retention::with_publication_retention(
             Arc::clone(&filters),
             self.retain_staged_candidates(),
@@ -197,8 +214,11 @@ impl CayenneStagedUpsert {
         .await?;
         let prepared = super::overwrite_retention::with_publication_retention(
             Arc::clone(&filters),
-            self.table
-                .prepare_transaction_resident_retention(&self.new_snapshot_id, &filters),
+            self.table.prepare_transaction_resident_retention(
+                &self.new_snapshot_id,
+                &filters,
+                superseding,
+            ),
         )
         .await?;
         Ok((Some(checkpoint_guard), prepared))
@@ -997,6 +1017,7 @@ impl CayenneTableProvider {
             superseded,
             first_load_pk_bloom: None,
             retention_folded: 0,
+            superseding_keys: None,
             fold: file_stats.map(|file_stats| super::append_stage::PendingFold {
                 write,
                 file_stats,

@@ -133,6 +133,11 @@ pub(super) struct StagedAppend {
     /// Rows `retention_sql` folded out of the staged files, so neither in
     /// `row_count` nor in `superseded`. The append still reports them inserted.
     pub retention_folded: u64,
+    /// The staged primary-key columns read before `retention_sql` folded any
+    /// row out of the staged files, when it did: every one still supersedes
+    /// its resident version, so resident retention skips it. `None` when
+    /// nothing was folded (the staged files hold every key).
+    pub superseding_keys: Option<Vec<arrow::array::RecordBatch>>,
     /// For a transaction staged with `retention_sql` deferred to its commit, on
     /// a table that folds hidden rows out of its staged files (rather than
     /// hiding them by position): the write shape, the per-file statistics, and
@@ -239,6 +244,7 @@ impl CayenneTableProvider {
             .transpose()?;
         let start = Instant::now();
         let mut retention_folded = 0_u64;
+        let mut superseding_keys = None;
         let defer_fold = super::overwrite_retention::staged_retention_deferred();
         let mut pending_fold = HashMap::new();
         let written: Result<ResolvedFiles> = async {
@@ -283,6 +289,9 @@ impl CayenneTableProvider {
                 Some(file_stats) if !superseded.is_empty() => {
                     let dropped: u64 = superseded.values().map(|rows| rows.len() as u64).sum();
                     retention_folded = dropped.saturating_sub(repeats);
+                    if retention_folded > 0 {
+                        superseding_keys = self.staged_key_columns(&new_snapshot_id).await?;
+                    }
                     let stats = self
                         .fold_superseded_copies(
                             &new_snapshot_id,
@@ -340,6 +349,7 @@ impl CayenneTableProvider {
             superseded,
             first_load_pk_bloom,
             retention_folded,
+            superseding_keys,
             fold: file_stats
                 .filter(|_| defer_fold)
                 .map(|file_stats| PendingFold {
