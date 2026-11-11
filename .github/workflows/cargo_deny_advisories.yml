@@ -90,6 +90,34 @@ jobs:
               issue.body?.includes(marker)
             );
 
+            // The owner is assigned only if GitHub will accept them. An account that
+            // was deleted, renamed or removed from the repository makes the
+            // assignment call return 404, which used to throw after the issue body
+            // was written: the step went red in place of "Fail on advisory
+            // violations", and the issue was left with no owner. Ask first, and
+            // warn instead of throwing, so the issue is always filed and updated.
+            // Only a 404 from this check means "not assignable"; any other error
+            // still fails the step.
+            const issueOwner = 'claudespice';
+            let assignees = [issueOwner];
+            try {
+              await github.rest.issues.checkUserCanBeAssigned({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                assignee: issueOwner,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+              assignees = [];
+              core.warning(
+                `${issueOwner} cannot be assigned issues in ${context.repo.owner}/${context.repo.repo} ` +
+                '(GitHub returned 404), so the advisory issue is left unassigned. ' +
+                'Change issueOwner in .github/workflows/cargo_deny_advisories.yml to an account that can be assigned.'
+              );
+            }
+
             if (existingIssue) {
               await github.rest.issues.update({
                 owner: context.repo.owner,
@@ -97,12 +125,14 @@ jobs:
                 issue_number: existingIssue.number,
                 body,
               });
-              await github.rest.issues.addAssignees({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existingIssue.number,
-                assignees: ['claudespice'],
-              });
+              if (assignees.length > 0) {
+                await github.rest.issues.addAssignees({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: existingIssue.number,
+                  assignees,
+                });
+              }
               return;
             }
 
@@ -111,7 +141,7 @@ jobs:
               repo: context.repo.repo,
               title,
               body,
-              assignees: ['claudespice'],
+              assignees,
             });
 
       - name: Fail on advisory violations
