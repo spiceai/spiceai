@@ -553,6 +553,22 @@ pub struct CayenneDeletionSink {
     /// superseded position deletion vectors waits for. `None` leaves those files
     /// on disk.
     file_deletion_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    /// Rows the predicate must never see: keys a pending write supersedes, plus
+    /// every row the sink's visibility rules already retire. When set, a scanned
+    /// row is dropped by key and by liveness BEFORE the filters are evaluated, so
+    /// a hidden version can neither fail the predicate nor be counted, and the
+    /// filter-shaped key fast path is not taken. `None` keeps the ordinary
+    /// `DELETE` order (filters, then liveness).
+    skip_before_filters: Option<Arc<SkipKeys>>,
+}
+
+/// The primary keys a resident `retention_sql` delete skips before evaluating
+/// its predicate: the keys the pending write supersedes, in the sink's own key
+/// encoding. Bounded by the write, not the table.
+#[derive(Debug, Default)]
+pub(crate) struct SkipKeys {
+    int64: std::collections::HashSet<i64>,
+    rows: std::collections::HashSet<Box<[u8]>>,
 }
 
 /// The locks a coherent (listing, deletion index) capture holds, outer first.
@@ -618,7 +634,91 @@ impl CayenneDeletionSink {
             scan_input_version: None,
             capture_locks: None,
             file_deletion_fence: None,
+            skip_before_filters: None,
         }
+    }
+
+    /// Skip `keys` and every non-live row before the filters run (see
+    /// [`Self::skip_before_filters`]).
+    pub(crate) fn with_skip_before_filters(mut self, keys: SkipKeys) -> Self {
+        self.skip_before_filters = Some(Arc::new(keys));
+        self
+    }
+
+    /// The keys of `batches` (the primary key columns, in key order) in this
+    /// sink's key encoding. Errors on a position-based strategy, whose deletes do
+    /// not address keys.
+    pub(crate) fn skip_keys_from(
+        &self,
+        batches: &[arrow::array::RecordBatch],
+    ) -> super::super::Result<SkipKeys> {
+        let mut keys = SkipKeys::default();
+        let pk_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                for batch in batches {
+                    keys.int64
+                        .extend(self.extract_int64_pk_values(batch, &pk_indices)?);
+                }
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                let Some(converter) = self.pk_row_converter.as_ref() else {
+                    return Err(Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "RowConverter not available for RowConverterBased strategy"
+                            .to_string(),
+                    });
+                };
+                for batch in batches {
+                    keys.rows
+                        .extend(Self::extract_row_keys(batch, &pk_indices, converter)?);
+                }
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
+                return Err(Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: "a position-based delete cannot skip rows by key".to_string(),
+                });
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Drops the rows of `batch` (key columns at `pk_indices`) that are skipped
+    /// keys or not live in `source`. Identity when no skip set is wired.
+    fn drop_skipped_rows(
+        &self,
+        batch: arrow::array::RecordBatch,
+        pk_indices: &[usize],
+        source: &DeleteScanSource,
+    ) -> super::super::Result<arrow::array::RecordBatch> {
+        let Some(skip) = &self.skip_before_filters else {
+            return Ok(batch);
+        };
+        let keep: arrow::array::BooleanArray = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => self
+                .extract_int64_pk_values(&batch, pk_indices)?
+                .into_iter()
+                .map(|pk| Some(!skip.int64.contains(&pk) && self.is_live_int64_pk(pk, source)))
+                .collect(),
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                let Some(converter) = self.pk_row_converter.as_ref() else {
+                    return Err(Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "RowConverter not available for RowConverterBased strategy"
+                            .to_string(),
+                    });
+                };
+                Self::extract_row_keys(&batch, pk_indices, converter)?
+                    .into_iter()
+                    .map(|key| {
+                        Some(!skip.rows.contains(&key) && self.is_live_row_key(&key, source))
+                    })
+                    .collect()
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => return Ok(batch),
+        };
+        Ok(arrow::compute::filter_record_batch(&batch, &keep)?)
     }
 
     /// Wire the owning table's `file_deletion_fence`, so a position delete removes
@@ -1069,7 +1169,7 @@ impl CayenneDeletionSink {
         // client, so it must NOT take the fast path: it falls through to the
         // scan-based path below, which extracts PKs from the LIVE rows the scan
         // matched and thus counts only rows actually removed.
-        if !self.count_exact {
+        if !self.count_exact && self.skip_before_filters.is_none() {
             match self.try_extract_pks_from_filters(&coerced_filters) {
                 Some(ExtractedPkDeletes::Int64(pk_values)) => {
                     tracing::debug!(
@@ -1145,7 +1245,9 @@ impl CayenneDeletionSink {
 
                     while let Some(batch_result) = stream.next().await {
                         let batch =
-                            self.apply_physical_filters_to_batch(batch_result?, &physical_filters)?;
+                            self.drop_skipped_rows(batch_result?, &projected_pk_indices, source)?;
+                        let batch =
+                            self.apply_physical_filters_to_batch(batch, &physical_filters)?;
                         if batch.num_rows() == 0 {
                             continue;
                         }
@@ -1220,7 +1322,9 @@ impl CayenneDeletionSink {
 
                     while let Some(batch_result) = stream.next().await {
                         let batch =
-                            self.apply_physical_filters_to_batch(batch_result?, &physical_filters)?;
+                            self.drop_skipped_rows(batch_result?, &projected_pk_indices, source)?;
+                        let batch =
+                            self.apply_physical_filters_to_batch(batch, &physical_filters)?;
                         if batch.num_rows() == 0 {
                             continue;
                         }

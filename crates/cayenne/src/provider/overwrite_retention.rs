@@ -488,8 +488,9 @@ pub(crate) fn publication_retention_filters() -> Option<Vec<Expr>> {
 impl CayenneTableProvider {
     /// Prepares the `retention_sql` delete over the resident rows a keyed
     /// append keeps, against the generation it replaces. The rows whose keys
-    /// the staged snapshot rewrites are superseded first: the predicate never
-    /// sees them, so a superseded version cannot fail or be counted. Nothing is
+    /// the staged snapshot rewrites, and the rows already deleted, are skipped
+    /// first: the predicate never sees them, so a hidden version cannot fail or
+    /// be counted. Nothing is
     /// committed; the append's transaction takes the returned delete files.
     pub(crate) async fn prepare_resident_retention(
         &self,
@@ -520,23 +521,44 @@ impl CayenneTableProvider {
             .read_staged_columns(snapshot_id, &keys)
             .await
             .map_err(failed)?;
-        let superseded = incoming_key_predicate(&keys, &incoming).map_err(failed)?;
-        let guarded: Vec<Expr> = filters
-            .iter()
-            .map(|filter| match &superseded {
-                Some(superseded) => datafusion::logical_expr::when(
-                    superseded.clone(),
-                    datafusion::logical_expr::lit(false),
+        if self.is_position_based() {
+            // A position delete addresses (file, row), not keys, so the sink
+            // cannot skip by key before evaluating. Until it skips the write's
+            // superseded positions, the predicate is guarded by the staged keys
+            // (size grows with the write).
+            let superseded = incoming_key_predicate(&keys, &incoming).map_err(failed)?;
+            let guarded: Vec<Expr> = filters
+                .iter()
+                .map(|filter| match &superseded {
+                    Some(superseded) => datafusion::logical_expr::when(
+                        superseded.clone(),
+                        datafusion::logical_expr::lit(false),
+                    )
+                    .otherwise(filter.clone()),
+                    None => Ok(filter.clone()),
+                })
+                .collect::<datafusion_common::Result<_>>()
+                .map_err(failed)?;
+            let sink = self
+                .build_deletion_vector_sink(
+                    &guarded,
+                    None,
+                    super::table::DeletionRequestSource::User,
                 )
-                .otherwise(filter.clone()),
-                None => Ok(filter.clone()),
-            })
-            .collect::<datafusion_common::Result<_>>()
-            .map_err(failed)?;
+                .await
+                .map_err(failed)?;
+            let prepared = sink.prepare_delete().await?;
+            return Ok(prepared.filter(|prepared| !prepared.delete_files().is_empty()));
+        }
         let sink = self
-            .build_deletion_vector_sink(&guarded, None, super::table::DeletionRequestSource::User)
+            .build_deletion_vector_sink(filters, None, super::table::DeletionRequestSource::User)
             .await
             .map_err(failed)?;
+        // The staged keys and every row already retired are dropped by key
+        // before the predicate runs: bounded by the write, never a predicate
+        // whose size grows with it.
+        let skip = sink.skip_keys_from(&incoming)?;
+        let sink = sink.with_skip_before_filters(skip);
         let prepared = sink.prepare_delete().await?;
         Ok(prepared.filter(|prepared| !prepared.delete_files().is_empty()))
     }
