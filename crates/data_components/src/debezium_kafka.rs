@@ -17,7 +17,8 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::kafka::{
-    KafkaOffsetCommitHook, MessageBatchCommitter, inject_ready_signal_on_caught_up,
+    CatchUp, KafkaMessage, KafkaOffsetCommitHook, MessageBatchCommitter, changes_after_catch_up,
+    rdkafka::error::KafkaError,
 };
 use crate::{
     cdc::{self, ChangeEnvelope, ChangesStream},
@@ -121,63 +122,88 @@ impl DebeziumKafka {
         let schema = Arc::clone(&self.schema);
         let primary_keys = self.primary_keys.clone();
         let consumer = self.consumer;
-        let metrics = Arc::clone(self.consumer.metrics());
         let offset_commit_hook = self.offset_commit_hook.clone();
         let projection = self.projection.clone();
-        let inner = self
-            .consumer
-            .stream_json::<ChangeEventKey, ChangeEvent>()
-            .chunks_timeout(self.batching.0, self.batching.1)
-            .map(move |msgs| {
-                let schema = Arc::clone(&schema);
-                let pk = primary_keys.clone();
+        let batching = self.batching;
+        changes_after_catch_up(consumer, Arc::clone(&self.schema), move |mut catch_up| {
+            let signal_schema = Arc::clone(&schema);
+            let to_envelope =
+                move |messages: &[KafkaMessage<'static, ChangeEventKey, ChangeEvent>],
+                      catch_up: &mut CatchUp| {
+                    let changes: Vec<_> = messages.iter().map(KafkaMessage::value).collect();
 
+                    // Newest upstream commit timestamp in the batch, for the
+                    // replication-lag signal: prefer the source DB commit time
+                    // (`source.ts_ms`), falling back to the connector envelope time
+                    // (`payload.ts_ms`) when the source time is absent (0).
+                    let source_commit_ts_ms = changes
+                        .iter()
+                        .map(|change| {
+                            let source_ts = change.payload.source.ts_ms;
+                            if source_ts != 0 {
+                                source_ts
+                            } else {
+                                change.payload.ts_ms
+                            }
+                        })
+                        .max();
+
+                    let rb = changes::vector_to_change_batch(
+                        &schema,
+                        &primary_keys,
+                        &changes,
+                        projection.as_ref(),
+                    )
+                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
+                    .with_source_commit_ts_ms(source_commit_ts_ms);
+
+                    let committer = MessageBatchCommitter::from_messages(consumer, messages)
+                        .with_offset_commit_hook(offset_commit_hook.clone());
+
+                    Ok(ChangeEnvelope::new(
+                        Box::new(committer),
+                        rb,
+                        catch_up.mark_ready(),
+                    ))
+                };
+            let batches = consumer
+                .stream_json::<ChangeEventKey, ChangeEvent>()
+                .chunks_timeout(batching.0, batching.1);
+            futures::StreamExt::flat_map(batches, move |msgs| {
                 if msgs.is_empty() {
-                    return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
+                    return futures::stream::iter(vec![Err(cdc::StreamError::Kafka(
+                        Error::EmptyBatch,
+                    ))]);
                 }
 
-                let messages: Vec<_> = msgs
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(cdc::StreamError::Kafka)?;
-
-                let changes: Vec<_> = messages
-                    .iter()
-                    .map(super::kafka::KafkaMessage::value)
-                    .collect();
-
-                // Newest upstream commit timestamp in the batch, for the
-                // replication-lag signal: prefer the source DB commit time
-                // (`source.ts_ms`), falling back to the connector envelope time
-                // (`payload.ts_ms`) when the source time is absent (0).
-                let source_commit_ts_ms = changes
-                    .iter()
-                    .map(|change| {
-                        let source_ts = change.payload.source.ts_ms;
-                        if source_ts != 0 {
-                            source_ts
-                        } else {
-                            change.payload.ts_ms
+                let mut messages = Vec::with_capacity(msgs.len());
+                let mut error = None;
+                for msg in msgs {
+                    match msg {
+                        Ok(message) => {
+                            catch_up.observe_message(message.partition(), message.offset());
+                            messages.push(message);
                         }
-                    })
-                    .max();
+                        Err(Error::UnableToReceiveMessage {
+                            source: KafkaError::PartitionEOF(partition),
+                        }) => catch_up.observe_partition_end(partition),
+                        Err(e) => {
+                            error.get_or_insert(e);
+                        }
+                    }
+                }
 
-                let rb =
-                    changes::vector_to_change_batch(&schema, &pk, &changes, projection.as_ref())
-                        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
-                        .with_source_commit_ts_ms(source_commit_ts_ms);
-
-                let committer = MessageBatchCommitter::from_messages(consumer, &messages)
-                    .with_offset_commit_hook(offset_commit_hook.clone());
-
-                Ok(ChangeEnvelope::new(Box::new(committer), rb, true))
-            });
-
-        Box::pin(inject_ready_signal_on_caught_up(
-            inner,
-            metrics,
-            Arc::clone(&self.schema),
-        ))
+                let mut items = Vec::with_capacity(2);
+                // An error fails the whole batch.
+                if let Some(e) = error {
+                    items.push(Err(cdc::StreamError::Kafka(e)));
+                } else if !messages.is_empty() {
+                    items.push(to_envelope(&messages, &mut catch_up));
+                }
+                items.extend(catch_up.ready_signal(&signal_schema));
+                futures::stream::iter(items)
+            })
+        })
     }
 }
 

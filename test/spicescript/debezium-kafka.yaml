@@ -9,15 +9,16 @@ description: >
 
 sources:
   src: { kind: postgres }
-  # Two listeners: Debezium, in a container, reaches the broker as
-  # host.docker.internal; spiced, on the host, as 127.0.0.1.
+  # Three listeners: Debezium, in a container, reaches the broker as
+  # host.docker.internal; spiced, on the host, as 127.0.0.1; rpk, in the
+  # broker's container, as 127.0.0.1:9093.
   kafka:
     kind: docker
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
     ports: [9092, 19092]
     command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
-      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092',
-      --advertise-kafka-addr, 'internal://host.docker.internal:${port.9092},external://127.0.0.1:${port.19092}']
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092,local://127.0.0.1:9093',
+      --advertise-kafka-addr, 'internal://host.docker.internal:${port.9092},external://127.0.0.1:${port.19092},local://127.0.0.1:9093']
     ready: rpk cluster health | grep -E 'Healthy:.+true'
   # One Debezium Server per instance, each with its own slot, publication,
   # offsets and topic.
@@ -105,3 +106,14 @@ steps:
         DELETE FROM t WHERE id > 590;
   - query: SELECT * FROM t
     eventually: 60s
+
+  # One row is updated many times while spiced is down. Restarted with small
+  # batches, spiced replays that backlog and reports ready only once all of it
+  # is applied, so the first query after ready sees the row's latest version.
+  - stop: {}
+  - source-exec:
+      src: DO $$ BEGIN FOR i IN 1..5000 LOOP UPDATE t SET n = i WHERE id = 1; END LOOP; END $$;
+  - source-query: { kafka: "last() { timeout 10 rpk topic consume ${sources.src.namespace}.public.t -X brokers=127.0.0.1:9093 -o -1 -n 1 -f '%v'; }; for i in $(seq 1 120); do last | grep -q '\"n\":5000' && break; sleep 1; done; last | grep -c '\"n\":5000'" }
+    expect: { rows: [['1']] }
+  - start: { patch: { datasets: { t: { params: { batch_max_size: '1' } } } } }
+  - query: SELECT * FROM t
