@@ -22,7 +22,7 @@ use super::{
     slot::{StateLease, StateSlot},
 };
 use crate::{
-    catalog::{CatalogError, CatalogResult, MetadataCatalog},
+    catalog::{CatalogError, CatalogResult},
     metadata::CreateTableOptions,
 };
 use arrow_schema::SchemaRef;
@@ -628,10 +628,15 @@ impl Inner {
         let table_id = self.reopen_table_settings(options).await?;
         let table = self.reader.get_table(&options.table_name).await?;
         crate::cayenne_catalog::verify_stored_data_files_in(
-            &self.reader,
             &table,
             options.vortex_config.memory_mode,
             options.vortex_config.settings_change,
+            async { Ok(self.reader.get_all_snapshot_sequences(&table.table_id)) },
+            |snapshot_id| {
+                std::future::ready(Ok(self
+                    .reader
+                    .get_snapshot_files(&table.table_id, &snapshot_id)))
+            },
         )
         .await?;
         Ok(table_id)

@@ -19,28 +19,23 @@ limitations under the License.
 //! from a [`DatasetState`] replayed out of object storage, loading the
 //! immutable blobs that state references (schemas, statistics, indexes, inline
 //! payloads) from the store and checking each against its recorded digest. It
-//! holds no database and writes nothing: every mutating [`MetadataCatalog`]
-//! method returns an error, and the object-native catalog applies committed
-//! records to its state instead. Data and deletion-vector files must remain
+//! holds no database and writes nothing. The object-native catalog applies
+//! committed records to its state. Data and deletion-vector files must remain
 //! available at the paths the state records.
 
 use crate::{
-    catalog::{
-        CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
-    },
+    catalog::{CatalogError, CatalogResult},
     metadata::{
-        ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, IndexRunRecord, InlinedData,
-        InlinedDataStats, InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics,
-        TableMetadata, TableStatistics, TableStorageStats,
+        ColdTierFile, DeleteFile, DeletionType, IndexRunRecord, InlinedData, InlinedDataStats,
+        InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata,
+        TableStatistics, TableStorageStats,
     },
 };
-use arrow_schema::SchemaRef;
-use async_trait::async_trait;
 use cayenne_metastore_actions::{DatasetState, ObjRef, TableState};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use std::{collections::HashMap, sync::Arc};
 
-/// A read-only [`MetadataCatalog`] over one replayed [`DatasetState`].
+/// Metadata reads over one replayed [`DatasetState`].
 /// Data files remain in the locations recorded by the writer.
 pub(crate) struct DatasetStateReader {
     pub(crate) state: DatasetState,
@@ -114,39 +109,13 @@ impl DatasetStateReader {
     }
 }
 
-#[async_trait]
-impl MetadataCatalog for DatasetStateReader {
-    async fn commit_pending(&self) -> CatalogResult<()> {
-        // Read-only: there is never anything pending.
-        Ok(())
-    }
-
-    async fn commit_pending_for(&self, _table_id: &str) -> CatalogResult<()> {
-        // Read-only: there is never anything pending.
-        Ok(())
-    }
-
-    fn commits_source_positions(&self) -> bool {
-        // Read-only: it commits nothing, positions included.
-        false
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    async fn commit_publications(
-        &self,
-        _publications: &[crate::catalog::CatalogPublication<'_>],
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn list_pending_write_back(
+impl DatasetStateReader {
+    pub(crate) fn list_pending_write_back(
         &self,
         table_id: &str,
         limit: usize,
         after: Option<&(i64, Vec<u8>)>,
-    ) -> CatalogResult<Vec<(Vec<u8>, i64)>> {
+    ) -> Vec<(Vec<u8>, i64)> {
         let mut rows: Vec<_> = self
             .rows(table_id)
             .pending_write_back
@@ -156,30 +125,17 @@ impl MetadataCatalog for DatasetStateReader {
             .collect();
         rows.sort_by(|(a, x), (b, y)| (x, a).cmp(&(y, b)));
         rows.truncate(limit);
-        Ok(rows)
+        rows
     }
-    async fn clear_pending_write_back(
-        &self,
-        _table_id: &str,
-        _keys: &[(Vec<u8>, i64)],
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
+    pub(crate) fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
         count(self.rows(table_id).pending_write_back.len())
     }
-    async fn init(&self) -> CatalogResult<()> {
-        Ok(())
-    }
-    async fn shutdown(&self) -> CatalogResult<()> {
-        Ok(())
-    }
-    async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
+    pub(crate) fn list_table_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.state.tables.values().map(|t| t.name.clone()).collect();
         names.sort();
-        Ok(names)
+        names
     }
-    async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata> {
+    pub(crate) async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata> {
         let (id, t) = self
             .state
             .tables
@@ -230,12 +186,11 @@ impl MetadataCatalog for DatasetStateReader {
             current_sequence_number: t.seq,
         })
     }
-    async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
+    pub(crate) fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
         Ok(self.table(table_id)?.seq)
     }
-    async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
-        Ok(self
-            .rows(table_id)
+    pub(crate) fn get_table_delete_files(&self, table_id: &str) -> Vec<DeleteFile> {
+        self.rows(table_id)
             .delete_files
             .values()
             .map(|d| DeleteFile {
@@ -251,46 +206,35 @@ impl MetadataCatalog for DatasetStateReader {
                 sequence_number: d.seq,
                 reinsert_sequence: d.reinsert,
             })
-            .collect())
+            .collect()
     }
-    async fn get_orphan_eligible_delete_files(
+    pub(crate) fn get_orphan_eligible_delete_files(
         &self,
         table_id: &str,
         max_sequence: i64,
         limit: usize,
-    ) -> CatalogResult<Vec<DeleteFile>> {
-        Ok(self
-            .get_table_delete_files(table_id)
-            .await?
+    ) -> Vec<DeleteFile> {
+        self.get_table_delete_files(table_id)
             .into_iter()
             .filter(|d| d.source_data_file_path.is_none() && d.sequence_number <= max_sequence)
             .take(limit)
-            .collect())
+            .collect()
     }
-    async fn get_insert_records(&self, table_id: &str) -> CatalogResult<HashMap<Box<[u8]>, i64>> {
-        Ok(self
-            .rows(table_id)
+    pub(crate) fn get_insert_records(&self, table_id: &str) -> HashMap<Box<[u8]>, i64> {
+        self.rows(table_id)
             .insert_records
             .iter()
             .map(|(k, v)| (k.clone().into_boxed_slice(), *v))
-            .collect())
+            .collect()
     }
-    async fn get_snapshot_sequence(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-    ) -> CatalogResult<Option<i64>> {
-        Ok(self.rows(table_id).groups.get(snapshot_id).copied())
+    pub(crate) fn get_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> Option<i64> {
+        self.rows(table_id).groups.get(snapshot_id).copied()
     }
-    async fn get_all_snapshot_sequences(
-        &self,
-        table_id: &str,
-    ) -> CatalogResult<HashMap<String, i64>> {
-        Ok(self.rows(table_id).groups.clone().into_iter().collect())
+    pub(crate) fn get_all_snapshot_sequences(&self, table_id: &str) -> HashMap<String, i64> {
+        self.rows(table_id).groups.clone().into_iter().collect()
     }
-    async fn get_partitions(&self, table_id: &str) -> CatalogResult<Vec<PartitionMetadata>> {
-        Ok(self
-            .rows(table_id)
+    pub(crate) fn get_partitions(&self, table_id: &str) -> Vec<PartitionMetadata> {
+        self.rows(table_id)
             .partitions
             .iter()
             .map(|(id, p)| PartitionMetadata {
@@ -303,9 +247,12 @@ impl MetadataCatalog for DatasetStateReader {
                 record_count: p.record_count,
                 file_size_bytes: p.size,
             })
-            .collect())
+            .collect()
     }
-    async fn get_table_statistics(&self, table_id: &str) -> CatalogResult<Option<TableStatistics>> {
+    pub(crate) async fn get_table_statistics(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<TableStatistics>> {
         let Some(s) = &self.rows(table_id).stats else {
             return Ok(None);
         };
@@ -320,7 +267,7 @@ impl MetadataCatalog for DatasetStateReader {
             },
         }))
     }
-    async fn get_snapshot_file_statistics(
+    pub(crate) async fn get_snapshot_file_statistics(
         &self,
         table_id: &str,
         snapshot_id: &str,
@@ -348,9 +295,8 @@ impl MetadataCatalog for DatasetStateReader {
                 .await?,
         }))
     }
-    async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
-        Ok(self
-            .rows(table_id)
+    pub(crate) fn get_all_snapshot_files(&self, table_id: &str) -> Vec<SnapshotFile> {
+        self.rows(table_id)
             .files
             .iter()
             .map(|((snapshot, path), f)| SnapshotFile {
@@ -363,21 +309,22 @@ impl MetadataCatalog for DatasetStateReader {
                 max_sequence: f.max_seq,
                 digest: f.digest.clone(),
             })
-            .collect())
+            .collect()
     }
-    async fn get_snapshot_files(
+    pub(crate) fn get_snapshot_files(
         &self,
         table_id: &str,
         snapshot_id: &str,
-    ) -> CatalogResult<Vec<SnapshotFile>> {
-        Ok(self
-            .get_all_snapshot_files(table_id)
-            .await?
+    ) -> Vec<SnapshotFile> {
+        self.get_all_snapshot_files(table_id)
             .into_iter()
             .filter(|f| f.snapshot_id == snapshot_id)
-            .collect())
+            .collect()
     }
-    async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>> {
+    pub(crate) async fn list_cold_tier_files(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<ColdTierFile>> {
         let mut files = Vec::new();
         for f in self.rows(table_id).cold.values() {
             files.push(ColdTierFile {
@@ -402,15 +349,17 @@ impl MetadataCatalog for DatasetStateReader {
         }
         Ok(files)
     }
-    async fn get_pk_index(&self, table_id: &str) -> CatalogResult<Option<(String, Vec<u8>)>> {
+    pub(crate) async fn get_pk_index(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<(String, Vec<u8>)>> {
         match &self.rows(table_id).pk_index {
             Some((s, r)) => Ok(Some((s.clone(), self.blob(r).await?))),
             None => Ok(None),
         }
     }
-    async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>> {
-        Ok(self
-            .rows(table_id)
+    pub(crate) fn list_index_runs(&self, table_id: &str) -> Vec<IndexRunRecord> {
+        self.rows(table_id)
             .index_runs
             .iter()
             .map(|((key, name), (rows, size))| IndexRunRecord {
@@ -420,9 +369,9 @@ impl MetadataCatalog for DatasetStateReader {
                 row_count: *rows,
                 size_bytes: *size,
             })
-            .collect())
+            .collect()
     }
-    async fn get_inlined_data(&self, table_id: &str) -> CatalogResult<Vec<InlinedData>> {
+    pub(crate) fn get_inlined_data(&self, table_id: &str) -> Vec<InlinedData> {
         let mut rows: Vec<_> = self
             .rows(table_id)
             .inlined_data
@@ -438,27 +387,25 @@ impl MetadataCatalog for DatasetStateReader {
             })
             .collect();
         rows.sort_by_key(|r| r.sequence_number);
-        Ok(rows)
+        rows
     }
-    async fn get_inlined_data_for_partition(
+    pub(crate) fn get_inlined_data_for_partition(
         &self,
         table_id: &str,
         partition_key: &str,
-    ) -> CatalogResult<Vec<InlinedData>> {
-        Ok(self
-            .get_inlined_data(table_id)
-            .await?
+    ) -> Vec<InlinedData> {
+        self.get_inlined_data(table_id)
             .into_iter()
             .filter(|r| r.partition_key.as_deref() == Some(partition_key))
-            .collect())
+            .collect()
     }
-    async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64> {
+    pub(crate) fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64> {
         sum(self.rows(table_id).inlined_data.values().map(|r| r.count))
     }
-    async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats> {
+    pub(crate) fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats> {
         let t = self.rows(table_id);
         Ok(InlinedDataStats {
-            record_count: self.get_inlined_data_count(table_id).await?,
+            record_count: self.get_inlined_data_count(table_id)?,
             entry_count: count(t.inlined_data.len())?,
             ipc_bytes: sum(t
                 .inlined_data
@@ -473,7 +420,7 @@ impl MetadataCatalog for DatasetStateReader {
                 .collect::<CatalogResult<Vec<_>>>()?)?,
         })
     }
-    async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>> {
+    pub(crate) fn get_inlined_deletes(&self, table_id: &str) -> Vec<InlinedDelete> {
         let mut rows: Vec<_> = self
             .rows(table_id)
             .inlined_deletes
@@ -489,34 +436,25 @@ impl MetadataCatalog for DatasetStateReader {
             })
             .collect();
         rows.sort_by_key(|r| r.sequence_number);
-        Ok(rows)
+        rows
     }
-    async fn get_published_inlined_deletes(
-        &self,
-        table_id: &str,
-    ) -> CatalogResult<Vec<InlinedDelete>> {
-        Ok(self
-            .get_inlined_deletes(table_id)
-            .await?
+    pub(crate) fn get_published_inlined_deletes(&self, table_id: &str) -> Vec<InlinedDelete> {
+        self.get_inlined_deletes(table_id)
             .into_iter()
             .filter(|r| r.published)
-            .collect())
+            .collect()
     }
-    async fn get_unpublished_inlined_delete_ids(
-        &self,
-        table_id: &str,
-    ) -> CatalogResult<Vec<String>> {
-        Ok(self
-            .rows(table_id)
+    pub(crate) fn get_unpublished_inlined_delete_ids(&self, table_id: &str) -> Vec<String> {
+        self.rows(table_id)
             .inlined_deletes
             .iter()
             .filter(|(_, r)| !r.published)
             .map(|(id, _)| id.clone())
-            .collect())
+            .collect()
     }
-    async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats> {
+    pub(crate) fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats> {
         let t = self.rows(table_id);
-        let inline = self.get_inlined_data_stats(table_id).await?;
+        let inline = self.get_inlined_data_stats(table_id)?;
         let mut s = TableStorageStats {
             cold_files: count(t.cold.len())?,
             cold_bytes: sum(t.cold.values().map(|f| f.size))?,
@@ -551,334 +489,15 @@ impl MetadataCatalog for DatasetStateReader {
         s.reachable_manifest_rows = add(s.current_files, s.protected_files)?;
         Ok(s)
     }
-    async fn create_table(&self, _options: CreateTableOptions) -> CatalogResult<String> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn update_table_schema(&self, _table_id: &str, _schema: &SchemaRef) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn update_table_schema_dropping_statistics(
-        &self,
-        _table_id: &str,
-        _schema: &SchemaRef,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn set_current_snapshot(
-        &self,
-        _table_id: &str,
-        _replaced_snapshot_id: &str,
-        _new_snapshot_id: &str,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn increment_sequence_number(&self, _table_id: &str) -> CatalogResult<i64> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn reserve_sequence_numbers(&self, _table_id: &str, _count: u32) -> CatalogResult<i64> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn add_delete_file(&self, _delete_file: DeleteFile) -> CatalogResult<String> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn add_delete_files(&self, _delete_files: Vec<DeleteFile>) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_delete_files_with_inlined_rewrite(
-        &self,
-        _delete_files: Vec<DeleteFile>,
-        _table_id: &str,
-        _updated_data: Vec<InlinedData>,
-        _deleted_inlined_ids: Vec<String>,
-        _replaced_delete_file_ids: Vec<String>,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn remove_delete_files(
-        &self,
-        _table_id: &str,
-        _delete_file_ids: &[String],
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_delete_files(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn add_insert_record(
-        &self,
-        _table_id: &str,
-        _pk_bytes: Vec<u8>,
-        _sequence_number: i64,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn add_insert_records_batch(
-        &self,
-        _table_id: &str,
-        _pk_bytes_list: Vec<Vec<u8>>,
-        _sequence_number: i64,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_on_conflict_deletions(
-        &self,
-        _delete_files: Vec<DeleteFile>,
-        _table_id: &str,
-        _insert_pk_bytes_list: Vec<Vec<u8>>,
-        _insert_sequence: i64,
-        _snapshot_sequence: Option<SnapshotSequenceCommit>,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_on_conflict_deletions_with_tombstone(
-        &self,
-        _delete_files: Vec<DeleteFile>,
-        _table_id: &str,
-        _insert_pk_bytes_list: Vec<Vec<u8>>,
-        _insert_sequence: i64,
-        _snapshot_sequence: Option<SnapshotSequenceCommit>,
-        _inline_tombstone: Option<InlinedDelete>,
-        _pending_durable_flips: &[String],
-    ) -> CatalogResult<Option<String>> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_insert_records(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn set_snapshot_sequence(
-        &self,
-        _table_id: &str,
-        _snapshot_id: &str,
-        _sequence_number: i64,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_snapshot_sequence(
-        &self,
-        _table_id: &str,
-        _snapshot_id: &str,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_compaction(
-        &self,
-        _table_id: &str,
-        _replaced_snapshot_id: &str,
-        _new_snapshot_id: &str,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_compaction_fenced(
-        &self,
-        _table_id: &str,
-        _replaced_snapshot_id: &str,
-        _new_snapshot_id: &str,
-        _cutoff: i64,
-        _protected_snapshot_ids_to_clear: &[String],
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn swap_protected_snapshots(
-        &self,
-        _table_id: &str,
-        _old_snapshot_ids: &[String],
-        _new_snapshot_id: &str,
-        _new_sequence_number: i64,
-    ) -> CatalogResult<bool> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_overwrite(
-        &self,
-        _table_id: &str,
-        _new_snapshot_id: &str,
-        _inlined: Option<&InlinedData>,
-        _delete_files: &[crate::metadata::DeleteFile],
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn add_partition(&self, _partition: PartitionMetadata) -> CatalogResult<String> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn upsert_table_statistics(&self, _stats: &TableStatistics) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_table_statistics(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn upsert_snapshot_file_statistics(
-        &self,
-        _stats: &SnapshotFileStatistics,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_snapshot_file_statistics_except(
-        &self,
-        _table_id: &str,
-        _snapshot_id: &str,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_snapshot_file_statistics(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn upsert_snapshot_file(&self, _file: &SnapshotFile) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn replace_snapshot_files(
-        &self,
-        _table_id: &str,
-        _snapshot_id: &str,
-        _files: &[SnapshotFile],
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_snapshot_cached_metadata(
-        &self,
-        _table_id: &str,
-        _snapshot_id: &str,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_snapshot_files_except(
-        &self,
-        _table_id: &str,
-        _snapshot_id: &str,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn remove_snapshot_files(
-        &self,
-        _table_id: &str,
-        _snapshot_id: &str,
-        _file_names: &[String],
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
-        let table = self.get_table(table_name).await?;
-        crate::cayenne_catalog::verify_stored_data_files_in(
-            self,
-            &table,
-            table.vortex_config.memory_mode,
-            crate::metadata::SettingsChangeAction::KeepStored,
-        )
-        .await
-    }
-    async fn clear_snapshot_files(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_overwrite_to_cold(
-        &self,
-        _table_id: &str,
-        _new_snapshot_id: &str,
-        _cold_files: &[ColdTierFile],
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn upsert_pk_index(
-        &self,
-        _table_id: &str,
-        _snapshot_id: &str,
-        _index_blob: &[u8],
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_pk_index(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn register_index_run(&self, _run: &IndexRunRecord) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn remove_index_run(
-        &self,
-        _table_id: &str,
-        _index_key: &str,
-        _run_name: &str,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_mem_tier_durable(&self, _commit: MemTierDurableCommit) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn add_inlined_data(&self, _data: InlinedData) -> CatalogResult<String> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn get_inlined_data_above_sequence(
+    pub(crate) fn get_inlined_data_above_sequence(
         &self,
         table_id: &str,
         after_sequence: i64,
-    ) -> CatalogResult<Vec<InlinedData>> {
-        Ok(self
-            .get_inlined_data(table_id)
-            .await?
+    ) -> Vec<InlinedData> {
+        self.get_inlined_data(table_id)
             .into_iter()
             .filter(|r| r.sequence_number > after_sequence)
-            .collect())
-    }
-    async fn clear_inlined_data(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_inlined_data_and_deletes(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_on_conflict_deletions_and_clear_inlined(
-        &self,
-        _delete_files: Vec<DeleteFile>,
-        _table_id: &str,
-        _insert_pk_bytes_list: Vec<Vec<u8>>,
-        _insert_sequence: i64,
-        _snapshot_sequence: Option<SnapshotSequenceCommit>,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn add_inlined_delete(&self, _delete: InlinedDelete) -> CatalogResult<String> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn mark_inlined_delete_published(
-        &self,
-        _table_id: &str,
-        _inlined_id: &str,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn mark_inlined_delete_unpublished(
-        &self,
-        _table_id: &str,
-        _inlined_id: &str,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn publish_orphan_inlined_deletes(&self, _table_id: &str) -> CatalogResult<u64> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn commit_inlined_mutation(
-        &self,
-        _table_id: &str,
-        _updated_data: Vec<InlinedData>,
-        _deleted_inlined_ids: Vec<String>,
-        _data: Vec<InlinedData>,
-        _assigned_sequence: i64,
-    ) -> CatalogResult<Option<i64>> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn clear_inlined_deletes(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn checkpoint_wal(&self) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn incremental_vacuum(&self) -> CatalogResult<u64> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn drop_table(&self, _table_name: &str) -> CatalogResult<bool> {
-        Err(invalid("the dataset state reader is read-only"))
-    }
-    async fn import_dataset_slice(
-        &self,
-        _slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
-        _data_dir_anchor: &std::path::Path,
-    ) -> CatalogResult<()> {
-        Err(invalid("the dataset state reader is read-only"))
+            .collect()
     }
 }
 

@@ -1522,7 +1522,16 @@ impl CayenneCatalog {
         memory_mode: bool,
         settings_change: SettingsChangeAction,
     ) -> CatalogResult<()> {
-        verify_stored_data_files_in(self, table, memory_mode, settings_change).await
+        verify_stored_data_files_in(
+            table,
+            memory_mode,
+            settings_change,
+            self.get_all_snapshot_sequences(&table.table_id),
+            |snapshot_id| async move {
+                self.get_snapshot_files(&table.table_id, &snapshot_id).await
+            },
+        )
+        .await
     }
 
     async fn validate_existing_table_configuration(
@@ -6278,12 +6287,17 @@ fn stored_snapshot_dir(table_path: &str, table_id: &str, snapshot_id: &str) -> s
 /// catalog's reads, and decide by `settings_change` whether a mismatch rebuilds
 /// the table, holds it, refuses it, or is served with a warning. See
 /// [`CayenneCatalog::verify_stored_data_files`] for the rules.
-pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
-    catalog: &C,
+pub(crate) async fn verify_stored_data_files_in<F, Fut>(
     table: &TableMetadata,
     memory_mode: bool,
     settings_change: SettingsChangeAction,
-) -> CatalogResult<()> {
+    snapshot_sequences: impl std::future::Future<Output = CatalogResult<HashMap<String, i64>>> + Send,
+    snapshot_files: F,
+) -> CatalogResult<()>
+where
+    F: Fn(String) -> Fut + Send,
+    Fut: std::future::Future<Output = CatalogResult<Vec<SnapshotFile>>> + Send,
+{
     if table.path.starts_with("s3://") || memory_mode {
         return Ok(());
     }
@@ -6291,8 +6305,7 @@ pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
     // by CDC upserts and checkpoints live in their own snapshots), so every
     // live snapshot is checked before deciding: a tolerated mismatch in one
     // must not hide unreadable rows in another.
-    let mut protected: Vec<String> = catalog
-        .get_all_snapshot_sequences(&table.table_id)
+    let mut protected: Vec<String> = snapshot_sequences
         .await?
         .into_keys()
         .filter(|snapshot_id| *snapshot_id != table.current_snapshot_id)
@@ -6300,9 +6313,7 @@ pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
     protected.sort();
     let mut damages = Vec::new();
     for snapshot_id in std::iter::once(table.current_snapshot_id.clone()).chain(protected) {
-        let manifest = catalog
-            .get_snapshot_files(&table.table_id, &snapshot_id)
-            .await?;
+        let manifest = snapshot_files(snapshot_id.clone()).await?;
         if let Some(damage) = inspect_stored_data_files(table, &snapshot_id, manifest).await? {
             damages.push(damage);
         }
