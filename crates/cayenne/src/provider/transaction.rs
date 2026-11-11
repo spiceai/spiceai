@@ -450,6 +450,37 @@ enum FusedFailure {
 /// Fuse every prepared table's durable publish into one `MetastoreTransaction`.
 /// Bounded retry on a busy backend; an `apply` failure is terminal (the whole
 /// multi-table commit aborts). On success every table is durable together.
+/// The prepared commits of a shared COMMIT whose outcome the caller has not
+/// yet observed. The COMMIT can land durably while its future is cancelled (a
+/// dropped caller, an aborted task); dropping this guard before
+/// [`Self::observed`] treats that as an unknown outcome — every table keeps
+/// its staged and deletion-vector files and refuses writes until it is
+/// reloaded — rather than letting each publish's abort cleanup delete files a
+/// committed catalog references, or letting later writes build on an
+/// in-memory view the catalog has moved past.
+struct OutcomeUnknownOnDrop<'a>(Option<&'a mut [PreparedTxnCommit]>);
+
+impl<'a> OutcomeUnknownOnDrop<'a> {
+    fn prepared(&self) -> &[PreparedTxnCommit] {
+        self.0.as_deref().unwrap_or_default()
+    }
+
+    /// The outcome is now known to the caller; hand the commits back.
+    fn observed(mut self) -> &'a mut [PreparedTxnCommit] {
+        self.0.take().unwrap_or_default()
+    }
+}
+
+impl Drop for OutcomeUnknownOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(prepared) = self.0.take() {
+            for pc in prepared.iter_mut() {
+                pc.retain_after_unknown_outcome();
+            }
+        }
+    }
+}
+
 async fn commit_fused(
     catalog: &CayenneCatalog,
     prepared: &mut [PreparedTxnCommit],
@@ -476,11 +507,12 @@ async fn commit_fused(
             let _ = txn.rollback().await;
             return Err(FusedFailure::Uncommitted(Error::from(e)));
         }
+        let pending = OutcomeUnknownOnDrop(Some(&mut *prepared));
         match super::append_commit::commit_transaction(txn, &first_table).await {
             Ok(()) => {
                 // Durably committed — disarm each publish's abort cleanup so its
                 // `Drop` does not delete the now-live deletion-vector files.
-                for pc in prepared.iter_mut() {
+                for pc in pending.observed().iter_mut() {
                     pc.mark_committed();
                 }
                 return Ok(());
@@ -489,13 +521,15 @@ async fn commit_fused(
                 if attempt < DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS
                     && crate::is_retryable_write_conflict(&e) =>
             {
+                // A conflict is a definite rollback.
+                pending.observed();
                 tracing::debug!(
                     attempt,
                     "retrying fused multi-table transaction after commit conflict"
                 );
                 tokio::time::sleep(retry_backoff_delay(attempt)).await;
             }
-            Err(e) => return resolve_failed_fused_commit(catalog, prepared, Error::from(e)).await,
+            Err(e) => return resolve_failed_fused_commit(catalog, pending, Error::from(e)).await,
         }
     }
     Err(FusedFailure::Uncommitted(Error::WriteConflict {
@@ -510,12 +544,12 @@ async fn commit_fused(
 /// kept and each table refuses writes until it is reloaded.
 async fn resolve_failed_fused_commit(
     catalog: &CayenneCatalog,
-    prepared: &mut [PreparedTxnCommit],
+    pending: OutcomeUnknownOnDrop<'_>,
     error: Error,
 ) -> std::result::Result<(), FusedFailure> {
     let mut committed = 0;
     let mut unreadable = None;
-    for pc in prepared.iter() {
+    for pc in pending.prepared() {
         match pc.read_back_committed(catalog).await {
             Ok(true) => committed += 1,
             Ok(false) => {}
@@ -525,6 +559,7 @@ async fn resolve_failed_fused_commit(
             }
         }
     }
+    let prepared = pending.observed();
     match unreadable {
         None if committed == prepared.len() => {
             tracing::warn!(

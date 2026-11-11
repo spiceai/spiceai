@@ -84360,6 +84360,7 @@ mod tests {
     mod hybrid_retention;
     mod layered_upsert_state;
     mod repeated_keys;
+    mod transaction_cancellation;
     mod unkeyed_transaction_generation;
     mod update_visibility;
 }

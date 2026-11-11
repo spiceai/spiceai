@@ -356,6 +356,12 @@ pub(super) async fn commit_transaction(
     } else {
         txn.commit().await
     };
+    if committed.is_ok()
+        && fault.is_none()
+        && let Some(pause) = test_seams::take_pause_after_commit(table_id)
+    {
+        pause().await;
+    }
     match (committed, fault) {
         (Ok(()), Some(_)) => Err(crate::catalog::CatalogError::InvalidOperationNoSource {
             message: "injected commit failure".to_string(),
@@ -402,6 +408,21 @@ pub(crate) mod test_seams {
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static PAUSES: LazyLock<Mutex<HashMap<String, Pause>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    static PAUSES_AFTER_COMMIT: LazyLock<Mutex<HashMap<String, Pause>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Run `pause` in the next catalog commit keyed on `table_id`, after the
+    /// transaction durably committed and before the commit returns: the point
+    /// where a cancelled caller leaves a durable outcome it never observed.
+    pub(crate) fn pause_after_commit(table_id: &str, pause: Pause) {
+        PAUSES_AFTER_COMMIT
+            .lock()
+            .insert(table_id.to_string(), pause);
+    }
+
+    pub(super) fn take_pause_after_commit(table_id: &str) -> Option<Pause> {
+        PAUSES_AFTER_COMMIT.lock().remove(table_id)
+    }
 
     pub(crate) fn inject(table_id: &str, fault: CommitFault) {
         FAULTS.lock().insert(table_id.to_string(), fault);
