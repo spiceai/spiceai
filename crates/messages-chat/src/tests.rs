@@ -33,6 +33,7 @@ use crate::ChatMessages;
 use crate::request::chat_request;
 use crate::response::{message, messages_error};
 use crate::stream::{Translator, message_stream};
+use messages_api::types::ThinkingDisplay;
 
 fn typed(body: &Value) -> messages_api::types::CreateMessageRequest {
     serde_json::from_value(body.clone()).expect("a valid Messages API request")
@@ -305,7 +306,7 @@ fn a_completion_becomes_a_message() {
         "tool_calls",
     );
     assert_eq!(
-        serde_json::to_value(message(answer.clone(), true).expect("a message"))
+        serde_json::to_value(message(answer.clone(), ThinkingDisplay::Shown).expect("a message"))
             .expect("serializable"),
         json!({
             "id": "msg_abc",
@@ -323,7 +324,7 @@ fn a_completion_becomes_a_message() {
             "usage": {"input_tokens": 20, "output_tokens": 30, "cache_read_input_tokens": 100},
         })
     );
-    let without_thinking = message(answer, false).expect("a message");
+    let without_thinking = message(answer, ThinkingDisplay::Off).expect("a message");
     assert_eq!(
         without_thinking.content.first(),
         Some(&messages_api::types::ContentBlock::Text {
@@ -336,7 +337,8 @@ fn a_completion_becomes_a_message() {
 fn finish_reasons_become_stop_reasons() {
     let stop = |finish: &str, message: Value| {
         serde_json::to_value(
-            crate::response::message(completion(&message, finish), false).expect("a message"),
+            crate::response::message(completion(&message, finish), ThinkingDisplay::Off)
+                .expect("a message"),
         )
         .expect("serializable")["stop_reason"]
             .clone()
@@ -370,7 +372,7 @@ fn tool_arguments_that_are_not_an_object_are_an_api_error() {
         "tool_calls",
     );
     assert_eq!(
-        message(answer, false).expect_err("truncated arguments"),
+        message(answer, ThinkingDisplay::Off).expect_err("truncated arguments"),
         MessagesError::api(
             "Model 'gpt' called the tool 'read_file' with arguments that are not a JSON object, which the Messages API cannot return: {\"path\": "
         )
@@ -410,15 +412,15 @@ fn tool_call(index: u32, id: Option<&str>, name: Option<&str>, arguments: &str) 
 async fn events(
     chunks: Vec<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
 ) -> Vec<Value> {
-    events_showing_thinking(chunks, false).await
+    events_showing_thinking(chunks, ThinkingDisplay::Off).await
 }
 
 async fn events_showing_thinking(
     chunks: Vec<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
-    show_thinking: bool,
+    thinking: ThinkingDisplay,
 ) -> Vec<Value> {
     let chunks: ChatCompletionResponseStream = Box::pin(futures::stream::iter(chunks));
-    message_stream(chunks, "gpt".to_string(), show_thinking)
+    message_stream(chunks, "gpt".to_string(), thinking)
         .map(|event| event.unwrap_or_else(|error| error.to_envelope()))
         .collect()
         .await
@@ -449,9 +451,10 @@ fn streamed_blocks(events: &[Value]) -> Vec<Value> {
     blocks
 }
 
-/// A reasoning model's reasoning streams as a `thinking` block ahead of the answer when the
-/// request's `thinking` shows it, and the blocks a client builds from the stream are the
-/// unstreamed message's for the same reply.
+/// A reasoning model's reasoning streams as a `thinking` block ahead of the answer, with its text
+/// when the request's `thinking` shows it and empty when it omits it (Claude Code asks for
+/// `{"type": "adaptive", "display": "omitted"}`), and the blocks a client builds from the stream
+/// are the unstreamed message's for the same reply.
 #[tokio::test]
 async fn reasoning_streams_as_the_unstreamed_thinking_block() {
     let chunks = || {
@@ -478,18 +481,28 @@ async fn reasoning_streams_as_the_unstreamed_thinking_block() {
         &json!({"role": "assistant", "content": "Reading it.", "reasoning_content": "The user wants the file."}),
         "stop",
     );
-    for show_thinking in [true, false] {
-        let streamed = events_showing_thinking(chunks(), show_thinking).await;
+    for thinking in [
+        ThinkingDisplay::Shown,
+        ThinkingDisplay::Omitted,
+        ThinkingDisplay::Off,
+    ] {
+        let streamed = events_showing_thinking(chunks(), thinking).await;
         let unstreamed =
-            serde_json::to_value(message(answer.clone(), show_thinking).expect("a message"))
+            serde_json::to_value(message(answer.clone(), thinking).expect("a message"))
                 .expect("serializable");
         assert_eq!(
             Value::Array(streamed_blocks(&streamed)),
             unstreamed["content"],
-            "show_thinking: {show_thinking}"
+            "{thinking:?}"
         );
     }
-    let streamed = events_showing_thinking(chunks(), true).await;
+    let omitted = events_showing_thinking(chunks(), ThinkingDisplay::Omitted).await;
+    assert_eq!(
+        streamed_blocks(&omitted)[0],
+        json!({"type": "thinking", "thinking": "", "signature": ""}),
+        "an omitted thinking block carries no text"
+    );
+    let streamed = events_showing_thinking(chunks(), ThinkingDisplay::Shown).await;
     assert_eq!(
         streamed[2],
         json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "The user "}}),
@@ -618,7 +631,7 @@ async fn interleaved_tool_calls_stream_the_message_the_unstreamed_answer_carries
 /// arrive: a call that starts once the one before it is whole ends that one's block.
 #[test]
 fn a_tool_call_that_starts_after_a_whole_one_streams_as_it_arrives() {
-    let mut translator = Translator::new("gpt".to_string(), false);
+    let mut translator = Translator::new("gpt".to_string(), ThinkingDisplay::Off);
     let values = |events: Result<Vec<StreamEvent>, MessagesError>| -> Vec<Value> {
         events
             .expect("events")
@@ -1095,7 +1108,9 @@ async fn tool_calls_that_finish_with_stop_are_a_tool_use_stop() {
         "stop",
     );
     assert_eq!(
-        message(answer, false).expect("a message").stop_reason,
+        message(answer, ThinkingDisplay::Off)
+            .expect("a message")
+            .stop_reason,
         Some(messages_api::types::StopReason::ToolUse)
     );
     let streamed = events(vec![
@@ -1151,7 +1166,7 @@ fn a_tool_call_cut_off_by_max_tokens_is_left_out() {
         ]}),
         "length",
     );
-    let cut = message(answer, false).expect("a message");
+    let cut = message(answer, ThinkingDisplay::Off).expect("a message");
     assert_eq!(
         serde_json::to_value(&cut).expect("serializable")["content"],
         json!([{"type": "text", "text": "Writing it."}])

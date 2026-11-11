@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chat_api::Chat;
-use messages_api::types::CreateMessageRequest;
+use messages_api::types::{CreateMessageRequest, ThinkingDisplay};
 use messages_api::{MessageStream, Messages, MessagesError, MessagesRequest};
 use serde_json::Value;
 
@@ -60,16 +60,13 @@ impl Messages for ChatMessages {
     async fn create(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
         let mut request = parse(request)?;
         request.stream = None;
-        let show_thinking = request
-            .thinking
-            .as_ref()
-            .is_some_and(messages_api::types::ThinkingConfig::shows_thinking);
+        let thinking = ThinkingDisplay::of(request.thinking.as_ref());
         let completion = self
             .chat
             .chat_request(request::chat_request(request)?)
             .await
             .map_err(response::messages_error)?;
-        let message = response::message(completion, show_thinking)?;
+        let message = response::message(completion, thinking)?;
         serde_json::to_value(message)
             .map_err(|e| MessagesError::api(format!("Failed to serialize the message: {e}")))
     }
@@ -81,16 +78,13 @@ impl Messages for ChatMessages {
         let mut request = parse(request)?;
         request.stream = Some(true);
         let model = request.model.clone();
-        let show_thinking = request
-            .thinking
-            .as_ref()
-            .is_some_and(messages_api::types::ThinkingConfig::shows_thinking);
+        let thinking = ThinkingDisplay::of(request.thinking.as_ref());
         let chunks = self
             .chat
             .chat_stream(request::chat_request(request)?)
             .await
             .map_err(response::messages_error)?;
-        Ok(stream::message_stream(chunks, model, show_thinking))
+        Ok(stream::message_stream(chunks, model, thinking))
     }
 
     async fn count_tokens(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
