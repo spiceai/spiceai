@@ -17,8 +17,9 @@ there is currently no engine entry point through which a Spicepod can invoke it.
 - Conditional-write enforcement probes for creation and writer construction.
 
 - Deletion of batches, spilled payloads and checkpoints below the floor
-  (`Collector`, `collect.rs`): each floor is stamped with the store time of the
-  first collection that sees it, and its objects go a retention later.
+  (`Collector`, `collect.rs`): each floor is stamped with the store time of a
+  head with a higher commit than the one it was first seen in, and its objects
+  go a retention later.
 
 **Not implemented:** pins, reference admission, or reachability of the
 objects callers' payloads reference; those are the caller's to collect.

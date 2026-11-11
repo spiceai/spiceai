@@ -8,9 +8,12 @@
 //! reader that read an older head may still be fetching them. Every age here
 //! is the head's store time (`LastModified`), never a local clock:
 //!
-//! - A floor is stamped with the store time of the first collection that sees
-//!   it. The head that collection read was written no earlier than the floor's
-//!   publication, so the stamp is no earlier than the publication either.
+//! - A floor is stamped with the `LastModified` of a head with a higher commit
+//!   than the one the collector first saw it in. That head was written on a
+//!   base that already held the floor, so after the floor was published. The
+//!   head that first shows the floor is not enough: a store may set an
+//!   object's `LastModified` when its upload starts, before it is published
+//!   (the local store stamps the staged file before its rename).
 //! - Objects below a floor are deleted once the head's store time is a
 //!   retention past the floor's stamp. A reader that read an older head read it
 //!   before the floor was published, so it has had at least the retention to
@@ -58,9 +61,10 @@ pub struct Collector {
     prefix: Path,
     retention_ms: u64,
     incarnation: Vec<u8>,
-    /// Floors seen published, oldest first, with their stamps (store time,
-    /// Unix milliseconds).
-    retired: VecDeque<(u64, u64)>,
+    /// Floors seen published, oldest first: each with the commit of the head
+    /// it was first seen in, and its stamp (store time, Unix milliseconds)
+    /// once a head with a higher commit has been read.
+    retired: VecDeque<(u64, u64, Option<u64>)>,
     /// The floor objects were last deleted below.
     collected: u64,
 }
@@ -78,8 +82,9 @@ impl Collector {
         }
     }
 
-    /// Read the head, stamp its floor if it is new, and delete below the
-    /// newest floor stamped a retention ago. One head `GET`, and when a floor
+    /// Read the head, note its floor if it is new, stamp the floors noted at
+    /// a lower commit, and delete below the newest floor stamped a retention
+    /// ago. One head `GET`, and when a floor
     /// is due one `LIST` per object directory and a bulk delete.
     /// # Errors
     /// Returns an error when the head cannot be read or a request fails; what
@@ -92,22 +97,29 @@ impl Collector {
             self.retired.clear();
             self.collected = 0;
         }
-        let newest = self.retired.back().map_or(self.collected, |&(f, _)| f);
+        let newest = self.retired.back().map_or(self.collected, |&(f, _, _)| f);
         if head.floor > newest {
-            self.retired.push_back((head.floor, modified));
+            self.retired.push_back((head.floor, head.commit, None));
+        }
+        for (_, seen, stamp) in &mut self.retired {
+            if head.commit > *seen {
+                stamp.get_or_insert(modified);
+            }
         }
         let due = self
             .retired
             .iter()
-            .filter(|&&(_, stamp)| stamp.saturating_add(self.retention_ms) <= modified)
-            .map(|&(floor, _)| floor)
+            .filter(|&&(_, _, stamp)| {
+                stamp.is_some_and(|stamp| stamp.saturating_add(self.retention_ms) <= modified)
+            })
+            .map(|&(floor, _, _)| floor)
             .max();
         let Some(due) = due else {
             return Ok(None);
         };
         let deleted = self.delete_below(due).await?;
         self.collected = due;
-        self.retired.retain(|&(floor, _)| floor > due);
+        self.retired.retain(|&(floor, _, _)| floor > due);
         Ok(Some(Collected {
             floor: due,
             deleted,

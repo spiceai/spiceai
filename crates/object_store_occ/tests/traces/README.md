@@ -46,7 +46,7 @@ initial_index=0. Walks use seed 42, count 20, max_steps 40.
 | source-no-skip / source-positions | 6 | 0 | 4 |
 | source-position-before-data / source-positions | 4 | 0 | 2 |
 
-The window set holds 20 Gc, 11 Query, 15 Tick and 6 Restart actions.
+The window set holds 24 Gc, 11 Query, 15 Tick and 6 Restart actions.
 
 Control tests select FAIL witnesses for the named invariant: I2 for persistence
 and early acknowledgement, I4 for batch existence, I7 for a collection that

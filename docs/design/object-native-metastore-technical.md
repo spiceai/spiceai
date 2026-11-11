@@ -795,9 +795,13 @@ records spilled and the previous checkpoint leave the head. The head log's
 once no log reader can still need them, by a rule that needs no durable
 removal list:
 
-- It stamps each floor it has not seen with the `LastModified` of the head it
-  read, which is no earlier than the floor's publication, and deletes below
-  that floor once a later head's `LastModified` is a retention past the stamp.
+- It notes each floor it has not seen with the head's commit, and stamps it
+  with the `LastModified` of a later head with a higher commit: that head was
+  written on a base holding the floor, so after the floor was published. (The
+  head that first shows the floor can carry an earlier time: a store may set
+  `LastModified` when an upload starts, and the local store stamps the staged
+  file before its rename.) It deletes below the floor once a later head's
+  `LastModified` is a retention past the stamp.
   A reader that read an older head read it before the floor was published, so
   it has had at least the retention to fetch what that head lists.
 - A restarted collector knows no stamps; it stamps the current floor afresh.

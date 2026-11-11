@@ -1212,12 +1212,17 @@ async fn headlog_collects_objects_below_the_floor_after_the_retention() {
         assert_eq!(patient.collect().await.expect("collect"), None);
         assert_eq!(numbered(&backend, "wal").await, batches);
 
-        // Past it, everything below the floor goes.
+        // Past it, everything below the floor goes, but only once a head
+        // written after the floor's publication gives it a stamp: the head
+        // that first shows a floor may carry a store time from before it was
+        // published.
         let mut collector = Collector::new(
             Arc::clone(&backend.store),
             backend.prefix.clone(),
             std::time::Duration::ZERO,
         );
+        assert_eq!(collector.collect().await.expect("collect"), None);
+        append(&mut writer, Bytes::from_static(b"stamps the floor")).await;
         assert_eq!(
             collector.collect().await.expect("collect"),
             Some(Collected {
@@ -1241,7 +1246,7 @@ async fn headlog_collects_objects_below_the_floor_after_the_retention() {
                 .iter()
                 .map(|r| r.commit)
                 .collect::<Vec<_>>(),
-            vec![13, 14, 15, 16, 17]
+            vec![13, 14, 15, 16, 17, 18]
         );
         assert_eq!(opened.records[0].record.payload, payloads[12]);
         // The first commit's batch is gone; the checkpoint still resolves it.
@@ -1281,6 +1286,8 @@ async fn headlog_open_overtaken_by_collection_reopens_from_the_newer_head() {
             backend.prefix.clone(),
             std::time::Duration::ZERO,
         );
+        assert_eq!(collector.collect().await.expect("collect"), None);
+        append(&mut writer, Bytes::from_static(b"stamps the newer floor")).await;
         let collected = collector.collect().await.expect("collect");
         assert_eq!(collected.map(|c| c.floor), Some(newer));
         assert!(newer > floor);
@@ -1291,7 +1298,7 @@ async fn headlog_open_overtaken_by_collection_reopens_from_the_newer_head() {
         assert_eq!(reader.state().head.floor, newer);
         assert_eq!(opened.floor, newer);
         assert_eq!(opened.checkpoint_root, Some(Bytes::from_static(b"newer root")));
-        let expected: Vec<u64> = (newer + 1..=14).collect();
+        let expected: Vec<u64> = (newer + 1..=15).collect();
         assert_eq!(
             opened.records.iter().map(|r| r.commit).collect::<Vec<_>>(),
             expected

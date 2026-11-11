@@ -11,8 +11,11 @@ const MAX_CHECKPOINTS: u8 = 2;
 const MAX_GCS: u8 = 3;
 
 /// Deletion below the floor, as the head log's collector does it. A floor the
-/// collector has not seen before is stamped with the store time of the
-/// collection that first sees it, which is no earlier than its publication.
+/// collector has not seen before is noted with the commit it was seen at, and
+/// stamped with the store time of a later collection that sees a higher
+/// commit: that head was written on a base holding the floor, so after its
+/// publication, while the head that first showed it may carry a store time
+/// from before its own publication.
 /// Objects below a stamped floor are deleted once the store clock is one
 /// retention past the stamp: a reader that read an older head read it before
 /// the floor was published, so it has had a whole retention to finish. A
@@ -43,8 +46,9 @@ pub struct State {
     time: u8,
     /// Checkpoint objects that exist, by the commit they are at.
     roots: Vec<usize>,
-    /// Floors the collector has seen, oldest first, with their stamps.
-    retired: Vec<(usize, Option<u8>)>,
+    /// Floors the collector has seen, oldest first, with the commit each was
+    /// first seen at and its stamp.
+    retired: Vec<(usize, usize, Option<u8>)>,
     /// The floor the collector last deleted below.
     collected: usize,
     restarted: bool,
@@ -264,19 +268,22 @@ impl Protocol {
     /// commit (`action + 1`), a checkpoint by its commit.
     fn collect(&self, next: &mut State) {
         let floor = next.store.floor;
-        let newest = next.retired.last().map_or(next.collected, |&(f, _)| f);
+        let commit = next.log.len();
+        let newest = next.retired.last().map_or(next.collected, |&(f, _, _)| f);
         if floor > newest {
-            next.retired.push((floor, None));
+            next.retired.push((floor, commit, None));
         }
         let now = next.time;
-        for (_, stamp) in &mut next.retired {
-            stamp.get_or_insert(now);
+        for (_, seen, stamp) in &mut next.retired {
+            if commit > *seen {
+                stamp.get_or_insert(now);
+            }
         }
         let due = next
             .retired
             .iter()
-            .filter(|(_, stamp)| stamp.is_some_and(|s| s + self.retention() <= now))
-            .map(|&(f, _)| f)
+            .filter(|(_, _, stamp)| stamp.is_some_and(|s| s + self.retention() <= now))
+            .map(|&(f, _, _)| f)
             .max();
         if next
             .query
@@ -306,7 +313,7 @@ impl Protocol {
         next.root_collected |= next.roots.len() < before;
         next.collected_after_restart |= next.restarted;
         next.collected = due;
-        next.retired.retain(|&(f, _)| f > due);
+        next.retired.retain(|&(f, _, _)| f > due);
     }
 }
 
