@@ -41,6 +41,7 @@ use crate::response::{
 /// The content block an event stream has open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenBlock {
+    Thinking { index: usize },
     Text { index: usize },
     ToolUse { index: usize, tool_call: u32 },
 }
@@ -48,7 +49,9 @@ enum OpenBlock {
 impl OpenBlock {
     fn index(self) -> usize {
         match self {
-            OpenBlock::Text { index } | OpenBlock::ToolUse { index, .. } => index,
+            OpenBlock::Thinking { index }
+            | OpenBlock::Text { index }
+            | OpenBlock::ToolUse { index, .. } => index,
         }
     }
 }
@@ -67,6 +70,9 @@ struct HeldToolCall {
 pub struct Translator {
     /// The model the request named, which a chunk without one is answered as.
     model: String,
+    /// Whether the model's reasoning streams as `thinking` blocks: the request's `thinking`
+    /// shows it, as the unstreamed answer's thinking block requires.
+    show_thinking: bool,
     started: bool,
     open: Option<OpenBlock>,
     /// The tool the open `tool_use` block calls.
@@ -85,9 +91,10 @@ pub struct Translator {
 
 impl Translator {
     #[must_use]
-    pub fn new(model: String) -> Self {
+    pub fn new(model: String, show_thinking: bool) -> Self {
         Self {
             model,
+            show_thinking,
             started: false,
             open: None,
             tool_name: String::new(),
@@ -209,6 +216,35 @@ impl Translator {
         Ok(index)
     }
 
+    /// More of the model's reasoning, as a `thinking` block: the one open, or a new one after the
+    /// open block and the tool calls held back. Its signature is empty, as in the unstreamed
+    /// answer: the reasoning is the model's own text, not a provider's signed record.
+    fn thinking(
+        &mut self,
+        thinking: String,
+        events: &mut Vec<StreamEvent>,
+    ) -> Result<(), MessagesError> {
+        let index = if let Some(OpenBlock::Thinking { index }) = self.open {
+            index
+        } else {
+            self.release_held(events)?;
+            let index = self.open(
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: String::new(),
+                },
+                events,
+            )?;
+            self.open = Some(OpenBlock::Thinking { index });
+            index
+        };
+        events.push(StreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentBlockDelta::ThinkingDelta { thinking },
+        });
+        Ok(())
+    }
+
     fn text(&mut self, text: String, events: &mut Vec<StreamEvent>) -> Result<(), MessagesError> {
         let index = if let Some(OpenBlock::Text { index }) = self.open {
             index
@@ -250,6 +286,11 @@ impl Translator {
             return Ok(events);
         };
         let delta = choice.delta;
+        if self.show_thinking
+            && let Some(thinking) = delta.reasoning_content.filter(|text| !text.is_empty())
+        {
+            self.thinking(thinking, &mut events)?;
+        }
         if let Some(text) = delta.content.filter(|text| !text.is_empty()) {
             self.text(text, &mut events)?;
         }
@@ -393,12 +434,17 @@ impl State {
     }
 }
 
-/// `chunks`, a chat completion's stream, as a Message's stream of events. An error ends it.
+/// `chunks`, a chat completion's stream, as a Message's stream of events, with the model's
+/// reasoning as `thinking` blocks when `show_thinking`. An error ends it.
 #[must_use]
-pub fn message_stream(chunks: ChatCompletionResponseStream, model: String) -> MessageStream {
+pub fn message_stream(
+    chunks: ChatCompletionResponseStream,
+    model: String,
+    show_thinking: bool,
+) -> MessageStream {
     let state = State {
         chunks,
-        translator: Some(Translator::new(model)),
+        translator: Some(Translator::new(model, show_thinking)),
         queue: VecDeque::new(),
     };
     Box::pin(futures::stream::unfold(state, |mut state| async move {

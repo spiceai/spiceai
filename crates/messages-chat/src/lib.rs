@@ -81,12 +81,16 @@ impl Messages for ChatMessages {
         let mut request = parse(request)?;
         request.stream = Some(true);
         let model = request.model.clone();
+        let show_thinking = request
+            .thinking
+            .as_ref()
+            .is_some_and(messages_api::types::ThinkingConfig::shows_thinking);
         let chunks = self
             .chat
             .chat_stream(request::chat_request(request)?)
             .await
             .map_err(response::messages_error)?;
-        Ok(stream::message_stream(chunks, model))
+        Ok(stream::message_stream(chunks, model, show_thinking))
     }
 
     async fn count_tokens(&self, request: MessagesRequest) -> Result<Value, MessagesError> {

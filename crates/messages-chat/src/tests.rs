@@ -410,11 +410,91 @@ fn tool_call(index: u32, id: Option<&str>, name: Option<&str>, arguments: &str) 
 async fn events(
     chunks: Vec<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
 ) -> Vec<Value> {
+    events_showing_thinking(chunks, false).await
+}
+
+async fn events_showing_thinking(
+    chunks: Vec<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
+    show_thinking: bool,
+) -> Vec<Value> {
     let chunks: ChatCompletionResponseStream = Box::pin(futures::stream::iter(chunks));
-    message_stream(chunks, "gpt".to_string())
+    message_stream(chunks, "gpt".to_string(), show_thinking)
         .map(|event| event.unwrap_or_else(|error| error.to_envelope()))
         .collect()
         .await
+}
+
+/// The content blocks a client builds from `events`: each block as it started, with its deltas
+/// applied in order.
+fn streamed_blocks(events: &[Value]) -> Vec<Value> {
+    let mut blocks: Vec<Value> = Vec::new();
+    for event in events {
+        match event["type"].as_str() {
+            Some("content_block_start") => blocks.push(event["content_block"].clone()),
+            Some("content_block_delta") => {
+                let index = usize::try_from(event["index"].as_u64().expect("an index"))
+                    .expect("a small index");
+                let block = &mut blocks[index];
+                let delta = &event["delta"];
+                for (field, key) in [("thinking", "thinking"), ("text", "text")] {
+                    if let Some(more) = delta[key].as_str() {
+                        let so_far = block[field].as_str().unwrap_or_default().to_string();
+                        block[field] = json!(so_far + more);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// A reasoning model's reasoning streams as a `thinking` block ahead of the answer when the
+/// request's `thinking` shows it, and the blocks a client builds from the stream are the
+/// unstreamed message's for the same reply.
+#[tokio::test]
+async fn reasoning_streams_as_the_unstreamed_thinking_block() {
+    let chunks = || {
+        vec![
+            Ok(chunk(
+                &json!({"index": 0, "delta": {"role": "assistant", "reasoning_content": "The user "}, "finish_reason": null}),
+            )),
+            Ok(chunk(
+                &json!({"index": 0, "delta": {"reasoning_content": "wants the file."}, "finish_reason": null}),
+            )),
+            Ok(chunk(
+                &json!({"index": 0, "delta": {"content": "Reading "}, "finish_reason": null}),
+            )),
+            Ok(chunk(
+                &json!({"index": 0, "delta": {"content": "it."}, "finish_reason": null}),
+            )),
+            Ok(chunk(
+                &json!({"index": 0, "delta": {}, "finish_reason": "stop"}),
+            )),
+            Ok(usage_chunk()),
+        ]
+    };
+    let answer = completion(
+        &json!({"role": "assistant", "content": "Reading it.", "reasoning_content": "The user wants the file."}),
+        "stop",
+    );
+    for show_thinking in [true, false] {
+        let streamed = events_showing_thinking(chunks(), show_thinking).await;
+        let unstreamed =
+            serde_json::to_value(message(answer.clone(), show_thinking).expect("a message"))
+                .expect("serializable");
+        assert_eq!(
+            Value::Array(streamed_blocks(&streamed)),
+            unstreamed["content"],
+            "show_thinking: {show_thinking}"
+        );
+    }
+    let streamed = events_showing_thinking(chunks(), true).await;
+    assert_eq!(
+        streamed[2],
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "The user "}}),
+        "the thinking streams as it arrives"
+    );
 }
 
 #[tokio::test]
@@ -538,7 +618,7 @@ async fn interleaved_tool_calls_stream_the_message_the_unstreamed_answer_carries
 /// arrive: a call that starts once the one before it is whole ends that one's block.
 #[test]
 fn a_tool_call_that_starts_after_a_whole_one_streams_as_it_arrives() {
-    let mut translator = Translator::new("gpt".to_string());
+    let mut translator = Translator::new("gpt".to_string(), false);
     let values = |events: Result<Vec<StreamEvent>, MessagesError>| -> Vec<Value> {
         events
             .expect("events")
