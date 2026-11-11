@@ -158,6 +158,48 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/))'
 slow-timeout = { period = "120s", terminate-after = 8 }
 
+# Three more Cayenne tests whose real work sits inside the contention band of
+# the global 360s ceiling. Each is sized the same way as the blocks above: the
+# slowest pass on a sign-off host that was not over-subscribed, x 4.6 x 1.25
+# (5.75x), rounded up to whole 120s periods.
+#
+# Slowest pass on `macmini-runner-01-01` / `-04-01`, across one sign-off a day
+# from 2026-10-20 to 2026-11-11 (the per-test times are flat over that window, so
+# this is not a test that got slower):
+#
+#   test                                                       baseline  x5.75   ceiling
+#   provider::table::tests::small_tier_merge_runs_while_…       122.5s   704s    720s (6)
+#   lookup_index_widening_test::file_mode_widened_keys_…        140.9s   810s    840s (7)
+#   bulk_load_index_coverage_test::bulk_load_with_repeats_…      91.7s   527s    600s (5)
+#
+# On the over-subscribed hosts (#14557) the same tests take 2.5-3.8x as long.
+# Sign-off 42129155331 on `-03-01` passed `file_mode_widened_keys` on its second
+# try at 353.8s, a 6s margin, and `small_tier_merge` only on its third. In
+# 42841473174 on `-01-01` both were killed on all four tries, and the sign-off
+# failed on a diff that never touched Cayenne. In 42863051342 and 42959854527,
+# also on `-01-01`, both passed only on the fourth try: three kills, 18 minutes
+# of runner time per test spent re-running work that was never going to finish
+# inside 360s.
+#
+# These keep the default retries: an assertion failure is still retried and
+# reported exactly as before, and a genuine hang is still killed, at most 14
+# minutes per try instead of 6. `small_tier_merge` is a unit test in the
+# `cayenne` library binary, so it is named exactly rather than by module: its
+# module, `provider::table::tests`, holds thousands of tests that need no extra
+# room. `.github/scripts/check_nextest_config.py` holds all three to these
+# baselines.
+[[profile.default.overrides]]
+filter = '(binary_id(=cayenne) & test(=provider::table::tests::small_tier_merge_runs_while_large_tier_merge_is_in_flight))'
+slow-timeout = { period = "120s", terminate-after = 6 }
+
+[[profile.default.overrides]]
+filter = '(binary_id(=cayenne::integration) & test(/^lookup_index_widening_test::/))'
+slow-timeout = { period = "120s", terminate-after = 7 }
+
+[[profile.default.overrides]]
+filter = '(binary_id(=cayenne::integration) & test(/^bulk_load_index_coverage_test::/))'
+slow-timeout = { period = "120s", terminate-after = 5 }
+
 # Hold every GitHub test to the `github-api-tests` group — see its definition
 # above for why the shared secondary rate limit makes parallelism self-defeating
 # here.

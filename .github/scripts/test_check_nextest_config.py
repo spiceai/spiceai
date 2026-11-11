@@ -25,6 +25,26 @@ test-group = 'cayenne-property-tests'
 retries = 0
 """
 
+# The ceilings for three Cayenne tests that sat inside the contention band of the
+# global 360s: one unit test of the `cayenne` library named exactly, and two
+# integration-test modules.
+SMALL_TIER_TEST = (
+    "provider::table::tests::small_tier_merge_runs_while_large_tier_merge_is_in_flight"
+)
+SLOW_SIGN_OFF_TESTS = f"""
+[[profile.default.overrides]]
+filter = '(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))'
+slow-timeout = {{ period = "120s", terminate-after = 6 }}
+
+[[profile.default.overrides]]
+filter = '(binary_id(=cayenne::integration) & test(/^lookup_index_widening_test::/))'
+slow-timeout = {{ period = "120s", terminate-after = 7 }}
+
+[[profile.default.overrides]]
+filter = '(binary_id(=cayenne::integration) & test(/^bulk_load_index_coverage_test::/))'
+slow-timeout = {{ period = "120s", terminate-after = 5 }}
+"""
+
 # The fix: the same overrides, plus an explicit ceiling for the slow binaries.
 # `mutation_model_test` is split out at a lower ceiling, mirroring the real
 # config: its baseline is a third of the others', so 960s already clears the
@@ -44,7 +64,7 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 filter = '(binary_id(=cayenne::integration) & test(/^result_correctness_vs_duckdb_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_vs_sqlite_test::/)) | (binary_id(=runtime::integration) & test(/^result_correctness::/))'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }
-"""
+""" + SLOW_SIGN_OFF_TESTS
 
 # The ceiling sized against the 3.7x contention factor measured for #12336: high
 # enough to clear every baseline at that factor, and still reached once the pool
@@ -193,6 +213,52 @@ class BinaryFilterTest(unittest.TestCase):
                 "retention_oom",
             },
         )
+
+    def test_matches_one_test_of_a_library_or_an_integration_binary(self):
+        self.assertEqual(
+            check_nextest_config.selectors_matched(
+                f"(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))"
+                " | (binary_id(=cayenne::integration) & test(=a_test::one))"
+            ),
+            {f"cayenne#{SMALL_TIER_TEST}", "cayenne::integration#a_test::one"},
+        )
+
+    def test_a_test_selector_matches_only_that_test(self):
+        expr = f"(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))"
+        self.assertTrue(check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}", expr))
+        self.assertFalse(
+            check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}_sibling", expr)
+        )
+        # The same test path in another binary is a different test.
+        self.assertFalse(
+            check_nextest_config.selected(f"cayenne::integration#{SMALL_TIER_TEST}", expr)
+        )
+        # And it does not stand in for the library's other tests.
+        self.assertFalse(check_nextest_config.selected("cayenne", expr))
+
+    def test_a_test_key_is_selected_by_its_module_or_its_binary(self):
+        """nextest applies a module or whole-binary override to every test in it."""
+        key = "cayenne::integration#lookup_index_widening_test::file_mode"
+        self.assertTrue(
+            check_nextest_config.selected(
+                key, "(binary_id(=cayenne::integration) & test(/^lookup_index_widening_test::/))"
+            )
+        )
+        # A module whose name is a prefix of the test's module is a different module.
+        self.assertFalse(
+            check_nextest_config.selected(
+                key, "(binary_id(=cayenne::integration) & test(/^lookup_index_widening::/))"
+            )
+        )
+        # A module of a different binary with the same name does not match.
+        self.assertFalse(
+            check_nextest_config.selected(
+                key, "(binary_id(=runtime::integration) & test(/^lookup_index_widening_test::/))"
+            )
+        )
+        self.assertTrue(check_nextest_config.selected(key, "binary(=integration)"))
+        self.assertTrue(check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}", "binary(=cayenne)"))
+        self.assertFalse(check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}", "binary(=runtime)"))
 
     def test_a_module_selector_does_not_match_the_whole_binary(self):
         """Selecting one module must not stand in for the binary, or its siblings."""
@@ -363,6 +429,30 @@ class CheckConfigTest(unittest.TestCase):
         widest = max(check_nextest_config.QUIET_BASELINE_SECONDS.values())
         self.assertGreater(1200, widest * check_nextest_config.CONTENTION_FACTOR)
         self.assertTrue(any("partition_chunking_test is killed after 1200s" in p for p in problems))
+
+    def test_rejects_the_global_ceiling_for_the_slow_sign_off_tests(self):
+        """Without their overrides, all three are killed at 360s again."""
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(
+                write(tmp, FIXED_CONFIG.replace(SLOW_SIGN_OFF_TESTS, ""))
+            )
+        self.assertEqual(len(problems), 3, problems)
+        for needle in (
+            f"cayenne#{SMALL_TIER_TEST} is killed after 360s",
+            "lookup_index_widening_test is killed after 360s",
+            "bulk_load_index_coverage_test is killed after 360s",
+        ):
+            self.assertTrue(any(needle in p for p in problems), (needle, problems))
+
+    def test_rejects_a_test_ceiling_one_period_short(self):
+        """The exact-test ceiling is held to its own baseline: 600s < 122.5 x 5.75."""
+        line = f"test(={SMALL_TIER_TEST}))'\nslow-timeout = {{ period = \"120s\", terminate-after = %d }}"
+        undersized = FIXED_CONFIG.replace(line % 6, line % 5)
+        self.assertNotEqual(undersized, FIXED_CONFIG)
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, undersized))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(f"cayenne#{SMALL_TIER_TEST} is killed after 600s", problems[0])
 
     def test_rejects_raising_the_global_ceiling_instead(self):
         """The tempting one-line 'fix' hides slowness across the whole workspace."""

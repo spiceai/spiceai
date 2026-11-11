@@ -52,10 +52,13 @@ from pathlib import Path
 # Source: `Remote Sign-off` run 30833882620 (trunk @ 7b98c234), which ran with no
 # other sign-off in flight. Value is the slowest single test in that set.
 #
-# A key is either a binary name, matched by a `binary(=name)` filter term, or
+# A key is either a binary name, matched by a `binary(=name)` filter term,
 # `package::binary::module` for one module of a test binary that holds many,
-# matched by a `(binary_id(=package::binary) & test(/^module::/))` term. Cayenne's
-# integration tests are modules of its single `integration` binary.
+# matched by a `(binary_id(=package::binary) & test(/^module::/))` term, or
+# `binary_id#test::path` for one test, matched by a
+# `(binary_id(=binary_id) & test(=test::path))` term. Cayenne's integration tests
+# are modules of its single `integration` binary; its unit tests are in the
+# `cayenne` library binary, whose `binary_id` is the package name alone.
 QUIET_BASELINE_SECONDS = {
     "cayenne::integration::mutation_property_test": 239.5,  # prop_concurrent_mixed_position_sqlite
     "cayenne::integration::partition_chunking_test": 247.9,  # ..._timestamp_partition_with_date_part_impl_sqlite
@@ -69,6 +72,15 @@ QUIET_BASELINE_SECONDS = {
     # fixture on disk, plus the 25.4s `tpcdsgen` takes to write it on a fresh
     # runner, rounded up.
     "cayenne::integration::result_correctness_vs_sqlite_test": 200.0,
+    # The three below come from one sign-off a day, 2026-10-20 to 2026-11-11, on
+    # `macmini-runner-01-01` and `-04-01`, the hosts not over-subscribed in that
+    # window (#14557): the slowest pass of each. The times are flat across it.
+    # Run 41931913741 (04-01).
+    "cayenne#provider::table::tests::small_tier_merge_runs_while_large_tier_merge_is_in_flight": 122.5,
+    # file_mode_widened_keys_return_the_rows_of_an_unindexed_table, run 40144055680 (01-01).
+    "cayenne::integration::lookup_index_widening_test": 140.9,
+    # bulk_load_with_repeats_is_indexed_when_it_returns_impl_sqlite, run 41136640039 (04-01).
+    "cayenne::integration::bulk_load_index_coverage_test": 91.7,
 }
 
 # Worst same-test slowdown measured between a quiet pool and a saturated one.
@@ -142,6 +154,12 @@ _BINARY_EQ_TERM = re.compile(r"binary\(=([A-Za-z0-9_]+)\)")
 _MODULE_TERM = re.compile(
     r"\(\s*binary_id\(=([A-Za-z0-9_-]+)::([A-Za-z0-9_]+)\)"
     r"\s*&\s*test\(/\^([A-Za-z0-9_]+)::/\)\s*\)"
+)
+# One test of a binary, by its exact name. `binary_id` is `package` for a
+# library's unit tests and `package::binary` for an integration-test binary.
+_TEST_TERM = re.compile(
+    r"\(\s*binary_id\(=([A-Za-z0-9_-]+(?:::[A-Za-z0-9_]+)?)\)"
+    r"\s*&\s*test\(=([A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*)\)\s*\)"
 )
 _OTHER_BINARY_TERM = re.compile(r"binary(?:-id|_id)?\((?!=[A-Za-z0-9_]+\))")
 
@@ -258,7 +276,8 @@ def selectors_matched(filter_expr: str) -> set[str]:
     """Return the test-set keys a filter expression matches exactly.
 
     A `binary(=name)` term yields `name`; a
-    `(binary_id(=p::b) & test(/^module::/))` term yields `p::b::module`.
+    `(binary_id(=p::b) & test(/^module::/))` term yields `p::b::module`; a
+    `(binary_id(=id) & test(=path))` term yields `id#path`.
     A filter selecting tests by name alone (for example `test(=mysql::…)`)
     matches nothing here, which is correct: it cannot be resolved to a test set
     without knowing every binary's test names.
@@ -267,7 +286,8 @@ def selectors_matched(filter_expr: str) -> set[str]:
         f"{package}::{binary}::{module}"
         for package, binary, module in _MODULE_TERM.findall(filter_expr)
     }
-    rest = _MODULE_TERM.sub("", filter_expr)
+    selectors |= {f"{binary_id}#{path}" for binary_id, path in _TEST_TERM.findall(filter_expr)}
+    rest = _TEST_TERM.sub("", _MODULE_TERM.sub("", filter_expr))
     if _OTHER_BINARY_TERM.search(rest) or (
         "&" in rest and _BINARY_EQ_TERM.search(rest)
     ):
@@ -281,11 +301,25 @@ def selected(key: str, filter_expr: str) -> bool:
     """Return whether the filter expression selects the test set `key`.
 
     A `package::binary::module` key is also selected by a `binary(=binary)` term,
-    which selects every module of that binary, as nextest applies it.
+    which selects every module of that binary, as nextest applies it. A
+    `binary_id#test::path` key is also selected by a module term of the same
+    binary whose module the path is in, and by a `binary(=…)` term naming its
+    binary: the last segment of `binary_id`, which for a library is the package.
     """
     selectors = selectors_matched(filter_expr)
     if key in selectors:
         return True
+    if "#" in key:
+        binary_id, path = key.split("#", 1)
+        for selector in selectors:
+            if "#" in selector:
+                continue
+            selector_binary, _, module = selector.rpartition("::")
+            if selector.count("::") == 2 and selector_binary == binary_id and path.startswith(
+                f"{module}::"
+            ):
+                return True
+        return binary_id.split("::")[-1] in selectors
     parts = key.split("::")
     return len(parts) == 3 and parts[1] in selectors
 
