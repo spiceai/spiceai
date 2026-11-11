@@ -2290,12 +2290,16 @@ async fn maintenance_pass_and_append_are_serialized_impl(
             !append.is_finished(),
             "{name}: the append waits while the maintenance pass holds its generation"
         );
-        // No scan here: parked inside its predicate the pass is mid-delete and
-        // a reader waits on the listing fence it holds (a scan here deadlocked
-        // against the handshake). The library test reads the rows while its pass
-        // is parked at entry, before the fence.
+        // No scan here: the pass is parked inside its predicate, mid-delete. The
+        // library test reads the rows while its pass is parked at entry.
         release_tx.send(())?;
-        let pass = racer.join().expect("racer thread");
+        // Join off the runtime thread: this test runs on a current-thread
+        // runtime, and the append may be parked mid-way (holding a lock while
+        // its catalog I/O completes); a blocking join here would starve it and
+        // deadlock the pass that waits on that lock.
+        let pass = tokio::task::spawn_blocking(move || racer.join())
+            .await?
+            .expect("racer thread");
         assert_eq!(
             pass.is_err(),
             fail_pass,
