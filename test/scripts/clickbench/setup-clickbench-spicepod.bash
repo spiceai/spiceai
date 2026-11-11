@@ -8,7 +8,7 @@ engine=arrow
 # Function to display usage
 usage() {
     echo "Usage: $0 [-engine acceleration_engine]"
-    echo "  --engine Acceleration Engine (default: arrow)"
+    echo "  --engine Acceleration Engine: arrow or sqlite (default: arrow)"
 }
 
 # Parse command-line options
@@ -25,6 +25,16 @@ while [[ "$#" -gt 0 ]]; do
             ;;
     esac
 done
+
+# Each engine below writes its own dataset; any other value would write a Spicepod with none.
+case "$engine" in
+    arrow | sqlite ) ;;
+    * )
+        echo "error: Unsupported engine: $engine (expected arrow or sqlite)" 1>&2
+        usage
+        exit 1
+        ;;
+esac
 
 # test if duckdb command exists
 if ! type "duckdb" 1> /dev/null 2>&1; then
