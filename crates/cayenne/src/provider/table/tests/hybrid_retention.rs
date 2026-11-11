@@ -256,28 +256,55 @@ async fn rows(provider: &CayenneTableProvider) -> Vec<(i64, i64)> {
     out
 }
 
-/// Retention OFF while seeding. Durable: two checkpoint snapshots (two
-/// protected runs of one size tier). Tier: newer versions of keys 2 (retained
-/// -> archived) and 3 (archived -> retained).
-async fn seed(f: &Fixture) {
-    let p = &f.provider;
-    f.set(OFF);
-    apply(p, &[(1, -1), (2, 2), (3, -3)]).await.expect("seed a");
-    p.checkpoint_mem_tier().await.expect("checkpoint a");
-    apply(p, &[(4, 4), (5, -5)]).await.expect("seed b");
-    p.checkpoint_mem_tier().await.expect("checkpoint b");
-    apply(p, &[(2, -2), (3, 3)]).await.expect("seed tier");
-    settle(p).await;
-    assert_eq!(rows(p).await, SEEDED.to_vec(), "{}: seeded", f.name);
+/// What sits in the RAM tier across all shards: every resident row version
+/// (sorted) and every key tombstone (sorted).
+fn tier_view(provider: &CayenneTableProvider) -> (Vec<(i64, i64)>, Vec<i64>) {
+    use arrow::array::Int64Array;
+    let mut rows = Vec::new();
+    let mut tombstones = Vec::new();
+    for shard in provider.mem_tier.shards() {
+        let tier = shard.load();
+        for segment in tier.segments.iter() {
+            for batch in segment.batches.iter() {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id");
+                let values = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("value");
+                rows.extend((0..batch.num_rows()).map(|r| (ids.value(r), values.value(r))));
+            }
+        }
+        tombstones.extend(tier.tombstones.int64_pk.keys().copied());
+    }
+    rows.sort_unstable();
+    tombstones.sort_unstable();
+    (rows, tombstones)
 }
 
-/// [`seed`] with the newer versions of keys 2 and 3 checkpointed too: three
+/// The rows durable in the catalog: a fresh provider (no retention) opened on
+/// it, as the ack observer does.
+async fn durable_rows(f: &Fixture) -> Vec<(i64, i64)> {
+    rows(&open(&f.catalog, &f.name, f.shards, vec![]).await).await
+}
+
+/// The durable rows [`seed_keeping_tier`] leaves: keys 2 and 3 at their older
+/// versions (retained 2, archived 3).
+const DURABLE_SEED: [(i64, i64); 5] = [(1, -1), (2, 2), (3, -3), (4, 4), (5, -5)];
+/// The tier rows [`seed_keeping_tier`] leaves: the newer versions of 2 and 3.
+const TIER_SEED: [(i64, i64); 2] = [(2, -2), (3, 3)];
+
+/// [`seed_keeping_tier`] with the newer versions of keys 2 and 3 checkpointed too: three
 /// protected runs and no pending mem-tier delete, so the delete fence is the
 /// durable maximum and every run is at or below it. With the newer versions
 /// still in the tier their key deletes are pending and the fence sits below
 /// both runs' thresholds, so a merge is declined
 /// (`DeclinedAboveDeleteFence`) unless something else checkpoints them first,
-/// which made a compaction barrier on [`seed`] state nondeterministic.
+/// which made a compaction barrier on tier-resident state nondeterministic.
 async fn seed_durable(f: &Fixture) {
     let p = &f.provider;
     f.set(OFF);
@@ -375,22 +402,31 @@ async fn hybrid_apply_excludes_the_checkpoint_and_acks_only_durable_deletes() {
         Box::pin(async move {
             let f = hybrid(&format!("hy_ckpt_{shards}"), shards).await;
             let p = &f.provider;
-            seed(&f).await;
+            let hold = seed_keeping_tier(&f).await;
             let probe = hold_mid_scan(p, |probe| {
                 Box::pin(async move {
-                    match probe.try_checkpoint_mem_tier().await.expect("attempt") {
+                    // The evaluation barrier: the tier still holds 2 and 3.
+                    let tier = tier_view(&probe);
+                    let attempt = match probe.try_checkpoint_mem_tier().await.expect("attempt") {
                         CheckpointAttempt::Completed(rows) => format!("ran ({rows} rows)"),
                         CheckpointAttempt::Busy => "busy".to_string(),
-                    }
+                    };
+                    format!("{attempt}; tier {tier:?}")
                 })
             });
             f.set(ON);
             apply(p, &[(6, 6)]).await.expect("apply");
             assert_eq!(
-                probe.lock().take().as_deref(),
-                Some("busy"),
+                probe.lock().take(),
+                Some(format!("busy; tier {:?}", (TIER_SEED.to_vec(), vec![2, 3]))),
                 "shards={shards}"
             );
+            assert_eq!(
+                durable_rows(&f).await,
+                DURABLE_SEED.to_vec(),
+                "shards={shards}: the apply wrote nothing durable"
+            );
+            drop(hold);
             assert_eq!(
                 rows(p).await,
                 RETAINED.to_vec(),
@@ -518,7 +554,7 @@ async fn hybrid_apply_rescans_when_a_compaction_commits_mid_scan() {
 async fn maintenance_pass_and_hybrid_apply_serialize_by_entry_handshake() {
     let f = hybrid("hy_maint", 1).await;
     let p = &f.provider;
-    seed(&f).await;
+    let hold = seed_keeping_tier(&f).await;
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     *p.test_retention_pass_entered_hook.lock() = Some(Box::new(move || {
@@ -528,6 +564,7 @@ async fn maintenance_pass_and_hybrid_apply_serialize_by_entry_handshake() {
         })
     }));
     f.set(ON);
+    drop(hold);
     let pass_table = p.clone_for_write();
     let pass = tokio::spawn(async move { pass_table.apply_retention_filters().await });
     entered_rx.await.expect("the pass entered");
@@ -563,8 +600,9 @@ async fn hybrid_replay_after_staged_uncommitted_and_committed_unacked_crashes() 
         Box::pin(async move {
             let f = hybrid(&format!("hy_replay_{shards}"), shards).await;
             let p = &f.provider;
-            seed(&f).await;
-            p.checkpoint_mem_tier().await.expect("seed durable");
+            // Every seeded version durable: this test covers no tier-resident row
+            // (see `hybrid_replay_with_tier_resident_rows`).
+            seed_durable(&f).await;
             quiesce(p).await;
             let acked = f.acks.lock().len();
             f.set(ON);
@@ -613,9 +651,13 @@ async fn hybrid_replay_after_staged_uncommitted_and_committed_unacked_crashes() 
     }
 }
 
-/// [`seed`], with the retention pass held from before the tier write so the
-/// newer versions of keys 2 and 3 stay in the RAM tier (the pass forces a
-/// tier checkpoint, and [`settle`] runs it). Returns the hold.
+/// Retention OFF while seeding. Durable: two checkpoint snapshots (two
+/// protected runs of one size tier) holding [`DURABLE_SEED`]. Tier: the newer
+/// versions of keys 2 (retained -> archived) and 3 (archived -> retained), kept
+/// there by holding the retention maintenance pass from before the tier write
+/// (the pass forces a tier checkpoint, and [`settle`] runs it). Asserts both
+/// layers independently, then returns the hold. The caller must not
+/// [`settle`]/[`quiesce`] while holding it: the drain would wait on the pass.
 async fn seed_keeping_tier(f: &Fixture) -> tokio::sync::OwnedRwLockWriteGuard<()> {
     let p = &f.provider;
     f.set(OFF);
@@ -625,9 +667,33 @@ async fn seed_keeping_tier(f: &Fixture) -> tokio::sync::OwnedRwLockWriteGuard<()
     p.checkpoint_mem_tier().await.expect("checkpoint b");
     settle(p).await;
     let hold = Arc::clone(&p.test_retention_pass_gate).write_owned().await;
-    apply(p, &[(2, -2), (3, 3)]).await.expect("seed tier");
-    assert_eq!(rows(p).await, SEEDED.to_vec(), "{}: seeded", f.name);
+    apply(p, &TIER_SEED).await.expect("seed tier");
+    assert_tier_seeded(f, "seeded").await;
     hold
+}
+
+/// The two layers [`seed_keeping_tier`] built, asserted independently: the
+/// tier holds exactly the newer versions of 2 and 3 and their key tombstones,
+/// the catalog the older ones, and the scan the merged view.
+async fn assert_tier_seeded(f: &Fixture, at: &str) {
+    assert_eq!(
+        tier_view(&f.provider),
+        (TIER_SEED.to_vec(), vec![2, 3]),
+        "{}: {at}: tier versions and tombstones",
+        f.name
+    );
+    assert_eq!(
+        durable_rows(f).await,
+        DURABLE_SEED.to_vec(),
+        "{}: {at}: durable",
+        f.name
+    );
+    assert_eq!(
+        rows(&f.provider).await,
+        SEEDED.to_vec(),
+        "{}: {at}: merged view",
+        f.name
+    );
 }
 
 /// The durable write routes that reach an armed `cdc_durability: memory` table
@@ -662,49 +728,131 @@ async fn durable_write(provider: &CayenneTableProvider, route: DurableRoute, row
     }
 }
 
-/// A durable write (transaction or SQL insert) to an armed hybrid table applies
-/// `retention_sql` to the whole logical view it publishes, tier rows included:
-/// key 2's tier version (retained -> archived) is retired, key 3's tier version
-/// (archived -> retained) stays and its archived durable version neither fails
-/// nor resurrects. The view holds through the next checkpoint and a restart.
+/// Replay after a crash with tier-resident rows. The newer versions of 2 and 3
+/// live only in the tier and were never acknowledged (the last ack saw
+/// [`DURABLE_SEED`]); the apply retains against them in memory and writes
+/// nothing durable. A crash before the checkpoint loses the tier: the restart
+/// reads [`DURABLE_SEED`], the source replays from its ack (the tier seed, then
+/// the apply), and the replay converges on the same view, durably.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn armed_tier_durable_writes_retain_the_whole_logical_view() {
-    for route in [DurableRoute::Transaction, DurableRoute::SqlInsert] {
-        let f = hybrid(&format!("hyb_durable_{route:?}").to_lowercase(), 1).await;
-        let hold = seed_keeping_tier(&f).await;
-        assert!(
-            !f.provider.mem_tier.tier().load().is_empty(),
-            "{route:?}: precondition: keys 2 and 3 have newer versions in the tier"
-        );
-        let acks_before = f.acks.lock().len();
-        f.set(ON);
-        durable_write(&f.provider, route, &[(6, 6)]).await;
-        // How the write treated the tier: drained (its rows made durable and
-        // acknowledged by the write) or left in place.
-        eprintln!(
-            "{route:?}: tier empty after write = {}, acks {} -> {}",
-            f.provider.mem_tier.tier().load().is_empty(),
-            acks_before,
-            f.acks.lock().len()
-        );
-        assert_eq!(
-            rows(&f.provider).await,
-            RETAINED.to_vec(),
-            "{route:?}: published view"
-        );
-        drop(hold);
-        f.provider.checkpoint_mem_tier().await.expect("checkpoint");
-        assert_eq!(
-            rows(&f.provider).await,
-            RETAINED.to_vec(),
-            "{route:?}: after the tier checkpoint"
-        );
-        settle(&f.provider).await;
-        let restarted = f.restart().await;
-        assert_eq!(
-            rows(&restarted).await,
-            RETAINED.to_vec(),
-            "{route:?}: after a restart"
-        );
+async fn hybrid_replay_with_tier_resident_rows() {
+    for shards in [1_usize, 4] {
+        Box::pin(async move {
+            let f = hybrid(&format!("hy_replay_tier_{shards}"), shards).await;
+            let p = &f.provider;
+            let hold = seed_keeping_tier(&f).await;
+            assert_eq!(
+                f.acks.lock().last().cloned(),
+                Some(DURABLE_SEED.to_vec()),
+                "shards={shards}: the tier seed was never acknowledged"
+            );
+            let acked = f.acks.lock().len();
+            f.set(ON);
+            apply(p, &[(6, 6)]).await.expect("apply");
+            assert_eq!(rows(p).await, RETAINED.to_vec(), "shards={shards}: applied");
+            assert_eq!(f.acks.lock().len(), acked, "shards={shards}: not acked");
+            assert_eq!(
+                durable_rows(&f).await,
+                DURABLE_SEED.to_vec(),
+                "shards={shards}: nothing durable"
+            );
+
+            // Crash before the checkpoint: replay from the ack.
+            let restarted = f.restart().await;
+            assert_eq!(
+                rows(&restarted).await,
+                DURABLE_SEED.to_vec(),
+                "shards={shards}: the durable generation"
+            );
+            apply(&restarted, &TIER_SEED)
+                .await
+                .expect("replay tier seed");
+            apply(&restarted, &[(6, 6)]).await.expect("replay apply");
+            assert_eq!(
+                rows(&restarted).await,
+                RETAINED.to_vec(),
+                "shards={shards}: replayed"
+            );
+            restarted.checkpoint_mem_tier().await.expect("checkpoint");
+            assert_eq!(
+                rows(&f.restart().await).await,
+                RETAINED.to_vec(),
+                "shards={shards}: durable"
+            );
+            drop(hold);
+        })
+        .await;
     }
+}
+
+/// [`seed_keeping_tier`], then a durable write of `(6, 6)` with retention ON by
+/// `route`, still holding the retention pass. Asserts the write acknowledged
+/// nothing. Returns the fixture and the hold.
+async fn armed_durable_write(
+    route: DurableRoute,
+    step: &str,
+) -> (Fixture, tokio::sync::OwnedRwLockWriteGuard<()>) {
+    let f = hybrid(&format!("hyb_{step}_{route:?}").to_lowercase(), 1).await;
+    let hold = seed_keeping_tier(&f).await;
+    let acks_before = f.acks.lock().len();
+    f.set(ON);
+    durable_write(&f.provider, route, &[(6, 6)]).await;
+    assert_eq!(
+        f.acks.lock().len(),
+        acks_before,
+        "{route:?}: the write acknowledged nothing"
+    );
+    (f, hold)
+}
+
+/// A durable write (transaction or SQL insert) to an armed hybrid table must
+/// apply `retention_sql` to the whole logical view it publishes, tier rows
+/// included: key 2's tier version (retained -> archived) is retired, key 3's
+/// tier version (archived -> retained) stays and its archived durable version
+/// neither fails nor resurrects.
+async fn assert_armed_published_view(route: DurableRoute) {
+    let (f, hold) = armed_durable_write(route, "live").await;
+    assert_eq!(
+        rows(&f.provider).await,
+        RETAINED.to_vec(),
+        "{route:?}: published view"
+    );
+    drop(hold);
+}
+
+/// The same write's view after the tier checkpoints and after a restart,
+/// checked independently of the live view so a resurrection at either step
+/// shows even when the live view is already wrong.
+async fn assert_armed_view_after_checkpoint_and_restart(route: DurableRoute) {
+    let (f, hold) = armed_durable_write(route, "ckpt").await;
+    drop(hold);
+    f.provider.checkpoint_mem_tier().await.expect("checkpoint");
+    let after_checkpoint = rows(&f.provider).await;
+    settle(&f.provider).await;
+    let after_restart = rows(&f.restart().await).await;
+    assert_eq!(
+        (after_checkpoint, after_restart),
+        (RETAINED.to_vec(), RETAINED.to_vec()),
+        "{route:?}: (after the tier checkpoint, after a restart)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn armed_tier_transaction_publishes_the_whole_logical_view() {
+    assert_armed_published_view(DurableRoute::Transaction).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn armed_tier_sql_insert_publishes_the_whole_logical_view() {
+    assert_armed_published_view(DurableRoute::SqlInsert).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn armed_tier_transaction_view_survives_checkpoint_and_restart() {
+    assert_armed_view_after_checkpoint_and_restart(DurableRoute::Transaction).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn armed_tier_sql_insert_view_survives_checkpoint_and_restart() {
+    assert_armed_view_after_checkpoint_and_restart(DurableRoute::SqlInsert).await;
 }
