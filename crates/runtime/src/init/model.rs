@@ -147,7 +147,9 @@ impl Runtime {
 
         // A node other than the first of a distributed model never reads the weights: the first
         // reads them and sends each node its share, so the files need exist only there.
-        if matches!(source, Some(ModelSource::File)) && !is_distributed_worker(&params) {
+        if matches!(source, Some(ModelSource::File))
+            && !distributed_node_rank(&params).is_some_and(|rank| rank > 0)
+        {
             // Verify all referenced local files exist before attempting to load the model and determine its type.
             // Otherwise, we will fail to determine the model type and the error will be confusing.
             if let Err(err) = verify_local_files_exist(m) {
@@ -291,6 +293,13 @@ impl Runtime {
             .write()
             .await
             .insert(m.name.clone(), rate_controller);
+        let node_ranks = self.model_node_ranks();
+        let mut node_ranks = node_ranks.write().await;
+        match distributed_node_rank(params) {
+            Some(rank) => node_ranks.insert(m.name.clone(), rank),
+            None => node_ranks.remove(&m.name),
+        };
+        drop(node_ranks);
         // Last, so a request never finds the capabilities without the handlers.
         let model_capabilities = self.model_capabilities();
         model_capabilities
@@ -329,6 +338,8 @@ impl Runtime {
         let mut rc_map = model_rate_controllers.write().await;
         rc_map.remove(&m.name);
         drop(rc_map);
+
+        self.model_node_ranks().write().await.remove(&m.name);
 
         tracing::info!("Model [{}] has been unloaded", m.name);
         let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();
@@ -518,17 +529,23 @@ fn model_error<'a>(
     }
 }
 
-/// Whether this node holds a share of a distributed model for another node, which serves it.
-/// It reads the params with their secrets and environment variables resolved, and parses them
-/// as the model's loader does, so both agree on which node this is.
-fn is_distributed_worker(params: &HashMap<String, SecretString>) -> bool {
-    params.get("distributed_backend").is_some_and(|backend| {
+/// This node's rank in a model split across several nodes (`distributed_backend: ring`), or
+/// `None` for a model that runs on one node. Rank 0 serves the model; every other rank holds a
+/// share of it for rank 0. It reads the params with their secrets and environment variables
+/// resolved, and parses them as the model's loader does, so both agree on which node this is: a
+/// missing or empty `node_rank` is rank 0, and one the loader refuses is `None`.
+fn distributed_node_rank(params: &HashMap<String, SecretString>) -> Option<usize> {
+    let ring = params.get("distributed_backend").is_some_and(|backend| {
         backend.expose_secret().parse::<DistributedBackendSetting>()
             == Ok(DistributedBackendSetting::Ring)
-    }) && params
-        .get("node_rank")
-        .and_then(|rank| rank.expose_secret().trim().parse::<usize>().ok())
-        .is_some_and(|rank| rank > 0)
+    });
+    if !ring {
+        return None;
+    }
+    match params.get("node_rank").map(|rank| rank.expose_secret().trim()) {
+        None | Some("") => Some(0),
+        Some(rank) => rank.parse::<usize>().ok(),
+    }
 }
 
 fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
@@ -843,5 +860,31 @@ mod tests {
             "{rejected}"
         );
         assert!(is_permanent_model_failure(&rejected), "{rejected}");
+    }
+
+    /// The rank `/v1/models` reports, which also decides whether this node reads the weights,
+    /// is the one the loader reads: `parse_distributed_config` takes a missing or empty
+    /// `node_rank` as rank 0 and refuses one that is not a number, and a model without
+    /// `distributed_backend: ring` runs on one node.
+    #[test]
+    fn a_models_node_rank_is_read_as_its_loader_reads_it() {
+        let params = |pairs: &[(&str, &str)]| -> HashMap<String, SecretString> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), SecretString::from((*value).to_string())))
+                .collect()
+        };
+        for (pairs, expected) in [
+            (&[("distributed_backend", "ring"), ("node_rank", "2")][..], Some(2)),
+            (&[("distributed_backend", "Ring"), ("node_rank", " 1 ")][..], Some(1)),
+            (&[("distributed_backend", "ring")][..], Some(0)),
+            (&[("distributed_backend", "ring"), ("node_rank", "")][..], Some(0)),
+            (&[("distributed_backend", "ring"), ("node_rank", "first")][..], None),
+            (&[("distributed_backend", "none"), ("node_rank", "1")][..], None),
+            (&[("node_rank", "1")][..], None),
+            (&[][..], None),
+        ] {
+            assert_eq!(distributed_node_rank(&params(pairs)), expected, "{pairs:?}");
+        }
     }
 }
