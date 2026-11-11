@@ -580,10 +580,17 @@ fn sqlite_cast_is_faithful(from: &DataType, to: &DataType) -> bool {
 /// where `DataFusion` truncates, a `/` or `%` whose divisor might be zero,
 /// which `MySQL` answers with `NULL` where `DataFusion` fails the query, and a
 /// `DISTINCT` aggregate `MySQL` cannot parse, such as `stddev(DISTINCT x)`.
+///
+/// So does every `DataFusion` array, list and map function: `MySQL` has none of
+/// those types, so `range`, `make_array` and the rest fail there, and an
+/// `UNNEST` over one goes with them (`ERROR 1064 … near 'range(0, 100))'`).
 #[must_use]
 pub fn deny_spice_functions_for_mysql_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
-        .deny_also([crate::dialect::BTRIM_NAME.to_string()])
+        .deny_also(
+            std::iter::once(crate::dialect::BTRIM_NAME.to_string())
+                .chain(datafusion_nested_function_names().iter().cloned()),
+        )
         .expression(Arc::new(crate::dialect::mysql_can_evaluate_expression))
         .build()
 }
