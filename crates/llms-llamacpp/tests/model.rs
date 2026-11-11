@@ -329,6 +329,62 @@ async fn a_streamed_reply_is_the_non_streamed_one() {
     );
 }
 
+/// A streamed reply carries the model's reasoning as it is generated, in `reasoning_content`,
+/// and the fragments add up to the non-streamed reply's reasoning and answer exactly.
+#[tokio::test]
+async fn a_streamed_reply_carries_the_non_streamed_reasoning() {
+    let model = qwen3().await;
+    let body = json!({
+        "model": "qwen3",
+        "messages": [{ "role": "user", "content": "What is 17 + 25? Reply with only the number." }],
+        "temperature": 0,
+        "max_tokens": 1024,
+    });
+    let whole = model
+        .chat_request(request(body.clone()))
+        .await
+        .expect("a reply");
+    let message = &whole.choices[0].message;
+    // Two empty reasonings agree and compare nothing.
+    assert!(
+        message
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty()),
+        "{message:?}"
+    );
+    let mut streamed_body = body;
+    streamed_body["stream"] = json!(true);
+    let mut stream = model
+        .chat_stream(request(streamed_body))
+        .await
+        .expect("a stream");
+    let (mut reasoning, mut content, mut answer_started) = (String::new(), String::new(), false);
+    while let Some(chunk) = stream.next().await {
+        for choice in chunk.expect("a chunk").choices {
+            let delta = choice.delta;
+            assert!(
+                delta.reasoning_content.is_none() || delta.content.is_none(),
+                "a chunk carries reasoning or answer, never both: {delta:?}"
+            );
+            if let Some(fragment) = delta.reasoning_content {
+                assert!(!fragment.is_empty(), "an empty reasoning fragment");
+                assert!(
+                    !answer_started,
+                    "reasoning after the answer began: {fragment:?}"
+                );
+                reasoning.push_str(&fragment);
+            }
+            if let Some(fragment) = delta.content {
+                answer_started |= !fragment.is_empty();
+                content.push_str(&fragment);
+            }
+        }
+    }
+    assert_eq!(Some(reasoning), message.reasoning_content);
+    assert_eq!(Some(content), message.content);
+}
+
 #[tokio::test]
 async fn max_tokens_ends_the_reply_at_its_length() {
     let model = qwen3().await;
