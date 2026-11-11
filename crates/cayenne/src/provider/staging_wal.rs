@@ -95,10 +95,6 @@ pub struct CayenneStagedAppend {
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
-    /// A committed `retention_sql` delete over resident rows, published under
-    /// the same fence as the staged files.
-    resident_retention:
-        parking_lot::Mutex<Option<super::overwrite_retention::CommittedResidentRetention>>,
 }
 
 impl std::fmt::Debug for CayenneStagedAppend {
@@ -176,17 +172,7 @@ impl CayenneStagedAppend {
             target_snapshot_id,
             target_kind: StagingWalTargetKind::CurrentSnapshot,
             row_count,
-            resident_retention: parking_lot::Mutex::new(None),
         }
-    }
-
-    /// Publish `retention` with the staged files.
-    pub(crate) fn with_resident_retention(
-        self,
-        retention: Option<super::overwrite_retention::CommittedResidentRetention>,
-    ) -> Self {
-        *self.resident_retention.lock() = retention;
-        self
     }
 
     pub(crate) fn from_staged_append_to_snapshot(
@@ -206,7 +192,6 @@ impl CayenneStagedAppend {
             target_snapshot_id,
             target_kind,
             row_count,
-            resident_retention: parking_lot::Mutex::new(None),
         }
     }
 
@@ -285,24 +270,6 @@ impl CayenneStagedAppend {
     /// Returns an error if any fallible step in the finalize sequence (write WAL, move files,
     /// or remove WAL) fails.
     pub async fn finalize_staged_write(&self) -> Result<()> {
-        let result = self.finalize_staged_write_inner().await;
-        // The catalog already holds a resident retention delete; when the append
-        // fails it still has to reach the caches, or they disagree with the
-        // catalog. The table then shows the previous generation with retention.
-        let leftover = if result.is_err() {
-            self.resident_retention.lock().take()
-        } else {
-            None
-        };
-        if let Some(retention) = leftover {
-            let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
-            let _fence = self.table.lock_listing_fence_write_owned().await;
-            retention.publish_under_held_fence(&self.table);
-        }
-        result
-    }
-
-    async fn finalize_staged_write_inner(&self) -> Result<()> {
         use super::table::record_cayenne_write_phase;
 
         // Carve the single `publish` phase into its four cost centers so the
@@ -326,10 +293,6 @@ impl CayenneStagedAppend {
 
         let commit_start = Instant::now();
         self.remove_wal().await?;
-        let retention = self.resident_retention.lock().take();
-        if let Some(retention) = retention {
-            retention.publish_under_held_fence(&self.table);
-        }
         self.table
             .publish_current_snapshot_files_changed_under_held_fence();
         self.table.mark_maintained_aggregates_stale();
