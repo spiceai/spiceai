@@ -196,9 +196,12 @@ impl CayenneStagedUpsert {
             .table
             .lock_mem_tier_checkpoint_for_durable_write()
             .await;
-        // The publication's one `now()`, taken after its last lock wait (the
-        // caller already holds every write lock and fence and has validated),
-        // so no wait can leave it in the past.
+        // The publication's one `now()`, taken after this table's write lock,
+        // optimistic check and checkpoint-lock wait. NOT after every wait: a
+        // multi-table transaction prepares its tables one by one (a later
+        // table's checkpoint wait follows this `now()`), and the visibility
+        // locks and listing fences are taken after every prepare
+        // (`CayenneTransaction::commit`). Known gap, not yet fixed.
         let Some(filters) = self.commit_retention_context()? else {
             return Ok((Some(checkpoint_guard), None));
         };
