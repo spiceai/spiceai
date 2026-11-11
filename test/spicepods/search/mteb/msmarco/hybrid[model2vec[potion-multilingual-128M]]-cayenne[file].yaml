@@ -50,7 +50,7 @@ datasets:
       file_format: parquet
 
   - from: file:data/msmarco/queries.parquet
-    name: test_queries
+    name: queries
     params:
       file_format: parquet
     acceleration:
@@ -64,6 +64,14 @@ datasets:
       enabled: true
 
 views:
+  # `queries` holds all 509,962 MS MARCO queries, but only the 43 in the `test` split have relevance
+  # judgments, and the test scores only judged queries. Searching the rest took more than 10 hours
+  # without changing a retrieval metric, so the test searches only the judged queries.
+  - name: test_queries
+    sql: |
+      SELECT _id, text FROM queries
+      WHERE _id IN (SELECT DISTINCT "query-id" FROM relevance_data)
+
   - name: corpus
     sql: |
       SELECT * FROM corpus_0
