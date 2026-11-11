@@ -496,6 +496,7 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
         filters: &[Expr],
+        superseded_positions: &std::collections::HashMap<std::sync::Arc<str>, Vec<u64>>,
     ) -> super::Result<Option<super::delete::PreparedDeletionPublish>> {
         let failed = |error: datafusion_common::DataFusionError| super::Error::DataFusion {
             source: datafusion_common::DataFusionError::Execution(format!(
@@ -517,39 +518,37 @@ impl CayenneTableProvider {
                     .to_string(),
             });
         }
-        let incoming = self
-            .read_staged_columns(snapshot_id, &keys)
-            .await
-            .map_err(failed)?;
         if self.is_position_based() {
-            // A position delete addresses (file, row), not keys, so the sink
-            // cannot skip by key before evaluating. Until it skips the write's
-            // superseded positions, the predicate is guarded by the staged keys
-            // (size grows with the write).
-            let superseded = incoming_key_predicate(&keys, &incoming).map_err(failed)?;
-            let guarded: Vec<Expr> = filters
-                .iter()
-                .map(|filter| match &superseded {
-                    Some(superseded) => datafusion::logical_expr::when(
-                        superseded.clone(),
-                        datafusion::logical_expr::lit(false),
-                    )
-                    .otherwise(filter.clone()),
-                    None => Ok(filter.clone()),
-                })
-                .collect::<datafusion_common::Result<_>>()
-                .map_err(failed)?;
+            // A position delete addresses (file, row): the write's superseded
+            // positions are excluded from each file's scan with its deletion
+            // vector, so neither they nor deleted rows reach the predicate.
+            let mut positions: std::collections::HashMap<String, roaring::RoaringBitmap> =
+                std::collections::HashMap::new();
+            for (file, rows) in superseded_positions {
+                let bitmap = positions.entry(file.to_string()).or_default();
+                for row in rows {
+                    bitmap.insert(u32::try_from(*row).map_err(|_| super::Error::Internal {
+                        table: self.table_name().to_string(),
+                        message: format!("superseded position {row} exceeds u32 in '{file}'"),
+                    })?);
+                }
+            }
             let sink = self
                 .build_deletion_vector_sink(
-                    &guarded,
+                    filters,
                     None,
                     super::table::DeletionRequestSource::User,
                 )
                 .await
-                .map_err(failed)?;
+                .map_err(failed)?
+                .with_skip_positions(positions);
             let prepared = sink.prepare_delete().await?;
             return Ok(prepared.filter(|prepared| !prepared.delete_files().is_empty()));
         }
+        let incoming = self
+            .read_staged_columns(snapshot_id, &keys)
+            .await
+            .map_err(failed)?;
         let sink = self
             .build_deletion_vector_sink(filters, None, super::table::DeletionRequestSource::User)
             .await
@@ -636,47 +635,6 @@ impl CayenneTableProvider {
         }
         Ok(batches)
     }
-}
-
-/// `key IN (incoming keys)`; for a composite key, the disjunction of each
-/// incoming key's column equalities. `None` when nothing was staged.
-fn incoming_key_predicate(
-    keys: &[String],
-    incoming: &[RecordBatch],
-) -> datafusion_common::Result<Option<Expr>> {
-    use datafusion::logical_expr::{col, lit};
-    use datafusion::scalar::ScalarValue;
-    let mut seen = std::collections::HashSet::new();
-    let mut tuples: Vec<Vec<ScalarValue>> = Vec::new();
-    for batch in incoming {
-        for row in 0..batch.num_rows() {
-            let tuple = (0..keys.len())
-                .map(|column| ScalarValue::try_from_array(batch.column(column), row))
-                .collect::<datafusion_common::Result<Vec<_>>>()?;
-            if seen.insert(tuple.clone()) {
-                tuples.push(tuple);
-            }
-        }
-    }
-    if tuples.is_empty() {
-        return Ok(None);
-    }
-    let column = |name: &String| col(datafusion::common::Column::new_unqualified(name));
-    if let [key] = keys {
-        let list = tuples
-            .into_iter()
-            .map(|mut tuple| lit(tuple.swap_remove(0)))
-            .collect();
-        return Ok(Some(column(key).in_list(list, false)));
-    }
-    let disjuncts = tuples.into_iter().map(|tuple| {
-        keys.iter()
-            .zip(tuple)
-            .map(|(key, value)| column(key).eq(lit(value)))
-            .reduce(Expr::and)
-            .unwrap_or_else(|| lit(false))
-    });
-    Ok(datafusion::logical_expr::utils::disjunction(disjuncts))
 }
 
 /// [`with_publication_retention`] for synchronous work.

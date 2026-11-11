@@ -378,6 +378,39 @@ impl CayenneDeletionSink {
     /// # Returns
     ///
     /// Vector of file-local row indices that match the filter (new deletions only).
+    /// The access plan that excludes `file_path`'s deleted rows and the rows a
+    /// pending write supersedes in it (`skip_positions`), or `None` when neither
+    /// hides a row of it. ArcSwap load is wait-free; the snapshot is immutable.
+    fn excluded_positions_plan(
+        &self,
+        file_path: &str,
+    ) -> crate::provider::Result<Option<Arc<vortex_datafusion::VortexAccessPlan>>> {
+        let cache = self
+            .pk_deletion_strategy
+            .position_based_cache()
+            .ok_or_else(|| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "a position-based scan needs a position-based strategy".to_string(),
+            })?;
+        let current = cache.load();
+        let existing = current.get(file_path);
+        let superseded = self
+            .skip_positions
+            .as_ref()
+            .and_then(|positions| positions.get(file_path))
+            .filter(|positions| !positions.is_empty());
+        Ok(match (existing, superseded) {
+            (existing, None) => existing.map(|deletion_vector| deletion_vector.access_plan()),
+            (existing, Some(superseded)) => {
+                let mut excluded = existing
+                    .map(|deletion_vector| deletion_vector.to_bitmap())
+                    .unwrap_or_default();
+                excluded |= superseded;
+                Some(PositionDeletionVector::new(excluded).access_plan())
+            }
+        })
+    }
+
     async fn scan_file_for_new_deletions(
         &self,
         file_path: &str,
@@ -387,22 +420,9 @@ impl CayenneDeletionSink {
     ) -> crate::provider::Result<Vec<u64>> {
         let table_name = &self.table_metadata.table_name;
 
-        // Get existing deletions for this file to exclude from scan
-        let cached_deleted_row_ids = self
-            .pk_deletion_strategy
-            .position_based_cache()
-            .ok_or_else(|| Error::Internal {
-                table: table_name.clone(),
-                message: "scan_file_for_deletions called with incompatible PkDeletionStrategy"
-                    .to_string(),
-            })?;
-        // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
-        let already_deleted = {
-            let current = cached_deleted_row_ids.load();
-            current
-                .get(file_path)
-                .map(|deletion_vector| deletion_vector.access_plan())
-        };
+        // Existing deletions (and positions a pending write supersedes) are
+        // excluded from the scan.
+        let already_deleted = self.excluded_positions_plan(file_path)?;
 
         // Open the Vortex file directly using the session
         let vxf = vortex_session
@@ -572,21 +592,7 @@ impl CayenneDeletionSink {
 
         let table_name = &self.table_metadata.table_name;
 
-        let already_deleted = {
-            let cache = self
-                .pk_deletion_strategy
-                .position_based_cache()
-                .ok_or_else(|| Error::Internal {
-                    table: table_name.clone(),
-                    message:
-                        "scan_file_for_filter_matches called with incompatible PkDeletionStrategy"
-                            .to_string(),
-                })?;
-            cache
-                .load()
-                .get(file_path)
-                .map(|deletion_vector| deletion_vector.access_plan())
-        };
+        let already_deleted = self.excluded_positions_plan(file_path)?;
 
         let vxf = vortex_session
             .open_options()

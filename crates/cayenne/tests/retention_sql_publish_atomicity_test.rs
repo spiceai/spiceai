@@ -1381,9 +1381,15 @@ async fn resident_retention_skips_hidden_versions_before_its_predicate_impl(
         )
         .expect("batch")
     };
-    for (name, key) in [
-        ("rsql_skip_int64", vec!["id"]),
-        ("rsql_skip_composite", vec!["id", "tag"]),
+    for (name, key, mode) in [
+        ("rsql_skip_int64", vec!["id"], None),
+        ("rsql_skip_composite", vec!["id", "tag"], None),
+        // Asking for position deletes on an upsert table still deletes by key.
+        (
+            "rsql_skip_position_requested",
+            vec!["id"],
+            Some(DeletionMode::Position),
+        ),
     ] {
         let broken = Arc::new(AtomicBool::new(false));
         let b = Arc::clone(&broken);
@@ -1415,7 +1421,10 @@ async fn resident_retention_skips_hidden_versions_before_its_predicate_impl(
             on_conflict: Some(OnConflict::Upsert(ColumnReference::new(key))),
             base_path: dir.to_string_lossy().to_string(),
             partition_column: None,
-            vortex_config: file_tier_config(),
+            vortex_config: VortexConfig {
+                deletion_mode: mode.unwrap_or(file_tier_config().deletion_mode),
+                ..file_tier_config()
+            },
         };
         let t = Arc::new(
             CayenneTableProvider::create_table_with_retention(
@@ -1425,6 +1434,10 @@ async fn resident_retention_skips_hidden_versions_before_its_predicate_impl(
                 SessionContext::new().runtime_env(),
             )
             .await?,
+        );
+        assert!(
+            !t.is_position_based(),
+            "{name}: an upsert table deletes by key"
         );
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::clone(&t) as Arc<dyn TableProvider>)?;
@@ -1917,5 +1930,264 @@ async fn null_primary_key_is_refused_on_a_retention_table_impl(
     eprintln!("null primary key write: {result:?}");
     assert!(result.is_err(), "a NULL primary key is refused");
     assert_eq!(ids(&t).await?, vec![1], "the table keeps its rows");
+    Ok(())
+}
+
+/// After a publication's retention delete removes resident rows, a maintained
+/// aggregate is not served stale: the query answers over the new generation.
+/// File tier (keyed, unkeyed) and `mode: memory` (keyed).
+#[test]
+fn maintained_aggregate_is_not_served_stale_after_resident_retention_sqlite() -> Result<(), String>
+{
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        maintained_aggregate_is_not_served_stale_after_resident_retention_impl,
+    )
+}
+
+async fn maintained_aggregate_is_not_served_stale_after_resident_retention_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use cayenne::maintained_aggregate::{
+        MaintainedAggregateExpr, MaintainedAggregateFunction, MaintainedAggregateSpec,
+    };
+    use cayenne::optimizer_rules::CayenneMaintainedAggregateRewriter;
+    use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    for (name, keyed, memory) in [
+        ("rsql_ivm_keyed", true, false),
+        ("rsql_ivm_unkeyed", false, false),
+        ("rsql_ivm_memory", true, true),
+    ] {
+        let aged = Arc::new(AtomicBool::new(false));
+        let a = Arc::clone(&aged);
+        let udf = create_udf(
+            "aged",
+            vec![DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args: &[ColumnarValue]| {
+                let array = args[0].clone().into_array(1)?;
+                let values = array.as_any().downcast_ref::<StringArray>().expect("utf8");
+                let on = a.load(Ordering::SeqCst);
+                Ok(ColumnarValue::Array(Arc::new(
+                    values
+                        .iter()
+                        .map(|v| Some(on && v == Some("old")))
+                        .collect::<arrow::array::BooleanArray>(),
+                )))
+            }),
+        );
+        let dir = fixture.data_path.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let options = CreateTableOptions {
+            table_name: name.to_string(),
+            schema: schema(),
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                vec![]
+            },
+            on_conflict: keyed
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: if memory {
+                common::lookup_index::memory_mode_config()
+            } else {
+                file_tier_config()
+            },
+        };
+        let spec = MaintainedAggregateSpec {
+            group_by: vec!["status".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("id".to_string()),
+            }],
+            filter: None,
+        };
+        let t = Arc::new(
+            CayenneTableProviderBuilder::new(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                SessionContext::new().runtime_env(),
+            )
+            .with_maintained_aggregates(vec![spec])
+            .with_retention_filters(vec![udf.call(vec![col("status")])])
+            .create(options)
+            .await?,
+        );
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(CayenneMaintainedAggregateRewriter::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("t", Arc::clone(&t) as Arc<dyn TableProvider>)?;
+        let sums = || async {
+            let batches = ctx
+                .sql("SELECT status, SUM(id) FROM t GROUP BY status ORDER BY status")
+                .await?
+                .collect()
+                .await?;
+            let mut out = Vec::new();
+            for b in &batches {
+                for i in 0..b.num_rows() {
+                    out.push(format!(
+                        "{}={}",
+                        arrow::util::display::array_value_to_string(b.column(0), i)?,
+                        arrow::util::display::array_value_to_string(b.column(1), i)?
+                    ));
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error>>(out)
+        };
+        common::insert_batch(t.as_ref(), rows(&[(1, Some("old")), (2, Some("new"))])).await?;
+        assert_eq!(sums().await?, vec!["new=2", "old=1"], "{name}: before");
+        aged.store(true, Ordering::SeqCst);
+        common::insert_batch(t.as_ref(), rows(&[(3, Some("new"))])).await?;
+        assert_eq!(
+            sums().await?,
+            vec!["new=5"],
+            "{name}: the aggregate reflects the resident row retention removed"
+        );
+    }
+    Ok(())
+}
+
+/// Ownership of the previous generation across a carried-generation flip: a
+/// plan built before the flip pins the previous snapshot's files, cleanup
+/// defers them while it lives, the plan reads the previous generation, and
+/// once it is dropped cleanup removes them.
+#[test]
+#[ignore = "RED, open: the previous generation's file survives reader drop + next commit + sweep (green35-old_reader_pins.out)"]
+fn old_reader_pins_its_generation_until_dropped_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        old_reader_pins_its_generation_until_dropped_impl,
+    )
+}
+
+fn vortex_files(dir: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "vortex") {
+                out.insert(path);
+            }
+        }
+    }
+    out
+}
+
+async fn old_reader_pins_its_generation_until_dropped_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    let gone = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&gone);
+    let udf = create_udf(
+        "gone",
+        vec![DataType::Int64],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(move |args: &[ColumnarValue]| {
+            let array = args[0].clone().into_array(1)?;
+            let ids = array.as_any().downcast_ref::<Int64Array>().expect("int64");
+            let on = flag.load(Ordering::SeqCst);
+            Ok(ColumnarValue::Array(Arc::new(
+                ids.iter()
+                    .map(|id| Some(on && id == Some(1)))
+                    .collect::<arrow::array::BooleanArray>(),
+            )))
+        }),
+    );
+    let name = "rsql_old_reader_pin";
+    let t = table(&fixture, name, false, udf.call(vec![col("id")])).await?;
+    common::insert_batch(
+        t.as_ref(),
+        rows(&[(1, Some("active")), (2, Some("active"))]),
+    )
+    .await?;
+    t.flush_pending_maintenance().await?;
+    let dir = fixture.data_path.join(name);
+    let old_files = vortex_files(&dir);
+    assert!(
+        !old_files.is_empty(),
+        "precondition: the first generation has files"
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(&t) as Arc<dyn TableProvider>)?;
+    let old_plan = ctx
+        .sql("SELECT id FROM t ORDER BY id")
+        .await?
+        .create_physical_plan()
+        .await?;
+
+    gone.store(true, Ordering::SeqCst);
+    common::insert_batch(t.as_ref(), rows(&[(3, Some("active"))])).await?;
+    let cleanup = || async {
+        for _ in 0..3 {
+            t.elapse_snapshot_cleanup_grace();
+            t.sweep_retired_snapshot_dirs_now().await;
+            t.flush_pending_maintenance().await?;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    cleanup().await?;
+    let now_files = vortex_files(&dir);
+    let kept_while_pinned = old_files.iter().all(|f| now_files.contains(f));
+    eprintln!(
+        "old files {} kept while the plan lives: {kept_while_pinned}",
+        old_files.len()
+    );
+    assert!(
+        kept_while_pinned,
+        "cleanup defers the previous generation while a reader holds it"
+    );
+
+    let old = datafusion::physical_plan::collect(old_plan, ctx.task_ctx()).await?;
+    let mut old_ids: Vec<i64> = old
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    old_ids.sort_unstable();
+    assert_eq!(old_ids, vec![1, 2], "the reader reads its own generation");
+    assert_eq!(
+        ids(&t).await?,
+        vec![2, 3],
+        "a new reader reads the new generation"
+    );
+
+    drop(old);
+    // The next commit's sweep reclaims what the reader deferred.
+    common::insert_batch(t.as_ref(), rows(&[(4, Some("active"))])).await?;
+    cleanup().await?;
+    let after = vortex_files(&dir);
+    let remaining: Vec<_> = old_files.iter().filter(|f| after.contains(*f)).collect();
+    eprintln!("old files remaining after the reader is dropped: {remaining:?}");
+    assert!(
+        remaining.is_empty(),
+        "the previous generation is removed once unpinned"
+    );
+    assert_eq!(
+        ids(&t).await?,
+        vec![2, 3, 4],
+        "cleanup does not touch the new generation"
+    );
     Ok(())
 }

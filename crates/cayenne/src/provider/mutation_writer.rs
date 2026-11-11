@@ -1608,7 +1608,11 @@ impl<'a> AppendMutationWriter<'a> {
         let resident_retention = match (&publication_filters, self.into_empty_table) {
             (Some(filters), false) => match self
                 .table
-                .prepare_resident_retention(&snapshot_id, filters)
+                .prepare_resident_retention(
+                    &snapshot_id,
+                    filters,
+                    &on_conflict_deletions.delete_specs,
+                )
                 .await
             {
                 Ok(prepared) => prepared,

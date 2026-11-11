@@ -560,6 +560,10 @@ pub struct CayenneDeletionSink {
     /// filter-shaped key fast path is not taken. `None` keeps the ordinary
     /// `DELETE` order (filters, then liveness).
     skip_before_filters: Option<Arc<SkipKeys>>,
+    /// Per data file, positions a pending write supersedes. A position-based
+    /// scan excludes them with the file's deletion vector, before any conjunct
+    /// is evaluated. Bounded by the write.
+    skip_positions: Option<Arc<HashMap<String, roaring::RoaringBitmap>>>,
 }
 
 /// The primary keys a resident `retention_sql` delete skips before evaluating
@@ -635,7 +639,18 @@ impl CayenneDeletionSink {
             capture_locks: None,
             file_deletion_fence: None,
             skip_before_filters: None,
+            skip_positions: None,
         }
+    }
+
+    /// Exclude `positions` (per data file) from a position-based scan together
+    /// with each file's deletion vector, before the filters run.
+    pub(crate) fn with_skip_positions(
+        mut self,
+        positions: HashMap<String, roaring::RoaringBitmap>,
+    ) -> Self {
+        self.skip_positions = Some(Arc::new(positions));
+        self
     }
 
     /// Skip `keys` and every non-live row before the filters run (see
