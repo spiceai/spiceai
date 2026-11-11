@@ -52,9 +52,9 @@ steps:
   - query: SELECT id, a % b AS r FROM m WHERE b <> 0 ORDER BY id
     oracle-sql: SELECT id, MOD(a, b) AS r FROM m WHERE b <> 0 ORDER BY id
   - query: SELECT id, a / b AS q FROM m WHERE id = 4
-    expect-error: true
+    expect-error: Divide by zero
   - query: SELECT id, a % b AS r FROM m WHERE id = 4
-    expect-error: true
+    expect-error: Divide by zero
   # TPC-DS q34 and q73's shape: a guarded divisor, compared to a fraction.
   - query: SELECT id FROM m WHERE CASE WHEN b > 0 THEN a / b ELSE NULL END > 1.2 ORDER BY id
     oracle-sql: SELECT id FROM m WHERE CASE WHEN b > 0 THEN a DIV b ELSE NULL END > 1.2E0 ORDER BY id
@@ -66,7 +66,7 @@ steps:
     oracle-sql: SELECT id FROM big WHERE c DIV k > 1 ORDER BY id
   # i64::MIN / -1 overflows.
   - query: SELECT id, c / k AS q FROM overflow
-    expect-error: true
+    expect-error: 'Overflow happened on: -9223372036854775808 / -1'
   # A decimal quotient truncates at its scale; MySQL's `/` rounds the last
   # digit. The text cast compares every digit, which the comparator's float
   # tolerance would not.
