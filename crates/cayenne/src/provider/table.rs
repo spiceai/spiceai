@@ -9839,7 +9839,7 @@ impl CayenneTableProvider {
         let mut written: BTreeMap<String, u64> =
             self.uncommitted_files.files(snapshot_id).into_iter().collect();
         self.uncommitted_files.forget(snapshot_id);
-        if !Self::is_staging_snapshot_id(snapshot_id) {
+        if uuid::Uuid::parse_str(snapshot_id).is_ok() {
             for row in self
                 .catalog
                 .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
@@ -11398,6 +11398,10 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Copies (or hard-links) every file of `source_snapshot_id` into
+    /// `target_snapshot_id`'s folder. A flat table (its data in the object-native
+    /// location) is refused: its snapshots have no folder of their own, and it
+    /// carries a file by naming it, never by a copy.
     pub(crate) async fn clone_snapshot_files(
         &self,
         source_snapshot_id: &str,
@@ -11456,6 +11460,15 @@ impl CayenneTableProvider {
                 }
             }
         }
+        ensure!(
+            !self.data_in_object_native_location(),
+            InternalSnafu {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "refusing to copy the files of snapshot '{source_snapshot_id}' into '{target_snapshot_id}': the table carries a file by naming it"
+                ),
+            }
+        );
         let mut cleanup = CloneCleanupGuard {
             table: self.clone_for_write(),
             snapshot_id: target_snapshot_id.to_string(),
@@ -11477,32 +11490,6 @@ impl CayenneTableProvider {
                 })?;
             let store = Arc::clone(&config.store);
             let table_name = self.table_name().to_string();
-            // A table in the object-native location clones the files its state
-            // names, never what a listing of the source finds.
-            if self.data_in_object_native_location() {
-                let files = self.snapshot_files_from_state(source_snapshot_id).await?;
-                stream::iter(files.into_iter().map(Ok::<_, Error>))
-                    .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |(name, size)| {
-                        let store = Arc::clone(&store);
-                        let table_name = table_name.clone();
-                        let source = crate::object_child(&source_prefix, &name);
-                        let target = crate::object_child(&target_prefix, &name);
-                        async move {
-                            store.copy(&source, &target).await.map_err(|source| {
-                                Error::ObjectStore {
-                                    operation: "clone snapshot object",
-                                    table: table_name,
-                                    source,
-                                }
-                            })?;
-                            self.uncommitted_files.note(target_snapshot_id, &name, size);
-                            Ok(())
-                        }
-                    })
-                    .await?;
-                cleanup.armed = false;
-                return Ok(());
-            }
             config
                 .store
                 .list(Some(&source_prefix))
@@ -24268,32 +24255,79 @@ impl CayenneTableProvider {
                 .await;
         };
 
-        // 1. Stage candidate files alone (hardlink/copy) for a tight scan.
-        if let Err(e) = self
-            .link_or_copy_snapshot_files(source_snapshot_id, &staging_snapshot_id, &picked_list)
-            .await
-        {
-            cleanup_all.await;
-            return Err(e);
-        }
+        // A flat table (its data in the object-native location) reads its picked
+        // files where they are and names the files it does not rewrite under
+        // their keys, both from the source snapshot's committed rows: no scratch
+        // snapshot and no copy. Every other table links or copies them.
+        let flat = self.data_in_object_native_location();
+        let mut carried: Vec<SnapshotFile> = Vec::new();
+        let picked_files = if flat {
+            match self
+                .committed_rows_named(source_snapshot_id, &picked_list, &unpicked)
+                .await
+            {
+                Ok((picked_files, unpicked_rows)) => {
+                    carried = unpicked_rows;
+                    Some(picked_files)
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            // 1. Stage candidate files alone (hardlink/copy) for a tight scan.
+            if let Err(e) = self
+                .link_or_copy_snapshot_files(
+                    source_snapshot_id,
+                    &staging_snapshot_id,
+                    &picked_list,
+                )
+                .await
+            {
+                cleanup_all.await;
+                return Err(e);
+            }
 
-        // 2. Hard-link unpicked settled files into the destination snapshot.
-        if let Err(e) = self
-            .link_or_copy_snapshot_files(source_snapshot_id, &new_snapshot_id, &unpicked)
-            .await
-        {
-            cleanup_all.await;
-            return Err(e);
-        }
+            // 2. Hard-link unpicked settled files into the destination snapshot.
+            if let Err(e) = self
+                .link_or_copy_snapshot_files(source_snapshot_id, &new_snapshot_id, &unpicked)
+                .await
+            {
+                cleanup_all.await;
+                return Err(e);
+            }
+            None
+        };
 
-        // 3. Scan the staging snapshot (candidates only) with deletion filter
-        //    and re-encode into the destination alongside the hardlinked files.
+        // 3. Scan the candidates alone with deletion filter and re-encode into
+        //    the destination alongside the carried files.
         let ctx = self.create_compaction_session_context();
         let state = ctx.state();
-        let plan = match self
-            .create_snapshot_scan_plan(&state, &staging_snapshot_id, None, &[], None)
-            .await
-        {
+        let planned = match picked_files {
+            Some(picked_files) => {
+                self.create_snapshot_scan_plan_with_config(
+                    &state,
+                    source_snapshot_id,
+                    None,
+                    &[],
+                    None,
+                    state.config(),
+                    false,
+                    None,
+                    self.table_schema(),
+                    false,
+                    Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
+                    Some(&picked_files),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+            None => {
+                self.create_snapshot_scan_plan(&state, &staging_snapshot_id, None, &[], None)
+                    .await
+            }
+        };
+        let plan = match planned {
             Ok(p) => p,
             Err(source) => {
                 cleanup_all.await;
@@ -24356,8 +24390,10 @@ impl CayenneTableProvider {
             .await;
 
         // Staging dir is no longer needed after the encode.
-        self.cleanup_failed_compaction_snapshot(&staging_snapshot_id, is_s3)
-            .await;
+        if !flat {
+            self.cleanup_failed_compaction_snapshot(&staging_snapshot_id, is_s3)
+                .await;
+        }
 
         let (_total_rows, _ops, _stats) = match write_result {
             Ok(r) => r,
@@ -24391,7 +24427,8 @@ impl CayenneTableProvider {
                 .hold_writers_and_carry_appends(files, source_snapshot_id, &new_snapshot_id, is_s3)
                 .await
             {
-                Ok(Some((guards, carried_files, generation))) => {
+                Ok(Some((guards, carried_files, carried_rows, generation))) => {
+                    carried.extend(carried_rows);
                     (Some(guards), carried_files, generation)
                 }
                 Ok(None) => {
@@ -24442,12 +24479,13 @@ impl CayenneTableProvider {
         // The number of files the new snapshot holds, when the manifest listed them.
         let mut new_snapshot_files = None;
         let manifest_authored = match self
-            .upsert_snapshot_manifest_from_files(
+            .upsert_snapshot_manifest_carrying(
                 &new_snapshot_id,
                 ManifestSequenceTag::Uniform {
                     min: merged_min,
                     max: merged_max,
                 },
+                carried,
             )
             .await
         {
@@ -24633,10 +24671,12 @@ impl CayenneTableProvider {
     ///   removes: the encode read the rows it held;
     /// - every file the source snapshot holds that `files` does not — an append, or an
     ///   inline flush, which publishes a file without moving `current_dir_generation` — is
-    ///   linked into the new snapshot, so the pass publishes the source snapshot's whole
-    ///   live set.
+    ///   carried into the new snapshot, so the pass publishes the source snapshot's whole
+    ///   live set. A flat table names each by its committed row, under its key, and copies
+    ///   nothing; every other table links or copies it into the new snapshot's folder.
     ///
-    /// Returns the held guards, how many files it carried, and the generation the commit
+    /// Returns the held guards, how many files it carried, the committed rows a flat table
+    /// carries them by (none for a table that links them), and the generation the commit
     /// fences on; `None` when the pass must abort.
     async fn hold_writers_and_carry_appends(
         &self,
@@ -24644,7 +24684,7 @@ impl CayenneTableProvider {
         source_snapshot_id: &str,
         new_snapshot_id: &str,
         is_s3: bool,
-    ) -> Result<Option<(PositionRewriteGuards, usize, u64)>> {
+    ) -> Result<Option<(PositionRewriteGuards, usize, Vec<SnapshotFile>, u64)>> {
         let table = self.table_metadata.table_name.as_str();
         let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
         let write = loop {
@@ -24707,7 +24747,39 @@ impl CayenneTableProvider {
             .filter(|path| !listed.contains(*path))
             .collect();
         if appended.is_empty() {
-            return Ok(Some((guards, 0, generation)));
+            return Ok(Some((guards, 0, Vec::new(), generation)));
+        }
+        if self.data_in_object_native_location() {
+            // Named by their committed rows, read with writers held; a file no
+            // commit names yet is not the table's, so the pass aborts.
+            let rows: HashMap<String, SnapshotFile> = self
+                .catalog
+                .get_snapshot_files(&self.table_metadata.table_id, source_snapshot_id)
+                .await
+                .map_err(|source| Error::Catalog { source })?
+                .into_iter()
+                .map(|row| (row.file_path.clone(), row))
+                .collect();
+            let mut carried = Vec::with_capacity(appended.len());
+            for name in &appended {
+                let Some(row) = rows.get(*name) else {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table,
+                        file = *name,
+                        "Aborting subset small-file rewrite: a file appended during the encode is not committed"
+                    );
+                    return Ok(None);
+                };
+                carried.push(row.clone());
+            }
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table,
+                carried_files = carried.len(),
+                "Carrying files appended during the subset rewrite into its snapshot by name"
+            );
+            return Ok(Some((guards, carried.len(), carried, generation)));
         }
         self.link_or_copy_snapshot_files(source_snapshot_id, new_snapshot_id, &appended)
             .await?;
@@ -24724,11 +24796,61 @@ impl CayenneTableProvider {
             carried_files = appended.len(),
             "Carrying files appended during the subset rewrite into its snapshot"
         );
-        Ok(Some((guards, appended.len(), generation)))
+        Ok(Some((guards, appended.len(), Vec::new(), generation)))
+    }
+
+    /// For a flat table's subset compaction: the source snapshot's committed
+    /// rows for `picked`, as the file set a scan of them reads where they are,
+    /// and for `unpicked`, which the new snapshot names under their keys. A name
+    /// no commit names is refused: a compaction reads and keeps only the
+    /// table's committed files.
+    async fn committed_rows_named(
+        &self,
+        source_snapshot_id: &str,
+        picked: &[&str],
+        unpicked: &[&str],
+    ) -> Result<(CapturedSnapshotFiles, Vec<SnapshotFile>)> {
+        let table_id = self.table_metadata.table_id.as_str();
+        let rows: HashMap<String, SnapshotFile> = self
+            .catalog
+            .get_snapshot_files(table_id, source_snapshot_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?
+            .into_iter()
+            .map(|row| (row.file_path.clone(), row))
+            .collect();
+        let named = |names: &[&str]| -> Result<Vec<SnapshotFile>> {
+            names
+                .iter()
+                .map(|name| {
+                    rows.get(*name).cloned().ok_or_else(|| Error::Internal {
+                        table: self.table_name().to_string(),
+                        message: format!(
+                            "refusing to compact data file '{name}' of snapshot '{source_snapshot_id}': no commit names it"
+                        ),
+                    })
+                })
+                .collect()
+        };
+        let picked_rows = named(picked)?;
+        let unpicked_rows = named(unpicked)?;
+        let url = Self::snapshot_listing_url(self.data_root(), table_id, source_snapshot_id)
+            .map_err(|source| Error::DataFusion { source })?;
+        let files = Self::manifest_files_as_partitioned_files(url.prefix(), picked_rows);
+        Ok((
+            CapturedSnapshotFiles::new(
+                self.current_dir_generation.load(Ordering::Acquire),
+                self.listing_cache_epoch.load(Ordering::Acquire),
+                Arc::new(files),
+            ),
+            unpicked_rows,
+        ))
     }
 
     /// Hard-link (local) or copy (S3 / cross-device) named basenames from
     /// `source_snapshot_id` into `target_snapshot_id`. Creates the target dir.
+    /// A flat table (its data in the object-native location) is refused: it
+    /// carries a file by naming it, never by a copy.
     ///
     /// `#[doc(hidden)] pub` so integration tests can exercise the hardlink /
     /// copy fallback without going through a full subset rewrite.
@@ -24742,26 +24864,15 @@ impl CayenneTableProvider {
         if basenames.is_empty() {
             return Ok(());
         }
-        // A table in the object-native location carries only files its state
-        // names, and records each copy as the target snapshot's own file.
-        let carried_sizes: Option<HashMap<String, u64>> = if self.data_in_object_native_location() {
-            let sizes: HashMap<String, u64> = self
-                .snapshot_files_from_state(source_snapshot_id)
-                .await?
-                .into_iter()
-                .collect();
-            if let Some(unknown) = basenames.iter().find(|name| !sizes.contains_key(**name)) {
-                return Err(Error::Internal {
-                    table: self.table_name().to_string(),
-                    message: format!(
-                        "refusing to carry data file '{unknown}' from snapshot '{source_snapshot_id}': no commit names it"
-                    ),
-                });
+        ensure!(
+            !self.data_in_object_native_location(),
+            InternalSnafu {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "refusing to copy data files from snapshot '{source_snapshot_id}': the table carries a file by naming it"
+                ),
             }
-            Some(sizes)
-        } else {
-            None
-        };
+        );
         if self.data_in_store() {
             let config = self.require_object_store()?;
             let source_prefix = self
@@ -24789,13 +24900,6 @@ impl CayenneTableProvider {
                         table: table_name.clone(),
                         source,
                     })?;
-                if let Some(size) = carried_sizes
-                    .as_ref()
-                    .and_then(|sizes| sizes.get(*basename))
-                {
-                    self.uncommitted_files
-                        .note(target_snapshot_id, basename, *size);
-                }
             }
             return Ok(());
         }
@@ -27797,7 +27901,22 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         tag: ManifestSequenceTag,
     ) -> CatalogResult<Vec<(String, u64)>> {
-        let files = self
+        self.upsert_snapshot_manifest_carrying(snapshot_id, tag, Vec::new())
+            .await
+    }
+
+    /// [`Self::upsert_snapshot_manifest_from_files`] for a snapshot that also
+    /// names `carried`: committed manifest rows of another snapshot of this flat
+    /// table, files a compaction keeps where they are. Each is named under its
+    /// existing key with its row count and digest, tagged like the snapshot's
+    /// other files; none is copied, and none enters the writer's record.
+    async fn upsert_snapshot_manifest_carrying(
+        &self,
+        snapshot_id: &str,
+        tag: ManifestSequenceTag,
+        carried: Vec<SnapshotFile>,
+    ) -> CatalogResult<Vec<(String, u64)>> {
+        let mut files = self
             .list_snapshot_files_with_sizes(snapshot_id)
             .await
             .map_err(|e| CatalogError::InvalidOperation {
@@ -27859,6 +27978,29 @@ impl CayenneTableProvider {
                 )
                 .await,
             );
+        }
+
+        for row in carried {
+            if files.iter().any(|(name, _)| *name == row.file_path) {
+                continue;
+            }
+            let (min_sequence, max_sequence) = match tag {
+                ManifestSequenceTag::Uniform { min, max } => (min, max),
+                ManifestSequenceTag::PreserveOrUniform { .. } => {
+                    (row.min_sequence, row.max_sequence)
+                }
+            };
+            files.push((
+                row.file_path.clone(),
+                u64::try_from(row.file_size_bytes).unwrap_or(0),
+            ));
+            replacement.push(SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.to_string(),
+                min_sequence,
+                max_sequence,
+                ..row
+            });
         }
 
         self.catalog

@@ -64,6 +64,8 @@ struct CountingStore {
     /// Requests of any kind under this prefix are counted in `forbidden_hits`.
     forbidden: parking_lot::RwLock<String>,
     forbidden_hits: AtomicUsize,
+    /// COPY and RENAME requests, of any key.
+    copies: AtomicUsize,
 }
 
 impl CountingStore {
@@ -75,6 +77,7 @@ impl CountingStore {
             listed: parking_lot::Mutex::new(Vec::new()),
             forbidden: parking_lot::RwLock::new(String::new()),
             forbidden_hits: AtomicUsize::new(0),
+            copies: AtomicUsize::new(0),
         }
     }
 
@@ -217,6 +220,7 @@ impl ObjectStore for CountingStore {
     ) -> object_store::Result<()> {
         self.note(Some(from));
         self.note(Some(to));
+        self.copies.fetch_add(1, Ordering::SeqCst);
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -226,6 +230,7 @@ impl ObjectStore for CountingStore {
         to: &Path,
         options: RenameOptions,
     ) -> object_store::Result<()> {
+        self.copies.fetch_add(1, Ordering::SeqCst);
         self.inner.rename_opts(from, to, options).await
     }
 }
@@ -3702,5 +3707,360 @@ async fn a_placed_table_writes_flat_keys() {
             (1900, expected_sum(1, 2000) - expected_sum(100, 199)),
         ),
         "no object outside the table's flat keys; data {data:?} vs manifest {named:?}, deletion vectors {deletions:?} vs committed {named_deletions:?}"
+    );
+}
+
+/// A placed table's subset compaction copies nothing: it reads its picked files
+/// where they are and names the files it does not rewrite under their keys, so
+/// the store sees no COPY (or RENAME) request. The rows are exact, and a reader
+/// that started before the compaction reads all of its rows after the
+/// compaction retired the picked files and the retention passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subset_compaction_copies_nothing() {
+    let (setup, catalog, table, ctx) = create_with_config(
+        "events",
+        // Every write is a small file, and four of them qualify the small tier.
+        VortexConfig {
+            compaction_trigger_files: 4,
+            target_vortex_file_size_mb: 1,
+            compaction_max_levels: 1,
+            compaction_max_files_per_pick: 4,
+            compaction_background_interval_ms: 0,
+            ..vortex_config()
+        },
+    )
+    .await;
+    let table_id = table.metadata().table_id.clone();
+    // No pass runs during the appends: the one below is the one measured.
+    let held = table.hold_compaction().await;
+    for first in (1..=6000).step_by(500) {
+        run(
+            &ctx,
+            &format!(
+                "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series({first}, {})",
+                first + 499
+            ),
+        )
+        .await;
+    }
+    let before = catalog
+        .get_table("events")
+        .await
+        .expect("stored table")
+        .current_snapshot_id;
+    let source_files: std::collections::BTreeSet<String> = catalog
+        .get_snapshot_files(&table_id, &before)
+        .await
+        .expect("source manifest")
+        .into_iter()
+        .map(|file| file.file_path)
+        .collect();
+
+    // A reader that starts before the compaction, one file per partition.
+    let reader_ctx = SessionContext::new_with_config(
+        datafusion::prelude::SessionConfig::new()
+            .with_target_partitions(1)
+            .with_batch_size(256),
+    );
+    reader_ctx
+        .register_table("events", Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    let mut reader = reader_ctx
+        .sql("SELECT v FROM events")
+        .await
+        .expect("plan")
+        .execute_stream()
+        .await
+        .expect("start the reader");
+
+    drop(held);
+    setup.counting.copies.store(0, Ordering::SeqCst);
+    let compacted = table.maybe_compact_small_files().await.expect("compact");
+    let copies = setup.counting.copies.load(Ordering::SeqCst);
+    let path = table.last_small_file_compact_path();
+    let after = catalog
+        .get_table("events")
+        .await
+        .expect("stored table")
+        .current_snapshot_id;
+    let named: std::collections::BTreeSet<String> = catalog
+        .get_snapshot_files(&table_id, &after)
+        .await
+        .expect("new manifest")
+        .into_iter()
+        .map(|file| file.file_path)
+        .collect();
+    let retired: std::collections::BTreeSet<String> = catalog
+        .retired_files(&table_id)
+        .await
+        .expect("read the retirement record")
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    // The retention passes; the reader still holds the files it may read.
+    table.reclaim_retired_snapshots_now().await;
+    let mut reader_rows = 0_i64;
+    let mut reader_sum = 0_i64;
+    while let Some(batch) = futures::StreamExt::next(&mut reader).await {
+        let batch = batch.expect("the earlier reader reads on");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("v");
+        reader_rows += i64::try_from(values.len()).expect("small");
+        reader_sum += values.iter().flatten().sum::<i64>();
+    }
+    drop(reader);
+
+    assert_eq!(
+        (
+            compacted,
+            path,
+            copies,
+            before != after,
+            // The picked files are retired, and the rest are carried under their keys.
+            !retired.is_empty(),
+            source_files.difference(&retired).count() > 0,
+            source_files.difference(&retired).all(|key| named.contains(key)),
+            retired.iter().all(|key| !key.contains('/') && source_files.contains(key)),
+            (reader_rows, reader_sum),
+            count_and_sum(&ctx, "events").await,
+        ),
+        (
+            true,
+            cayenne::LastSmallFileCompactPath::Subset,
+            0,
+            true,
+            true,
+            true,
+            true,
+            true,
+            (6000, expected_sum(1, 6000)),
+            (6000, expected_sum(1, 6000)),
+        ),
+        "compacted by the subset path, copies, a new snapshot, the picked files retired ({retired:?}) and the others named ({named:?}), the earlier reader's rows, rows"
+    );
+}
+
+/// A write or a maintenance pass of a placed table that the fault test fails
+/// at one of its storage requests.
+#[derive(Clone, Copy, Debug)]
+enum FailedOperation {
+    Append,
+    Overwrite,
+    Compaction,
+    KeyedBurst,
+}
+
+/// The compaction lock a fixture holds until its operation runs.
+type HeldCompaction = Option<tokio::sync::OwnedRwLockWriteGuard<()>>;
+
+/// A fresh placed table set up for `operation`: two appends (twelve before a
+/// compaction, with no pass during them; the hold is returned and released
+/// when the operation runs), or a keyed change-stream table holding one burst.
+async fn failed_operation_fixture(
+    operation: FailedOperation,
+) -> (
+    Setup,
+    Arc<dyn MetadataCatalog>,
+    Arc<CayenneTableProvider>,
+    SessionContext,
+    HeldCompaction,
+) {
+    if let FailedOperation::KeyedBurst = operation {
+        let (setup, catalog, table, ctx) = create_keyed_with_config(
+            "changes",
+            &["id"],
+            Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            cdc_config(CdcDurability::File),
+        )
+        .await;
+        table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        cdc_upsert(&table, &(1..=500).map(|id| (id, id * 10)).collect::<Vec<_>>()).await;
+        table.drain_in_flight_maintenance().await.expect("drain");
+        return (setup, catalog, table, ctx, None);
+    }
+    let (setup, catalog, table, ctx) = create_with_config(
+        "events",
+        VortexConfig {
+            compaction_trigger_files: 4,
+            target_vortex_file_size_mb: 1,
+            compaction_max_levels: 1,
+            compaction_max_files_per_pick: 4,
+            compaction_background_interval_ms: 0,
+            ..vortex_config()
+        },
+    )
+    .await;
+    let appends = if matches!(operation, FailedOperation::Compaction) {
+        12
+    } else {
+        2
+    };
+    let held = table.hold_compaction().await;
+    for append in 0..appends {
+        let first = append * 500 + 1;
+        run(
+            &ctx,
+            &format!(
+                "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series({first}, {})",
+                first + 499
+            ),
+        )
+        .await;
+    }
+    (setup, catalog, table, ctx, Some(held))
+}
+
+/// Run `operation` once; its outcome is not checked, only the requests it sent.
+async fn run_failed_operation(
+    operation: FailedOperation,
+    table: &Arc<CayenneTableProvider>,
+    ctx: &SessionContext,
+) {
+    let sql = match operation {
+        FailedOperation::Append => {
+            "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series(100001, 100500)"
+        }
+        FailedOperation::Overwrite => {
+            "INSERT OVERWRITE events SELECT value AS id, value * 10 AS v FROM generate_series(1, 800)"
+        }
+        FailedOperation::Compaction => {
+            let _ = table.maybe_compact_small_files().await;
+            let _ = table.drain_in_flight_maintenance().await;
+            return;
+        }
+        FailedOperation::KeyedBurst => {
+            let rows: Vec<(i64, i64)> = (250..=750).map(|id| (id, id * 100)).collect();
+            let batch = rows_batch(&rows);
+            let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    batch.schema(),
+                    futures::stream::iter([Ok(batch)]),
+                ),
+            );
+            let task = SessionContext::new().task_ctx();
+            if let Ok(write) = table.write_cdc_append_stream(stream, &task).await {
+                let _ = write.finish().await;
+            }
+            let _ = table.drain_in_flight_maintenance().await;
+            return;
+        }
+    };
+    if let Ok(frame) = ctx.sql(sql).await {
+        let _ = frame.collect().await;
+    }
+    let _ = table.drain_in_flight_maintenance().await;
+}
+
+/// The keys under `prefix` in the bottom store.
+async fn keys_under(setup: &Setup, prefix: &str) -> std::collections::BTreeSet<String> {
+    setup
+        .counting
+        .inner
+        .list(Some(&Path::from(prefix)))
+        .map_ok(|meta| meta.location.to_string())
+        .try_collect()
+        .await
+        .expect("list objects")
+}
+
+/// A placed table's append, overwrite, compaction and keyed change-stream burst,
+/// each failed at every one of its storage requests in turn, delete only by
+/// name: no LIST of the data path (the orphan sweep, which lists it, does not
+/// run in a table's first interval), so no prefix is ever deleted, and every
+/// key a failed operation deletes is one it uploaded itself or one the
+/// committed state retired, never a file that was there before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_request_of_a_placed_write_deletes_only_its_own_uploads() {
+    let mut runs = 0_usize;
+    let mut deletes = 0_usize;
+    let mut violations: Vec<String> = Vec::new();
+    for operation in [
+        FailedOperation::Append,
+        FailedOperation::Overwrite,
+        FailedOperation::Compaction,
+        FailedOperation::KeyedBurst,
+    ] {
+        // The clean run's requests, by kind.
+        let (setup, _catalog, table, ctx, held) =
+            Box::pin(failed_operation_fixture(operation)).await;
+        let seen = setup.faults.log().len();
+        drop(held);
+        Box::pin(run_failed_operation(operation, &table, &ctx)).await;
+        let mut kinds: Vec<(Op, usize)> = Vec::new();
+        for applied in &setup.faults.log()[seen..] {
+            match kinds.iter_mut().find(|(op, _)| *op == applied.op) {
+                Some((_, count)) => *count += 1,
+                None => kinds.push((applied.op, 1)),
+            }
+        }
+        eprintln!("{operation:?}: clean run's requests {kinds:?}");
+        drop((setup, table, ctx));
+
+        for (op, count) in kinds {
+            for nth in 0..count {
+                let (setup, catalog, table, ctx, held) =
+                    Box::pin(failed_operation_fixture(operation)).await;
+                let before = keys_under(&setup, &setup.data_prefix).await;
+                let seen = setup.faults.log().len();
+                drop(held);
+                let matched = Arc::new(AtomicUsize::new(0));
+                setup.faults.arm(
+                    op,
+                    move |_| matched.fetch_add(1, Ordering::SeqCst) == nth,
+                    Fault::Fail,
+                );
+                Box::pin(run_failed_operation(operation, &table, &ctx)).await;
+                runs += 1;
+                let table_id = table.metadata().table_id.clone();
+                let retired: std::collections::BTreeSet<String> = catalog
+                    .retired_files(&table_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flat_map(|key| {
+                        [
+                            format!("{}/{table_id}/{key}", setup.data_prefix),
+                            format!("{}/{key}", setup.data_prefix),
+                        ]
+                    })
+                    .collect();
+                for applied in &setup.faults.log()[seen..] {
+                    let path = applied.path.as_ref();
+                    let in_data = path.starts_with(&setup.data_prefix)
+                        || setup.data_prefix.starts_with(path);
+                    if !in_data {
+                        continue;
+                    }
+                    if applied.op == Op::Delete {
+                        deletes += 1;
+                    }
+                    match applied.op {
+                        Op::List => violations.push(format!(
+                            "{operation:?}, {op:?} #{nth} failed: LIST '{path}'"
+                        )),
+                        Op::Delete if before.contains(path) && !retired.contains(path) => {
+                            violations.push(format!(
+                                "{operation:?}, {op:?} #{nth} failed: deleted '{path}', which was there before and is not retired"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("{runs} failed runs sent {deletes} deletes to the data path");
+    assert_eq!(
+        (runs > 20, deletes > 0, violations),
+        (true, true, Vec::<String>::new()),
+        "{runs} failed runs: a LIST of the data path, or a delete of a key the run did not upload and the state did not retire"
     );
 }

@@ -496,3 +496,206 @@ async fn placed_writes_and_reopen(location: &Location) {
         );
     }
 }
+
+/// The options a placed table is created and reopened with.
+fn placed_options(
+    name: &str,
+    data_url: &str,
+    keyed: bool,
+    settings_change: cayenne::metadata::SettingsChangeAction,
+) -> CreateTableOptions {
+    CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: if keyed {
+            vec!["id".to_string()]
+        } else {
+            Vec::new()
+        },
+        on_conflict: keyed
+            .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        base_path: data_url.to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            inline_max_rows: 0,
+            inline_max_bytes: 0,
+            target_vortex_file_size_mb: 1,
+            compaction_trigger_files: 3,
+            compaction_max_levels: 3,
+            compaction_max_files_per_pick: 3,
+            compaction_background_interval_ms: 0,
+            deletion_mode: if keyed {
+                cayenne::metadata::DeletionMode::Key
+            } else {
+                cayenne::metadata::DeletionMode::default()
+            },
+            settings_change,
+            ..VortexConfig::default()
+        },
+    }
+}
+
+/// Placed datasets in a local directory, one appended to and compacted, one
+/// keyed and key-deleted, reopen through the catalog's reopen with
+/// `settings_change: rebuild`: their files are flat under each table's
+/// directory, so the startup check of stored data files (which compares a
+/// snapshot folder) does not apply and no rebuild is asked for, and the rows
+/// are exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compacted_and_key_deleted_local_dataset_reopens_without_a_rebuild() {
+    use cayenne::metadata::SettingsChangeAction;
+    let directory = tempfile::tempdir().expect("temp dir");
+    let location = Location::Local(directory.path().join("state"));
+    let store = location.store();
+    let native = location.open_catalog(&store).await;
+    let datasets_prefix = native.datasets_prefix().to_string();
+    let catalog: Arc<dyn MetadataCatalog> = Arc::new(native);
+    let ctx = SessionContext::new();
+    let (_, root) = location.prefix_and_root();
+    let mut placed = Vec::new();
+    for (name, keyed) in [("events", false), ("orders", true)] {
+        let data_url = format!("{root}/{datasets_prefix}/{}/data", new_dataset_folder(name));
+        let table = Arc::new(
+            crate::common::table_builder_on_store(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                object_store_config(&store, &data_url),
+            )
+            .create(placed_options(
+                name,
+                &data_url,
+                keyed,
+                SettingsChangeAction::Rebuild,
+            ))
+            .await
+            .expect("create the table"),
+        );
+        ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+            .expect("register");
+        placed.push((name, keyed, data_url, table));
+    }
+    let current = |name: &'static str| {
+        let catalog = Arc::clone(&catalog);
+        async move {
+            catalog
+                .get_table(name)
+                .await
+                .expect("stored table")
+                .current_snapshot_id
+        }
+    };
+
+    // Appends commit into the current snapshot; a compaction (after a write,
+    // or the pass below) rewrites it under a new id.
+    let events = Arc::clone(&placed[0].3);
+    let orders = Arc::clone(&placed[1].3);
+    let before_compaction = current("events").await;
+    let mut events_rows = BTreeMap::new();
+    for append in 0..5_i64 {
+        let (first, last) = (append * 1000 + 1, append * 1000 + 1000);
+        events_rows.extend((first..=last).map(|id| (id, id * 10)));
+        run(
+            &ctx,
+            &format!("INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series({first}, {last})"),
+        )
+        .await;
+        events.drain_in_flight_maintenance().await.expect("drain");
+    }
+    for _ in 0..40 {
+        if current("events").await != before_compaction
+            || events
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("compact")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    events.drain_in_flight_maintenance().await.expect("drain");
+    let compacted = current("events").await != before_compaction;
+
+    // A keyed dataset: appends, then a key delete.
+    let mut orders_rows = BTreeMap::new();
+    for append in 0..2_i64 {
+        let (first, last) = (append * 1000 + 1, append * 1000 + 1000);
+        orders_rows.extend((first..=last).map(|id| (id, id * 10)));
+        run(
+            &ctx,
+            &format!("INSERT INTO orders SELECT value AS id, value * 10 AS v FROM generate_series({first}, {last})"),
+        )
+        .await;
+    }
+    orders_rows.retain(|id, _| id % 7 != 0);
+    run(&ctx, "DELETE FROM orders WHERE id % 7 = 0").await;
+    orders.drain_in_flight_maintenance().await.expect("drain");
+    let deletion_vectors = catalog
+        .get_table_delete_files(orders.table_id())
+        .await
+        .expect("deletion vectors")
+        .len();
+
+    // On disk each table's directory holds no folder but `deletions`.
+    let mut folders = Vec::new();
+    for (name, _, data_url, table) in &placed {
+        let table_dir = std::path::PathBuf::from(
+            data_url
+                .strip_prefix("file://")
+                .expect("a local data url"),
+        )
+        .join(table.table_id());
+        let mut found: Vec<String> = std::fs::read_dir(&table_dir)
+            .expect("table directory")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.is_dir())
+            .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+            .collect();
+        found.sort();
+        folders.push((*name, found));
+    }
+
+    let reopen: Vec<(&str, bool, String)> = placed
+        .iter()
+        .map(|(name, keyed, data_url, _)| (*name, *keyed, data_url.clone()))
+        .collect();
+    drop((placed, events, orders, ctx, catalog));
+    let store = location.store();
+    let catalog: Arc<dyn MetadataCatalog> = Arc::new(location.open_catalog(&store).await);
+    let ctx = SessionContext::new();
+    let mut after = Vec::new();
+    for (name, keyed, data_url) in reopen {
+        let reopened = crate::common::table_builder_on_store(
+            Arc::clone(&catalog),
+            ctx.runtime_env(),
+            object_store_config(&store, &data_url),
+        )
+        .create(placed_options(
+            name,
+            &data_url,
+            keyed,
+            SettingsChangeAction::Rebuild,
+        ))
+        .await;
+        after.push(match reopened {
+            Ok(table) => {
+                let table = Arc::new(table);
+                table.wait_for_orphan_sweep().await;
+                ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+                    .expect("register");
+                Ok(rows(&ctx, name).await)
+            }
+            Err(error) => Err(error.to_string()),
+        });
+    }
+    let deletions = vec!["deletions".to_string()];
+    assert_eq!(
+        (compacted, deletion_vectors > 0, folders, after),
+        (
+            true,
+            true,
+            vec![("events", Vec::new()), ("orders", deletions)],
+            vec![Ok(events_rows), Ok(orders_rows)],
+        ),
+        "compacted, a deletion vector written, each table directory's folders, rows after the reopen"
+    );
+}
