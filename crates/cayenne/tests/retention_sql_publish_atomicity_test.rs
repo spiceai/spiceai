@@ -1256,3 +1256,89 @@ async fn resident_row_newly_matching_is_gone_at_next_publish_impl(
     }
     Ok(())
 }
+
+/// A reader planned against the previous generation keeps reading it through a
+/// carried-generation flip (table without a primary key) and the unreferenced
+/// snapshot cleanup that follows; a query planned after the flip reads the new
+/// generation, with an existing row now matching retention gone.
+#[test]
+fn old_reader_survives_carried_generation_flip_and_cleanup_sqlite() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        common::BackendType::Sqlite,
+        old_reader_survives_carried_generation_flip_and_cleanup_impl,
+    )
+}
+
+async fn old_reader_survives_carried_generation_flip_and_cleanup_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    let gone = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&gone);
+    let udf = create_udf(
+        "gone",
+        vec![DataType::Int64],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(move |args: &[ColumnarValue]| {
+            let array = args[0].clone().into_array(1)?;
+            let ids = array.as_any().downcast_ref::<Int64Array>().expect("int64");
+            let on = flag.load(Ordering::SeqCst);
+            Ok(ColumnarValue::Array(Arc::new(
+                arrow::array::BooleanArray::from_iter(
+                    ids.iter().map(|id| Some(on && id == Some(1))),
+                ),
+            )))
+        }),
+    );
+    let t = table(
+        &fixture,
+        "rsql_old_reader",
+        false,
+        udf.call(vec![col("id")]),
+    )
+    .await?;
+    common::insert_batch(
+        t.as_ref(),
+        rows(&[(1, Some("active")), (2, Some("active"))]),
+    )
+    .await?;
+    t.flush_pending_maintenance().await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(&t) as Arc<dyn TableProvider>)?;
+    let old_plan = ctx
+        .sql("SELECT id FROM t ORDER BY id")
+        .await?
+        .create_physical_plan()
+        .await?;
+
+    gone.store(true, Ordering::SeqCst);
+    common::insert_batch(t.as_ref(), rows(&[(3, Some("active"))])).await?;
+    t.retire_unreferenced_snapshot_dirs().await?;
+
+    let old = datafusion::physical_plan::collect(old_plan, ctx.task_ctx()).await?;
+    let mut old_ids: Vec<i64> = old
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    old_ids.sort_unstable();
+    assert_eq!(
+        old_ids,
+        vec![1, 2],
+        "planned before the flip: the old generation"
+    );
+    assert_eq!(
+        ids(&t).await?,
+        vec![2, 3],
+        "planned after the flip: the new generation"
+    );
+    Ok(())
+}
