@@ -147,7 +147,7 @@ jobs:
     concurrency:
       group: cayenne-data-store-s3-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
-    name: S3 data store
+    name: Object-native (rustfs)
     # Runs the change's code on persistent self-hosted runners, so fork and
     # Dependabot pull requests run it only from the merge queue.
     if: >-
