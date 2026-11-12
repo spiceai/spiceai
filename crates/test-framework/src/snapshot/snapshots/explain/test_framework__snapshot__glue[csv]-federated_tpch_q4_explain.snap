@@ -27,10 +27,10 @@ description: "Query: tpch_q4"
 |               |               RepartitionExec: partitioning=Hash([o_orderkey@0], 32), input_partitions=32                                                                                                      |
 |               |                 FilterExec: o_orderdate@1 >= 1993-07-01 AND o_orderdate@1 < 1993-10-01, projection=[o_orderkey@0, o_orderpriority@2]                                                           |
 |               |                   BytesProcessedExec                                                                                                                                                           |
-|               |                     DataSourceExec: file_groups={32 groups: [<redacted>]}, projection=[o_orderkey, o_orderdate, o_orderpriority], file_type=csv, has_header=true                               |
+|               |                     DataSourceExec: file_groups={32 groups: [<redacted>]}, projection=[o_orderkey, o_orderdate, o_orderpriority], file_type=csv, has_header=true, header_projection=true       |
 |               |               RepartitionExec: partitioning=Hash([l_orderkey@0], 32), input_partitions=32                                                                                                      |
 |               |                 FilterExec: l_receiptdate@2 > l_commitdate@1, projection=[l_orderkey@0]                                                                                                        |
 |               |                   BytesProcessedExec                                                                                                                                                           |
-|               |                     DataSourceExec: file_groups={32 groups: [<redacted>]}, projection=[l_orderkey, l_commitdate, l_receiptdate], file_type=csv, has_header=true                                |
+|               |                     DataSourceExec: file_groups={32 groups: [<redacted>]}, projection=[l_orderkey, l_commitdate, l_receiptdate], file_type=csv, has_header=true, header_projection=true        |
 |               |                                                                                                                                                                                                |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
