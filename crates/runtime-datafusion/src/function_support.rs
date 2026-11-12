@@ -622,8 +622,9 @@ pub const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
 /// `PostgreSQL` connector's federation deny-list. See issue #10703.
 ///
 /// A cast from a fractional value into an integer stays local too, because
-/// `PostgreSQL` rounds it where `DataFusion` truncates, and so does a window
-/// function with `DISTINCT`, which `PostgreSQL` does not implement
+/// `PostgreSQL` rounds it where `DataFusion` truncates, and so do a decimal `/`,
+/// which `PostgreSQL` answers with more digits than `DataFusion`'s scale, and a
+/// window function with `DISTINCT`, which `PostgreSQL` does not implement
 /// ([`crate::dialect::postgres_can_evaluate_expression`]).
 #[must_use]
 pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {

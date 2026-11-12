@@ -436,15 +436,16 @@ fn integer_value(value: &ScalarValue) -> Option<i128> {
     }
 }
 
-/// Whether `expr` is a `/` whose operands `DuckDB` or `SQLite` would evaluate
-/// in floating point.
+/// Whether `expr` is a `/` whose operands are not both known to be
+/// non-decimal, which no SQL source divides with `DataFusion`'s precision.
 ///
 /// The `DuckDB` dialect unparses every `DataFusion` `Divide` as `//` so that
 /// integer `/` stays integer division (#3155). On a `DECIMAL`, both `//` and
 /// `/` answer a `DOUBLE` (~16 significant digits). Federation then casts that
 /// double back to a decimal, so digits past the mantissa look exact and are
 /// wrong. `SQLite` has no decimal type and computes `/` in `REAL`. `MySQL`
-/// rounds the last digit of a decimal quotient where `DataFusion` truncates it.
+/// rounds the last digit of a decimal quotient where `DataFusion` truncates it,
+/// and `PostgreSQL` keeps more digits than `DataFusion`'s scale.
 ///
 /// Either operand being a decimal is enough: `amt / 3` is decimal division
 /// after type coercion. An operand whose type cannot be read is refused rather
@@ -468,12 +469,17 @@ pub(crate) fn divides_a_decimal(expr: &Expr, scope: Option<&DFSchema>) -> bool {
 /// does. [`integer_cast_is_renderable`] refuses a cast from a fractional value
 /// into an integer, which `PostgreSQL` rounds where `DataFusion` truncates;
 /// [`string_timestamp_cast_is_renderable`] refuses a string read as a
-/// timestamp; and [`window_distinct_is_renderable`] refuses a window function
-/// with `DISTINCT`.
+/// timestamp; [`divides_a_decimal`] refuses a decimal `/`, which `DataFusion`
+/// truncates at 4 more digits of scale than the dividend while `PostgreSQL`
+/// keeps at least 16 significant digits (`dd / e` is `-6.575402` against
+/// `-6.5754026354319180`), and a `/` whose operand types cannot be read; and
+/// [`window_distinct_is_renderable`] refuses a window function with
+/// `DISTINCT`.
 #[must_use]
 pub fn postgres_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     integer_cast_is_renderable(expr, scope)
         && string_timestamp_cast_is_renderable(expr, scope)
+        && !divides_a_decimal(expr, scope)
         && window_distinct_is_renderable(expr)
 }
 

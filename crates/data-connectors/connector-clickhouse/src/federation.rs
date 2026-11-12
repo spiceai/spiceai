@@ -23,9 +23,14 @@ use clickhouse_rs::ClientHandle;
 use data_components::function_support::FunctionSupport;
 use datafusion::{
     arrow::datatypes::{DataType, SchemaRef},
-    common::{DFSchema, NullEquality, Result, Statistics, TableReference, tree_node::TreeNode},
+    common::{
+        DFSchema, NullEquality, Result, ScalarValue, Statistics, TableReference,
+        tree_node::TreeNode,
+    },
     datasource::TableProvider,
-    logical_expr::{Expr, ExprSchemable, JoinType, LogicalPlan, WindowFunctionDefinition},
+    logical_expr::{
+        Expr, ExprSchemable, JoinType, LogicalPlan, Operator, WindowFunctionDefinition,
+    },
     optimizer::OptimizerRule,
     physical_plan::{PhysicalExpr, SendableRecordBatchStream, metrics::MetricsSet},
     sql::unparser::dialect::Dialect,
@@ -40,13 +45,19 @@ use datafusion_federation::{
 use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 use runtime_udfs_api::FunctionSupportBuilder;
 
+use crate::dialect::ClickHouseDialect;
+
 type ClickhouseSqlTable = SqlTable<ClientHandle, &'static dyn Sync>;
 
 pub(super) fn create_federated_provider(
     table: ClickhouseSqlTable,
     table_reference: TableReference,
 ) -> FederatedTableProviderAdaptor {
-    let table = Arc::new(table.with_function_support(Some(function_support())));
+    let table = Arc::new(
+        table
+            .with_function_support(Some(function_support()))
+            .with_dialect(Arc::new(ClickHouseDialect::new())),
+    );
     let executor = Arc::new(ClickhouseExecutor {
         table: Arc::clone(&table),
     });
@@ -146,11 +157,32 @@ fn supports_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
                 && non_decimal(&cast.expr, scope)
                 && cast.expr.nullable(scope).is_ok_and(|nullable| !nullable)
         }
-        Expr::BinaryExpr(binary) => [&binary.left, &binary.right]
-            .iter()
-            .all(|arg| non_decimal(arg, scope)),
+        Expr::BinaryExpr(binary) => {
+            [&binary.left, &binary.right]
+                .iter()
+                .all(|arg| non_decimal(arg, scope))
+                && (binary.op != Operator::Modulo || modulo_divisor_is_renderable(&binary.right))
+        }
         _ => true,
     }
+}
+
+/// `ClickHouse` 24.8 gives `%` by a negative constant the divisor's sign:
+/// `a % -2` answers `1` for `a = -33`, where SQL answers `-1`. A column divisor,
+/// whatever its sign, answers correctly.
+fn modulo_divisor_is_renderable(divisor: &Expr) -> bool {
+    match divisor {
+        Expr::Literal(value, _) => !value.is_null() && !is_negative(value),
+        divisor => !divisor.column_refs().is_empty(),
+    }
+}
+
+/// A value that cannot be compared with zero counts as negative.
+fn is_negative(value: &ScalarValue) -> bool {
+    ScalarValue::new_zero(&value.data_type())
+        .ok()
+        .and_then(|zero| value.partial_cmp(&zero))
+        .is_none_or(std::cmp::Ordering::is_lt)
 }
 
 fn non_decimal(expr: &Expr, scope: &DFSchema) -> bool {

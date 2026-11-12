@@ -1,11 +1,13 @@
 name: federation-matrix
 description: >
-  The pushdown corpus answers the same through Spice whichever database a
-  table federates to, PostgreSQL, MySQL, ClickHouse, DuckDB or DuckLake: each backend receives
-  the query rewritten in its own dialect, and every answer is checked against
-  one reference, PostgreSQL holding the same generated rows, so one corpus in
-  one dialect covers every backend. DuckDB is read through both the duckdb
-  connector and the ADBC connector with the DuckDB driver.
+  The pushdown and SQL-semantics corpora answer the same through Spice
+  whichever database a table federates to, PostgreSQL, MySQL, ClickHouse,
+  DuckDB or DuckLake: each backend receives the query rewritten in its own
+  dialect, and every answer is checked against one reference, PostgreSQL
+  holding the same generated rows, so one corpus in one dialect covers every
+  backend. Integer division by zero and overflow fail with DataFusion's errors
+  on every backend. DuckDB is read through both the duckdb connector and the
+  ADBC connector with the DuckDB driver.
 
 sources:
   backend: { kind: '${matrix.backend}' }
@@ -30,6 +32,16 @@ variants:
         params:
           $merge: '${sources.backend.adbc_params}'
           duckdb_open: null
+      w:
+        from: adbc:w
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
+      edge:
+        from: adbc:edge
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
 
 spicepod:
   version: v1
@@ -41,6 +53,12 @@ spicepod:
       params: ${sources.backend.params}
     - from: '${matrix.backend}:u'
       name: u
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:w'
+      name: w
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:edge'
+      name: edge
       params: ${sources.backend.params}
 
 defaults:
@@ -75,8 +93,127 @@ steps:
           - { name: t_id, int: [1, 440] }
           - { name: label, choice: [red, blue, green] }
     mirror: ref
+  # Arithmetic and statistics: `g` leaves some groups with one row, `k` is
+  # sometimes zero, and `e` never is.
+  - generate:
+      backend:
+        table: w
+        rows: 300
+        seed: 33
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: g, int: [1, 150] }
+          - { name: a, int: [-100, 100], nulls: 0.1 }
+          - { name: k, int: [-9, 9] }
+          - { name: c, bigint: [-9223372036854775807, 9223372036854775807] }
+          - { name: x, float: [0, 50], nulls: 0.1 }
+          - { name: dd, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: e, decimal: { range: [1, 9], scale: 2 } }
+    mirror: ref
+  - generate:
+      backend:
+        table: edge
+        rows: 1
+        seed: 34
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: c, bigint: [-9223372036854775808, -9223372036854775808] }
+          - { name: k, bigint: [-1, -1] }
+    mirror: ref
   - start: {}
   - corpus: corpus/pushdown.sql
+  - corpus: corpus/sql-semantics.sql
+  # A zero divisor and i64::MIN / -1 fail, where MySQL would answer NULL: Spice
+  # computes them with DataFusion's errors, or PostgreSQL and ClickHouse raise
+  # their own.
+  - query: SELECT id, a / k FROM w WHERE k = 0 AND a IS NOT NULL
+    expect-error: Divide by zero
+    when: { backend: [mysql, duckdb, ducklake] }
+  - query: SELECT id, a % k FROM w WHERE k = 0 AND a IS NOT NULL
+    expect-error: Divide by zero
+    when: { backend: [mysql, duckdb, ducklake] }
+  - query: SELECT id, c / k FROM edge
+    expect-error: 'Overflow happened on: -9223372036854775808 / -1'
+    when: { backend: [mysql, duckdb, ducklake] }
+  - query: SELECT id, a / k FROM w WHERE k = 0 AND a IS NOT NULL
+    expect-error: 'DB::Exception: Division by zero'
+    when: { backend: clickhouse }
+  - query: SELECT id, a % k FROM w WHERE k = 0 AND a IS NOT NULL
+    expect-error: 'DB::Exception: Division by zero'
+    when: { backend: clickhouse }
+  - query: SELECT id, c / k FROM edge
+    expect-error: 'DB::Exception: Division of minimal signed number by minus one'
+    when: { backend: clickhouse }
+  - query: SELECT id, a / k FROM w WHERE k = 0 AND a IS NOT NULL
+    expect-error: 'ERROR: division by zero'
+    when: { backend: postgres }
+  - query: SELECT id, a % k FROM w WHERE k = 0 AND a IS NOT NULL
+    expect-error: 'ERROR: division by zero'
+    when: { backend: postgres }
+  - query: SELECT id, c / k FROM edge
+    expect-error: 'ERROR: bigint out of range'
+    when: { backend: postgres }
+  # MySQL reads `||` as OR, divides integers exactly with `/`, and reads
+  # `30000.0` as a DECIMAL, so it is sent CONCAT, DIV and a float literal.
+  - explain: SELECT id, s || '!' FROM t
+    contains: [VirtualExecutionPlan, "CONCAT(`t`.`s`, '!')"]
+    when: { backend: mysql }
+  - explain: SELECT id, a / 2, a % 2, a / 30000.0 FROM w
+    contains: [VirtualExecutionPlan, "(`w`.`a` DIV 2)", "(`w`.`a` % 2)", "/ 3E4)"]
+    when: { backend: mysql }
+  # A divisor that might be zero, or a decimal division, stays local on MySQL:
+  # MySQL answers NULL for a zero divisor and rounds a decimal quotient.
+  - explain: SELECT id FROM w WHERE CASE WHEN k > 0 THEN a / k ELSE NULL END > 1.2
+    contains: [VirtualExecutionPlan]
+    omits: ["`w`.`a` / `w`.`k`", "`w`.`a` DIV `w`.`k`"]
+    when: { backend: mysql }
+  - explain: SELECT id, dd / e FROM w
+    contains: [VirtualExecutionPlan]
+    omits: ["`w`.`dd` / `w`.`e`"]
+    when: { backend: mysql }
+  # Sample figures are sent under their standard names.
+  - explain: SELECT g, stddev(x), var_samp(x) FROM w GROUP BY g
+    contains: [VirtualExecutionPlan, "stddev_samp(", "var_samp("]
+    when: { backend: [postgres, mysql, duckdb, ducklake] }
+  - explain: SELECT id, stddev(x) OVER (PARTITION BY g) FROM w
+    contains: [VirtualExecutionPlan, "stddev_samp(", ") OVER ("]
+    when: { backend: [postgres, mysql, duckdb, ducklake] }
+  # MySQL takes DISTINCT only in COUNT, SUM, AVG, MIN and MAX.
+  - explain: SELECT g, stddev(DISTINCT x) FROM w GROUP BY g
+    contains: [VirtualExecutionPlan]
+    omits: ["(DISTINCT `"]
+    when: { backend: mysql }
+  - explain: SELECT g, stddev(DISTINCT x) FROM w GROUP BY g
+    contains: [VirtualExecutionPlan, "stddev_samp(DISTINCT "]
+    when: { backend: postgres }
+  # Neither MySQL nor PostgreSQL takes DISTINCT in a window function.
+  - explain: SELECT id, count(DISTINCT x) OVER (PARTITION BY g) FROM w
+    contains: [VirtualExecutionPlan]
+    omits: [") OVER ("]
+    when: { backend: [mysql, postgres] }
+  # ClickHouse's `/` divides integers as Float64, so an integer quotient is sent
+  # as intDiv. Its `%` by a negative constant takes the divisor's sign, so that
+  # stays local; by a positive constant or a column it is sent.
+  - explain: SELECT id, a / 3, a / k, a % 3, a % k FROM w
+    contains: [VirtualExecutionPlan, "intDiv(w.a, 3)", "intDiv(w.a, w.k)", "(w.a % 3)", "(w.a % w.k)"]
+    when: { backend: clickhouse }
+  - explain: SELECT id, a % -2 FROM w
+    contains: [VirtualExecutionPlan, "base_sql=SELECT w.id, w.a FROM w"]
+    omits: ["(w.a % -2)"]
+    when: { backend: clickhouse }
+  # PostgreSQL keeps more digits of a decimal quotient than DataFusion's scale.
+  - explain: SELECT id, dd / e FROM w
+    contains: [VirtualExecutionPlan, 'base_sql=SELECT "w"."id", "w"."dd", "w"."e" FROM "w"']
+    omits: ['("w"."dd" / "w"."e")']
+    when: { backend: postgres }
+  # ClickHouse answers `nan` where SQL answers NULL, so Spice computes these:
+  # the SQL sent to ClickHouse groups nothing.
+  - explain: SELECT g, stddev(x), var_samp(x) FROM w GROUP BY g
+    contains: [AggregateExec, VirtualExecutionPlan]
+    omits: ["GROUP BY"]
+    when: { backend: clickhouse }
   # The federated query reached the backend rather than being answered locally.
   - explain: SELECT id FROM t WHERE i > 40
     contains: [VirtualExecutionPlan]
