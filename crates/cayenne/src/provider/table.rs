@@ -9443,6 +9443,23 @@ impl CayenneTableProvider {
         crate::metastore_layout::is_object_native_data_path(&self.table_metadata.path)
     }
 
+    /// Whether `id` names a reserved directory of the table rather than a
+    /// snapshot: `_staging` (and a staged write's `_staging/<id>`) or
+    /// `_lookup_index`, underscore-prefixed like every reserved directory. On a
+    /// table whose data is in the object-native location every snapshot is flat,
+    /// its files directly under the table's directory, but a reserved directory
+    /// keeps its own: its cleanup deletes what it does not recognize there, and
+    /// must never reach the table's data files.
+    fn is_reserved_dir(id: &str) -> bool {
+        id.starts_with('_')
+    }
+
+    /// Whether `id`'s files are directly under the table's directory: a snapshot
+    /// of a table whose data is in the object-native location.
+    fn is_flat(table_path: &str, id: &str) -> bool {
+        crate::metastore_layout::is_object_native_data_path(table_path) && !Self::is_reserved_dir(id)
+    }
+
     /// Whether the cleanup a commit schedules takes the snapshots it reclaims
     /// from the committed state instead of listing the table's prefix: a table
     /// whose data is in the object-native location on a store, in a catalog
@@ -9711,9 +9728,10 @@ impl CayenneTableProvider {
             .await
     }
 
-    /// The table-relative key of a data file.
+    /// The table-relative key of a data file: the name itself for a flat
+    /// snapshot, `<folder>/<name>` for a file in a folder of its own.
     fn data_file_key(&self, snapshot_id: &str, name: &str) -> String {
-        if self.data_in_object_native_location() {
+        if Self::is_flat(&self.table_metadata.path, snapshot_id) {
             name.to_string()
         } else {
             format!("{snapshot_id}/{name}")
@@ -9796,7 +9814,7 @@ impl CayenneTableProvider {
             .into_iter()
             .collect();
         self.uncommitted_files.forget(snapshot_id);
-        if self.data_in_object_native_location() {
+        if Self::is_flat(&self.table_metadata.path, snapshot_id) {
             for row in self
                 .catalog
                 .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
@@ -10487,7 +10505,7 @@ impl CayenneTableProvider {
         if crate::is_object_store_path(table_path) {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
-            if crate::metastore_layout::is_object_native_data_path(table_path) {
+            if Self::is_flat(table_path, snapshot_id) {
                 return format!("{base}/{table_id}/");
             }
             format!("{base}/{table_id}/{snapshot_id}/")
@@ -48844,20 +48862,33 @@ mod tests {
         );
     }
 
+    /// Every snapshot of an object-native table is flat; the reserved
+    /// directories keep theirs, so the lookup index's and staging's cleanup,
+    /// which delete what they do not recognize in their directory, never reach
+    /// the table's data files.
     #[test]
-    fn object_native_snapshot_paths_are_flat_for_every_snapshot_id() {
+    fn object_native_snapshots_are_flat_and_reserved_directories_are_not() {
         for base in [
             "s3://bucket/state/v1/datasets/orders/data",
             "file:///tmp/state/v1/datasets/orders/data",
         ] {
-            for snapshot in [
-                uuid::Uuid::now_v7().to_string(),
-                "staging-write".to_string(),
-                "lookup-index".to_string(),
-            ] {
+            assert_eq!(
+                CayenneTableProvider::snapshot_dir_url(
+                    base,
+                    "table",
+                    &uuid::Uuid::now_v7().to_string()
+                ),
+                format!("{base}/table/")
+            );
+            assert_eq!(
+                CayenneTableProvider::snapshot_dir_url(base, "table", "snapshot"),
+                format!("{base}/table/")
+            );
+            let staged_write = format!("{STAGING_DIR_NAME}/write");
+            for reserved in [STAGING_DIR_NAME, staged_write.as_str(), LOOKUP_INDEX_DIR_NAME] {
                 assert_eq!(
-                    CayenneTableProvider::snapshot_dir_url(base, "table", &snapshot),
-                    format!("{base}/table/")
+                    CayenneTableProvider::snapshot_dir_url(base, "table", reserved),
+                    format!("{base}/table/{reserved}/")
                 );
             }
         }
