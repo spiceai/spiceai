@@ -23,7 +23,70 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use super::{CLUSTER_ASSIGNMENT_INTERVAL, Instance};
+use super::{CLUSTER_ASSIGNMENT_INTERVAL, Instance, Options, executors_in_containers};
+use crate::script::Script;
+
+/// The address a script's executors and sources meet at when its executors
+/// run in containers behind a rootless Docker daemon, which then run on the
+/// bridge network (see [`crate::spiced::ContainerRun::bridge`]): this
+/// machine's routable one. `None` for every other script.
+pub(super) async fn bridge_address(
+    script: &Script,
+    options: &Options,
+) -> Result<Option<std::net::IpAddr>> {
+    if !cfg!(target_os = "linux")
+        || !executors_in_containers(script, options)
+        || !crate::docker::daemon_is_rootless().await
+    {
+        return Ok(None);
+    }
+    crate::docker::routable_address()
+        .map(Some)
+        .context("executors in containers behind a rootless Docker daemon")
+}
+
+/// The source kinds a spicepod may name when its executors run in bridge
+/// containers: an object store, which [`published_to_bridge`] puts where they
+/// reach it, behind a secret of the run's own; and files and `DuckDB`
+/// databases, which they read from the mounted work directory. Every other
+/// source serves on loopback, out of the executors' reach, so as not to
+/// publish a database with fixed or no credentials on every interface.
+const BRIDGEABLE_KINDS: [&str; 3] = ["rustfs", "files", "duckdb"];
+
+/// Whether a source of `kind` publishes its ports at the bridge address too,
+/// not only on loopback (see [`BRIDGEABLE_KINDS`]).
+pub(super) fn published_to_bridge(kind: &str) -> bool {
+    kind == "rustfs"
+}
+
+/// Refuses a run with bridged executors whose script names, by a
+/// `${sources.<name>…}` placeholder anywhere, a source of a kind not in
+/// [`BRIDGEABLE_KINDS`]: the executors could not reach it, and the run would
+/// fail later and less clearly. The whole script is read, not only its
+/// spicepod and variants, because every patch a step applies (`start`,
+/// `restart`, `edit-spicepod`, a fault's restart) can name a source too; a
+/// placeholder in a step the executors never see is refused as well, which
+/// errs on the side of the clear error. A source only named bare, such as a
+/// script's oracle, stays on loopback.
+pub(super) fn check_bridged_sources<'a>(
+    script: &Script,
+    sources: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let text = format!("{script:?}");
+    for (name, kind) in sources {
+        let named = [format!("sources.{name}."), format!("sources.{name}}}")]
+            .iter()
+            .any(|needle| text.contains(needle.as_str()));
+        if named && !BRIDGEABLE_KINDS.contains(&kind) {
+            anyhow::bail!(
+                "executors in containers behind a rootless Docker daemon reach only {} sources, \
+                 and the spicepod names source '{name}' ({kind})",
+                BRIDGEABLE_KINDS.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Starts every executor of the instance that is not running, and waits for
 /// the scheduler to report all the running ones ready to take work.
@@ -86,10 +149,16 @@ pub(super) async fn start_executors(
 /// is down, would compare against the cache instead.
 /// `--cluster`: the scheduler and executor arguments, with node mTLS from the
 /// run's generated CA and certificates.
+///
+/// Every node advertises, and the scheduler binds, loopback, unless the
+/// executors run in bridge containers (`bridge`): then that address, the one
+/// they reach this machine and each other's published ports at, while each
+/// executor binds every interface inside its container.
 pub(super) fn cluster_args(
     pki: &std::path::Path,
     context: &Value,
     executors: usize,
+    bridge: Option<std::net::IpAddr>,
 ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
     let file = |name: &str| pki.join(name).display().to_string();
     let scheduler_port = context["instance"]["port"].to_string();
@@ -103,22 +172,33 @@ pub(super) fn cluster_args(
             file(&format!("{node}.key")),
         ]
     };
+    let advertise = bridge
+        .unwrap_or(std::net::Ipv4Addr::LOCALHOST.into())
+        .to_string();
+    let executor_bind = if bridge.is_some() {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
     let mut scheduler: Vec<String> = [
         "--role",
         "scheduler",
         "--node-advertise-address",
-        "127.0.0.1",
+        &advertise,
         "--node-bind-address",
     ]
     .iter()
     .map(ToString::to_string)
     .collect();
-    scheduler.push(format!("127.0.0.1:{scheduler_port}"));
+    scheduler.push(format!("{advertise}:{scheduler_port}"));
     scheduler.extend(mtls("scheduler"));
     let mut all = Vec::new();
     for n in 0..executors {
         let port = if n == 0 {
             context["instance"]["executor_port"].to_string()
+        } else if bridge.is_some() {
+            // Published on `bridge` as well as loopback, so free on both.
+            crate::docker::free_port_on(std::net::Ipv4Addr::UNSPECIFIED.into())?.to_string()
         } else {
             crate::docker::free_port()?.to_string()
         };
@@ -126,17 +206,62 @@ pub(super) fn cluster_args(
             .iter()
             .map(ToString::to_string)
             .collect();
-        executor.push(format!("https://127.0.0.1:{scheduler_port}"));
+        executor.push(format!("https://{advertise}:{scheduler_port}"));
         executor.extend([
             "--node-advertise-address".to_string(),
-            "127.0.0.1".to_string(),
+            advertise.clone(),
             "--node-bind-address".to_string(),
         ]);
-        executor.push(format!("127.0.0.1:{port}"));
+        executor.push(format!("{executor_bind}:{port}"));
         executor.extend(mtls("executor"));
         all.push(executor);
     }
     Ok((scheduler, all))
+}
+
+/// Executors in bridge containers (see [`crate::spiced::ContainerRun::bridge`])
+/// reach a source at this machine's routable address, not at loopback, which
+/// is their own: so every loopback address in the spicepod becomes `address`.
+/// The sources of such a run also publish their ports there.
+pub(super) fn spicepod_for_bridge(spicepod: &mut Value, address: std::net::IpAddr) {
+    match spicepod {
+        Value::String(text) if text.contains("127.0.0.1") => {
+            *text = bridged_host(text, &address.to_string());
+        }
+        Value::Array(items) => {
+            for item in items {
+                spicepod_for_bridge(item, address);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                spicepod_for_bridge(value, address);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `text` with `127.0.0.1` replaced by `address` wherever it is a host: after
+/// `://` or `@` in a URL, or at the start of a `host:port` or of one in a
+/// comma-separated list. Elsewhere, such as
+/// inside a file path, it is left as it is.
+fn bridged_host(text: &str, address: &str) -> String {
+    const LOOPBACK: &str = "127.0.0.1";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(LOOPBACK) {
+        let before = &text[..text.len() - rest.len() + at];
+        let after = &rest[at + LOOPBACK.len()..];
+        let is_host =
+            (before.is_empty() || before.ends_with("://") || before.ends_with(['@', ',']))
+                && (after.is_empty() || after.starts_with([':', '/', ',']));
+        out.push_str(&rest[..at]);
+        out.push_str(if is_host { address } else { LOOPBACK });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The engine an acceleration block runs, or `None` when it is disabled,
@@ -277,7 +402,144 @@ pub(super) fn make_cluster_ready(
 mod tests {
     use serde_json::json;
 
-    use super::{make_cluster_ready, undistributed_engine, unpartitionable_acceleration};
+    use super::{
+        check_bridged_sources, cluster_args, make_cluster_ready, published_to_bridge,
+        spicepod_for_bridge, undistributed_engine, unpartitionable_acceleration,
+    };
+
+    /// The value after `flag` in `args`.
+    fn after<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let i = args.iter().position(|a| a == flag).expect(flag);
+        &args[i + 1]
+    }
+
+    #[test]
+    fn nodes_meet_on_loopback_unless_the_executors_are_bridged() {
+        let context = json!({ "instance": { "port": 29170, "executor_port": 29160 } });
+        let pki = std::path::Path::new("pki");
+        let (scheduler, executors) =
+            cluster_args(pki, &context, 1, None).expect("cluster arguments");
+        assert_eq!(after(&scheduler, "--node-bind-address"), "127.0.0.1:29170");
+        assert_eq!(after(&scheduler, "--node-advertise-address"), "127.0.0.1");
+        let executor = &executors[0];
+        assert_eq!(
+            after(executor, "--scheduler-address"),
+            "https://127.0.0.1:29170"
+        );
+        assert_eq!(after(executor, "--node-advertise-address"), "127.0.0.1");
+        assert_eq!(after(executor, "--node-bind-address"), "127.0.0.1:29160");
+
+        let address = std::net::Ipv4Addr::new(10, 244, 0, 183).into();
+        let (scheduler, executors) =
+            cluster_args(pki, &context, 2, Some(address)).expect("cluster arguments");
+        assert_eq!(
+            after(&scheduler, "--node-bind-address"),
+            "10.244.0.183:29170"
+        );
+        assert_eq!(
+            after(&scheduler, "--node-advertise-address"),
+            "10.244.0.183"
+        );
+        assert_eq!(executors.len(), 2);
+        for executor in &executors {
+            assert_eq!(
+                after(executor, "--scheduler-address"),
+                "https://10.244.0.183:29170"
+            );
+            assert_eq!(after(executor, "--node-advertise-address"), "10.244.0.183");
+            assert!(after(executor, "--node-bind-address").starts_with("0.0.0.0:"));
+        }
+        assert_eq!(after(&executors[0], "--node-bind-address"), "0.0.0.0:29160");
+    }
+
+    #[test]
+    fn bridged_executors_reach_only_vetted_sources_the_spicepod_names() {
+        let script = crate::script::Script::parse(
+            "name: s\n\
+             sources: { lake: { kind: rustfs }, db: { kind: postgres }, oracle: { kind: postgres } }\n\
+             spicepod:\n  datasets:\n    - from: s3://${sources.lake.bucket}/orders/\n      name: orders\n      params: { $merge: '${sources.lake.params}', file_format: parquet }\n\
+             variants:\n  pg: { datasets: { '*': { params: { pg_port: '${sources.db.port}' } } } }\n\
+             steps: [{ start: {} }]",
+        )
+        .expect("script parses");
+        // The object store the spicepod names, and an oracle it does not.
+        check_bridged_sources(&script, [("lake", "rustfs"), ("oracle", "postgres")])
+            .expect("an object store and an unnamed oracle are allowed");
+        // A database named only by a variant would be published with fixed
+        // credentials: refused.
+        let error = check_bridged_sources(&script, [("lake", "rustfs"), ("db", "postgres")])
+            .expect_err("a named database is refused");
+        assert!(error.to_string().contains("'db' (postgres)"), "{error}");
+        // A source whose name only extends a named one's is not named.
+        check_bridged_sources(&script, [("lak", "kafka")]).expect("not named");
+        // A source named only by a restart's patch is refused too.
+        let patched = crate::script::Script::parse(
+            "name: s\n\
+             sources: { lake: { kind: rustfs }, feed: { kind: kafka } }\n\
+             spicepod: { datasets: [{ from: 's3://${sources.lake.bucket}/t/', name: t }] }\n\
+             steps:\n  - start: {}\n  - restart:\n      patch: { datasets: { t: { params: { kafka_bootstrap_servers: '${sources.feed.bootstrap}' } } } }",
+        )
+        .expect("script parses");
+        let error = check_bridged_sources(&patched, [("lake", "rustfs"), ("feed", "kafka")])
+            .expect_err("a source named by a patch is refused");
+        assert!(error.to_string().contains("'feed' (kafka)"), "{error}");
+        // And one only an `edit-spicepod` step names.
+        let edited = crate::script::Script::parse(
+            "name: s\n\
+             sources: { lake: { kind: rustfs }, db: { kind: postgres } }\n\
+             spicepod: { datasets: [{ from: 's3://${sources.lake.bucket}/t/', name: t }] }\n\
+             steps:\n  - start: {}\n  - edit-spicepod:\n      spicepod:\n        datasets:\n          - { from: 'postgres:t', name: added, params: '${sources.db.params}' }",
+        )
+        .expect("script parses");
+        let error = check_bridged_sources(&edited, [("lake", "rustfs"), ("db", "postgres")])
+            .expect_err("a source named by edit-spicepod is refused");
+        assert!(error.to_string().contains("'db' (postgres)"), "{error}");
+        assert!(published_to_bridge("rustfs"));
+        assert!(!published_to_bridge("postgres"));
+        assert!(!published_to_bridge("mock-http"));
+    }
+
+    #[test]
+    fn a_bridged_spicepod_names_sources_at_the_peer_address() {
+        let mut spicepod = json!({
+            "datasets": [{
+                "from": "s3://i0-default/orders/",
+                "params": { "s3_endpoint": "http://127.0.0.1:29150", "s3_region": "us-east-1" },
+                "acceleration": { "refresh_check_interval": 10 }
+            }]
+        });
+        spicepod_for_bridge(
+            &mut spicepod,
+            std::net::Ipv4Addr::new(10, 244, 0, 183).into(),
+        );
+        // Only a host is rewritten: a path that holds the text keeps it.
+        let mut paths = json!({
+            "file": "file:/work/127.0.0.1/rows.csv",
+            "plain": "127.0.0.1:29150",
+            "auth": "postgres://u:p@127.0.0.1:5432/db",
+            "list": "127.0.0.1:9092,127.0.0.1:9093"
+        });
+        spicepod_for_bridge(&mut paths, std::net::Ipv4Addr::new(10, 244, 0, 183).into());
+        assert_eq!(
+            paths,
+            json!({
+                "file": "file:/work/127.0.0.1/rows.csv",
+                "plain": "10.244.0.183:29150",
+                "auth": "postgres://u:p@10.244.0.183:5432/db",
+                "list": "10.244.0.183:9092,10.244.0.183:9093"
+            })
+        );
+        assert_eq!(
+            spicepod,
+            json!({
+                "datasets": [{
+                    "from": "s3://i0-default/orders/",
+                    "params": { "s3_endpoint": "http://10.244.0.183:29150", "s3_region": "us-east-1" },
+                    "acceleration": { "refresh_check_interval": 10 }
+                }]
+            })
+        );
+    }
 
     fn pod(acceleration: &serde_json::Value) -> serde_json::Value {
         json!({ "datasets": [{ "name": "t", "acceleration": acceleration }] })

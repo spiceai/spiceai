@@ -162,6 +162,9 @@ mod rustfs;
 mod s3;
 mod s3_folder_marker;
 mod s3_location_pruning;
+// Cayenne is not built on Windows.
+#[cfg(not(windows))]
+mod s3_missing_source;
 mod s3_parquet_overwrite;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod schema_evolution;

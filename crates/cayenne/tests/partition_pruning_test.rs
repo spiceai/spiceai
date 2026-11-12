@@ -107,7 +107,7 @@ async fn test_cayenne_partition_pruning_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -394,7 +394,7 @@ async fn test_cayenne_scan_uses_target_partitions_impl(
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
     let table = Arc::new(
         CayenneTableProvider::create_table(
-            Arc::<cayenne::CayenneCatalog>::clone(catalog),
+            Arc::<common::FixtureCatalog>::clone(catalog),
             table_options,
             ctx.runtime_env(),
         )
@@ -476,7 +476,7 @@ async fn test_cayenne_bucket_partitioning_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )

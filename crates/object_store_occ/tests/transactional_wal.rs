@@ -901,7 +901,13 @@ fn process_restart_at_wal_publication_boundaries() {
     for mode in [7, 8] {
         let directory = tempfile::tempdir().expect("process directory");
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args(["--exact", "subprocess_writer", "--ignored", "--nocapture"])
+            // The helper's path in the crate's one `integration` test binary.
+            .args([
+                "--exact",
+                "transactional_wal::subprocess_writer",
+                "--ignored",
+                "--nocapture",
+            ])
             .env("SPICE_WAL_TEST_DIRECTORY", directory.path())
             .env("SPICE_WAL_TEST_BOUNDARY", mode.to_string())
             .output()
