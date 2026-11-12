@@ -28,6 +28,11 @@ on:
         type: choice
         options: [quick, all]
         default: quick
+      store:
+        description: 'the data store the data-path suites run on (nightly runs both)'
+        type: choice
+        options: [memory, rustfs, both]
+        default: memory
 
 permissions:
   contents: read
@@ -154,7 +159,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        store: ${{ github.event_name == 'schedule' && fromJson('["memory","rustfs"]') || fromJson('["memory"]') }}
+        store: ${{ (github.event_name == 'schedule' || inputs.store == 'both') && fromJson('["memory","rustfs"]') || (inputs.store == 'rustfs' && fromJson('["rustfs"]')) || fromJson('["memory"]') }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 120
     env:
