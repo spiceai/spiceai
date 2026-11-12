@@ -483,10 +483,15 @@ impl Protocol {
             READS
         }
     }
-    /// Restore points are in the two-upload local graphs; at three uploads
-    /// they would push the graph past the checker's time limit.
+    /// Restore points are covered by the base local retirement graph and its
+    /// restore-hold control; prepared and three-upload graphs omit them to
+    /// stay within the exhaustive checker's time limit.
     fn restores(&self) -> u8 {
-        if self.has(ModeFlag::Lean) || self.remote() || self.uploads >= 3 {
+        if self.has(ModeFlag::Prepared)
+            || self.has(ModeFlag::Lean)
+            || self.remote()
+            || self.uploads >= 3
+        {
             0
         } else {
             RESTORES
