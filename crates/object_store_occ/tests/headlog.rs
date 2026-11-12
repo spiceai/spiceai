@@ -13,15 +13,18 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use object_store_occ::headlog::{
-    HeadLog, HeadLogConfig, Outcome, Poll, PreparedAttempt, Reader, Record, Writer,
+    Collected, Collector, DEFAULT_RETENTION, HeadLog, HeadLogConfig, Outcome, Poll,
+    PreparedAttempt, Reader, Record, Writer,
 };
 use object_store_occ::{Expected, LocalConditionalPut, conditional_put};
+use object_store_sim::fault::FaultStore as GatedStore;
 use prost::Message;
 
 fn config() -> HeadLogConfig {
@@ -951,8 +954,9 @@ async fn headlog_spills_large_records_and_verifies_them_on_read() {
         .expect("owner");
         // Inline below the threshold, spilled above it, and spilled far above R.
         let payloads = [vec![1_u8; 10], vec![2; 78], vec![3; 10_000]];
+        let mut receipts = vec![];
         for payload in &payloads {
-            append(&mut writer, Bytes::from(payload.clone())).await;
+            receipts.push(append(&mut writer, Bytes::from(payload.clone())).await);
         }
         let spilled = writer
             .state()
@@ -974,14 +978,11 @@ async fn headlog_spills_large_records_and_verifies_them_on_read() {
             vec![(false, 10, 32), (true, 0, 58), (true, 0, 59)],
             "window keeps references, not payloads"
         );
-        let digest = blake3::hash(&payloads[2]);
-        let path = backend
-            .prefix
-            .clone()
-            .join("objects")
-            .join("00000000000000000001")
-            .join("records")
-            .join(digest.to_hex().as_str());
+        // Named by the commit its record proposed and the attempt that proposed it.
+        let path = backend.prefix.clone().join("records").join(format!(
+            "00000000000000000003-{}",
+            hex(receipts[2].attempt_id())
+        ));
         assert_eq!(
             backend
                 .store
@@ -1103,5 +1104,222 @@ async fn headlog_attempt_evidence_expires_after_the_horizon() {
                 );
             }
         }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut hex, b| {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+        hex
+    })
+}
+
+/// The numbers that name the objects in one of a log's directories: a batch's
+/// first commit, a spilled payload's commit, a checkpoint's commit.
+async fn numbered(backend: &Backend, directory: &str) -> Vec<u64> {
+    let listed: Vec<_> = backend
+        .store
+        .list(Some(&backend.prefix.clone().join(directory)))
+        .try_collect()
+        .await
+        .expect("list");
+    let mut numbers: Vec<u64> = listed
+        .iter()
+        .map(|meta| {
+            let name = meta.location.filename().expect("object name");
+            name.split('-')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .expect("numbered object")
+        })
+        .collect();
+    numbers.sort_unstable();
+    numbers
+}
+
+/// Records 1..=12, every even one spilled. Batches of four; returns the
+/// writer with the second batch end staged as a checkpoint and published by a
+/// thirteenth record, with that floor.
+async fn spilling_log(backend: &Backend) -> (Writer, Vec<Bytes>, Vec<PreparedAttempt>, u64) {
+    let spilling = HeadLogConfig {
+        spill_above_bytes: 70,
+        ..config()
+    };
+    HeadLog::create(Arc::clone(&backend.store), backend.prefix.clone(), spilling)
+        .await
+        .expect("create");
+    let mut writer = Writer::take_over(
+        Arc::clone(&backend.store),
+        backend.prefix.clone(),
+        spilling,
+        1,
+    )
+    .await
+    .expect("owner");
+    let mut payloads = vec![];
+    let mut receipts = vec![];
+    for commit in 1..=12_u8 {
+        let payload = Bytes::from(vec![commit; if commit % 2 == 0 { 80 } else { 10 }]);
+        receipts.push(append(&mut writer, payload.clone()).await);
+        payloads.push(payload);
+    }
+    writer.wait_for_sealing().await;
+    let floor = writer.state().head.batches[1];
+    writer
+        .publish_checkpoint(floor, Bytes::from_static(b"root"))
+        .await
+        .expect("stage checkpoint");
+    let payload = Bytes::from_static(b"publishes the floor");
+    receipts.push(append(&mut writer, payload.clone()).await);
+    payloads.push(payload);
+    assert_eq!(writer.state().head.floor, floor);
+    (writer, payloads, receipts, floor)
+}
+
+/// Batches, spilled payloads and checkpoints below the floor are deleted once
+/// the floor is a retention old, and not before; what is above the floor, the
+/// current checkpoint and the evidence that resolves an older commit stay.
+#[tokio::test]
+async fn headlog_collects_objects_below_the_floor_after_the_retention() {
+    for backend in backends() {
+        let (mut writer, payloads, receipts, floor) = spilling_log(&backend).await;
+        assert_eq!(floor, 8, "batches of four end at 4 and 8");
+        // A second checkpoint, so one checkpoint is below the floor.
+        for commit in 14..=16_u8 {
+            let payload = Bytes::from(vec![commit; 10]);
+            append(&mut writer, payload).await;
+        }
+        writer.wait_for_sealing().await;
+        let ends = writer.state().head.batches.clone();
+        let floor = *ends.last().expect("batch above the floor");
+        writer
+            .publish_checkpoint(floor, Bytes::from_static(b"second root"))
+            .await
+            .expect("stage second checkpoint");
+        append(
+            &mut writer,
+            Bytes::from_static(b"publishes the second floor"),
+        )
+        .await;
+        assert_eq!(floor, 12);
+        let batches = numbered(&backend, "wal").await;
+        let spilled = numbered(&backend, "records").await;
+        assert_eq!(batches, vec![1, 5, 9, 13]);
+        assert_eq!(spilled, vec![2, 4, 6, 8, 10, 12]);
+        assert_eq!(numbered(&backend, "checkpoints").await, vec![8, 12]);
+
+        // Within the retention nothing goes, even from a collector that has
+        // seen the floor before.
+        let mut patient = Collector::new(
+            Arc::clone(&backend.store),
+            backend.prefix.clone(),
+            DEFAULT_RETENTION,
+        );
+        assert_eq!(patient.collect().await.expect("collect"), None);
+        assert_eq!(patient.collect().await.expect("collect"), None);
+        assert_eq!(numbered(&backend, "wal").await, batches);
+
+        // Past it, everything below the floor goes, but only once a head
+        // written after the floor's publication gives it a stamp: the head
+        // that first shows a floor may carry a store time from before it was
+        // published.
+        let mut collector = Collector::new(
+            Arc::clone(&backend.store),
+            backend.prefix.clone(),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(collector.collect().await.expect("collect"), None);
+        append(&mut writer, Bytes::from_static(b"stamps the floor")).await;
+        assert_eq!(
+            collector.collect().await.expect("collect"),
+            Some(Collected {
+                floor: 12,
+                deleted: 3 + 6 + 1
+            })
+        );
+        assert_eq!(numbered(&backend, "wal").await, vec![13]);
+        assert_eq!(numbered(&backend, "records").await, Vec::<u64>::new());
+        assert_eq!(numbered(&backend, "checkpoints").await, vec![12]);
+        // Nothing new is due until a newer floor is published.
+        assert_eq!(collector.collect().await.expect("collect"), None);
+
+        let (_, opened) = Reader::open(Arc::clone(&backend.store), backend.prefix.clone())
+            .await
+            .expect("cold open after collection");
+        assert_eq!(
+            opened.checkpoint_root,
+            Some(Bytes::from_static(b"second root"))
+        );
+        assert_eq!(
+            opened.records.iter().map(|r| r.commit).collect::<Vec<_>>(),
+            vec![13, 14, 15, 16, 17, 18]
+        );
+        assert_eq!(opened.records[0].record.payload, payloads[12]);
+        // The first commit's batch is gone; the checkpoint still resolves it.
+        assert_eq!(
+            writer.resolve(&receipts[0]).await.expect("resolve"),
+            Outcome::Accepted { commit: 1 }
+        );
+    }
+}
+
+/// A reader that read the head before a collection and fetches what it lists
+/// only after the collection, past the retention, opens again from the newer
+/// head: it returns that head's state, never a mix of the two.
+#[tokio::test]
+async fn headlog_open_overtaken_by_collection_reopens_from_the_newer_head() {
+    for backend in backends() {
+        let (mut writer, payloads, _, floor) = spilling_log(&backend).await;
+        let gated = Arc::new(GatedStore::new(Arc::clone(&backend.store)));
+        let head = backend.prefix.clone().join("head");
+        gated.gate_reads(move |path| path != &head);
+        let reader_store: Arc<dyn ObjectStore> = Arc::clone(&gated) as Arc<dyn ObjectStore>;
+        let prefix = backend.prefix.clone();
+        let open = tokio::spawn(async move { Reader::open(reader_store, prefix).await });
+        gated.wait_gated(1).await;
+
+        // The reader holds the head with floor 8. A newer floor is published
+        // and everything below it collected, including that head's checkpoint.
+        writer.wait_for_sealing().await;
+        let newer = *writer.state().head.batches.last().expect("sealed batch");
+        writer
+            .publish_checkpoint(newer, Bytes::from_static(b"newer root"))
+            .await
+            .expect("stage newer checkpoint");
+        append(
+            &mut writer,
+            Bytes::from_static(b"publishes the newer floor"),
+        )
+        .await;
+        let mut collector = Collector::new(
+            Arc::clone(&backend.store),
+            backend.prefix.clone(),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(collector.collect().await.expect("collect"), None);
+        append(&mut writer, Bytes::from_static(b"stamps the newer floor")).await;
+        let collected = collector.collect().await.expect("collect");
+        assert_eq!(collected.map(|c| c.floor), Some(newer));
+        assert!(newer > floor);
+        assert_eq!(numbered(&backend, "checkpoints").await, vec![newer]);
+
+        gated.open_reads();
+        let (reader, opened) = open.await.expect("join").expect("open retries");
+        assert_eq!(reader.state().head.floor, newer);
+        assert_eq!(opened.floor, newer);
+        assert_eq!(
+            opened.checkpoint_root,
+            Some(Bytes::from_static(b"newer root"))
+        );
+        let expected: Vec<u64> = (newer + 1..=15).collect();
+        assert_eq!(
+            opened.records.iter().map(|r| r.commit).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            opened.records[0].record.payload,
+            payloads[usize::try_from(newer).expect("small")]
+        );
     }
 }

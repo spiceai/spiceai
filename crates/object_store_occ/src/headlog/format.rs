@@ -136,7 +136,8 @@ pub struct Record {
     pub spilled: Option<Spilled>,
 }
 
-/// A payload stored at `objects/<generation>/records/<blake3 hex>`.
+/// A payload stored at `records/<commit>-<attempt id hex>`, verified by its
+/// length and BLAKE3 digest.
 #[derive(Clone, PartialEq, Message)]
 pub struct Spilled {
     #[prost(bytes = "vec", tag = "1")]
