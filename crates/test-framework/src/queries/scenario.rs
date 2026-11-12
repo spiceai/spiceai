@@ -41,9 +41,9 @@ pub struct ScenarioQueryDefinition {
     pub expected_results: Option<ExpectedResults>,
 
     /// SQL that returns one row of parameters for each query to run. When set, `sql` is a
-    /// template: each row becomes one query, with `$1`, `$2`, ... in `sql` replaced by the row's
-    /// columns, in order, as SQL literals. All the queries share `name`, so their latencies are
-    /// reported together. The SQL runs against `spiced` when the test starts.
+    /// template: each row becomes one query, with the row's columns, in order, bound to `$1`,
+    /// `$2`, ... in `sql`. All the queries share `name`, so their latencies are reported together.
+    /// The SQL runs against `spiced` when the test starts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters_from: Option<String>,
 }
@@ -169,14 +169,13 @@ impl ScenarioQuerySet {
 /// Replaces each `parameters_from` template in `queries` with one query per row that its SQL
 /// returns from `spiced`. Other queries are kept as they are, in order.
 ///
-/// The parameters are inlined as SQL literals, not sent as prepared-statement parameters, because
-/// some table functions (for example `text_search`) do not accept a placeholder argument.
+/// Each query keeps the template SQL and carries its row in [`Query::parameters`], so executors
+/// that support it (Flight SQL) send the row as prepared-statement parameters.
 ///
 /// # Errors
 ///
-/// - If the parameter SQL fails, returns no rows, or returns a NULL or a column type that cannot
-///   be a parameter.
-/// - If the template has a placeholder with no matching column.
+/// If the parameter SQL fails, returns no rows, or returns a NULL or a column type that cannot be
+/// a parameter.
 pub async fn expand_parameter_rows(
     queries: Vec<Query>,
     spice_client: &Arc<SpiceClient>,
@@ -218,16 +217,27 @@ pub async fn expand_parameter_rows(
             query.name,
             rows.len()
         );
-        for (row, parameters) in rows.iter().enumerate() {
-            let sql = inline_parameters(&query.sql, parameters).map_err(|e| {
-                anyhow::anyhow!("Scenario query '{}', parameter row {row}: {e}", query.name)
-            })?;
-            let mut row_query = Query::new(Arc::clone(&query.name), sql.into(), query.overridden);
-            row_query.parameter_rows = ParameterRows::Row(row);
-            expanded.push(row_query);
-        }
+        expanded.extend(template_rows(&query, rows));
     }
     Ok(expanded)
+}
+
+/// One query for each parameter row of `template`, with the template SQL and the row as its
+/// parameters.
+fn template_rows(
+    template: &Query,
+    rows: Vec<Vec<ParameterValue>>,
+) -> impl Iterator<Item = Query> + '_ {
+    rows.into_iter().enumerate().map(|(row, parameters)| {
+        let mut query = Query::new(
+            Arc::clone(&template.name),
+            Arc::clone(&template.sql),
+            template.overridden,
+        );
+        query.parameters = Some(parameters);
+        query.parameter_rows = ParameterRows::Row(row);
+        query
+    })
 }
 
 /// Reads every row of `batches` as a list of parameters, one per column.
@@ -286,37 +296,6 @@ fn parameter_column(column: &dyn Array, name: &str) -> anyhow::Result<Vec<Parame
         ),
     };
     Ok(values)
-}
-
-/// Replaces each `$n` placeholder in `template` with `parameters[n - 1]` as a SQL literal, in one
-/// pass, so that a placeholder-like string inside a parameter value is not replaced again.
-fn inline_parameters(template: &str, parameters: &[ParameterValue]) -> anyhow::Result<String> {
-    let mut sql = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(dollar) = rest.find('$') {
-        sql.push_str(&rest[..dollar]);
-        let after = &rest[dollar + 1..];
-        let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-        if digits == 0 {
-            sql.push('$');
-            rest = after;
-            continue;
-        }
-        let index: usize = after[..digits].parse()?;
-        let parameter = index
-            .checked_sub(1)
-            .and_then(|i| parameters.get(i))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "placeholder ${index} has no parameter; the row has {} column(s)",
-                    parameters.len()
-                )
-            })?;
-        sql.push_str(&parameter.to_sql_literal());
-        rest = &after[digits..];
-    }
-    sql.push_str(rest);
-    Ok(sql)
 }
 
 /// Load CSV file as Arrow `RecordBatches`
@@ -491,19 +470,32 @@ queries:
     }
 
     #[test]
-    fn inline_parameters_replaces_each_placeholder_once() {
-        let parameters = [
-            ParameterValue::String("it's $2".into()),
-            ParameterValue::Number(10),
+    fn template_rows_keep_the_sql_and_bind_each_row() {
+        let template = Query::new(
+            "phrase".into(),
+            "SELECT _id FROM text_search(corpus, $1, $2)".into(),
+            false,
+        );
+        let rows = vec![
+            vec![
+                ParameterValue::String("it's $2".into()),
+                ParameterValue::Number(10),
+            ],
+            vec![
+                ParameterValue::String("new york".into()),
+                ParameterValue::Number(5),
+            ],
         ];
-        // `$2` inside the first value must stay as text; `$` alone is not a placeholder.
-        let sql = inline_parameters("SELECT $1 AS q, $2 AS k, '$' AS d", &parameters)
-            .expect("all placeholders have parameters");
-        assert_eq!(sql, "SELECT 'it''s $2' AS q, 10 AS k, '$' AS d");
 
-        let err = inline_parameters("SELECT $3", &parameters).expect_err("no third parameter");
-        assert!(err.to_string().contains("$3"), "{err}");
-        inline_parameters("SELECT $0", &parameters).expect_err("placeholders start at $1");
+        let queries: Vec<Query> = template_rows(&template, rows.clone()).collect();
+        assert_eq!(queries.len(), 2);
+        for (row, (query, parameters)) in queries.iter().zip(rows).enumerate() {
+            assert_eq!(query.name, template.name);
+            // The values are bound, not written into the SQL.
+            assert_eq!(query.sql, template.sql);
+            assert_eq!(query.parameters, Some(parameters));
+            assert_eq!(query.parameter_rows, ParameterRows::Row(row));
+        }
     }
 
     #[test]

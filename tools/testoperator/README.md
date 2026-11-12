@@ -141,9 +141,9 @@ For more examples, see `test/spicepods/http/queries.yaml`.
 ##### Run one query template for many parameter values (`parameters_from`)
 
 A scenario query can set `parameters_from`: SQL that returns one row for each query to run. Then
-`sql` is a template. Each row becomes one query, with `$1`, `$2`, ... replaced by the row's
-columns, in order, as SQL literals (text, integers, or floats; a NULL is an error). The SQL runs
-against `spiced` after it is ready.
+`sql` is a template. Each row becomes one query, with the row's columns, in order, bound to `$1`,
+`$2`, ... (text, integers, or floats; a NULL is an error). The SQL runs against `spiced` after it is
+ready.
 
 All the queries of a template have the same `name`. Thus, bench reports one latency distribution
 (median, P90, P95, P99, and the number of runs as `iterations`) for each `name`. Bench runs each
@@ -158,8 +158,13 @@ queries:
     parameters_from: SELECT text FROM test_queries WHERE query_type = 'phrase' ORDER BY _id
 ```
 
-The values are inlined, not sent as prepared-statement parameters, because `text_search` does not
-accept a placeholder argument.
+With the default Flight SQL client, each query is a prepared statement with the row as its
+parameters. Thus, the latency includes the prepare and parameter requests. With `--http-clients` or
+`--distributed`, the values are written into the SQL as literals.
+
+A placeholder in a table function argument, such as `text_search(corpus, $1, 10)`, needs a
+`spiced` that has [#15048](https://github.com/spiceai/spiceai/pull/15048). Older versions fail to
+prepare the query.
 
 Full-text search latency benchmarks use this format. The spicepods are in
 `test/spicepods/scenario/sf1/search/`, and the scenario files are in `test/scenario/search/`:
