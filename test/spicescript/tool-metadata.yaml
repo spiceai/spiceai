@@ -105,11 +105,11 @@ steps:
     expect:
       status: 200
       json:
-        - { pointer: '', matches: '^spice\.public\.orders: Customer orders\n  id BIGINT( NOT NULL)?\n  customer_id BIGINT( NOT NULL)?\n  total DECIMAL\(\d+,2\)( NOT NULL)? -- Order total in dollars\n  primary key \(id\)\n$' }
+        - { pointer: '', equals: "spice.public.orders: Customer orders\n  id BIGINT\n  customer_id INT\n  total DECIMAL(18,2) -- Order total in dollars\n  primary key (id)\n" }
 
   # Search keeps only the matching columns and counts the others.
   - http: { method: POST, path: /v1/tools/table_schema, headers: { content-type: application/json }, body: '{"tables": ["orders"], "search": "total", "output": "minimal"}' }
     expect:
       status: 200
       json:
-        - { pointer: '', matches: '^spice\.public\.orders\n  total DECIMAL\(\d+,2\)( NOT NULL)?\n  \(2 other columns not shown\)\n$' }
+        - { pointer: '', equals: "spice.public.orders\n  total DECIMAL(18,2)\n  (2 other columns not shown)\n" }
