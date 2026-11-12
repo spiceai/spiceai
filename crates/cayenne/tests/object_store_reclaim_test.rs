@@ -561,7 +561,7 @@ async fn a_skipped_manifest_rebuild_names_the_files_once_the_lock_is_free(
 async fn a_skipped_manifest_rebuild_names_the_files_once_the_lock_is_free_on_an_object_store()
 -> TestResult {
     let url = url::Url::parse(&format!(
-        "s3://cayenne-test/{}/data",
+        "s3://cayenne-test/state/cayenne/v1/datasets/{}/data",
         uuid::Uuid::now_v7().simple()
     ))?;
     a_skipped_manifest_rebuild_names_the_files_once_the_lock_is_free(Storage::Store {

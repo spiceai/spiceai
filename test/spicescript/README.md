@@ -15,7 +15,6 @@ target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spic
 | --- | --- |
 | `*.yaml` | Scripts that pass; CI runs them against the commit's `spiced`. |
 | `variants.yaml` | The shared variants scripts name instead of writing the patch (`cayenne: cayenne-file`), for every script here and in the directories below. Not a script. |
-| `object-native-data-coverage.md` | Which scripts cover each Cayenne feature, and which have an object-native data variant yet. |
 | `known-failing/<group>/` | Scripts that reproduce open bugs, grouped by the component a fix would touch (one issue per group). A script moves up to `test/spicescript/` once its bug is fixed. |
 | `long/` | Scripts that wait on a source's own clock for many minutes, such as a DynamoDB Streams shard iterator expiring. The merge queue does not run them; `spicescript_long.yml` runs them nightly against the nightly `spiced`, and on demand against any E2E Test CI run's build (`gh workflow run spicescript_long.yml -f run_id=<run>`). |
 | `snapshots/` | Scripts that need a `spiced` built with the `snapshots` feature; `snapshots/known-failing/<group>/` holds those that reproduce open bugs. CI runs neither: its `spiced` is built without the feature. |

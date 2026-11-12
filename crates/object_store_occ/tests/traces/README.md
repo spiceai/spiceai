@@ -186,9 +186,17 @@ Each test prints its replay and control lines with `--no-capture`.
 
 ## Data-file traces
 
-`data-files.jsonl` (8 witnesses) and `data-files-walk.jsonl` (20 walks) are
-copies of `crates/cayenne/tests/traces/` (generation commands in that
-directory's README); keep both copies identical. `../data_file_replay.rs`
+`data-files.jsonl` holds the 8 witnesses of `data-files`, and
+`data-files-walk.jsonl` 20 walks of it (seed 42, 20 steps). They exist only
+here. Generated from the repository root (`TRACE_JSON` appends, so delete the
+files first):
+
+    cargo build --release -p cayenne-metastore-model
+    B=target/release/cayenne-metastore-model; T=crates/object_store_occ/tests/traces
+    TRACE_JSON=$T/data-files.jsonl $B run data-files
+    WALK=42:20:20 TRACE_JSON=$T/data-files-walk.jsonl $B run data-files
+
+`../data_file_replay.rs`
 replays each through the real head log (records carry the committed file set)
 and data PUTs under `dataset/data/`, on InMemory and
 LocalConditionalPut::new_durable, and compares the head and stored files with
@@ -201,7 +209,7 @@ whose PUT has not returned, and a reader that lists the prefix.
 
 `data-files-retire.jsonl` holds the witnesses of `data-files-retire` (17),
 `data-files-retire-3` (17), `data-files-retire-remote` (14) and
-`data-files-retire-prepared` (19), `data-files-retire-walk.jsonl` 20 walks of
+`data-files-retire-prepared` (18), `data-files-retire-walk.jsonl` 20 walks of
 each (seed 42, 40 steps), and `data-files-retire-controls.jsonl` the
 counterexample of each of eight controls for the property it must fail. They
 exist only here. Generated serially from the repository root (`TRACE_JSON`

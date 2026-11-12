@@ -187,7 +187,7 @@ async fn datasets_in_a_shared_bucket_reach_only_their_own_store() -> TestResult 
     let store_b: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut tables = Vec::new();
     for (name, store) in [("orders", &store_a), ("events", &store_b)] {
-        let data_url = format!("s3://bucket/state/{name}/data");
+        let data_url = format!("s3://bucket/state/cayenne/v1/datasets/{name}/data");
         let table = Arc::new(
             crate::common::table_builder_on_store(
                 Arc::clone(&catalog),
@@ -287,11 +287,11 @@ async fn a_dataset_store_refuses_a_path_outside_the_dataset() -> TestResult {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     store
         .put(
-            &Path::from("state/other/data/x.vortex"),
+            &Path::from("state/cayenne/v1/datasets/other/data/x.vortex"),
             PutPayload::from_static(b"x"),
         )
         .await?;
-    let data_url = "s3://bucket/state/mine/data".to_string();
+    let data_url = "s3://bucket/state/cayenne/v1/datasets/mine/data".to_string();
     let table = crate::common::table_builder_on_store(
         catalog,
         ctx.runtime_env(),
@@ -313,13 +313,13 @@ async fn a_dataset_store_refuses_a_path_outside_the_dataset() -> TestResult {
 
     let registered = ctx.runtime_env().object_store(dataset_url(&table)?)?;
     let error = registered
-        .get(&Path::from("state/other/data/x.vortex"))
+        .get(&Path::from("state/cayenne/v1/datasets/other/data/x.vortex"))
         .await
         .err()
         .ok_or("a read outside the dataset's data path succeeded")?;
     assert_eq!(
         error.to_string(),
-        "Generic cayenne error: No Cayenne dataset's storage contains 's3://bucket/state/other/data/x.vortex', so it was not accessed. A dataset reads and writes only under its own data path."
+        "Generic cayenne error: No Cayenne dataset's storage contains 's3://bucket/state/cayenne/v1/datasets/other/data/x.vortex', so it was not accessed. A dataset reads and writes only under its own data path."
     );
     Ok(())
 }
@@ -336,7 +336,10 @@ async fn a_local_dataset_store_leaves_the_shared_file_store_alone() -> TestResul
         .runtime_env()
         .object_store(ObjectStoreUrl::local_filesystem())?;
 
-    let dir = std::fs::canonicalize(&fixture.data_path)?;
+    // The dataset's data directory in a local state location.
+    let dir = fixture.data_path.join("state/cayenne/v1/datasets/local_orders/data");
+    std::fs::create_dir_all(&dir)?;
+    let dir = std::fs::canonicalize(&dir)?;
     let dir_url = url::Url::from_directory_path(&dir).map_err(|()| "directory URL")?;
     let table = Arc::new(
         crate::common::table_builder_on_store(
@@ -569,7 +572,7 @@ async fn a_scan_reads_its_data_files_through_the_dataset_store() -> TestResult {
     let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
     let counting = Arc::new(DataReadCountingStore::default());
     let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
-    let data_url = "s3://bucket/state/scanned/data".to_string();
+    let data_url = "s3://bucket/state/cayenne/v1/datasets/scanned/data".to_string();
     let config = ObjectStoreConfig {
         url: url::Url::parse(&data_url)?,
         store,

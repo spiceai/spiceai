@@ -1390,33 +1390,6 @@ async fn a_placed_dataset_reclaims_orphaned_deletion_vectors_rows_first() {
     );
 }
 
-/// A dataset outside the location keeps today's order, object first: when the
-/// object delete fails the row stays, so a later sweep retries it.
-#[tokio::test]
-async fn an_unplaced_dataset_reclaims_orphaned_deletion_vectors_objects_first() {
-    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
-    let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
-    // An object-native catalog with the dataset's data path outside its location
-    // (`cayenne_file_path: s3://…` under `runtime.params.cayenne_vnext`).
-    let fixture = crate::common::TestFixture::new(crate::common::BackendType::ObjectNative)
-        .await
-        .expect("fixture");
-    let catalog: Arc<dyn MetadataCatalog> =
-        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let data_url = format!("s3://lake/{}/data", uuid::Uuid::now_v7().simple());
-    let outcome = sweep_with_failing_deletes(catalog, &faults, store, &data_url, "swept").await;
-    assert!(
-        outcome.rows_before >= 25,
-        "the upserts wrote deletion vectors: {}",
-        outcome.rows_before
-    );
-    assert_eq!(
-        outcome.rows_after, outcome.rows_before,
-        "a failed object delete keeps its row"
-    );
-    assert_eq!(outcome.objects_after, outcome.objects_before);
-}
-
 /// A placed dataset that holds its rows inline in the metastore flushes them to
 /// a data file it records in its committed file set, so the rows stay visible,
 /// with or without a primary key, and after a restart.
