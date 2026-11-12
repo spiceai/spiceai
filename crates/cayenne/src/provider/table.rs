@@ -8648,6 +8648,10 @@ impl CayenneTableProvider {
             "Retired the snapshot directories the table's snapshot no longer references; each is deleted once no query reads it"
         );
         self.retire_snapshot_dirs(unreferenced.iter().map(String::as_str));
+        // The ledger is shared with the instance this one replaced, so these ids
+        // may already be in it, retired by an instance that closed before its
+        // follow-up swept them. This instance must sweep them itself.
+        self.follow_up_retired_snapshot_dirs(Self::SNAPSHOT_CLEANUP_GRACE);
         Ok(unreferenced)
     }
 

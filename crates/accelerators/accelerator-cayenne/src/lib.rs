@@ -3367,6 +3367,14 @@ impl CayenneAccelerator {
         metastore_type: &str,
     ) -> Result<()> {
         let table_name = source.name().to_string();
+        // The SQLite sidecar is the dataset's own `cayenne.db` under its metadata
+        // directory, which is not the shared catalog's when datasets set different
+        // `cayenne_metadata_dir`s. With no such file there is no load record to clear.
+        if metastore_type != "object_native"
+            && !path_exists(&format!("{metadata_dir}/{METASTORE_DB_FILE}")).await
+        {
+            return Ok(());
+        }
         let sidecar = self
             .sidecar_in(
                 source,
