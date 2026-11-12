@@ -8,6 +8,7 @@ mod action_compatibility;
 mod commits;
 mod concurrent;
 mod core;
+mod data_files;
 mod dataset_lifecycle;
 mod floors;
 mod intent_partitioned;
@@ -2339,6 +2340,135 @@ fn additional_runs() -> Vec<Run> {
             failure: "",
         });
     }
+    // Data files uploaded before the commit that names them.
+    for (name, mode, bound, failure) in [
+        ("data-files", "data-files", 2, ""),
+        ("data-files-3", "data-files", 3, ""),
+        (
+            "data-files-no-upload-before-commit",
+            "data-files-no-upload-before-commit",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-no-committed-read",
+            "data-files-no-committed-read",
+            2,
+            "reader sees only committed files",
+        ),
+        (
+            "data-files-no-resolve-by-head",
+            "data-files-no-resolve-by-head",
+            2,
+            "unknown outcome resolves all-or-nothing",
+        ),
+        ("data-files-intent", "data-files-intent", 2, ""),
+        (
+            "data-files-intent-sweep-ignores-intent",
+            "data-files-intent-sweep-ignores-intent",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-intent-adopt-by-listing",
+            "data-files-intent-adopt-by-listing",
+            2,
+            "aborted or abandoned upload never visible to a reader",
+        ),
+        // Per-file retirement of committed data files and reader protection.
+        ("data-files-retire", "data-files-intent-retire", 2, ""),
+        ("data-files-retire-3", "data-files-intent-retire", 3, ""),
+        // The clock, the retention T and a reader on another instance.
+        (
+            "data-files-retire-remote",
+            "data-files-intent-retire-remote",
+            2,
+            "",
+        ),
+        (
+            "data-files-retire-remote-3",
+            "data-files-intent-retire-remote",
+            3,
+            "",
+        ),
+        (
+            "data-files-retire-whole-snapshot",
+            "data-files-intent-retire-whole-snapshot",
+            2,
+            "local scan within T finds every file",
+        ),
+        (
+            "data-files-retire-3-retires-carried",
+            "data-files-intent-retire-retires-carried",
+            3,
+            "carried or shared file never deleted while live",
+        ),
+        (
+            "data-files-retire-local-ignores-retention",
+            "data-files-intent-retire-local-ignores-retention",
+            2,
+            "local scan within T finds every file",
+        ),
+        (
+            "data-files-retire-remote-ignores-retention",
+            "data-files-intent-retire-remote-ignores-retention",
+            2,
+            "remote reader within T - S finds every file",
+        ),
+        (
+            "data-files-retire-forget-early",
+            "data-files-intent-retire-forget-early",
+            2,
+            "forgotten file leaves nothing behind",
+        ),
+        (
+            "data-files-retire-ignores-restore-hold",
+            "data-files-intent-retire-ignores-restore-hold",
+            2,
+            "restore point copies every file",
+        ),
+        (
+            "data-files-retire-sweep-uncommitted",
+            "data-files-intent-retire-sweep-uncommitted",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-retire-prepared",
+            "data-files-intent-retire-prepared",
+            2,
+            "",
+        ),
+        (
+            "data-files-retire-prepared-lean-3",
+            "data-files-intent-retire-prepared-lean",
+            3,
+            "",
+        ),
+        (
+            "data-files-retire-prepared-orphan-ignores-reservation",
+            "data-files-intent-retire-prepared-orphan-ignores-reservation",
+            2,
+            "committed files exist",
+        ),
+        // Not a control: the retirement sweep's reservation check is not
+        // needed for these properties (see the README).
+        (
+            "data-files-retire-prepared-lean-3-retire-ignores-reservation",
+            "data-files-intent-retire-prepared-lean-retire-ignores-reservation",
+            3,
+            "",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "data-files",
+            mode,
+            bound,
+            seed: None,
+            failure,
+        });
+    }
     runs
 }
 
@@ -2570,12 +2700,22 @@ where
     // broker closure as evidence that the search exhausted its graph.
     let (finished, watch) = std::sync::mpsc::channel::<()>();
     let name = run.name;
+    // Retirement composes local scans and restore points with the retention clock.
+    // Keep the complete graph's bounds while allowing its extra interleavings.
+    let timeout = if run.family == "data-files" && run.mode.contains("retire") {
+        std::time::Duration::from_mins(30)
+    } else {
+        std::time::Duration::from_mins(9)
+    };
     let watchdog = std::thread::spawn(move || {
         if matches!(
-            watch.recv_timeout(std::time::Duration::from_mins(9)),
+            watch.recv_timeout(timeout),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ) {
-            eprintln!("INCOMPLETE {name}: checker exceeded 540 seconds");
+            eprintln!(
+                "INCOMPLETE {name}: checker exceeded {} seconds",
+                timeout.as_secs()
+            );
             std::process::exit(1);
         }
     });
@@ -2724,8 +2864,10 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         && run.failure.is_empty()
         && (run.mode.contains("remote-gc") || run.mode.contains("checkpoint"))
         && *expectation == Expectation::Sometimes;
-    let standby_required = matches!(run.family, "standby" | "object-names" | "reads")
-        && run.failure.is_empty()
+    let standby_required = matches!(
+        run.family,
+        "standby" | "object-names" | "reads" | "data-files"
+    ) && run.failure.is_empty()
         && *expectation == Expectation::Sometimes;
     let promotion_required = run.family == "cold-promotion"
         && run.failure.is_empty()
@@ -2940,6 +3082,7 @@ where
                 || run.family == "standby"
                 || run.family == "object-names"
                 || run.family == "reads"
+                || run.family == "data-files"
                 || run.family == "intent-roll-forward"
                 || run.family == "replicas"
                 || run.mode.contains("restart")
@@ -2997,6 +3140,7 @@ pub fn run(name: &str) -> Result<(), String> {
         "standby" => check(standby::Protocol::new(r.mode), r),
         "object-names" => check(object_names::Protocol::new(r.mode, r.bound), r),
         "reads" => check(reads::Protocol::new(r.mode, r.bound), r),
+        "data-files" => check(data_files::Protocol::new(r.mode, r.bound), r),
         "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
         "retention" => check(retention::Protocol::new(r.mode), r),
         "replicas" => check(replicas::Protocol::new(r.mode), r),
@@ -3065,6 +3209,46 @@ pub fn transaction_steps(run: &str, actions: &[String]) -> Option<Vec<Transactio
         .into_iter()
         .find(|r| r.name == run && r.family == "transactions")?;
     transactions::steps(run.mode, run.bound, actions)
+}
+
+pub use data_files::{
+    CommitKind as DataFileCommitKind, File as DataFile, Key as DataFileKey, Op as DataFileOp,
+    Prepared as DataFilePrepared, Retired as DataFileRetired, Step as DataFileStep,
+};
+
+/// What each action of a `data-files` trace from `run` does in the model, for a
+/// replay through real storage. `None` for an unknown run, a run of another
+/// family, or an action the run does not enable at that point.
+///
+/// Each action maps to one real operation (see [`DataFileOp`]):
+/// `StartUpload(w)` sends writer `w`'s PUT of a fresh data file to its final
+/// key under the dataset prefix, and `FinishUpload(i)` lands the `i`-th PUT in
+/// flight (acknowledged to the writer only if it still knows the upload).
+/// `Commit(w)` sends the conditional head publication, on the head version the
+/// writer read and its lease generation, naming every file whose upload has
+/// returned; `Deliver(i)` has the store evaluate the `i`-th commit request in
+/// flight, and `Drop(i)` loses it. `Timeout(w)` loses the response, leaving an
+/// unknown outcome; `Retry(w)` resends the identical request; `Resolve(w)`
+/// reads the head and resolves the outcome (committed when the head names the
+/// files, aborted once the head moved past the request's base). `Takeover(w)`
+/// is the head commit that raises the lease generation; `Crash(w)` restarts the
+/// writer process. `Read` reads the head's committed file set; `Fetch` GETs the
+/// next file of it. `Sweep(i)` deletes the `i`-th stored file, which no
+/// committed head names and whose generation is fenced. The `retire` runs add
+/// records that remove files by name and retire them (`Compact`,
+/// `CompactCarry`, `Remove`, `Prepare` with `CommitTx`/`AbortTx`), the
+/// holder's sweep (`Plan`, `DeleteLand`, `DeleteFail`, `Forget`), a logical
+/// clock (`Tick`), local scan pins (`Unpin`), restore points and a reader on
+/// another instance (`RemoteConfirm`, `RemoteStart`, `RemoteFetch`). Each step
+/// also carries the head (version, lease, files), the store's files, and in
+/// the `retire` runs the retired set and the clock after the action, the state
+/// a replay checks after every operation.
+#[must_use]
+pub fn data_file_steps(run: &str, actions: &[String]) -> Option<Vec<DataFileStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "data-files")?;
+    data_files::steps(run.mode, run.bound, actions)
 }
 
 /// Problems with the model citations in design documents: a cited run that does
