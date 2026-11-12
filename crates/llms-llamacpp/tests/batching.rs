@@ -370,6 +370,163 @@ async fn requests_with_no_output_limit_preempt_and_reply_as_alone_with_an_mtp_he
     requests_with_no_output_limit_preempt_and_reply_as_alone(&gguf, "qwen3.5", async {}).await;
 }
 
+/// A preempted request whose client reads again resumes in place of a running request whose
+/// client has stopped reading, even the only one running: a request whose client is not reading
+/// holds no room another request can use.
+///
+/// The first request's client stops reading after its first chunk, and the first is preempted
+/// for the second's room, as in [`requests_with_no_output_limit_preempt_and_reply_as_alone`].
+/// The second's client then stops reading too, partway through its reply: the second holds more
+/// of the context than the first's tokens leave, and stalls before the end of the context. The
+/// first's client then reads its whole reply, which it can only once the second leaves the shared
+/// cache for it, and then the second's client reads the rest. Both reply as alone.
+#[tokio::test]
+async fn a_preempted_request_resumes_in_place_of_one_whose_client_stopped_reading() {
+    let (gguf, name) = (qwen3_gguf().await, "qwen3-0.6b");
+    let (alone, prompt) = {
+        let model = load(&gguf, name, 1, SMALL_CONTEXT).await;
+        let usage = model
+            .chat_request(request(unlimited(name, PAST_THE_CONTEXT)))
+            .await
+            .expect("a reply")
+            .usage
+            .expect("the reply reports its usage");
+        let prompt = usize::try_from(usage.prompt_tokens).expect("a count");
+        (
+            streamed(&model, unlimited(name, PAST_THE_CONTEXT)).await,
+            prompt,
+        )
+    };
+    // The first stalls holding its prompt and about a buffer's worth of its reply, and leaves the
+    // shared cache once the second's tokens need its room: past `past_the_first` chunks of the
+    // second's reply. The second's client keeps reading until then, so the second still steps
+    // when room runs out, and stops a buffer's worth short of the end, so the second stalls,
+    // holding the room the first needs, before its reply ends. It stops halfway between.
+    let past_the_first = SMALL_CONTEXT - 2 * prompt - STREAM_BUFFER;
+    let short_of_the_end = SMALL_CONTEXT - prompt - STREAM_BUFFER;
+    let stop_after = past_the_first.midpoint(short_of_the_end);
+    assert!(
+        alone.chunks > stop_after + STREAM_BUFFER,
+        "the reply alone streams {} chunks, so the second could end without its client reading",
+        alone.chunks
+    );
+    let model = load(&gguf, name, 0, SMALL_CONTEXT).await;
+    let mut first = model
+        .chat_stream(request(unlimited(name, PAST_THE_CONTEXT)))
+        .await
+        .expect("a stream");
+    let mut first_text = first_content(&mut first).await;
+    let mut second = model
+        .chat_stream(request(unlimited(name, PAST_THE_CONTEXT)))
+        .await
+        .expect("a stream");
+    let mut second_text =
+        tokio::time::timeout(SERVED_WITHIN, content_chunks(&mut second, stop_after))
+            .await
+            .expect("the second streams while the first's client is not reading");
+    first_text.push_str(
+        &tokio::time::timeout(SERVED_WITHIN, rest(first))
+            .await
+            .expect("the first resumes and replies while the second's client is not reading"),
+    );
+    second_text.push_str(
+        &tokio::time::timeout(SERVED_WITHIN, rest(second))
+            .await
+            .expect("the second resumes once its client reads"),
+    );
+    assert_eq!(
+        (first_text, second_text),
+        (alone.text.clone(), alone.text),
+        "the replies served together, against alone"
+    );
+}
+
+/// The room #15598 specifies a request starts with beside the running ones on a cache every
+/// sequence shares, after its prompt.
+const SPECIFIED_HEADROOM: usize = 256;
+
+/// On a cache every sequence shares, a request whose prompt would leave less than
+/// [`SPECIFIED_HEADROOM`] tokens of room beside a running request does not start beside it, only
+/// to be preempted a few steps later: it waits for the running request to end, and both reply as
+/// alone.
+///
+/// The second request's prompt of about 300 tokens fits beside the first's with room for a step,
+/// but not with the headroom, from the first's first chunk on.
+#[tokio::test]
+async fn a_request_that_would_leave_less_than_the_headroom_waits_for_room() {
+    let (gguf, name) = (qwen3_gguf().await, "qwen3-0.6b");
+    let long = format!(
+        "{}\n\n{}",
+        "The quick brown fox jumps over the lazy dog. ".repeat(30),
+        PROMPTS[0]
+    );
+    let first_body = unlimited(name, PAST_THE_CONTEXT);
+    let second_body = body(name, &long, 300);
+    let (first_alone, second_alone, first_prompt, second_prompt) = {
+        let model = load(&gguf, name, 1, SMALL_CONTEXT).await;
+        let first = model
+            .chat_request(request(first_body.clone()))
+            .await
+            .expect("a reply");
+        let second = model
+            .chat_request(request(second_body.clone()))
+            .await
+            .expect("a reply");
+        let prompt = |reply: &async_openai::types::chat::CreateChatCompletionResponse| {
+            usize::try_from(reply.usage.as_ref().expect("usage").prompt_tokens).expect("a count")
+        };
+        (
+            first.choices[0].message.content.clone().expect("content"),
+            second.choices[0].message.content.clone().expect("content"),
+            prompt(&first),
+            prompt(&second),
+        )
+    };
+    assert!(
+        first_prompt + 1 + second_prompt + SPECIFIED_HEADROOM > SMALL_CONTEXT
+            && first_prompt + STREAM_BUFFER + second_prompt + 1 < SMALL_CONTEXT,
+        "prompts of {first_prompt} and {second_prompt} tokens must leave less than the headroom \
+         from the first's first token on, and room for a step"
+    );
+    let model = load(&gguf, name, 0, SMALL_CONTEXT).await;
+    let mut first = model
+        .chat_stream(request(first_body))
+        .await
+        .expect("a stream");
+    let mut first_text = first_content(&mut first).await;
+    let mut second = model
+        .chat_stream(request(second_body))
+        .await
+        .expect("a stream");
+    let ((first_ended, first_rest), (second_started, second_first)) =
+        tokio::time::timeout(SERVED_WITHIN, async {
+            tokio::join!(
+                async {
+                    let text = rest(first).await;
+                    (std::time::Instant::now(), text)
+                },
+                async {
+                    let text = first_content(&mut second).await;
+                    (std::time::Instant::now(), text)
+                },
+            )
+        })
+        .await
+        .expect("both requests reply");
+    assert!(
+        second_started > first_ended,
+        "the second request's first content came {:?} before the first request ended",
+        first_ended.saturating_duration_since(second_started)
+    );
+    first_text.push_str(&first_rest);
+    let second_text = second_first + &rest(second).await;
+    assert_eq!(
+        (first_text, second_text),
+        (first_alone, second_alone),
+        "the replies, against alone"
+    );
+}
+
 /// A request that needs the room idle sequences' caches hold gets it, even when no other request
 /// runs. On a 1024-token context, two requests with prompts of about 450 tokens run together and
 /// leave that much cached in each sequence; a third, whose prompt of about 680 tokens shares
