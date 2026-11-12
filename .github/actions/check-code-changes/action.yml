@@ -75,6 +75,7 @@ inputs:
         - 'scripts/test_check_bench_mysql_load_nulls.py'
         - 'scripts/check_cayenne_data_path_fs.py'
         - 'scripts/test_check_cayenne_data_path_fs.py'
+        - 'scripts/cayenne_data_path_fs_allowlist.json'
         # Imported by the guards above, so it changes what each of them enforces; its
         # harness runs in `lint-rust` too.
         - 'scripts/rust_guard_common.py'
