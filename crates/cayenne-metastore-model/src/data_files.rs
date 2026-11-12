@@ -122,9 +122,34 @@ const STALENESS: u8 = 1;
 const TICKS: u8 = 3;
 const TICKS_3: u8 = 2;
 
+/// Independent controls selected once from the model run's mode.
+#[derive(Clone, Copy, Debug)]
+enum ModeFlag {
+    AdoptByListing,
+    ForgetEarly,
+    IgnoresPins,
+    IgnoresReservation,
+    IgnoresRestoreHold,
+    IgnoresRetention,
+    Intent,
+    Lean,
+    NoCommittedRead,
+    NoResolveByHead,
+    NoUploadBeforeCommit,
+    OrphanIgnoresReservation,
+    Prepared,
+    Remote,
+    Retire,
+    RetireIgnoresReservation,
+    RetiresCarried,
+    SweepIgnoresIntent,
+    SweepUncommitted,
+    WholeSnapshot,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Protocol {
-    mode: String,
+    flags: u32,
     /// Uploads across writers.
     uploads: u8,
 }
@@ -391,15 +416,45 @@ fn entry<T: Copy>(set: &[(File, T)], file: File) -> Option<T> {
 impl Protocol {
     pub(crate) fn new(mode: &str, bound: usize) -> Self {
         Self {
-            mode: mode.into(),
+            flags: [
+                (ModeFlag::AdoptByListing, "adopt-by-listing"),
+                (ModeFlag::ForgetEarly, "forget-early"),
+                (ModeFlag::IgnoresPins, "ignores-pins"),
+                (ModeFlag::IgnoresReservation, "ignores-reservation"),
+                (ModeFlag::IgnoresRestoreHold, "ignores-restore-hold"),
+                (ModeFlag::IgnoresRetention, "ignores-retention"),
+                (ModeFlag::Intent, "intent"),
+                (ModeFlag::Lean, "lean"),
+                (ModeFlag::NoCommittedRead, "no-committed-read"),
+                (ModeFlag::NoResolveByHead, "no-resolve-by-head"),
+                (ModeFlag::NoUploadBeforeCommit, "no-upload-before-commit"),
+                (
+                    ModeFlag::OrphanIgnoresReservation,
+                    "orphan-ignores-reservation",
+                ),
+                (ModeFlag::Prepared, "prepared"),
+                (ModeFlag::Remote, "remote"),
+                (ModeFlag::Retire, "retire"),
+                (
+                    ModeFlag::RetireIgnoresReservation,
+                    "retire-ignores-reservation",
+                ),
+                (ModeFlag::RetiresCarried, "retires-carried"),
+                (ModeFlag::SweepIgnoresIntent, "sweep-ignores-intent"),
+                (ModeFlag::SweepUncommitted, "sweep-uncommitted"),
+                (ModeFlag::WholeSnapshot, "whole-snapshot"),
+            ]
+            .into_iter()
+            .filter(|(_, name)| mode.contains(*name))
+            .fold(0, |flags, (flag, _)| flags | (1 << flag as u32)),
             uploads: u8::try_from(bound.max(1)).unwrap_or(1),
         }
     }
-    fn has(&self, t: &str) -> bool {
-        self.mode.contains(t)
+    fn has(&self, flag: ModeFlag) -> bool {
+        self.flags & (1 << flag as u32) != 0
     }
     fn retiring(&self) -> bool {
-        self.has("retire")
+        self.has(ModeFlag::Retire)
     }
     fn takes(&self) -> u8 {
         if self.retiring() { RETIRE_TAKES } else { TAKES }
@@ -409,7 +464,7 @@ impl Protocol {
     /// no clock: there T protects no reader, so they take T as zero and the
     /// sweep deletes a retired file once it observes it.
     fn remote(&self) -> bool {
-        self.retiring() && self.has("remote")
+        self.retiring() && self.has(ModeFlag::Remote)
     }
     fn retention(&self) -> u8 {
         if self.remote() { RETENTION } else { 0 }
@@ -425,7 +480,7 @@ impl Protocol {
         }
     }
     fn reads(&self) -> u8 {
-        if self.has("lean") || self.remote() {
+        if self.has(ModeFlag::Lean) || self.remote() {
             0
         } else if self.retiring() {
             RETIRE_READS
@@ -436,7 +491,7 @@ impl Protocol {
     /// Restore points are in the two-upload local graphs; at three uploads
     /// they would push the graph past the checker's time limit.
     fn restores(&self) -> u8 {
-        if self.has("lean") || self.remote() || self.uploads >= 3 {
+        if self.has(ModeFlag::Lean) || self.remote() || self.uploads >= 3 {
             0
         } else {
             RESTORES
@@ -488,14 +543,14 @@ impl Protocol {
     fn named_for_orphans(&self, s: &State, file: File) -> bool {
         s.head.contains(&file)
             || entry(&s.retired, file).is_some()
-            || s.prepared.is_some() && !self.has("orphan-ignores-reservation")
+            || s.prepared.is_some() && !self.has(ModeFlag::OrphanIgnoresReservation)
     }
     /// The retired set the sweeping process reads: the committed one, and in
     /// `sweep-uncommitted` its own removal in flight applied as if it had
     /// landed.
     fn local_view(&self, s: &State, holder: &Writer) -> Vec<Retired> {
         let mut retired = s.retired.clone();
-        if self.has("sweep-uncommitted")
+        if self.has(ModeFlag::SweepUncommitted)
             && let Some((request, _)) = &holder.pending
             && request.kind != CommitKind::Prepare
             && !s.applied.contains(&request.attempt)
@@ -516,9 +571,9 @@ impl Protocol {
         let h = Self::holder_index(s)?;
         let holder = &s.writers[h];
         if s.sweep.is_some()
-            || s.prepared.is_some() && !self.has("retire-ignores-reservation")
-            || s.restore.is_some() && !self.has("ignores-restore-hold")
-            || holder.pending.is_some() && !self.has("sweep-uncommitted")
+            || s.prepared.is_some() && !self.has(ModeFlag::RetireIgnoresReservation)
+            || s.restore.is_some() && !self.has(ModeFlag::IgnoresRestoreHold)
+            || holder.pending.is_some() && !self.has(ModeFlag::SweepUncommitted)
         {
             return None;
         }
@@ -531,9 +586,9 @@ impl Protocol {
             }
             // A scan pinned at commit `p` reads files live at `p`; a file the
             // record at version `by` removed was live at `p` when `by > p`.
-            let pinned = !self.has("ignores-pins") && s.pin.is_some_and(|p| by.version > p);
+            let pinned = !self.has(ModeFlag::IgnoresPins) && s.pin.is_some_and(|p| by.version > p);
             // A snapshot-level rule keeps the files the live set names.
-            let live = self.has("whole-snapshot") && s.head.contains(&file);
+            let live = self.has(ModeFlag::WholeSnapshot) && s.head.contains(&file);
             if waited && !pinned && !live {
                 delete.push(file);
             }
@@ -548,7 +603,7 @@ impl Protocol {
     /// passed on its timer (with no clock, T is zero).
     fn waited(&self, s: &State, holder: &Writer, file: File) -> bool {
         self.retention() == 0
-            || self.has("ignores-retention")
+            || self.has(ModeFlag::IgnoresRetention)
             || entry(&holder.timers, file).is_some_and(|since| s.now >= since + self.retention())
     }
     /// Deletes in flight the running sweep still waits for.
@@ -607,8 +662,8 @@ impl Protocol {
             && match kind {
                 CommitKind::Append => {
                     !writer.finished.is_empty()
-                        || self.has("no-upload-before-commit") && !writer.started.is_empty()
-                        || self.has("adopt-by-listing") && !Self::unnamed(s).is_empty()
+                        || self.has(ModeFlag::NoUploadBeforeCommit) && !writer.started.is_empty()
+                        || self.has(ModeFlag::AdoptByListing) && !Self::unnamed(s).is_empty()
                 }
                 CommitKind::Compact => {
                     self.retiring() && !writer.finished.is_empty() && !s.head.is_empty()
@@ -617,7 +672,7 @@ impl Protocol {
                     self.retiring() && !writer.finished.is_empty() && s.head.len() >= 2
                 }
                 CommitKind::Remove => self.retiring() && !s.head.is_empty(),
-                CommitKind::Prepare => self.has("prepared") && !writer.finished.is_empty(),
+                CommitKind::Prepare => self.has(ModeFlag::Prepared) && !writer.finished.is_empty(),
             }
     }
     /// Whether `action` is enabled in `s`. The model lists only enabled
@@ -651,7 +706,7 @@ impl Protocol {
                 Some((request, true)) => {
                     self.landed(s, request)
                         || s.version != request.base
-                        || self.has("no-resolve-by-head")
+                        || self.has(ModeFlag::NoResolveByHead)
                 }
                 _ => false,
             },
@@ -670,9 +725,9 @@ impl Protocol {
             // the holder's own intent does not protect.
             Action::Sweep(i) => s.store.get(i).is_some_and(|f| {
                 !self.named_for_orphans(s, *f)
-                    && if self.has("intent") {
+                    && if self.has(ModeFlag::Intent) {
                         Self::holder(s).is_some_and(|holder| {
-                            self.has("sweep-ignores-intent") || !Self::intends(holder, *f)
+                            self.has(ModeFlag::SweepIgnoresIntent) || !Self::intends(holder, *f)
                         })
                     } else {
                         f.0.generation < s.lease
@@ -687,7 +742,7 @@ impl Protocol {
             Action::DeleteLand(i) => i < s.deletes.len(),
             Action::DeleteFail(i) => i < s.deletes.len() && s.delete_failures < DELETE_FAILURES,
             Action::Forget => s.sweep.as_ref().is_some_and(|sweep| {
-                self.has("forget-early") || !sweep.failed && Self::outstanding(s) == 0
+                self.has(ModeFlag::ForgetEarly) || !sweep.failed && Self::outstanding(s) == 0
             }),
             Action::Unpin => s.pin.is_some(),
             Action::RestoreStart => {
@@ -695,7 +750,7 @@ impl Protocol {
                     && s.restores < self.restores()
                     && s.restore.is_none()
                     && !s.head.is_empty()
-                    && (s.sweep.is_none() || self.has("ignores-restore-hold"))
+                    && (s.sweep.is_none() || self.has(ModeFlag::IgnoresRestoreHold))
             }
             Action::RestoreCopy => s
                 .restore
@@ -766,10 +821,10 @@ impl Protocol {
         } else {
             vec![]
         };
-        if self.has("no-upload-before-commit") {
+        if self.has(ModeFlag::NoUploadBeforeCommit) {
             files.extend(writer.started.iter().copied());
         }
-        if self.has("adopt-by-listing") {
+        if self.has(ModeFlag::AdoptByListing) {
             let adopted: Vec<File> = Self::unnamed(s)
                 .into_iter()
                 .filter(|f| !files.contains(f))
@@ -800,7 +855,7 @@ impl Protocol {
         if uploads {
             writer.finished.clear();
         }
-        if self.has("no-upload-before-commit") {
+        if self.has(ModeFlag::NoUploadBeforeCommit) {
             writer.started.clear();
         }
         writer.pending = Some((request.clone(), false));
@@ -820,9 +875,9 @@ impl Protocol {
             );
         }
         insert_sorted(&mut next.carried, carry.iter().copied());
-        let retiring: Vec<File> = if self.has("whole-snapshot") && !remove.is_empty() {
+        let retiring: Vec<File> = if self.has(ModeFlag::WholeSnapshot) && !remove.is_empty() {
             base
-        } else if self.has("retires-carried") {
+        } else if self.has(ModeFlag::RetiresCarried) {
             remove.iter().chain(carry).copied().collect()
         } else {
             remove.to_vec()
@@ -1115,7 +1170,7 @@ impl Model for Protocol {
             }
             Action::Read => {
                 next.reads += 1;
-                let listed = if self.has("no-committed-read") {
+                let listed = if self.has(ModeFlag::NoCommittedRead) {
                     keys(&s.store).collect()
                 } else {
                     keys(&s.head).collect()
@@ -1478,7 +1533,7 @@ impl Model for Protocol {
                 |_, s: &State| s.forgot_carried,
             ));
         }
-        if self.has("prepared") {
+        if self.has(ModeFlag::Prepared) {
             properties.extend([
                 Property::sometimes("prepared transaction committed", |_, s: &State| {
                     s.tx_committed
@@ -1486,7 +1541,7 @@ impl Model for Protocol {
                 Property::sometimes("prepared transaction aborted", |_, s: &State| s.tx_aborted),
             ]);
         }
-        if self.has("ignores-reservation") {
+        if self.has(ModeFlag::IgnoresReservation) {
             properties.push(Property::sometimes(
                 "sweep plans while a transaction is prepared",
                 |_, s: &State| s.planned_while_reserved,
