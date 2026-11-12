@@ -373,8 +373,8 @@ jobs:
     needs: [build, check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     permissions:
-      id-token: write
-      contents: write
+      id-token: write  # RustFS, AWS, Docker Hub and Databricks credentials over OIDC
+      contents: read
     runs-on: spiceai-dev-runners
     environment: ci
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 30.7 min (run
