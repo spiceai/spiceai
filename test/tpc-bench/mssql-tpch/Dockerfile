@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/mssql/server:2022-latest
+FROM mcr.microsoft.com/mssql/server:2022-CU27-GDR2-ubuntu-22.04@sha256:11927f5edc5122658e90b3a80ee36e8aef779310bf771415c1d89271859c73fd
 ENV ACCEPT_EULA=Y
 ENV MSSQL_SA_PASSWORD=S3cretP@ssw0rd
 ENV DB_NAME=tpch

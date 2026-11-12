@@ -903,7 +903,7 @@ enum ChoiceDisposition {
     /// The model finished a tool call: run the Spice tools it named and stream the
     /// follow-up answer in place of this choice.
     RunTools,
-    /// Nothing in the choice is for the caller: no finish and no content.
+    /// Nothing in the choice is for the caller: no finish, no content and no reasoning.
     Drop,
 }
 
@@ -917,11 +917,16 @@ enum ChoiceDisposition {
 /// the stream ended on `finish_reason: tool_calls` although the tool had run and
 /// the answer was complete, and a chunk carrying both content and `stop` was
 /// forwarded twice.
+///
+/// A chunk carrying only reasoning is forwarded as it arrives, in every round, so a
+/// reasoning model's thinking streams before its answer or its tool calls.
 fn choice_disposition(choice: &ChatChoiceStream) -> ChoiceDisposition {
     match choice.finish_reason {
         Some(FinishReason::ToolCalls) => ChoiceDisposition::RunTools,
         Some(_) => ChoiceDisposition::Forward,
-        None if choice.delta.content.is_some() => ChoiceDisposition::Forward,
+        None if choice.delta.content.is_some() || choice.delta.reasoning_content.is_some() => {
+            ChoiceDisposition::Forward
+        }
         None => ChoiceDisposition::Drop,
     }
 }
@@ -1438,10 +1443,17 @@ mod tests {
     }
 
     #[test]
-    fn a_choice_without_a_finish_is_forwarded_only_when_it_carries_content() {
+    fn a_choice_without_a_finish_is_forwarded_only_when_it_carries_content_or_reasoning() {
         assert_eq!(
             choice_disposition(&stream_choice(
                 r#"{"index":0,"delta":{"content":"The table has "}}"#
+            )),
+            ChoiceDisposition::Forward
+        );
+        // A reasoning model thinks before it answers or calls a tool: its thinking streams.
+        assert_eq!(
+            choice_disposition(&stream_choice(
+                r#"{"index":0,"delta":{"reasoning_content":"I need the orders table"}}"#
             )),
             ChoiceDisposition::Forward
         );
