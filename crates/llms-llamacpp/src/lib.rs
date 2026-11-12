@@ -156,7 +156,7 @@ const MAX_CONCURRENT: u32 = 8;
 /// replacing it, as llama-server keeps one prompt per slot. Idle prompts give up their room
 /// when a request needs it, longest unused first, so one request can still use the whole
 /// context.
-const CACHED_PROMPTS: u32 = 4;
+pub const CACHED_PROMPTS: u32 = 4;
 
 /// The context size when the model sets no `context_length`.
 const DEFAULT_CONTEXT: u32 = 8192;

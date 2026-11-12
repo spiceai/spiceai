@@ -358,10 +358,23 @@ fn admit<'m, S: Shared<'m>>(
             .unwrap_or(n_ctx)
             .min(n_ctx.saturating_sub(prompt_len));
         let reserve = prompt_len + reply + shared.n_draft() + 1;
-        // With nothing running, the request is served as it would be alone, whatever room the
-        // idle caches gave up.
+        // The running requests' reservations and this one's must fit together, so none runs out
+        // of room mid-reply. With nothing running, the request is served as it would be alone.
         let running = slots.iter().any(|slot| slot.running.is_some());
-        if !make_room(shared, slots, free, reserve, n_ctx) && running {
+        let reserved: usize = slots
+            .iter()
+            .filter_map(|slot| slot.running.as_ref())
+            .map(|running| running.reserved)
+            .sum();
+        if running && reserved + reserve > n_ctx {
+            return;
+        }
+        // The idle caches give up cells only as they are needed, here for the prompt and in
+        // each step for what it decodes: a request with no output limit reserves the whole
+        // context, and emptying them for that would discard every cached prompt for a short
+        // reply.
+        let prompt_cells = prompt_len + shared.n_draft() + 1;
+        if !make_room(shared, slots, Some(free), prompt_cells, n_ctx) && running {
             return;
         }
         let Some(job) = waiting.pop_front() else {
@@ -382,8 +395,8 @@ fn admit<'m, S: Shared<'m>>(
 }
 
 /// The free sequence for `job`: the one whose cache shares the longest prefix with its prompt,
-/// from the same caller, then the one idle longest, then the lowest. `None` when every sequence
-/// runs a request.
+/// from the same caller, then an empty one, then the one idle longest, then the lowest. `None`
+/// when every sequence runs a request.
 fn choose_slot(model: &Model, slots: &[Slot<'_>], job: &Job) -> Option<usize> {
     let tokens = model
         .vocab()
@@ -414,8 +427,12 @@ fn choose_slot(model: &Model, slots: &[Slot<'_>], job: &Job) -> Option<usize> {
             } else {
                 0
             };
+            // An empty cache comes before the one idle longest, however recently it was used:
+            // one whose request failed, or whose client left while its reply waited for room,
+            // is empty with a recent `last_used`, and taking it discards nothing.
             (
                 shared,
+                slot.cache.tokens.is_empty(),
                 std::cmp::Reverse(slot.last_used),
                 std::cmp::Reverse(index),
             )
@@ -423,33 +440,36 @@ fn choose_slot(model: &Model, slots: &[Slot<'_>], job: &Job) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-/// Whether `reserve` more cells fit beside the running requests and the idle caches, emptying
-/// the idle caches longest unused first until they do; `free`'s own cache is the new request's
-/// to reuse, so it is not counted.
+/// Whether `need` more cells fit beside what the sequences hold now, emptying the idle caches
+/// longest unused first until they do. `free`'s cache is the starting request's to reuse, so it
+/// is not counted. When `need` would not fit with every idle cache empty, none is emptied.
 fn make_room<'m, S: Shared<'m>>(
     shared: &mut S,
     slots: &mut [Slot<'m>],
-    free: usize,
-    reserve: usize,
+    free: Option<usize>,
+    need: usize,
     n_ctx: usize,
 ) -> bool {
-    let used = |slots: &[Slot<'m>]| -> usize {
-        slots
-            .iter()
-            .enumerate()
-            .map(|(index, slot)| match &slot.running {
-                Some(running) => running.reserved,
-                None if index == free => 0,
-                None => slot.cache.tokens.len(),
-            })
-            .sum()
-    };
-    while used(slots) + reserve > n_ctx {
+    let running: usize = slots
+        .iter()
+        .filter_map(|slot| slot.running.as_ref())
+        .map(|running| running.history.len())
+        .sum();
+    if running + need > n_ctx {
+        return false;
+    }
+    let mut idle: usize = slots
+        .iter()
+        .enumerate()
+        .filter(|(index, slot)| Some(*index) != free && slot.running.is_none())
+        .map(|(_, slot)| slot.cache.tokens.len())
+        .sum();
+    while running + idle + need > n_ctx {
         let Some(victim) = slots
             .iter()
             .enumerate()
             .filter(|(index, slot)| {
-                *index != free && slot.running.is_none() && !slot.cache.tokens.is_empty()
+                Some(*index) != free && slot.running.is_none() && !slot.cache.tokens.is_empty()
             })
             .min_by_key(|(_, slot)| slot.last_used)
             .map(|(index, _)| index)
@@ -457,6 +477,7 @@ fn make_room<'m, S: Shared<'m>>(
             return false;
         };
         let slot = &mut slots[victim];
+        idle -= slot.cache.tokens.len();
         let mut target = InSeq {
             shared: &mut *shared,
             seq: slot.seq,
@@ -676,6 +697,17 @@ fn step<'m, S: Shared<'m>>(
     if stepping.is_empty() {
         return slots.iter().all(|slot| slot.running.is_none());
     }
+    // A request's step writes its last token and a draft cut to the context, as below, which
+    // the idle caches make room for. The running requests' reservations fit together, so it fits.
+    let need: usize = stepping
+        .iter()
+        .filter_map(|&index| slots[index].running.as_ref())
+        .map(|running| {
+            let past = running.history.len();
+            1 + shared.n_draft().min(n_ctx.saturating_sub(past + 1))
+        })
+        .sum();
+    make_room(shared, slots, None, need, n_ctx);
     let drafts = {
         let requests: Vec<DraftRequest<'_>> = stepping
             .iter()

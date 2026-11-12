@@ -97,16 +97,27 @@ async fn load(gguf: &Path, name: &'static str) -> LlamaCpp {
 
 /// The greedy reply to `messages`, and how many tokens its prompt is.
 async fn ask(model: &LlamaCpp, name: &str, messages: &[Value]) -> (String, usize) {
-    let reply = model
-        .chat_request(request(json!({
-            "model": name,
-            "messages": messages,
-            "temperature": 0,
-            "reasoning_effort": "none",
-            "max_tokens": 32,
-        })))
-        .await
-        .expect("a reply");
+    ask_up_to(model, name, messages, Some(32)).await
+}
+
+/// The greedy reply to `messages` of up to `max_tokens` tokens, or with no output limit when
+/// `None`, and how many tokens its prompt is.
+async fn ask_up_to(
+    model: &LlamaCpp,
+    name: &str,
+    messages: &[Value],
+    max_tokens: Option<u32>,
+) -> (String, usize) {
+    let mut body = json!({
+        "model": name,
+        "messages": messages,
+        "temperature": 0,
+        "reasoning_effort": "none",
+    });
+    if let Some(max_tokens) = max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    let reply = model.chat_request(request(body)).await.expect("a reply");
     let usage = reply.usage.expect("usage");
     let content = reply.choices[0].message.content.clone().expect("content");
     let prompt_tokens = usize::try_from(usage.prompt_tokens).expect("a prompt length fits");
@@ -368,31 +379,113 @@ async fn a_caller_reuses_only_its_own_prompts() {
 /// the cache, reports it as `cached_tokens`, and replies as from an empty cache.
 #[tokio::test]
 async fn a_conversation_keeps_its_prompt_across_an_unrelated_request() {
-    let gguf = crate::qwen3_gguf().await;
     let name = "qwen3-0.6b-cached-prompts";
+    keeps_its_prompt_across(name, Some(32), async |model: &LlamaCpp| {
+        // Another prefix, which with one cached prompt would replace the conversation's.
+        let other = [json!({ "role": "user", "content": "Name one fruit." })];
+        ask(model, name, &other).await;
+    })
+    .await;
+}
+
+/// A request that names no output limit reserves the whole context, which it needs only if it
+/// replies at that length: the other cached prompts give up their room as it grows, not before
+/// it starts, so a conversation's prompt survives a short unrelated reply with no limit.
+#[tokio::test]
+async fn a_conversation_keeps_its_prompt_across_requests_with_no_output_limit() {
+    let name = "qwen3-0.6b-cached-prompts-no-limit";
+    keeps_its_prompt_across(name, None, async |model: &LlamaCpp| {
+        let other = [json!({ "role": "user", "content": "Name one fruit." })];
+        ask_up_to(model, name, &other, None).await;
+    })
+    .await;
+}
+
+/// Questions that share no prefix with each other or with the conversation's, beyond a chat
+/// template's opening tokens, so each takes a cache of its own.
+const UNRELATED: &[&str] = &[
+    "What is the capital of France?",
+    "Write a haiku about rain.",
+    "Translate 'good morning' into Spanish.",
+];
+
+/// A cache a failed request emptied is taken before an occupied one, though it was used more
+/// recently. Once every cache holds a prompt, a request that extends the newest cache's prompt
+/// past the context fails, which empties that cache and no other: it could never fit, so the
+/// idle caches keep their room. An unrelated request then takes the emptied cache, and the
+/// conversation's prompt, idle longest, survives.
+#[tokio::test]
+async fn an_unrelated_request_takes_a_cache_a_failed_request_emptied() {
+    let name = "qwen3-0.6b-cached-prompts-failed";
+    keeps_its_prompt_across(name, Some(32), async |model: &LlamaCpp| {
+        let others = usize::try_from(llms_llamacpp::CACHED_PROMPTS).expect("a count") - 2;
+        assert!(others < UNRELATED.len(), "enough unrelated questions");
+        for question in &UNRELATED[..others] {
+            ask(
+                model,
+                name,
+                &[json!({ "role": "user", "content": question })],
+            )
+            .await;
+        }
+        // The last cache's prompt, long beside its reply, so a request extending it reuses
+        // that cache.
+        let filler = "Paragraph of filler that says nothing. ".repeat(20);
+        let last = [json!({ "role": "user", "content": format!("{filler}Name one tool.") })];
+        ask(model, name, &last).await;
+        let too_long = [json!({ "role": "user", "content": format!("{filler}{}", notes(1500)) })];
+        let refused = model
+            .chat_request(request(json!({
+                "model": name,
+                "messages": too_long,
+                "temperature": 0,
+                "reasoning_effort": "none",
+                "max_tokens": 32,
+            })))
+            .await
+            .expect_err("a prompt longer than the context is refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("and the model's context holds"),
+            "refused for its length: {refused}"
+        );
+        let unrelated = [json!({ "role": "user", "content": UNRELATED[others] })];
+        ask(model, name, &unrelated).await;
+    })
+    .await;
+}
+
+/// Asks a conversation's first turn, runs `between` on the same model, then asks its next turn,
+/// which must read the first turn's prompt from the cache, report it as `cached_tokens`, and
+/// reply as from an empty cache. With `max_tokens` `None`, the turns name no output limit.
+async fn keeps_its_prompt_across(
+    name: &'static str,
+    max_tokens: Option<u32>,
+    between: impl AsyncFnOnce(&LlamaCpp),
+) {
+    let gguf = crate::qwen3_gguf().await;
     let model = load(&gguf, name).await;
     let first = vec![json!({
         "role": "user",
         "content": format!("{}\n\n{}", notes(60), USER_TURNS[0]),
     })];
-    let (reply, first_tokens) = ask(&model, name, &first).await;
-    // Another prefix, which with one cached prompt would replace the conversation's.
-    let other = vec![json!({ "role": "user", "content": "Name one fruit." })];
-    ask(&model, name, &other).await;
+    let (reply, first_tokens) = ask_up_to(&model, name, &first, max_tokens).await;
+    between(&model).await;
 
     let mut next = first.clone();
     next.push(json!({ "role": "assistant", "content": reply }));
     next.push(json!({ "role": "user", "content": USER_TURNS[1] }));
-    let answer = model
-        .chat_request(request(json!({
-            "model": name,
-            "messages": next,
-            "temperature": 0,
-            "reasoning_effort": "none",
-            "max_tokens": 32,
-        })))
-        .await
-        .expect("a reply");
+    let mut body = json!({
+        "model": name,
+        "messages": next,
+        "temperature": 0,
+        "reasoning_effort": "none",
+    });
+    if let Some(max_tokens) = max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    let answer = model.chat_request(request(body)).await.expect("a reply");
     let reused = model.reused_prompt_tokens();
     let cached = answer
         .usage
@@ -412,7 +505,7 @@ async fn a_conversation_keeps_its_prompt_across_an_unrelated_request() {
     let reply = answer.choices[0].message.content.clone().expect("content");
     drop(model);
     let fresh = load(&gguf, name).await;
-    let (cold, _) = ask(&fresh, name, &next).await;
+    let (cold, _) = ask_up_to(&fresh, name, &next, max_tokens).await;
     assert_eq!(reply, cold, "the reply against an empty cache's");
 }
 
