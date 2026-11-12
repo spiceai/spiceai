@@ -862,15 +862,21 @@ impl HostCache {
     /// Returns a prompt [`HostCache::take_best`] took and a request continued only part of, so
     /// its conversation can still continue all of it. What the cache holds stays within the
     /// memory it may use: the sequence's own prompt may have taken the room this one left, so
-    /// the prompts saved longest ago leave, this one among them, until everything fits.
+    /// the prompts saved longest ago leave, this one among them, until everything fits. One that
+    /// no longer fits alone is forgotten, and moves nothing out.
     fn put_back(&mut self, saved: Saved) {
-        let budget = host_budget(self.bytes);
+        // Its state is in memory already: it counts as held, not as memory still available.
+        let budget = host_budget(self.bytes + saved.bytes());
         self.put_back_within(saved, budget);
     }
 
     /// [`HostCache::put_back`] within `budget` bytes.
     fn put_back_within(&mut self, saved: Saved, budget: usize) {
-        self.bytes += saved.bytes();
+        let bytes = saved.bytes();
+        if bytes > budget {
+            return;
+        }
+        self.bytes += bytes;
         self.saved.push(saved);
         self.shrink_to(budget);
     }
@@ -1372,6 +1378,17 @@ mod tests {
         host.put_back_within(taken, 1_000);
         assert_eq!(ticks(&host), [3, 4]);
         assert_eq!(host.bytes, 900);
+    }
+
+    /// A prompt a request continued only part of that no longer fits the budget alone, which
+    /// shrinks as the memory the process can still use does, is forgotten and moves nothing
+    /// out, as [`HostCache::admits`] refuses such a prompt.
+    #[test]
+    fn a_partly_continued_prompt_over_the_budget_moves_nothing_out() {
+        let mut host = holding(&[(300, 1), (300, 2)]);
+        host.put_back_within(saved(300, 3), 250);
+        assert_eq!(ticks(&host), [1, 2]);
+        assert_eq!(host.bytes, 600);
     }
 
     /// What `pick_slot` reads of each free sequence: an empty cache, idle since `last_used`.
