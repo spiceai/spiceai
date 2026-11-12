@@ -85,6 +85,123 @@ impl Protocol {
         rows.sort_unstable();
         rows
     }
+    fn keys(keys: &[usize]) -> String {
+        let keys: Vec<_> = keys.iter().map(|k| format!("k{k}")).collect();
+        format!("[{}]", keys.join(", "))
+    }
+    /// The Explorer's view of a state: the files a reader scans, which rows are
+    /// visible against the rows the serial history expects, the commit log and
+    /// the operations still in flight. "Complete State?" shows the raw state.
+    fn render(state: &State) -> Result<String, std::fmt::Error> {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        writeln!(out, "FILES (position: key)")?;
+        for file in &state.files {
+            write!(out, "  file {} (seq {}):", file.id, file.seq)?;
+            for (position, key) in file.rows.iter().enumerate() {
+                let deleted = state
+                    .deletes
+                    .iter()
+                    .find(|&&(f, p, q)| f == file.id && p == position && q >= file.seq);
+                match deleted {
+                    Some((_, _, seq)) => write!(out, "  {position}:k{key} [deleted @{seq}]")?,
+                    None => write!(out, "  {position}:k{key}")?,
+                }
+            }
+            writeln!(out)?;
+        }
+        let visible = Self::visible(&state.files, &state.deletes);
+        writeln!(out)?;
+        writeln!(
+            out,
+            "READ NOW   visible {}  expected {}  {}",
+            Self::keys(&visible),
+            Self::keys(&state.expected),
+            if visible == state.expected {
+                "ok"
+            } else {
+                "MISMATCH"
+            }
+        )?;
+        writeln!(out)?;
+        writeln!(out, "COMMITTED VERSIONS (visible vs expected)")?;
+        for (version, (actual, expected)) in state.versions.iter().enumerate() {
+            writeln!(
+                out,
+                "  v{version}: {} vs {}  {}",
+                Self::keys(actual),
+                Self::keys(expected),
+                if actual == expected { "ok" } else { "MISMATCH" }
+            )?;
+        }
+        writeln!(out)?;
+        writeln!(out, "COMMIT LOG")?;
+        if state.log.is_empty() {
+            writeln!(out, "  (empty)")?;
+        }
+        for (index, record) in state.log.iter().enumerate() {
+            match record {
+                Record::Replace(r) => {
+                    let mapping: Vec<_> = r
+                        .mapping
+                        .iter()
+                        .enumerate()
+                        .map(|(from, to)| match to {
+                            Some(to) => format!("{from}->{to}"),
+                            None => format!("{from}->gone"),
+                        })
+                        .collect();
+                    writeln!(
+                        out,
+                        "  {}. compaction: file 0 -> file {} {}, positions {}",
+                        index + 1,
+                        r.output.id,
+                        Self::keys(&r.output.rows),
+                        mapping.join(" ")
+                    )?;
+                }
+                Record::Delete {
+                    original,
+                    target,
+                    seq,
+                } => match target {
+                    Some((file, position)) => writeln!(
+                        out,
+                        "  {}. delete k{original} at file {file} position {position} (seq {seq})",
+                        index + 1
+                    )?,
+                    None => writeln!(
+                        out,
+                        "  {}. delete k{original} with no position (seq {seq})",
+                        index + 1
+                    )?,
+                },
+            }
+        }
+        writeln!(out)?;
+        writeln!(out, "IN FLIGHT")?;
+        match &state.delete {
+            Some(d) => writeln!(
+                out,
+                "  delete k{} at file {} position {}, planned at log {}",
+                d.key, d.target.0, d.target.1, d.base
+            )?,
+            None if state.planned_delete => writeln!(out, "  delete: published")?,
+            None => writeln!(out, "  delete: not planned")?,
+        }
+        match &state.rewrite {
+            Some(r) => writeln!(
+                out,
+                "  compaction to file {} {}, planned at log {}",
+                r.output.id,
+                Self::keys(&r.output.rows),
+                r.base
+            )?,
+            None if state.planned_rewrite => writeln!(out, "  compaction: published")?,
+            None => writeln!(out, "  compaction: not planned")?,
+        }
+        Ok(out)
+    }
     fn save(state: &mut State) {
         state.versions.push((
             Self::visible(&state.files, &state.deletes),
@@ -256,6 +373,22 @@ impl Model for Protocol {
             }
         }
         (next != *state).then_some(next)
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::PlanDelete(position) => {
+                format!("plan delete of the row at file 0 position {position}")
+            }
+            Action::PlanRewrite(false) => "plan compaction of file 0 (rotate rows)".into(),
+            Action::PlanRewrite(true) => "plan compaction of file 0 (reverse rows)".into(),
+            Action::PublishRewrite => "publish compaction".into(),
+            Action::RebaseDelete => "rebase delete over the compaction".into(),
+            Action::PublishDelete => "publish delete".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        self.next_state(last_state, action)
+            .and_then(|next| Self::render(&next).ok())
     }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
