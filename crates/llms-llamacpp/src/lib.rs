@@ -1820,6 +1820,18 @@ impl PromptCache {
         }
     }
 
+    /// Gives a request that continues all of `tokens` without reading any of them, as a preempted
+    /// request resumes with its next token already sampled, the cache as it stands: true when it
+    /// holds exactly `tokens` from the caller in `namespace`.
+    fn resume(&mut self, tokens: &[Token], namespace: &CacheNamespace) -> bool {
+        if self.namespace.as_ref() == Some(namespace) && self.tokens == tokens {
+            self.tokens.clear();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Records `tokens` as what the caches hold for the next request, after truncating them to
     /// `tokens`, which drops any drafts verified after them. A cache that cannot roll back that
     /// far leaves nothing to reuse.
@@ -1999,17 +2011,29 @@ fn read_prompt<'m>(
         .vocab()
         .tokenize(prompt, false, true)
         .map_err(|e| e.to_string())?;
-    let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
     if tokens.is_empty() {
         return Err("the rendered prompt is empty".to_string());
     }
+    let (batch, start) = read_tokens(target, cache, (&tokens, namespace), stopping)?;
+    Ok((tokens, batch, start))
+}
+
+/// Decodes the part of `tokens` the cache does not already hold, returning the batch whose last
+/// logits predict the token after them, and how many of the tokens the cache held.
+fn read_tokens<'m>(
+    target: &mut impl Target<'m>,
+    cache: &mut PromptCache,
+    (tokens, namespace): (&[Token], &CacheNamespace),
+    stopping: &AtomicBool,
+) -> std::result::Result<(Batch, usize), String> {
+    let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
     if tokens.len() >= n_ctx {
         return Err(format!(
             "the prompt is {} tokens, and the model's context holds {n_ctx}. Shorten the conversation, or raise `context_length`.",
             tokens.len()
         ));
     }
-    let start = cache.reuse(target, &tokens, namespace);
+    let start = cache.reuse(target, tokens, namespace);
     let mut batch = Batch::new(PROMPT_BATCH);
     // The prompt is read in two spans split at the checkpoint, so the state saved there
     // follows exactly the tokens before it; without one, the first span is empty.
@@ -2019,7 +2043,7 @@ fn read_prompt<'m>(
     // Each span is timed to its computation's end, so the reading's cost and the save's stay
     // apart; sampling, and the save itself, wait for that computation anyway.
     let started = Instant::now();
-    decode_span(target, &mut batch, &tokens, start..split, stopping)?;
+    decode_span(target, &mut batch, tokens, start..split, stopping)?;
     target.context_mut().synchronize();
     let mut read = started.elapsed();
     if let Some(at) = checkpoint {
@@ -2028,11 +2052,11 @@ fn read_prompt<'m>(
         cache.head_stash = target.head_state().map(|state| (at, state));
     }
     let resumed = Instant::now();
-    decode_span(target, &mut batch, &tokens, split..tokens.len(), stopping)?;
+    decode_span(target, &mut batch, tokens, split..tokens.len(), stopping)?;
     target.context_mut().synchronize();
     read += resumed.elapsed();
     cache.read(tokens.len() - start, read);
-    Ok((tokens, batch, start))
+    Ok((batch, start))
 }
 
 /// Decodes `tokens[span]` at their positions, in batches of at most `PROMPT_BATCH`, asking for

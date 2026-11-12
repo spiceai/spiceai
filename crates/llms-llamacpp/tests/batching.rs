@@ -207,16 +207,98 @@ async fn requests_drafted_for_together_reply_as_each_does_alone() {
     assert_eq!(together, alone, "replies served together, against alone");
 }
 
-/// Requests that do not all fit the shared cache at once still all reply, as each does alone:
-/// each is admitted with room for its prompt and its whole reply, so the later ones wait for
-/// the earlier ones instead of failing for lack of room. With a 1024-token context, each of
-/// the four requests reserves its prompt and 320 reply tokens, more than a third of the context,
-/// so at most two run at a time.
+/// Requests whose output limits together pass the shared cache still all reply, as each does
+/// alone. With a 1024-token context, each of the four requests may write 320 reply tokens, more
+/// than a third of the context; each is admitted while its prompt fits beside the running
+/// requests' tokens, and the request admitted last would be preempted should their tokens
+/// outgrow the context.
 #[tokio::test]
-async fn requests_beyond_the_cache_wait_their_turn_and_reply_as_alone() {
+async fn requests_whose_limits_pass_the_cache_reply_as_alone() {
     let gguf = qwen3_gguf().await;
     let (alone, together) = alone_and_together(&gguf, "qwen3-0.6b", &PROMPTS, 320, 1024).await;
     assert_eq!(together, alone, "replies served together, against alone");
+}
+
+/// A request with no output limit: neither `max_tokens` nor `max_completion_tokens`.
+fn unlimited(name: &str, prompt: &str) -> Value {
+    json!({
+        "model": name,
+        "messages": [{ "role": "user", "content": prompt }],
+        "temperature": 0,
+        "reasoning_effort": "none",
+    })
+}
+
+/// A prompt whose greedy reply runs on past [`SMALL_CONTEXT`], so the reply alone ends where
+/// the context does.
+const PAST_THE_CONTEXT: &str =
+    "Count from 1 to 3000 in digits, separated by single spaces. Reply with only the numbers.";
+
+/// A context that one reply to [`PAST_THE_CONTEXT`] fills alone.
+const SMALL_CONTEXT: usize = 512;
+
+/// Two requests with no output limit decode together on a cache every sequence shares, and
+/// when their tokens outgrow the context, one is preempted and resumes later: both reply as
+/// alone.
+///
+/// The first request's client stops reading after its first chunk, so the request holds its
+/// tokens without stepping once its client's buffer is full. The second streams to the end of the
+/// context, which it reaches only if the first's tokens leave the shared cache. The first's client
+/// then reads the rest, and the first resumes. Were each request admitted with room for its
+/// whole possible reply, the second would wait for the first to end, which waits on a client
+/// that is not reading.
+async fn requests_with_no_output_limit_preempt_and_reply_as_alone(gguf: &Path, name: &'static str) {
+    let alone = {
+        let model = load(gguf, name, 1, SMALL_CONTEXT).await;
+        model
+            .chat_request(request(unlimited(name, PAST_THE_CONTEXT)))
+            .await
+            .expect("a reply")
+    };
+    let usage = alone.usage.as_ref().expect("the reply reports its usage");
+    let alone = alone.choices[0].message.content.clone().expect("content");
+    let (held, prompt) = (
+        usize::try_from(usage.total_tokens).expect("a count"),
+        usize::try_from(usage.prompt_tokens).expect("a count"),
+    );
+    assert!(
+        held + prompt > SMALL_CONTEXT,
+        "one reply alone holds {held} tokens and the other's prompt {prompt}, which must not \
+         fit the {SMALL_CONTEXT}-token context together: {alone}"
+    );
+    let model = load(gguf, name, 0, SMALL_CONTEXT).await;
+    let mut first = model
+        .chat_stream(request(unlimited(name, PAST_THE_CONTEXT)))
+        .await
+        .expect("a stream");
+    let mut first_text = first_content(&mut first).await;
+    let second = tokio::time::timeout(
+        SERVED_WITHIN,
+        streamed(&model, unlimited(name, PAST_THE_CONTEXT)),
+    )
+    .await
+    .expect("the second request replies while the first reply's client is not reading");
+    first_text.push_str(&rest(first).await);
+    assert_eq!(
+        (first_text, second.text),
+        (alone.clone(), alone),
+        "the replies served together, against alone"
+    );
+}
+
+/// [`requests_with_no_output_limit_preempt_and_reply_as_alone`] on a model without a draft head.
+#[tokio::test]
+async fn requests_with_no_output_limit_preempt_and_reply_as_alone_without_a_draft() {
+    let gguf = qwen3_gguf().await;
+    requests_with_no_output_limit_preempt_and_reply_as_alone(&gguf, "qwen3-0.6b").await;
+}
+
+/// [`requests_with_no_output_limit_preempt_and_reply_as_alone`] on a hybrid model with an MTP
+/// head, whose recurrent state and head state leave the shared cache with its tokens.
+#[tokio::test]
+async fn requests_with_no_output_limit_preempt_and_reply_as_alone_with_an_mtp_head() {
+    let gguf = qwen35_gguf().await;
+    requests_with_no_output_limit_preempt_and_reply_as_alone(&gguf, "qwen3.5").await;
 }
 
 /// A request that needs the room idle sequences' caches hold gets it, even when no other request
