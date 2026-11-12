@@ -9,6 +9,8 @@ on:
       - 'docs/design/object-native-metastore.md'
       - 'docs/design/object-native-metastore-technical.md'
       - 'crates/cayenne/**'
+      - 'crates/cayenne-metastore-actions/**'
+      - 'crates/accelerators/accelerator-cayenne/**'
       - 'crates/object_store_occ/**'
       - 'crates/object_store_sim/**'
       - '.github/workflows/cayenne_object_native.yml'
@@ -49,7 +51,56 @@ env:
     test(/^rustfs_store_conformance_test::/)
 
 jobs:
+  changes:
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      model: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.model == 'true' }}
+      stores: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.stores == 'true' }}
+      object_store_occ: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.object_store_occ == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: paths
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        with:
+          base: ${{ github.event.merge_group.base_sha || github.event.repository.default_branch }}
+          filters: |
+            model:
+              - 'crates/cayenne-metastore-model/**'
+              - 'docs/design/object-native-metastore.md'
+              - 'docs/design/object-native-metastore-technical.md'
+              - '.github/workflows/cayenne_object_native.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+            stores:
+              - 'crates/cayenne/**'
+              - 'crates/accelerators/accelerator-cayenne/**'
+              - 'crates/cayenne-metastore-actions/**'
+              - 'crates/object_store_occ/**'
+              - 'crates/object_store_sim/**'
+              - '.github/workflows/cayenne_object_native.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+            object_store_occ:
+              - 'crates/object_store_occ/**'
+              - 'crates/object_store_sim/**'
+              - 'crates/cayenne-metastore-actions/**'
+              - 'crates/cayenne-metastore-model/**'
+              - '.github/workflows/cayenne_object_native.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+
   model:
+    needs: changes
     concurrency:
       group: cayenne-metastore-model-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
@@ -57,9 +108,10 @@ jobs:
     # Runs the change's code on persistent self-hosted runners, so fork and
     # Dependabot pull requests run it only from the merge queue.
     if: >-
-      github.event_name != 'pull_request' ||
+      needs.changes.outputs.model == 'true' &&
+      (github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]')
+      github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: spiceai-dev-runners
     # `quick` took 40 s on a 16-core Mac; `all` is not yet timed.
     timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.set == 'all') && 720 || 60 }}
@@ -74,44 +126,21 @@ jobs:
           persist-credentials: false
           # The merge-group path filter diffs against the queue's base.
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
-      # A merge group cannot be filtered by path. Keep this list equal to the
-      # pull_request paths above.
-      - name: Check the merge group for model changes
-        id: changes
-        if: github.event_name == 'merge_group'
-        uses: ./.github/actions/check-code-changes
-        with:
-          filters: |
-            code_changes:
-              - 'crates/cayenne-metastore-model/**'
-              - 'docs/design/object-native-metastore.md'
-              - 'docs/design/object-native-metastore-technical.md'
-              - 'crates/cayenne/**'
-              - 'crates/object_store_occ/**'
-              - 'crates/object_store_sim/**'
-              - '.github/workflows/cayenne_object_native.yml'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
       - uses: ./.github/actions/setup-rust
-        if: github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true'
       # The dev runner image has no C toolchain; mimalloc builds C.
       - uses: ./.github/actions/setup-cc
-        if: github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true'
       - name: Build the model
-        if: github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true'
         run: cargo build --locked --release -p cayenne-metastore-model
       - name: Check the design documents' model citations
-        if: github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true'
         run: target/release/cayenne-metastore-model cite-check docs/design/object-native-metastore.md docs/design/object-native-metastore-technical.md
       - name: Run the ${{ env.SET }} model set
-        if: github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true'
         # Controls (in `all`) require EXHAUST=1.
         env:
           EXHAUST: ${{ env.SET == 'all' && '1' || '' }}
         run: target/release/cayenne-metastore-model "$SET"
 
   stores:
+    needs: changes
     concurrency:
       group: cayenne-data-store-${{ matrix.store }}-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
@@ -119,9 +148,10 @@ jobs:
     # Runs the change's code on persistent self-hosted runners, so fork and
     # Dependabot pull requests run it only from the merge queue.
     if: >-
-      github.event_name != 'pull_request' ||
+      needs.changes.outputs.stores == 'true' &&
+      (github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]')
+      github.event.pull_request.user.login != 'dependabot[bot]'))
     strategy:
       fail-fast: false
       matrix:
@@ -139,40 +169,14 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
-      # A merge group cannot be filtered by path. Keep this list equal to the
-      # pull_request paths above.
-      - name: Check the merge group for data-path changes
-        id: changes
-        if: github.event_name == 'merge_group'
-        uses: ./.github/actions/check-code-changes
-        with:
-          filters: |
-            code_changes:
-              - 'crates/cayenne-metastore-model/**'
-              - 'docs/design/object-native-metastore.md'
-              - 'docs/design/object-native-metastore-technical.md'
-              - 'crates/cayenne/**'
-              - 'crates/object_store_occ/**'
-              - 'crates/object_store_sim/**'
-              - '.github/workflows/cayenne_object_native.yml'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-      - name: Decide whether to run
-        id: run
-        run: echo "run=${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}" >> "$GITHUB_OUTPUT"
       - uses: ./.github/actions/setup-rust
-        if: steps.run.outputs.run == 'true'
       # The dev runner image has no C toolchain, and rustc links through cc.
       - uses: ./.github/actions/setup-cc
-        if: steps.run.outputs.run == 'true'
       - uses: ./.github/actions/install-protoc
-        if: steps.run.outputs.run == 'true'
       - uses: ./.github/actions/setup-nextest
-        if: steps.run.outputs.run == 'true'
 
       - name: Start RustFS
-        if: steps.run.outputs.run == 'true' && matrix.store == 'rustfs'
+        if: matrix.store == 'rustfs'
         env:
           ACCESS_KEY: cayenne-data
           SECRET_KEY: cayenne-data-secret
@@ -209,11 +213,10 @@ jobs:
       # retries = 0: a seeded walk that fails prints its seed and history, and a
       # retry could only hide it.
       - name: Run the data-path suites on the ${{ matrix.store }} store
-        if: steps.run.outputs.run == 'true'
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 --no-fail-fast -E "$SUITES"
       # Session credentials that expire mid-run need RustFS's STS.
       - name: Run the session-credential test against RustFS
-        if: steps.run.outputs.run == 'true' && matrix.store == 'rustfs'
+        if: matrix.store == 'rustfs'
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 --run-ignored only -E 'test(/^session_credentials_test::/)'
 
       - name: Stop RustFS
@@ -223,6 +226,7 @@ jobs:
           docker rm -f "$RUSTFS_CONTAINER" > /dev/null 2>&1 || true
 
   object_store_occ:
+    needs: changes
     concurrency:
       group: cayenne-object-store-occ-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
@@ -230,9 +234,10 @@ jobs:
     # Runs the change's code on persistent self-hosted runners, so fork and
     # Dependabot pull requests run it only from the merge queue.
     if: >-
-      github.event_name != 'pull_request' ||
+      needs.changes.outputs.object_store_occ == 'true' &&
+      (github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]')
+      github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: spiceai-dev-runners
     timeout-minutes: 60
     steps:
@@ -240,38 +245,11 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
-      # A merge group cannot be filtered by path. Keep this list equal to the
-      # pull_request paths above.
-      - name: Check the merge group for data-path changes
-        id: changes
-        if: github.event_name == 'merge_group'
-        uses: ./.github/actions/check-code-changes
-        with:
-          filters: |
-            code_changes:
-              - 'crates/cayenne-metastore-model/**'
-              - 'docs/design/object-native-metastore.md'
-              - 'docs/design/object-native-metastore-technical.md'
-              - 'crates/cayenne/**'
-              - 'crates/object_store_occ/**'
-              - 'crates/object_store_sim/**'
-              - '.github/workflows/cayenne_object_native.yml'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-      - name: Decide whether to run
-        id: run
-        run: echo "run=${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}" >> "$GITHUB_OUTPUT"
       - uses: ./.github/actions/setup-rust
-        if: steps.run.outputs.run == 'true'
       # The dev runner image has no C toolchain, and rustc links through cc.
       - uses: ./.github/actions/setup-cc
-        if: steps.run.outputs.run == 'true'
       - uses: ./.github/actions/install-protoc
-        if: steps.run.outputs.run == 'true'
       - uses: ./.github/actions/setup-nextest
-        if: steps.run.outputs.run == 'true'
 
       - name: Run conditional-write and data-file replay tests
-        if: steps.run.outputs.run == 'true'
         run: cargo nextest run --locked -p object_store_occ --retries 0
