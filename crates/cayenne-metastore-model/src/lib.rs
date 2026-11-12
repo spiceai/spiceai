@@ -13,6 +13,7 @@ mod dataset_lifecycle;
 mod floors;
 mod intent_partitioned;
 mod intent_roll_forward;
+mod mem_tier;
 mod object_names;
 mod position_deletes;
 mod read_programs;
@@ -43,6 +44,62 @@ const DEFAULT_THREADS: usize = 6;
 #[must_use]
 pub fn runs() -> Vec<Run> {
     let mut declared = vec![
+        Run {
+            name: "mem-tier-current-3-exhaust",
+            family: "mem-tier",
+            mode: "mem-tier-current",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-seal-delete-only",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "mem-tier-seal-delete-only-sqlite",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-sqlite",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "mem-tier-no-one-call",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-one-call",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-no-insert-records",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-insert-records",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-no-capture-reservation",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-capture-reservation",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
+        Run {
+            name: "mem-tier-late-stamp",
+            family: "mem-tier",
+            mode: "mem-tier-seal-delete-only-no-early-stamp",
+            bound: 3,
+            seed: None,
+            failure: "recovered reads match the source",
+        },
         Run {
             name: "dataset-lifecycle",
             family: "dataset-lifecycle",
@@ -2779,6 +2836,7 @@ where
         || run.family == "read-delivery"
         || run.family == "remote-maintenance"
         || run.family == "position-deletes"
+        || run.family == "mem-tier"
         || run.family.ends_with("-progress")
         || run.mode.contains("symmetry")
     {
@@ -2969,6 +3027,18 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 | "collector restarted after losing a stamp collects"
         );
     window_required
+        || (run.family == "mem-tier"
+        && run.failure.is_empty()
+        && matches!(
+            name,
+            "flush between checkpoint stage and end"
+                | "crash between checkpoint stage and publish"
+                | "bake prunes then reinsert checkpoints"
+                | "seal shadow recovered"
+                | "full rewrite committed"
+                | "full rewrite interleaves apply"
+                | "full rewrite retains later protected snapshot"
+        ))
         || intent_required
         || added_required
         || standby_required
@@ -3096,6 +3166,7 @@ where
                 || run.family == "position-deletes"
                 || run.family == "cold-promotion"
                 || run.family == "seq-order"
+                || run.family == "mem-tier"
                 || run.family == "lifecycle-composed"
                 || run.family == "state-rules"
                 || run.name.starts_with("dataset-lifecycle")
@@ -3182,6 +3253,7 @@ pub fn run(name: &str) -> Result<(), String> {
         "floors" => check(floors::Protocol::new(r.mode, r.bound), r),
         "concurrent" => check(concurrent::Protocol::new(r.mode, r.bound), r),
         "state-rules" => check(state_rules::Protocol::new(r.mode, r.bound), r),
+        "mem-tier" => check(mem_tier::Protocol::new(r.mode, r.bound), r),
         "seq-order" => check(seq_order::Protocol::new(r.mode, r.bound), r),
         "predicate-progress" => check(read_programs::PredicateProgress::new(r.bound), r),
         "cold-promotion" => check(dataset_lifecycle::promotion::Protocol::new(r.mode), r),
@@ -3219,6 +3291,18 @@ pub fn window_outcome_after(run: &str, actions: &[String]) -> Option<WindowOutco
     window::outcome_after(run.mode, run.bound, actions)
 }
 pub use window::Outcome as WindowOutcome;
+
+pub use mem_tier::{CatalogView as MemTierCatalogView, Step as MemTierStep};
+
+/// Per-action live rows, durable action lists and crash/recover/replay rows.
+/// Returns `None` for an unknown family/run or a disabled/unknown action.
+#[must_use]
+pub fn mem_tier_steps(run: &str, actions: &[String]) -> Option<Vec<MemTierStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "mem-tier")?;
+    mem_tier::steps(run.mode, run.bound, actions)
+}
 
 pub use transactions::Step as TransactionStep;
 

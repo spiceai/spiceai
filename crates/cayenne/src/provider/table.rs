@@ -2590,6 +2590,11 @@ struct TestListingSeams {
 #[cfg(test)]
 type TestCheckpointUnionHook = Box<dyn FnOnce() + Send>;
 
+/// Test-only rendezvous at a completed mem-tier model action.
+#[cfg(test)]
+type TestMemTierStepHook =
+    Arc<dyn Fn(&'static str) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
 #[cfg(test)]
 type TestScanViewBuildHook = Box<dyn FnOnce() + Send>;
 
@@ -2918,6 +2923,8 @@ pub struct CayenneTableProvider {
     /// before it writes the durable shadow. Consumed on first fire.
     #[cfg(test)]
     test_post_seal_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    #[cfg(test)]
+    test_mem_tier_step_hook: Arc<ParkingMutex<Option<TestMemTierStepHook>>>,
     /// Test-only seam fired by a write that fell back from inline to a new snapshot,
     /// after it wrote the snapshot and before it publishes it with its deletions, so
     /// a test can land a checkpoint in that window. Consumed on first fire.
@@ -4593,6 +4600,18 @@ struct ScanFileStatisticsRequest<'a> {
     table_schema: &'a SchemaRef,
     schema_fingerprint: &'a Arc<SchemaFingerprint>,
     generation: u64,
+}
+
+/// What a data-bearing mem-tier checkpoint commits beside its tombstones and
+/// snapshot, so the checkpoint is one metastore commit.
+#[derive(Default)]
+struct CheckpointCommitExtras {
+    /// See [`CayenneTableProvider::flushed_pk_insert_records`].
+    insert_records: Vec<Vec<u8>>,
+    /// The table's statistics including the checkpoint's rows.
+    table_statistics: Option<TableStatistics>,
+    /// The current snapshot, whose per-file statistics are kept.
+    keep_file_statistics_of: Option<String>,
 }
 
 /// Outcome of a best-effort [`CayenneTableProvider::try_checkpoint_mem_tier`].
@@ -12234,6 +12253,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_seal_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_mem_tier_step_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_pre_staged_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::new(ParkingMutex::new(None)),
@@ -14799,6 +14820,8 @@ impl CayenneTableProvider {
             test_post_prepare_hook: Arc::clone(&self.test_post_prepare_hook),
             #[cfg(test)]
             test_post_seal_capture_hook: Arc::clone(&self.test_post_seal_capture_hook),
+            #[cfg(test)]
+            test_mem_tier_step_hook: Arc::clone(&self.test_mem_tier_step_hook),
             #[cfg(test)]
             test_pre_staged_publish_hook: Arc::clone(&self.test_pre_staged_publish_hook),
             #[cfg(test)]
@@ -20143,90 +20166,23 @@ impl CayenneTableProvider {
         }
     }
 
-    /// After `checkpoint_inlined_data` flushes inline rows to a Vortex file at
-    /// `flush_sequence`, walk the supplied PKs and upgrade any pre-existing
-    /// tombstone that still hides them (`insert_seq` absent or older than
-    /// `delete_seq`) to record `insert_seq=flush_sequence`.
+    /// After a checkpoint flushes rows to a Vortex file at `flush_sequence`,
+    /// upgrade any pre-existing tombstone that still hides one of the flushed
+    /// PKs (`insert_seq` absent or older than `delete_seq`) to record
+    /// `insert_seq=flush_sequence`, durably and then in memory.
     ///
     /// Without this upgrade, listing-time pruning via
     /// `vortex_key_delete_pushdown_filter` and the runtime
     /// `Int64PkDeletionFilterExec` keep treating those PKs as fully hidden and
-    /// drop the brand-new checkpoint file's rows. The upgrade is also persisted
-    /// to the catalog as paired insert records so the same state is rebuilt on
-    /// restart.
+    /// drop the brand-new checkpoint file's rows. A caller that commits its own
+    /// metastore change carries [`Self::flushed_pk_insert_records`] in it and
+    /// calls [`Self::upgrade_flushed_pk_tombstones_in_memory`] after publishing.
     async fn upgrade_tombstones_for_flushed_pks(
         &self,
         flushed_pks: &[i64],
         flush_sequence: i64,
     ) -> Result<()> {
-        if flushed_pks.is_empty() {
-            return Ok(());
-        }
-        let PkDeletionStrategyWithCache::Int64Pk {
-            deletion_snapshot, ..
-        } = &self.pk_deletion_strategy
-        else {
-            return Ok(());
-        };
-
-        // Scan the LIVE in-memory index for flushed PKs whose tombstone still
-        // hides them: delete-only, or carrying an insert older than its delete
-        // (a key re-inserted, deleted, then re-inserted again). Its
-        // `insert_sequence` must be stamped so scans see the re-insert. Grouped
-        // by `delete_sequence` for a single rcu fold.
-        let current = deletion_snapshot.load_full();
-        let mut by_delete_seq: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
-        for &pk in flushed_pks {
-            if let Some(t) = current.tombstones.get(pk)
-                && t.insert_sequence
-                    .is_none_or(|insert| insert < t.delete_sequence)
-            {
-                by_delete_seq.entry(t.delete_sequence).or_default().push(pk);
-            }
-        }
-
-        // Persist the reinsert records. This upgrade commits no delete files, so
-        // the metadata-only publish path (`commit_on_conflict_deletions`, which
-        // stamps `reinsert_sequence` on delete-file rows) cannot carry it —
-        // persist per-key insert sequences through the `cayenne_insert_record`
-        // table instead; the merge-on-read reload reads both sides (∪ max), so
-        // the tombstones rebuild identically on restart.
-        //
-        // Crucially, the in-memory scan above can MISS a re-inserted key: a
-        // mem-tier bake (`prune_deletion_index_at_or_below`) prunes tombstones
-        // from the in-memory index only and never clears the durable delete
-        // vector, so a key deleted, absorbed by an earlier checkpoint, pruned,
-        // then re-inserted has a durable delete-only tombstone but no in-memory
-        // entry here. Without a reinsert record, reopen's `load_deletion_vectors_all`
-        // reloads that durable tombstone and the sequence-blind key-delete
-        // pushdown filter hides the just-flushed row — silent data loss. So when
-        // the table has ANY durable delete file, stamp a reinsert record for
-        // EVERY flushed PK (this flush is the latest sequence, so any durable
-        // `delete_sequence < flush_sequence` becomes visible again; a never-deleted
-        // PK's record is inert — no matching delete vector — exactly like the
-        // per-key insert records the pre-metadata-only-publish path always wrote).
-        // With no durable delete file there is nothing to reload, so fall back to
-        // stamping only the live in-memory tombstones, and delete-free tables keep
-        // the metadata-only-publish fast path.
-        let insert_pk_bytes: Vec<Vec<u8>> = if self
-            .catalog
-            .get_table_delete_files(&self.table_metadata.table_id)
-            .await
-            .map_err(|err| Error::Catalog { source: err })?
-            .is_empty()
-        {
-            by_delete_seq
-                .values()
-                .flatten()
-                .map(|pk| pk.to_be_bytes().to_vec())
-                .collect()
-        } else {
-            flushed_pks
-                .iter()
-                .map(|pk| pk.to_be_bytes().to_vec())
-                .collect()
-        };
-
+        let insert_pk_bytes = self.flushed_pk_insert_records(flushed_pks, false).await?;
         if !insert_pk_bytes.is_empty() {
             self.catalog
                 .add_insert_records_batch(
@@ -20237,14 +20193,105 @@ impl CayenneTableProvider {
                 .await
                 .map_err(|err| Error::Catalog { source: err })?;
         }
+        self.upgrade_flushed_pk_tombstones_in_memory(flushed_pks, flush_sequence);
+        Ok(())
+    }
 
-        if by_delete_seq.is_empty() {
-            return Ok(());
+    /// The flushed PKs to persist as insert records at the flush sequence, so
+    /// restart rebuilds the upgrade [`Self::upgrade_flushed_pk_tombstones_in_memory`]
+    /// makes. `adds_delete_files` says whether the commit carrying them also adds
+    /// delete files. Empty for any strategy but `Int64Pk`.
+    ///
+    /// Reinsert records are per-key insert sequences in the
+    /// `cayenne_insert_record` table: the merge-on-read reload reads them and the
+    /// delete vectors (∪ max), so the tombstones rebuild identically on restart.
+    ///
+    /// The in-memory index can MISS a re-inserted key: a mem-tier bake
+    /// (`prune_deletion_index_at_or_below`) prunes tombstones from the in-memory
+    /// index only and never clears the durable delete vector, so a key deleted,
+    /// absorbed by an earlier checkpoint, pruned, then re-inserted has a durable
+    /// delete-only tombstone but no in-memory entry. Without a reinsert record,
+    /// reopen's `load_deletion_vectors_all` reloads that durable tombstone and the
+    /// sequence-blind key-delete pushdown filter hides the just-flushed row —
+    /// silent data loss. So when the table has ANY durable delete file, record
+    /// EVERY flushed PK (the flush is the latest sequence, so any durable
+    /// `delete_sequence < flush_sequence` becomes visible again; a never-deleted
+    /// PK's record is inert — no matching delete vector). With no durable delete
+    /// file there is nothing to reload, so only the PKs a live in-memory
+    /// tombstone hides are recorded, and delete-free tables keep the
+    /// metadata-only-publish fast path.
+    ///
+    /// A delete that lands after this is computed has a sequence above the
+    /// flush's, which a record at the flush sequence does not unhide.
+    async fn flushed_pk_insert_records(
+        &self,
+        flushed_pks: &[i64],
+        adds_delete_files: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        if flushed_pks.is_empty() {
+            return Ok(Vec::new());
         }
+        let PkDeletionStrategyWithCache::Int64Pk {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return Ok(Vec::new());
+        };
+        let has_durable_delete_files = adds_delete_files
+            || !self
+                .catalog
+                .get_table_delete_files(&self.table_metadata.table_id)
+                .await
+                .map_err(|err| Error::Catalog { source: err })?
+                .is_empty();
+        let keys: Vec<i64> = if has_durable_delete_files {
+            flushed_pks.to_vec()
+        } else {
+            Self::flushed_pks_hidden_by(&deletion_snapshot.load_full(), flushed_pks)
+                .into_values()
+                .flatten()
+                .collect()
+        };
+        Ok(keys.iter().map(|pk| pk.to_be_bytes().to_vec()).collect())
+    }
 
-        // ATOMIC upgrade: replay the precomputed groups against the LIVE index
-        // under `rcu`, folding EVERY group in one pass (a single bloom rebuild)
-        // rather than one `extend_max_conflicts` per group.
+    /// The flushed PKs whose tombstone still hides them — delete-only, or
+    /// carrying an insert older than its delete (a key re-inserted, deleted,
+    /// then re-inserted again) — grouped by `delete_sequence`.
+    fn flushed_pks_hidden_by(
+        snapshot: &Int64PkDeletionSnapshot,
+        flushed_pks: &[i64],
+    ) -> BTreeMap<i64, Vec<i64>> {
+        let mut by_delete_seq: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+        for &pk in flushed_pks {
+            if let Some(t) = snapshot.tombstones.get(pk)
+                && t.insert_sequence
+                    .is_none_or(|insert| insert < t.delete_sequence)
+            {
+                by_delete_seq.entry(t.delete_sequence).or_default().push(pk);
+            }
+        }
+        by_delete_seq
+    }
+
+    /// Stamp `insert_seq=flush_sequence` on the live in-memory tombstones that
+    /// still hide a flushed PK, so scans see the flushed rows. The durable side
+    /// is [`Self::flushed_pk_insert_records`].
+    fn upgrade_flushed_pk_tombstones_in_memory(&self, flushed_pks: &[i64], flush_sequence: i64) {
+        let PkDeletionStrategyWithCache::Int64Pk {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return;
+        };
+        let by_delete_seq =
+            Self::flushed_pks_hidden_by(&deletion_snapshot.load_full(), flushed_pks);
+        if by_delete_seq.is_empty() {
+            return;
+        }
+        // ATOMIC upgrade: replay the groups against the LIVE index under `rcu`,
+        // folding EVERY group in one pass (a single bloom rebuild) rather than
+        // one `extend_max_conflicts` per group.
         deletion_snapshot.rcu(move |current| {
             let updated = current.tombstones.extend_max(
                 std::iter::empty::<(i64, i64)>(),
@@ -20255,7 +20302,6 @@ impl CayenneTableProvider {
             Arc::new(Int64PkDeletionSnapshot::from_index(updated))
         });
         self.refresh_deletion_memory_accounting();
-        Ok(())
     }
 
     /// Durably commit an inlined-data mutation to the catalog WITHOUT publishing
@@ -20646,6 +20692,10 @@ impl CayenneTableProvider {
     /// new row versions without the tombstones that hide the old ones, or baked
     /// file rows alongside the inline shadows they replace: duplicate keys
     /// after restart (#16147).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is one part of the one metastore commit"
+    )]
     async fn commit_mem_tier_checkpoint_metadata(
         &self,
         snapshot: &crate::provider::mem_tier::MemTier,
@@ -20654,6 +20704,7 @@ impl CayenneTableProvider {
         corpus_keys: &CheckpointCorpusKeys,
         inline_data: Vec<InlinedData>,
         clear_inlined: bool,
+        extras: CheckpointCommitExtras,
     ) -> CatalogResult<OnConflictUpdate> {
         let mut pure_delete_files: Vec<crate::metadata::DeleteFile> = Vec::new();
         let mut reinsert_delete_files: Vec<crate::metadata::DeleteFile> = Vec::new();
@@ -20766,6 +20817,9 @@ impl CayenneTableProvider {
                 }),
                 inline_data,
                 clear_inlined,
+                insert_records: extras.insert_records,
+                table_statistics: extras.table_statistics,
+                keep_file_statistics_of: extras.keep_file_statistics_of,
             })
             .await?;
 
@@ -28912,6 +28966,8 @@ impl CayenneTableProvider {
                     hook().await;
                 }
             }
+            #[cfg(test)]
+            self.test_mem_tier_step("FullRewriteCapture").await;
             let (stream, rewrite_plan) = self
                 .rewrite_stream_from_view(&ctx, &order, scan_view)
                 .await?;
@@ -34649,6 +34705,14 @@ impl CayenneTableProvider {
         }
     }
 
+    #[cfg(test)]
+    async fn test_mem_tier_step(&self, step: &'static str) {
+        let hook = self.test_mem_tier_step_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(step).await;
+        }
+    }
+
     /// Fire (and consume) the test-only post-seal-capture hook, if one is
     /// installed. See [`Self::test_post_seal_capture_hook`].
     #[cfg(test)]
@@ -34900,6 +34964,17 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the listing table cannot be reconstructed.
     pub(crate) async fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
+        self.refresh_listing_table_under_held_fence_with(true).await
+    }
+
+    /// [`Self::refresh_listing_table_under_held_fence`], clearing the per-file
+    /// statistics of every other snapshot only when `clear_file_statistics` is
+    /// set: a caller whose own metastore commit already cleared them passes
+    /// `false`.
+    async fn refresh_listing_table_under_held_fence_with(
+        &self,
+        clear_file_statistics: bool,
+    ) -> Result<()> {
         // [sound output_ordering] A listing refresh re-lists the current snapshot
         // because its file set changed (a checkpoint/append wrote files), which
         // may have added UNSORTED files — invalidate the sorted attestation. The
@@ -34932,10 +35007,14 @@ impl CayenneTableProvider {
 
         self.listing_table.store(new_listing_table);
 
-        if let Err(error) = self
-            .catalog
-            .clear_snapshot_file_statistics_except(&self.table_metadata.table_id, &current_snapshot)
-            .await
+        if clear_file_statistics
+            && let Err(error) = self
+                .catalog
+                .clear_snapshot_file_statistics_except(
+                    &self.table_metadata.table_id,
+                    &current_snapshot,
+                )
+                .await
         {
             tracing::debug!(
                 table = %self.table_metadata.table_name,
@@ -35595,10 +35674,46 @@ impl CayenneTableProvider {
         num_rows_update: RowCountUpdate,
         replace_aggregate: bool,
     ) -> bool {
+        let Some(stats) = self
+            .prepare_table_stats_locked(accumulator, num_rows_update, replace_aggregate)
+            .await
+        else {
+            return false;
+        };
+        #[cfg(test)]
+        {
+            let hook = self.test_statistics_publish_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+        if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
+            return self.abandon_table_stats_update(&format!(
+                "the statistics record could not be written: {e}"
+            ));
+        }
+        self.table_stats_recorded(stats);
+        true
+    }
+
+    /// The statistics record [`Self::persist_table_stats_locked`] writes, for a
+    /// caller that commits it with its own metastore change. Returns `None` when
+    /// the update is abandoned (and demoted, see
+    /// [`Self::abandon_table_stats_update`]) or the accumulator has no rows. Hold
+    /// `table_statistics_persistence_lock` until the record is committed and
+    /// [`Self::table_stats_recorded`] has run, or until the commit fails.
+    async fn prepare_table_stats_locked(
+        &self,
+        accumulator: &ColumnStatsAccumulator,
+        num_rows_update: RowCountUpdate,
+        replace_aggregate: bool,
+    ) -> Option<TableStatistics> {
+        let abandon = |reason: &str| {
+            self.abandon_table_stats_update(reason);
+            None
+        };
         if accumulator.schema() != self.table_schema().as_ref() {
-            return self.abandon_table_stats_update(
-                "the accumulated statistics describe a different logical schema",
-            );
+            return abandon("the accumulated statistics describe a different logical schema");
         }
         let Some((new_blob, _new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
         else {
@@ -35606,10 +35721,9 @@ impl CayenneTableProvider {
             // still describes the corpus. Any other failure here (serialization,
             // a poisoned mutex) drops rows that ARE already visible to scans.
             if accumulator.row_count() == 0 {
-                return false;
+                return None;
             }
-            return self
-                .abandon_table_stats_update("this write's statistics blob could not be built");
+            return abandon("this write's statistics blob could not be built");
         };
         let new_ndv = accumulator.to_ndv_sketches();
 
@@ -35635,7 +35749,7 @@ impl CayenneTableProvider {
                     // [`PersistedTableStatistics::Unreadable`] for what merging
                     // without one publishes.
                     PersistedTableStatistics::Unreadable => {
-                        return self.abandon_table_stats_update(
+                        return abandon(
                             "the existing statistics record could not be read, so this write has no baseline to merge onto",
                         );
                     }
@@ -35685,27 +35799,17 @@ impl CayenneTableProvider {
         let (num_rows, num_rows_exact) =
             Self::apply_row_count_update(num_rows_update, prev_num_rows, prev_num_rows_exact);
 
-        let stats = TableStatistics {
+        Some(TableStatistics {
             table_id: self.table_metadata.table_id.clone(),
             statistics_blob,
             num_rows,
             ndv_sketches,
             num_rows_exact,
-        };
+        })
+    }
 
-        #[cfg(test)]
-        {
-            let hook = self.test_statistics_publish_hook.lock().take();
-            if let Some(hook) = hook {
-                hook().await;
-            }
-        }
-        if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
-            return self.abandon_table_stats_update(&format!(
-                "the statistics record could not be written: {e}"
-            ));
-        }
-
+    /// Publish a statistics record that has been committed to the metastore.
+    fn table_stats_recorded(&self, stats: TableStatistics) {
         // An authoritative exact count settles anything a failed taint left owed:
         // a full-rewrite `Set` measured the live rows directly, so the durable bit
         // it just wrote is correct regardless of what the previous one claimed.
@@ -35714,7 +35818,6 @@ impl CayenneTableProvider {
         }
         // Keeping the raw blob also avoids a catalog read on the next persist.
         self.store_cached_table_statistics(stats);
-        true
     }
 
     /// Run `publish`, a write's publish (which makes its changes visible) and
@@ -39991,7 +40094,12 @@ impl CayenneTableProvider {
             CheckpointCorpusKeys::None
         };
 
+        #[cfg(test)]
+        self.test_mem_tier_step("CkCapture").await;
+
         if batches.is_empty() {
+            #[cfg(test)]
+            self.test_mem_tier_step("CkPrecompute").await;
             // Tombstones-only tier: no visible row survived the merge-on-read
             // filter (delete-only bursts, or every appended row superseded /
             // deleted in-tier). The tombstones may hide DURABLE rows (file or
@@ -40012,8 +40120,11 @@ impl CayenneTableProvider {
                         &corpus_keys,
                         Vec::new(),
                         clear_inlined,
+                        CheckpointCommitExtras::default(),
                     )
                     .await?;
+                #[cfg(test)]
+                self.test_mem_tier_step("CkStage").await;
                 // The deletion-cache publish and the tier clear must be
                 // indivisible w.r.t. scans (the same fence the data-bearing
                 // arm holds): a scan between them would observe neither the
@@ -40061,6 +40172,8 @@ impl CayenneTableProvider {
             // the tombstones are durable and the tier is cleared, so the request is
             // already owed, and `fire_slot_advancer` awaits.
             self.arm_retention_after_checkpoint();
+            #[cfg(test)]
+            self.test_mem_tier_step("CkPublish").await;
             self.fire_slot_advancer(flushed_epoch).await;
             return Ok(0);
         }
@@ -40259,10 +40372,32 @@ impl CayenneTableProvider {
             } else {
                 Some(self.listing_fence.write().await)
             };
-            let OnConflictUpdate {
-                deletion_update,
-                inlined_tombstone_written,
-            } = self
+            // Everything the checkpoint changes in the metastore commits in this
+            // one call: its tombstones and snapshot, the insert records that keep
+            // re-inserted keys visible after a restart, the statistics including
+            // its rows, and the cleanup of stale per-file statistics. Committed
+            // in parts, a concurrent acknowledgement point could publish one part
+            // alone. The statistics lock is held until the record is committed
+            // and published to the cache, as a standalone persist holds it.
+            let flushed_pks: Vec<i64> = match &corpus_keys {
+                CheckpointCorpusKeys::Int64(corpus) => corpus.iter().copied().collect(),
+                _ => Vec::new(),
+            };
+            let insert_records = self
+                .flushed_pk_insert_records(&flushed_pks, Self::mem_tier_has_tombstones(&snapshot))
+                .await?;
+            let stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+            let pending_superseded = self.mem_tier_pending_superseded.swap(0, Ordering::Relaxed);
+            let table_statistics = self
+                .prepare_table_stats_locked(
+                    &stats,
+                    self.checkpoint_row_count_update(flushed_mem_rows, pending_superseded),
+                    false,
+                )
+                .await;
+            #[cfg(test)]
+            self.test_mem_tier_step("CkPrecompute").await;
+            let committed = self
                 .commit_mem_tier_checkpoint_metadata(
                     &snapshot,
                     Some(&new_snapshot_id),
@@ -40270,8 +40405,34 @@ impl CayenneTableProvider {
                     &corpus_keys,
                     Vec::new(),
                     clear_inlined,
+                    CheckpointCommitExtras {
+                        insert_records,
+                        table_statistics: table_statistics.clone(),
+                        keep_file_statistics_of: Some(self.get_current_snapshot_id()),
+                    },
                 )
-                .await?;
+                .await;
+            let OnConflictUpdate {
+                deletion_update,
+                inlined_tombstone_written,
+            } = match committed {
+                Ok(update) => {
+                    if let Some(table_statistics) = table_statistics {
+                        self.table_stats_recorded(table_statistics);
+                    }
+                    update
+                }
+                Err(error) => {
+                    // Nothing was recorded: the supersedes stay owed to the
+                    // next checkpoint's count.
+                    self.mem_tier_pending_superseded
+                        .fetch_add(pending_superseded, Ordering::Relaxed);
+                    return Err(error.into());
+                }
+            };
+            drop(stats_persistence_guard);
+            #[cfg(test)]
+            self.test_mem_tier_step("CkStage").await;
             // Folding every key the corpus supersedes into the deletion index is
             // the costly part of the publication below; built here, the fenced
             // section only swaps it in (redoing it there if a writer moved the
@@ -40324,18 +40485,16 @@ impl CayenneTableProvider {
                 // store extends the just-published index, not a stale capture)
                 // and BEFORE the listing refresh (the new file must not become
                 // scannable while its PKs are still pushdown-hidden).
-                if let CheckpointCorpusKeys::Int64(corpus) = &corpus_keys {
-                    let flushed_pks: Vec<i64> = corpus.iter().copied().collect();
-                    self.upgrade_tombstones_for_flushed_pks(&flushed_pks, sequence_number)
-                        .await?;
-                }
+                self.upgrade_flushed_pk_tombstones_in_memory(&flushed_pks, sequence_number);
                 self.clear_flushed_mem_tier_state_all_shards(
                     &flushed_counts,
                     clear_inlined,
                     prepared_retains,
                 )
                 .await?;
-                self.refresh_listing_table_under_held_fence().await?;
+                // The checkpoint's record already cleared stale per-file statistics.
+                self.refresh_listing_table_under_held_fence_with(false)
+                    .await?;
             }
             // Sweep previously-retired snapshot dirs (event-anchored, graceful,
             // backgrounded). A checkpoint must NOT drive the uuid7-anchored
@@ -40365,44 +40524,13 @@ impl CayenneTableProvider {
             stats
         };
 
-        // Seed the persisted live `num_rows` from the mem-tier rows that just
-        // became durable. Unlike the inline/staged path — which persists
-        // `Delta(live_rows_delta)` at write time (`try_inline_or_restream` /
-        // `AppendMutationWriter`) — the RAM-append path (`append_to_shard`) only
-        // nets these rows into the in-memory `inlined_row_count`; it never feeds
-        // the persisted aggregate. So the checkpoint is where they enter the
-        // maintained count, or a `cdc_durability: memory` table reports
-        // `num_rows: 0` to the optimizer forever (collapsing every hash join's
-        // build/probe sizing).
-        //
-        // `flushed_mem_rows` is the retained, post-tombstone RAM corpus (any inline
-        // rows swept into the same checkpoint file were ALREADY persisted at
-        // inline-commit time, so `total_rows` would double-count them). But those
-        // rows include NEW versions that supersede already-durable rows which stay
-        // physically resident until compaction — so a raw `Delta(flushed_mem_rows)`
-        // over-counts the live set by the number of durable supersedes, and that
-        // over-count is served `Exact` to the distributed COUNT(*) fold once no
-        // deletions are pending. Net it out with the durable supersedes accumulated
-        // by `append_to_shard` (best-effort: concurrent off-fence appends / a
-        // partial-prefix flush can leave a small residual), and mark the delta
-        // `exact: false` so the maintained count is served `Inexact` — the fold then
-        // declines and a real scan answers `COUNT(*)`. A full-rewrite compaction
-        // `Set` later re-establishes an exact count.
-        let pending_superseded = self.mem_tier_pending_superseded.swap(0, Ordering::Relaxed);
-        let row_count_update = if let Ok(flushed) = i64::try_from(flushed_mem_rows) {
-            RowCountUpdate::Delta {
-                delta: flushed.saturating_sub(pending_superseded),
-                exact: false,
-            }
-        } else {
-            tracing::warn!(
-                table = self.table_metadata.table_name.as_str(),
-                flushed_mem_rows,
-                "mem-tier checkpoint flushed row count exceeds i64::MAX; skipping num_rows delta to avoid poisoning the maintained count"
-            );
-            RowCountUpdate::Unchanged
-        };
-        self.persist_table_stats(&stats, row_count_update).await;
+        // The key arms committed the statistics with the checkpoint's record.
+        if self.pk_deletion_strategy.is_position_based() {
+            let pending_superseded = self.mem_tier_pending_superseded.swap(0, Ordering::Relaxed);
+            let row_count_update =
+                self.checkpoint_row_count_update(flushed_mem_rows, pending_superseded);
+            self.persist_table_stats(&stats, row_count_update).await;
+        }
 
         record_cayenne_write_phase(
             &self.table_metadata.table_name,
@@ -40432,6 +40560,8 @@ impl CayenneTableProvider {
 
         // ONLY NOW — after the Vortex file + metastore pointer are durable — tell
         // the runtime it may advance the source slot to cover this epoch.
+        #[cfg(test)]
+        self.test_mem_tier_step("CkPublish").await;
         self.fire_slot_advancer(flushed_epoch).await;
 
         Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
@@ -40480,6 +40610,49 @@ impl CayenneTableProvider {
     pub(crate) fn arm_retention_after_memory_resident_write(&self) {
         if self.is_memory_resident_mode() {
             self.arm_retention_after_checkpoint();
+        }
+    }
+
+    /// The row-count update that seeds the persisted live `num_rows` from the
+    /// mem-tier rows that just became durable. Unlike the inline/staged path — which persists
+    /// `Delta(live_rows_delta)` at write time (`try_inline_or_restream` /
+    /// `AppendMutationWriter`) — the RAM-append path (`append_to_shard`) only
+    /// nets these rows into the in-memory `inlined_row_count`; it never feeds
+    /// the persisted aggregate. So the checkpoint is where they enter the
+    /// maintained count, or a `cdc_durability: memory` table reports
+    /// `num_rows: 0` to the optimizer forever (collapsing every hash join's
+    /// build/probe sizing).
+    ///
+    /// `flushed_mem_rows` is the retained, post-tombstone RAM corpus (any inline
+    /// rows swept into the same checkpoint file were ALREADY persisted at
+    /// inline-commit time, so `total_rows` would double-count them). But those
+    /// rows include NEW versions that supersede already-durable rows which stay
+    /// physically resident until compaction — so a raw `Delta(flushed_mem_rows)`
+    /// over-counts the live set by the number of durable supersedes, and that
+    /// over-count is served `Exact` to the distributed COUNT(*) fold once no
+    /// deletions are pending. Net it out with the durable supersedes accumulated
+    /// by `append_to_shard` (best-effort: concurrent off-fence appends / a
+    /// partial-prefix flush can leave a small residual), and mark the delta
+    /// `exact: false` so the maintained count is served `Inexact` — the fold then
+    /// declines and a real scan answers `COUNT(*)`. A full-rewrite compaction
+    /// `Set` later re-establishes an exact count.
+    fn checkpoint_row_count_update(
+        &self,
+        flushed_mem_rows: usize,
+        pending_superseded: i64,
+    ) -> RowCountUpdate {
+        if let Ok(flushed) = i64::try_from(flushed_mem_rows) {
+            RowCountUpdate::Delta {
+                delta: flushed.saturating_sub(pending_superseded),
+                exact: false,
+            }
+        } else {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                flushed_mem_rows,
+                "mem-tier checkpoint flushed row count exceeds i64::MAX; skipping num_rows delta to avoid poisoning the maintained count"
+            );
+            RowCountUpdate::Unchanged
         }
     }
 
@@ -40648,6 +40821,9 @@ impl CayenneTableProvider {
             .fold(0, u64::saturating_add);
         let any_tombstones = deltas.iter().any(|d| Self::mem_tier_has_tombstones(d));
 
+        #[cfg(test)]
+        self.test_mem_tier_step("SealCapture").await;
+
         if union_visible.is_empty() && !any_tombstones {
             // Every active row was superseded within the delta and no tombstone hides
             // a durable row: the epoch is vacuously durable. Advance the per-shard
@@ -40659,19 +40835,24 @@ impl CayenneTableProvider {
             return Ok(0);
         }
 
-        // PK membership of the (cross-shard) visible rows drives the reinserted-vs-
-        // pure tombstone split, same as the checkpoint.
-        let corpus_keys = self.checkpoint_corpus_pk_keys(&union_visible)?;
-
-        // Shadow inserts and both kinds of tombstones commit together. Durable
-        // commit only: NO `publish_inlined_mutation`, generation bump, or watermark
-        // advance, so live scans keep serving the RAM tier. The shadow's seal
-        // sequence exceeds every active tombstone sequence; the target snapshot
-        // is None because the inserts live in the inline BLOB. Drop the returned
-        // update: reads hide deleted rows via RAM tombstones until restart.
-        // A later bake may re-commit the tombstones (the index merges by max
-        // sequence). At N==1 the view is shard 0's delta; at N>1 it is the
-        // disjoint-key union, exactly as in the sharded checkpoint.
+        // Shadow inserts and the tombstones commit together. Durable commit only:
+        // NO `publish_inlined_mutation`, generation bump, or watermark advance, so
+        // live scans keep serving the RAM tier. The shadow's seal sequence exceeds
+        // every active tombstone sequence; the target snapshot is None because the
+        // inserts live in the inline BLOB. Drop the returned update: reads hide
+        // deleted rows via RAM tombstones until restart. A later bake may re-commit
+        // the tombstones (the index merges by max sequence). At N==1 the view is
+        // shard 0's delta; at N>1 it is the disjoint-key union, exactly as in the
+        // sharded checkpoint.
+        //
+        // Every tombstone is delete-only, including those of keys the shadow
+        // re-inserts. Inline visibility compares a row's sequence with the delete
+        // sequence and never consults a re-insert, so the shadow needs no stamp. A
+        // stamp would make the restored index re-expose every stored copy of the
+        // key: with no protected snapshot, the current-snapshot scan honors a
+        // re-insert, so a restart served the superseded row beside the shadow
+        // (#16278). The checkpoint that later moves these rows into a file stamps
+        // its own re-inserts and insert records at that file's sequence.
         let inline_data = if union_visible.is_empty() {
             Vec::new()
         } else {
@@ -40696,12 +40877,16 @@ impl CayenneTableProvider {
                 &union_view,
                 None,
                 seal_sequence,
-                &corpus_keys,
+                &CheckpointCorpusKeys::None,
                 inline_data,
                 false,
+                CheckpointCommitExtras::default(),
             )
             .await
             .map_err(|source| Error::Catalog { source })?;
+
+        #[cfg(test)]
+        self.test_mem_tier_step("SealStage").await;
 
         // Flag the durable-but-unpublished shadow so the next bake clears it (its
         // published inline view is empty, so the bake's usual clear gate would miss
@@ -87240,6 +87425,8 @@ mod tests {
              discard its keyset, which rebuilds the whole keyset on every write"
         );
     }
+
+    mod mem_tier_model_replay;
 
     mod append_only_compaction;
 

@@ -852,7 +852,7 @@ impl ObjectNativeCatalog {
                     Err(error) => return Err(invalid(error)),
                 }
                 let mut domain =
-                    Domain::open_with_config(store, prefix, config, false, anchor, &name).await?;
+                    Domain::open_with_config(store, prefix, config, config.commit_each_change, anchor, &name).await?;
                 domain.folder = folder;
                 Ok::<_, CatalogError>((name, Some(domain)))
             }
@@ -1158,7 +1158,7 @@ impl ObjectNativeCatalog {
             Arc::clone(&self.store),
             self.datasets.clone().join(folder.as_str()),
             self.config,
-            false,
+            self.config.commit_each_change,
             self.anchor.clone(),
             &name,
         )
