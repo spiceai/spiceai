@@ -1,4 +1,6 @@
 """Unit tests for check_workflow_environments.py."""
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -428,7 +430,15 @@ class DefinitionsTest(unittest.TestCase):
             result = check_workflow_environments.check_definitions(Path(tmp))
             self.assertEqual(len(result), 1)
             self.assertTrue(result[0].startswith(f"{workflows / 'bad.yaml'}: job 'a' selects no"), result)
-            self.assertEqual(check_workflow_environments.main(["--github-dir", tmp]), 1)
+            # main() prints each problem as a `::error::` workflow command. Left on the
+            # job's stdout, the runner turns this fixture's problem into a failure
+            # annotation on every run of the guard, green or red, pointing at a
+            # temporary file. Capture it, and check the line it would have printed.
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(check_workflow_environments.main(["--github-dir", tmp]), 1)
+            self.assertEqual(out.getvalue().splitlines(), [f"::error::{result[0]}"])
+            self.assertEqual(err.getvalue(), "1 workflow environment problem(s) found.\n")
 
     def test_repository_workflows_pass(self):
         github_dir = Path(__file__).resolve().parent.parent
