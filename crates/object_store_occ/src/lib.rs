@@ -33,7 +33,6 @@ limitations under the License.
 mod capabilities;
 pub mod cleanup;
 mod conditional;
-pub mod durable_local;
 pub mod headlog;
 pub mod lease;
 pub mod local_conditional_put;
@@ -48,7 +47,6 @@ pub use capabilities::{
     ConditionalWriteSupport, Enforcement, is_probe_object, probe_conditional_writes,
 };
 pub use conditional::{ConditionalWriteError, Expected, conditional_put, refused_as_conflict};
-pub use durable_local::DurableLocalFileSystem;
 pub use local_conditional_put::LocalConditionalPut;
 pub use object_store::UpdateVersion;
 pub use retry::{Attempt, ConflictRetry, RetryOnConflictError, retry_on_conflict};

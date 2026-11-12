@@ -195,11 +195,13 @@ impl Display for DataFileError {
 impl std::error::Error for DataFileError {}
 
 /// A store for a dataset whose data is in a local directory addressed as
-/// `file:///…`: object paths are absolute paths without the leading `/`, and
-/// every write is flushed before it returns. Each dataset gets its own.
+/// `file:///…`: object paths are absolute paths without the leading `/`. A
+/// write survives a process crash (written to a temporary file, then renamed)
+/// but is not flushed for power loss: a local directory is for development and
+/// testing. Each dataset gets its own.
 #[must_use]
 pub fn local_directory_store() -> Arc<dyn ObjectStore> {
-    Arc::new(object_store_occ::DurableLocalFileSystem::new())
+    Arc::new(object_store::local::LocalFileSystem::new())
 }
 
 /// A dataset's storage, resolved once when its table opens.

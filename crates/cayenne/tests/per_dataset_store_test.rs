@@ -344,7 +344,7 @@ async fn a_local_dataset_store_leaves_the_shared_file_store_alone() -> TestResul
             ctx.runtime_env(),
             ObjectStoreConfig {
                 url: url::Url::parse("file:///")?,
-                store: Arc::new(object_store_occ::DurableLocalFileSystem::new()),
+                store: Arc::new(object_store::local::LocalFileSystem::new()),
             },
         )
         .create(CreateTableOptions {
