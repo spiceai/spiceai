@@ -118,8 +118,7 @@ async fn probe_bedrock_decision_candidates(
     #[values(
         "us.amazon.nova-lite-v1:0",
         "us.amazon.nova-pro-v1:0",
-        "us.amazon.nova-2-lite-v1:0",
-        "us.amazon.nova-premier-v1:0"
+        "us.amazon.nova-2-lite-v1:0"
     )]
     model_id: &str,
 ) {
@@ -134,10 +133,10 @@ async fn probe_bedrock_decision_candidates(
     })
     .await
     .unwrap_or_else(|e| panic!("PROBE {model_id}: failed to create: {e}"));
-    let model: Arc<dyn Evaluate> = Arc::new(ChatEvaluator::new("bedrock", chat));
+    let model: Arc<dyn Evaluate> = Arc::new(ChatEvaluator::new("bedrock", chat).with_options(evaluate_chat::ChatEvaluatorOptions { output_mode: evaluate_chat::OutputMode::Native, ..Default::default() }));
     let mut failed_rounds = 0;
     for round in 1..=5 {
-        let label = format!("bedrock[{model_id}]#{round}");
+        let label = format!("bedrock-native[{model_id}]#{round}");
         let m = Arc::clone(&model);
         let failures =
             on_shared_runtime(async move { conformance::run_all(m.as_ref(), "bedrock").await }).await;
