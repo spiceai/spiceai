@@ -88,9 +88,6 @@ pub struct ObjectNativeCatalog {
     /// and resolved against it on every read, so a copy of the location opened
     /// at another URL reads its own data.
     anchor: Option<Arc<str>>,
-    /// Lists and aborts the multipart uploads left unfinished in the location,
-    /// for the orphan sweep of each dataset in it, when the location can.
-    unfinished_uploads: Option<Arc<dyn crate::provider::orphan_sweep::UnfinishedUploads>>,
 }
 
 /// A weak handle to a table's restore-point and export deletion hold.
@@ -885,7 +882,6 @@ impl ObjectNativeCatalog {
             dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             deletion_holds: parking_lot::Mutex::new(HashMap::new()),
             anchor,
-            unfinished_uploads: None,
         };
         catalog.recover().await?;
         catalog.reclaim().await?;
@@ -917,27 +913,6 @@ impl ObjectNativeCatalog {
     pub fn with_data_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
         self.data_store = Some(store);
         self
-    }
-
-    /// The orphan sweep of each dataset in the location aborts the multipart
-    /// uploads `uploads` lists under its prefix once they are older than its age
-    /// floor (`object_store` cannot list them).
-    #[must_use]
-    pub fn with_unfinished_uploads(
-        mut self,
-        uploads: Arc<dyn crate::provider::orphan_sweep::UnfinishedUploads>,
-    ) -> Self {
-        self.unfinished_uploads = Some(uploads);
-        self
-    }
-
-    /// What lists and aborts the location's unfinished multipart uploads, when
-    /// the location was given one ([`Self::with_unfinished_uploads`]).
-    #[must_use]
-    pub fn unfinished_uploads(
-        &self,
-    ) -> Option<Arc<dyn crate::provider::orphan_sweep::UnfinishedUploads>> {
-        self.unfinished_uploads.clone()
     }
 
     /// The store a dataset whose data files are in the location keeps them in,

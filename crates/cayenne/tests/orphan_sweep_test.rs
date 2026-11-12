@@ -18,10 +18,9 @@ limitations under the License.
 //! (`cayenne::provider::orphan_sweep`), on fault-injecting stores: an
 //! unreferenced object goes only once the store dates it older than the floor
 //! and no write in flight holds it; an object whose commit outcome is unknown,
-//! a reader's snapshot and a committed file the listing misses are kept;
-//! unfinished multipart uploads are aborted after the floor. A table that is
-//! never written again is swept when it opens, the sweep deletes in batched
-//! requests, and it counts what it reclaimed.
+//! a reader's snapshot and a committed file the listing misses are kept. A table
+//! that is never written again is swept when it opens, the sweep deletes in
+//! batched requests, and it counts what it reclaimed.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{self, Display, Formatter};
@@ -36,9 +35,7 @@ use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig, VortexConfig};
 use cayenne::metastore::object_native::{
     NativeCatalogConfig, ObjectNativeCatalog, new_dataset_folder,
 };
-use cayenne::provider::orphan_sweep::{UnfinishedUpload, UnfinishedUploads};
 use cayenne::{CayenneTableProvider, MetadataCatalog};
-use chrono::Utc;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -49,7 +46,6 @@ use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    UploadPart,
 };
 use object_store_sim::Op;
 use object_store_sim::fault::{Fault, FaultStore};
@@ -61,13 +57,11 @@ const LOCATION: &str = "s3://bucket/state/cayenne/v1";
 /// is young, short enough to wait out.
 const FLOOR: Duration = Duration::from_millis(400);
 
-/// An in-memory store that tracks its unfinished multipart uploads, initiated
-/// on its own clock, can hide keys from listings, lists some keys as last
+/// An in-memory store that can hide keys from listings, lists some keys as last
 /// modified earlier than they were, and records the keys of every delete call.
 #[derive(Debug, Default)]
 struct TrackingStore {
     inner: InMemory,
-    uploads: Arc<Mutex<BTreeMap<String, UnfinishedUpload>>>,
     hidden: Mutex<HashSet<String>>,
     /// Keys listed as last modified this long before the store stamped them.
     aged: Mutex<BTreeMap<String, Duration>>,
@@ -112,28 +106,6 @@ impl Display for TrackingStore {
     }
 }
 
-#[derive(Debug)]
-struct TrackedUpload {
-    inner: Box<dyn MultipartUpload>,
-    id: String,
-    uploads: Arc<Mutex<BTreeMap<String, UnfinishedUpload>>>,
-}
-
-#[async_trait]
-impl MultipartUpload for TrackedUpload {
-    fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        self.inner.put_part(data)
-    }
-    async fn complete(&mut self) -> object_store::Result<PutResult> {
-        self.uploads.lock().remove(&self.id);
-        self.inner.complete().await
-    }
-    async fn abort(&mut self) -> object_store::Result<()> {
-        self.uploads.lock().remove(&self.id);
-        self.inner.abort().await
-    }
-}
-
 #[async_trait]
 impl ObjectStore for TrackingStore {
     async fn put_opts(
@@ -150,21 +122,7 @@ impl ObjectStore for TrackingStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let inner = self.inner.put_multipart_opts(location, opts).await?;
-        let id = uuid::Uuid::now_v7().to_string();
-        self.uploads.lock().insert(
-            id.clone(),
-            UnfinishedUpload {
-                location: location.clone(),
-                upload_id: id.clone(),
-                initiated: Utc::now(),
-            },
-        );
-        Ok(Box::new(TrackedUpload {
-            inner,
-            id,
-            uploads: Arc::clone(&self.uploads),
-        }))
+        self.inner.put_multipart_opts(location, opts).await
     }
     async fn get_opts(
         &self,
@@ -249,28 +207,6 @@ impl ObjectStore for TrackingStore {
         options: RenameOptions,
     ) -> object_store::Result<()> {
         self.inner.rename_opts(from, to, options).await
-    }
-}
-
-/// The tracking store's unfinished uploads, as the sweep sees them.
-#[derive(Debug)]
-struct Uploads(Arc<TrackingStore>);
-
-#[async_trait]
-impl UnfinishedUploads for Uploads {
-    async fn list(&self, prefix: &Path) -> object_store::Result<Vec<UnfinishedUpload>> {
-        Ok(self
-            .0
-            .uploads
-            .lock()
-            .values()
-            .filter(|upload| upload.location.as_ref().starts_with(prefix.as_ref()))
-            .cloned()
-            .collect())
-    }
-    async fn abort(&self, upload: &UnfinishedUpload) -> object_store::Result<()> {
-        self.0.uploads.lock().remove(&upload.upload_id);
-        Ok(())
     }
 }
 
@@ -366,8 +302,7 @@ impl Rig {
                 url: url::Url::parse(&data_url).expect("data url"),
                 store: Arc::clone(&self.store),
             },
-        )
-        .with_unfinished_uploads(Arc::new(Uploads(Arc::clone(&self.tracking))));
+        );
         let table = if native.get_table(name).await.is_ok() {
             builder.open(name).await.expect("open the table")
         } else {
@@ -784,51 +719,6 @@ async fn a_reader_that_opened_before_a_sweep_finishes_with_its_rows() {
     }
     assert_eq!(rows, 5000, "the reader finished with every row: {swept:?}");
     assert_eq!(placed.count().await.expect("count"), (8000, 8000));
-}
-
-/// A multipart upload under the table's prefix that its writer never finished
-/// is aborted once the store dates it older than the floor, not before.
-#[tokio::test]
-async fn an_unfinished_multipart_upload_is_aborted_after_the_floor() {
-    let rig = Rig::new();
-    let placed = rig.place(rig.catalog().await, "orders", None).await;
-    placed.insert(1, 1000).await.expect("first write");
-    let stored = placed.native.get_table("orders").await.expect("table");
-    let key = Path::from(format!(
-        "{}/{}/abandoned.vortex",
-        placed.data_prefix, stored.table_id
-    ));
-    let mut upload = rig
-        .store
-        .put_multipart(&key)
-        .await
-        .expect("begin an upload");
-    upload
-        .put_part(PutPayload::from_static(&[0_u8; 1024]))
-        .await
-        .expect("a part");
-    // The writer goes away without completing or aborting it.
-    drop(upload);
-    let pending = |rig: &Rig| rig.tracking.uploads.lock().len();
-    assert_eq!(pending(&rig), 1);
-
-    let young = placed.table.sweep_orphan_files_now().await.expect("sweep");
-    assert!(
-        young.aborted_uploads.is_empty(),
-        "aborted inside the floor: {young:?}"
-    );
-    assert_eq!(pending(&rig), 1);
-    // Past the floor on the store's clock, which a commit stamps on the head.
-    tokio::time::sleep(FLOOR + Duration::from_millis(200)).await;
-    placed.insert(1001, 1100).await.expect("a later write");
-    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
-    assert_eq!(
-        swept.aborted_uploads,
-        vec!["abandoned.vortex".to_string()],
-        "the upload is aborted after the floor"
-    );
-    assert_eq!(pending(&rig), 0);
-    assert_eq!(placed.count().await.expect("count"), (1100, 1100));
 }
 
 /// A committed file that the store's listings do not return is still read,

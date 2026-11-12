@@ -26,7 +26,6 @@ pub mod s3;
 pub mod snapshot_engine;
 #[cfg(test)]
 mod table_create_tests;
-pub mod unfinished_uploads;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -3773,24 +3772,6 @@ impl CayenneAccelerator {
                         Arc::clone(&store),
                         runtime_state_location::StateFeature::CayenneData,
                     );
-                    // On an S3-compatible location, the orphan sweep of each
-                    // dataset aborts the multipart uploads a crashed write left
-                    // under its folder.
-                    let unfinished_uploads = runtime_state_location::build_s3_sdk_client(
-                        Arc::clone(&secrets),
-                        tokio::runtime::Handle::current(),
-                        &location,
-                        runtime_state_location::StateFeature::CayenneData,
-                    )
-                    .await
-                    .boxed()
-                    .context(AccelerationInitializationFailedSnafu)?
-                    .map(|(client, bucket)| {
-                        Arc::new(unfinished_uploads::S3UnfinishedUploads::new(
-                            client, &bucket,
-                        ))
-                            as Arc<dyn cayenne::provider::orphan_sweep::UnfinishedUploads>
-                    });
                     cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
                         runtime_state_location::metrics::metered(
                             store,
@@ -3802,13 +3783,7 @@ impl CayenneAccelerator {
                         &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
                     )
                     .await
-                    .map(|native| {
-                        let native = native.with_data_store(data_store);
-                        match unfinished_uploads {
-                            Some(uploads) => native.with_unfinished_uploads(uploads),
-                            None => native,
-                        }
-                    })
+                    .map(|native| native.with_data_store(data_store))
                 }
                 None => {
                     cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(

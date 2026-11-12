@@ -46,10 +46,6 @@ limitations under the License.
 //! while a transaction across datasets is prepared on the table: a prepared
 //! transaction names files its commit would add. A file is never adopted.
 //!
-//! Multipart uploads started under the table's prefix and never completed are
-//! aborted on the same floor, measured from the time the store says each was
-//! initiated, when the store can list them ([`UnfinishedUploads`]).
-//!
 //! The sweep runs when the table opens, so the objects a write that crashed or
 //! was fenced left behind are reclaimed even if the table is never written
 //! again, and then at most every [`ORPHAN_SWEEP_INTERVAL`], after a commit or on
@@ -59,9 +55,7 @@ limitations under the License.
 
 use std::time::Duration;
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use object_store::path::Path;
 
 /// How old an unnamed object must be, on the store's clock, before the orphan
 /// sweep deletes it. Far above the longest upload and commit resolution a
@@ -71,30 +65,6 @@ pub(crate) const ORPHAN_AGE_FLOOR: Duration = Duration::from_hours(1);
 
 /// The least time between two orphan sweeps of one table.
 pub(crate) const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_mins(15);
-
-/// A multipart upload a store has started and neither completed nor aborted.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnfinishedUpload {
-    /// The object the upload completes into.
-    pub location: Path,
-    /// The store's id of the upload.
-    pub upload_id: String,
-    /// When the store initiated the upload, on the store's clock.
-    pub initiated: DateTime<Utc>,
-}
-
-/// A store's unfinished multipart uploads: listed under a prefix and aborted.
-/// `object_store` neither lists nor exposes them, and a store without lifecycle
-/// rules (S3 Express One Zone directory buckets) keeps them, and bills for
-/// their parts, until they are aborted.
-#[async_trait]
-pub trait UnfinishedUploads: Send + Sync + std::fmt::Debug {
-    /// Every upload under `prefix` not completed or aborted yet.
-    async fn list(&self, prefix: &Path) -> object_store::Result<Vec<UnfinishedUpload>>;
-
-    /// Abort `upload`, deleting its parts.
-    async fn abort(&self, upload: &UnfinishedUpload) -> object_store::Result<()>;
-}
 
 /// What one orphan sweep did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -107,8 +77,6 @@ pub struct OrphanSweep {
     pub kept_young: usize,
     /// Unnamed objects kept because a write in this process holds them.
     pub kept_in_flight: usize,
-    /// Unfinished multipart uploads aborted.
-    pub aborted_uploads: Vec<String>,
     /// Objects the sweep tried to delete that may still be stored; the next
     /// sweep retries them.
     pub failed: usize,

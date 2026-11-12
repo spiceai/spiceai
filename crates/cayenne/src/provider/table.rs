@@ -3508,9 +3508,6 @@ pub struct CayenneTableProvider {
     /// in snapshot directories and no commit names yet (see
     /// [`super::uncommitted_files`]). Shared by every clone.
     uncommitted_files: Arc<super::uncommitted_files::UncommittedFiles>,
-    /// Lists and aborts the store's unfinished multipart uploads, for the orphan
-    /// sweep; `None` when the store cannot.
-    unfinished_uploads: Option<Arc<dyn super::orphan_sweep::UnfinishedUploads>>,
     /// The orphan sweep's age floor, in milliseconds
     /// ([`super::orphan_sweep::ORPHAN_AGE_FLOOR`] unless a test sets it).
     orphan_age_floor_ms: Arc<AtomicU64>,
@@ -3859,7 +3856,6 @@ pub struct CayenneTableProviderBuilder {
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
     partitioned_table_conflict_detection: Option<PkConflictDetection>,
-    unfinished_uploads: Option<Arc<dyn super::orphan_sweep::UnfinishedUploads>>,
 }
 
 /// Whether a table's secondary index runs persist as run files, so a
@@ -4014,7 +4010,6 @@ struct CayenneTableProviderOpenOptions {
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
-    unfinished_uploads: Option<Arc<dyn super::orphan_sweep::UnfinishedUploads>>,
     /// The conflict detection recorded for the partitioned table this table is a
     /// partition of, if it is one. A partition follows that table turning the check
     /// off, with the conflict action it records cleared to match, as the table's own is:
@@ -4073,7 +4068,6 @@ impl CayenneTableProviderBuilder {
             dataset_name: None,
             snapshot_dir_pins: None,
             partitioned_table_conflict_detection: None,
-            unfinished_uploads: None,
         }
     }
 
@@ -4095,18 +4089,6 @@ impl CayenneTableProviderBuilder {
     #[must_use]
     pub fn with_snapshot_dir_pins(mut self, pins: SnapshotDirPins) -> Self {
         self.snapshot_dir_pins = Some(pins);
-        self
-    }
-
-    /// List and abort the multipart uploads the table's store started and never
-    /// finished, which the orphan sweep aborts once they are older than its
-    /// floor. Without it the sweep leaves them to the store.
-    #[must_use]
-    pub fn with_unfinished_uploads(
-        mut self,
-        uploads: Arc<dyn super::orphan_sweep::UnfinishedUploads>,
-    ) -> Self {
-        self.unfinished_uploads = Some(uploads);
         self
     }
 
@@ -4252,7 +4234,6 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
-            unfinished_uploads: self.unfinished_uploads,
             partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
             existed: true,
         };
@@ -4295,7 +4276,6 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
-            unfinished_uploads: self.unfinished_uploads,
             partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
             existed,
         };
@@ -11877,7 +11857,6 @@ impl CayenneTableProvider {
             index_word_bits,
             dataset_name,
             snapshot_dir_pins,
-            unfinished_uploads,
             partitioned_table_conflict_detection,
             existed,
         } = options;
@@ -11885,18 +11864,6 @@ impl CayenneTableProvider {
         let mut table_metadata = catalog.get_table(table_name).await?;
         table_metadata.on_conflict =
             upsert_on_primary_key(&table_metadata.primary_key, table_metadata.on_conflict);
-        // A table in the object-native location takes the location's lister of
-        // unfinished multipart uploads unless it was given its own.
-        let unfinished_uploads = unfinished_uploads.or_else(|| {
-            crate::metastore_layout::is_object_native_data_path(&table_metadata.path)
-                .then(|| {
-                    catalog
-                        .as_any()
-                        .downcast_ref::<crate::metastore::object_native::ObjectNativeCatalog>()
-                        .and_then(crate::metastore::object_native::ObjectNativeCatalog::unfinished_uploads)
-                })
-                .flatten()
-        });
         if partitioned_table_conflict_detection == Some(PkConflictDetection::None) {
             table_metadata.vortex_config.pk_conflict_detection = PkConflictDetection::None;
             table_metadata.on_conflict = None;
@@ -12388,7 +12355,6 @@ impl CayenneTableProvider {
             staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             publication_outcome_unknown: Arc::new(AtomicBool::new(false)),
             uncommitted_files,
-            unfinished_uploads,
             orphan_age_floor_ms: Arc::new(AtomicU64::new(
                 u64::try_from(super::orphan_sweep::ORPHAN_AGE_FLOOR.as_millis())
                     .unwrap_or(u64::MAX),
@@ -14888,7 +14854,6 @@ impl CayenneTableProvider {
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
             publication_outcome_unknown: Arc::clone(&self.publication_outcome_unknown),
             uncommitted_files: Arc::clone(&self.uncommitted_files),
-            unfinished_uploads: self.unfinished_uploads.clone(),
             orphan_age_floor_ms: Arc::clone(&self.orphan_age_floor_ms),
             last_orphan_sweep: Arc::clone(&self.last_orphan_sweep),
             orphan_sweep_running: Arc::clone(&self.orphan_sweep_running),
@@ -25081,9 +25046,7 @@ impl CayenneTableProvider {
         let outcome = match &result {
             Ok(report) if report.skipped.is_some() => None,
             Ok(report) if report.failed > 0 => Some(MaintenanceOutcome::Failed),
-            Ok(report) if !report.deleted.is_empty() || !report.aborted_uploads.is_empty() => {
-                Some(MaintenanceOutcome::Reclaimed)
-            }
+            Ok(report) if !report.deleted.is_empty() => Some(MaintenanceOutcome::Reclaimed),
             Ok(_) => Some(MaintenanceOutcome::NoOp),
             Err(_) => Some(MaintenanceOutcome::Failed),
         };
@@ -25100,7 +25063,7 @@ impl CayenneTableProvider {
     /// Run the orphan sweep ([`super::orphan_sweep`]) with the age floor
     /// `floor`: delete what a listing of the table finds that no snapshot names,
     /// no write of this process holds, and the store dates older than the floor,
-    /// in batched requests, and abort unfinished multipart uploads older than it.
+    /// in batched requests.
     /// Nothing listed is ever adopted. The caller holds `orphan_sweep_running`.
     ///
     /// # Errors
@@ -25307,35 +25270,10 @@ impl CayenneTableProvider {
             .collect();
         report.deleted.sort();
 
-        if let Some(uploads) = &self.unfinished_uploads {
-            let unfinished = uploads
-                .list(&table_prefix)
-                .await
-                .map_err(store_error("list the table's unfinished multipart uploads"))?;
-            for upload in unfinished {
-                if !older_than_floor(upload.initiated, store_now, floor) {
-                    continue;
-                }
-                let relative = crate::object_relative(&table_prefix, &upload.location)
-                    .unwrap_or(upload.location.as_ref())
-                    .to_string();
-                let held_upload =
-                    held_keys.contains(relative.rsplit('/').next().unwrap_or(relative.as_str()));
-                if held_upload {
-                    continue;
-                }
-                uploads
-                    .abort(&upload)
-                    .await
-                    .map_err(store_error("abort an unfinished multipart upload"))?;
-                report.aborted_uploads.push(relative);
-            }
-        }
-        if !report.deleted.is_empty() || !report.aborted_uploads.is_empty() {
+        if !report.deleted.is_empty() {
             tracing::debug!(
                 table = self.table_name(),
                 deleted = report.deleted.len(),
-                aborted_uploads = report.aborted_uploads.len(),
                 "The orphan sweep reclaimed objects no snapshot of the table names"
             );
         }

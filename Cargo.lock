@@ -18567,7 +18567,6 @@ version = "2.5.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
- "aws-sdk-s3",
  "bytes",
  "datafusion",
  "futures",

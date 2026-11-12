@@ -431,42 +431,6 @@ impl S3ObjectStoreBuilder {
 
         Ok(Arc::new(store))
     }
-
-    /// The bucket the store is built for.
-    #[must_use]
-    pub fn bucket_name(&self) -> &str {
-        &self.bucket_name
-    }
-
-    /// An AWS SDK S3 client for the same endpoint, region and credentials as
-    /// [`Self::build`], for the requests `object_store` does not expose, such as
-    /// listing and aborting unfinished multipart uploads. With no region set it
-    /// takes `AWS_REGION`, then `AWS_DEFAULT_REGION`, then `us-east-1`, as the
-    /// store does; a custom endpoint is addressed path-style.
-    pub async fn build_sdk_client(&self) -> aws_sdk_s3::Client {
-        let region = self
-            .region
-            .clone()
-            .or_else(|| std::env::var("AWS_REGION").ok())
-            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-            .unwrap_or_else(|| "us-east-1".to_string());
-        let sdk_config = crate::initiate_config_with_credentials(
-            "spice-object-store",
-            region,
-            self.access_key_id.clone(),
-            self.secret_access_key.clone(),
-            self.session_token.clone(),
-            None,
-        )
-        .await
-        .load()
-        .await;
-        let mut config = aws_sdk_s3::config::Builder::from(&sdk_config);
-        if let Some(endpoint) = &self.endpoint {
-            config = config.endpoint_url(endpoint).force_path_style(true);
-        }
-        aws_sdk_s3::Client::from_conf(config.build())
-    }
 }
 
 /// Applies AWS SDK credentials to an S3 builder if available.
