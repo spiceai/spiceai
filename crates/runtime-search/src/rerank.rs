@@ -434,13 +434,13 @@ impl RerankTableFuncArgs {
             }
         };
 
-        let model = extract_string_named(&named, "model");
-        let document = extract_string_named(&named, "document").ok_or_else(|| {
+        let model = extract_string_named(&named, "model")?;
+        let document = extract_string_named(&named, "document")?.ok_or_else(|| {
             DataFusionError::Plan(format!(
                 "{RERANK_UDTF_NAME}: 'document => <column>' is required (the text column to score against the query)."
             ))
         })?;
-        let query_override = extract_string_named(&named, "query");
+        let query_override = extract_string_named(&named, "query")?;
         let query = query_override.or(auto_query);
 
         let limit = match named.get("limit") {
@@ -453,16 +453,16 @@ impl RerankTableFuncArgs {
             None => None,
         };
 
-        let strategy = match extract_string_named(&named, "strategy") {
+        let strategy = match extract_string_named(&named, "strategy")? {
             Some(s) => Some(LlmStrategy::parse(&s).map_err(DataFusionError::Plan)?),
             None => None,
         };
 
-        let via = match extract_string_named(&named, "via") {
+        let via = match extract_string_named(&named, "via")? {
             Some(s) => Some(RerankVia::parse(&s).map_err(DataFusionError::Plan)?),
             None => None,
         };
-        let prompt_template = extract_string_named(&named, "prompt_template");
+        let prompt_template = extract_string_named(&named, "prompt_template")?;
         let path = RerankPath::parse(via, prompt_template).map_err(DataFusionError::Plan)?;
 
         Ok(Self {
@@ -477,14 +477,22 @@ impl RerankTableFuncArgs {
     }
 }
 
-fn extract_string_named(named: &HashMap<&str, &Expr>, key: &str) -> Option<String> {
+/// A named string argument. A present argument of any other kind is an
+/// error, so it is never silently dropped.
+fn extract_string_named(
+    named: &HashMap<&str, &Expr>,
+    key: &str,
+) -> DataFusionResult<Option<String>> {
     match named.get(key) {
-        Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => Some(s.clone()),
+        None => Ok(None),
+        Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => Ok(Some(s.clone())),
         // `column` / `strategy` accept identifiers too (`document => content`),
         // which the Spice DataFusion fork wraps as an Expr::Column under the
         // named-arg metadata.
-        Some(Expr::Column(Column { name, .. })) => Some(name.clone()),
-        _ => None,
+        Some(Expr::Column(Column { name, .. })) => Ok(Some(name.clone())),
+        Some(other) => Err(DataFusionError::Plan(format!(
+            "{RERANK_UDTF_NAME}: '{key}' must be a string literal or identifier, got: {other}"
+        ))),
     }
 }
 
@@ -1664,6 +1672,39 @@ mod tests {
     fn extract_query_returns_none_for_column_ref() {
         let col = Expr::Column(Column::new_unqualified("docs"));
         assert_eq!(extract_query_literal(&col), None);
+    }
+
+    #[test]
+    fn parse_args_rejects_non_string_named_args() {
+        // `model => 5` or `query => k` that did not plan to a string must
+        // fail, not silently fall back to the default model or auto query.
+        for key in [
+            "model",
+            "query",
+            "strategy",
+            "via",
+            "prompt_template",
+            "document",
+        ] {
+            let meta = FieldMetadata::new(BTreeMap::from([(
+                "spice.parameter_name".to_string(),
+                key.to_string(),
+            )]));
+            let mut args = vec![
+                vector_search_call("q"),
+                Expr::Literal(ScalarValue::Int64(Some(5)), Some(meta)),
+            ];
+            if key != "document" {
+                args.push(named_lit_utf8("document", "content"));
+            }
+            let err = RerankTableFuncArgs::from_udtf_args(&args)
+                .expect_err("non-string named arg should be rejected");
+            assert!(
+                err.to_string()
+                    .contains(&format!("'{key}' must be a string literal or identifier")),
+                "unexpected error for {key}: {err}"
+            );
+        }
     }
 
     #[test]
