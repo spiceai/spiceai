@@ -250,12 +250,12 @@ async fn datasets_in_a_shared_bucket_reach_only_their_own_store() -> TestResult 
     let in_b = keys(&store_b).await?;
     assert!(
         in_a.iter().any(|key| key.ends_with(".vortex"))
-            && in_a.iter().all(|key| key.starts_with("state/orders/data/")),
+            && in_a.iter().all(|key| key.starts_with("state/cayenne/v1/datasets/orders/data/")),
         "the orders store holds only orders' data: {in_a:?}"
     );
     assert!(
         in_b.iter().any(|key| key.ends_with(".vortex"))
-            && in_b.iter().all(|key| key.starts_with("state/events/data/")),
+            && in_b.iter().all(|key| key.starts_with("state/cayenne/v1/datasets/events/data/")),
         "the events store holds only events' data: {in_b:?}"
     );
     assert_eq!(
