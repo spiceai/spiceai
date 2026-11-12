@@ -1354,6 +1354,7 @@ async fn a_scan_past_retention_gets_the_data_file_missing_error() {
         &location.data_url,
         &table_id,
         Arc::clone(&process.instance) as Arc<dyn ObjectStore>,
+        cayenne::catalog::DataWriteGate::open(),
     )
     .expect("dataset storage");
     for key in &captured {

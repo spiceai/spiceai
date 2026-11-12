@@ -306,6 +306,41 @@ pub struct SnapshotSequenceCommit {
     pub sequence_number: i64,
 }
 
+/// Whether an instance may write a table's data files; shared by the table's
+/// store and the metastore log that decides it, so the store sees a change of
+/// writer at once. See [`MetadataCatalog::data_write_gate`].
+#[derive(Clone, Debug)]
+pub struct DataWriteGate(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl DataWriteGate {
+    /// A gate that allows writes: the instance writes the table.
+    #[must_use]
+    pub fn open() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )))
+    }
+
+    /// A gate that refuses writes: another instance writes the table.
+    #[must_use]
+    pub fn closed() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )))
+    }
+
+    /// Whether a write may be sent now.
+    #[must_use]
+    pub fn allows(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Allow or refuse writes from now on.
+    pub fn set(&self, allows: bool) {
+        self.0.store(allows, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The durable effects of one mem-tier seal or checkpoint.
 #[derive(Debug, Default)]
 pub struct MemTierDurableCommit {
@@ -689,6 +724,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Initialize the catalog, creating necessary tables if they don't exist.
     async fn init(&self) -> CatalogResult<()>;
+
+    /// Bring this instance's view of `table_id` up to the commits another
+    /// instance made to it: on a replica of an object-native location, one
+    /// conditional read of the dataset head, and the records after it when it
+    /// moved. Returns whether the committed state changed. A metastore this
+    /// instance alone writes is always current and returns `false`.
+    ///
+    /// No default: a wrapper must forward it, or its replica never sees new
+    /// commits.
+    async fn follow_commits(&self, table_id: &str) -> CatalogResult<bool>;
+
+    /// Whether this instance may write `table_id`'s data to its location: open
+    /// while it writes the table, closed while another instance does. Every
+    /// data-file write and delete of a table checks it first, so an instance
+    /// that does not write a table leaves no object behind.
+    ///
+    /// No default: a wrapper must forward it, or a replica writes data files.
+    fn data_write_gate(&self, table_id: &str) -> DataWriteGate;
 
     /// List all table names in the catalog.
     async fn list_table_names(&self) -> CatalogResult<Vec<String>>;

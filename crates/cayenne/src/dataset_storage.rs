@@ -251,6 +251,7 @@ impl DatasetStorage {
         table_path: &str,
         dataset_id: &str,
         store: Arc<dyn ObjectStore>,
+        writes: crate::catalog::DataWriteGate,
     ) -> Result<Self, String> {
         let recorded = url::Url::parse(table_path)
             .map_err(|error| format!("data path '{table_path}' is not a URL: {error}"))?;
@@ -283,6 +284,7 @@ impl DatasetStorage {
             authority: recorded_authority.clone(),
             dataset: Arc::clone(&dataset),
             table_path: Arc::clone(&table_path),
+            writes,
         });
         Ok(Self {
             store: scoped,
@@ -489,6 +491,14 @@ pub(crate) async fn delete_in_batches(
     outcome
 }
 
+/// The refusal of a data write on an instance that does not write `dataset`.
+fn replica_write(dataset: &str) -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: STORE_NAME,
+        source: crate::metastore::object_native::replica_change_message(dataset).into(),
+    }
+}
+
 fn outside(authority: &str, location: &str) -> ObjectStoreError {
     let shown = if location.contains("://") {
         location.to_string()
@@ -515,9 +525,22 @@ struct DatasetScopedStore {
     /// committed file the store cannot serve.
     dataset: Arc<str>,
     table_path: Arc<str>,
+    /// Closed while another instance writes the dataset: then this store sends
+    /// no write or delete, so this instance leaves no object behind. A request
+    /// already sent when it closes is not recalled.
+    writes: crate::catalog::DataWriteGate,
 }
 
 impl DatasetScopedStore {
+    /// `Err` when another instance writes the dataset.
+    fn check_writes(&self) -> Result<(), ObjectStoreError> {
+        if self.writes.allows() {
+            Ok(())
+        } else {
+            Err(replica_write(&self.dataset))
+        }
+    }
+
     /// A failed read of `location` as the dataset sees it: a committed file that is
     /// not in the store keeps its `NotFound` kind, so callers that probe for a file
     /// still recognize it, and carries [`DataFileError::Missing`] as its source; a
@@ -616,6 +639,7 @@ impl ObjectStore for DatasetScopedStore {
         opts: PutOptions,
     ) -> Result<PutResult, ObjectStoreError> {
         self.check(location)?;
+        self.check_writes()?;
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -625,6 +649,7 @@ impl ObjectStore for DatasetScopedStore {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, ObjectStoreError> {
         self.check(location)?;
+        self.check_writes()?;
         self.inner.put_multipart_opts(location, opts).await
     }
 
@@ -695,8 +720,11 @@ impl ObjectStore for DatasetScopedStore {
         let prefix = self.prefix.clone();
         let authority = self.authority.clone();
         let inner = Arc::clone(&self.inner);
+        let writes = self.writes.clone();
+        let dataset = Arc::clone(&self.dataset);
         // Paths outside the dataset fail in place; each batch of the rest goes to
-        // the inner store's own batched delete.
+        // the inner store's own batched delete, unless another instance writes
+        // the dataset by the time the batch is sent.
         locations
             .ready_chunks(DELETE_BATCH)
             .flat_map(move |batch| {
@@ -713,6 +741,12 @@ impl ObjectStore for DatasetScopedStore {
                 }
                 let deleted = if inside.is_empty() {
                     stream::empty().boxed()
+                } else if !writes.allows() {
+                    let refusals: Vec<Result<Path, ObjectStoreError>> = inside
+                        .iter()
+                        .map(|_| Err(replica_write(&dataset)))
+                        .collect();
+                    stream::iter(refusals).boxed()
                 } else {
                     inner.delete_stream(stream::iter(inside.into_iter().map(Ok)).boxed())
                 };
@@ -758,6 +792,7 @@ impl ObjectStore for DatasetScopedStore {
     ) -> Result<(), ObjectStoreError> {
         self.check(from)?;
         self.check(to)?;
+        self.check_writes()?;
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -769,6 +804,7 @@ impl ObjectStore for DatasetScopedStore {
     ) -> Result<(), ObjectStoreError> {
         self.check(from)?;
         self.check(to)?;
+        self.check_writes()?;
         self.inner.rename_opts(from, to, options).await
     }
 }
@@ -785,6 +821,7 @@ mod tests {
             table_path,
             "0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
             Arc::clone(store),
+            crate::catalog::DataWriteGate::open(),
         )
         .expect("storage")
     }

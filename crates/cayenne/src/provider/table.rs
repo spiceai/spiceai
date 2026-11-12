@@ -11983,6 +11983,7 @@ impl CayenneTableProvider {
                     &table_metadata.path,
                     &table_metadata.table_id,
                     config.store,
+                    catalog.data_write_gate(&table_metadata.table_id),
                 )
                 .map_err(|message| Error::Internal {
                     table: table_name.to_string(),
@@ -34860,7 +34861,77 @@ impl CayenneTableProvider {
 
         // Acquire the write lock so no insert/delete is in-flight while we reload state.
         let _write_guard = self.write_lock.lock().await;
+        self.reload_from_catalog().await
+    }
 
+    /// On a replica of an object-native location, bring this table up to the
+    /// commits the instance that writes it has made, before a query plans: one
+    /// conditional read of the dataset head, and a reload of what this table
+    /// caches from the catalog when the head moved. The instance that writes the
+    /// table returns at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the head cannot be read or the reload fails; the
+    /// query then fails rather than answer from a state it could not confirm.
+    pub async fn follow_writer(&self) -> Result<()> {
+        let moved = self
+            .catalog
+            .follow_commits(&self.table_metadata.table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        if moved {
+            let _write_guard = self.write_lock.lock().await;
+            self.reload_from_catalog().await?;
+            self.reload_cached_statistics_and_inline_state().await?;
+        }
+        Ok(())
+    }
+
+    /// The table statistics and inline-corpus counters, read again from the
+    /// catalog after another instance changed them.
+    async fn reload_cached_statistics_and_inline_state(&self) -> Result<()> {
+        let (statistics, count_exact) =
+            Self::load_table_statistics(&self.catalog, &self.table_metadata).await;
+        {
+            let mut cache = self.table_statistics.write();
+            cache.optimizer_inexact = statistics
+                .as_ref()
+                .map(|s| Self::statistics_to_inexact(s.clone()));
+            cache.optimizer = statistics;
+            cache.raw = None;
+            cache.count_exact = count_exact;
+        }
+        let table_id = &self.table_metadata.table_id;
+        let inlined = self
+            .catalog
+            .get_inlined_data_stats(table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        let sequence = self
+            .catalog
+            .get_sequence_number(table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        // Drop the materialized inline view first: invalidating also zeroes the
+        // counters, which are then set to what the catalog holds, and the
+        // structural bump publishes them to the next scan.
+        self.invalidate_inlined_cache();
+        self.inlined_row_count
+            .store(inlined.record_count, Ordering::Release);
+        self.durable_inlined_row_count
+            .store(inlined.record_count, Ordering::Release);
+        self.inlined_tombstone_bytes
+            .store(inlined.tombstone_metastore_bytes(), Ordering::Release);
+        self.published_inlined_seq
+            .fetch_max(sequence, Ordering::AcqRel);
+        self.bump_inlined_structural_epoch();
+        Ok(())
+    }
+
+    /// Reload deletion vectors, protected snapshots, the current snapshot and the
+    /// listing from the catalog. The caller holds `write_lock`.
+    async fn reload_from_catalog(&self) -> Result<()> {
         // Reload deletion vectors from the catalog (SQLite) — the source of truth.
         // This picks up any deletions committed by writes that completed after the
         // source provider was opened.
@@ -47088,6 +47159,11 @@ impl TableProvider for CayenneTableProvider {
         // rows that may be wrong.
         if self.data_in_object_native_location() {
             self.ensure_publication_outcome_known()
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            // A replica serves at least every commit the writer acknowledged
+            // before this query started.
+            self.follow_writer()
+                .await
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
         }
         let reuse = self.prepare_scan(state, filters).await?;

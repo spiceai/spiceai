@@ -18,8 +18,8 @@ limitations under the License.
 
 use super::{
     super::{actions, state_reader, state_reader::DatasetStateReader},
-    Domain, FENCED_ON_REOPEN, Inner, NativeCatalogConfig, OpenSummary, Stop, ValueChange,
-    fenced_message, invalid, refused_change_message,
+    Access, Domain, FENCED_ON_REOPEN, Head, Inner, NativeCatalogConfig, OpenSummary, Stop,
+    ValueChange, fenced_message, invalid, refused_change_message, replica_change_message,
     slot::{StateLease, StateSlot},
     subject, transactions_beside,
 };
@@ -31,7 +31,7 @@ use crate::{
 use arrow_schema::SchemaRef;
 use cayenne_metastore_actions::{Action, DatasetState, Kind, ObjRef, Record, proto};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
-use object_store_occ::headlog::{Collector, Group, HeadLog, Opened, Reader, Writer};
+use object_store_occ::headlog::{Collector, Group, HeadLog, Opened, Poll, Reader, Writer};
 use parking_lot::Mutex;
 use prost::Message;
 use std::sync::Arc;
@@ -153,7 +153,7 @@ impl Domain {
     pub(super) async fn read(&self) -> CatalogResult<StateLease<'_>> {
         let inner = self.inner.take().await;
         match inner.stop {
-            None | Some(Stop::Fenced { reloaded: true }) => Ok(inner),
+            None | Some(Stop::Fenced { reloaded: true } | Stop::Replica) => Ok(inner),
             Some(stop) => Err(inner.stopped(stop)),
         }
     }
@@ -197,9 +197,14 @@ impl Domain {
             None,
         )
         .await?;
+        let data_writes = match config.access {
+            Access::Writer => crate::catalog::DataWriteGate::open(),
+            Access::Replica => crate::catalog::DataWriteGate::closed(),
+        };
         Ok(Self {
             opened,
             folder: String::new(),
+            data_writes,
             inner: Arc::new(StateSlot {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
@@ -226,7 +231,13 @@ impl Inner {
         let (reader, opened) = Reader::open(Arc::clone(&store), prefix.clone())
             .await
             .map_err(invalid)?;
-        let mut replayed = replay_state(opened)?;
+        let replayed = replay_state(opened)?;
+        if config.access == Access::Replica {
+            return Ok(Self::replica(
+                store, prefix, config, immediate, anchor, dataset, reader, replayed,
+            ));
+        }
+        let mut replayed = replayed;
         if let Some(held) = held
             && reader.state().head.lease > held
         {
@@ -279,7 +290,7 @@ impl Inner {
                     config.retain_below_floor,
                 ))),
                 reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
-                writer,
+                head: Head::Writer(writer),
                 stop: None,
                 recovering: false,
                 dataset,
@@ -306,7 +317,7 @@ impl Inner {
     pub(super) async fn recover(&mut self) -> CatalogResult<()> {
         match self.stop {
             Some(Stop::Unresolved) => {
-                let held = self.writer.state().head.lease;
+                let held = self.writer()?.state().head.lease;
                 let reopened = Self::open(
                     Arc::clone(&self.reader.store),
                     self.reader.prefix.clone(),
@@ -403,6 +414,7 @@ impl Inner {
             ),
             Stop::Fenced { .. } => fenced_message(&self.dataset),
             Stop::Refused => refused_change_message(&self.dataset, "see the earlier error"),
+            Stop::Replica => replica_change_message(&self.dataset),
         };
         CatalogError::InvalidOperationNoSource { message }
     }
@@ -412,6 +424,112 @@ impl Inner {
             None => Ok(()),
             Some(stop) => Err(self.stopped(stop)),
         }
+    }
+}
+
+impl Inner {
+    /// A log opened as a replica, from what `reader` replayed.
+    #[expect(clippy::too_many_arguments, reason = "the fields of an opened log")]
+    fn replica(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        config: NativeCatalogConfig,
+        immediate: bool,
+        anchor: Option<Arc<str>>,
+        dataset: Arc<str>,
+        reader: Reader,
+        replayed: Replayed,
+    ) -> (Self, OpenSummary) {
+        let Replayed {
+            state,
+            floor_state,
+            since_floor,
+        } = replayed;
+        let opened = OpenSummary {
+            replayed: since_floor.len(),
+            lease: reader.state().head.lease,
+        };
+        (
+            Self {
+                collector: Arc::new(tokio::sync::Mutex::new(Collector::new(
+                    Arc::clone(&store),
+                    prefix.clone(),
+                    config.retain_below_floor,
+                ))),
+                reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
+                head: Head::Replica(reader),
+                stop: Some(Stop::Replica),
+                recovering: false,
+                dataset,
+                config,
+                floor_state,
+                since_floor,
+                staged_checkpoint: 0,
+                pending: Vec::new(),
+                immediate,
+            },
+            opened,
+        )
+    }
+
+    /// The head writer, which only the instance that writes the log has.
+    pub(super) fn writer(&self) -> CatalogResult<&Writer> {
+        match &self.head {
+            Head::Writer(writer) => Ok(writer),
+            Head::Replica(_) => Err(self.stopped(Stop::Replica)),
+        }
+    }
+
+    pub(super) fn writer_mut(&mut self) -> CatalogResult<&mut Writer> {
+        match &mut self.head {
+            Head::Writer(writer) => Ok(writer),
+            Head::Replica(_) => Err(replica_error(&self.dataset)),
+        }
+    }
+
+    /// On a replica, apply the commits the writer made since this log last
+    /// read its head: one conditional GET when nothing changed. Returns whether
+    /// the state moved. The writer's own state is always current.
+    pub(super) async fn follow(&mut self) -> CatalogResult<bool> {
+        let Head::Replica(reader) = &mut self.head else {
+            return Ok(false);
+        };
+        match reader.poll().await.map_err(invalid)? {
+            Poll::Unchanged => Ok(false),
+            Poll::Records(entries) => {
+                let moved = !entries.is_empty();
+                for entry in entries {
+                    for payload in Group::decode(entry.record.payload)
+                        .map_err(invalid)?
+                        .payloads
+                    {
+                        let record = Record::decode(payload).map_err(invalid)?;
+                        self.reader.state.apply(&record).map_err(invalid)?;
+                    }
+                }
+                Ok(moved)
+            }
+            Poll::Reopen => {
+                // The writer checkpointed past this replica's cursor and the
+                // records in between may be collected: read the log again.
+                let (reader, opened) =
+                    Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
+                        .await
+                        .map_err(invalid)?;
+                let replayed = replay_state(opened)?;
+                self.reader.state = replayed.state;
+                self.floor_state = replayed.floor_state;
+                self.since_floor = replayed.since_floor;
+                self.head = Head::Replica(reader);
+                Ok(true)
+            }
+        }
+    }
+}
+
+fn replica_error(dataset: &str) -> CatalogError {
+    CatalogError::InvalidOperationNoSource {
+        message: replica_change_message(dataset),
     }
 }
 
@@ -456,7 +574,10 @@ impl Inner {
     /// Checkpoint at the newest sealed batch once enough batches are listed. The
     /// root is the floor state with every record up to that batch end applied.
     pub(super) async fn maybe_checkpoint(&mut self) -> CatalogResult<()> {
-        let head = &self.writer.state().head;
+        let Head::Writer(writer) = &self.head else {
+            return Ok(());
+        };
+        let head = &writer.state().head;
         let Some(&at) = head.batches.last() else {
             return Ok(());
         };
@@ -486,7 +607,7 @@ impl Inner {
             }
         }
         let root = cayenne_metastore_actions::state_as_root(&self.floor_state).encode_to_vec();
-        self.writer
+        self.writer_mut()?
             .publish_checkpoint(at, root.into())
             .await
             .map_err(invalid)?;

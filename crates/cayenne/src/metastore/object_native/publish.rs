@@ -110,6 +110,10 @@ impl Inner {
     /// Commit every buffered change as one record. Nothing that depends on a
     /// buffered change may be acknowledged before this returns `Ok`.
     pub(super) async fn flush(&mut self) -> CatalogResult<()> {
+        // A replica buffers nothing, so it has nothing to commit.
+        if self.stop == Some(Stop::Replica) && self.pending.is_empty() {
+            return Ok(());
+        }
         self.ensure_accepting()?;
         let buffers = std::mem::take(&mut self.pending);
         self.publish_buffers(buffers).await
@@ -130,12 +134,14 @@ impl Inner {
         // not commit, they must never be acknowledged: the log refuses all
         // further work until it is reopened from what did commit. Set before the
         // first await, so a cancelled caller leaves the log to be resolved too.
+        // A replica has no writer and refuses here, before anything changes.
+        self.writer()?;
         self.stop = Some(Stop::Unresolved);
-        let attempt = match self
-            .writer
+        let prepared = self
+            .writer_mut()?
             .prepare_group(vec![record.encode_to_vec().into()])
-            .await
-        {
+            .await;
+        let attempt = match prepared {
             Ok(attempt) => attempt,
             Err(error) => return Err(self.unresolved(&error.to_string())),
         };
@@ -278,7 +284,7 @@ impl Inner {
     ) -> CatalogResult<Outcome> {
         let attempts = self.config.publish_attempts;
         let base = self.config.retry_delay;
-        let mut outcome = self.writer.commit(attempt).await;
+        let mut outcome = self.writer_mut()?.commit(attempt).await;
         for retry in 1..=attempts {
             let error = match outcome {
                 Ok(Outcome::Unresolved) => "the outcome was unresolved".to_string(),
@@ -292,7 +298,7 @@ impl Inner {
                 delay.as_millis()
             );
             tokio::time::sleep(delay).await;
-            outcome = self.writer.resolve(attempt).await;
+            outcome = self.writer_mut()?.resolve(attempt).await;
         }
         outcome.map_err(invalid)
     }

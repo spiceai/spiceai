@@ -2495,6 +2495,16 @@ impl MetadataCatalog for CayenneCatalog {
         crate::provider::append_commit::commit_transaction(txn, publications[0].table_id).await
     }
 
+    fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
+        // One process writes a SQLite metastore's tables.
+        crate::catalog::DataWriteGate::open()
+    }
+
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<bool> {
+        // One process writes a SQLite metastore; its state is always current.
+        Ok(false)
+    }
+
     async fn init(&self) -> CatalogResult<()> {
         // Create database directory if it doesn't exist.
         //

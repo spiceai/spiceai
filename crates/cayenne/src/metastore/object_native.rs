@@ -21,7 +21,7 @@ use crate::catalog::{CatalogError, CatalogResult};
 use cayenne_metastore_actions::{Action, DatasetState, Kind, Record, proto};
 use domain::replay_state;
 use object_store::path::Path;
-use object_store_occ::headlog::{Collector, HeadLogConfig, Writer};
+use object_store_occ::headlog::{Collector, HeadLogConfig, Reader, Writer};
 use slot::StateSlot;
 use std::sync::Arc;
 mod catalog;
@@ -40,6 +40,9 @@ struct Domain {
     opened: OpenSummary,
     /// The dataset folder this log is in; empty for the name registry.
     folder: String,
+    /// Open while this instance writes the log, so its tables' stores accept
+    /// data writes; closed on a replica.
+    data_writes: crate::catalog::DataWriteGate,
 }
 
 /// What opening the catalog found, for the startup log.
@@ -49,9 +52,29 @@ struct OpenSummary {
     lease: u64,
 }
 
+/// How this instance holds a log's head.
+enum Head {
+    /// It took the head over, and commits under its lease generation.
+    Writer(Writer),
+    /// It reads the head another instance writes, and follows its commits.
+    Replica(Reader),
+}
+
+/// How a catalog opens its logs. Internal; which instance writes a dataset is
+/// decided for the user, never configured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Access {
+    /// Take each log over, fencing any previous writer.
+    #[default]
+    Writer,
+    /// Read each log without taking it over: write nothing to the location,
+    /// and follow the commits of the instance that writes it.
+    Replica,
+}
+
 struct Inner {
     reader: DatasetStateReader,
-    writer: Writer,
+    head: Head,
     /// Why this log accepts no change, when it does not.
     stop: Option<Stop>,
     /// A background task is resolving [`Stop::Unresolved`] or reloading after
@@ -94,6 +117,9 @@ enum Stop {
     /// The state refused a change this catalog made, which is a bug: the state
     /// no longer matches the log, so the log stops until the process restarts.
     Refused,
+    /// This instance reads the log as a replica: it serves the committed state
+    /// and follows the writer's commits, and accepts no change itself.
+    Replica,
 }
 
 /// Buffered changes for a set of tables. Actions on different tables commute,
@@ -111,6 +137,8 @@ struct Pending {
 pub struct NativeCatalogConfig {
     /// The log's budgets; every writer of one log must use the same values.
     pub log: HeadLogConfig,
+    /// Whether this catalog writes its logs or follows another instance's.
+    pub access: Access,
     /// Sealed batches listed in the head before the catalog checkpoints at the
     /// newest one.
     pub checkpoint_after_batches: usize,
@@ -150,6 +178,7 @@ impl Default for NativeCatalogConfig {
     fn default() -> Self {
         Self {
             log: HeadLogConfig::default(),
+            access: Access::Writer,
             // Small for the prototype, so short CDC runs checkpoint.
             checkpoint_after_batches: 1,
             attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
@@ -292,6 +321,14 @@ pub(crate) fn refused_change_message(dataset: &str, cause: &str) -> String {
 pub(crate) fn fenced_message(dataset: &str) -> String {
     format!(
         "{} stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again.",
+        subject(dataset)
+    )
+}
+
+/// The refusal a replica gives a change: another instance writes the dataset.
+pub(crate) fn replica_change_message(dataset: &str) -> String {
+    format!(
+        "{} is written by another Spice instance; this instance serves its queries from the saved state and accepts no change.",
         subject(dataset)
     )
 }

@@ -95,6 +95,12 @@ impl MetadataCatalog for Domain {
     async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
         self.read().await?.reader.pending_write_back_count(table_id)
     }
+    fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
+        self.data_writes.clone()
+    }
+    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<bool> {
+        self.inner.take().await.follow().await
+    }
     async fn init(&self) -> CatalogResult<()> {
         self.read().await?;
         Ok(())
