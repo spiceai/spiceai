@@ -3212,12 +3212,12 @@ impl CayenneAccelerator {
                 }
             );
         }
-        // With the flag off, the catalog in the state location is looked up only when
-        // the metadata directory has an `object_native` folder.
-        let in_native = (vnext || path_exists(format!("{metadata_dir}/object_native")).await)
-            && self
-                .existing_native_catalog_holds(metadata_dir, source, &table_name)
-                .await?;
+        // Whatever the flag, a table the object-native catalog holds stays there: with the
+        // flag off it is refused rather than opened on SQLite, which may hold an older
+        // copy. The catalog is in the state location, so this reads its head there.
+        let in_native = self
+            .existing_native_catalog_holds(metadata_dir, source, &table_name)
+            .await?;
         // Without the flag, an instance that never used the object-native metastore
         // keeps SQLite after one local check.
         if !vnext && !in_native {

@@ -54,13 +54,34 @@ fn schema() -> SchemaRef {
 /// `name` under `runtime.params.cayenne_vnext: {flag}`, in `mode`, with its data and
 /// metastore under `base`.
 fn dataset(base: &Path, name: &str, flag: &str, mode: Mode) -> TestAccelerationSource {
-    let app = AppBuilder::new("metastore-move")
+    let mut app = AppBuilder::new("metastore-move")
         .with_runtime_params(
             [(CAYENNE_VNEXT_PARAM.to_string(), flag.to_string())]
                 .into_iter()
                 .collect(),
         )
         .build();
+    // The state location is set whatever the flag, as an app keeps it when the flag
+    // changes: a local directory here. With the flag on a table's data is there; with
+    // it off it stays at `cayenne_file_path`.
+    let state = base.join("state");
+    std::fs::create_dir_all(&state).expect("state directory");
+    app.runtime.state = Some(RuntimeState {
+        location: url::Url::from_directory_path(&state)
+            .expect("state location URL")
+            .to_string(),
+        params: None,
+    });
+    let mut params = vec![(
+        "cayenne_metadata_dir".to_string(),
+        base.join("metadata").to_string_lossy().into_owned(),
+    )];
+    if flag != "enabled" {
+        params.push((
+            "cayenne_file_path".to_string(),
+            base.join("data").to_string_lossy().into_owned(),
+        ));
+    }
     TestAccelerationSource::new(name)
         .with_app(Arc::new(app))
         .with_acceleration(Acceleration {
@@ -68,18 +89,7 @@ fn dataset(base: &Path, name: &str, flag: &str, mode: Mode) -> TestAccelerationS
             engine: Engine::Cayenne,
             mode,
             refresh_mode: Some(RefreshMode::Full),
-            params: [
-                (
-                    "cayenne_file_path".to_string(),
-                    base.join("data").to_string_lossy().into_owned(),
-                ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    base.join("metadata").to_string_lossy().into_owned(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
+            params: params.into_iter().collect(),
             ..Default::default()
         })
 }
@@ -440,8 +450,10 @@ async fn a_file_create_move_back_does_not_serve_the_older_copy_in_the_location()
     load(&accelerator, &flag_on, &table, 0..3_000).await;
     drop((accelerator, table));
 
-    let flag_off = in_location(base.path(), &name, "disabled", Mode::File);
-    let (accelerator, table) = start(&flag_off).await;
+    // A flag change alone is refused while the object-native catalog holds the table,
+    // so the move to SQLite is an explicit `file_create`.
+    let flag_off = in_location(base.path(), &name, "disabled", Mode::FileCreate);
+    let (accelerator, table) = start_with(placed_accelerator(&store).await, &flag_off).await;
     load(&accelerator, &flag_off, &table, 0..2_900).await;
     drop((accelerator, table));
 
