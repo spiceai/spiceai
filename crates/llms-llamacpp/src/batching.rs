@@ -1183,8 +1183,11 @@ fn step<'m, S: Shared<'m>>(
             stepping.retain(|&index| index != victim);
         }
     }
+    // With no request stepping, the caller pauses: a request preempted for room may wait on a
+    // client that is not reading even when no request runs, and with no request at all the
+    // caller blocks for the next one after the pause.
     if stepping.is_empty() {
-        return slots.iter().all(|slot| slot.running.is_none());
+        return false;
     }
     let drafts = {
         let requests: Vec<DraftRequest<'_>> = stepping

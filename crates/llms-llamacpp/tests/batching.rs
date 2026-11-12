@@ -246,8 +246,13 @@ const SMALL_CONTEXT: usize = 512;
 /// context, which it reaches only if the first's tokens leave the shared cache. The first's client
 /// then reads the rest, and the first resumes. Were each request admitted with room for its
 /// whole possible reply, the second would wait for the first to end, which waits on a client
-/// that is not reading.
-async fn requests_with_no_output_limit_preempt_and_reply_as_alone(gguf: &Path, name: &'static str) {
+/// that is not reading. `while_the_first_waits` runs after the second reply ends and before the
+/// first's client reads again, while the first, preempted, is the only request left.
+async fn requests_with_no_output_limit_preempt_and_reply_as_alone(
+    gguf: &Path,
+    name: &'static str,
+    while_the_first_waits: impl Future<Output = ()>,
+) {
     let alone = {
         let model = load(gguf, name, 1, SMALL_CONTEXT).await;
         model
@@ -278,6 +283,7 @@ async fn requests_with_no_output_limit_preempt_and_reply_as_alone(gguf: &Path, n
     )
     .await
     .expect("the second request replies while the first reply's client is not reading");
+    while_the_first_waits.await;
     first_text.push_str(&rest(first).await);
     assert_eq!(
         (first_text, second.text),
@@ -290,7 +296,70 @@ async fn requests_with_no_output_limit_preempt_and_reply_as_alone(gguf: &Path, n
 #[tokio::test]
 async fn requests_with_no_output_limit_preempt_and_reply_as_alone_without_a_draft() {
     let gguf = qwen3_gguf().await;
-    requests_with_no_output_limit_preempt_and_reply_as_alone(&gguf, "qwen3-0.6b").await;
+    requests_with_no_output_limit_preempt_and_reply_as_alone(&gguf, "qwen3-0.6b", async {}).await;
+}
+
+/// Set in the environment of the process `preempted_while_its_client_is_not_reading` runs in.
+#[cfg(unix)]
+const IDLE_PROBE: &str = "SPICE_LLAMACPP_TEST_IDLE_PROBE";
+
+/// How long the process's CPU time is measured while its only request waits on its client.
+#[cfg(unix)]
+const IDLE_WINDOW: Duration = Duration::from_secs(1);
+
+/// While the only request left is one preempted for room whose client is not reading, the
+/// decode thread waits for that client rather than looping. The check runs in a process of its
+/// own, as it measures the CPU time of the whole process.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preempted_request_whose_client_is_not_reading_leaves_the_decode_thread_idle() {
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("the test binary's path"))
+            .args([
+                "--exact",
+                "batching::preempted_while_its_client_is_not_reading",
+                "--nocapture",
+            ])
+            .env(IDLE_PROBE, "1")
+            .status()
+            .expect("the probe runs");
+    assert!(status.success(), "the probe's checks failed: {status}");
+}
+
+/// [`requests_with_no_output_limit_preempt_and_reply_as_alone`] on a model without a draft
+/// head, run only by [`a_preempted_request_whose_client_is_not_reading_leaves_the_decode_thread_idle`]
+/// in a process of its own. Between the second reply's end and the first client reading again,
+/// the process may spend under a quarter of [`IDLE_WINDOW`] on the CPU: a decode thread that
+/// loops without pausing spends about all of it. Without [`IDLE_PROBE`] it does nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn preempted_while_its_client_is_not_reading() {
+    if std::env::var_os(IDLE_PROBE).is_none() {
+        return;
+    }
+    let gguf = qwen3_gguf().await;
+    requests_with_no_output_limit_preempt_and_reply_as_alone(&gguf, "qwen3-0.6b", async {
+        let before = cpu_time();
+        tokio::time::sleep(IDLE_WINDOW).await;
+        let spent = cpu_time().saturating_sub(before);
+        eprintln!("CPU time while the preempted request waited: {spent:?} of {IDLE_WINDOW:?}");
+        assert!(
+            spent < IDLE_WINDOW / 4,
+            "the process spent {spent:?} on the CPU in {IDLE_WINDOW:?} while its only request \
+             waited, preempted, on a client that was not reading"
+        );
+    })
+    .await;
+}
+
+/// The CPU time this process has spent, in user and system mode, across its threads.
+#[cfg(unix)]
+fn cpu_time() -> Duration {
+    use nix::sys::resource::{UsageWho, getrusage};
+    use nix::sys::time::TimeValLike as _;
+    let usage = getrusage(UsageWho::RUSAGE_SELF).expect("the process's resource usage");
+    let micros = usage.user_time().num_microseconds() + usage.system_time().num_microseconds();
+    Duration::from_micros(u64::try_from(micros).expect("a CPU time is not negative"))
 }
 
 /// [`requests_with_no_output_limit_preempt_and_reply_as_alone`] on a hybrid model with an MTP
@@ -298,7 +367,7 @@ async fn requests_with_no_output_limit_preempt_and_reply_as_alone_without_a_draf
 #[tokio::test]
 async fn requests_with_no_output_limit_preempt_and_reply_as_alone_with_an_mtp_head() {
     let gguf = qwen35_gguf().await;
-    requests_with_no_output_limit_preempt_and_reply_as_alone(&gguf, "qwen3.5").await;
+    requests_with_no_output_limit_preempt_and_reply_as_alone(&gguf, "qwen3.5", async {}).await;
 }
 
 /// A request that needs the room idle sequences' caches hold gets it, even when no other request
