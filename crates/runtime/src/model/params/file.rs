@@ -40,7 +40,7 @@ pub struct FileModelParams {
     /// Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.
     #[param(runtime)]
     pub nodes: Option<String>,
-    /// Where clients reach the head (rank 0) for a model in `nodes`, such as 'http://192.168.1.100:8090'. A node other than the head names it when it refuses a request: `nodes` holds the addresses the nodes reach each other at, which a client may not reach. When unset, the refusal names the head's address in `nodes`.
+    /// Where clients reach the head (rank 0) for a model in `nodes`, such as `http://192.168.1.100:8090`. A node other than the head names it when it refuses a request: `nodes` holds the addresses the nodes reach each other at, which a client may not reach. When unset, the refusal names the head's address in `nodes`.
     #[param(runtime)]
     pub head_url: Option<String>,
     /// Sequence-length budget, in tokens, for a locally served model: it plans cross-device layer placement and sizes the KV cache. Defaults to the engine default (4096) when unset. It does not raise the context the weights were trained for, and larger values need proportionally more KV-cache memory.
