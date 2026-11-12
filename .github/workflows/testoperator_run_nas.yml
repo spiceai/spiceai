@@ -27,7 +27,7 @@ jobs:
   run-nas-bench:
     name: Run network-attached storage benchmark tests
     runs-on: spiceai-macos
-    environment: ci-build
+    environment: ci
     permissions:
       contents: read
       id-token: write  # RustFS credentials
