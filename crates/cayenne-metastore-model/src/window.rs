@@ -59,8 +59,8 @@ pub struct State {
     restarted: bool,
     root_collected: bool,
     collected_after_restart: bool,
-    /// A collection ran while a reader of an older head was still within
-    /// its retention.
+    /// A collection deleted objects while a reader of an older head was
+    /// still within its retention.
     gc_during_query: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,7 +250,7 @@ impl Model for Protocol {
                 state.root_collected && !state.store.deleted.is_empty()
             }),
             Property::sometimes(
-                "collection while a reader of an older head is within retention",
+                "collection deletes while a reader of an older head is within retention",
                 |_, state: &State| state.gc_during_query,
             ),
             Property::sometimes(
@@ -291,13 +291,6 @@ impl Protocol {
             .filter(|(_, _, stamp)| stamp.is_some_and(|s| s + self.retention() <= now))
             .map(|&(f, _, _)| f)
             .max();
-        if next
-            .query
-            .as_ref()
-            .is_some_and(|(p, at)| *at == next.time && p.floor < floor)
-        {
-            next.gc_during_query = true;
-        }
         let Some(due) = due else { return };
         let doomed: Vec<usize> = next
             .store
@@ -309,7 +302,7 @@ impl Protocol {
         next.store
             .batches
             .retain(|(action, _)| !doomed.contains(action));
-        for action in doomed {
+        for &action in &doomed {
             if !next.store.deleted.contains(&action) {
                 next.store.deleted.push(action);
             }
@@ -317,7 +310,15 @@ impl Protocol {
         let before = next.roots.len();
         next.roots.retain(|&c| c >= due);
         next.root_collected |= next.roots.len() < before;
-        next.collected_after_restart |= next.restarted;
+        // The witnesses below need objects actually deleted, not a floor that
+        // merely came due with nothing under it.
+        let deleted = !doomed.is_empty() || next.roots.len() < before;
+        next.collected_after_restart |= deleted && next.restarted;
+        next.gc_during_query |= deleted
+            && next
+                .query
+                .as_ref()
+                .is_some_and(|(p, at)| *at == next.time && p.floor < floor);
         next.collected = due;
         next.retired.retain(|&(f, _, _)| f > due);
     }

@@ -144,6 +144,8 @@ struct Replay {
     query: Option<Query>,
     /// Objects the collector deleted over the replay.
     collected: usize,
+    /// Objects the collector deleted while a query waited at the read gate.
+    collected_while_reading: usize,
 }
 impl Replay {
     fn object_store(&self) -> Arc<dyn ObjectStore> {
@@ -212,6 +214,7 @@ impl Replay {
             collector,
             query: None,
             collected: 0,
+            collected_while_reading: 0,
         }
     }
     fn collector(store: Arc<FaultStore>, control: Control) -> Collector {
@@ -903,6 +906,9 @@ impl Replay {
             "Gc" => {
                 if let Some(collected) = result(self.collector.collect().await)? {
                     self.collected += collected.deleted;
+                    if self.query.is_some() {
+                        self.collected_while_reading += collected.deleted;
+                    }
                 }
             }
             "Query" => self.start_query().await?,
@@ -997,6 +1003,22 @@ async fn replay(
                 trace.run, trace.property, trace.actions
             )
         })?;
+    }
+    if trace.property == "collection deletes while a reader of an older head is within retention" {
+        // The witness is about a reader surviving a deletion: the collector
+        // must have removed objects while the reader waited at the gate, and
+        // the reader then returned its original snapshot (checked above).
+        require(replay.collected_while_reading > 0, || {
+            format!(
+                "trace={} {:?} expected objects deleted while the query waited; actual none",
+                trace.run, trace.property
+            )
+        })?;
+        println!(
+            "READER backend={} deleted_while_reading={}",
+            if local { "durable-local" } else { "memory" },
+            replay.collected_while_reading
+        );
     }
     if window && trace.status != "FAIL" {
         // The expected head and objects come from stepping the model through

@@ -2822,7 +2822,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         && matches!(
             name,
             "batches and a checkpoint collected"
-                | "collection while a reader of an older head is within retention"
+                | "collection deletes while a reader of an older head is within retention"
                 | "expired reader of an older head finds an object collected"
                 | "restarted collector collects"
         );

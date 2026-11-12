@@ -46,7 +46,7 @@ initial_index=0. Walks use seed 42, count 20, max_steps 40.
 | source-no-skip / source-positions | 6 | 0 | 4 |
 | source-position-before-data / source-positions | 4 | 0 | 2 |
 
-The window set holds 24 Gc, 11 Query, 15 Tick and 6 Restart actions.
+The window set holds 26 Gc, 11 Query, 16 Tick and 6 Restart actions.
 
 Control tests select FAIL witnesses for the named invariant: I2 for persistence
 and early acknowledgement, I4 for batch existence, I7 for a collection that
@@ -139,6 +139,11 @@ those of the model stepped through the same actions
 (`cayenne_metastore_model::window_head_after`, with the trace's own run), at
 10,000 bytes per symbolic byte. The expectation comes from the model, never from
 the head log. The replay prints a `CUTS` line for each trace (`--no-capture`).
+For the witness of a collection that deletes while a reader of an older head is
+within its retention, the collector must have deleted at least one object while
+that reader waited at the read gate (a `READER` line), and the reader must then
+return its original snapshot exactly.
+
 After every positive window trace the batch objects (`wal/`, by first commit)
 and checkpoint objects in storage must also equal those the model's collector
 left; the replay prints an `OBJECTS` line with the count it deleted.
