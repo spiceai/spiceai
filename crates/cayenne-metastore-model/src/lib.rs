@@ -2598,22 +2598,23 @@ where
         }
     }
 }
-fn check<M>(model: M, run: Run) -> bool
+fn check<M>(model: M, run: Run, explore: Option<&str>) -> bool
 where
-    M: Model + Send + Sync + 'static,
+    M: Model + Clone + Send + Sync + 'static,
     M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
     M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
 {
-    check_with_symmetry(model, run, None)
+    check_with_symmetry(model, run, None, explore)
 }
 type Representative<S> = fn(&S) -> S;
 fn check_with_symmetry<M>(
     model: M,
     run: Run,
     representative: Option<Representative<M::State>>,
+    explore: Option<&str>,
 ) -> bool
 where
-    M: Model + Send + Sync + 'static,
+    M: Model + Clone + Send + Sync + 'static,
     M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
     M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
 {
@@ -2657,15 +2658,12 @@ where
     } else {
         stateright::HasDiscoveries::AllOf(targets)
     };
-    let builder = model
-        .checker()
-        .threads(
-            std::env::var("MODEL_THREADS")
-                .ok()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(DEFAULT_THREADS),
-        )
-        .finish_when(finish);
+    let threads = std::env::var("MODEL_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(DEFAULT_THREADS);
+    let explorer_model = explore.map(|_| model.clone());
+    let builder = model.checker().threads(threads).finish_when(finish);
     let builder = if let Some(f) = representative {
         builder.symmetry_fn(f)
     } else {
@@ -2680,6 +2678,7 @@ where
                 .join(),
             &run,
             start,
+            explore,
         )
     } else if run.failure.is_empty()
         || run.family == "dataset-lifecycle"
@@ -2692,12 +2691,19 @@ where
         || run.family.ends_with("-progress")
         || run.mode.contains("symmetry")
     {
-        output(&builder.spawn_dfs().join(), &run, start)
+        output(&builder.spawn_dfs().join(), &run, start, explore)
     } else {
-        output(&builder.spawn_bfs().join(), &run, start)
+        output(&builder.spawn_bfs().join(), &run, start, explore)
     };
     drop(finished);
     let joined = watchdog.join().is_ok();
+    if let (Some(address), Some(model)) = (explore, explorer_model) {
+        println!(
+            "EXPLORER {} serving http://{address}/ (Ctrl-C to stop)",
+            run.name
+        );
+        model.checker().threads(threads).serve(address);
+    }
     result && joined
 }
 /// Whether a run must reach the `sometimes` property `name`.
@@ -2906,7 +2912,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 _ => false,
             }
 }
-fn output<M: Model, C: Checker<M>>(c: &C, run: &Run, start: Instant) -> bool
+fn output<M: Model, C: Checker<M>>(c: &C, run: &Run, start: Instant, explore: Option<&str>) -> bool
 where
     M::State: Clone + PartialEq + std::fmt::Debug,
     M::Action: Clone + PartialEq + std::fmt::Debug,
@@ -2985,6 +2991,16 @@ where
                 "MINIMIZED enabled={valid} steps={} {action:?}",
                 action.len()
             );
+            if let Some(address) = explore
+                && let Some(path) =
+                    stateright::Path::from_actions(c.model(), initial.clone(), &action)
+            {
+                println!(
+                    "EXPLORE {status} {} http://{address}/#/steps/{}",
+                    p.name,
+                    path.encode(c.model())
+                );
+            }
             trace_json(&format!(
                 "{{\"kind\":\"witness\",\"run\":{},\"family\":{},\"mode\":{},\"property\":{},\"status\":{},\"valid\":{valid},\"initial_index\":{},\"actions\":{}}}",
                 json_string(run.name),
@@ -3044,11 +3060,33 @@ where
 /// # Errors
 /// Returns an error for an unknown run, missing control opt-in, or an unexpected result.
 pub fn run(name: &str) -> Result<(), String> {
+    run_checks(name, None)
+}
+
+/// Check a named configuration as [`run`] does, print a Stateright Explorer
+/// link for each counterexample and witness it finds, then serve the Explorer
+/// on `address` until the process is stopped. Controls do not need
+/// `EXHAUST=1`: their counterexample is usually what is worth showing.
+///
+/// # Errors
+/// Returns an error for an unknown run or an address that cannot be bound.
+pub fn serve(name: &str, address: &str) -> Result<(), String> {
+    // The Explorer panics on a bind failure; check the address first so a busy
+    // port is an error rather than a panic after the check has run.
+    drop(
+        std::net::TcpListener::bind(address)
+            .map_err(|e| format!("Cannot serve the Explorer on {address}: {e}"))?,
+    );
+    run_checks(name, Some(address))
+}
+
+fn run_checks(name: &str, explore: Option<&str>) -> Result<(), String> {
     let r = runs()
         .into_iter()
         .find(|r| r.name == name)
         .ok_or_else(|| format!("Unknown run {name}; use list"))?;
-    if (r.mode.contains("-no-") || !r.failure.is_empty())
+    if explore.is_none()
+        && (r.mode.contains("-no-") || !r.failure.is_empty())
         && std::env::var("EXHAUST").as_deref() != Ok("1")
     {
         return Err("Controls require EXHAUST=1".into());
@@ -3057,44 +3095,65 @@ pub fn run(name: &str) -> Result<(), String> {
         "remote-maintenance" => check(
             dataset_lifecycle::remote_maintenance::Protocol::new(r.mode, r.bound),
             r,
+            explore,
         ),
-        "position-deletes" => check(position_deletes::Protocol::new(r.mode), r),
+        "position-deletes" => check(position_deletes::Protocol::new(r.mode), r, explore),
         "lifecycle-composed" => check(
             dataset_lifecycle::composed::Protocol::new(r.mode, r.bound),
             r,
+            explore,
         ),
-        "dataset-lifecycle" => check(dataset_lifecycle::Protocol::new(r.mode, r.bound), r),
-        "source-positions" => check(source_positions::Protocol::new(r.mode, r.bound), r),
-        "standby" => check(standby::Protocol::new(r.mode), r),
-        "object-names" => check(object_names::Protocol::new(r.mode, r.bound), r),
-        "reads" => check(reads::Protocol::new(r.mode, r.bound), r),
-        "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
-        "retention" => check(retention::Protocol::new(r.mode), r),
-        "replicas" => check(replicas::Protocol::new(r.mode), r),
-        "commits" => check(commits::Protocol::new(r.mode, r.bound), r),
+        "dataset-lifecycle" => check(
+            dataset_lifecycle::Protocol::new(r.mode, r.bound),
+            r,
+            explore,
+        ),
+        "source-positions" => check(source_positions::Protocol::new(r.mode, r.bound), r, explore),
+        "standby" => check(standby::Protocol::new(r.mode), r, explore),
+        "object-names" => check(object_names::Protocol::new(r.mode, r.bound), r, explore),
+        "reads" => check(reads::Protocol::new(r.mode, r.bound), r, explore),
+        "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r, explore),
+        "retention" => check(retention::Protocol::new(r.mode), r, explore),
+        "replicas" => check(replicas::Protocol::new(r.mode), r, explore),
+        "commits" => check(commits::Protocol::new(r.mode, r.bound), r, explore),
         "transactions" => check_with_symmetry(
             transactions::Protocol::new(r.mode, r.bound),
             r,
             r.mode
                 .contains("symmetry")
                 .then_some(transactions::Protocol::representative),
+            explore,
         ),
-        "intent-roll-forward" if r.mode.contains("partitioned") => {
-            check(intent_partitioned::Protocol::new(r.mode, r.bound), r)
-        }
-        "intent-roll-forward" => check(intent_roll_forward::Protocol::new(r.mode, r.bound), r),
-        "window" => check(window::Protocol::new(r.mode, r.bound), r),
-        "floors" => check(floors::Protocol::new(r.mode, r.bound), r),
-        "concurrent" => check(concurrent::Protocol::new(r.mode, r.bound), r),
-        "state-rules" => check(state_rules::Protocol::new(r.mode, r.bound), r),
-        "mem-tier" => check(mem_tier::Protocol::new(r.mode, r.bound), r),
-        "seq-order" => check(seq_order::Protocol::new(r.mode, r.bound), r),
-        "predicate-progress" => check(read_programs::PredicateProgress::new(r.bound), r),
-        "cold-promotion" => check(dataset_lifecycle::promotion::Protocol::new(r.mode), r),
-        "read-delivery" => check(read_programs::delivery::Protocol::new(r.mode, r.bound), r),
+        "intent-roll-forward" if r.mode.contains("partitioned") => check(
+            intent_partitioned::Protocol::new(r.mode, r.bound),
+            r,
+            explore,
+        ),
+        "intent-roll-forward" => check(
+            intent_roll_forward::Protocol::new(r.mode, r.bound),
+            r,
+            explore,
+        ),
+        "window" => check(window::Protocol::new(r.mode, r.bound), r, explore),
+        "floors" => check(floors::Protocol::new(r.mode, r.bound), r, explore),
+        "concurrent" => check(concurrent::Protocol::new(r.mode, r.bound), r, explore),
+        "state-rules" => check(state_rules::Protocol::new(r.mode, r.bound), r, explore),
+        "mem-tier" => check(mem_tier::Protocol::new(r.mode, r.bound), r, explore),
+        "seq-order" => check(seq_order::Protocol::new(r.mode, r.bound), r, explore),
+        "predicate-progress" => check(read_programs::PredicateProgress::new(r.bound), r, explore),
+        "cold-promotion" => check(
+            dataset_lifecycle::promotion::Protocol::new(r.mode),
+            r,
+            explore,
+        ),
+        "read-delivery" => check(
+            read_programs::delivery::Protocol::new(r.mode, r.bound),
+            r,
+            explore,
+        ),
         "read-programs" => {
             let model = read_programs::Protocol::new(r.mode, r.bound);
-            let good = check(model.clone(), r);
+            let good = check(model.clone(), r, explore);
             println!("COMMIT_COST_PROFILES {} {:?}", r.name, model.profiles());
             println!(
                 "MODEL_COUNTS {} max_winners={} max_rows_evaluated={}",

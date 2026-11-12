@@ -1,7 +1,7 @@
 // Copyright 2024-2026 The Spice.ai OSS Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use cayenne_metastore_model::{cite_check, run, runs};
+use cayenne_metastore_model::{cite_check, run, runs, serve};
 
 // Checking clones and drops a state per transition; allocation dominates the
 // system allocator's profile.
@@ -17,6 +17,10 @@ fn main() -> Result<(), String> {
             }
         }
         Some("run") => run(args.get(1).ok_or("Usage: run <name>")?)?,
+        Some("serve") => serve(
+            args.get(1).ok_or("Usage: serve <name> [address]")?,
+            args.get(2).map_or("127.0.0.1:3000", String::as_str),
+        )?,
         Some("quick") => {
             let mut failed = false;
             for name in [
@@ -93,7 +97,7 @@ fn main() -> Result<(), String> {
         }
         _ => {
             return Err(
-                "Usage: cayenne-metastore-model list | run <name> | quick | all | cite-check <doc>…"
+                "Usage: cayenne-metastore-model list | run <name> | serve <name> [address] | quick | all | cite-check <doc>…"
                     .into(),
             );
         }

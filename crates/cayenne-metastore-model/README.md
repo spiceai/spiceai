@@ -30,6 +30,21 @@ links to a section that does.
 cargo run --release -p cayenne-metastore-model -- cite-check docs/design/object-native-metastore.md docs/design/object-native-metastore-technical.md
 ```
 
+`serve <run> [address]` checks a run as `run` does, then serves the
+[Stateright Explorer](https://docs.rs/stateright/0.31.0/stateright/struct.CheckerBuilder.html#method.serve)
+on `address` (default `127.0.0.1:3000`) until stopped. For each failed or
+reached property it prints an `EXPLORE` line with a link that opens the
+minimized trace step by step; from any step the Explorer lists the enabled
+actions, so a trace can be extended by hand. Controls do not need `EXHAUST=1`
+here, since their counterexample is usually what is worth showing. The
+Explorer's own "Run to completion" re-explores the graph without the run's
+symmetry reduction or early stop, so prefer the printed links on large runs.
+
+```sh
+cargo run --release -p cayenne-metastore-model -- serve position-delete-no-position-remap-silent-drop
+cargo run --release -p cayenne-metastore-model -- serve standby 127.0.0.1:3001
+```
+
 Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
 A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
