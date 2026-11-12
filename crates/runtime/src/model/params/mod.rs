@@ -34,6 +34,7 @@ pub mod file;
 pub mod google;
 pub mod huggingface;
 pub mod openai;
+pub mod openrouter;
 pub mod spiceai;
 pub mod typesafe;
 pub mod xai;
@@ -60,6 +61,7 @@ source_specs!(BEDROCK_SPEC, bedrock::BedrockModelParams);
 source_specs!(SPICEAI_SPEC, spiceai::SpiceAiModelParams);
 source_specs!(GOOGLE_SPEC, google::GoogleModelParams);
 source_specs!(TYPESAFE_SPEC, typesafe::TypeSafeModelParams);
+source_specs!(OPENROUTER_SPEC, openrouter::OpenRouterModelParams);
 
 /// Returns the parameter specifications for a given model source, generated
 /// from that source's `#[derive(TypedParams)]` struct (the single source of
@@ -79,6 +81,7 @@ pub fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
         ModelSource::SpiceAI => &SPICEAI_SPEC,
         ModelSource::Google => &GOOGLE_SPEC,
         ModelSource::TypeSafe => &TYPESAFE_SPEC,
+        ModelSource::OpenRouter => &OPENROUTER_SPEC,
     }
 }
 
@@ -310,6 +313,10 @@ mod tests {
             (ModelSource::SpiceAI, spiceai::SpiceAiModelParams::PREFIX),
             (ModelSource::Google, google::GoogleModelParams::PREFIX),
             (ModelSource::TypeSafe, typesafe::TypeSafeModelParams::PREFIX),
+            (
+                ModelSource::OpenRouter,
+                openrouter::OpenRouterModelParams::PREFIX,
+            ),
         ] {
             assert_eq!(
                 prefix,

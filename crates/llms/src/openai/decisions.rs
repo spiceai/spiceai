@@ -164,10 +164,10 @@ impl OpenAiDecisions {
     }
 }
 
-/// The provider's message from an `OpenAI` error body (`{"error": {"message": ...}}`), or
+/// The provider's message from an `OpenAI`-style error body (`{"error": {"message": ...}}`), or
 /// the body as it came when it is not one. `/v1/decisions` relays the message in its own
 /// error envelope, which would otherwise carry the provider's envelope as a JSON string.
-fn provider_message(body: String) -> String {
+pub(crate) fn provider_message(body: String) -> String {
     #[derive(serde::Deserialize)]
     struct Envelope {
         error: Detail,

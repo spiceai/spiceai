@@ -154,7 +154,7 @@ fn provider_default(provider: ModelSource) -> ModelCapabilities {
             native_decisions: false,
             messages: Some(MessagesBackend::ViaChat),
         },
-        ModelSource::TypeSafe => ModelCapabilities {
+        ModelSource::TypeSafe | ModelSource::OpenRouter => ModelCapabilities {
             provider,
             chat: false,
             responses: false,
@@ -267,6 +267,15 @@ mod tests {
                 "{from}"
             );
         }
+    }
+
+    #[test]
+    fn openrouter_models_answer_decisions_only() {
+        let found = capabilities("openrouter:baseten/elephant-1");
+        assert_eq!(found.decisions(), Some(DecisionsBackend::Native));
+        assert!(!found.has(Capability::Chat));
+        assert!(!found.has(Capability::Responses));
+        assert_eq!(found.messages(), None);
     }
 
     #[test]
