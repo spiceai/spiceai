@@ -47,6 +47,7 @@ mod messages_tests;
 #[cfg(feature = "models")]
 mod model_capability_tests;
 mod mtls;
+pub(crate) mod optional_json;
 mod response_outcome;
 mod routes;
 mod server_timing;
