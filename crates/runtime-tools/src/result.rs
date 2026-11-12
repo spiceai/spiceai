@@ -77,6 +77,29 @@ const MAX_EXACT_DECIMAL_PRECISION: u8 = 15;
 /// Bytes of the byte budget kept for the result's other keys and its `message`.
 const ENVELOPE_BYTES: usize = 640;
 
+/// What the value encoders did to the values they wrote, which the result's `message` reports.
+#[derive(Debug, Default)]
+struct ValueFlags {
+    /// A text value or a list was shortened.
+    shortened: AtomicBool,
+    /// A binary value was written as its size.
+    binary: AtomicBool,
+}
+
+impl ValueFlags {
+    fn snapshot(&self) -> (bool, bool) {
+        (
+            self.shortened.load(Ordering::Relaxed),
+            self.binary.load(Ordering::Relaxed),
+        )
+    }
+
+    fn restore(&self, (shortened, binary): (bool, bool)) {
+        self.shortened.store(shortened, Ordering::Relaxed);
+        self.binary.store(binary, Ordering::Relaxed);
+    }
+}
+
 /// How much of a tool result a model may be given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResultBudget {
@@ -182,14 +205,25 @@ pub fn result_schema() -> Value {
 /// Rows encoded for a model, within a [`ResultBudget`].
 #[derive(Debug)]
 pub struct ToolRows {
+    /// The column names shown: every column's, unless [`Self::too_wide`] says otherwise.
     columns: Vec<String>,
+    /// The number of columns, when their names alone do not fit the budget. Then `columns` holds
+    /// the names that fit followed by a marker, and no rows are shown.
+    too_wide: Option<usize>,
     /// A JSON array of row arrays.
     rows: Vec<u8>,
     shown: usize,
     truncated: bool,
     shortened: bool,
+    binary: bool,
     max_bytes: usize,
 }
+
+/// The `message` part saying what happened to long values.
+const SHORTENED_VALUES: &str = "Some long values were shortened: text to its first 1,024 characters and lists to their first 16 items. Read the rest with substr(column, 1025, 1024) or array_slice(column, 17, 32).";
+/// The `message` part saying how binary values are shown.
+const BINARY_VALUES: &str =
+    "Binary values are shown as their size; select encode(column, 'hex') to read one.";
 
 impl ToolRows {
     /// The number of rows shown.
@@ -210,15 +244,20 @@ impl ToolRows {
         self.shortened
     }
 
-    /// The message for the model, when rows were left out or values shortened.
+    /// The message for the model, when rows were left out or values shortened or summarized.
     #[must_use]
     pub fn message(&self) -> Option<String> {
-        let rows = if !self.truncated {
+        let kib = self.max_bytes / 1024;
+        let rows = if let Some(columns) = self.too_wide {
+            Some(format!(
+                "The result has {}, more than the {kib} KiB this result may use can name, so no rows are shown. Select fewer columns.",
+                count_of(columns, "column")
+            ))
+        } else if !self.truncated {
             None
         } else if self.shown == 0 {
             Some(format!(
-                "The first row is larger than the {} KiB this result may use, so no rows are shown. Select fewer columns, or select long columns on their own.",
-                self.max_bytes / 1024
+                "The first row is larger than the {kib} KiB this result may use, so no rows are shown. Select fewer columns, or select substr(column, 1, 1024) of long ones."
             ))
         } else {
             Some(format!(
@@ -226,40 +265,106 @@ impl ToolRows {
                 self.shown
             ))
         };
-        let values = self.shortened.then_some(
-            "Some long values were shortened; select the column on its own to read it in full.",
+        let parts: Vec<&str> = [
+            rows.as_deref(),
+            self.shortened.then_some(SHORTENED_VALUES),
+            self.binary.then_some(BINARY_VALUES),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
+
+    /// The tool result as an object holding `rows`.
+    fn object(&self, rows: Vec<Value>) -> Value {
+        let mut object = Map::with_capacity(4);
+        object.insert(
+            "columns".to_string(),
+            Value::Array(self.columns.iter().cloned().map(Value::String).collect()),
         );
-        match (rows, values) {
-            (None, None) => None,
-            (Some(rows), None) => Some(rows),
-            (None, Some(values)) => Some(values.to_string()),
-            (Some(rows), Some(values)) => Some(format!("{rows} {values}")),
+        object.insert("rows".to_string(), Value::Array(rows));
+        if self.truncated {
+            object.insert("truncated".to_string(), Value::Bool(true));
         }
+        if let Some(message) = self.message() {
+            object.insert("message".to_string(), Value::String(message));
+        }
+        Value::Object(object)
     }
 
     /// The tool result: `{"columns":[…],"rows":[…]}`, with `truncated` when rows were left out and
     /// `message` when rows were left out or values shortened.
     ///
+    /// The result, serialized, is never larger than the budget: should a row read back from JSON
+    /// serialize longer than it was encoded (a whole `f64` gains `.0`), rows are dropped from the
+    /// end, and the result is marked truncated, until it fits.
+    ///
     /// # Errors
     ///
     /// Returns an error if the encoded rows are not valid JSON, which would be a bug in the
     /// encoder.
-    pub fn into_value(self) -> Result<Value, serde_json::Error> {
-        let message = self.message();
-        let mut object = Map::with_capacity(4);
-        object.insert(
-            "columns".to_string(),
-            Value::Array(self.columns.into_iter().map(Value::String).collect()),
-        );
-        object.insert("rows".to_string(), serde_json::from_slice(&self.rows)?);
-        if self.truncated {
-            object.insert("truncated".to_string(), Value::Bool(true));
+    pub fn into_value(mut self) -> Result<Value, serde_json::Error> {
+        let mut rows: Vec<Value> = serde_json::from_slice(&self.rows)?;
+        loop {
+            let value = self.object(rows);
+            if serde_json::to_vec(&value)?.len() <= self.max_bytes {
+                return Ok(value);
+            }
+            let Value::Object(mut object) = value else {
+                return Ok(value);
+            };
+            rows = match object.remove("rows") {
+                Some(Value::Array(rows)) if !rows.is_empty() => rows,
+                _ => return Ok(Value::Object(object_with_rows(object))),
+            };
+            rows.pop();
+            self.shown = rows.len();
+            self.truncated = true;
         }
-        if let Some(message) = message {
-            object.insert("message".to_string(), Value::String(message));
-        }
-        Ok(Value::Object(object))
     }
+}
+
+/// `object` with an empty `rows` put back.
+fn object_with_rows(mut object: Map<String, Value>) -> Map<String, Value> {
+    object.insert("rows".to_string(), Value::Array(Vec::new()));
+    object
+}
+
+/// `count` and `noun`, plural unless `count` is 1.
+fn count_of(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// The length of `value` serialized as JSON.
+fn json_len(value: &impl serde::Serialize) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |json| json.len())
+}
+
+/// The longest prefix of `names` that fits in `limit` bytes as a JSON array together with a
+/// marker of how many names were left out.
+fn names_that_fit(names: &[String], limit: usize) -> Vec<String> {
+    let mut shown: Vec<String> = Vec::new();
+    for name in names {
+        shown.push(name.clone());
+        let marker = format!("…[+{}]", count_of(names.len() - shown.len(), "column"));
+        shown.push(marker);
+        let fits = json_len(&shown) <= limit;
+        shown.pop();
+        if !fits {
+            shown.pop();
+            break;
+        }
+    }
+    let left_out = names.len() - shown.len();
+    if left_out > 0 {
+        shown.push(format!("…[+{}]", count_of(left_out, "column")));
+    }
+    shown
 }
 
 /// Whether a [`RowEncoder`] can take more rows.
@@ -274,6 +379,7 @@ pub enum Progress {
 /// Encodes record batches into a [`ToolRows`], one row at a time, until the budget is spent.
 pub struct RowEncoder {
     columns: Vec<String>,
+    too_wide: Option<usize>,
     budget: ResultBudget,
     /// The bytes the encoded rows may take: the budget less the column names and the envelope.
     rows_budget: usize,
@@ -281,35 +387,44 @@ pub struct RowEncoder {
     row: Vec<u8>,
     shown: usize,
     truncated: bool,
-    shortened: Arc<AtomicBool>,
+    flags: Arc<ValueFlags>,
     options: EncoderOptions,
 }
 
 impl RowEncoder {
     #[must_use]
     pub fn new(schema: &SchemaRef, budget: ResultBudget) -> Self {
-        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let columns_bytes = columns.iter().map(|name| name.len() + 3).sum::<usize>() + 2;
-        let rows_budget = budget
+        let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        // The column names are measured as they are serialized, escapes included.
+        let names_bytes = json_len(&names);
+        let (columns, too_wide, rows_budget) = if let Some(rows_budget) = budget
             .max_bytes
-            .saturating_sub(columns_bytes.saturating_add(ENVELOPE_BYTES));
-        let shortened = Arc::new(AtomicBool::new(false));
+            .checked_sub(names_bytes.saturating_add(ENVELOPE_BYTES))
+        {
+            (names, None, rows_budget)
+        } else {
+            let total = names.len();
+            let limit = budget.max_bytes.saturating_sub(ENVELOPE_BYTES);
+            (names_that_fit(&names, limit), Some(total), 0)
+        };
+        let flags = Arc::new(ValueFlags::default());
         let options = EncoderOptions::default()
             .with_explicit_nulls(true)
             .with_encoder_factory(Arc::new(ModelValueEncoders {
-                shortened: Arc::clone(&shortened),
+                flags: Arc::clone(&flags),
             }));
         let mut rows = Vec::with_capacity(rows_budget.min(MAX_RESULT_BYTES));
         rows.push(b'[');
         Self {
             columns,
+            too_wide,
             budget,
             rows_budget,
             rows,
             row: Vec::new(),
             shown: 0,
             truncated: false,
-            shortened,
+            flags,
             options,
         }
     }
@@ -342,7 +457,7 @@ impl RowEncoder {
                 self.truncated = true;
                 return Ok(Progress::Full);
             }
-            let shortened_before = self.shortened.load(Ordering::Relaxed);
+            let flags_before = self.flags.snapshot();
             self.row.clear();
             if self.shown > 0 {
                 self.row.push(b',');
@@ -363,7 +478,7 @@ impl RowEncoder {
             if self.rows.len() + self.row.len() + 1 > self.rows_budget {
                 // A value shortened only in a row that is not shown was not shortened for the
                 // model.
-                self.shortened.store(shortened_before, Ordering::Relaxed);
+                self.flags.restore(flags_before);
                 self.truncated = true;
                 return Ok(Progress::Full);
             }
@@ -377,12 +492,15 @@ impl RowEncoder {
     #[must_use]
     pub fn finish(mut self) -> ToolRows {
         self.rows.push(b']');
+        let (shortened, binary) = self.flags.snapshot();
         ToolRows {
             columns: self.columns,
+            too_wide: self.too_wide,
             rows: self.rows,
             shown: self.shown,
             truncated: self.truncated,
-            shortened: self.shortened.load(Ordering::Relaxed),
+            shortened,
+            binary,
             max_bytes: self.budget.max_bytes,
         }
     }
@@ -429,8 +547,7 @@ pub fn encode_batches(
 /// The value encoders that differ from `arrow-json`'s, for every column and every nested value.
 #[derive(Debug)]
 struct ModelValueEncoders {
-    /// Set when a value is shortened.
-    shortened: Arc<AtomicBool>,
+    flags: Arc<ValueFlags>,
 }
 
 impl EncoderFactory for ModelValueEncoders {
@@ -440,31 +557,35 @@ impl EncoderFactory for ModelValueEncoders {
         array: &'a dyn Array,
         options: &'a EncoderOptions,
     ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
-        let shortened = || Arc::clone(&self.shortened);
+        let flags = || Arc::clone(&self.flags);
         let encoder: Box<dyn Encoder + 'a> = match array.data_type() {
             DataType::Utf8 => Box::new(TextEncoder {
                 values: array.as_string::<i32>(),
-                shortened: shortened(),
+                flags: flags(),
             }),
             DataType::LargeUtf8 => Box::new(TextEncoder {
                 values: array.as_string::<i64>(),
-                shortened: shortened(),
+                flags: flags(),
             }),
             DataType::Utf8View => Box::new(TextEncoder {
                 values: array.as_string_view(),
-                shortened: shortened(),
+                flags: flags(),
             }),
             DataType::Binary => Box::new(BinaryEncoder {
                 values: array.as_binary::<i32>(),
+                flags: flags(),
             }),
             DataType::LargeBinary => Box::new(BinaryEncoder {
                 values: array.as_binary::<i64>(),
+                flags: flags(),
             }),
             DataType::BinaryView => Box::new(BinaryEncoder {
                 values: array.as_binary_view(),
+                flags: flags(),
             }),
             DataType::FixedSizeBinary(_) => Box::new(BinaryEncoder {
                 values: array.as_fixed_size_binary(),
+                flags: flags(),
             }),
             DataType::Float16 => Box::new(FloatEncoder {
                 values: array.as_primitive::<Float16Type>(),
@@ -485,38 +606,66 @@ impl EncoderFactory for ModelValueEncoders {
                     formatter: ArrayFormatter::try_new(array, &FormatOptions::default())?,
                 })
             }
+            // `arrow-json` has no encoding for a union; its display form names the variant.
+            DataType::Union(_, _) => Box::new(QuotedDisplayEncoder {
+                formatter: ArrayFormatter::try_new(array, &FormatOptions::default())?,
+            }),
             DataType::List(item) => {
                 let list = array.as_list::<i32>();
                 Box::new(ListEncoder {
-                    ranges: ListRanges::Offsets(
-                        list.value_offsets()
-                            .iter()
-                            .map(|offset| offset_to_usize(*offset))
-                            .collect::<Result<_, _>>()?,
-                    ),
+                    spans: offset_spans(list.value_offsets())?,
                     values: make_encoder(item, list.values().as_ref(), options)?,
-                    shortened: shortened(),
+                    flags: flags(),
                 })
             }
             DataType::LargeList(item) => {
                 let list = array.as_list::<i64>();
                 Box::new(ListEncoder {
-                    ranges: ListRanges::Offsets(
-                        list.value_offsets()
-                            .iter()
-                            .map(|offset| offset_to_usize(*offset))
-                            .collect::<Result<_, _>>()?,
-                    ),
+                    spans: offset_spans(list.value_offsets())?,
                     values: make_encoder(item, list.values().as_ref(), options)?,
-                    shortened: shortened(),
+                    flags: flags(),
+                })
+            }
+            DataType::ListView(item) => {
+                let list = array.as_list_view::<i32>();
+                Box::new(ListEncoder {
+                    spans: view_spans(list.value_offsets(), list.value_sizes())?,
+                    values: make_encoder(item, list.values().as_ref(), options)?,
+                    flags: flags(),
+                })
+            }
+            DataType::LargeListView(item) => {
+                let list = array.as_list_view::<i64>();
+                Box::new(ListEncoder {
+                    spans: view_spans(list.value_offsets(), list.value_sizes())?,
+                    values: make_encoder(item, list.values().as_ref(), options)?,
+                    flags: flags(),
                 })
             }
             DataType::FixedSizeList(item, size) => {
                 let list = array.as_fixed_size_list();
+                let size = offset_to_usize(*size)?;
                 Box::new(ListEncoder {
-                    ranges: ListRanges::Fixed(offset_to_usize(*size)?),
+                    spans: (0..list.len()).map(|i| (i * size, size)).collect(),
                     values: make_encoder(item, list.values().as_ref(), options)?,
-                    shortened: shortened(),
+                    flags: flags(),
+                })
+            }
+            // A map is a list of `[key, value]` pairs, not a JSON object: keys of any type stay
+            // typed, and two keys that read the same once shortened stay two entries.
+            DataType::Map(entries, _) => {
+                let DataType::Struct(entry_fields) = entries.data_type() else {
+                    return Ok(None);
+                };
+                let [key_field, value_field] = entry_fields.as_ref() else {
+                    return Ok(None);
+                };
+                let map = array.as_map();
+                Box::new(MapEncoder {
+                    spans: offset_spans(map.value_offsets())?,
+                    keys: make_encoder(key_field, map.keys().as_ref(), options)?,
+                    values: make_encoder(value_field, map.values().as_ref(), options)?,
+                    flags: flags(),
                 })
             }
             _ => return Ok(None),
@@ -529,6 +678,33 @@ fn offset_to_usize<O: TryInto<usize> + Copy + Display>(offset: O) -> Result<usiz
     offset.try_into().map_err(|_| {
         ArrowError::InvalidArgumentError(format!("List offset {offset} is not a valid index"))
     })
+}
+
+/// Each list's start and length in its values, from offsets where list `i` is
+/// `offsets[i]..offsets[i + 1]`.
+fn offset_spans<O: TryInto<usize> + Copy + Display>(
+    offsets: &[O],
+) -> Result<Vec<(usize, usize)>, ArrowError> {
+    offsets
+        .windows(2)
+        .map(|pair| {
+            let start = offset_to_usize(pair[0])?;
+            let end = offset_to_usize(pair[1])?;
+            Ok((start, end.saturating_sub(start)))
+        })
+        .collect()
+}
+
+/// Each list view's start and length in its values.
+fn view_spans<O: TryInto<usize> + Copy + Display>(
+    offsets: &[O],
+    sizes: &[O],
+) -> Result<Vec<(usize, usize)>, ArrowError> {
+    offsets
+        .iter()
+        .zip(sizes)
+        .map(|(offset, size)| Ok((offset_to_usize(*offset)?, offset_to_usize(*size)?)))
+        .collect()
 }
 
 /// Writes `value` as a JSON string.
@@ -545,7 +721,7 @@ fn write_json_string(value: &str, out: &mut Vec<u8>) {
 /// out.
 struct TextEncoder<A> {
     values: A,
-    shortened: Arc<AtomicBool>,
+    flags: Arc<ValueFlags>,
 }
 
 impl<'a, A> Encoder for TextEncoder<A>
@@ -558,7 +734,7 @@ where
             None => write_json_string(value, out),
             Some((cut, _)) => {
                 let left_out = value[cut..].chars().count();
-                self.shortened.store(true, Ordering::Relaxed);
+                self.flags.shortened.store(true, Ordering::Relaxed);
                 write_json_string(&format!("{}…[+{left_out} chars]", &value[..cut]), out);
             }
         }
@@ -568,6 +744,7 @@ where
 /// A binary value, as its length.
 struct BinaryEncoder<A> {
     values: A,
+    flags: Arc<ValueFlags>,
 }
 
 impl<'a, A> Encoder for BinaryEncoder<A>
@@ -576,6 +753,7 @@ where
 {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
         let len = self.values.value(idx).len();
+        self.flags.binary.store(true, Ordering::Relaxed);
         write_json_string(&format!("<binary {len} bytes>"), out);
     }
 }
@@ -626,7 +804,8 @@ impl Encoder for FloatEncoder<'_, Float16Type> {
     }
 }
 
-/// A value written as a JSON string of its display form: a decimal too wide for an `f64`.
+/// A value written as a JSON string of its display form: a decimal too wide for an `f64`, or a
+/// type `arrow-json` cannot encode.
 struct QuotedDisplayEncoder<'a> {
     formatter: ArrayFormatter<'a>,
 }
@@ -637,36 +816,25 @@ impl Encoder for QuotedDisplayEncoder<'_> {
     }
 }
 
-enum ListRanges {
-    /// Where each list starts and ends in the values: list `i` is `offsets[i]..offsets[i + 1]`.
-    Offsets(Vec<usize>),
-    /// Every list has this many values.
-    Fixed(usize),
-}
-
-impl ListRanges {
-    fn range(&self, idx: usize) -> (usize, usize) {
-        match self {
-            ListRanges::Offsets(offsets) => (
-                offsets.get(idx).copied().unwrap_or_default(),
-                offsets.get(idx + 1).copied().unwrap_or_default(),
-            ),
-            ListRanges::Fixed(size) => (idx * size, (idx + 1) * size),
-        }
+/// Writes the marker for `left_out` elements that were not written, after `written` that were.
+fn write_left_out(written: usize, left_out: usize, unit: &str, out: &mut Vec<u8>) {
+    if written > 0 {
+        out.push(b',');
     }
+    write_json_string(&format!("…[+{left_out} {unit}]"), out);
 }
 
 /// A list, shortened to [`MAX_LIST_ITEMS`] elements with a marker of how many were left out.
 struct ListEncoder<'a> {
-    ranges: ListRanges,
+    /// Each list's start and length in `values`.
+    spans: Vec<(usize, usize)>,
     values: NullableEncoder<'a>,
-    shortened: Arc<AtomicBool>,
+    flags: Arc<ValueFlags>,
 }
 
 impl Encoder for ListEncoder<'_> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
-        let (start, end) = self.ranges.range(idx);
-        let len = end.saturating_sub(start);
+        let (start, len) = self.spans.get(idx).copied().unwrap_or_default();
         let shown = len.min(MAX_LIST_ITEMS);
         out.push(b'[');
         for (n, value) in (start..start + shown).enumerate() {
@@ -680,11 +848,48 @@ impl Encoder for ListEncoder<'_> {
             }
         }
         if len > shown {
-            self.shortened.store(true, Ordering::Relaxed);
-            if shown > 0 {
+            self.flags.shortened.store(true, Ordering::Relaxed);
+            write_left_out(shown, len - shown, "items", out);
+        }
+        out.push(b']');
+    }
+}
+
+/// A map, as a list of `[key, value]` pairs, shortened to [`MAX_LIST_ITEMS`] entries.
+struct MapEncoder<'a> {
+    /// Each map's start and number of entries.
+    spans: Vec<(usize, usize)>,
+    keys: NullableEncoder<'a>,
+    values: NullableEncoder<'a>,
+    flags: Arc<ValueFlags>,
+}
+
+impl Encoder for MapEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let (start, len) = self.spans.get(idx).copied().unwrap_or_default();
+        let shown = len.min(MAX_LIST_ITEMS);
+        out.push(b'[');
+        for (n, entry) in (start..start + shown).enumerate() {
+            if n > 0 {
                 out.push(b',');
             }
-            write_json_string(&format!("…[+{} items]", len - shown), out);
+            out.push(b'[');
+            if self.keys.is_null(entry) {
+                out.extend_from_slice(b"null");
+            } else {
+                self.keys.encode(entry, out);
+            }
+            out.push(b',');
+            if self.values.is_null(entry) {
+                out.extend_from_slice(b"null");
+            } else {
+                self.values.encode(entry, out);
+            }
+            out.push(b']');
+        }
+        if len > shown {
+            self.flags.shortened.store(true, Ordering::Relaxed);
+            write_left_out(shown, len - shown, "entries", out);
         }
         out.push(b']');
     }
@@ -707,9 +912,11 @@ mod tests {
     use arrow::{
         array::{
             ArrayRef, BinaryArray, Decimal128Array, Float32Array, Float64Array, Int32Array,
-            Int64Array, ListArray, StringArray, StructArray,
+            Int32Builder, Int64Array, ListArray, ListViewArray, MapBuilder, StringArray,
+            StringBuilder, StructArray, UnionArray,
         },
-        datatypes::{Field, Int32Type},
+        buffer::ScalarBuffer,
+        datatypes::{Field, Int32Type, UnionFields},
     };
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 
@@ -840,9 +1047,107 @@ mod tests {
                 "columns": ["a", "b", "c", "d", "e"],
                 "rows": [],
                 "truncated": true,
-                "message": "The first row is larger than the 4 KiB this result may use, so no rows are shown. Select fewer columns, or select long columns on their own.",
+                "message": "The first row is larger than the 4 KiB this result may use, so no rows are shown. Select fewer columns, or select substr(column, 1, 1024) of long ones.",
             })
         );
+    }
+
+    fn serialized_len(value: &Value) -> usize {
+        serde_json::to_vec(value).expect("serializes").len()
+    }
+
+    #[test]
+    fn column_names_alone_never_exceed_the_budget() {
+        // One name longer than the whole budget, and no rows.
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "x".repeat(40_000),
+            DataType::Int32,
+            true,
+        )]));
+        let value = encode_batches(&schema, &[], ResultBudget::default())
+            .expect("encodes")
+            .into_value()
+            .expect("valid JSON");
+        assert!(
+            serialized_len(&value) <= MAX_RESULT_BYTES,
+            "{}",
+            serialized_len(&value)
+        );
+        assert_eq!(value["columns"], json!(["…[+1 column]"]));
+        assert_eq!(value["rows"], json!([]));
+        assert_eq!(
+            value["message"],
+            "The result has 1 column, more than the 32 KiB this result may use can name, so no rows are shown. Select fewer columns."
+        );
+        assert!(
+            value.get("truncated").is_none(),
+            "there were no rows to leave out"
+        );
+
+        // Names that only escaping makes too long, with a row.
+        let names: Vec<Field> = (0..20)
+            .map(|i| Field::new(format!("{i}{}", "\u{1}".repeat(400)), DataType::Int32, true))
+            .collect();
+        let schema = Arc::new(arrow::datatypes::Schema::new(names));
+        let columns: Vec<ArrayRef> = (0..20)
+            .map(|_| Arc::new(Int32Array::from(vec![1])) as ArrayRef)
+            .collect();
+        let row = RecordBatch::try_new(Arc::clone(&schema), columns).expect("valid batch");
+        let value = encode_batches(&schema, &[row], ResultBudget::default())
+            .expect("encodes")
+            .into_value()
+            .expect("valid JSON");
+        assert!(
+            serialized_len(&value) <= MAX_RESULT_BYTES,
+            "{}",
+            serialized_len(&value)
+        );
+        assert_eq!(value["rows"], json!([]));
+        assert_eq!(value["truncated"], json!(true));
+        let columns = value["columns"].as_array().expect("an array");
+        assert!(
+            columns
+                .last()
+                .and_then(Value::as_str)
+                .is_some_and(|marker| marker.starts_with("…[+") && marker.ends_with(" columns]")),
+            "{columns:?}"
+        );
+    }
+
+    #[test]
+    fn a_result_never_serializes_larger_than_its_budget() {
+        // Control characters take six bytes each once escaped.
+        let escaped = "\u{1}".repeat(300);
+        let rows = batch(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from((0..500).collect::<Vec<i64>>())) as ArrayRef,
+            ),
+            (
+                "text",
+                Arc::new(StringArray::from(vec![escaped.as_str(); 500])) as ArrayRef,
+            ),
+            (
+                "amount",
+                Arc::new(
+                    Decimal128Array::from((0..500).map(|i| i * 100_000_000).collect::<Vec<i128>>())
+                        .with_precision_and_scale(15, 2)
+                        .expect("valid decimal"),
+                ) as ArrayRef,
+            ),
+        ]);
+        for max_bytes in [MIN_RESULT_BYTES, 8 * 1024, 13_107, MAX_RESULT_BYTES] {
+            let value = encode(
+                std::slice::from_ref(&rows),
+                ResultBudget::with_limits(DEFAULT_MAX_ROWS, max_bytes),
+            );
+            assert!(
+                serialized_len(&value) <= max_bytes,
+                "{} > {max_bytes}",
+                serialized_len(&value)
+            );
+            assert_eq!(value["truncated"], json!(true));
+        }
     }
 
     #[test]
@@ -912,18 +1217,14 @@ mod tests {
             (0..20).map(Some).collect::<Vec<_>>(),
         )]);
         let bytes = BinaryArray::from(vec![b"abc".as_slice()]);
-        let value = encode_batches(
-            &batch(vec![("t", Arc::new(text.clone()) as ArrayRef)]).schema(),
+        let value = encode(
             &[batch(vec![
                 ("t", Arc::new(text) as ArrayRef),
                 ("l", Arc::new(list) as ArrayRef),
                 ("b", Arc::new(bytes) as ArrayRef),
             ])],
             ResultBudget::default(),
-        )
-        .expect("encodes")
-        .into_value()
-        .expect("valid JSON");
+        );
         let row = &value["rows"][0];
         assert_eq!(
             row[0],
@@ -954,12 +1255,167 @@ mod tests {
         assert_eq!(row[2], Value::String("<binary 3 bytes>".to_string()));
         assert_eq!(
             value["message"],
-            Value::String(
-                "Some long values were shortened; select the column on its own to read it in full."
-                    .to_string()
-            )
+            Value::String(format!("{SHORTENED_VALUES} {BINARY_VALUES}"))
         );
         assert!(value.get("truncated").is_none());
+    }
+
+    #[test]
+    fn binary_alone_says_how_to_read_it() {
+        let bytes = BinaryArray::from(vec![b"abc".as_slice()]);
+        assert_eq!(
+            encode(
+                &[batch(vec![("b", Arc::new(bytes) as ArrayRef)])],
+                ResultBudget::default()
+            ),
+            json!({
+                "columns": ["b"],
+                "rows": [["<binary 3 bytes>"]],
+                "message": "Binary values are shown as their size; select encode(column, 'hex') to read one.",
+            })
+        );
+    }
+
+    #[test]
+    fn map_entries_stay_distinct_and_keep_their_key_types() {
+        // Two keys that read the same once shortened.
+        let mut text_keys = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        text_keys
+            .keys()
+            .append_value(format!("{}X", "a".repeat(MAX_TEXT_CHARS)));
+        text_keys.values().append_value(1);
+        text_keys
+            .keys()
+            .append_value(format!("{}Y", "a".repeat(MAX_TEXT_CHARS)));
+        text_keys.values().append_value(2);
+        text_keys.append(true).expect("appends");
+        // Integer keys, which `arrow-json` cannot write as object keys.
+        let mut int_keys = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+        int_keys.keys().append_value(1);
+        int_keys.values().append_value("one");
+        int_keys.append(true).expect("appends");
+
+        let value = encode(
+            &[batch(vec![
+                ("text_keys", Arc::new(text_keys.finish()) as ArrayRef),
+                ("int_keys", Arc::new(int_keys.finish()) as ArrayRef),
+            ])],
+            ResultBudget::default(),
+        );
+        let shortened = format!("{}…[+1 chars]", "a".repeat(MAX_TEXT_CHARS));
+        assert_eq!(
+            value["rows"][0],
+            json!([[[shortened, 1], [shortened, 2]], [[1, "one"]]])
+        );
+    }
+
+    #[test]
+    fn list_views_are_shortened_like_lists() {
+        let values = Int32Array::from((0..20).collect::<Vec<i32>>());
+        let view = ListViewArray::new(
+            Arc::new(Field::new_list_field(DataType::Int32, true)),
+            ScalarBuffer::from(vec![0]),
+            ScalarBuffer::from(vec![20]),
+            Arc::new(values),
+            None,
+        );
+        let value = encode(
+            &[batch(vec![("v", Arc::new(view) as ArrayRef)])],
+            ResultBudget::default(),
+        );
+        assert_eq!(
+            value["rows"][0][0],
+            json!([
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                "…[+4 items]"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_union_is_written_as_its_display_form() {
+        let fields = UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Field::new("n", DataType::Int32, true),
+                Field::new("s", DataType::Utf8, true),
+            ],
+        )
+        .expect("valid union fields");
+        let union = UnionArray::try_new(
+            fields,
+            ScalarBuffer::from(vec![0_i8, 1]),
+            None,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(7), None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None, Some("seven")])) as ArrayRef,
+            ],
+        )
+        .expect("valid union");
+        let value = encode(
+            &[batch(vec![("u", Arc::new(union) as ArrayRef)])],
+            ResultBudget::default(),
+        );
+        assert_eq!(value["rows"], json!([["{n=7}"], ["{s=seven}"]]));
+    }
+
+    #[test]
+    fn floats_and_decimals_read_back_exactly() {
+        let floats = Float64Array::from(vec![
+            1e-30,
+            0.1 + 0.2,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            5e-324,
+            -0.0,
+        ]);
+        let value = encode(
+            &[batch(vec![("f", Arc::new(floats.clone()) as ArrayRef)])],
+            ResultBudget::default(),
+        );
+        for (i, expected) in floats.values().iter().enumerate() {
+            let read = value["rows"][i][0].as_f64().expect("a number");
+            assert_eq!(
+                read.to_bits(),
+                expected.to_bits(),
+                "row {i}: {read} vs {expected}"
+            );
+        }
+
+        // A negative scale, and a scale equal to the precision, each within 15 digits.
+        let negative_scale = Decimal128Array::from(vec![999_999_999_999_999_i128])
+            .with_precision_and_scale(15, -8)
+            .expect("valid decimal");
+        let deep_scale = Decimal128Array::from(vec![12_345_i128])
+            .with_precision_and_scale(10, 10)
+            .expect("valid decimal");
+        let value = encode(
+            &[batch(vec![
+                ("negative_scale", Arc::new(negative_scale) as ArrayRef),
+                ("deep_scale", Arc::new(deep_scale) as ArrayRef),
+            ])],
+            ResultBudget::default(),
+        );
+        assert_eq!(
+            value["rows"][0][0].as_f64(),
+            Some(99_999_999_999_999_900_000_000.0)
+        );
+        assert_eq!(value["rows"][0][1].as_f64(), Some(0.000_001_234_5));
     }
 
     #[test]

@@ -90,7 +90,16 @@ steps:
       json:
         - { pointer: /rows, length: 3 }
         - { pointer: '/rows/*/1', matches: '…\[\+\d+ chars\]$' }
-        - { pointer: /message, equals: 'Some long values were shortened; select the column on its own to read it in full.' }
+        - { pointer: /message, equals: 'Some long values were shortened: text to its first 1,024 characters and lists to their first 16 items. Read the rest with substr(column, 1025, 1024) or array_slice(column, 17, 32).' }
+
+  # The rest of a shortened value is read the way the message says.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT length(doc) - 1024 AS rest, length(substr(doc, 1025, 1024)) AS read FROM docs WHERE id = 1"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /rows/0/0, above: 0 }
+        - { pointer: /rows/0/1, above: 0 }
+        - { pointer: /message, exists: false }
         - { pointer: /truncated, exists: false }
 
   # 100 rows of 1 KiB values are over the 32 KiB budget: the result ends at the last whole row that fits.
