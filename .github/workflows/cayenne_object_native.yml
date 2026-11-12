@@ -212,7 +212,8 @@ jobs:
       # retries = 0: a seeded walk that fails prints its seed and history, and a
       # retry could only hide it.
       - name: Run the data-path suites on S3
-        run: cargo nextest run --locked -p cayenne --test integration --retries 0 --no-fail-fast -E "$SUITES"
+        # Tests named `_sqlite` run on SQLite whatever the store, so sign-off covers them.
+        run: cargo nextest run --locked -p cayenne --test integration --retries 0 --no-fail-fast -E "($SUITES) - test(/_sqlite$/)"
       # What Cayenne's data path needs from an S3-compatible store.
       - name: Run the S3 store conformance test
         if: ${{ !cancelled() }}
