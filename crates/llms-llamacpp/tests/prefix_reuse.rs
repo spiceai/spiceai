@@ -646,7 +646,7 @@ async fn a_streamed_request_reuses_only_its_callers_prompts() {
 async fn each_further_choice_reuses_the_prompt() {
     let gguf = crate::qwen3_gguf().await;
     let model = LlamaCpp::from(
-        &[gguf.clone()],
+        std::slice::from_ref(&gguf),
         LocalModelOptions {
             reasoning: ReasoningDefault {
                 model_name: "qwen3-0.6b-choices",

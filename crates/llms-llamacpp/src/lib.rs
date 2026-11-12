@@ -1106,15 +1106,11 @@ fn serve(
             return;
         }
     };
+    let layout = cache_layout(model.architecture().as_deref());
     if ceiling > 1 {
-        // A DeepSeek-V4 cache keeps a stream of the whole context per sequence.
-        let per_request = matches!(
-            model.architecture().as_deref(),
-            Some("deepseek4" | "deepseek41")
-        );
         tracing::info!(
             "{}",
-            concurrency_note(name, (concurrent, ceiling), context.n_ctx(), per_request)
+            concurrency_note(name, (concurrent, ceiling), context.n_ctx(), layout)
         );
     }
     let context_window = context.n_ctx();
@@ -1159,7 +1155,14 @@ fn serve(
         caches.push(more);
     }
     let running = usize::try_from(concurrent).unwrap_or(1);
-    batching::serve(&model, &mut decoder, split, (caches, running), jobs, &eog);
+    batching::serve(
+        &model,
+        &mut decoder,
+        split,
+        (caches, running, layout),
+        jobs,
+        &eog,
+    );
 }
 
 /// Sends `event` to its client, waiting while the client's buffer is full, and returns whether
@@ -1420,14 +1423,26 @@ fn concurrent_context<'m>(
     }
 }
 
+/// How the cache of a model of `architecture` holds concurrent requests' sequences: llama.cpp's
+/// DeepSeek-V4 cache keeps a stream of the whole context per sequence even when asked for a
+/// unified one.
+fn cache_layout(architecture: Option<&str>) -> batching::CacheLayout {
+    match architecture {
+        Some("deepseek4" | "deepseek41") => batching::CacheLayout::PerSequence,
+        _ => batching::CacheLayout::Unified,
+    }
+}
+
 /// The line a model logs at load for how many requests it serves at once, `(serves, ceiling)`,
-/// with `n_ctx` tokens of context: shared by them, or each request's own when `per_request`.
+/// with `n_ctx` tokens of context: shared by them, or each request's own when its cache is laid
+/// out per sequence.
 fn concurrency_note(
     model: &str,
     (serves, ceiling): (u32, u32),
     n_ctx: u32,
-    per_request: bool,
+    layout: batching::CacheLayout,
 ) -> String {
+    let per_request = layout == batching::CacheLayout::PerSequence;
     let requests = if serves == 1 { "request" } else { "requests" };
     let lowered = if serves < ceiling {
         format!(", not {ceiling}")
@@ -3168,19 +3183,29 @@ mod tests {
     #[test]
     fn the_concurrency_line_says_how_many_requests_and_what_context() {
         assert_eq!(
-            concurrency_note("glm", (8, 8), 131_072, false),
+            concurrency_note("glm", (8, 8), 131_072, batching::CacheLayout::Unified),
             "Model 'glm' serves up to 8 requests at once from 131072 tokens of shared context memory; one request can use all of it. See: https://spiceai.org/docs/components/models"
         );
         assert_eq!(
-            concurrency_note("qwen", (4, 8), 131_072, false),
+            concurrency_note("qwen", (4, 8), 131_072, batching::CacheLayout::Unified),
             "Model 'qwen' serves up to 4 requests at once, not 8: more would not fit beside its weights, so further requests wait. See: https://spiceai.org/docs/components/models"
         );
         assert_eq!(
-            concurrency_note("deepseek", (8, 8), 131_072, true),
+            concurrency_note(
+                "deepseek",
+                (8, 8),
+                131_072,
+                batching::CacheLayout::PerSequence
+            ),
             "Model 'deepseek' serves up to 8 requests at once, each with its whole 131072-token context. See: https://spiceai.org/docs/components/models"
         );
         assert_eq!(
-            concurrency_note("deepseek", (1, 8), 131_072, true),
+            concurrency_note(
+                "deepseek",
+                (1, 8),
+                131_072,
+                batching::CacheLayout::PerSequence
+            ),
             "Model 'deepseek' serves up to 1 request at once, not 8, each with its whole 131072-token context: more would not fit beside its weights, so further requests wait. See: https://spiceai.org/docs/components/models"
         );
     }
