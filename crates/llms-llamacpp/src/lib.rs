@@ -149,14 +149,14 @@ const PROMPT_BATCH: usize = 512;
 /// draft, which stays well within the context's batch size (`PROMPT_BATCH`).
 const MAX_CONCURRENT: u32 = 8;
 
-/// How many prompts a model keeps cached, each in its own sequence of one shared cache, however
-/// many requests it decodes at once. A request reuses the cached prompt that shares the longest
-/// prefix with its own, so a request with another prefix (a coding agent's permission check or
-/// subagent, another conversation) leaves a conversation's cache for its next turn instead of
-/// replacing it, as llama-server keeps one prompt per slot. Idle prompts give up their room
-/// when a request needs it, longest unused first, so one request can still use the whole
-/// context.
-pub const CACHED_PROMPTS: u32 = 4;
+/// The most host memory a model's idle prompts take, as llama.cpp's server bounds its prompt cache
+/// in RAM (`--cache-ram`, 8 GiB by default). A prompt is saved out of the shared cache when
+/// another request needs its sequence, and restored when a request continues it, so a request
+/// with another prefix (a coding agent's permission check or subagent, another conversation)
+/// leaves a conversation's prompt for its next turn instead of replacing it. Saved prompts also
+/// keep within half the memory the process can still use when each is saved: on a machine whose
+/// GPU shares its memory, what the cache takes the model's own buffers no longer have.
+const HOST_CACHE_BYTES: u64 = 8 << 30;
 
 /// The context size when the model sets no `context_length`.
 const DEFAULT_CONTEXT: u32 = 8192;
@@ -988,8 +988,8 @@ fn render(
 }
 
 /// The decode thread: loads the model, reports readiness, then runs jobs: one at a time, in
-/// order, or up to `concurrent` together, each in the sequence of one shared cache whose cached
-/// prompt shares the longest prefix with its own, of up to [`CACHED_PROMPTS`] sequences.
+/// order, or up to `concurrent` together, each in its own sequence of one shared cache, with
+/// idle prompts saved to host memory for later requests to continue ([`HOST_CACHE_BYTES`]).
 fn serve(
     name: &str,
     path: &Path,
@@ -1071,46 +1071,26 @@ fn serve(
     let snapshots = head.map_or(0, |(_, kind)| {
         u32::try_from(draft_len(kind, mtp_len)).unwrap_or(0)
     });
-    let params = ContextParams::default()
-        .with_n_ctx(n_ctx)
-        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
-        .with_n_rs_seq(snapshots);
-    // The sequences share one cache of `n_ctx` cells, so keeping more prompts than requests
-    // costs only each sequence's own state, such as a recurrent layer's. A model whose context
-    // llama.cpp cannot create with them, or creates giving each sequence less than the whole
-    // context, keeps one prompt per request instead.
-    let sequences = concurrent.max(CACHED_PROMPTS);
-    let several = (sequences > concurrent)
-        .then(|| {
-            model
-                .new_context(backend, &shared_cache(params, sequences))
-                .ok()
-                .filter(|context| context.n_ctx_seq() == context.n_ctx())
-        })
-        .flatten();
-    let (context, sequences) = match several {
-        Some(context) => (context, sequences),
-        None => match model.new_context(backend, &shared_cache(params, concurrent)) {
-            Ok(context) => {
-                if sequences > concurrent {
-                    tracing::debug!(
-                        "Model '{name}' keeps {concurrent} cached prompt(s): llama.cpp could not give {sequences} sequences the whole context each."
-                    );
-                }
-                (context, concurrent)
-            }
-            Err(e) => {
-                let _ = ready.send(Err(failed(format!(
-                    "llama.cpp could not create a context: {e}"
-                ))));
-                return;
-            }
-        },
+    let context_params = shared_cache(
+        ContextParams::default()
+            .with_n_ctx(n_ctx)
+            .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
+            .with_n_rs_seq(snapshots),
+        concurrent,
+    );
+    let context = match model.new_context(backend, &context_params) {
+        Ok(context) => context,
+        Err(e) => {
+            let _ = ready.send(Err(failed(format!(
+                "llama.cpp could not create a context: {e}"
+            ))));
+            return;
+        }
     };
     let context_window = context.n_ctx();
     let mut decoder = match head {
         None => Decoder::Plain(context),
-        Some((head, kind)) => match mtp(head, kind, context, (mtp_len, sequences)) {
+        Some((head, kind)) => match mtp(head, kind, context, (mtp_len, concurrent)) {
             Ok(spec) => Decoder::Mtp(Box::new(spec)),
             Err(message) => {
                 let _ = ready.send(Err(failed(message)));
@@ -1128,7 +1108,7 @@ fn serve(
         Decoder::Plain(context) => context.truncation(),
         Decoder::Mtp(spec) => spec.target_mut().truncation(),
     };
-    let mut cache = PromptCache::new(name, truncation);
+    let cache = PromptCache::new(name, truncation);
     let loaded = Loaded {
         template: model.chat_template(),
         architecture: model.architecture(),
@@ -1142,35 +1122,14 @@ fn serve(
     if ready.send(Ok(loaded)).is_err() {
         return;
     }
-    if sequences > 1 {
-        let mut caches = vec![cache];
-        while caches.len() < usize::try_from(sequences).unwrap_or(usize::MAX) {
-            let mut more = PromptCache::new(name, truncation);
-            more.reused = Arc::clone(&caches[0].reused);
-            caches.push(more);
-        }
-        let running = usize::try_from(concurrent).unwrap_or(1);
-        batching::serve(&model, &mut decoder, split, (caches, running), jobs, &eog);
-        return;
+    let mut caches = vec![cache];
+    while caches.len() < usize::try_from(concurrent).unwrap_or(usize::MAX) {
+        let mut more = PromptCache::new(name, truncation);
+        more.reused = Arc::clone(&caches[0].reused);
+        caches.push(more);
     }
-    while let Ok(job) = jobs.recv() {
-        // A client that has gone, as one that stopped reading before a later choice's turn,
-        // is not decoded for.
-        if job.events.is_closed() {
-            continue;
-        }
-        let events = job.events.clone();
-        let stopping = Arc::clone(&job.stopping);
-        let result = match &mut decoder {
-            Decoder::Plain(context) => generate(&model, context, split, &mut cache, job, &eog),
-            Decoder::Mtp(spec) => generate_mtp(&model, spec, split, &mut cache, job, &eog),
-        };
-        let event = match result {
-            Ok(outcome) => Event::Done(outcome),
-            Err(message) => Event::Failed(message),
-        };
-        send_unless_stopping(&events, &stopping, event);
-    }
+    let running = usize::try_from(concurrent).unwrap_or(1);
+    batching::serve(&model, &mut decoder, split, (caches, running), jobs, &eog);
 }
 
 /// Sends `event` to its client, waiting while the client's buffer is full, and returns whether
@@ -1690,6 +1649,65 @@ impl PromptCache {
         self.cost.read(tokens, took);
     }
 
+    /// Takes what the cache knows about its sequence's cells, leaving it empty, for cells saved
+    /// out of the shared cache; `None` when it holds nothing to reuse.
+    fn take(&mut self) -> Option<CachedPrompt> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+        Some(CachedPrompt {
+            tokens: std::mem::take(&mut self.tokens),
+            namespace: self.namespace.take(),
+            checkpoints: self
+                .checkpoints
+                .as_mut()
+                .map(|checkpoints| std::mem::take(&mut checkpoints.0))
+                .unwrap_or_default(),
+            head_stash: self.head_stash.take(),
+        })
+    }
+
+    /// A copy of what [`PromptCache::take`] would take, leaving the cache as it is; `None` when
+    /// it holds nothing to reuse.
+    fn copy(&self) -> Option<CachedPrompt> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+        Some(CachedPrompt {
+            tokens: self.tokens.clone(),
+            namespace: self.namespace.clone(),
+            checkpoints: self
+                .checkpoints
+                .as_ref()
+                .map(|checkpoints| checkpoints.0.clone())
+                .unwrap_or_default(),
+            head_stash: self.head_stash.clone(),
+        })
+    }
+
+    /// Gives back what [`PromptCache::take`] took, for its cells restored into this cache's
+    /// sequence.
+    fn put(&mut self, prompt: CachedPrompt) {
+        self.tokens = prompt.tokens;
+        self.namespace = prompt.namespace;
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.0 = prompt.checkpoints;
+        }
+        self.head_stash = prompt.head_stash;
+    }
+
+    /// How many of `tokens` the cache would give a request from the caller in `namespace`
+    /// before reading the rest: the prefix they share, or nothing when that is less than half
+    /// of what the cache holds. Taking a cache it shares only a little with, such as a chat
+    /// template's opening tokens with another conversation, would throw away more than the
+    /// request reuses, so llama-server chooses a slot by prompt similarity too.
+    fn shares(&self, tokens: &[Token], namespace: &CacheNamespace) -> usize {
+        if self.namespace.as_ref() != Some(namespace) {
+            return 0;
+        }
+        shared_prefix(&self.tokens, tokens)
+    }
+
     /// Forgets everything the cache held, for a sequence whose cells were emptied: by a request
     /// that failed, or to make room for another request's sequence.
     fn forget(&mut self) {
@@ -1710,12 +1728,69 @@ impl PromptCache {
     }
 }
 
+/// What a prompt cache knows about the cells its sequence held, moved out with them when they
+/// are saved to host memory ([`PromptCache::take`]).
+struct CachedPrompt {
+    tokens: Vec<Token>,
+    namespace: Option<CacheNamespace>,
+    checkpoints: Vec<Checkpoint>,
+    head_stash: Option<(usize, Vec<u8>)>,
+}
+
+impl CachedPrompt {
+    /// The host memory its checkpoints and draft-head state take.
+    fn bytes(&self) -> usize {
+        let checkpoints: usize = self
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.state.len() + checkpoint.head.as_ref().map_or(0, Vec::len))
+            .sum();
+        checkpoints + self.head_stash.as_ref().map_or(0, |(_, state)| state.len())
+    }
+
+    fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// A copy for a request that continues only its first `n` tokens: whatever its checkpoints
+    /// and draft-head stash past them hold, the request's read drops.
+    fn up_to(&self, n: usize) -> CachedPrompt {
+        CachedPrompt {
+            tokens: self.tokens.clone(),
+            namespace: self.namespace.clone(),
+            checkpoints: self
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.n_tokens <= n)
+                .cloned()
+                .collect(),
+            head_stash: self.head_stash.clone().filter(|(at, _)| *at <= n),
+        }
+    }
+}
+
+/// How many of `tokens` a cache holding `cached` gives a request: the prefix they share, or
+/// nothing when that is less than half of `cached` (see [`PromptCache::shares`]).
+fn shared_prefix(cached: &[Token], tokens: &[Token]) -> usize {
+    let shared = cached
+        .iter()
+        .zip(tokens)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if 2 * shared >= cached.len() {
+        shared
+    } else {
+        0
+    }
+}
+
 /// A model's recurrent state saved after a prompt's first tokens, oldest first, as llama.cpp's
 /// server keeps context checkpoints: the attention cache truncates to any position, but the
 /// recurrent state rolls back only to one of these.
 #[derive(Default)]
 struct Checkpoints(Vec<Checkpoint>);
 
+#[derive(Clone)]
 struct Checkpoint {
     /// How many tokens the state follows.
     n_tokens: usize,
@@ -2412,181 +2487,6 @@ fn draw<'v>(sampling: &Sampling) -> Vec<Sampler<'v>> {
             Sampler::dist(sampling.seed),
         ],
         _ => vec![Sampler::greedy()],
-    }
-}
-
-/// Runs one request, one token per forward pass. On a model `split` across nodes, a request
-/// that picks greedily alone takes its picks from the context's argmax output
-/// ([`Context::set_argmax_output`]), set before its prompt is read.
-fn generate(
-    model: &Model,
-    context: &mut Context<'_>,
-    split: bool,
-    cache: &mut PromptCache,
-    job: Job,
-    eog: &[Token],
-) -> std::result::Result<Outcome, String> {
-    let namespace = job.namespace.clone();
-    let (prompt, sampling, mut out) = Output::new(job);
-    let vocab = model.vocab();
-    let mut picker = Picker::new(
-        vocab,
-        &sampling,
-        &out.ruled_out(eog),
-        context.n_ctx(),
-        out.pending(),
-    )?;
-    out.begin(picker.goes_on());
-    context.set_argmax_output(split && picker.picks_greedily());
-    // `tokens` grows by every reply token decoded, so it is always what the cache holds.
-    let (mut tokens, mut batch, cached) =
-        read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
-    out.cached = cached;
-    let prompt_tokens = tokens.len();
-    let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
-    let finish = loop {
-        let token = picker.sample(context, batch.n_tokens() - 1, out.in_content());
-        if let Some(finish) = out.token(model, token) {
-            break finish;
-        }
-        if tokens.len() + 1 >= n_ctx {
-            break FinishReason::Length;
-        }
-        batch.clear();
-        let pos = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
-        batch.add(token, pos, true).map_err(|e| e.to_string())?;
-        context.decode(&batch).map_err(|e| e.to_string())?;
-        tokens.push(token);
-    };
-    cache.keep(context, tokens);
-    out.finish(finish, prompt_tokens)
-}
-
-/// Runs one request with MTP drafting: each forward pass verifies the last token plus up
-/// to its draft length of drafted ones, and keeps the drafts the target would have sampled.
-///
-/// A model `split` across nodes verifies every drafted token even when the request has fewer
-/// left, so each verify batch keeps one shape: a shorter batch at a request's end rebuilds the
-/// verify graph twice (to the short shape and back), which over RPC re-serializes every rank's
-/// graph. Tokens past the limit are verified but never emitted. A request that picks greedily
-/// alone on a split model takes its picks from the target's argmax output, as in [`generate`].
-fn generate_mtp(
-    model: &Model,
-    spec: &mut Mtp<'_>,
-    split: bool,
-    cache: &mut PromptCache,
-    job: Job,
-    eog: &[Token],
-) -> std::result::Result<Outcome, String> {
-    let namespace = job.namespace.clone();
-    let (prompt, sampling, mut out) = Output::new(job);
-    let vocab = model.vocab();
-    let mut picker = Picker::new(
-        vocab,
-        &sampling,
-        &out.ruled_out(eog),
-        spec.target().n_ctx(),
-        out.pending(),
-    )?;
-    out.begin(picker.goes_on());
-    spec.target_mut()
-        .set_argmax_output(split && picker.picks_greedily());
-    // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
-    // hidden state at each prompt position before `begin`; its cache keeps the positions the
-    // target's reuses.
-    let (mut history, mut batch, cached) =
-        read_prompt(model, spec, cache, (&prompt, &namespace), &out.stopping)?;
-    out.cached = cached;
-    spec.begin(0, &history).map_err(|e| e.to_string())?;
-    let n_ctx = usize::try_from(spec.target().n_ctx()).unwrap_or(usize::MAX);
-    let prompt_tokens = history.len();
-    let mut n_past = i32::try_from(prompt_tokens).map_err(|e| e.to_string())?;
-    let mut id = picker.sample(spec.target(), batch.n_tokens() - 1, out.in_content());
-    let full_draft = split;
-    let finish = 'generate: loop {
-        if let Some(finish) = out.token(model, id) {
-            break finish;
-        }
-        let past = usize::try_from(n_past).unwrap_or(usize::MAX);
-        if past + 1 >= n_ctx {
-            break FinishReason::Length;
-        }
-        let mut draft = spec
-            .draft(0, n_past, id, &history)
-            .map_err(|e| e.to_string())?;
-        // `accept` is owed exactly when the head drafted something.
-        let drafted = !draft.is_empty();
-        draft.truncate(if full_draft {
-            n_ctx - past - 1
-        } else {
-            out.remaining().min(n_ctx - past - 1)
-        });
-        // The tokens the head drafted; with `full_draft` a shorter draft is padded to the head's
-        // length so every verify batch keeps one shape, and only these can be accepted.
-        let real = draft.len();
-        if full_draft && real > 0 {
-            let want = spec.n_max().min(n_ctx - past - 1);
-            if real < want {
-                let last = draft[real - 1];
-                draft.resize(want, last);
-            }
-        }
-        // Drafting wrote its positions into the head's cache, and processing the verify batch
-        // writes them again, so they go first.
-        truncate_cache(spec.draft_mut(), n_past)?;
-
-        batch.clear();
-        batch.add(id, n_past, true).map_err(|e| e.to_string())?;
-        for (i, &token) in draft.iter().enumerate() {
-            let at = n_past + 1 + i32::try_from(i).map_err(|e| e.to_string())?;
-            batch.add(token, at, true).map_err(|e| e.to_string())?;
-        }
-        spec.target_mut()
-            .decode(&batch)
-            .map_err(|e| e.to_string())?;
-        spec.process(&batch).map_err(|e| e.to_string())?;
-        history.push(id);
-
-        let mut accepted: usize = 0;
-        let next = loop {
-            let index = i32::try_from(accepted).map_err(|e| e.to_string())?;
-            let token = picker.sample(spec.target(), index, out.in_content());
-            if accepted < real && token == draft[accepted] {
-                accepted += 1;
-                // An accepted draft was decoded in the verify batch, so the cache holds it
-                // whether or not it ends the reply, and the next request may reuse it.
-                history.push(token);
-                if let Some(finish) = out.token(model, token) {
-                    break 'generate finish;
-                }
-            } else {
-                break token;
-            }
-        };
-        n_past += 1 + i32::try_from(accepted).map_err(|e| e.to_string())?;
-        if drafted {
-            spec.accept(0, u16::try_from(accepted).unwrap_or(u16::MAX))
-                .map_err(|e| e.to_string())?;
-        }
-        // The rejected drafts leave both caches.
-        truncate_cache(spec, n_past)?;
-        id = next;
-    };
-    // The prompt and the reply tokens before the one that finished it.
-    cache.keep(spec, history);
-    out.finish(finish, prompt_tokens)
-}
-
-/// Removes sequence 0's cache entries from position `from` on. A context that cannot roll
-/// back that far, such as a recurrent layer with too few state snapshots, fails the request
-/// instead of decoding on from a state that still holds the removed tokens.
-fn truncate_cache<'m>(target: &mut impl Target<'m>, from: i32) -> std::result::Result<(), String> {
-    if target.truncate(from) {
-        Ok(())
-    } else {
-        Err(format!(
-            "llama.cpp could not roll its cache back to position {from}"
-        ))
     }
 }
 

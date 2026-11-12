@@ -374,9 +374,10 @@ async fn a_caller_reuses_only_its_own_prompts() {
 }
 
 /// A conversation's prompt survives a request with another prefix, as a coding agent's
-/// permission check or another conversation sends between two of its turns: the engine keeps
-/// several prompts cached, so the conversation's next turn reads its whole shared prompt from
-/// the cache, reports it as `cached_tokens`, and replies as from an empty cache.
+/// permission check or another conversation sends between two of its turns: the engine saves
+/// the conversation's prompt to host memory while the other request runs, so the
+/// conversation's next turn reads its whole shared prompt from the cache, reports it as
+/// `cached_tokens`, and replies as from an empty cache.
 #[tokio::test]
 async fn a_conversation_keeps_its_prompt_across_an_unrelated_request() {
     let name = "qwen3-0.6b-cached-prompts";
@@ -389,8 +390,8 @@ async fn a_conversation_keeps_its_prompt_across_an_unrelated_request() {
 }
 
 /// A request that names no output limit reserves the whole context, which it needs only if it
-/// replies at that length: the other cached prompts give up their room as it grows, not before
-/// it starts, so a conversation's prompt survives a short unrelated reply with no limit.
+/// replies at that length: the conversation's prompt waits in host memory meanwhile rather than
+/// being dropped for room, so it survives a short unrelated reply with no limit.
 #[tokio::test]
 async fn a_conversation_keeps_its_prompt_across_requests_with_no_output_limit() {
     let name = "qwen3-0.6b-cached-prompts-no-limit";
@@ -401,25 +402,87 @@ async fn a_conversation_keeps_its_prompt_across_requests_with_no_output_limit() 
     .await;
 }
 
+/// A request's greedy reply is the one an idle model gives, whatever conversations are cached,
+/// and a conversation cached across more requests than the model runs at once still serves its
+/// next turn from the cache: idle prompts wait in host memory, so none takes room in the shared
+/// cache from the request, and none is dropped for it.
+#[tokio::test]
+async fn a_reply_is_the_one_an_idle_model_gives_whatever_prompts_are_cached() {
+    let name = "qwen3-0.6b-cached-prompts-alone";
+    let gguf = crate::qwen3_gguf().await;
+    let model = load(&gguf, name).await;
+    let conversation = vec![json!({
+        "role": "user",
+        "content": format!("{}{}", notes(300), USER_TURNS[0]),
+    })];
+    let (reply, first_tokens) = ask(&model, name, &conversation).await;
+    for question in UNRELATED {
+        ask(
+            &model,
+            name,
+            &[json!({ "role": "user", "content": question })],
+        )
+        .await;
+    }
+    let probe = [json!({ "role": "user", "content": "Write a limerick about a cat." })];
+    let (warm, _) = ask_up_to(&model, name, &probe, Some(64)).await;
+
+    let mut next = conversation.clone();
+    next.push(json!({ "role": "assistant", "content": reply }));
+    next.push(json!({ "role": "user", "content": USER_TURNS[1] }));
+    ask(&model, name, &next).await;
+    let reused = model.reused_prompt_tokens();
+    assert!(
+        reused >= first_tokens - EMPTY_THINK_TOKENS,
+        "the conversation's prompt was cached while the probe ran: {reused} of {first_tokens} reused"
+    );
+    drop(model);
+
+    let fresh = load(&gguf, name).await;
+    let (cold, _) = ask_up_to(&fresh, name, &probe, Some(64)).await;
+    assert_eq!(
+        warm, cold,
+        "the probe's reply beside cached prompts and on an idle model"
+    );
+}
+
+/// A request that continues only part of a conversation's saved prompt, as a coding agent's
+/// classifier repeats a conversation's opening with its own question, leaves that prompt whole:
+/// the conversation's next turn still reads all of it from the cache.
+#[tokio::test]
+async fn a_request_continuing_part_of_a_saved_prompt_leaves_it_whole() {
+    let name = "qwen3-0.6b-cached-prompts-partial";
+    keeps_its_prompt_across(name, Some(32), async |model: &LlamaCpp| {
+        // moves the conversation's prompt out of the shared cache
+        let other = [json!({ "role": "user", "content": UNRELATED[0] })];
+        ask(model, name, &other).await;
+        // repeats the conversation's notes, then asks its own question
+        let partial = [json!({
+            "role": "user",
+            "content": format!("{}\n\nHow many lines do the notes have?", notes(60)),
+        })];
+        ask(model, name, &partial).await;
+    })
+    .await;
+}
+
 /// Questions that share no prefix with each other or with the conversation's, beyond a chat
-/// template's opening tokens, so each takes a cache of its own.
+/// template's opening tokens, so none continues another's prompt.
 const UNRELATED: &[&str] = &[
     "What is the capital of France?",
     "Write a haiku about rain.",
     "Translate 'good morning' into Spanish.",
 ];
 
-/// A cache a failed request emptied is taken before an occupied one, though it was used more
-/// recently. Once every cache holds a prompt, a request that extends the newest cache's prompt
-/// past the context fails, which empties that cache and no other: it could never fit, so the
-/// idle caches keep their room. An unrelated request then takes the emptied cache, and the
-/// conversation's prompt, idle longest, survives.
+/// A request that extends the last prompt past the context fails, which empties its own
+/// sequence and nothing saved to host memory: it could never fit, so the prompts saved while
+/// unrelated requests ran keep their place. An unrelated request then runs, and the
+/// conversation's prompt, saved longest ago, still serves its next turn.
 #[tokio::test]
-async fn an_unrelated_request_takes_a_cache_a_failed_request_emptied() {
+async fn a_request_too_long_for_the_context_leaves_the_saved_prompts() {
     let name = "qwen3-0.6b-cached-prompts-failed";
     keeps_its_prompt_across(name, Some(32), async |model: &LlamaCpp| {
-        let others = usize::try_from(llms_llamacpp::CACHED_PROMPTS).expect("a count") - 2;
-        assert!(others < UNRELATED.len(), "enough unrelated questions");
+        let others = UNRELATED.len() - 1;
         for question in &UNRELATED[..others] {
             ask(
                 model,
@@ -428,8 +491,7 @@ async fn an_unrelated_request_takes_a_cache_a_failed_request_emptied() {
             )
             .await;
         }
-        // The last cache's prompt, long beside its reply, so a request extending it reuses
-        // that cache.
+        // The last prompt, long beside its reply, so a request extending it continues it.
         let filler = "Paragraph of filler that says nothing. ".repeat(20);
         let last = [json!({ "role": "user", "content": format!("{filler}Name one tool.") })];
         ask(model, name, &last).await;
