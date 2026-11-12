@@ -404,6 +404,16 @@ fn choose_slot(model: &Model, slots: &[Slot<'_>], job: &Job) -> Option<usize> {
             } else {
                 0
             };
+            // A request keeps less than half of a cache it shares only a little with, such as
+            // a chat template's opening tokens with another conversation, so taking that cache
+            // would throw away more than the request reuses: it counts as sharing nothing, and
+            // the request takes the cache unused longest, an empty one first. llama-server
+            // chooses a slot by prompt similarity for the same reason.
+            let shared = if 2 * shared >= slot.cache.tokens.len() {
+                shared
+            } else {
+                0
+            };
             (
                 shared,
                 std::cmp::Reverse(slot.last_used),

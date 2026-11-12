@@ -271,10 +271,11 @@ async fn a_sliding_window_cache_reuses_past_its_window() {
     );
 }
 
-/// A prompt that shares only the start of a cache longer than Gemma 3 270M's window cuts the
-/// cache back by more than a window: the sliding-window layers must still hold every position
-/// the shared prefix ends on, as a cache kept at full size does, so the reply is a freshly
-/// loaded model's.
+/// A prompt that shares the start of a cache longer than Gemma 3 270M's window, but not its
+/// last window, cuts the cache back by more than a window: the sliding-window layers must still
+/// hold every position the shared prefix ends on, as a cache kept at full size does, so the
+/// reply is a freshly loaded model's. It shares most of the cache, as a request that would keep
+/// less than half of a cache takes an empty one instead.
 #[tokio::test]
 async fn a_sliding_window_cache_is_cut_back_more_than_a_window() {
     let gguf = gemma_gguf().await;
@@ -285,7 +286,7 @@ async fn a_sliding_window_cache_is_cut_back_more_than_a_window() {
     })];
     let short = vec![json!({
         "role": "user",
-        "content": format!("{}\n\nWhich planet is closest to the Sun? Reply with one word.", notes(10)),
+        "content": format!("{}\n\nWhich planet is closest to the Sun? Reply with one word.", notes(120)),
     })];
     let model = load(&gguf, name).await;
     let (_, long_tokens) = ask(&model, name, &long).await;
@@ -359,6 +360,60 @@ async fn a_caller_reuses_only_its_own_prompts() {
     assert_eq!(alice, cold, "alice's reply against an empty cache's");
     assert_eq!(bob, cold, "bob's reply against an empty cache's");
     assert_eq!(again, cold, "bob's repeated reply against an empty cache's");
+}
+
+/// A conversation's prompt survives a request with another prefix, as a coding agent's
+/// permission check or another conversation sends between two of its turns: the engine keeps
+/// several prompts cached, so the conversation's next turn reads its whole shared prompt from
+/// the cache, reports it as `cached_tokens`, and replies as from an empty cache.
+#[tokio::test]
+async fn a_conversation_keeps_its_prompt_across_an_unrelated_request() {
+    let gguf = crate::qwen3_gguf().await;
+    let name = "qwen3-0.6b-cached-prompts";
+    let model = load(&gguf, name).await;
+    let first = vec![json!({
+        "role": "user",
+        "content": format!("{}\n\n{}", notes(60), USER_TURNS[0]),
+    })];
+    let (reply, first_tokens) = ask(&model, name, &first).await;
+    // Another prefix, which with one cached prompt would replace the conversation's.
+    let other = vec![json!({ "role": "user", "content": "Name one fruit." })];
+    ask(&model, name, &other).await;
+
+    let mut next = first.clone();
+    next.push(json!({ "role": "assistant", "content": reply }));
+    next.push(json!({ "role": "user", "content": USER_TURNS[1] }));
+    let answer = model
+        .chat_request(request(json!({
+            "model": name,
+            "messages": next,
+            "temperature": 0,
+            "reasoning_effort": "none",
+            "max_tokens": 32,
+        })))
+        .await
+        .expect("a reply");
+    let reused = model.reused_prompt_tokens();
+    let cached = answer
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.prompt_tokens_details.as_ref())
+        .and_then(|details| details.cached_tokens);
+    eprintln!("the next turn reused {reused} tokens; the first turn's prompt was {first_tokens}");
+    assert!(
+        reused >= first_tokens - EMPTY_THINK_TOKENS,
+        "the next turn reads the first turn's prompt from the cache: {reused} of {first_tokens}"
+    );
+    assert_eq!(
+        cached,
+        Some(u32::try_from(reused).expect("a count that fits")),
+        "the usage reports the tokens read from the cache"
+    );
+    let reply = answer.choices[0].message.content.clone().expect("content");
+    drop(model);
+    let fresh = load(&gguf, name).await;
+    let (cold, _) = ask(&fresh, name, &next).await;
+    assert_eq!(reply, cold, "the reply against an empty cache's");
 }
 
 /// Asks `messages` of `model` as a streamed request: the reply's text joined from its chunks,
