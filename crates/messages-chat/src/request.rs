@@ -19,13 +19,25 @@ limitations under the License.
 //! What the chat completion can carry is carried over. What only changes how the request is
 //! served, not what the model is asked, is accepted and left out: prompt caching
 //! (`cache_control`), `service_tier`, `speed`, `context_management`, `fallbacks`,
-//! `diagnostics`, and how hard the model thinks (`thinking`, `output_config.effort`). Anything
-//! else the chat completion cannot carry is refused by name, so the client never gets an answer
-//! to a different question than the one it asked.
+//! `diagnostics`, `safeguards`, and how hard the model thinks (`thinking`,
+//! `output_config.effort`). Anything else the chat completion cannot carry is refused by name, so
+//! the client never gets an answer to a different question than the one it asked.
 //!
 //! `output_config.effort` is not sent as `reasoning_effort`: a model without reasoning refuses
 //! that parameter, and Claude Code sets an effort on every request, whatever the model. A
 //! reasoning model's effort is its Spicepod `reasoning_effort` param.
+//!
+//! `safeguards` asks Anthropic's servers to run their own classifiers over the request, which a
+//! model served another way does not have. Claude Code sends it on every request in auto mode,
+//! where its own classifier still checks each tool call before it runs.
+//!
+//! A tool with `defer_loading` is offered to the model only once a `tool_reference` block in a
+//! tool result names it, as the Messages API loads it. Until then the model sees only the tool's
+//! name, wherever the client lists it. A `tool_reference` reads as the tool's definition, one
+//! `<function>` line inside a `<functions>` block, which is how Claude Code's tool search tells
+//! the model to expect it. A loaded tool joins the chat completion's tools after the tools that
+//! were never deferred, in the order the conversation loaded them, so loading one changes only
+//! the end of the tool list and a server that caches prompts keeps the rest.
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
@@ -54,13 +66,14 @@ pub(crate) const DOCS: &str = "https://spiceai.org/docs/components/models";
 
 /// Top-level fields that change how a request is served, not what the model is asked, which a
 /// chat completion has no equivalent for.
-const SERVING_ONLY_FIELDS: [&str; 6] = [
+const SERVING_ONLY_FIELDS: [&str; 7] = [
     "cache_control",
     "service_tier",
     "speed",
     "context_management",
     "fallbacks",
     "diagnostics",
+    "safeguards",
 ];
 
 /// The name `response_format` gives the schema of `output_config.format`.
@@ -167,22 +180,21 @@ pub fn chat_request(
         refuse_other(&model, &format.other, &[], place)?;
     }
 
+    let tools = tools
+        .map(|tools| Tools::new(&model, tools))
+        .transpose()?
+        .unwrap_or_default();
+    let loaded = loaded_tools(&model, &messages, &tools)?;
+
     let mut chat_messages = Vec::with_capacity(messages.len() + 1);
     if let Some(system) = system {
         chat_messages.push(system_message(&model, system)?);
     }
     for message in messages {
-        append_message(&model, message, &mut chat_messages)?;
+        append_message(&model, message, &tools, &mut chat_messages)?;
     }
 
-    let tools = tools
-        .map(|tools| {
-            tools
-                .into_iter()
-                .map(|tool| chat_tool(&model, tool))
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?;
+    let tools = tools.offered(&loaded);
     let offers_tools = tools.as_ref().is_some_and(|tools| !tools.is_empty());
     let parallel_tool_calls = tool_choice
         .as_ref()
@@ -269,6 +281,7 @@ fn system_content(
 fn append_message(
     model: &str,
     message: MessageParam,
+    tools: &Tools,
     chat_messages: &mut Vec<ChatCompletionRequestMessage>,
 ) -> Result<(), MessagesError> {
     refuse_other(model, &message.other, &[], "on a message")?;
@@ -298,7 +311,7 @@ fn append_message(
             )));
         }
         (Role::User, MessageContent::Blocks(blocks)) => {
-            append_user_blocks(model, blocks, chat_messages)?;
+            append_user_blocks(model, blocks, tools, chat_messages)?;
         }
         (Role::Assistant, MessageContent::Text(text)) => {
             chat_messages.push(assistant_message(Some(text), Vec::new()));
@@ -349,6 +362,7 @@ fn assistant_message(
 fn append_user_blocks(
     model: &str,
     blocks: Vec<ContentBlockParam>,
+    tools: &Tools,
     chat_messages: &mut Vec<ChatCompletionRequestMessage>,
 ) -> Result<(), MessagesError> {
     let mut tool_images = Vec::new();
@@ -356,7 +370,7 @@ fn append_user_blocks(
     for block in blocks {
         match block {
             ContentBlockParam::ToolResult(result) => {
-                chat_messages.push(tool_message(model, result, &mut tool_images)?);
+                chat_messages.push(tool_message(model, result, tools, &mut tool_images)?);
             }
             block => append_user_part(model, block, &mut parts)?,
         }
@@ -521,10 +535,12 @@ fn append_document(
 }
 
 /// A tool result as a tool message. A tool message carries only text, so images the result
-/// returned are appended to `images`, for the user message that follows.
+/// returned are appended to `images`, for the user message that follows, and each
+/// `tool_reference` reads as the definition of the tool it names.
 fn tool_message(
     model: &str,
     result: ToolResultBlockParam,
+    tools: &Tools,
     images: &mut Vec<ChatCompletionRequestUserMessageContentPart>,
 ) -> Result<ChatCompletionRequestMessage, MessagesError> {
     refuse_other(
@@ -538,7 +554,20 @@ fn tool_message(
         Some(ToolResultContent::Text(text)) => text,
         Some(ToolResultContent::Blocks(blocks)) => {
             let mut texts = Vec::new();
+            // The definitions of a run of `tool_reference` blocks, which read as one
+            // `<functions>` block.
+            let mut functions = Vec::new();
             for block in blocks {
+                if let ContentBlockParam::Other { block_type, block } = &block
+                    && block_type == TOOL_REFERENCE
+                {
+                    let name = tool_reference_name(model, block)?;
+                    functions.push(tools.definition(model, name)?);
+                    continue;
+                }
+                if !functions.is_empty() {
+                    texts.push(functions_block(&mut functions));
+                }
                 match block {
                     ContentBlockParam::Text(text) => texts.push(text_of(model, text)?),
                     ContentBlockParam::Image(image) => {
@@ -560,10 +589,13 @@ fn tool_message(
                         return Err(unsupported(
                             model,
                             &format!("a `{}` block in a tool result", other.block_type()),
-                            "Return the tool result as text or images.",
+                            "Return the tool result as text, images or `tool_reference` blocks.",
                         ));
                     }
                 }
+            }
+            if !functions.is_empty() {
+                texts.push(functions_block(&mut functions));
             }
             texts.join("\n")
         }
@@ -624,7 +656,140 @@ fn assistant_blocks(
     Ok(Some(assistant_message(text, tool_calls)))
 }
 
-fn chat_tool(model: &str, tool: ToolParam) -> Result<ChatCompletionTools, MessagesError> {
+/// The `type` of the block that loads a deferred tool.
+const TOOL_REFERENCE: &str = "tool_reference";
+
+/// A request's tools as chat completion tools, in the request's order, each with whether
+/// `defer_loading` holds it back until the conversation loads it.
+#[derive(Default)]
+struct Tools(Vec<(FunctionObject, bool)>);
+
+impl Tools {
+    fn new(model: &str, tools: Vec<ToolParam>) -> Result<Self, MessagesError> {
+        tools
+            .into_iter()
+            .map(|tool| chat_tool(model, tool))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
+    }
+
+    fn get(&self, name: &str) -> Option<&(FunctionObject, bool)> {
+        self.0.iter().find(|(function, _)| function.name == name)
+    }
+
+    /// The tool `name` as the line a `tool_reference` to it reads as: its definition in the
+    /// encoding of a tool list, `<function>{"description": …, "name": …, "parameters": …}</function>`.
+    fn definition(&self, model: &str, name: &str) -> Result<String, MessagesError> {
+        let Some((function, _)) = self.get(name) else {
+            return Err(unknown_tool_reference(model, name));
+        };
+        let mut definition = Map::new();
+        if let Some(description) = &function.description {
+            definition.insert("description".into(), Value::String(description.clone()));
+        }
+        definition.insert("name".into(), Value::String(function.name.clone()));
+        if let Some(parameters) = &function.parameters {
+            definition.insert("parameters".into(), parameters.clone());
+        }
+        Ok(format!(
+            "<function>{}</function>",
+            Value::Object(definition)
+        ))
+    }
+
+    /// The tools to offer the model: every tool that was never deferred, in the request's order,
+    /// then each deferred tool in `loaded`, in that order. `None` when the request offered none.
+    fn offered(self, loaded: &[String]) -> Option<Vec<ChatCompletionTools>> {
+        let tool = |function| ChatCompletionTools::Function(ChatCompletionTool { function });
+        let (mut deferred, eager): (Vec<_>, Vec<_>) =
+            self.0.into_iter().partition(|(_, deferred)| *deferred);
+        let mut offered: Vec<_> = eager
+            .into_iter()
+            .map(|(function, _)| tool(function))
+            .collect();
+        for name in loaded {
+            if let Some(at) = deferred
+                .iter()
+                .position(|(function, _)| &function.name == name)
+            {
+                offered.push(tool(deferred.swap_remove(at).0));
+            }
+        }
+        (!offered.is_empty()).then_some(offered)
+    }
+}
+
+/// `function` lines as one `<functions>` block, emptying `functions`.
+fn functions_block(functions: &mut Vec<String>) -> String {
+    let block = format!("<functions>\n{}\n</functions>", functions.join("\n"));
+    functions.clear();
+    block
+}
+
+/// The name a `tool_reference` block loads. Its `cache_control` only says how to cache the
+/// prompt; any other field is refused by name.
+fn tool_reference_name<'a>(model: &str, block: &'a Value) -> Result<&'a str, MessagesError> {
+    let Some(name) = block.get("tool_name").and_then(Value::as_str) else {
+        return Err(MessagesError::invalid_request(
+            "A `tool_reference` block needs a `tool_name`: the name of a tool in `tools`.",
+        ));
+    };
+    if let Some(fields) = block.as_object() {
+        let other = fields
+            .iter()
+            .filter(|(field, _)| field.as_str() != "tool_name")
+            .map(|(field, value)| (field.clone(), value.clone()))
+            .collect();
+        refuse_other(model, &other, &BLOCK_FIELDS, "on a tool_reference block")?;
+    }
+    Ok(name)
+}
+
+fn unknown_tool_reference(model: &str, name: &str) -> MessagesError {
+    MessagesError::invalid_request(format!(
+        "A `tool_reference` in the request to model '{model}' names the tool '{name}', which is not in `tools`. Add '{name}' to `tools`, with `defer_loading: true` to offer it only once it is referenced. See: {DOCS}"
+    ))
+}
+
+/// The tools `messages` load, by name, in the order their first `tool_reference` names them.
+/// Each must name a tool in `tools`.
+fn loaded_tools(
+    model: &str,
+    messages: &[MessageParam],
+    tools: &Tools,
+) -> Result<Vec<String>, MessagesError> {
+    let mut loaded: Vec<String> = Vec::new();
+    let results = messages.iter().flat_map(|message| match &message.content {
+        MessageContent::Blocks(blocks) => blocks.as_slice(),
+        MessageContent::Text(_) => &[],
+    });
+    for result in results {
+        let ContentBlockParam::ToolResult(ToolResultBlockParam {
+            content: Some(ToolResultContent::Blocks(blocks)),
+            ..
+        }) = result
+        else {
+            continue;
+        };
+        for block in blocks {
+            if let ContentBlockParam::Other { block_type, block } = block
+                && block_type == TOOL_REFERENCE
+            {
+                let name = tool_reference_name(model, block)?;
+                if tools.get(name).is_none() {
+                    return Err(unknown_tool_reference(model, name));
+                }
+                if !loaded.iter().any(|loaded| loaded == name) {
+                    loaded.push(name.to_string());
+                }
+            }
+        }
+    }
+    Ok(loaded)
+}
+
+/// `tool` as a chat completion function, with whether `defer_loading` holds it back.
+fn chat_tool(model: &str, tool: ToolParam) -> Result<(FunctionObject, bool), MessagesError> {
     match tool {
         ToolParam::Custom(CustomToolParam {
             name,
@@ -637,17 +802,32 @@ fn chat_tool(model: &str, tool: ToolParam) -> Result<ChatCompletionTools, Messag
             refuse_other(
                 model,
                 &other,
-                &["type", "cache_control", "eager_input_streaming"],
+                &[
+                    "type",
+                    "cache_control",
+                    "eager_input_streaming",
+                    "defer_loading",
+                ],
                 &format!("on the tool '{name}'"),
             )?;
-            Ok(ChatCompletionTools::Function(ChatCompletionTool {
-                function: FunctionObject {
+            let deferred = match other.get("defer_loading") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(deferred)) => *deferred,
+                Some(value) => {
+                    return Err(MessagesError::invalid_request(format!(
+                        "`defer_loading` on the tool '{name}' is {value}, and must be `true` or `false`."
+                    )));
+                }
+            };
+            Ok((
+                FunctionObject {
                     name,
                     description,
                     parameters: Some(input_schema),
                     strict,
                 },
-            }))
+                deferred,
+            ))
         }
         ToolParam::Other { tool_type, .. } => Err(unsupported(
             model,
