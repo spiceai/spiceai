@@ -80,12 +80,41 @@ async fn create(catalog: &ObjectNativeCatalog, name: &str) -> String {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: format!("/tmp/unused/{name}"),
+            base_path: format!("s3://bucket/v1/datasets/{name}/data"),
             partition_column: None,
             vortex_config: VortexConfig::default(),
         })
         .await
         .expect("create table")
+}
+
+/// The real catalog refuses an unplaced path before publishing a table.
+#[tokio::test]
+async fn an_object_native_table_refuses_an_unplaced_data_path() {
+    use cayenne::metadata::{CreateTableOptions, VortexConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = ObjectNativeCatalog::create(Arc::clone(&store), Path::from("catalog"))
+        .await
+        .expect("catalog");
+    let error = catalog
+        .create_table(CreateTableOptions {
+            table_name: "orders".to_string(),
+            schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            ])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/unplaced".to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        })
+        .await
+        .expect_err("unplaced data must be refused");
+    assert_eq!(
+        error.to_string(),
+        "Invalid operation: Failed to load dataset 'orders' (cayenne): With `runtime.params.cayenne_vnext` enabled, its data must be in `runtime.state.location`. Remove `cayenne_file_path`, `cayenne_s3_zone_ids`, and `cayenne_datalake_location`, use a supported refresh mode (full, append, or changes), and set `runtime.state.location` to an S3 or local file location. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    );
+    assert!(catalog.list_table_names().await.expect("tables").is_empty());
 }
 
 /// Publish snapshot `snapshot` at `sequence` on `table_id`.
@@ -381,7 +410,7 @@ async fn a_sweep_waits_for_a_transaction_that_reserves_the_dataset() {
     let first = uuid::Uuid::now_v7().to_string();
     let merged = uuid::Uuid::now_v7().to_string();
     let first_files = one_file(&orders, &first);
-    let first_key = format!("{first}/part-0.vortex");
+    let first_key = "part-0.vortex".to_string();
     catalog
         .commit_publications(&[CatalogPublication {
             files: &first_files,
@@ -540,7 +569,7 @@ async fn create_fails(catalog: &ObjectNativeCatalog, name: &str) {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: format!("/tmp/unused/{name}"),
+            base_path: format!("s3://bucket/v1/datasets/{name}/data"),
             partition_column: None,
             vortex_config: VortexConfig::default(),
         })

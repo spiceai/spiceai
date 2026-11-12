@@ -4481,9 +4481,7 @@ impl MetadataCatalog for CayenneCatalog {
             .get_all_snapshot_files(table_id)
             .await?
             .into_iter()
-            .map(|row| {
-                cayenne_metastore_actions::state::file_key(false, &row.snapshot_id, &row.file_path)
-            })
+            .map(|row| format!("{}/{}", row.snapshot_id, row.file_path))
             .collect();
         keys.extend(
             self.get_table_delete_files(table_id)

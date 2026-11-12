@@ -23,7 +23,6 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
         vortex_config_json: s.vortex_config_json.clone(),
         current_snapshot_id: s.current_snapshot_id.clone(),
         seq: s.seq,
-        flat_layout: s.flat,
     }))];
     let mut snapshots = std::collections::BTreeMap::<&str, Vec<p::FileEntry>>::new();
     for ((snapshot, _), file) in &s.files {

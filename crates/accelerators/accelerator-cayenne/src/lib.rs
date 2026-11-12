@@ -3191,6 +3191,28 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(|acceleration| acceleration.mode == Mode::FileCreate);
         let table_name = source.name().to_string();
+        let partitioned = source
+            .acceleration()
+            .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
+        if vnext && !partitioned {
+            let location_supported = source
+                .app()
+                .runtime
+                .state
+                .as_ref()
+                .and_then(|state| url::Url::parse(&state.location).ok())
+                .is_some_and(|location| {
+                    location_datasets_url(&location, &object_store::path::Path::default()).is_some()
+                });
+            ensure!(
+                location_supported && object_native_data_unsupported(source).is_none(),
+                InvalidConfigurationSnafu {
+                    detail: Arc::from(cayenne::metastore_layout::object_native_data_path_refusal(
+                        &table_name
+                    )),
+                }
+            );
+        }
         // The local `object_native` directory holds the catalog, or records that this
         // instance uses one in `runtime.state.location`.
         let in_native = (vnext || path_exists(format!("{metadata_dir}/object_native")).await)
@@ -3205,9 +3227,6 @@ impl CayenneAccelerator {
             }
             return Ok("sqlite");
         }
-        let partitioned = source
-            .acceleration()
-            .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
         let in_sqlite = path_exists(format!("{metadata_dir}/cayenne.db")).await
             && self
                 .catalog_holds(metadata_dir, "sqlite", source, &table_name)
@@ -3550,11 +3569,7 @@ impl CayenneAccelerator {
     /// its dataset folder there,
     /// `…/cayenne/v1/datasets/<name>-<id>/data`, the table path the metastore records.
     ///
-    /// Placement is decided once, when the dataset is created, and the recorded table
-    /// path keeps it: a dataset created elsewhere stays there, and one created in the
-    /// location stays in it. A dataset whose configuration needs something data in
-    /// the location does not support yet is created at its data path as before; one
-    /// already in the location that now needs it fails to load rather than move.
+    /// The recorded table path keeps its placement when the dataset reopens.
     async fn object_native_data_placement(
         source: &dyn AccelerationSource,
         catalog: &Arc<dyn cayenne::MetadataCatalog>,
@@ -3566,36 +3581,37 @@ impl CayenneAccelerator {
         else {
             return Ok(None);
         };
+        let refusal = || Error::InvalidConfiguration {
+            detail: Arc::from(cayenne::metastore_layout::object_native_data_path_refusal(
+                table_name,
+            )),
+        };
         let app = source.app();
-        let Some(state) = app.runtime.state.as_ref() else {
-            return Ok(None);
-        };
-        let Ok(location) = url::Url::parse(&state.location) else {
-            return Ok(None);
-        };
-        let Some(datasets_url) = location_datasets_url(&location, native.datasets_prefix()) else {
-            return Ok(None);
-        };
+        let datasets_url = app
+            .runtime
+            .state
+            .as_ref()
+            .and_then(|state| url::Url::parse(&state.location).ok())
+            .and_then(|location| location_datasets_url(&location, native.datasets_prefix()))
+            .ok_or_else(refusal)?;
+        ensure!(
+            object_native_data_unsupported(source).is_none(),
+            InvalidConfigurationSnafu {
+                detail: Arc::from(cayenne::metastore_layout::object_native_data_path_refusal(
+                    table_name
+                )),
+            }
+        );
         let store = cayenne::metadata::ObjectStoreConfig {
             url: url::Url::parse(&datasets_url)
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?,
             store: native.data_store(),
         };
-        let unsupported = object_native_data_unsupported(source);
         match catalog.get_table(table_name).await {
             Ok(stored) => {
                 if !cayenne::metastore_layout::is_object_native_data_path(&stored.path) {
-                    return Ok(None);
-                }
-                if let Some(reason) = unsupported {
-                    return InvalidConfigurationSnafu {
-                        detail: Arc::from(format!(
-                            "Dataset '{table_name}' (cayenne) keeps its data in '{}', which does not support {reason} yet. Remove {reason}, or set `mode: file_create` to reload the dataset from its source.",
-                            state.location
-                        )),
-                    }
-                    .fail();
+                    return Err(refusal());
                 }
                 return Ok(Some(ObjectNativeDataPlacement {
                     base_path: stored.path,
@@ -3604,14 +3620,6 @@ impl CayenneAccelerator {
             }
             Err(cayenne::CatalogError::TableNotFound { .. }) => {}
             Err(error) => return Err(error).boxed().context(AccelerationCreationFailedSnafu),
-        }
-        if let Some(reason) = unsupported {
-            tracing::info!(
-                target: "spiced::acceleration::cayenne",
-                "Dataset '{table_name}' (cayenne) keeps its data files at its data path rather than in '{}', because data in the state location does not support {reason} yet.",
-                state.location
-            );
-            return Ok(None);
         }
         let folder = cayenne::metastore::object_native::new_dataset_folder(table_name);
         let base_path = format!("{datasets_url}/{folder}/data");
@@ -3624,8 +3632,8 @@ impl CayenneAccelerator {
 
     /// Where `source`'s data files are: in the state location (stored there, or a
     /// new dataset that goes there) or at its data path. Decided as
-    /// [`Self::object_native_data_placement`] decides it, without logging or
-    /// refusing anything, for the steps of a load that run before the table opens.
+    /// [`Self::object_native_data_placement`] decides it, validating placement
+    /// before the table opens.
     async fn location_placement(
         &self,
         source: &dyn AccelerationSource,
@@ -3650,21 +3658,25 @@ impl CayenneAccelerator {
             .is_some_and(|location| {
                 location_datasets_url(&location, &object_store::path::Path::default()).is_some()
             });
-        if !in_object_store {
-            return Ok(LocationPlacement::Elsewhere);
-        }
+        ensure!(
+            in_object_store && object_native_data_unsupported(source).is_none(),
+            InvalidConfigurationSnafu {
+                detail: Arc::from(cayenne::metastore_layout::object_native_data_path_refusal(
+                    &source.name().to_string()
+                )),
+            }
+        );
         match catalog.get_table(&source.name().to_string()).await {
             Ok(stored) if cayenne::metastore_layout::is_object_native_data_path(&stored.path) => {
                 Ok(LocationPlacement::Stored(stored.path))
             }
-            Ok(_) => Ok(LocationPlacement::Elsewhere),
-            Err(cayenne::CatalogError::TableNotFound { .. }) => {
-                Ok(if object_native_data_unsupported(source).is_none() {
-                    LocationPlacement::New
-                } else {
-                    LocationPlacement::Elsewhere
-                })
+            Ok(_) => InvalidConfigurationSnafu {
+                detail: Arc::from(cayenne::metastore_layout::object_native_data_path_refusal(
+                    &source.name().to_string(),
+                )),
             }
+            .fail(),
+            Err(cayenne::CatalogError::TableNotFound { .. }) => Ok(LocationPlacement::New),
             Err(error) => Err(error).boxed().context(AccelerationCreationFailedSnafu),
         }
     }
@@ -7401,8 +7413,7 @@ mod tests {
                         engine: Engine::Cayenne,
                         mode: Mode::File,
                         refresh_mode: Some(RefreshMode::Append),
-                        // No `cayenne_file_path`: a dataset that sets one keeps its
-                        // data path.
+                        // The state location owns this dataset's data placement.
                         params: [(
                             "cayenne_metadata_dir".to_string(),
                             directory.join("metadata").to_string_lossy().into_owned(),
@@ -7513,6 +7524,52 @@ mod tests {
             outside.is_empty(),
             "data files outside the dataset folder in the location: {outside:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn unplaced_object_native_data_is_refused_at_dataset_load() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        for (location, explicit_path) in [("file:///tmp/state", true), ("gs://bucket/state", false)]
+        {
+            let mut app = AppBuilder::new("test")
+                .with_runtime_params(
+                    [(CAYENNE_VNEXT_PARAM.to_string(), "enabled".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build();
+            app.runtime.state = Some(spicepod::component::runtime::RuntimeState {
+                location: location.to_string(),
+                params: None,
+            });
+            let mut params = std::collections::HashMap::from([(
+                "cayenne_metadata_dir".to_string(),
+                directory.path().to_string_lossy().into_owned(),
+            )]);
+            if explicit_path {
+                params.insert("cayenne_file_path".to_string(), "/tmp/data".to_string());
+            }
+            let source = TestAccelerationSource::new("orders")
+                .with_app(Arc::new(app))
+                .with_acceleration(Acceleration {
+                    engine: Engine::Cayenne,
+                    mode: Mode::File,
+                    refresh_mode: Some(RefreshMode::Append),
+                    params,
+                    ..Default::default()
+                });
+            let error = CayenneAccelerator::new()
+                .location_placement(&source)
+                .await
+                .expect_err("refuse unplaced data");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Invalid Cayenne acceleration configuration: {}",
+                    cayenne::metastore_layout::object_native_data_path_refusal("orders")
+                )
+            );
+        }
     }
 
     /// With `runtime.params.cayenne_vnext` off, an object-store data path fails to

@@ -81,12 +81,8 @@ pub struct ObjectNativeCatalog {
     ddl: Arc<tokio::sync::Mutex<()>>,
     /// Folders of datasets dropped in this process whose deletion is pending.
     dropping: Arc<parking_lot::Mutex<HashSet<String>>>,
-    /// Ends the wait of every pending folder deletion as if `dropped_grace` had
-    /// passed (tests).
-    drop_grace_elapsed: Arc<tokio::sync::watch::Sender<bool>>,
-    /// What tells whether this process still reads each table's files, by table
-    /// id: a dropped dataset's folder is deleted once none of its tables is read.
-    readers: parking_lot::Mutex<HashMap<String, Vec<TableReaders>>>,
+    /// Restore-point and export holds on each table's deletions, by table id.
+    deletion_holds: parking_lot::Mutex<HashMap<String, Vec<TableDeletionHolds>>>,
     /// The URL of the folder `datasets/` is in, when the catalog was opened at a
     /// location URL: a dataset's data path under it is recorded relative to it
     /// and resolved against it on every read, so a copy of the location opened
@@ -97,44 +93,27 @@ pub struct ObjectNativeCatalog {
     unfinished_uploads: Option<Arc<dyn crate::provider::orphan_sweep::UnfinishedUploads>>,
 }
 
-/// Whether this process still reads one table's files: the scans in flight on
-/// it, by snapshot, and the hold a restore point being taken keeps on its
-/// deletions. Weak, so a table that is gone reads nothing.
+/// A weak handle to a table's restore-point and export deletion hold.
 #[derive(Clone, Debug)]
-pub struct TableReaders {
-    scans: std::sync::Weak<parking_lot::Mutex<crate::provider::scan::SnapshotScanRefs>>,
+pub struct TableDeletionHolds {
     deletions: std::sync::Weak<tokio::sync::RwLock<()>>,
 }
 
-impl TableReaders {
-    /// The readers of a table whose scans count themselves in `scans` and whose
-    /// restore points hold `deletions` shared.
-    #[must_use]
-    pub(crate) fn new(
-        scans: &Arc<parking_lot::Mutex<crate::provider::scan::SnapshotScanRefs>>,
-        deletions: &Arc<tokio::sync::RwLock<()>>,
-    ) -> Self {
+impl TableDeletionHolds {
+    pub(crate) fn new(deletions: &Arc<tokio::sync::RwLock<()>>) -> Self {
         Self {
-            scans: Arc::downgrade(scans),
             deletions: Arc::downgrade(deletions),
         }
     }
 
-    /// Whether a scan or a restore point still reads the table's files.
-    fn reading(&self) -> bool {
-        let scanning = self
-            .scans
+    fn held(&self) -> bool {
+        self.deletions
             .upgrade()
-            .is_some_and(|scans| !scans.lock().is_empty());
-        let archiving = self
-            .deletions
-            .upgrade()
-            .is_some_and(|fence| fence.try_write().is_err());
-        scanning || archiving
+            .is_some_and(|fence| fence.try_write().is_err())
     }
 
     fn gone(&self) -> bool {
-        self.scans.strong_count() == 0 && self.deletions.strong_count() == 0
+        self.deletions.strong_count() == 0
     }
 }
 
@@ -904,8 +883,7 @@ impl ObjectNativeCatalog {
             routes: RwLock::new(routes),
             ddl: Arc::new(tokio::sync::Mutex::new(())),
             dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
-            drop_grace_elapsed: Arc::new(tokio::sync::watch::Sender::new(false)),
-            readers: parking_lot::Mutex::new(HashMap::new()),
+            deletion_holds: parking_lot::Mutex::new(HashMap::new()),
             anchor,
             unfinished_uploads: None,
         };
@@ -1017,10 +995,9 @@ impl ObjectNativeCatalog {
             .await
     }
 
-    /// Tell the catalog how to see whether this process still reads `table_id`'s
-    /// files, so dropping its dataset waits for those reads before deleting them.
-    pub fn register_readers(&self, table_id: &str, readers: TableReaders) {
-        let mut registered = self.readers.lock();
+    /// Register the restore-point and export holds that delay folder deletion.
+    pub fn register_deletion_holds(&self, table_id: &str, readers: TableDeletionHolds) {
+        let mut registered = self.deletion_holds.lock();
         registered.retain(|_, tables| {
             tables.retain(|table| !table.gone());
             !tables.is_empty()
@@ -1069,20 +1046,10 @@ impl ObjectNativeCatalog {
             })
     }
 
-    /// Test-only: end the wait of every pending and later deletion of a dropped
-    /// dataset's folder as if `dropped_grace` had passed; scans and restore
-    /// points still hold it.
-    #[doc(hidden)]
-    pub fn elapse_dropped_grace(&self) {
-        self.drop_grace_elapsed.send_replace(true);
-    }
-
-    /// Delete a dropped dataset's folder, its log and its data, once this process
-    /// no longer reads it: `dropped_grace` after the drop, and then once every
-    /// scan of its tables has ended and no restore point is being taken from
-    /// them. The `dropped` marker goes last, so a process that stops first leaves
-    /// the folder to a later open's [`Self::reclaim`].
-    fn reclaim_dropped_folder(&self, name: &str, folder: &str, readers: Vec<TableReaders>) {
+    /// Delete a dropped dataset's folder after `dropped_grace` and once no
+    /// restore point or export holds its deletions. The marker goes last so a
+    /// later open can resume deletion after a process stops.
+    fn reclaim_dropped_folder(&self, name: &str, folder: &str, readers: Vec<TableDeletionHolds>) {
         let store = Arc::clone(&self.store);
         let data_store = self.data_store();
         let prefix = self.datasets.clone().join(folder);
@@ -1091,20 +1058,11 @@ impl ObjectNativeCatalog {
         let folder = folder.to_string();
         let ddl = Arc::clone(&self.ddl);
         let dropping = Arc::clone(&self.dropping);
-        let mut elapsed = self.drop_grace_elapsed.subscribe();
         dropping.lock().insert(folder.clone());
         tokio::spawn(async move {
-            tokio::select! {
-                () = tokio::time::sleep(grace) => {}
-                () = async {
-                    // A catalog that is gone ends no wait early.
-                    if elapsed.wait_for(|elapsed| *elapsed).await.is_err() {
-                        std::future::pending::<()>().await;
-                    }
-                } => {}
-            }
+            tokio::time::sleep(grace).await;
             let grace = grace.min(std::time::Duration::from_secs(1));
-            while readers.iter().any(TableReaders::reading) {
+            while readers.iter().any(TableDeletionHolds::held) {
                 tokio::time::sleep(grace.max(std::time::Duration::from_millis(100))).await;
             }
             // Under the DDL lock, so no create can take the folder while it goes.
@@ -1311,8 +1269,8 @@ impl ObjectNativeCatalog {
                 routes.refresh(&domain, Vec::new());
                 routes.datasets.remove(name);
             }
-            let readers: Vec<TableReaders> = {
-                let mut registered = self.readers.lock();
+            let readers: Vec<TableDeletionHolds> = {
+                let mut registered = self.deletion_holds.lock();
                 table_ids
                     .iter()
                     .filter_map(|id| registered.remove(id))

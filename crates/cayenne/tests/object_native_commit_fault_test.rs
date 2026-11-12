@@ -228,7 +228,7 @@ async fn create(catalog: &ObjectNativeCatalog, name: &str) -> String {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: format!("/tmp/unused/{name}"),
+            base_path: format!("s3://bucket/v1/datasets/{name}/data"),
             partition_column: None,
             vortex_config: VortexConfig::default(),
         })
@@ -1482,7 +1482,7 @@ async fn retired_files_are_answered_from_committed_state_only() {
     let first = uuid::Uuid::now_v7().to_string();
     let merged = uuid::Uuid::now_v7().to_string();
     let first_files = one_file(&orders, &first);
-    let first_key = format!("{first}/part-0.vortex");
+    let first_key = "part-0.vortex".to_string();
     catalog
         .commit_publications(&[cayenne::catalog::CatalogPublication {
             files: &first_files,

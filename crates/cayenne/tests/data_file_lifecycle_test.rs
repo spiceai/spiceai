@@ -44,7 +44,9 @@ use bytes::Bytes;
 use cayenne::metadata::{
     CdcDurability, CreateTableOptions, DeletionMode, ObjectStoreConfig, VortexConfig,
 };
-use cayenne::metastore::object_native::{ObjectNativeCatalog, new_dataset_folder};
+use cayenne::metastore::object_native::{
+    NativeCatalogConfig, ObjectNativeCatalog, new_dataset_folder,
+};
 use cayenne::{CayenneContext, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::SessionStateBuilder;
@@ -506,12 +508,20 @@ fn session(config: SessionConfig) -> SessionContext {
 }
 
 impl Location {
-    async fn new(name: &str) -> (Self, ObjectNativeCatalog, Arc<Instance>, Arc<FaultStore>) {
+    async fn new_with_catalog_config(
+        name: &str,
+        config: NativeCatalogConfig,
+    ) -> (Self, ObjectNativeCatalog, Arc<Instance>, Arc<FaultStore>) {
         let probe = Arc::new(Probe::new());
         let (instance, faults, store) = Self::stack(&probe);
-        let catalog = ObjectNativeCatalog::open_or_create_at(store, Path::from(CATALOG), LOCATION)
-            .await
-            .expect("create the object-native catalog");
+        let catalog = ObjectNativeCatalog::open_or_create_at_with_config(
+            store,
+            Path::from(CATALOG),
+            LOCATION,
+            config,
+        )
+        .await
+        .expect("create the object-native catalog");
         catalog.init().await.expect("init");
         let folder = new_dataset_folder(name);
         let data_prefix = format!("{}/{folder}/data", catalog.datasets_prefix());
@@ -565,7 +575,25 @@ impl Location {
         config: SessionConfig,
         vortex: &VortexConfig,
     ) -> (Self, Process) {
-        let (location, catalog, instance, faults) = Self::new(name).await;
+        Self::create_with_catalog_config(
+            name,
+            keyed,
+            config,
+            vortex,
+            NativeCatalogConfig::default(),
+        )
+        .await
+    }
+
+    async fn create_with_catalog_config(
+        name: &str,
+        keyed: bool,
+        config: SessionConfig,
+        vortex: &VortexConfig,
+        catalog_config: NativeCatalogConfig,
+    ) -> (Self, Process) {
+        let (location, catalog, instance, faults) =
+            Self::new_with_catalog_config(name, catalog_config).await;
         let catalog: Arc<dyn MetadataCatalog> = Arc::new(catalog);
         let ctx = session(config);
         let table = Arc::new(
@@ -676,15 +704,6 @@ impl Location {
             .filter(|key| wanted.contains(key))
             .collect()
     }
-}
-
-/// The process's catalog as the object-native catalog it is.
-fn native(process: &Process) -> &ObjectNativeCatalog {
-    process
-        .catalog
-        .as_any()
-        .downcast_ref::<ObjectNativeCatalog>()
-        .expect("an object-native catalog")
 }
 
 impl Process {
@@ -1513,16 +1532,19 @@ impl Location {
     }
 }
 
-/// A dataset dropped while one of its scans has not finished keeps its folder,
-/// past the retention, until that scan is done; the scan returns every row; then
-/// the instance that dropped it deletes the whole folder, log and data, with no
-/// restart.
+/// A running scan does not extend retention. Restore-point and export holds
+/// keep the exact folder contents until released, then the whole folder goes.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_dropped_dataset_is_deleted_once_no_scan_reads_it() {
-    let (location, process) = Location::create(
+async fn a_dropped_dataset_is_deleted_after_grace_despite_a_running_scan() {
+    let (location, process) = Location::create_with_catalog_config(
         "orders",
         false,
         SessionConfig::new().with_target_partitions(1),
+        &parked(),
+        NativeCatalogConfig {
+            dropped_grace: Duration::from_millis(100),
+            ..NativeCatalogConfig::default()
+        },
     )
     .await;
     common::insert_batch(&process.table, batch(0..2_000, |id| id * 7))
@@ -1534,65 +1556,54 @@ async fn a_dropped_dataset_is_deleted_once_no_scan_reads_it() {
         .await
         .expect("drain");
     let folder = location.folder();
-    assert!(
-        location
-            .probe
-            .objects(&folder)
-            .await
-            .keys()
-            .any(|key| has_extension(key, "vortex")),
-        "the dataset's folder holds its data"
-    );
-
-    let mut reader = process
+    let reader = process
         .ctx
         .sql("SELECT id, v FROM orders")
         .await
         .expect("plan")
         .execute_stream()
         .await
-        .expect("start the scan");
+        .expect("start scan");
+    let hold = process.table.hold_file_deletions().await;
     assert!(process.catalog.drop_table("orders").await.expect("drop"));
-
-    // Past the retention the folder is still there: the scan holds it.
-    native(&process).elapse_dropped_grace();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let contents = location.probe.objects(&folder).await;
     assert!(
-        location
-            .probe
-            .objects(&folder)
-            .await
-            .keys()
-            .any(|key| has_extension(key, "vortex")),
-        "a dropped dataset's folder is kept while a scan reads it"
+        contents.keys().any(|key| has_extension(key, "vortex")),
+        "{contents:?}"
     );
-    let mut read = Vec::new();
-    while let Some(next) = reader.next().await {
-        read.extend(collect_rows(vec![
-            next.expect("the scan reads on after the drop"),
-        ]));
-    }
-    read.sort_unstable();
-    assert_eq!(read, (0..2_000).map(|id| (id, id * 7)).collect::<Vec<_>>());
-    drop(reader);
-
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        location.probe.objects(&folder).await,
+        contents,
+        "restore-point/export hold keeps every object past grace"
+    );
+    drop(hold);
     eventually(
         Duration::from_secs(30),
-        "the dropped dataset's folder is deleted",
+        "folder deleted with the scan still alive",
         async || {
             let left = location.probe.objects(&folder).await;
             (left.is_empty(), left)
         },
     )
     .await;
+    drop(reader);
 }
 
-/// A dataset dropped with nothing reading it keeps its folder for the
-/// retention, which outlasts the old 5-second grace, and the running instance
-/// deletes it once the retention has passed; the catalog's own log stays.
+/// With no reader or hold the folder survives the grace, then is deleted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_dataset_with_no_reader_is_deleted_after_the_grace() {
-    let (location, process) = Location::create("orders", false, SessionConfig::new()).await;
+    let (location, process) = Location::create_with_catalog_config(
+        "orders",
+        false,
+        SessionConfig::new(),
+        &parked(),
+        NativeCatalogConfig {
+            dropped_grace: Duration::from_secs(1),
+            ..NativeCatalogConfig::default()
+        },
+    )
+    .await;
     common::insert_batch(&process.table, batch(0..500, |id| id))
         .await
         .expect("load");
@@ -1603,24 +1614,30 @@ async fn a_dropped_dataset_with_no_reader_is_deleted_after_the_grace() {
         .expect("drain");
     let folder = location.folder();
     assert!(process.catalog.drop_table("orders").await.expect("drop"));
-    tokio::time::sleep(Duration::from_secs(7)).await;
+    let before = location.probe.objects(&folder).await;
     assert!(
-        !location.probe.objects(&folder).await.is_empty(),
-        "a dropped dataset's folder is kept for the retention"
+        before.keys().any(|key| has_extension(key, "vortex")),
+        "{before:?}"
     );
-    native(&process).elapse_dropped_grace();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        location.probe.objects(&folder).await,
+        before,
+        "grace keeps every object"
+    );
     eventually(
         Duration::from_secs(30),
-        "the dropped dataset's folder is deleted",
+        "folder deleted after grace",
         async || {
             let left = location.probe.objects(&folder).await;
             (left.is_empty(), left)
         },
     )
     .await;
-    // The catalog itself is untouched: a new dataset under the same name works.
-    let catalog_objects = location.probe.objects(CATALOG).await;
-    assert!(!catalog_objects.is_empty(), "the catalog's own log is kept");
+    assert!(
+        !location.probe.objects(CATALOG).await.is_empty(),
+        "catalog log stays"
+    );
 }
 
 // ---------------------------------------------------------------------------

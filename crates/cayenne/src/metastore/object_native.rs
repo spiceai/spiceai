@@ -41,7 +41,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Notify;
 
 mod catalog;
-pub use catalog::{ObjectNativeCatalog, TableReaders, dataset_log_at, new_dataset_folder};
+pub use catalog::{ObjectNativeCatalog, TableDeletionHolds, dataset_log_at, new_dataset_folder};
 
 /// One head log: a serial writer and its last acknowledged state. The catalog
 /// keeps one for its name registry and one per dataset. No database is used.
@@ -127,9 +127,8 @@ pub struct NativeCatalogConfig {
     /// them: anything newer may belong to a process still writing it.
     pub reclaim_after: std::time::Duration,
     /// How long after a dataset is dropped the instance that dropped it waits
-    /// before it deletes the dataset's folder, once no scan of its tables still
-    /// runs and no restore point is being taken from them: the window in which a
-    /// query planned just before the drop opens its files.
+    /// before it deletes the dataset's folder, once no restore point or export
+    /// holds its tables' deletions. Running scans do not extend this retention.
     pub dropped_grace: std::time::Duration,
     /// How long the coordinator of a transaction across datasets tries to
     /// commit it before it aborts it instead, so its client gets an answer and
@@ -2752,6 +2751,13 @@ impl Domain {
         id: String,
         snapshot: String,
     ) -> CatalogResult<String> {
+        if !crate::metastore_layout::is_object_native_data_path(&options.base_path) {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: crate::metastore_layout::object_native_data_path_refusal(
+                    &options.table_name,
+                ),
+            });
+        }
         options.schema = arrow_tools::map_entries::conforming_schema(options.schema);
         crate::cayenne_catalog::validate_create_table_options(&options)?;
         let mut inner = self.inner.take().await;
@@ -2796,11 +2802,6 @@ impl Domain {
                 vortex_config_json,
                 current_snapshot_id: snapshot,
                 seq: 0,
-                // A table whose data is in the object-native location keeps its
-                // files flat under its own directory, keyed by path alone.
-                flat_layout: crate::metastore_layout::is_object_native_data_path(
-                    &options.base_path,
-                ),
             }))])
             .await?;
         Ok(id)

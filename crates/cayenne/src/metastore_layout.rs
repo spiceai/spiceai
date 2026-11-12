@@ -57,6 +57,14 @@ pub use util::spice_paths::fs_probe_path;
 /// folder, and the folder `file_create` replaces, stay as long.
 pub const DATA_FILE_RETENTION: std::time::Duration = std::time::Duration::from_hours(1);
 
+/// Configuration error for data outside the object-native state location.
+#[must_use]
+pub fn object_native_data_path_refusal(dataset: &str) -> String {
+    format!(
+        "Failed to load dataset '{dataset}' (cayenne): With `runtime.params.cayenne_vnext` enabled, its data must be in `runtime.state.location`. Remove `cayenne_file_path`, `cayenne_s3_zone_ids`, and `cayenne_datalake_location`, use a supported refresh mode (full, append, or changes), and set `runtime.state.location` to an S3 or local file location. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 /// How a configured directory string becomes the filesystem path it names.
 ///
 /// This is not a formatting preference — it decides *which directory* the overlap

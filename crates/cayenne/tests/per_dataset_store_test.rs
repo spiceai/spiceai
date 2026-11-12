@@ -655,29 +655,22 @@ fn append_kill_batches() -> Vec<i64> {
     batches
 }
 
-/// Append refresh into a keyed dataset whose data path is an object store outside
-/// the state location (`cayenne_file_path: s3://…` under `runtime.params.cayenne_vnext`,
-/// its metastore in a local object-native catalog), as the `append-kill` script
-/// drives it: file durability, compaction every interval once four files wait.
-///
-/// A small append is held inline in the metastore until the inline corpus reaches
-/// a flush threshold (64 appends, 10,000 rows or 8 MiB by default), so with the
-/// default inline settings the script's 38 appends never reach a data file and
-/// leave nothing to compact. With inline storage off, as the script now sets it,
-/// every append is a data file in the store and compaction commits there.
+/// Appends to a keyed dataset in the state location write data files and
+/// compact them when inline storage is disabled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appends_to_an_object_store_data_path_reach_data_files_and_compact() -> TestResult {
-    let directory = tempfile::tempdir()?;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(
-        cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(
-            directory.path(),
+        cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
+            Arc::clone(&store),
+            object_store::path::Path::from("v1/catalog"),
+            "s3://lake/v1",
         )
         .await?,
     );
     catalog.init().await?;
     let ctx = SessionContext::new();
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let data_url = "s3://lake/data/events".to_string();
+    let data_url = "s3://lake/v1/datasets/events/data".to_string();
     // `cayenne_inline_max_rows: '0'`, as the script sets it.
     let vortex_config = VortexConfig {
         cdc_durability: cayenne::metadata::CdcDurability::File,

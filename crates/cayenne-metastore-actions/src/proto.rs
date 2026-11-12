@@ -163,10 +163,7 @@ pub struct CreateTable {
     pub current_snapshot_id: String,
     #[prost(int64, tag = "11")]
     pub seq: i64,
-    /// The table's data files are keyed by their path alone, relative to the
-    /// table, rather than by `<snapshot>/<path>`.
-    #[prost(bool, tag = "12")]
-    pub flat_layout: bool,
+    // Tag 12 is reserved.
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]

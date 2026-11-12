@@ -83,12 +83,6 @@ pub(crate) struct SnapshotScanRefs {
     pub(crate) snapshots: HashMap<String, usize>,
 }
 
-impl SnapshotScanRefs {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.snapshots.is_empty()
-    }
-}
-
 impl SnapshotScanRef {
     /// Increment the in-flight-scan ref-count for each snapshot id and return
     /// a guard that releases the references on drop.

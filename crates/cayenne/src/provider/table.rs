@@ -9463,13 +9463,6 @@ impl CayenneTableProvider {
         crate::metastore_layout::is_object_native_data_path(&self.table_metadata.path)
     }
 
-    /// Whether `snapshot_id` names a flat committed snapshot of this table.
-    /// Staging and scratch ids keep their own directories.
-    fn is_flat_snapshot(table_path: &str, snapshot_id: &str) -> bool {
-        crate::metastore_layout::is_object_native_data_path(table_path)
-            && uuid::Uuid::parse_str(snapshot_id).is_ok()
-    }
-
     /// Whether the cleanup a commit schedules takes the snapshots it reclaims
     /// from the committed state instead of listing the table's prefix: a table
     /// whose data is in the object-native location on a store, in a catalog
@@ -9738,17 +9731,13 @@ impl CayenneTableProvider {
             .await
     }
 
-    /// The key of data file `name` of `snapshot_id`: its path relative to the
-    /// table, as the committed state keys it
-    /// (`cayenne_metastore_actions::state::TableState::file_key`): the name
-    /// itself for a snapshot of a flat table, `<folder>/<name>` for a file in a
-    /// folder of its own (any snapshot of another table, a staging write's).
+    /// The table-relative key of a data file.
     fn data_file_key(&self, snapshot_id: &str, name: &str) -> String {
-        cayenne_metastore_actions::state::file_key(
-            Self::is_flat_snapshot(&self.table_metadata.path, snapshot_id),
-            snapshot_id,
-            name,
-        )
+        if self.data_in_object_native_location() {
+            name.to_string()
+        } else {
+            format!("{snapshot_id}/{name}")
+        }
     }
 
     /// The keys of every data file and deletion vector the committed state
@@ -9827,7 +9816,7 @@ impl CayenneTableProvider {
             .into_iter()
             .collect();
         self.uncommitted_files.forget(snapshot_id);
-        if Self::is_flat_snapshot(&self.table_metadata.path, snapshot_id) {
+        if self.data_in_object_native_location() {
             for row in self
                 .catalog
                 .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
@@ -10509,17 +10498,16 @@ impl CayenneTableProvider {
     ///
     /// A table whose data is in the object-native location
     /// ([`crate::metastore_layout::is_object_native_data_path`]) is flat: a
-    /// snapshot (a UUID) has no folder, and its files are under the table's own
+    /// snapshot has no folder, and its files are under the table's own
     /// directory, `<table_path>/<table_id>/`, where a manifest row's path is
     /// relative to (so a row written as `<snapshot>/<name>` still resolves).
-    /// Any other name, a staging write's or the lookup index's, stays a folder
-    /// of its own. Every other table keeps a folder per snapshot:
+    /// Every other table keeps a folder per snapshot:
     /// `<table_path>/<table_id>/<snapshot_id>/`, a local path or an object URL.
     fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
         if crate::is_object_store_path(table_path) {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
-            if Self::is_flat_snapshot(table_path, snapshot_id) {
+            if crate::metastore_layout::is_object_native_data_path(table_path) {
                 return format!("{base}/{table_id}/");
             }
             format!("{base}/{table_id}/{snapshot_id}/")
@@ -12567,10 +12555,9 @@ impl CayenneTableProvider {
             .as_any()
             .downcast_ref::<crate::metastore::object_native::ObjectNativeCatalog>(
         ) {
-            native.register_readers(
+            native.register_deletion_holds(
                 &provider.table_metadata.table_id,
-                crate::metastore::object_native::TableReaders::new(
-                    &provider.snapshot_scan_refs,
+                crate::metastore::object_native::TableDeletionHolds::new(
                     &provider.file_deletion_fence,
                 ),
             );
@@ -48916,6 +48903,29 @@ mod tests {
                 ScalarValue::Int64(Some(1)),
                 ScalarValue::Int64(Some(2))
             ])
+        );
+    }
+
+    #[test]
+    fn object_native_snapshot_paths_are_flat_for_every_snapshot_id() {
+        for base in [
+            "s3://bucket/state/v1/datasets/orders/data",
+            "file:///tmp/state/v1/datasets/orders/data",
+        ] {
+            for snapshot in [
+                uuid::Uuid::now_v7().to_string(),
+                "staging-write".to_string(),
+                "lookup-index".to_string(),
+            ] {
+                assert_eq!(
+                    CayenneTableProvider::snapshot_dir_url(base, "table", &snapshot),
+                    format!("{base}/table/")
+                );
+            }
+        }
+        assert_eq!(
+            CayenneTableProvider::snapshot_dir_url("s3://bucket/legacy", "table", "snapshot"),
+            "s3://bucket/legacy/table/snapshot/"
         );
     }
 
