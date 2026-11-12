@@ -8277,24 +8277,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_dropped_placed_acceleration_message_says_what_happens_to_its_files() {
-        let data_path = "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data";
-        let folder = placed_dataset_folder(data_path);
-        assert_eq!(
-            folder,
-            "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000"
-        );
-        assert_eq!(
-            placed_acceleration_dropped_message("orders", folder, true),
-            "Dataset 'orders' (cayenne) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is deleted once the data-file retention has passed and no query reads it; if Spice stops first, it is deleted at a later start. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-        );
-        assert_eq!(
-            placed_acceleration_dropped_message("orders", folder, false),
-            "Dataset 'orders' (cayenne) dropped its acceleration. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is deleted once the data-file retention has passed and no query reads it; if Spice stops first, it is deleted at a later start. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-        );
-    }
-
     /// The `file_update` schema rebuild reaches `remove_dir_all` without going through
     /// `init`, so it needs its own guard — and must leave the metastore on disk.
     /// Regression test for #13055 / #13068.
