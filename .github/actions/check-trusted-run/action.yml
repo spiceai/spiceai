@@ -11,17 +11,22 @@ description: >-
     - triggered by push, merge_group, workflow_dispatch, schedule or release, never pull_request
       or pull_request_target;
     - built from this repository, not a fork;
-    - built from trunk, a release branch (release/X.Y or release/X.Y.Z, optionally -rc.N or
-      -rcN), a merge queue branch gh-readonly-queue/<one of those>/pr-<number>-<sha>
-      (merge_group only), or a release tag (vX.Y.Z, optionally -rc.N or -rcN, optionally
-      -enterprise) of this repository that points at the commit the run built. Nothing else.
+    - built from trunk or a release branch (release/X.Y or release/X.Y.Z, optionally -rc.N or
+      -rcN) and on that branch's history; from a merge queue branch
+      gh-readonly-queue/<one of those>/pr-<number>-<sha> (merge_group only); or from a release
+      tag (vX.Y.Z, optionally -rc.N or -rcN, optionally -enterprise) of this repository that
+      points at the commit the run built, where that commit is on trunk or a release branch.
+      Nothing else. head_branch is only a name, and a tag can be called `trunk`, so the commit
+      is checked against the branches themselves.
+  It fetches the commit history (no trees or blobs) of trunk and refs/heads/release/* into a
+  scratch repository under $RUNNER_TEMP, runs nothing from it, and fails if the fetch fails.
 
 inputs:
   run-id:
     description: Workflow run ID to check. Must be numeric.
     required: true
   token:
-    description: Token that can read this repository's Actions runs and tags.
+    description: Token that can read this repository's Actions runs, tags and contents.
     required: true
 
 outputs:
@@ -73,8 +78,46 @@ runs:
 
         release_branch='release/[0-9]+\.[0-9]+(\.[0-9]+)?(-rc\.?[0-9]+)?'
         release_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.?[0-9]+)?(-enterprise)?$'
+
+        # The commit history of trunk and the release branches, fetched once into a scratch repo.
+        # The token goes to git through GIT_CONFIG_* for this one command, never to disk.
+        git_dir=""
+        fetch_branches() {
+          [ -z "$git_dir" ] || return 0
+          git_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/check-trusted-run.XXXXXX")
+          git init -q --bare "$git_dir"
+          server="${GITHUB_SERVER_URL:-https://github.com}"
+          git --git-dir "$git_dir" remote add origin "$server/$GITHUB_REPOSITORY.git"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          # Three tries for a transient network error; still failing means the run is refused.
+          fetched=""
+          for attempt in 1 2 3; do
+            if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server/.extraheader" \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git --git-dir "$git_dir" fetch -q --no-tags --filter=tree:0 origin \
+                '+refs/heads/trunk:refs/remotes/origin/trunk' \
+                '+refs/heads/release/*:refs/remotes/origin/release/*'; then
+              fetched=1; break
+            fi
+            [ "$attempt" = 3 ] || sleep 5
+          done
+          [ -n "$fetched" ] || refuse "could not be checked: fetching trunk and the release branches failed"
+          git --git-dir "$git_dir" rev-parse -q --verify refs/remotes/origin/trunk >/dev/null \
+            || refuse "could not be checked: trunk was not fetched"
+        }
+        # True when head_sha is the tip of, or an ancestor of, refs/remotes/origin/<branch>.
+        # GIT_NO_LAZY_FETCH keeps a missing commit missing (so: not on the branch) on git 2.45+.
+        on_branch() {
+          GIT_NO_LAZY_FETCH=1 git --git-dir "$git_dir" merge-base --is-ancestor \
+            "$head_sha" "refs/remotes/origin/$1" 2>/dev/null
+        }
+
         if [ "$head_branch" = trunk ] || [[ "$head_branch" =~ ^${release_branch}$ ]]; then
-          :
+          fetch_branches
+          git --git-dir "$git_dir" rev-parse -q --verify "refs/remotes/origin/$head_branch" >/dev/null \
+            || refuse "names branch $head_branch, which this repository does not have"
+          on_branch "$head_branch" || refuse "built $head_sha, which is not on branch $head_branch"
         elif [[ "$head_branch" =~ ^gh-readonly-queue/(trunk|${release_branch})/pr-[0-9]+-[0-9a-f]+$ ]]; then
           [ "$event" = merge_group ] || refuse "is on a merge queue branch but was not a merge_group run"
         elif [[ "$head_branch" =~ $release_tag ]]; then
@@ -85,6 +128,17 @@ runs:
             || refuse "names $head_branch, which is not a tag of $GITHUB_REPOSITORY"
           [ "$tag_sha" = "$head_sha" ] \
             || refuse "built $head_sha, but tag $head_branch points at $tag_sha"
+          # Anyone who can push a tag can put one on any commit, so the commit must already be on
+          # trunk or a release branch (strict names only).
+          fetch_branches
+          trusted=""
+          while read -r branch; do
+            if [ "$branch" = trunk ] || [[ "$branch" =~ ^${release_branch}$ ]]; then
+              on_branch "$branch" && { trusted="$branch"; break; }
+            fi
+          done < <(git --git-dir "$git_dir" for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/)
+          [ -n "$trusted" ] || refuse "built $head_sha, which is not on trunk or a release branch"
+          head_branch="$head_branch (on $trusted)"
         else
           refuse "was built from $head_branch, not trunk, a release branch or a release tag"
         fi
