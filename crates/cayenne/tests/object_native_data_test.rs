@@ -3794,8 +3794,8 @@ async fn a_subset_compaction_copies_nothing() {
         .into_iter()
         .collect();
 
-    // The retention passes; the reader still holds the files it may read.
-    table.reclaim_retired_snapshots_now().await;
+    // Within T, the earlier reader can still open every input file.
+    table.sweep_retired_files_now().await;
     let mut reader_rows = 0_i64;
     let mut reader_sum = 0_i64;
     while let Some(batch) = futures::StreamExt::next(&mut reader).await {
@@ -3841,6 +3841,19 @@ async fn a_subset_compaction_copies_nothing() {
             (6000, expected_sum(1, 6000)),
         ),
         "compacted by the subset path, copies, a new snapshot, the picked files retired ({retired:?}) and the others named ({named:?}), the earlier reader's rows, rows"
+    );
+    table.elapse_data_file_retention();
+    table.sweep_retired_files_now().await;
+    assert_eq!(
+        catalog
+            .retired_files(&table_id)
+            .await
+            .expect("retired files"),
+        Some(vec![])
+    );
+    assert_eq!(
+        count_and_sum(&ctx, "events").await,
+        (6000, expected_sum(1, 6000))
     );
 }
 

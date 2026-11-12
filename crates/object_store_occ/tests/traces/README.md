@@ -199,9 +199,9 @@ whose PUT has not returned, and a reader that lists the prefix.
 
 ## Data-file retirement traces
 
-`data-files-retire.jsonl` holds the witnesses of `data-files-retire` (16),
-`data-files-retire-3` (16), `data-files-retire-remote` (14) and
-`data-files-retire-prepared` (18), `data-files-retire-walk.jsonl` 20 walks of
+`data-files-retire.jsonl` holds the witnesses of `data-files-retire` (17),
+`data-files-retire-3` (17), `data-files-retire-remote` (14) and
+`data-files-retire-prepared` (19), `data-files-retire-walk.jsonl` 20 walks of
 each (seed 42, 40 steps), and `data-files-retire-controls.jsonl` the
 counterexample of each of eight controls for the property it must fail. They
 exist only here. Generated serially from the repository root (`TRACE_JSON`
@@ -216,7 +216,7 @@ appends, so delete the files first; the controls file is then filtered to the
       WALK=42:20:40 TRACE_JSON=$T/data-files-retire-walk.jsonl $B run $r
     done
     for r in data-files-retire-whole-snapshot data-files-retire-3-retires-carried \
-      data-files-retire-ignores-pins data-files-retire-remote-ignores-retention \
+      data-files-retire-local-ignores-retention data-files-retire-remote-ignores-retention \
       data-files-retire-forget-early data-files-retire-ignores-restore-hold \
       data-files-retire-sweep-uncommitted \
       data-files-retire-prepared-orphan-ignores-reservation; do
@@ -234,10 +234,10 @@ retired set (each file with the model version of the record that removed it),
 and through data PUTs, GETs and `delete_stream` deletes on the fault store (a
 failed delete is a `Fail` fault on its path). The sweep's rules are checked
 against the real head when a trace plans, deletes, forgets, starts a restore
-point or sweeps an orphan; in the `remote` runs the sweep's retention timers
+point or sweeps an orphan; in all retirement runs the sweep's retention timers
 are the replay's per-process state, lost at a crash or takeover. `Tick` and
 `RemoteStart` touch no storage: they advance the replay's clock and record the
-remote query's start. Added invariants: a pinned scan's files, a restore
+remote query's start. Added invariants: a local scan's files within T, a restore
 point's remaining files and a prepared transaction's files exist, a forgotten
 file is gone, and a remote reader finds every file it fetches within T - S of
 its start. For each control counterexample the safe implementation must refuse
@@ -248,6 +248,6 @@ its fold with the model's retired set: the safe writer never writes a record
 that retires a file it keeps live.
 
 Not covered: the engine's records and the catalog that answers the retired set
-are not driven (they live in the Cayenne crates); a scan's pin is the replay's
-own bookkeeping, not the engine's scan references; deletes go one key per
+are not driven (they live in the Cayenne crates); a scan's start tick is the replay's
+own bookkeeping; deletes go one key per
 request rather than in batches.

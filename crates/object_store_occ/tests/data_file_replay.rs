@@ -19,12 +19,11 @@
 //! against that real state when the trace plans, deletes and forgets: a sweep
 //! plans only files the committed head retired, by the lease holder with no
 //! commit of its own outstanding, while no transaction is prepared and no
-//! restore point holds deletions; it keeps every file removed after the commit
-//! a scan pins and, in the `remote` runs, every file whose retention timer (the
-//! holder's, in memory, lost at a crash or takeover) has not run T; it forgets
+//! restore point holds deletions; it keeps every file whose retention timer
+//! (the holder's, in memory, lost at a crash or takeover) has not run T; it forgets
 //! only after its deletes returned. Deletes go through `delete_stream` on the
 //! fault store, and a failed delete is a `Fail` fault on that path. Added
-//! invariants: a pinned scan's files, a restore point's files and a prepared
+//! invariants: a local scan's files within T, a restore point's files and a prepared
 //! transaction's files exist, a forgotten file is gone, and a reader on
 //! another instance finds every file it fetches within T - S of its query's
 //! start.
@@ -38,7 +37,7 @@
 //! implementation must refuse the unsafe step by its rule, and the
 //! implementation with that rule removed must reach a state where an
 //! independent invariant fails. The controls: whole-snapshot retirement,
-//! retiring a carried file, ignoring pins, ignoring T (the remote reader),
+//! retiring a carried file, ignoring T for local and remote readers,
 //! forgetting early, ignoring the restore hold, sweeping from the uncommitted
 //! local view, and the orphan sweep ignoring a prepared transaction's
 //! reservation. A record that retires a file it keeps live (whole-snapshot,
@@ -46,7 +45,7 @@
 //! model's retired set, since the safe writer never writes one.
 //!
 //! The retirement records here are this test's own encoding; the Cayenne state
-//! machine that applies the engine's records is not driven, a scan's pin is the
+//! machine that applies the engine's records is not driven, a scan's start is the
 //! replay's own bookkeeping, and deletes go one key per request.
 #![expect(clippy::expect_used, reason = "integration setup and trace assertions")]
 
@@ -84,7 +83,7 @@ const LOG: &str = "dataset/log";
 const DATA: &str = "dataset/data";
 const WAIT: Duration = Duration::from_secs(10);
 /// The retention T and a remote reader's staleness bound S, in clock ticks, of
-/// the `remote` runs. The other runs have no clock and take T as zero.
+/// retirement runs; non-retirement runs take T as zero.
 const RETENTION: u8 = 2;
 const STALENESS: u8 = 1;
 
@@ -277,8 +276,8 @@ enum Control {
     /// The sweep reads its process's view, with its own removal in flight
     /// applied before the record commits.
     SweepUncommitted,
-    /// The sweep deletes files a scan's pinned commit needs.
-    IgnoresPins,
+    /// The sweep skips T for local scans.
+    LocalIgnoresRetention,
     /// The sweep deletes a retired file as soon as it observes the removal.
     IgnoresRetention,
     /// The sweep forgets before its deletes return.
@@ -370,9 +369,9 @@ struct Replay {
     puts: Vec<Upload>,
     snapshot: Vec<(u8, u8)>,
     fetched: usize,
-    /// The commit the scan pins, and the files of that commit.
-    pin: Option<u64>,
-    pinned_files: Vec<File>,
+    /// The local scan start tick and captured files; no deletion hold.
+    local_started: Option<u8>,
+    local_files: Vec<File>,
     /// A restore point holding deletions: the files it copies, and the next.
     restore: Option<(Vec<File>, usize)>,
     sweep: Option<Sweep>,
@@ -413,19 +412,15 @@ impl Replay {
             puts: vec![],
             snapshot: vec![],
             fetched: 0,
-            pin: None,
-            pinned_files: vec![],
+            local_started: None,
+            local_files: vec![],
             restore: None,
             sweep: None,
             deletes: vec![],
             forgotten: BTreeSet::new(),
             remote: None,
             now: 0,
-            retention: if retire && run.contains("remote") {
-                RETENTION
-            } else {
-                0
-            },
+            retention: if retire { RETENTION } else { 0 },
             retire,
             coverage: BTreeMap::new(),
         })
@@ -518,9 +513,12 @@ impl Replay {
                 format!("committed file missing from the store: {f:?}; stored {stored:?}")
             })?;
         }
-        for f in &self.pinned_files {
+        for f in self.local_files.iter().filter(|_| {
+            self.local_started
+                .is_some_and(|start| self.now < start + self.retention)
+        }) {
             require(stored.contains(f), || {
-                format!("file of a pinned scan's commit missing from the store: {f:?}")
+                format!("local scan within T missing a file: {f:?}")
             })?;
         }
         if let Some((files, next)) = &self.restore {
@@ -1029,7 +1027,7 @@ impl Replay {
             DataFileOp::ReadHead {
                 version,
                 files,
-                pinned,
+                local,
             } => {
                 let head = self.state().await?;
                 let committed = keys_of(&head.files);
@@ -1048,13 +1046,13 @@ impl Replay {
                         head.version
                     )
                 })?;
-                // A scan pins the commit it captured in the same step.
-                require(pinned == self.retire, || {
-                    format!("scan pins: model {pinned}; retire run {}", self.retire)
+                // Local head capture starts a query with S = 0.
+                require(local == self.retire, || {
+                    format!("local scan: model {local}; retire run {}", self.retire)
                 })?;
-                if pinned {
-                    self.pin = Some(head.version);
-                    self.pinned_files.clone_from(&head.files);
+                if local {
+                    self.local_started = Some(self.now);
+                    self.local_files.clone_from(&head.files);
                 }
                 self.snapshot = read;
                 self.fetched = 0;
@@ -1067,12 +1065,25 @@ impl Replay {
                 self.fetched += 1;
                 require((generation, id) == model_key(key), || "fetch order".into())?;
                 let got = self.get((generation, id)).await?;
-                require(got.is_some(), || {
-                    format!("committed file {generation}-{id} not found")
-                })?;
+                if self
+                    .local_started
+                    .is_none_or(|start| self.now < start + self.retention)
+                {
+                    require(got.is_some(), || {
+                        format!("local scan within T missing a file: {generation}-{id}")
+                    })?;
+                }
                 require(got.is_some() == found, || "fetch found".into())?;
-                self.cover("fetch of a committed file");
-                if self.pin.is_some()
+                if got.is_some() {
+                    self.cover("fetch of a committed file");
+                } else if self
+                    .local_started
+                    .is_some_and(|start| self.now >= start + self.retention)
+                {
+                    self.cover("local fetch past T found the file deleted");
+                }
+                if got.is_some()
+                    && self.local_started.is_some()
                     && !self
                         .state()
                         .await?
@@ -1080,12 +1091,12 @@ impl Replay {
                         .iter()
                         .any(|f| key_of(*f) == (generation, id))
                 {
-                    self.cover("scan read a file removed after its pin");
+                    self.cover("scan read a file removed after its start");
                 }
             }
-            DataFileOp::Unpinned => {
-                self.pin = None;
-                self.pinned_files.clear();
+            DataFileOp::ScanEnded => {
+                self.local_started = None;
+                self.local_files.clear();
                 self.snapshot.clear();
                 self.fetched = 0;
             }
@@ -1294,7 +1305,7 @@ impl Replay {
             }
             DataFileOp::RemoteConfirmed { version, files, at } => {
                 // A reader on another instance confirms the head with a real
-                // head GET; it writes and pins nothing.
+                // head GET; it writes nothing.
                 let head = self.state().await?;
                 let model = model_keys(&files);
                 require(
@@ -1425,21 +1436,20 @@ impl Replay {
         let mut observe = vec![];
         let mut due = vec![];
         let mut refusal = BTreeMap::new();
-        for (f, by) in &retired {
+        for f in retired.keys() {
             let timer = client.timers.get(f).copied();
             if self.retention > 0 && timer.is_none() {
                 observe.push(*f);
             }
-            // A scan pinned at commit `p` reads the files live at `p`; a file
-            // the record at version `by` removed was live at `p` when `by > p`.
-            let pinned = self.pin.is_some_and(|p| *by > p);
             let waited = self.retention == 0
                 || timer.is_some_and(|since| self.now >= since + self.retention);
             // A snapshot-level rule keeps the files the live set names.
             let live = self.control == Control::WholeSnapshot && head.live.contains(f);
-            let keep = if pinned && self.control != Control::IgnoresPins {
-                Some("removed after the commit a scan pins")
-            } else if !waited && self.control != Control::IgnoresRetention {
+            let keep = if !waited
+                && !matches!(
+                    self.control,
+                    Control::IgnoresRetention | Control::LocalIgnoresRetention
+                ) {
                 Some("before T has passed since the sweep observed its removal")
             } else if live {
                 Some("which the live set names")
@@ -1708,7 +1718,7 @@ async fn retirement_traces_replay_on_real_storage() {
 
 /// Witnesses in `data-files-retire.jsonl` and walks in
 /// `data-files-retire-walk.jsonl` (see `traces/README.md`).
-const RETIRE_WITNESSES: usize = 64;
+const RETIRE_WITNESSES: usize = 67;
 const RETIRE_WALKS: usize = 80;
 /// Real paths the retirement traces must reach.
 const RETIRE_COVERAGE: &[&str] = &[
@@ -1727,7 +1737,8 @@ const RETIRE_COVERAGE: &[&str] = &[
     "delete landed after a takeover",
     "delete failed",
     "forget committed",
-    "scan read a file removed after its pin",
+    "scan read a file removed after its start",
+    "local fetch past T found the file deleted",
     "restore point copied a file",
     "restore point copied a file removed after it started",
     "clock ticked",
@@ -1752,7 +1763,7 @@ async fn retirement_counterexamples_are_refused_and_caught() {
             "data-files-retire-whole-snapshot",
             Control::WholeSnapshot,
             "which stays live",
-            "file of a pinned scan's commit missing from the store",
+            "local scan within T missing a file",
         ),
         (
             "data-files-retire-3-retires-carried",
@@ -1761,10 +1772,10 @@ async fn retirement_counterexamples_are_refused_and_caught() {
             "committed file missing from the store",
         ),
         (
-            "data-files-retire-ignores-pins",
-            Control::IgnoresPins,
-            "removed after the commit a scan pins",
-            "file of a pinned scan's commit missing from the store",
+            "data-files-retire-local-ignores-retention",
+            Control::LocalIgnoresRetention,
+            "before T has passed",
+            "local scan within T missing a file",
         ),
         (
             "data-files-retire-remote-ignores-retention",

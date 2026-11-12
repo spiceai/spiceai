@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     sync::{Arc, OnceLock},
 };
 
@@ -64,80 +64,48 @@ use vortex_datafusion::VortexSource;
 /// segment files deleted out from under it by a concurrent compaction. This replaces
 /// the brittle time-based grace, which a query slower than the grace would outlive.
 ///
-/// Correctness rests on the listing-flip invariant: a scan captures its snapshot ids
-/// under `listing_fence.read()`, and a compaction's flip takes `listing_fence.write()`,
+/// Object-native data files instead use retention T; these references do not
+/// hold back their retirement sweep.
+///
+/// Correctness of snapshot-folder cleanup rests on the listing-flip invariant:
+/// a scan captures its snapshot ids under `listing_fence.read()`, and a compaction's flip takes `listing_fence.write()`,
 /// so after the flip no NEW scan can reference the superseded snapshot — its ref-count
 /// only decreases, and cleanup that observes count 0 can delete it safely.
 #[derive(Debug)]
 pub(crate) struct SnapshotScanRef {
     refs: Arc<Mutex<SnapshotScanRefs>>,
     snapshot_ids: Vec<String>,
-    generation: u64,
 }
 
-/// The next scan generation: every [`SnapshotScanRef`] takes one, in creation
-/// order across the process.
-static SCAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Snapshot and generation pins, updated under one lock.
+/// Per-snapshot scan refcounts for snapshot-folder cleanup.
 #[derive(Debug, Default)]
 pub(crate) struct SnapshotScanRefs {
     pub(crate) snapshots: HashMap<String, usize>,
-    generations: BTreeMap<u64, usize>,
 }
 
 impl SnapshotScanRefs {
     pub(crate) fn is_empty(&self) -> bool {
-        self.snapshots.is_empty() && self.generations.is_empty()
+        self.snapshots.is_empty()
     }
 }
 
-/// The generation the next scan takes. Call with the table's pin lock held
-/// to order the observation with scan registration.
-pub(crate) fn next_scan_generation() -> u64 {
-    SCAN_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// The generation of the oldest scan that has not ended.
-pub(crate) fn oldest_scan_generation(refs: &SnapshotScanRefs) -> Option<u64> {
-    refs.generations
-        .first_key_value()
-        .map(|(&generation, _)| generation)
-}
-
 impl SnapshotScanRef {
-    /// Increment the in-flight-scan ref-count for each snapshot id, and pin
-    /// this scan's generation, and return a guard that releases both on drop.
+    /// Increment the in-flight-scan ref-count for each snapshot id and return
+    /// a guard that releases the references on drop.
     pub(crate) fn new(refs: Arc<Mutex<SnapshotScanRefs>>, snapshot_ids: Vec<String>) -> Arc<Self> {
-        let generation = {
+        {
             let mut map = refs.lock();
-            // Taken under the lock, so the retirement sweep, which reads the
-            // next generation under it too, orders every scan against its
-            // first observation of a removed file.
-            let generation = SCAN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            *map.generations.entry(generation).or_insert(0) += 1;
             for id in &snapshot_ids {
                 *map.snapshots.entry(id.clone()).or_insert(0) += 1;
             }
-            generation
-        };
-        Arc::new(Self {
-            refs,
-            snapshot_ids,
-            generation,
-        })
+        }
+        Arc::new(Self { refs, snapshot_ids })
     }
 }
 
 impl Drop for SnapshotScanRef {
     fn drop(&mut self) {
         let mut map = self.refs.lock();
-        if let Some(count) = map.generations.get_mut(&self.generation) {
-            *count -= 1;
-            if *count == 0 {
-                map.generations.remove(&self.generation);
-            }
-        }
         for id in &self.snapshot_ids {
             if let Some(count) = map.snapshots.get_mut(id) {
                 *count = count.saturating_sub(1);

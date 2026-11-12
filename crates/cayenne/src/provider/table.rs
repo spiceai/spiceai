@@ -3573,13 +3573,11 @@ pub struct CayenneTableProvider {
     snapshot_last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
     /// For a table whose catalog keeps the durable retirement record, its
     /// retention timers in place of `retired_snapshot_dirs`: retired file key
-    /// → when this process's sweep first observed it retired, and the scan
-    /// generation then ([`super::scan::next_scan_generation`]). The sweep
-    /// deletes a file once [`crate::metastore_layout::DATA_FILE_RETENTION`]
-    /// has passed since and no scan older than that generation still runs. In
-    /// memory: a restart or a takeover observes every file again, which only
+    /// → when this process's sweep first observed it retired. The sweep deletes
+    /// a file once [`crate::metastore_layout::DATA_FILE_RETENTION`] has passed.
+    /// In memory: a restart or a takeover observes every file again, which only
     /// delays its deletion.
-    retired_file_timers: Arc<ParkingMutex<HashMap<String, (Instant, u64)>>>,
+    retired_file_timers: Arc<ParkingMutex<HashMap<String, Instant>>>,
     /// Bumped by every retirement into `retired_snapshot_dirs`, so the follow-up
     /// sweep knows to keep going for directories retired while it runs.
     retired_snapshot_generation: Arc<AtomicU64>,
@@ -4040,7 +4038,7 @@ pub struct SnapshotDirPins {
     scan_refs: Arc<ParkingMutex<super::scan::SnapshotScanRefs>>,
     last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
     retired: Arc<ParkingMutex<HashMap<String, Instant>>>,
-    retired_files: Arc<ParkingMutex<HashMap<String, (Instant, u64)>>>,
+    retired_files: Arc<ParkingMutex<HashMap<String, Instant>>>,
 }
 
 impl SnapshotDirPins {
@@ -10103,16 +10101,12 @@ impl CayenneTableProvider {
     /// process has not observed yet, and stop timing the files the record no
     /// longer names: forgotten, by this process or another.
     fn observe_retired_files(&self, keys: &[String]) {
-        let generation = {
-            let _refs = self.snapshot_scan_refs.lock();
-            super::scan::next_scan_generation()
-        };
         let now = Instant::now();
         let mut timers = self.retired_file_timers.lock();
         let named: HashSet<&str> = keys.iter().map(String::as_str).collect();
         timers.retain(|key, _| named.contains(key.as_str()));
         for key in keys {
-            timers.entry(key.clone()).or_insert((now, generation));
+            timers.entry(key.clone()).or_insert(now);
         }
     }
 
@@ -10143,8 +10137,7 @@ impl CayenneTableProvider {
     /// ([`MetadataCatalog::retired_files`]); the pass does nothing while it is
     /// not settled. A file is due once
     /// [`crate::metastore_layout::DATA_FILE_RETENTION`] has passed since this
-    /// process first observed it retired, and no scan that started before that
-    /// observation still runs (its generation pin is older). A write of this
+    /// process first observed it retired. A write of this
     /// process still building files in the file's snapshot keeps it too. A
     /// crash between the deletes and the forget leaves the files retired: the
     /// next pass deletes what is left (an object already gone counts as
@@ -10190,7 +10183,6 @@ impl CayenneTableProvider {
             return;
         }
         let now = Instant::now();
-        let oldest_scan = super::scan::oldest_scan_generation(&self.snapshot_scan_refs.lock());
         let flat = self.data_in_object_native_location();
         let held_names: HashSet<String> = if flat {
             self.uncommitted_files.held_keys()
@@ -10202,7 +10194,7 @@ impl CayenneTableProvider {
             let timers = self.retired_file_timers.lock();
             keys.iter()
                 .filter(|key| {
-                    let Some(&(observed, generation)) = timers.get(key.as_str()) else {
+                    let Some(&observed) = timers.get(key.as_str()) else {
                         return false;
                     };
                     let waited = now.duration_since(observed);
@@ -10210,12 +10202,6 @@ impl CayenneTableProvider {
                         let left =
                             crate::metastore_layout::DATA_FILE_RETENTION.saturating_sub(waited);
                         next_due = Some(next_due.map_or(left, |due| due.min(left)));
-                        return false;
-                    }
-                    // A scan that started before the removal was observed may
-                    // still read the file.
-                    if oldest_scan.is_some_and(|oldest| oldest < generation) {
-                        next_due = Some(Self::SNAPSHOT_CLEANUP_GRACE);
                         return false;
                     }
                     // A write of this process still holds the file: by name in a
@@ -10340,7 +10326,7 @@ impl CayenneTableProvider {
 
     /// Test-only: end the retention of every retired file this process has
     /// observed, as if [`crate::metastore_layout::DATA_FILE_RETENTION`] had
-    /// passed. Scans still hold the files they may read.
+    /// passed.
     #[doc(hidden)]
     pub fn elapse_data_file_retention(&self) {
         let Some(past) =
@@ -10348,7 +10334,7 @@ impl CayenneTableProvider {
         else {
             return;
         };
-        for (observed, _) in self.retired_file_timers.lock().values_mut() {
+        for observed in self.retired_file_timers.lock().values_mut() {
             *observed = past;
         }
     }

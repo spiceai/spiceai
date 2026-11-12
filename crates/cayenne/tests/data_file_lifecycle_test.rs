@@ -17,7 +17,7 @@ limitations under the License.
 //! What happens to a data file in the object-native location once a commit
 //! stops using it. The commit that takes a snapshot out of the live set is its
 //! retirement record; a sweep deletes the snapshot's files only after that
-//! commit, in batched requests, never while a query still reads them or a
+//! commit, in batched requests, only after retention expires and no
 //! restore point is being taken, and records the deletion in one commit per
 //! batch. A restart in the middle of a sweep leaves the rest to the next
 //! instance, and a delete still in flight from a replaced instance removes no
@@ -881,7 +881,7 @@ async fn eventually<T: fmt::Debug>(
 }
 
 // ---------------------------------------------------------------------------
-// Retirement, batching, pins
+// Retirement, batching, retention
 // ---------------------------------------------------------------------------
 
 /// A merge retires its input snapshots in its own commit. Their files are kept
@@ -1045,11 +1045,8 @@ async fn retired_files_are_deleted_in_batched_requests_after_the_retiring_commit
         .await;
 }
 
-/// A scan that started before a merge retired the files it reads, and is polled
-/// only after the sweep ran, finishes with every row: the sweep keeps the files
-/// while the scan holds them, and deletes them once it is done. (Without the
-/// scan's pin the sweep deletes the files and evicts them from the caches, and
-/// the scan fails reading them.)
+/// A scan polled after a sweep within T still returns every row. Once T has
+/// passed, the sweep deletes the retired files.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reader_that_opened_before_a_sweep_finishes_with_its_rows() {
     const READER_KEYS: i64 = 3_000;
@@ -1090,11 +1087,11 @@ async fn a_reader_that_opened_before_a_sweep_finishes_with_its_rows() {
         retired_files.len() >= 2 && retired_files.is_subset(&old_files),
         "the merge retires files the scan reads: {retired_files:?}"
     );
-    process.table.reclaim_retired_snapshots_now().await;
+    process.table.sweep_retired_files_now().await;
     assert_eq!(
         location.files_of(&table_id, &retired).await,
         retired_files,
-        "the sweep keeps the files a running scan reads"
+        "the sweep keeps the files within T"
     );
     assert_eq!(process.retired().await, Some(retired.clone()));
 
@@ -1108,11 +1105,12 @@ async fn a_reader_that_opened_before_a_sweep_finishes_with_its_rows() {
     assert_eq!(read, expected, "the scan returns every row");
     drop(reader);
 
-    process.table.reclaim_retired_snapshots_now().await;
+    process.table.elapse_data_file_retention();
+    process.table.sweep_retired_files_now().await;
     assert_eq!(
         location.files_of(&table_id, &retired).await,
         BTreeSet::new(),
-        "the files are deleted once the scan is done"
+        "the files are deleted once T has passed"
     );
     assert_eq!(process.retired().await, Some(vec![]));
     assert_eq!(process.rows("events").await, expected);
@@ -1311,75 +1309,81 @@ async fn a_retired_file_is_kept_until_the_retention_elapses() {
         .await;
 }
 
-/// A scan that started before a merge removed the files it reads keeps them
-/// past the retention, and finishes with every row; a scan that started after
-/// the sweep observed the removal reads only live files and holds nothing back.
+/// A captured file list has the same retention bound as a remote reader:
+/// after T, reading a retired file fails rather than returning other rows.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_scan_pinned_before_a_removal_keeps_its_files_past_the_retention() {
-    const READER_KEYS: i64 = 3_000;
-    let reader_config = SessionConfig::new()
-        .with_target_partitions(1)
-        .with_batch_size(256);
-    let (location, process) = keyed_table("events", UPSERTS, READER_KEYS, reader_config).await;
+async fn a_scan_past_retention_gets_the_data_file_missing_error() {
+    use cayenne::dataset_storage::DatasetStorage;
+    use object_store::ObjectStoreExt;
+
+    let (location, process) = keyed_with_protected_snapshots("orders", UPSERTS).await;
     let table_id = process.table.table_id().to_string();
-    let expected = upserted_keys(UPSERTS, READER_KEYS);
-    let mut before = process
+    // Execution streams can prefetch and cache file bytes. Capture the file list
+    // directly and hold the physical plan across the sweep so the test exercises
+    // a late file open deterministically, without depending on stream scheduling.
+    let plan = process
         .ctx
-        .sql("SELECT id, v FROM events")
+        .sql("SELECT id, v FROM orders")
         .await
         .expect("plan")
-        .execute_stream()
+        .create_physical_plan()
         .await
-        .expect("start the scan before the merge");
+        .expect("capture the scan");
+    let captured: BTreeSet<String> = location.data_files().await.into_keys().collect();
+    let storage = DatasetStorage::new(
+        "orders",
+        &location.data_url,
+        &table_id,
+        Arc::clone(&process.instance) as Arc<dyn ObjectStore>,
+    )
+    .expect("dataset storage");
+    for key in &captured {
+        storage
+            .store()
+            .get(&Path::from(key.as_str()))
+            .await
+            .expect("captured file exists before retirement");
+    }
     assert!(
         process
             .table
             .compact_protected_snapshots_subset(usize::MAX)
             .await
-            .expect("merge"),
-        "the merge commits"
+            .expect("merge")
     );
     let retired = process.retired().await.expect("the merge committed");
     let retired_files = location.files_of(&table_id, &retired).await;
-    assert!(retired_files.len() >= 2, "{retired_files:?}");
-
-    // Observed, and the retention passed: the earlier scan still holds them.
-    process.table.reclaim_retired_snapshots_now().await;
-    assert_eq!(
-        location.files_of(&table_id, &retired).await,
-        retired_files,
-        "a scan pinned before the removal keeps its files past the retention"
+    assert!(
+        retired_files.len() >= 2 && retired_files.is_subset(&captured),
+        "{retired_files:?}"
     );
-    let mut read = Vec::new();
-    while let Some(next) = before.next().await {
-        read.extend(collect_rows(vec![next.expect("the earlier scan reads on")]));
+    process.table.sweep_retired_files_now().await;
+    assert_eq!(location.files_of(&table_id, &retired).await, retired_files);
+    process.table.elapse_data_file_retention();
+    process.table.sweep_retired_files_now().await;
+    for key in &retired_files {
+        let error = storage
+            .store()
+            .get(&Path::from(key.as_str()))
+            .await
+            .expect_err("a late read must fail");
+        let object_store::Error::NotFound { source, .. } = error else {
+            panic!("expected data-file-missing NotFound, got {error}");
+        };
+        let relative = key
+            .strip_prefix(&format!("{}/", location.data_prefix))
+            .expect("dataset-relative key");
+        assert_eq!(
+            source.to_string(),
+            format!(
+                "Failed to query dataset 'orders' (cayenne): data file '{relative}' is missing from '{}', so the query fails rather than return partial results. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                location.data_url
+            )
+        );
     }
-    read.sort_unstable();
-    assert_eq!(read, expected, "the earlier scan returns every row");
-    drop(before);
-
-    // A scan that starts after the observation does not hold the retired files.
-    let mut after = process
-        .ctx
-        .sql("SELECT id, v FROM events")
-        .await
-        .expect("plan")
-        .execute_stream()
-        .await
-        .expect("start the scan after the merge");
-    process.table.reclaim_retired_snapshots_now().await;
-    assert_eq!(
-        location.files_of(&table_id, &retired).await,
-        BTreeSet::new(),
-        "a scan that started after the removal holds no retired file"
-    );
-    let mut read = Vec::new();
-    while let Some(next) = after.next().await {
-        read.extend(collect_rows(vec![next.expect("the later scan reads on")]));
-    }
-    read.sort_unstable();
-    assert_eq!(read, expected, "the later scan returns every row");
     assert_eq!(process.retired().await, Some(vec![]));
+    assert_eq!(process.rows("orders").await, upserted(UPSERTS));
+    drop(plan);
 }
 
 /// The retention is kept in memory: a process that observed a removal and then

@@ -45,9 +45,7 @@
 //! committed retired set and starts an in-memory timer for each file it sees
 //! for the first time (a crash or takeover loses the timers, and the next
 //! holder restarts them, which only delays a delete). It deletes a retired
-//! file by name, never by listing, once T has passed on its timer and no
-//! local scan pins a commit older than the record that removed the file (the
-//! sweep keeps every file removed after the oldest pinned commit). It declines
+//! file by name, never by listing, once T has passed on its timer. It declines
 //! while the holder has a commit whose outcome it does not know, while a
 //! prepared transaction reserves the table, and while a restore point holds
 //! deletions. Only after every delete has returned does it commit one record,
@@ -55,10 +53,10 @@
 //! land late (after a crash or a takeover of the sweeping process) or fail; a
 //! sweep with a failed delete or a crash before its forget leaves the files
 //! retired, and a later pass deletes again (a delete of a missing key is a
-//! no-op) and forgets them. A local scan reads the head and pins the commit it
-//! captured in one step, then fetches its files; a restore point reads the head
+//! no-op) and forgets them. A local scan captures the head in one step
+//! (S = 0), then fetches its files with protection only for T; a restore point reads the head
 //! and copies the live files while it holds deletions. A remote reader on
-//! another instance writes nothing and pins nothing: it confirms the head with a
+//! another instance writes nothing: it confirms the head with a
 //! GET, starts a query within S of the confirmation, and fetches the files; the
 //! retention guarantees it its files for T − S after it starts. In the
 //! `prepared` runs a commit can instead record a prepared transaction, a
@@ -68,8 +66,8 @@
 //! retired file as named until its forget. `lean` runs have no scans, restore
 //! points or remote readers, so a larger upload bound stays exhaustive.
 //!
-//! The clock advances only while a holder timer is running or the remote reader
-//! is in a query: every time comparison is between two ticks of one of those, so
+//! The clock advances only while a holder timer or a local or remote query
+//! is running: every time comparison is between two ticks of one of those, so
 //! a tick with neither only shifts every later time and reaches no new outcome.
 //!
 //! Controls: `no-upload-before-commit` lets a commit name a file whose upload
@@ -83,8 +81,7 @@
 //! would. In the `retire` runs: `whole-snapshot` retires every file live at a
 //! removing record's base, as a snapshot-level rule would, and its sweep keeps
 //! the files the live set names; `retires-carried` also retires the file a
-//! compaction carries; `ignores-pins` deletes a file a local scan's commit
-//! needs; `ignores-retention` deletes as soon as the sweep observes the
+//! compaction carries; `local-ignores-retention` skips T for a local scan; `ignores-retention` deletes as soon as the sweep observes the
 //! removal; `forget-early` forgets the files before their deletes return;
 //! `ignores-restore-hold` sweeps while a restore point copies;
 //! `sweep-uncommitted` plans from the holder's local view, with its removal
@@ -116,9 +113,8 @@ const DELETE_FAILURES: u8 = 1;
 /// The retention T and the remote reader's staleness bound S, in clock ticks.
 const RETENTION: u8 = 2;
 const STALENESS: u8 = 1;
-/// Clock ticks, and at three uploads in the `remote` runs, where those runs
-/// also have no crash (a takeover still restarts the sweep's timers), so the
-/// graph stays within the checker's time limit.
+/// Clock ticks, reduced at three uploads. The three-upload `remote` runs
+/// also omit crashes; a takeover still restarts the sweep's timers.
 const TICKS: u8 = 3;
 const TICKS_3: u8 = 2;
 
@@ -127,7 +123,7 @@ const TICKS_3: u8 = 2;
 enum ModeFlag {
     AdoptByListing,
     ForgetEarly,
-    IgnoresPins,
+    LocalIgnoresRetention,
     IgnoresReservation,
     IgnoresRestoreHold,
     IgnoresRetention,
@@ -315,8 +311,8 @@ pub(crate) struct State {
     prepared: Option<Prepared>,
     sweep: Option<Sweep>,
     deletes: Vec<Delete>,
-    /// The commit the local scan pinned.
-    pin: Option<u8>,
+    /// The local scan start tick (S = 0); it never holds back deletion.
+    local_started: Option<u8>,
     /// A restore point in progress: head version, the keys it copies, the next.
     restore: Option<(u8, Vec<Key>, usize)>,
     /// Every copy: key and whether the store returned it.
@@ -342,6 +338,8 @@ pub(crate) struct State {
     deleted_live: bool,
     /// A remote query, within T − S of its start, found a file missing (a ghost).
     remote_missed: bool,
+    local_missed: bool,
+    local_expired_missing: bool,
     remote_read_removed: bool,
     remote_late_missed: bool,
     fetched_retired: bool,
@@ -381,7 +379,7 @@ pub(crate) enum Action {
     DeleteLand(usize),
     DeleteFail(usize),
     Forget,
-    Unpin,
+    EndScan,
     RestoreStart,
     RestoreCopy,
     RestoreEnd,
@@ -419,7 +417,7 @@ impl Protocol {
             flags: [
                 (ModeFlag::AdoptByListing, "adopt-by-listing"),
                 (ModeFlag::ForgetEarly, "forget-early"),
-                (ModeFlag::IgnoresPins, "ignores-pins"),
+                (ModeFlag::LocalIgnoresRetention, "local-ignores-retention"),
                 (ModeFlag::IgnoresReservation, "ignores-reservation"),
                 (ModeFlag::IgnoresRestoreHold, "ignores-restore-hold"),
                 (ModeFlag::IgnoresRetention, "ignores-retention"),
@@ -459,15 +457,12 @@ impl Protocol {
     fn takes(&self) -> u8 {
         if self.retiring() { RETIRE_TAKES } else { TAKES }
     }
-    /// Whether this graph has the remote reader and the clock: the `remote`
-    /// runs. The other `retire` runs have local scans and restore points and
-    /// no clock: there T protects no reader, so they take T as zero and the
-    /// sweep deletes a retired file once it observes it.
+    /// Whether this retirement graph has a reader on another instance.
     fn remote(&self) -> bool {
         self.retiring() && self.has(ModeFlag::Remote)
     }
     fn retention(&self) -> u8 {
-        if self.remote() { RETENTION } else { 0 }
+        if self.retiring() { RETENTION } else { 0 }
     }
     fn ticks(&self) -> u8 {
         if self.uploads >= 3 { TICKS_3 } else { TICKS }
@@ -579,17 +574,14 @@ impl Protocol {
         }
         let mut observe = Vec::new();
         let mut delete = Vec::new();
-        for (file, by) in self.local_view(s, holder) {
+        for (file, _) in self.local_view(s, holder) {
             let waited = self.waited(s, holder, file);
             if self.retention() > 0 && entry(&holder.timers, file).is_none() {
                 observe.push(file);
             }
-            // A scan pinned at commit `p` reads files live at `p`; a file the
-            // record at version `by` removed was live at `p` when `by > p`.
-            let pinned = !self.has(ModeFlag::IgnoresPins) && s.pin.is_some_and(|p| by.version > p);
             // A snapshot-level rule keeps the files the live set names.
             let live = self.has(ModeFlag::WholeSnapshot) && s.head.contains(&file);
-            if waited && !pinned && !live {
+            if waited && !live {
                 delete.push(file);
             }
         }
@@ -600,10 +592,11 @@ impl Protocol {
         })
     }
     /// Whether `holder`'s sweep may delete the retired `file` now: T has
-    /// passed on its timer (with no clock, T is zero).
+    /// passed on its timer.
     fn waited(&self, s: &State, holder: &Writer, file: File) -> bool {
         self.retention() == 0
             || self.has(ModeFlag::IgnoresRetention)
+            || self.has(ModeFlag::LocalIgnoresRetention)
             || entry(&holder.timers, file).is_some_and(|since| s.now >= since + self.retention())
     }
     /// Deletes in flight the running sweep still waits for.
@@ -637,6 +630,7 @@ impl Protocol {
                 .iter()
                 .any(|(_, since)| s.now < since + self.retention())
         }) || s.remote.is_some()
+            || s.local_started.is_some()
     }
     /// Record a delete of `file` landing in the store (for the I15 checks).
     fn deleting(&self, s: &State, next: &mut State, file: File) {
@@ -714,7 +708,7 @@ impl Protocol {
             Action::Crash(w) => s.crashes < self.crashes() && *writer(w) != Writer::default(),
             Action::Read => {
                 s.reads < self.reads()
-                    && (!self.retiring() || s.pin.is_none() && !s.head.is_empty())
+                    && (!self.retiring() || s.local_started.is_none() && !s.head.is_empty())
             }
             Action::Fetch => s
                 .snapshot
@@ -744,7 +738,7 @@ impl Protocol {
             Action::Forget => s.sweep.as_ref().is_some_and(|sweep| {
                 self.has(ModeFlag::ForgetEarly) || !sweep.failed && Self::outstanding(s) == 0
             }),
-            Action::Unpin => s.pin.is_some(),
+            Action::EndScan => s.local_started.is_some(),
             Action::RestoreStart => {
                 self.retiring()
                     && s.restores < self.restores()
@@ -757,7 +751,7 @@ impl Protocol {
                 .as_ref()
                 .is_some_and(|(_, listed, next)| *next < listed.len()),
             Action::RestoreEnd => s.restore.is_some(),
-            Action::Tick => self.remote() && s.now < self.ticks() && self.timed(s),
+            Action::Tick => self.retiring() && s.now < self.ticks() && self.timed(s),
             Action::RemoteConfirm => {
                 s.remote_reads < self.remote_reads() && s.remote.is_none() && !s.head.is_empty()
             }
@@ -780,7 +774,7 @@ impl Protocol {
             return false;
         };
         if holder.pending.is_some()
-            || s.pin.is_some()
+            || s.local_started.is_some()
             || s.restore.is_some()
             || s.remote.is_some()
             || s.prepared.is_some()
@@ -949,7 +943,7 @@ impl Model for Protocol {
             prepared: None,
             sweep: None,
             deletes: vec![],
-            pin: None,
+            local_started: None,
             restore: None,
             copied: vec![],
             remote: None,
@@ -963,6 +957,8 @@ impl Model for Protocol {
             early_delete: false,
             deleted_live: false,
             remote_missed: false,
+            local_missed: false,
+            local_expired_missing: false,
             remote_read_removed: false,
             remote_late_missed: false,
             fetched_retired: false,
@@ -1009,7 +1005,7 @@ impl Model for Protocol {
             a.extend([
                 Action::Plan,
                 Action::Forget,
-                Action::Unpin,
+                Action::EndScan,
                 Action::RestoreStart,
                 Action::RestoreCopy,
                 Action::RestoreEnd,
@@ -1178,20 +1174,28 @@ impl Model for Protocol {
                 next.snapshot = Some((s.version, listed));
                 next.fetched = 0;
                 if self.retiring() {
-                    // The scan pins the commit it captured, in the same step.
-                    next.pin = Some(s.version);
+                    // Local head capture has no staleness: S = 0.
+                    next.local_started = Some(s.now);
                 }
             }
             Action::Fetch => {
                 let (version, listed) = s.snapshot.as_ref()?;
                 let key = *listed.get(s.fetched)?;
                 let bytes = s.store.iter().find(|(k, _)| *k == key).map(|(_, b)| *b);
+                next.local_missed |= s
+                    .local_started
+                    .is_some_and(|start| s.now < start + self.retention())
+                    && bytes.is_none();
+                next.local_expired_missing |= s
+                    .local_started
+                    .is_some_and(|start| s.now >= start + self.retention())
+                    && bytes.is_none();
                 next.observed.push((*version, key, bytes));
                 next.fetched += 1;
                 next.fetched_retired |= bytes.is_some() && !s.head.iter().any(|(k, _)| *k == key);
             }
-            Action::Unpin => {
-                next.pin = None;
+            Action::EndScan => {
+                next.local_started = None;
                 next.snapshot = None;
                 next.fetched = 0;
             }
@@ -1354,15 +1358,19 @@ impl Model for Protocol {
                         .as_ref()
                         .is_none_or(|tx| tx.files.iter().all(|f| s.store.contains(f)))
             }),
-            Property::always("reader sees only committed files", |_, s: &State| {
-                s.observed.iter().all(|&(version, key, bytes)| {
-                    bytes.is_some_and(|b| {
-                        s.history
-                            .get(usize::from(version))
-                            .is_some_and(|set| set.contains(&(key, b)))
+            Property::always(
+                "reader sees only committed files",
+                |model: &Self, s: &State| {
+                    s.observed.iter().all(|&(version, key, bytes)| {
+                        model.retiring() && bytes.is_none()
+                            || bytes.is_some_and(|b| {
+                                s.history
+                                    .get(usize::from(version))
+                                    .is_some_and(|set| set.contains(&(key, b)))
+                            })
                     })
-                })
-            }),
+                },
+            ),
             Property::always(
                 "aborted or abandoned upload never visible to a reader",
                 |_, s: &State| {
@@ -1444,10 +1452,9 @@ impl Model for Protocol {
                 "carried or shared file never deleted while live",
                 |_, s: &State| !s.deleted_live,
             ),
-            Property::always(
-                "pinned scan finds every file of its commit",
-                |_, s: &State| s.observed.iter().all(|(_, _, bytes)| bytes.is_some()),
-            ),
+            Property::always("local scan within T finds every file", |_, s: &State| {
+                !s.local_missed
+            }),
             Property::always(
                 "remote reader within T - S finds every file",
                 |_, s: &State| !s.remote_missed,
@@ -1484,25 +1491,18 @@ impl Model for Protocol {
                 "file shared across a removal later deleted and forgotten",
                 |_, s: &State| s.forgot_shared,
             ),
-            // The holder could delete a file once T has passed but for a
-            // scan's pin on an older commit.
             Property::sometimes(
-                "sweep waits for a file a scan's commit needs",
+                "sweep waits for T while a local scan runs",
                 |model: &Self, s: &State| {
-                    let Some(pin) = s.pin else {
-                        return false;
-                    };
-                    s.sweep.is_none()
-                        && s.restore.is_none()
-                        && s.prepared.is_none()
+                    s.local_started.is_some()
                         && Self::holder(s).is_some_and(|holder| {
-                            holder.pending.is_none()
-                                && s.retired
-                                    .iter()
-                                    .any(|(f, by)| by.version > pin && model.waited(s, holder, *f))
+                            s.retired.iter().any(|(f, _)| !model.waited(s, holder, *f))
                         })
                 },
             ),
+            Property::sometimes("local scan past T finds a file deleted", |_, s: &State| {
+                s.local_expired_missing
+            }),
             Property::sometimes(
                 "scan reads a file of its commit after the file was removed",
                 |_, s: &State| s.fetched_retired,
@@ -1554,8 +1554,9 @@ impl Model for Protocol {
         let remote = self.remote_reads() > 0;
         properties.retain(|p| match p.name {
             "reader fetches a committed file"
-            | "pinned scan finds every file of its commit"
-            | "sweep waits for a file a scan's commit needs"
+            | "local scan within T finds every file"
+            | "sweep waits for T while a local scan runs"
+            | "local scan past T finds a file deleted"
             | "scan reads a file of its commit after the file was removed" => local,
             "restore point copies every file"
             | "restore point copies a file removed after it started" => restore,
@@ -1624,17 +1625,17 @@ pub enum Op {
     /// `Crash(w)`: the writer process restarts and forgets its state.
     Crash { writer: usize },
     /// `Read`: the reader reads the head (`version`, `files`), and in the
-    /// `retire` runs pins commit `version` in the same step (`pinned`).
+    /// `retire` runs starts a local scan with S = 0 (`local`).
     ReadHead {
         version: u8,
         files: Vec<Key>,
-        pinned: bool,
+        local: bool,
     },
     /// `Fetch`: the reader GETs the next file of its snapshot; `found` when the
     /// store returned it.
     Fetch { key: Key, found: bool },
-    /// `Unpin`: the scan ends and releases its pin.
-    Unpinned,
+    /// `EndScan`: the local scan ends.
+    ScanEnded,
     /// `Sweep(i)`: the orphan sweep deletes an unnamed file.
     Swept { key: Key },
     /// `CommitTx(w)` / `AbortTx(w)`: the lease holder commits the resolve
@@ -1738,7 +1739,7 @@ fn parse(text: &str) -> Option<Action> {
         ("Crash", &[w]) => Action::Crash(w),
         ("Read", &[]) => Action::Read,
         ("Fetch", &[]) => Action::Fetch,
-        ("Unpin", &[]) => Action::Unpin,
+        ("EndScan", &[]) => Action::EndScan,
         ("Sweep", &[i]) => Action::Sweep(i),
         ("Plan", &[]) => Action::Plan,
         ("DeleteLand", &[i]) => Action::DeleteLand(i),
@@ -1845,7 +1846,7 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                 Op::ReadHead {
                     version,
                     files,
-                    pinned: next.pin.is_some(),
+                    local: next.local_started.is_some(),
                 }
             }
             Action::Fetch => {
@@ -1855,7 +1856,7 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                     found: bytes.is_some(),
                 }
             }
-            Action::Unpin => Op::Unpinned,
+            Action::EndScan => Op::ScanEnded,
             Action::Sweep(i) => Op::Swept {
                 key: state.store[i].0,
             },

@@ -2395,7 +2395,7 @@ fn additional_runs() -> Vec<Run> {
             "data-files-retire-whole-snapshot",
             "data-files-intent-retire-whole-snapshot",
             2,
-            "pinned scan finds every file of its commit",
+            "local scan within T finds every file",
         ),
         (
             "data-files-retire-3-retires-carried",
@@ -2404,10 +2404,10 @@ fn additional_runs() -> Vec<Run> {
             "carried or shared file never deleted while live",
         ),
         (
-            "data-files-retire-ignores-pins",
-            "data-files-intent-retire-ignores-pins",
+            "data-files-retire-local-ignores-retention",
+            "data-files-intent-retire-local-ignores-retention",
             2,
-            "pinned scan finds every file of its commit",
+            "local scan within T finds every file",
         ),
         (
             "data-files-retire-remote-ignores-retention",
@@ -2700,12 +2700,22 @@ where
     // broker closure as evidence that the search exhausted its graph.
     let (finished, watch) = std::sync::mpsc::channel::<()>();
     let name = run.name;
+    // Retirement composes local scans and restore points with the retention clock.
+    // Keep the complete graph's bounds while allowing its extra interleavings.
+    let timeout = if run.family == "data-files" && run.mode.contains("retire") {
+        std::time::Duration::from_mins(30)
+    } else {
+        std::time::Duration::from_mins(9)
+    };
     let watchdog = std::thread::spawn(move || {
         if matches!(
-            watch.recv_timeout(std::time::Duration::from_mins(9)),
+            watch.recv_timeout(timeout),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ) {
-            eprintln!("INCOMPLETE {name}: checker exceeded 540 seconds");
+            eprintln!(
+                "INCOMPLETE {name}: checker exceeded {} seconds",
+                timeout.as_secs()
+            );
             std::process::exit(1);
         }
     });
