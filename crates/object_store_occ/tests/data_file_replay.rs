@@ -1718,7 +1718,7 @@ async fn retirement_traces_replay_on_real_storage() {
 
 /// Witnesses in `data-files-retire.jsonl` and walks in
 /// `data-files-retire-walk.jsonl` (see `traces/README.md`).
-const RETIRE_WITNESSES: usize = 67;
+const RETIRE_WITNESSES: usize = 66;
 const RETIRE_WALKS: usize = 80;
 /// Real paths the retirement traces must reach.
 const RETIRE_COVERAGE: &[&str] = &[
