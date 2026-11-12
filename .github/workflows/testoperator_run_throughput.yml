@@ -104,7 +104,7 @@ jobs:
       # exist`. Excludes ducklake[postgres+s3], which provisions its own local
       # postgres catalog DB on the same port.
       postgres_tpch:
-        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && 'postgres:16' || '' }}
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')))) && 'postgres:16' || '' }}
         ports:
           - 5432:5432
         env:
@@ -293,34 +293,6 @@ jobs:
           fi
           echo "Seed complete: $DB_NAME on $PGHOST."
 
-      # Postgres-accelerator spicepods need a *_accelerated database that the
-      # empty postgres:16 container doesn't have yet - create it before spiced
-      # starts (idempotent), matching the PGHOST the spicepod will connect to.
-      - name: Create postgres acceleration databases
-        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        env:
-          PGHOST: ${{ (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres'))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
-          PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
-        run: |
-          set -e
-          SPICEPOD="${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
-          ACCEL_DBS="$(grep -oE 'pg_db: *[A-Za-z0-9_]+_accelerated' "$SPICEPOD" | awk '{print $2}' | sort -u)"
-          if [ -z "$ACCEL_DBS" ]; then
-            echo "No *_accelerated pg_db in $SPICEPOD - nothing to create."
-            exit 0
-          fi
-          if ! command -v psql >/dev/null; then
-            sudo apt-get update -y && sudo apt-get install -y postgresql-client
-          fi
-          for db in $ACCEL_DBS; do
-            if psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1; then
-              echo "$db already exists on $PGHOST."
-            else
-              createdb -U postgres "$db"
-              echo "Created $db on $PGHOST."
-            fi
-          done
-
       - name: Install ADBC BigQuery Driver
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
@@ -419,7 +391,7 @@ jobs:
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
