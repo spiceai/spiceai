@@ -13,7 +13,7 @@ description: >-
     - built from this repository, not a fork;
     - built from trunk, a release branch (release/X.Y, release/X.Y.Z, optionally -rc.N), a merge
       queue branch for one of those (merge_group only), or a release tag (vX.Y.Z, optionally
-      -rc.N and -enterprise) that exists in this repository.
+      -rc.N and -enterprise) of this repository that points at the commit the run built.
 
 inputs:
   run-id:
@@ -45,8 +45,8 @@ runs:
         [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
         # `gh run view --json` has no head repository field, so read the run from the API.
         info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
-          -q '.name, .event, (.head_repository.full_name // ""), (.head_branch // "")')
-        { read -r workflow; read -r event; read -r head_repo; read -r head_branch; } <<<"$info"
+          -q '.name, .event, (.head_repository.full_name // ""), (.head_branch // ""), .head_sha')
+        { read -r workflow; read -r event; read -r head_repo; read -r head_branch; read -r head_sha; } <<<"$info"
         refuse() {
           echo "::error::Run $RUN_ID ($workflow, $event event, $head_repo @ $head_branch) $1"
           exit 1
@@ -70,13 +70,16 @@ runs:
         release_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.?[0-9]+)?(-enterprise)?$'
         if [ "$head_branch" = trunk ] || [[ "$head_branch" =~ ^${release_branch}$ ]]; then
           :
-        elif [[ "$head_branch" =~ ^gh-readonly-queue/(trunk|${release_branch})/pr-[0-9]+-[0-9a-f]{40}$ ]]; then
+        elif [[ "$head_branch" =~ ^gh-readonly-queue/(trunk|${release_branch})/pr-[0-9]+-[0-9a-f]+$ ]]; then
           [ "$event" = merge_group ] || refuse "is on a merge queue branch but was not a merge_group run"
         elif [[ "$head_branch" =~ $release_tag ]]; then
-          # A tag build reports the tag name as head_branch; a branch can carry the same name, so
-          # the tag has to exist here too.
-          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$head_branch" -q .ref >/dev/null 2>&1 \
+          # A tag build reports the tag name as head_branch, but a branch can carry the same name,
+          # so the tag must exist here and point at the commit the run built. The commits endpoint
+          # peels an annotated tag to its commit.
+          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$head_branch" -q .sha 2>/dev/null) \
             || refuse "names $head_branch, which is not a tag of $GITHUB_REPOSITORY"
+          [ "$tag_sha" = "$head_sha" ] \
+            || refuse "built $head_sha, but tag $head_branch points at $tag_sha"
         else
           refuse "was built from $head_branch, not trunk, a release branch or a release tag"
         fi
