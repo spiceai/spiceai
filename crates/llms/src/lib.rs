@@ -21,6 +21,8 @@ pub mod bedrock;
 pub mod chat;
 pub mod config;
 pub mod databricks;
+#[cfg(feature = "local_llm")]
+pub mod decider;
 pub mod embeddings;
 pub mod evaluate;
 pub mod google;
@@ -39,7 +41,8 @@ pub mod typesafe;
 pub mod workload_identity;
 pub mod xai;
 
-// Engine crates register through `register_local_chat_engine!`, which names `linkme` through
+// Engine crates register through `register_local_chat_engine!` and
+// `register_local_decider_engine!`, which name `linkme` through
 // this crate so they need no `linkme` dependency of their own.
 #[cfg(feature = "local_llm")]
 #[doc(hidden)]

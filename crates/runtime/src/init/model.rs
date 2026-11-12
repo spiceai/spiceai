@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::model::decider::{self, FoundModel};
 use crate::model::try_to_evaluate_model;
 use crate::{
     Runtime, model::ENABLE_MODEL_SUPPORT_MESSAGE,
@@ -161,17 +162,31 @@ impl Runtime {
             }
         }
 
-        let result = match ModelCapabilities::of(m) {
-            Some(capabilities) => self.load_model_handlers(m, &params, capabilities).await,
-            None => Err(Error::FailedToLoadLLM {
-                name: m.name.clone(),
-                source: Box::new(crate::Error::UnableToInitializeLlm {
-                    source: Box::new(llms::chat::Error::UnknownModelSource {
-                        from: m.from.clone(),
+        let result = async {
+            // A local model's files can show it to be something its `from` does not say, such
+            // as a Strands decider, which changes its capabilities and the engine that loads it.
+            let found = decider::find(m, &params, &self.secrets())
+                .await
+                .map_err(|source| Error::FailedToLoadLLM {
+                    name: m.name.clone(),
+                    source,
+                })?;
+            match ModelCapabilities::of_found(m, found.kind()) {
+                Some(capabilities) => {
+                    self.load_model_handlers(m, &params, capabilities, &found)
+                        .await
+                }
+                None => Err(Error::FailedToLoadLLM {
+                    name: m.name.clone(),
+                    source: Box::new(crate::Error::UnableToInitializeLlm {
+                        source: Box::new(llms::chat::Error::UnknownModelSource {
+                            from: m.from.clone(),
+                        }),
                     }),
                 }),
-            }),
-        };
+            }
+        }
+        .await;
         match result {
             Ok(()) => {
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
@@ -213,12 +228,13 @@ impl Runtime {
     }
 
     /// Builds a handler for each capability the model has and registers them, then the
-    /// capabilities themselves.
+    /// capabilities themselves. `found` is what the model's files showed it to be.
     async fn load_model_handlers(
         &self,
         m: &SpicepodModel,
         params: &HashMap<String, SecretString>,
         capabilities: ModelCapabilities,
+        found: &FoundModel,
     ) -> Result<(), Error> {
         let failed = |source: Box<dyn std::error::Error + Send + Sync>| Error::FailedToLoadLLM {
             name: m.name.clone(),
@@ -239,10 +255,22 @@ impl Runtime {
 
         let evaluator = match capabilities.decisions() {
             Some(DecisionsBackend::Native) => {
-                let evaluator =
-                    try_to_evaluate_model(m, params, &self.secrets(), Arc::clone(&rate_controller))
-                        .await
-                        .map_err(|e| failed(Box::new(e)))?;
+                let evaluator = match found {
+                    FoundModel::AsConfigured => try_to_evaluate_model(
+                        m,
+                        params,
+                        &self.secrets(),
+                        Arc::clone(&rate_controller),
+                    )
+                    .await
+                    .map_err(|e| failed(Box::new(e)))?,
+                    #[cfg(feature = "models")]
+                    FoundModel::StrandsDecider(files) => {
+                        decider::load(m, files, Arc::clone(&rate_controller))
+                            .await
+                            .map_err(|e| failed(Box::new(e)))?
+                    }
+                };
                 // A model with chat was already probed through it.
                 if chat.is_none() {
                     Evaluate::health(evaluator.as_ref())
@@ -504,6 +532,7 @@ fn is_permanent_model_failure(err: &Error) -> bool {
         Error::ReferencedPathDoesNotExist { .. } => true,
         Error::FailedToLoadLLM { source, .. } => {
             model_error(source.as_ref()).is_some_and(llms::chat::Error::is_configuration_error)
+                || decider::is_configuration_error(source.as_ref())
         }
     }
 }

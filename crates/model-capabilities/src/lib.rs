@@ -17,8 +17,10 @@ limitations under the License.
 //! What each model can serve, and the gate every serving path asks.
 //!
 //! A model's capabilities start from its provider's default, and a rule on its model id
-//! can only add to them. Loading builds one handler for each capability a model has, and
-//! every path that serves a model asks [`require`] for the handler it needs.
+//! can only add to them. What a local model's files show it to be ([`FoundKind`]) is the one
+//! thing that replaces the default: a Strands decider answers decisions and serves no chat,
+//! whatever its provider serves. Loading builds one handler for each capability a model has,
+//! and every path that serves a model asks [`require`] for the handler it needs.
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -66,6 +68,18 @@ pub struct ModelCapabilities {
     messages: Option<MessagesBackend>,
 }
 
+/// What Spice found a model to be by reading its files when it loads, which its `from` alone
+/// cannot say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FoundKind {
+    /// Nothing beyond what its provider and model id say.
+    #[default]
+    AsConfigured,
+    /// A Strands decider (a base model, a `LoRA` adapter and a pointer head): it answers
+    /// decisions natively and serves no chat, nor any API built on chat.
+    StrandsDecider,
+}
+
 /// What a model-id rule adds to its provider's default. It has no way to remove a
 /// capability, so no model id can take away what its provider serves.
 #[derive(Clone, Copy, Default)]
@@ -77,9 +91,32 @@ impl ModelCapabilities {
     /// The capabilities of a Spicepod model, or `None` when its provider is unknown.
     #[must_use]
     pub fn of(model: &Model) -> Option<Self> {
+        Self::of_found(model, FoundKind::AsConfigured)
+    }
+
+    /// The capabilities of a Spicepod model whose files showed it to be `found`, or `None`
+    /// when its provider is unknown.
+    #[must_use]
+    pub fn of_found(model: &Model, found: FoundKind) -> Option<Self> {
         let provider = model.get_source()?;
-        let additions = model_id_additions(&provider, model.get_model_id().as_deref());
-        Some(provider_default(provider).with(additions))
+        match found {
+            FoundKind::AsConfigured => {
+                let additions = model_id_additions(&provider, model.get_model_id().as_deref());
+                Some(provider_default(provider).with(additions))
+            }
+            FoundKind::StrandsDecider => Some(Self::decisions_only(provider)),
+        }
+    }
+
+    /// A model that answers decisions natively and serves nothing else.
+    fn decisions_only(provider: ModelSource) -> Self {
+        Self {
+            provider,
+            chat: false,
+            responses: false,
+            native_decisions: true,
+            messages: None,
+        }
     }
 
     /// The provider that serves the model.
@@ -154,13 +191,7 @@ fn provider_default(provider: ModelSource) -> ModelCapabilities {
             native_decisions: false,
             messages: Some(MessagesBackend::ViaChat),
         },
-        ModelSource::TypeSafe => ModelCapabilities {
-            provider,
-            chat: false,
-            responses: false,
-            native_decisions: true,
-            messages: None,
-        },
+        ModelSource::TypeSafe => ModelCapabilities::decisions_only(provider),
     }
 }
 
@@ -266,6 +297,35 @@ mod tests {
                 (messages, messages.is_some()),
                 "{from}"
             );
+        }
+    }
+
+    #[test]
+    fn a_strands_decider_answers_decisions_natively_and_serves_no_chat() {
+        for from in [
+            "file:./Qwen3.5-2B-Base-F16.gguf",
+            "hf:org/strands-decider-GGUF",
+        ] {
+            let model = Model::new(from, "triage");
+            let found = ModelCapabilities::of_found(&model, FoundKind::StrandsDecider)
+                .expect("a known provider");
+            assert_eq!(found.decisions(), Some(DecisionsBackend::Native), "{from}");
+            for capability in [
+                Capability::Chat,
+                Capability::Responses,
+                Capability::Messages,
+            ] {
+                assert!(!found.has(capability), "{from} has no {capability:?}");
+            }
+            // The same files found to be a chat model keep their provider's default.
+            let chat = ModelCapabilities::of_found(&model, FoundKind::AsConfigured)
+                .expect("a known provider");
+            assert_eq!(
+                chat,
+                ModelCapabilities::of(&model).expect("a known provider")
+            );
+            assert!(chat.has(Capability::Chat), "{from}");
+            assert_eq!(chat.decisions(), Some(DecisionsBackend::ViaChat), "{from}");
         }
     }
 

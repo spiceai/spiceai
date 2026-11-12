@@ -70,6 +70,8 @@ cudarc = { version = "0.19", optional = true, features = [
 either = "1.15.0"
 indexmap.workspace = true
 linkme.workspace = true
+# The Strands decider readout, without a backend: what a decider's files are, and its questions.
+strands-decider = { path = "../strands-decider", optional = true }
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 aws-identity = { path = "../aws-identity" }
@@ -133,7 +135,7 @@ local_embed = [
     "dep:tei_core",
     "dep:model2vec-rs",
 ]
-local_llm = ["dep:mistralrs", "dep:mistralrs-core"]
+local_llm = ["dep:mistralrs", "dep:mistralrs-core", "dep:strands-decider"]
 metal = [
     "tei_backend/metal",
     "tei_candle/metal",

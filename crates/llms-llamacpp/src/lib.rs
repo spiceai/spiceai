@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Serves a single-node GGUF model with llama.cpp.
+//! Serves a single-node GGUF model with llama.cpp, and a Strands decider (`decider`).
 //!
 //! The prompt is the one the mistral.rs engine would send: the same messages
 //! ([`message_to_mistral`], fitted to the template by [`ContentSupport`]) rendered by the
@@ -90,6 +90,7 @@ use llms::streaming_utils::generate_stream_id;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
 mod batching;
+mod decider;
 mod distributed;
 mod harmony;
 

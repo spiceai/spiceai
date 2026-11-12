@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The architecture a GGUF model names in its header (`general.architecture`), read from the
-//! start of its first shard without loading it: which engine serves a model split across
-//! nodes depends on it, and every node has to decide alike.
+//! String values a GGUF file names in its header, read from the start of the file without
+//! loading it: the architecture (`general.architecture`), on which the engine that serves a
+//! model split across nodes depends, so every node decides alike; and the file's type
+//! (`general.type`), which tells a base model from a `LoRA` adapter.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -26,7 +27,14 @@ use tokio::io::AsyncReadExt;
 /// The architecture a draft model names; it drafts for a model, so it never decides.
 const DRAFTER: &str = "dflash";
 
-/// The bytes read first; `general.architecture` is the first key a GGUF writer writes.
+/// The key that names a model's architecture.
+const ARCHITECTURE: &str = "general.architecture";
+
+/// The key that names what a GGUF file holds: `model` for a model, `adapter` for a `LoRA`
+/// adapter, as llama.cpp's converters write it.
+pub(crate) const GENERAL_TYPE: &str = "general.type";
+
+/// The bytes read first; the `general.` keys are the first a GGUF writer writes.
 const FIRST_READ: u64 = 64 * 1024;
 
 /// The most bytes read looking for the key, past a tokenizer's vocabulary written before it.
@@ -35,12 +43,12 @@ const MAX_READ: u64 = 64 * 1024 * 1024;
 /// Arrays nest no deeper than this in a header that is read.
 const MAX_DEPTH: usize = 4;
 
-/// What the start of a GGUF file says about its architecture.
+/// What the start of a GGUF file says about one key.
 #[derive(Debug, PartialEq, Eq)]
 enum Header {
-    /// The value of `general.architecture`.
-    Architecture(String),
-    /// The bytes are not a GGUF header, or it names no architecture.
+    /// The key's value.
+    Found(String),
+    /// The bytes are not a GGUF header, or it has no string value for the key.
     Unknown,
     /// The header goes on past the bytes read.
     Truncated,
@@ -115,12 +123,12 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// What `bytes`, the start of a GGUF file, say about its architecture.
-fn architecture(bytes: &[u8]) -> Header {
-    scan(&mut Reader { bytes, at: 0 }).unwrap_or(Header::Truncated)
+/// What `bytes`, the start of a GGUF file, say about `key`.
+fn string_value(bytes: &[u8], key: &str) -> Header {
+    scan(&mut Reader { bytes, at: 0 }, key.as_bytes()).unwrap_or(Header::Truncated)
 }
 
-fn scan(reader: &mut Reader<'_>) -> Result<Header, Short> {
+fn scan(reader: &mut Reader<'_>, wanted: &[u8]) -> Result<Header, Short> {
     if reader.take(4)? != b"GGUF" {
         return Ok(Header::Unknown);
     }
@@ -133,14 +141,13 @@ fn scan(reader: &mut Reader<'_>) -> Result<Header, Short> {
     for _ in 0..keys {
         let key = reader.string()?;
         let kind = reader.u32()?;
-        if key == b"general.architecture" {
+        if key == wanted {
             if kind != 8 {
                 return Ok(Header::Unknown);
             }
             let value = reader.string()?;
-            return Ok(std::str::from_utf8(value).map_or(Header::Unknown, |arch| {
-                Header::Architecture(arch.to_string())
-            }));
+            return Ok(std::str::from_utf8(value)
+                .map_or(Header::Unknown, |value| Header::Found(value.to_string())));
         }
         if reader.skip(kind, 0)?.is_none() {
             return Ok(Header::Unknown);
@@ -149,9 +156,9 @@ fn scan(reader: &mut Reader<'_>) -> Result<Header, Short> {
     Ok(Header::Unknown)
 }
 
-/// The architecture in the header of a GGUF whose first `len` bytes `read` returns, reading
-/// more until the key is found or [`MAX_READ`] bytes were read.
-async fn read_architecture<F, Fut, E>(read: F) -> Result<Option<String>, E>
+/// The string value of `key` in the header of a GGUF whose first `len` bytes `read` returns,
+/// reading more until the key is found or [`MAX_READ`] bytes were read.
+pub(crate) async fn read_string<F, Fut, E>(key: &str, read: F) -> Result<Option<String>, E>
 where
     F: Fn(u64) -> Fut,
     Fut: Future<Output = Result<Vec<u8>, E>>,
@@ -159,8 +166,8 @@ where
     let mut len = FIRST_READ;
     loop {
         let bytes = read(len).await?;
-        match architecture(&bytes) {
-            Header::Architecture(arch) => return Ok(Some(arch)),
+        match string_value(&bytes, key) {
+            Header::Found(value) => return Ok(Some(value)),
             Header::Unknown => return Ok(None),
             // a file shorter than asked for has nothing more to give
             Header::Truncated
@@ -209,7 +216,7 @@ where
     Fut: Future<Output = Result<Vec<u8>, E>>,
 {
     for file in candidates(weights) {
-        match read_architecture(|len| read(file, len)).await? {
+        match read_string(ARCHITECTURE, |len| read(file, len)).await? {
             Some(arch) if arch != DRAFTER => return Ok(Some(arch)),
             _ => {}
         }
@@ -220,31 +227,61 @@ where
 /// The architecture a model of local GGUF `weights` names in its first shard's header. `None`
 /// when no file can be read or names one, as on a node that does not hold the weights.
 pub(crate) async fn local_architecture(weights: &[PathBuf]) -> Option<String> {
-    model_architecture(weights, |file: &PathBuf, len| {
-        let file = file.clone();
-        async move {
-            let mut bytes = Vec::new();
-            tokio::fs::File::open(&file)
-                .await?
-                .take(len)
-                .read_to_end(&mut bytes)
-                .await?;
-            Ok::<_, std::io::Error>(bytes)
-        }
-    })
-    .await
-    .ok()
-    .flatten()
+    model_architecture(weights, |file: &PathBuf, len| read_local(file.clone(), len))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The string value of `key` in the header of the local GGUF `file`.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read.
+pub(crate) async fn local_string(file: &Path, key: &str) -> std::io::Result<Option<String>> {
+    read_string(key, |len| read_local(file.to_path_buf(), len)).await
+}
+
+/// The first `len` bytes of `file`, or all of a shorter file.
+async fn read_local(file: PathBuf, len: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(&file)
+        .await?
+        .take(len)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Header, architecture, local_architecture};
+pub(crate) mod tests {
+    use super::{
+        ARCHITECTURE, GENERAL_TYPE, Header, local_architecture, local_string, string_value,
+    };
+
+    fn architecture(bytes: &[u8]) -> Header {
+        string_value(bytes, ARCHITECTURE)
+    }
 
     fn string(bytes: &mut Vec<u8>, text: &str) {
         let len = u64::try_from(text.len()).expect("a short string");
         bytes.extend_from_slice(&len.to_le_bytes());
         bytes.extend_from_slice(text.as_bytes());
+    }
+
+    /// A GGUF header of string keys and values, in order.
+    pub(crate) fn string_header(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let count = u64::try_from(pairs.len()).expect("a few keys");
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for (key, value) in pairs {
+            string(&mut bytes, key);
+            bytes.extend_from_slice(&8u32.to_le_bytes());
+            string(&mut bytes, value);
+        }
+        bytes
     }
 
     /// A GGUF header with a string array, a `u32` and a string before `general.architecture`,
@@ -274,10 +311,48 @@ mod tests {
     }
 
     #[test]
+    fn the_type_tells_a_model_from_an_adapter() {
+        for kind in ["model", "adapter"] {
+            let bytes =
+                string_header(&[("general.architecture", "qwen35"), ("general.type", kind)]);
+            assert_eq!(
+                string_value(&bytes, GENERAL_TYPE),
+                Header::Found(kind.to_string())
+            );
+        }
+        // A file written before `general.type` existed has none.
+        assert_eq!(
+            string_value(&header("qwen3"), GENERAL_TYPE),
+            Header::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn the_type_is_read_from_a_local_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("adapter.gguf");
+        std::fs::write(
+            &path,
+            string_header(&[
+                ("general.architecture", "qwen35"),
+                ("general.type", "adapter"),
+            ]),
+        )
+        .expect("the header is written");
+        assert_eq!(
+            local_string(&path, GENERAL_TYPE).await.expect("readable"),
+            Some("adapter".to_string())
+        );
+        local_string(&dir.path().join("absent.gguf"), GENERAL_TYPE)
+            .await
+            .expect_err("a missing file cannot be read");
+    }
+
+    #[test]
     fn the_architecture_is_read_past_the_keys_before_it() {
         assert_eq!(
             architecture(&header("glm-dsa")),
-            Header::Architecture("glm-dsa".to_string())
+            Header::Found("glm-dsa".to_string())
         );
     }
 
