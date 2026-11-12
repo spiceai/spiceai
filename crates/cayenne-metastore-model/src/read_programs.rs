@@ -56,6 +56,82 @@ enum Program {
     },
     Append(Vec<(Key, Image)>),
 }
+impl Predicate {
+    fn text(&self) -> String {
+        if self.equals == 4 {
+            format!("t{}", self.table)
+        } else {
+            format!("t{} WHERE c{} = {}", self.table, self.column, self.equals)
+        }
+    }
+}
+/// A program as SQL-like text for the Explorer.
+fn program_text(p: &Program) -> String {
+    match p {
+        Program::Transaction(statements) => format!(
+            "BEGIN; {}; COMMIT",
+            statements
+                .iter()
+                .map(program_text)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        Program::Update {
+            predicate,
+            column,
+            limit,
+        } => format!("UPDATE {} SET c{column} LIMIT {limit}", predicate.text()),
+        Program::Delete(predicate) => format!("DELETE FROM {}", predicate.text()),
+        Program::InsertSelect {
+            predicate,
+            target,
+            key_offset,
+        } => format!(
+            "INSERT INTO t{target} SELECT FROM {} (key + {key_offset})",
+            predicate.text()
+        ),
+        Program::Aggregate { table, target, cap } => format!(
+            "SET t{}.k{} = COUNT(t{table}) (cap {cap})",
+            target.0, target.1
+        ),
+        Program::Absent { lookup, target } => format!(
+            "IF NOT EXISTS t{}.k{} INSERT t{}.k{}",
+            lookup.0, lookup.1, target.0, target.1
+        ),
+        Program::Blind(writes) => format!(
+            "blind write {}",
+            writes
+                .iter()
+                .map(|((t, k), v)| format!(
+                    "t{t}.k{k}={}",
+                    v.map_or("delete".into(), |v| format!("{v:?}"))
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Program::Insert { target, value } => {
+            format!("INSERT t{}.k{} = {value:?}", target.0, target.1)
+        }
+        Program::Append(rows) => format!(
+            "append {}",
+            rows.iter()
+                .map(|((t, k), v)| format!("t{t}.k{k}={v:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+fn rows_text(rows: &Rows) -> String {
+    let mut out = vec![];
+    for (t, table) in rows.iter().enumerate() {
+        for (k, row) in table.iter().enumerate() {
+            if let Some(image) = row {
+                out.push(format!("t{t}.k{k}={image:?}"));
+            }
+        }
+    }
+    out.join(" ")
+}
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Mutation {
     key: Key,
@@ -995,6 +1071,94 @@ impl Model for Protocol {
         }
         Some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Start(w) => format!("writer {w} takes a snapshot and plans its program"),
+            Action::TransactionStatement(w) => {
+                format!("writer {w} runs its next transaction statement")
+            }
+            Action::Choose(w, c) => format!("writer {w} chooses program {c}"),
+            Action::Next(w) => format!("writer {w} moves to its next statement"),
+            Action::Cas(w) => format!("writer {w} publishes (CAS on its base)"),
+            Action::Retry(w) => {
+                format!("writer {w} validates against the winners and retries or re-plans")
+            }
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let mut lines = vec![format!(
+            "rows now: {}",
+            s.versions.last().map(rows_text).unwrap_or_default()
+        )];
+        for (i, w) in s.writers.iter().enumerate() {
+            lines.push(format!(
+                "writer {i}: {} | phase {}, snapshot {}, base {}, attempts {}",
+                program_text(&w.program),
+                w.phase,
+                w.snapshot,
+                w.base,
+                w.attempts
+            ));
+        }
+        lines.push(format!("commits: {}", s.log.len()));
+        lines.push(crate::explorer::flags(&[
+            ("re-planned", s.replanned),
+            ("retried", s.retried),
+            ("transactions interleaved", s.transaction_interleaved),
+        ]));
+        Some(crate::explorer::summary(&lines))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let last = path.last_state().clone();
+        let n = last.writers.len();
+        let mut boxes: Vec<(String, Vec<String>, crate::explorer::Tone)> = vec![(
+            format!("HEAD (commit {})", last.log.len()),
+            vec![last.versions.last().map(rows_text).unwrap_or_default()],
+            Tone::Live,
+        )];
+        for (i, w) in last.writers.iter().enumerate() {
+            boxes.push((
+                format!("WRITER {i}"),
+                vec![
+                    program_text(&w.program),
+                    format!(
+                        "snapshot {}, base {}, attempts {}",
+                        w.snapshot, w.base, w.attempts
+                    ),
+                ],
+                Tone::Actor,
+            ));
+        }
+        let mut lanes: Vec<String> = (0..n).map(|i| format!("writer {i}")).collect();
+        lanes.push("head".into());
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            events.push(match action {
+                Action::Cas(w) => {
+                    let ok = after.log.len() > before.log.len();
+                    Event::on(
+                        w,
+                        if ok {
+                            "publish lands".to_string()
+                        } else {
+                            "publish refused: head moved".into()
+                        },
+                    )
+                    .to(n)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::Start(w)
+                | Action::TransactionStatement(w)
+                | Action::Choose(w, _)
+                | Action::Next(w) => Event::on(w, label).tone(Tone::Staged),
+                Action::Retry(w) => Event::on(w, label).tone(Tone::Actor),
+            });
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("commit-order program serializability", |_, s: &State| {
@@ -1243,6 +1407,15 @@ impl Model for PredicateProgress {
             }
         }
         Some(n)
+    }
+    fn format_action(&self, action: &ProgressAction) -> String {
+        match action {
+            ProgressAction::Ingest => "ingest changes the row the predicate reads".into(),
+            ProgressAction::Validate => {
+                "the writer validates its predicate against the new head".into()
+            }
+            ProgressAction::Publish => "the writer publishes".into(),
+        }
     }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![

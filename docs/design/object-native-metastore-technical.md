@@ -6,7 +6,9 @@ milestones, decisions 1.1–1.14, 2.1–2.2 and 3.1–3.5, and every rejected
 alternative. This document says what to build: the components, the rules each
 follows, and the order of work, with the code each step changes. It is not a
 full specification. Exact rules and their proofs live in the protocol model,
-[`crates/cayenne-metastore-model`](../../crates/cayenne-metastore-model/README.md).
+[`crates/cayenne-metastore-model`](../../crates/cayenne-metastore-model/README.md);
+`cayenne-metastore-model serve <run>` opens any cited run's counterexample or
+witness in the [Stateright Explorer](../../crates/cayenne-metastore-model/README.md#exploring-runs-in-the-stateright-explorer).
 The user-facing surface is Enhancement [#16245](https://github.com/spiceai/spiceai/issues/16245); nothing here adds a user decision
 beyond `runtime.state.location`.
 

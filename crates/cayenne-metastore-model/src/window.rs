@@ -112,6 +112,49 @@ impl Model for Protocol {
         }
         if next == *state { None } else { Some(next) }
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Append(z) => format!("commit a record (variant {z}) into the head"),
+            Action::Observe => "observe a stable cut of the inline window".into(),
+            Action::Create(j) => format!("upload observed cut {j} as a batch (create if absent)"),
+            Action::Checkpoint(c) => format!("write a checkpoint root at {c}"),
+            Action::Gc => "collect batches below the floor".into(),
+            Action::Query => "start a query on the current head".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let state = self.next_state(last_state, action)?;
+        let log: Vec<String> = state
+            .log
+            .iter()
+            .map(|r| crate::explorer::record_id(*r))
+            .collect();
+        Some(crate::explorer::summary(&[
+            format!("serial history: {}", log.join(" ")),
+            format!(
+                "checkpoint written: {}, collection ran: {}",
+                state.checkpoint, state.gc
+            ),
+            crate::explorer::flags(&[
+                ("byte cut", state.store.byte_cut),
+                ("count cut", state.store.count_cut),
+                ("byte pressure", state.store.byte_pressure),
+                ("count pressure", state.store.count_pressure),
+                ("batch re-created after collection", state.store.revived),
+                ("conflicting batch bytes", state.store.conflict),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        let state = path.last_state();
+        let mut view = crate::explorer::StoreView::of(
+            "OBJECT STORE",
+            &state.store,
+            crate::explorer::record_id,
+        );
+        view.pin("running query", state.query.as_ref());
+        Some(crate::explorer::stacked(&[view]))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always(

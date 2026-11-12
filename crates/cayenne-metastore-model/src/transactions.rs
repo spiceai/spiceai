@@ -135,6 +135,39 @@ fn fold(log: &[Record]) -> View {
     }
     v
 }
+fn outcome(o: u8) -> &'static str {
+    match o {
+        0 => "none",
+        1 => "commit",
+        _ => "abort",
+    }
+}
+fn label(r: Record) -> String {
+    match (r.0, r.1) {
+        (1, _) => "P".into(),
+        (2, _) => "W".into(),
+        (3, 1) => "C".into(),
+        (3, _) => "A".into(),
+        _ => "o".into(),
+    }
+}
+fn request(r: Option<&Req>) -> String {
+    let Some(r) = r else { return "-".into() };
+    let kind = match r.kind {
+        1 => "Prepare",
+        2 => "write",
+        _ => "Resolve",
+    };
+    let answer = match r.answer {
+        0 => "unknown",
+        1 => "accepted",
+        _ => "rejected",
+    };
+    format!(
+        "{kind} on head (pos {}, lease {}, floor {}); copies sent {:02b} landed {:02b}; outcome {answer}",
+        r.base.pos, r.base.lease, r.base.floor, r.sent, r.done
+    )
+}
 impl Protocol {
     pub(crate) fn representative(s: &State) -> State {
         let mut n = s.clone();
@@ -578,6 +611,121 @@ impl Model for Protocol {
             }
         }
         if next == *state { None } else { Some(next) }
+    }
+    fn format_action(&self, action: &Action) -> String {
+        let name = |i: &usize| format!("participant {i}");
+        match action {
+            Action::Issue(i, 1) => format!("coordinator sends Prepare to {}", name(i)),
+            Action::Issue(i, 2) => format!("a writer sends an ordinary write to {}", name(i)),
+            Action::Issue(i, 3) => format!("a helper sends Resolve to {}", name(i)),
+            Action::Issue(i, _) => format!("the lease holder sends Resolve to {}", name(i)),
+            Action::Deliver(i, 0) => format!("the CAS to {} arrives", name(i)),
+            Action::Deliver(i, _) => format!("the resent CAS to {} arrives", name(i)),
+            Action::Check(i) => format!(
+                "the sender reads {}'s head to learn its CAS outcome",
+                name(i)
+            ),
+            Action::Fence(i) => format!("a takeover raises {}'s lease", name(i)),
+            Action::Deadline => "the transaction deadline passes".into(),
+            Action::Decide(1) => "coordinator creates the decision object: commit".into(),
+            Action::Decide(2) => "another process creates the decision object: abort".into(),
+            Action::Decide(_) => {
+                "coordinator creates the decision object at its deadline: abort".into()
+            }
+            Action::Checkpoint(i) => format!("{} writes a checkpoint root", name(i)),
+            Action::Publish(i) => format!("{} publishes its checkpoint floor", name(i)),
+            Action::Gc(i) => format!("{} collects below its floor", name(i)),
+            Action::Switch(i) => format!("{} swaps its in-flight and parked requests", name(i)),
+            Action::Observe(i) => format!("{} observes a stable cut of its window", name(i)),
+            Action::Advance(i) => format!("an unrelated commit lands on {}", name(i)),
+            Action::Create(i, j) => format!("{} uploads observed cut {j} as a batch", name(i)),
+            Action::Report => "coordinator reports the outcome to its client".into(),
+            Action::Forget(0) => "coordinator removes the transaction's records".into(),
+            Action::Forget(_) => "another process removes the transaction's records".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let state = self.next_state(last_state, action)?;
+        let mut lines = vec![
+            "records: P Prepare, W write, C/A Resolve commit/abort, o unrelated write".to_string(),
+        ];
+        for (i, dataset) in state.ds.iter().enumerate() {
+            let v = fold(&dataset.log);
+            lines.push(format!(
+                "participant {i}: value {} prepared {} resolved {}",
+                v.value,
+                v.pending,
+                outcome(v.out)
+            ));
+        }
+        lines.push(crate::explorer::flags(&[
+            ("deadline passed", state.deadline),
+            ("coordinator done", state.coordinator_done),
+            ("non-owner Resolve", state.nonowner),
+            ("BAD reservation", state.bad_reservation),
+            ("BAD fence", state.bad_fence),
+            ("BAD resolution", state.bad_resolution),
+        ]));
+        Some(crate::explorer::summary(&lines))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{StoreView, Tone, stacked_with};
+        let state = path.last_state();
+        let mut removed = vec![];
+        if state.removed & 1 != 0 {
+            removed.push("coordinator");
+        }
+        if state.removed & 2 != 0 {
+            removed.push("another process");
+        }
+        if state.removed & 4 != 0 {
+            removed.push("decision recreated after removal");
+        }
+        let header = vec![(
+            "TRANSACTION RECORDS (intent + decision objects)".to_string(),
+            vec![
+                format!("exist: {}", state.records),
+                format!("decision object: {}", outcome(state.recorded)),
+                format!("first decision ever: {}", outcome(state.decision)),
+                format!("reported to client: {}", outcome(state.reported)),
+                format!(
+                    "removed by: {}",
+                    if removed.is_empty() {
+                        "-".into()
+                    } else {
+                        removed.join(", ")
+                    }
+                ),
+            ],
+            if state.records {
+                Tone::Live
+            } else {
+                Tone::Gone
+            },
+        )];
+        let views: Vec<StoreView> = state
+            .ds
+            .iter()
+            .enumerate()
+            .map(|(i, dataset)| {
+                let mut view = StoreView::of(&format!("PARTICIPANT {i}"), &dataset.storage, label);
+                view.head.push(format!(
+                    "lease {} (coordinator holds {COORDINATOR_LEASE})",
+                    dataset.lease
+                ));
+                view.head
+                    .push(format!("in flight: {}", request(dataset.req.as_ref())));
+                if dataset.parked.is_some() {
+                    view.head
+                        .push(format!("parked: {}", request(dataset.parked.as_ref())));
+                }
+                if !dataset.object {
+                    view.head.push("data objects: collected".into());
+                }
+                view
+            })
+            .collect();
+        Some(stacked_with(&header, &views))
     }
     fn properties(&self) -> Vec<Property<Self>> {
         let mut properties: Vec<Property<Self>> = vec![

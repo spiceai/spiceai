@@ -395,6 +395,96 @@ impl Model for Protocol {
         }
         (next != *state).then_some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Mutation => "a mutation adds a file and a tombstone".into(),
+            Action::Maintenance => "maintenance rewrites the files into one".into(),
+            Action::Metadata => "a metadata change bumps the schema".into(),
+            Action::Checkpoint => "write a checkpoint".into(),
+            Action::TableRecord(t, k, true) => format!("commit an upsert of t{t}.k{k}"),
+            Action::TableRecord(t, k, false) => format!("commit a delete of t{t}.k{k}"),
+            Action::Move => "move a key from table 0 to table 1 in one record".into(),
+            Action::Both => "write key 1 in both tables in one record".into(),
+            Action::RetryRefused => "retry the refused record".into(),
+            Action::UpsertKey(k) => format!("upsert key {k} (tombstone, then a new file)"),
+            Action::DeleteKey(k) => format!("delete key {k} (tombstone)"),
+            Action::Compact(mask) => format!("compact warm files (selection {mask:b})"),
+            Action::Promote => "promote every warm file to cold".into(),
+            Action::Clear => "clear tombstones every file has applied".into(),
+            Action::Collect => "collect key records below the floor".into(),
+            Action::SetKey(k, true) => format!("record key {k} present"),
+            Action::SetKey(k, false) => format!("record key {k} absent"),
+            Action::Index => "refresh the key index from the checkpoint".into(),
+            Action::Recover => "recover the key set from index plus records".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let mut lines = vec![format!("step {}, high seq {}", s.step, s.high)];
+        if self.has("identity") {
+            lines.push(format!(
+                "physical state: files {:?}, tombstones {:?}, schema {}",
+                s.physical.files, s.physical.tombstones, s.physical.schema
+            ));
+            lines.push(format!(
+                "named states: {}",
+                s.named
+                    .iter()
+                    .map(|(n, _)| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+            lines.push(format!(
+                "checkpoints: {}",
+                s.checkpoints
+                    .iter()
+                    .map(|(n, _)| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
+        if !s.rows.is_empty() || s.table_high != [0, 0] {
+            lines.push(format!(
+                "table high seq: t0 {}, t1 {}",
+                s.table_high[0], s.table_high[1]
+            ));
+            for (t, k, v, seq) in &s.rows {
+                lines.push(format!("  row t{t}.k{k} = v{v} seq {seq}"));
+            }
+            for (t, k, d) in &s.deletes {
+                lines.push(format!("  delete t{t}.k{k} at or below seq {d}"));
+            }
+            lines.push(format!("source says: {:?}", s.oracle));
+        }
+        if !s.files.is_empty() || !s.tombstones.is_empty() {
+            for f in &s.files {
+                lines.push(format!(
+                    "  file #{} k{} seq {} min {} applied {:?}{}",
+                    f.id,
+                    f.key,
+                    f.seq,
+                    f.min_seq,
+                    f.applied,
+                    if f.cold { " cold" } else { " warm" }
+                ));
+            }
+            for (k, d) in &s.tombstones {
+                lines.push(format!("  tombstone k{k} at or below seq {d}"));
+            }
+            lines.push(format!("expected keys present: {:?}", s.expected));
+        }
+        if s.checkpoint.is_some() || !s.records.is_empty() {
+            lines.push(format!(
+                "keys {:?}; floor {}; key records {:?} (collected through {})",
+                s.keys, s.floor, s.records, s.collected
+            ));
+            lines.push(format!(
+                "checkpoint {:?}; index {:?}; recovered {:?}",
+                s.checkpoint, s.index, s.recovered
+            ));
+        }
+        Some(crate::explorer::summary(&lines))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         if self.has("identity") {
             vec![

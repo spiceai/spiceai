@@ -282,6 +282,78 @@ impl Model for Protocol {
         }
         if next == *state { None } else { Some(next) }
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Prepare(i, t) => format!("transaction {t} prepares on dataset {i}"),
+            Action::Resolve(i, t) => format!("transaction {t} resolves on dataset {i}"),
+            Action::Writer(i) => format!("an ordinary writer commits on dataset {i}"),
+            Action::Deadline(t) => format!("transaction {t}'s deadline passes"),
+            Action::Decide(t, 1) => format!("transaction {t} decides commit"),
+            Action::Decide(t, _) => format!("transaction {t} decides abort"),
+            Action::Seal(i) => format!("dataset {i} uploads its stable window cuts as batches"),
+            Action::Checkpoint(i) => format!("dataset {i} writes a checkpoint root"),
+            Action::Gc(i) => format!("dataset {i} collects below its floor"),
+            Action::Advance(i) => format!("an unrelated commit lands on dataset {i}"),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let outcome = |o: u8| match o {
+            0 => "undecided",
+            1 => "commit",
+            _ => "abort",
+        };
+        Some(crate::explorer::summary(&[
+            "records: P<t> Prepare, C<t>/A<t> Resolve commit/abort, W write, o unrelated".into(),
+            format!(
+                "transaction 0: {} (deadline {}); transaction 1: {} (deadline {})",
+                outcome(s.decision[0]),
+                s.deadline[0],
+                outcome(s.decision[1]),
+                s.deadline[1]
+            ),
+            crate::explorer::flags(&[
+                ("BAD reservation", s.bad_reservation),
+                ("prepare after abort", s.late_prepare),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{StoreView, stacked};
+        let s = path.last_state();
+        let views: Vec<StoreView> =
+            s.ds.iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let mut view =
+                        StoreView::of(&format!("DATASET {i}"), &d.store, |r| match (r.0, r.1) {
+                            (1, _) => format!("P{}", r.2),
+                            (3, 1) => format!("C{}", r.2),
+                            (3, _) => format!("A{}", r.2),
+                            (2, _) => "W".into(),
+                            _ => "o".into(),
+                        });
+                    let rejected: Vec<String> = (0..2)
+                        .filter(|t| d.rejected[*t])
+                        .map(|t| format!("t{t}"))
+                        .collect();
+                    if !rejected.is_empty() {
+                        view.head
+                            .push(format!("Prepare refused for {}", rejected.join(", ")));
+                    }
+                    let gone: Vec<String> = (0..2)
+                        .filter(|t| !d.objects[*t])
+                        .map(|t| format!("t{t}"))
+                        .collect();
+                    if !gone.is_empty() {
+                        view.head
+                            .push(format!("data objects collected for {}", gone.join(", ")));
+                    }
+                    view
+                })
+                .collect();
+        Some(stacked(&views))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always(

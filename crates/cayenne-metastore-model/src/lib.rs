@@ -9,6 +9,7 @@ mod commits;
 mod concurrent;
 mod core;
 mod dataset_lifecycle;
+mod explorer;
 mod floors;
 mod intent_partitioned;
 mod intent_roll_forward;
@@ -2598,22 +2599,15 @@ where
         }
     }
 }
-fn check<M>(model: M, run: Run) -> bool
-where
-    M: Model + Send + Sync + 'static,
-    M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
-    M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
-{
-    check_with_symmetry(model, run, None)
-}
 type Representative<S> = fn(&S) -> S;
 fn check_with_symmetry<M>(
     model: M,
     run: Run,
     representative: Option<Representative<M::State>>,
+    explore: Option<&str>,
 ) -> bool
 where
-    M: Model + Send + Sync + 'static,
+    M: Model + Clone + Send + Sync + 'static,
     M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
     M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
 {
@@ -2657,15 +2651,12 @@ where
     } else {
         stateright::HasDiscoveries::AllOf(targets)
     };
-    let builder = model
-        .checker()
-        .threads(
-            std::env::var("MODEL_THREADS")
-                .ok()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(DEFAULT_THREADS),
-        )
-        .finish_when(finish);
+    let threads = std::env::var("MODEL_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(DEFAULT_THREADS);
+    let explorer_model = explore.map(|_| model.clone());
+    let builder = model.checker().threads(threads).finish_when(finish);
     let builder = if let Some(f) = representative {
         builder.symmetry_fn(f)
     } else {
@@ -2680,6 +2671,7 @@ where
                 .join(),
             &run,
             start,
+            explore,
         )
     } else if run.failure.is_empty()
         || run.family == "dataset-lifecycle"
@@ -2692,12 +2684,19 @@ where
         || run.family.ends_with("-progress")
         || run.mode.contains("symmetry")
     {
-        output(&builder.spawn_dfs().join(), &run, start)
+        output(&builder.spawn_dfs().join(), &run, start, explore)
     } else {
-        output(&builder.spawn_bfs().join(), &run, start)
+        output(&builder.spawn_bfs().join(), &run, start, explore)
     };
     drop(finished);
     let joined = watchdog.join().is_ok();
+    if let (Some(address), Some(model)) = (explore, explorer_model) {
+        println!(
+            "EXPLORER {} serving http://{address}/ (Ctrl-C to stop)",
+            run.name
+        );
+        model.checker().threads(threads).serve(address);
+    }
     result && joined
 }
 /// Whether a run must reach the `sometimes` property `name`.
@@ -2906,7 +2905,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 _ => false,
             }
 }
-fn output<M: Model, C: Checker<M>>(c: &C, run: &Run, start: Instant) -> bool
+fn output<M: Model, C: Checker<M>>(c: &C, run: &Run, start: Instant, explore: Option<&str>) -> bool
 where
     M::State: Clone + PartialEq + std::fmt::Debug,
     M::Action: Clone + PartialEq + std::fmt::Debug,
@@ -2985,6 +2984,16 @@ where
                 "MINIMIZED enabled={valid} steps={} {action:?}",
                 action.len()
             );
+            if let Some(address) = explore
+                && let Some(path) =
+                    stateright::Path::from_actions(c.model(), initial.clone(), &action)
+            {
+                println!(
+                    "EXPLORE {status} {} http://{address}/#/steps/{}",
+                    p.name,
+                    path.encode(c.model())
+                );
+            }
             trace_json(&format!(
                 "{{\"kind\":\"witness\",\"run\":{},\"family\":{},\"mode\":{},\"property\":{},\"status\":{},\"valid\":{valid},\"initial_index\":{},\"actions\":{}}}",
                 json_string(run.name),
@@ -3044,35 +3053,70 @@ where
 /// # Errors
 /// Returns an error for an unknown run, missing control opt-in, or an unexpected result.
 pub fn run(name: &str) -> Result<(), String> {
+    run_checks(name, None)
+}
+
+/// Check a named configuration as [`run`] does, print a Stateright Explorer
+/// link for each counterexample and witness it finds, then serve the Explorer
+/// on `address` until the process is stopped. Controls do not need
+/// `EXHAUST=1`: their counterexample is usually what is worth showing.
+///
+/// # Errors
+/// Returns an error for an unknown run or an address that cannot be bound.
+pub fn serve(name: &str, address: &str) -> Result<(), String> {
+    // The Explorer panics on a bind failure; check the address first so a busy
+    // port is an error rather than a panic after the check has run.
+    drop(
+        std::net::TcpListener::bind(address)
+            .map_err(|e| format!("Cannot serve the Explorer on {address}: {e}"))?,
+    );
+    run_checks(name, Some(address))
+}
+
+fn run_checks(name: &str, explore: Option<&str>) -> Result<(), String> {
     let r = runs()
         .into_iter()
         .find(|r| r.name == name)
         .ok_or_else(|| format!("Unknown run {name}; use list"))?;
-    if (r.mode.contains("-no-") || !r.failure.is_empty())
+    if explore.is_none()
+        && (r.mode.contains("-no-") || !r.failure.is_empty())
         && std::env::var("EXHAUST").as_deref() != Ok("1")
     {
         return Err("Controls require EXHAUST=1".into());
     }
-    let good = match r.family {
-        "remote-maintenance" => check(
+    let good = dispatch(r, &mut CheckRun { explore }).unwrap_or(false);
+    if good {
+        Ok(())
+    } else {
+        Err(format!("Unexpected outcome for {name}"))
+    }
+}
+
+/// Builds the model a run names and hands it to `visitor`; `None` for a run
+/// of an unknown family.
+fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
+    Some(match r.family {
+        "remote-maintenance" => v.visit(
             dataset_lifecycle::remote_maintenance::Protocol::new(r.mode, r.bound),
             r,
+            None,
         ),
-        "position-deletes" => check(position_deletes::Protocol::new(r.mode), r),
-        "lifecycle-composed" => check(
+        "position-deletes" => v.visit(position_deletes::Protocol::new(r.mode), r, None),
+        "lifecycle-composed" => v.visit(
             dataset_lifecycle::composed::Protocol::new(r.mode, r.bound),
             r,
+            None,
         ),
-        "dataset-lifecycle" => check(dataset_lifecycle::Protocol::new(r.mode, r.bound), r),
-        "source-positions" => check(source_positions::Protocol::new(r.mode, r.bound), r),
-        "standby" => check(standby::Protocol::new(r.mode), r),
-        "object-names" => check(object_names::Protocol::new(r.mode, r.bound), r),
-        "reads" => check(reads::Protocol::new(r.mode, r.bound), r),
-        "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
-        "retention" => check(retention::Protocol::new(r.mode), r),
-        "replicas" => check(replicas::Protocol::new(r.mode), r),
-        "commits" => check(commits::Protocol::new(r.mode, r.bound), r),
-        "transactions" => check_with_symmetry(
+        "dataset-lifecycle" => v.visit(dataset_lifecycle::Protocol::new(r.mode, r.bound), r, None),
+        "source-positions" => v.visit(source_positions::Protocol::new(r.mode, r.bound), r, None),
+        "standby" => v.visit(standby::Protocol::new(r.mode), r, None),
+        "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
+        "reads" => v.visit(reads::Protocol::new(r.mode, r.bound), r, None),
+        "action-compatibility" => v.visit(action_compatibility::Protocol::new(r.mode), r, None),
+        "retention" => v.visit(retention::Protocol::new(r.mode), r, None),
+        "replicas" => v.visit(replicas::Protocol::new(r.mode), r, None),
+        "commits" => v.visit(commits::Protocol::new(r.mode, r.bound), r, None),
+        "transactions" => v.visit(
             transactions::Protocol::new(r.mode, r.bound),
             r,
             r.mode
@@ -3080,21 +3124,27 @@ pub fn run(name: &str) -> Result<(), String> {
                 .then_some(transactions::Protocol::representative),
         ),
         "intent-roll-forward" if r.mode.contains("partitioned") => {
-            check(intent_partitioned::Protocol::new(r.mode, r.bound), r)
+            v.visit(intent_partitioned::Protocol::new(r.mode, r.bound), r, None)
         }
-        "intent-roll-forward" => check(intent_roll_forward::Protocol::new(r.mode, r.bound), r),
-        "window" => check(window::Protocol::new(r.mode, r.bound), r),
-        "floors" => check(floors::Protocol::new(r.mode, r.bound), r),
-        "concurrent" => check(concurrent::Protocol::new(r.mode, r.bound), r),
-        "state-rules" => check(state_rules::Protocol::new(r.mode, r.bound), r),
-        "mem-tier" => check(mem_tier::Protocol::new(r.mode, r.bound), r),
-        "seq-order" => check(seq_order::Protocol::new(r.mode, r.bound), r),
-        "predicate-progress" => check(read_programs::PredicateProgress::new(r.bound), r),
-        "cold-promotion" => check(dataset_lifecycle::promotion::Protocol::new(r.mode), r),
-        "read-delivery" => check(read_programs::delivery::Protocol::new(r.mode, r.bound), r),
+        "intent-roll-forward" => {
+            v.visit(intent_roll_forward::Protocol::new(r.mode, r.bound), r, None)
+        }
+        "window" => v.visit(window::Protocol::new(r.mode, r.bound), r, None),
+        "floors" => v.visit(floors::Protocol::new(r.mode, r.bound), r, None),
+        "concurrent" => v.visit(concurrent::Protocol::new(r.mode, r.bound), r, None),
+        "state-rules" => v.visit(state_rules::Protocol::new(r.mode, r.bound), r, None),
+        "mem-tier" => v.visit(mem_tier::Protocol::new(r.mode, r.bound), r, None),
+        "seq-order" => v.visit(seq_order::Protocol::new(r.mode, r.bound), r, None),
+        "predicate-progress" => v.visit(read_programs::PredicateProgress::new(r.bound), r, None),
+        "cold-promotion" => v.visit(dataset_lifecycle::promotion::Protocol::new(r.mode), r, None),
+        "read-delivery" => v.visit(
+            read_programs::delivery::Protocol::new(r.mode, r.bound),
+            r,
+            None,
+        ),
         "read-programs" => {
             let model = read_programs::Protocol::new(r.mode, r.bound);
-            let good = check(model.clone(), r);
+            let good = v.visit(model.clone(), r, None);
             println!("COMMIT_COST_PROFILES {} {:?}", r.name, model.profiles());
             println!(
                 "MODEL_COUNTS {} max_winners={} max_rows_evaluated={}",
@@ -3104,12 +3154,41 @@ pub fn run(name: &str) -> Result<(), String> {
             );
             good
         }
-        _ => false,
-    };
-    if good {
-        Ok(())
-    } else {
-        Err(format!("Unexpected outcome for {name}"))
+        _ => return None,
+    })
+}
+
+/// What to do with a run's model: check it, serve it, or (in tests) render it.
+trait Visitor {
+    fn visit<M>(
+        &mut self,
+        model: M,
+        run: Run,
+        representative: Option<Representative<M::State>>,
+    ) -> bool
+    where
+        M: Model + Clone + Send + Sync + 'static,
+        M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
+        M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync;
+}
+
+/// Checks a run, then serves it in the Explorer when `explore` names an address.
+struct CheckRun<'a> {
+    explore: Option<&'a str>,
+}
+impl Visitor for CheckRun<'_> {
+    fn visit<M>(
+        &mut self,
+        model: M,
+        run: Run,
+        representative: Option<Representative<M::State>>,
+    ) -> bool
+    where
+        M: Model + Clone + Send + Sync + 'static,
+        M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
+        M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
+    {
+        check_with_symmetry(model, run, representative, self.explore)
     }
 }
 
@@ -3298,4 +3377,124 @@ fn citations(block: &str) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Representative, Run, Visitor, dispatch, runs};
+    use stateright::{Model, Path};
+    use std::collections::BTreeSet;
+
+    /// Families that show text only; every other family draws its state.
+    const TEXT_ONLY: [&str; 5] = [
+        "action-compatibility",
+        "position-deletes",
+        "predicate-progress",
+        "read-delivery",
+        "state-rules",
+    ];
+
+    /// Walks each run's model along seeded random paths and renders every
+    /// step the way the Explorer does: every enabled action's label and
+    /// outcome text, and the drawing of the path so far.
+    #[derive(Default)]
+    struct Render {
+        families: BTreeSet<&'static str>,
+        drawn: BTreeSet<&'static str>,
+        steps: usize,
+    }
+    impl Visitor for Render {
+        fn visit<M>(&mut self, model: M, run: Run, _: Option<Representative<M::State>>) -> bool
+        where
+            M: Model + Clone + Send + Sync + 'static,
+            M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
+            M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
+        {
+            self.families.insert(run.family);
+            for seed in 1..=3_u64 {
+                let mut rng = seed;
+                let mut next = |bound: usize| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    usize::try_from(rng % u64::try_from(bound).unwrap_or(1)).unwrap_or(0)
+                };
+                let inits = model.init_states();
+                let init = inits[next(inits.len())].clone();
+                let mut state = init.clone();
+                let mut actions = vec![];
+                for _ in 0..30 {
+                    let mut candidates = vec![];
+                    model.actions(&state, &mut candidates);
+                    let enabled: Vec<M::Action> = candidates
+                        .into_iter()
+                        .filter(|a| {
+                            assert!(
+                                !model.format_action(a).is_empty(),
+                                "{}: empty label",
+                                run.name
+                            );
+                            model.next_state(&state, a.clone()).is_some()
+                        })
+                        .collect();
+                    if enabled.is_empty() {
+                        break;
+                    }
+                    for a in &enabled {
+                        let text = model.format_step(&state, a.clone());
+                        assert!(
+                            text.is_some_and(|t| !t.is_empty()),
+                            "{} seed {seed}: no step text for {a:?}",
+                            run.name
+                        );
+                    }
+                    let action = enabled[next(enabled.len())].clone();
+                    state = model
+                        .next_state(&state, action.clone())
+                        .expect("an enabled action has a successor");
+                    actions.push(action);
+                    let path = Path::from_actions(&model, init.clone(), &actions)
+                        .expect("the walk replays");
+                    if let Some(svg) = model.as_svg(path) {
+                        assert!(
+                            svg.starts_with("<svg ") && svg.ends_with("</svg>"),
+                            "{} seed {seed}: not an SVG document",
+                            run.name
+                        );
+                        assert_eq!(
+                            svg.matches("<text").count(),
+                            svg.matches("</text>").count(),
+                            "{} seed {seed}: unbalanced text elements",
+                            run.name
+                        );
+                        assert!(svg.contains("<rect"), "{}: draws nothing", run.name);
+                        self.drawn.insert(run.family);
+                    }
+                    self.steps += 1;
+                }
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn every_run_renders_in_the_explorer() {
+        let mut render = Render::default();
+        for run in runs() {
+            assert_eq!(dispatch(run, &mut render), Some(true), "{}", run.name);
+        }
+        let expected: BTreeSet<&str> = render
+            .families
+            .iter()
+            .copied()
+            .filter(|f| !TEXT_ONLY.contains(f))
+            .collect();
+        assert_eq!(render.drawn, expected);
+        assert_eq!(render.families.len(), 24, "{:?}", render.families);
+        assert!(
+            render.steps > 10_000,
+            "only {} steps rendered",
+            render.steps
+        );
+    }
 }

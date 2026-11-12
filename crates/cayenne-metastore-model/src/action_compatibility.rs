@@ -59,6 +59,13 @@ impl Model for Protocol {
         }
         (n != *s).then_some(n)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Append(true) => "append an action kind the older reader does not know".into(),
+            Action::Append(false) => "append a known action".into(),
+            Action::Open => "the older reader opens the log".into(),
+        }
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("I11 compatible replay or refusal", |_, s: &State| {

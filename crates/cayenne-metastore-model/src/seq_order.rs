@@ -393,6 +393,164 @@ impl Model for Protocol {
         }
         (next != *state).then_some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Buffer(i, k, true) => format!("writer {i} buffers an upsert of key {k}"),
+            Action::Buffer(i, k, false) => format!("writer {i} buffers a delete of key {k}"),
+            Action::Seal(i) => format!("writer {i} seals its buffer"),
+            Action::Commit(i) => format!("writer {i} commits (CAS on its base)"),
+            Action::Retry(i) => format!("writer {i} retries on the new head"),
+            Action::StartMaintenance => "maintenance plans a compaction".into(),
+            Action::CommitMaintenance => "maintenance commits its compaction".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let values = |v: &Values| {
+            v.iter()
+                .enumerate()
+                .map(|(k, x)| format!("k{k}={}", x.map_or("-".into(), |x| format!("v{x}"))))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        Some(crate::explorer::summary(&[
+            format!("reader sees: {}", values(&s.data.visible())),
+            format!("serial says: {}", values(&s.reference)),
+            format!("compactions committed: {}", s.maintained),
+            crate::explorer::flags(&[
+                ("sequences shifted on retry", s.shifted),
+                ("maintenance replanned", s.replanned),
+                ("writers interleaved", s.interleaved),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let last = path.last_state().clone();
+        let hidden = |r: &Row| {
+            last.data
+                .deletes
+                .iter()
+                .any(|&(k, d)| k == r.key && d >= r.seq)
+        };
+        let mut rows: Vec<String> = last
+            .data
+            .rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "k{}=v{} seq {} (batch [{}, {}]){}",
+                    r.key,
+                    r.value,
+                    r.seq,
+                    r.range.0,
+                    r.range.1,
+                    if hidden(r) { " hidden" } else { "" }
+                )
+            })
+            .collect();
+        rows.extend(
+            last.data
+                .deletes
+                .iter()
+                .map(|(k, d)| format!("delete k{k} at or below seq {d}")),
+        );
+        if rows.is_empty() {
+            rows.push("(empty)".into());
+        }
+        let dup = !last.data.unique_keys();
+        let mut boxes = vec![(
+            format!("HEAD (commit {}, high seq {})", last.log.len(), last.high),
+            rows,
+            if dup { Tone::Bad } else { Tone::Live },
+        )];
+        for (i, w) in last.writers.iter().enumerate() {
+            let mut lines = vec![format!(
+                "base commit {}, allocator {}{}",
+                w.base,
+                w.allocator,
+                if w.sealed { ", sealed" } else { "" }
+            )];
+            lines.extend(w.buffer.iter().map(|o| {
+                format!(
+                    "k{}={} delete<={} insert {}",
+                    o.key,
+                    o.value.map_or("delete".into(), |v| format!("v{v}")),
+                    o.delete,
+                    o.insert
+                )
+            }));
+            boxes.push((format!("WRITER {i}"), lines, Tone::Actor));
+        }
+        if let Some(m) = &last.maintenance {
+            boxes.push((
+                format!("COMPACTION (on commit {}, cutoff {})", m.base, m.cutoff),
+                vec![
+                    format!(
+                        "inputs {}",
+                        m.inputs
+                            .iter()
+                            .map(|r| format!("k{}@{}", r.key, r.seq))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                    format!(
+                        "outputs {}",
+                        m.outputs
+                            .iter()
+                            .map(|r| format!("k{}@{}", r.key, r.seq))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                ],
+                Tone::Staged,
+            ));
+        }
+        let n = last.writers.len();
+        let (head, maint) = (n, n + 1);
+        let mut lanes: Vec<String> = (0..n).map(|i| format!("writer {i}")).collect();
+        lanes.extend(["head".to_string(), "maintenance".to_string()]);
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            events.push(match action {
+                Action::Buffer(i, ..) | Action::Seal(i) => Event::on(i, label).tone(Tone::Staged),
+                Action::Commit(i) | Action::Retry(i) => {
+                    let ok = after.log.len() > before.log.len();
+                    let what = if matches!(action, Action::Commit(_)) {
+                        "commit"
+                    } else {
+                        "retry"
+                    };
+                    Event::on(
+                        i,
+                        if ok {
+                            format!("{what} lands")
+                        } else {
+                            format!("{what} refused or rebased")
+                        },
+                    )
+                    .to(head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::StartMaintenance => Event::on(maint, label).tone(Tone::Staged),
+                Action::CommitMaintenance => {
+                    let ok = after.log.len() > before.log.len();
+                    Event::on(
+                        maint,
+                        if ok {
+                            "compaction lands"
+                        } else {
+                            "compaction dropped"
+                        },
+                    )
+                    .to(head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+            });
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("at most one live row per table key", |_, s: &State| {

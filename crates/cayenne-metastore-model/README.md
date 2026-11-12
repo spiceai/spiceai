@@ -7,7 +7,8 @@ It is a finite protocol abstraction, not the Spice engine or an object-store imp
 Lifecycle and coverage start with one live row per key, with two valid tier
 placements preserving warm-subset and cold-file witnesses. Live-row counts are
 checked independently of value selection and count identical physical rows.
-No model check runs through `cargo test`.
+No model check runs through `cargo test`; it runs the Explorer render test and
+the mem-tier trace replays.
 The `seq-order-two-writers-*` runs are the concurrent-ingest scenarios of
 Milestone 3.
 
@@ -29,6 +30,60 @@ links to a section that does.
 ```sh
 cargo run --release -p cayenne-metastore-model -- cite-check docs/design/object-native-metastore.md docs/design/object-native-metastore-technical.md
 ```
+
+## Exploring runs in the Stateright Explorer
+
+`serve <run> [address]` checks a run as `run` does, then serves the
+[Stateright Explorer](https://docs.rs/stateright/0.31.0/stateright/struct.CheckerBuilder.html#method.serve)
+on `address` (default `127.0.0.1:3000`) until stopped. Use it to walk someone
+through a counterexample or a witness, or to step a model by hand.
+
+```sh
+cargo build --release -p cayenne-metastore-model
+target/release/cayenne-metastore-model serve mem-tier-current-3-exhaust
+target/release/cayenne-metastore-model serve standby 127.0.0.1:3001
+```
+
+For each failed or reached property the run prints an `EXPLORE` line whose link
+opens the minimized trace in the Explorer:
+
+```text
+EXPLORE FAIL recovered reads match the source http://127.0.0.1:3000/#/steps/0/6/6/3/1/7/6/6/2/2/2/2/2/2
+```
+
+From any step the Explorer lists the enabled actions, so a trace can be extended
+by hand. Controls do not need `EXHAUST=1` when served, since their counterexample
+is usually what is worth showing. The Explorer's own "Run to completion"
+re-explores the graph without the run's symmetry reduction or early stop, so on
+large runs prefer the printed links.
+
+**What the Explorer shows.** Every model names its actions in plain language
+(the path and the next-action list) and, under "Current State", summarizes the
+facts its drawing leaves out: the serial history or source, what a reader sees
+next to what the source says, and the witness and violation flags that are set.
+"Complete State?" still shows the raw `Debug` state. Most models also draw their
+state; the drawings live in `src/explorer.rs` and come in three kinds:
+
+| Drawing | What it shows | Families |
+|---|---|---|
+| Object store | The head (floor, batch index, inline window) with arrows to the batch objects it indexes and the checkpoint root; staged roots, observed cuts and unreferenced or collected batches; a running query's or reader's captured head and the batches it still needs | `window`, `floors`, `commits`, `transactions`, `concurrent`, the byte window of `lifecycle-composed` |
+| Table layout | The dataset head (sequence highs, delete vectors, key page, prepared operations) with arrows to each file by tier, the files each delete vector hides, and stored objects the head does not reference (or references but are missing); in-flight maintenance plans, checkpoints and queries | `dataset-lifecycle`, `remote-maintenance`, `cold-promotion`, `lifecycle-composed`; `mem-tier` draws its durable catalog, memory tier and restart result the same way |
+| Trace timeline | One lane per actor (instances, writers, the lease object, heads, GC, replication, readers) and one row per step, with the current state in boxes above | `standby`, `intent-roll-forward` (with each intent in A pointing at the record that applies it in B), `reads`, `retention`, `replicas`, `source-positions`, `seq-order`, `read-programs`, `mem-tier`; `object-names` draws head references pointing at named objects |
+
+Colors: white is committed (referenced by the authoritative head), dashed yellow
+is written but not referenced or in flight, grey is collected or superseded, red
+is missing or violated (a duplicate live key, a reference to a missing object, a
+restart that disagrees with the source), and green is an actor. `position-deletes`,
+`state-rules`, `read-delivery`, `predicate-progress` and `action-compatibility`
+show text only.
+
+The drawings read state fields and call the model's own functions (`visible`,
+`recovered_rows`, `reference`); they never re-derive the protocol, and the
+checker never calls them, so they cannot change what is checked.
+`cargo test -p cayenne-metastore-model` walks every run along seeded random
+paths and renders each step as the Explorer does (every enabled action's label
+and text, and the drawing), failing on a panic, an empty label, malformed SVG,
+or a family that stops drawing.
 
 Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
