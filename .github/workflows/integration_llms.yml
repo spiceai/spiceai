@@ -309,17 +309,24 @@ jobs:
           # honours it for every service, so leaving it set sends this suite's Bedrock
           # calls to the local build cache instead of AWS.
           unset AWS_ENDPOINT_URL
-          # Bedrock runs as the CI role (`AWS_BEDROCK_ROLE_ARN`): until the `ci` environment has
-          # one, the other providers still run, and the run says Bedrock did not.
-          if [[ ",${MODEL_ALLOWLIST}," == *",bedrock,"* && "${HAS_BEDROCK_ROLE}" != "true" ]]; then
-            echo "::warning::AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
-            MODEL_ALLOWLIST=$(printf '%s' "$MODEL_ALLOWLIST" | tr ',' '\n' | grep -vx bedrock | paste -sd, - || true)
-            if [ -z "$MODEL_ALLOWLIST" ]; then
-              echo "::error::This run tests only Bedrock, which needs AWS_BEDROCK_ROLE_ARN."
-              exit 1
+          # Bedrock runs as the CI role (`AWS_BEDROCK_ROLE_ARN`) and TypeSafe with
+          # `TYPESAFE_API_KEY`: until the `ci` environment has the secret, the other providers
+          # still run, and the run says, as a warning annotation, which provider it did not test.
+          # A run that asked for nothing but such providers fails, because it would test nothing.
+          skip_unprovisioned() {
+            local model="$1" secret="$2" provisioned="$3"
+            if [[ ",${MODEL_ALLOWLIST}," == *",${model},"* && "${provisioned}" != "true" ]]; then
+              echo "::warning::${secret} is not set in the ci environment, so this run does not test ${model}. Set the secret in the ci environment."
+              MODEL_ALLOWLIST=$(printf '%s' "$MODEL_ALLOWLIST" | tr ',' '\n' | grep -vx "$model" | paste -sd, - || true)
+              if [ -z "$MODEL_ALLOWLIST" ]; then
+                echo "::error::This run tests only providers whose secrets the ci environment lacks; ${model} needs ${secret}."
+                exit 1
+              fi
             fi
-            export MODEL_ALLOWLIST
-          fi
+          }
+          skip_unprovisioned bedrock AWS_BEDROCK_ROLE_ARN "${HAS_BEDROCK_ROLE}"
+          skip_unprovisioned typesafe TYPESAFE_API_KEY "$([ -n "${TYPESAFE_API_KEY:-}" ] && echo true || echo false)"
+          export MODEL_ALLOWLIST
           # Each provider's credential is required only when the run tests that provider.
           runs() { [[ ",${MODEL_ALLOWLIST}," == *",$1,"* ]]; }
           for check in openai:OPENAI_IDENTITY_PROVIDER_ID anthropic:ANTHROPIC_FEDERATION_RULE_ID \
