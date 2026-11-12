@@ -15,8 +15,8 @@ description: "Query: tpch_simple_q5"
 |               |           SubqueryAlias: L                                                                                                                                                     |
 |               |             TableScan: oracle_tpch.TPCH_SF1.LINEITEM projection=[L_ORDERKEY, L_LINESTATUS]                                                                                     |
 | physical_plan | SortPreservingMergeExec: [TOTAL_PRICE@0 DESC]                                                                                                                                  |
-|               |   SortExec: expr=[TOTAL_PRICE@0 DESC], preserve_partitioning=[true]                                                                                                            |
-|               |     ProjectionExec: expr=[sum(O.O_TOTALPRICE)@1 as TOTAL_PRICE, L_LINESTATUS@0 as L_LINESTATUS]                                                                                |
+|               |   ProjectionExec: expr=[sum(O.O_TOTALPRICE)@1 as TOTAL_PRICE, L_LINESTATUS@0 as L_LINESTATUS]                                                                                  |
+|               |     SortExec: expr=[sum(O.O_TOTALPRICE)@1 DESC], preserve_partitioning=[true]                                                                                                  |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[L_LINESTATUS@0 as L_LINESTATUS], aggr=[sum(O.O_TOTALPRICE)]                                                                   |
 |               |         RepartitionExec: partitioning=Hash([L_LINESTATUS@0], 32), input_partitions=32                                                                                          |
 |               |           AggregateExec: mode=Partial, gby=[L_LINESTATUS@1 as L_LINESTATUS], aggr=[sum(O.O_TOTALPRICE)]                                                                        |
