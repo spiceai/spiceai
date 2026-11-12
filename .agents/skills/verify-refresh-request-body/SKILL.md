@@ -23,8 +23,8 @@ The file connector and Arrow acceleration are always linked, so no network or ex
 
 The helper:
 
-1. Seeds a local CSV and an Arrow-accelerated `file:` dataset `events` under a fresh `mktemp -d` work directory (override with `WORK_DIR`).
-2. Starts only this `spiced` on `HTTP_ADDR` (default `127.0.0.1:18391`) plus side ports, logging to `$WORK_DIR/spiced.log`, and records its pid.
+1. Seeds a local CSV and an Arrow-accelerated `file:` dataset `events` under a fresh `mktemp -d` work directory (override with `WORK_DIR`, which must be empty or new).
+2. Refuses to run if anything already answers on `HTTP_ADDR`, then starts only this `spiced` on `HTTP_ADDR` (default `127.0.0.1:18391`) plus side ports, logging to `$WORK_DIR/spiced.log`, and records its pid.
 3. Waits for `GET /v1/ready` to be `200` (90s timeout). An open port is not ready.
 4. Sends each body shape and prints one line per case: `case | HTTP status | body`.
 5. Stops the pid it started (never `pkill`) and removes the work directory it created unless `KEEP=1`. A `WORK_DIR` you pass is never removed.
