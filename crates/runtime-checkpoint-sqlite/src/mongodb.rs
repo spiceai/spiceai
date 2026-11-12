@@ -122,7 +122,7 @@ impl MongoCheckpointStore for SqliteMongoCheckpointStore {
         conn.conn
             .call(move |conn: &mut rusqlite::Connection| -> std::result::Result<MongoCheckpointMetadata, rusqlite::Error> {
                 let query = format!(
-                    "SELECT resume_token_json, cluster_time_ts, schema_json, strftime('%s', updated_at) FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?"
+                    "SELECT resume_token_json, cluster_time_ts, schema_json, CAST(strftime('%s', updated_at) AS INTEGER) FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([dataset_name])?;

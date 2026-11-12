@@ -10,6 +10,12 @@ description: >
 sources:
   src: { kind: postgres }
 
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod
@@ -31,6 +37,9 @@ spicepod:
 defaults:
   cluster-partition-by: { '*': id }
   expect: { oracle: src }
+  # Each variant's source stamps its own `now()` timestamps, which the rows
+  # include, so each variant is checked against its own source instead.
+  compare-variants: false
 
 steps:
   # Rows at hours from now; every column holds the same instant. The window

@@ -43,9 +43,10 @@ use crate::{
     DurableWriteBackUnsupportedBySourceSnafu, DurableWriteBackWithRetentionSnafu, Error,
     FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshFailedSnafu,
     HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
-    Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    Result, Runtime, SidecarColdTierSnafu, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     component::dataset::{
         Dataset,
         acceleration::{Acceleration, DurableWriteBackKey, Engine, Mode, RefreshMode},
@@ -75,7 +76,6 @@ use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
-use runtime_async::is_shutdown_cancellation;
 use runtime_metrics::{self as metrics, components::register_component_metric};
 use runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key;
 use snafu::prelude::*;
@@ -768,7 +768,7 @@ impl Runtime {
         let bootstrap_status = bootstrap_status.into();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        preflight_dataset(&ds, &self.status, &spaced_tracer)?;
+        preflight_dataset(&ds, self.role(), &self.status, &spaced_tracer)?;
 
         // Deferred path. Each connector factory decides via
         // `static_schema()` whether the dataset can be registered
@@ -955,14 +955,9 @@ impl Runtime {
             } else {
                 bootstrap_status.complete().await
             };
-            // A restore completed at initialization already updated the cached
-            // timestamps there; only one completed here still needs it.
             let restored = pending && bootstrap_status.is_bootstrapped();
             if restored && ds.is_snapshot_source() && self.refuses_projected_publisher(&ds).await {
                 return;
-            }
-            if restored {
-                update_cached_dataset_timestamps(ds.as_ref()).await;
             }
             // Rows restored from an acceleration snapshot are not the rows an append
             // cursor saved here before describes.
@@ -1973,7 +1968,7 @@ impl Runtime {
         // preflight would destroy the state of a dataset whose configuration
         // cannot deliver what it has already acknowledged. Cheap to check here,
         // and the running dataset is left as it was.
-        if preflight_dataset(&ds, &self.status, &self.spaced_tracer).is_err() {
+        if preflight_dataset(&ds, self.role(), &self.status, &self.spaced_tracer).is_err() {
             // `preflight_dataset` reported it.
             return None;
         }
@@ -1998,8 +1993,12 @@ impl Runtime {
             .await
         {
             Ok(connector) => {
-                // File accelerated datasets don't support hot reload.
-                if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
+                // File accelerated datasets don't support hot reload. A hot reload keeps the
+                // registered table serving until its replacement has loaded, so a dataset with
+                // no registered table loads in place instead, and its views find it registered.
+                if self.df.table_exists(&ds.name)
+                    && Self::accelerated_dataset_supports_hot_reload(&ds, &*connector)
+                {
                     tracing::info!("Accelerated Dataset {} updating...", &ds.name);
                     match Arc::clone(&self)
                         .reload_accelerated_dataset(
@@ -2716,6 +2715,45 @@ impl Runtime {
         Ok(())
     }
 
+    /// Unloads the datasets of `app` that embed with one of `models`.
+    /// [`Self::apply_dataset_diff`] loads again the ones that are valid in the new app.
+    pub(crate) async fn unload_datasets_using_embeddings(
+        self: &Arc<Self>,
+        app: &Arc<App>,
+        models: &HashSet<String>,
+    ) {
+        if models.is_empty() {
+            return;
+        }
+        for ds in Arc::clone(self).get_valid_datasets(app, LogErrors(false)) {
+            if !uses_embedding_model(&ds, models) {
+                continue;
+            }
+            // `file_create` discards the stored rows when the dataset loads again.
+            if ds.is_file_accelerated()
+                && ds.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.mode != crate::component::dataset::acceleration::Mode::FileCreate
+                })
+            {
+                tracing::warn!(
+                    "Dataset {} keeps the embeddings that its file acceleration stored with the previous configuration of its embedding model. A row is embedded with the new configuration only when a refresh writes it again.",
+                    ds.name
+                );
+            }
+            if self.df.table_exists(&ds.name) {
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
+                Arc::clone(self)
+                    .remove_dataset(
+                        ds.name.clone(),
+                        ds.acceleration.as_ref(),
+                        CacheInvalidation::Reload,
+                    )
+                    .await;
+            }
+        }
+    }
+
     /// Returns the datasets this diff loads, reloads or removes: the views that read
     /// them hold the tables they planned against, or failed to find one.
     pub(crate) async fn apply_dataset_diff(
@@ -2795,9 +2833,10 @@ impl Runtime {
         // apply queued behind it until the process restarts. A dataset that cannot
         // load lands in an error state reported through `status`; a transient
         // failure keeps retrying inside its own spawned task, while a permanent one
-        // is re-attempted only when the dataset's configuration changes — an
-        // identically-configured dataset is filtered out of `datasets_to_apply`
-        // above, so a later apply schedules no fresh load for it. Tracked in #13098.
+        // is re-attempted only when the dataset's configuration, or an embedding model
+        // it uses, changes — any other identically-configured dataset is filtered out of
+        // `datasets_to_apply` above, so a later apply schedules no fresh load for it.
+        // Tracked in #13098.
         //
         // Built here and spawned below so a localpod dataset can be chained behind
         // the dataset it reads from, exactly as `load_datasets` does at startup:
@@ -3153,7 +3192,7 @@ impl Runtime {
                 // below is where a `mode: file_create` accelerator is dropped,
                 // and the refusals this checks exist to stop exactly that
                 // happening to a dataset that cannot afford it.
-                if let Err(err) = preflight_dataset(&ds, &status, &spaced_tracer) {
+                if let Err(err) = preflight_dataset(&ds, df.role(), &status, &spaced_tracer) {
                     return (ds.name.clone(), Err(err));
                 }
 
@@ -3200,12 +3239,7 @@ impl Runtime {
                             source: Box::new(error),
                         },
                     }) {
-                    Ok(bootstrap_status) => {
-                        if bootstrap_status.is_bootstrapped() {
-                            update_cached_dataset_timestamps(ds.as_ref()).await;
-                        }
-                        (ds.name.clone(), Ok(bootstrap_status))
-                    }
+                    Ok(bootstrap_status) => (ds.name.clone(), Ok(bootstrap_status)),
                     Err(err) => {
                         let ds_name = &ds.name;
                         status.update_dataset(
@@ -3531,6 +3565,7 @@ pub(crate) fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::DataConnectorNotInBuild { .. }
         // Dataset-level settings that contradict each other.
         | Error::FullTextSearchRequiresAcceleration { .. }
+        | Error::SidecarColdTier { .. }
         | Error::AcceleratedWriteBackWithoutReplication { .. }
         | Error::AccelerationWriteModeWithChanges { .. }
         | Error::PkConflictDetectionDisabled { .. }
@@ -3683,10 +3718,21 @@ fn pk_conflict_detection_refusal(
 /// The decision itself is [`validate_dataset`], which touches nothing.
 fn preflight_dataset(
     ds: &Arc<Dataset>,
+    role: crate::config::Role,
     status: &status::RuntimeStatus,
     spaced_tracer: &Arc<util::tracers::SpacedTracer>,
 ) -> Result<()> {
-    let Err(err) = validate_dataset(ds) else {
+    let checked = validate_dataset(ds).and_then(|()| {
+        match sidecar_cold_tier_setting(ds).filter(|_| role == crate::config::Role::Sidecar) {
+            Some(setting) => Err(SidecarColdTierSnafu {
+                dataset_name: ds.name.to_string(),
+                setting,
+            }
+            .build()),
+            None => Ok(()),
+        }
+    });
+    let Err(err) = checked else {
         return Ok(());
     };
     // Everything `validate_dataset` raises is a pure function of the Spicepod, so
@@ -3739,6 +3785,33 @@ fn refuse_permanently(
         reason: err.to_string(),
     }
     .build()
+}
+
+/// The setting that keeps `ds`'s data or search index on object storage. A
+/// sidecar serves the memory (hot) and local-disk (warm) tiers; the cluster it
+/// reads from also serves the object-storage (cold) tier, so on a sidecar such
+/// a setting is refused rather than given a tier the sidecar does not hold.
+fn sidecar_cold_tier_setting(ds: &Dataset) -> Option<&'static str> {
+    if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
+        if acceleration.cayenne_datalake_location().is_some() {
+            return Some("cayenne_datalake_location");
+        }
+        // A local path, or a `file://` URL, keeps data on the sidecar's disk.
+        if acceleration
+            .params
+            .get("cayenne_file_path")
+            .is_some_and(|path| path.contains("://") && !path.trim_start().starts_with("file://"))
+        {
+            return Some("cayenne_file_path");
+        }
+        if acceleration.params.contains_key("cayenne_s3_zone_ids") {
+            return Some("cayenne_s3_zone_ids");
+        }
+    }
+    ds.vectors
+        .as_ref()
+        .is_some_and(|vectors| vectors.enabled && vectors.engine.as_deref() == Some("s3_vectors"))
+        .then_some("vectors.engine: s3_vectors")
 }
 
 fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
@@ -3862,50 +3935,6 @@ async fn unknown_data_connector(source: &str) -> Error {
         available: dataconnector::registered_connector_names().await,
     }
     .build()
-}
-
-/// Updates the `fetched_at` column for all records in a cached dataset that was bootstrapped.
-/// This is necessary for caching mode to ensure all bootstrapped records have a valid timestamp.
-async fn update_cached_dataset_timestamps(dataset: &Dataset) {
-    let is_caching_mode = dataset
-        .acceleration
-        .as_ref()
-        .and_then(|acc| acc.refresh_mode)
-        .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
-
-    if !is_caching_mode {
-        return;
-    }
-
-    let is_reset_expiry_on_load_enabled = dataset
-        .acceleration
-        .as_ref()
-        .is_some_and(|acc| acc.snapshots_reset_expiry_on_load_enabled);
-
-    if !is_reset_expiry_on_load_enabled {
-        return;
-    }
-
-    match crate::dataaccelerator::spice_sys::update_caching_engine_fetched_at(dataset).await {
-        Ok(()) => {
-            tracing::info!(
-                "Updated _fetched_at for all records in cached dataset {}",
-                dataset.name
-            );
-        }
-        Err(e) if is_shutdown_cancellation(&e) => {
-            tracing::debug!(
-                "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
-                dataset.name
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to update _fetched_at for cached dataset {}: {e}",
-                dataset.name
-            );
-        }
-    }
 }
 
 /// The message logged when an accelerated dataset with data on disk waits for its
@@ -4183,34 +4212,32 @@ mod tests {
 
         #[test]
         fn other_engines_are_told_on_conflict_is_removed_in_3_0() {
-            for engine in ["arrow", "duckdb"] {
-                let mut acceleration = acceleration(engine, Some("upsert"));
-                for (mode, refresh_mode) in [
-                    (Mode::File, None),
-                    (Mode::File, Some(RefreshMode::Changes)),
-                    (Mode::FileUpdate, None),
-                    (Mode::FileUpdate, Some(RefreshMode::Changes)),
-                    (Mode::Memory, None),
-                    (Mode::Memory, Some(RefreshMode::Full)),
-                    (Mode::Memory, Some(RefreshMode::Append)),
-                ] {
-                    acceleration.mode = mode;
-                    acceleration.refresh_mode = refresh_mode;
-                    assert_eq!(
-                        deprecated_on_conflict_warning(
-                            "orders",
-                            &acceleration,
-                            refresh_mode.unwrap_or(RefreshMode::Full),
-                        ),
-                        "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
-                    );
-                }
+            let mut acceleration = acceleration("arrow", Some("upsert"));
+            for (mode, refresh_mode) in [
+                (Mode::File, None),
+                (Mode::File, Some(RefreshMode::Changes)),
+                (Mode::FileUpdate, None),
+                (Mode::FileUpdate, Some(RefreshMode::Changes)),
+                (Mode::Memory, None),
+                (Mode::Memory, Some(RefreshMode::Full)),
+                (Mode::Memory, Some(RefreshMode::Append)),
+            ] {
+                acceleration.mode = mode;
+                acceleration.refresh_mode = refresh_mode;
+                assert_eq!(
+                    deprecated_on_conflict_warning(
+                        "orders",
+                        &acceleration,
+                        refresh_mode.unwrap_or(RefreshMode::Full),
+                    ),
+                    "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
+                );
             }
         }
 
         #[test]
         fn changes_recommend_persistent_cayenne() {
-            let mut acceleration = acceleration("duckdb", Some("upsert"));
+            let mut acceleration = acceleration("arrow", Some("upsert"));
             assert_eq!(acceleration.mode, Mode::Memory);
             for (mode, refresh_mode) in [
                 (Mode::Memory, None),
@@ -4239,8 +4266,8 @@ mod tests {
     #[test]
     fn the_last_arrival_warning_says_which_rows_are_missed_and_how_to_load_them() {
         assert_eq!(
-            last_arrival_without_overlap_warning("acc", Engine::DuckDB),
-            "Dataset 'acc' (`engine: duckdb`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+            last_arrival_without_overlap_warning("acc", Engine::Sqlite),
+            "Dataset 'acc' (`engine: sqlite`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
     }
 
@@ -4260,12 +4287,11 @@ mod tests {
         let (keyed, time_keyed) = (Some(&key), Some(&with_time));
         let (append, full) = (RefreshMode::Append, RefreshMode::Full);
         for (engine, key, mode, expected, what) in [
-            (Engine::DuckDB, keyed, append, true, "keyed"),
             (Engine::Sqlite, keyed, append, true, "keyed"),
-            (Engine::DuckDB, None, append, false, "unkeyed"),
-            (Engine::DuckDB, keyed, full, false, "full"),
+            (Engine::Sqlite, None, append, false, "unkeyed"),
+            (Engine::Sqlite, keyed, full, false, "full"),
             (Engine::Cayenne, keyed, append, false, "keeps newest"),
-            (Engine::DuckDB, time_keyed, append, false, "key holds time"),
+            (Engine::Sqlite, time_keyed, append, false, "key holds time"),
         ] {
             assert_eq!(
                 reads_by_time_despite_commits(&acceleration(engine, key), ts, mode),
@@ -4334,6 +4360,103 @@ mod tests {
             primary_key: Some("id".to_string()),
             ..Default::default()
         }
+    }
+
+    /// A sidecar holds the memory and local-disk tiers only. Each setting that
+    /// keeps data or a search index on object storage is named, and a local or
+    /// `file://` path, a disabled acceleration, or no tier setting at all is not.
+    #[tokio::test]
+    async fn a_sidecar_refuses_object_storage_tiers() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let accelerated = |enabled: bool, params: &[(&str, &str)]| {
+            dataset_with_acceleration(
+                &runtime,
+                spicepod::acceleration::Acceleration {
+                    enabled,
+                    engine: Some("cayenne".to_string()),
+                    params: Some(spicepod::param::Params::from_string_map(
+                        params
+                            .iter()
+                            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                            .collect(),
+                    )),
+                    ..Default::default()
+                },
+            )
+        };
+        for (params, enabled, setting) in [
+            (
+                &[("cayenne_datalake_location", "s3://bucket/prefix")][..],
+                true,
+                Some("cayenne_datalake_location"),
+            ),
+            (&[("cayenne_datalake_location", "  ")][..], true, None),
+            (
+                &[("cayenne_file_path", "s3://bucket--use1-az4--x-s3/")][..],
+                true,
+                Some("cayenne_file_path"),
+            ),
+            (
+                &[("cayenne_file_path", "/mnt/ephemeral/spice")][..],
+                true,
+                None,
+            ),
+            (
+                &[("cayenne_file_path", "file:///mnt/ephemeral/spice")][..],
+                true,
+                None,
+            ),
+            (
+                &[("cayenne_s3_zone_ids", "use1-az4")][..],
+                true,
+                Some("cayenne_s3_zone_ids"),
+            ),
+            (
+                &[("cayenne_datalake_location", "s3://bucket/prefix")][..],
+                false,
+                None,
+            ),
+            (&[][..], true, None),
+        ] {
+            assert_eq!(
+                sidecar_cold_tier_setting(&accelerated(enabled, params)),
+                setting,
+                "{params:?}, enabled: {enabled}"
+            );
+        }
+
+        let mut spec = spicepod::component::dataset::Dataset::new("postgres:orders", "orders");
+        spec.vectors = Some(spicepod::vector::VectorStore {
+            enabled: true,
+            engine: Some("s3_vectors".to_string()),
+            ..Default::default()
+        });
+        let app = app::AppBuilder::new("sidecar_tiers")
+            .with_dataset(spec.clone())
+            .build();
+        let vectors = DatasetBuilder::try_from(spec)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid runtime dataset");
+        assert_eq!(
+            sidecar_cold_tier_setting(&vectors),
+            Some("vectors.engine: s3_vectors")
+        );
+
+        assert_eq!(
+            SidecarColdTierSnafu {
+                dataset_name: "orders",
+                setting: "cayenne_datalake_location",
+            }
+            .build()
+            .to_string(),
+            "Dataset 'orders' sets `cayenne_datalake_location`, which keeps its data on object \
+             storage, but a sidecar serves data only from memory and local disk; the cluster it \
+             reads from serves object-storage tiers. Remove `cayenne_datalake_location` from the \
+             sidecar's Spicepod, or start Spice without `--role sidecar`."
+        );
     }
 
     fn dataset_with_acceleration(
@@ -4480,7 +4603,7 @@ mod tests {
         for (acceleration, named) in [
             (
                 spicepod::acceleration::Acceleration {
-                    engine: Some("duckdb".to_string()),
+                    engine: Some("arrow".to_string()),
                     ..durable_write_back_acceleration()
                 },
                 "acceleration.engine: cayenne",
@@ -4786,7 +4909,7 @@ mod tests {
         }
 
         let not_cayenne = Acceleration {
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             ..acceleration_with_params(WriteMode::WriteThrough, &none)
         };
         assert_eq!(
@@ -7162,6 +7285,6 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "snapshots", feature = "duckdb"))]
+#[cfg(feature = "snapshots")]
 #[path = "dataset_snapshot_bootstrap_tests.rs"]
 mod snapshot_bootstrap_tests;

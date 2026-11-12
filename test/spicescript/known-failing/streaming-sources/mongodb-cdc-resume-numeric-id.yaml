@@ -11,11 +11,17 @@ description: >
 sources:
   mongo:
     kind: docker
-    image: docker.io/library/mongo:8.0
+    image: docker.io/library/mongo:9.0
     ports: [27017]
     command: [mongod, --replSet, rs0, --bind_ip_all]
     ready: >-
       mongosh --quiet --eval "try { rs.status(); db.hello().isWritablePrimary ? 1 : 0 } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }" | grep -qx 1
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
 
 spicepod:
   version: v1

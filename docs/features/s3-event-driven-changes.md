@@ -31,7 +31,7 @@ datasets:
       file_format: parquet
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: changes
       primary_key: id

@@ -4,8 +4,9 @@ description: >
   aggregates, DISTINCT, same-source joins, IN subqueries, CASE, LIKE, date
   ranges, NULL tests and window functions reach a federated PostgreSQL, MySQL,
   DuckDB or DuckLake source inside the one statement Spice sends it, and answer as
-  PostgreSQL does over the same rows. DuckDB is also read through ADBC with
-  the DuckDB driver.
+  PostgreSQL does over the same rows. A scan that reads no column of the source
+  is sent as `SELECT 1` where the source has no empty select list. DuckDB is
+  also read through ADBC with the DuckDB driver.
 
 sources:
   backend: { kind: '${matrix.backend}' }
@@ -37,6 +38,8 @@ spicepod:
   datasets:
     - { from: '${matrix.backend}:t', name: t, params: '${sources.backend.params}' }
     - { from: '${matrix.backend}:u', name: u, params: '${sources.backend.params}' }
+    # A table on another source, so a query reading it cannot go to the backend whole.
+    - { from: 'postgres:u', name: r, params: '${sources.ref.params}' }
 
 defaults:
   # A cluster buckets each acceleration on this column (--cluster).
@@ -71,3 +74,15 @@ steps:
     mirror: ref
   - start: {}
   - corpus: corpus/pushdown-shapes.sql
+  # A scan that reads no column of `t`: it only filters, beside a scalar subquery
+  # over another source (the TPC-DS q9 shape, #14670). PostgreSQL takes an empty
+  # select list; the other backends have none, so they are sent
+  # `SELECT 1 FROM t WHERE …` and Spice reduces the answer to a row count.
+  - explain: SELECT (SELECT count(*) FROM r) AS n FROM t WHERE i > 40
+    contains: [SELECT FROM]
+    when: { backend: postgres }
+  - explain: SELECT (SELECT count(*) FROM r) AS n FROM t WHERE i > 40
+    contains: [SELECT 1 FROM]
+    when: { backend: [mysql, duckdb, ducklake] }
+  - query: SELECT (SELECT count(*) FROM r) AS n FROM t WHERE i > 40
+    oracle-sql: SELECT (SELECT count(*) FROM u) AS n FROM t WHERE i > 40

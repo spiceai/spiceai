@@ -18,6 +18,8 @@ sources:
 variants:
   federated: {}
   cayenne: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
 
 spicepod:
   version: v1

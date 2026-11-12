@@ -24,7 +24,6 @@ pub mod change_sink;
 pub mod dataset_checkpoint;
 mod engine;
 pub mod layout;
-pub mod memory_budget;
 pub mod schema_change;
 pub mod sidecar;
 pub mod snapshot;
@@ -44,7 +43,7 @@ pub use snapshot::{SnapshotDownloadInfo, SnapshotPoll, SnapshotPollOutcome};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Unknown acceleration engine '{name}'. Valid engines are: arrow, duckdb, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{name}'. Valid engines are: arrow, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratorEngineNotAvailable { name: String },
 

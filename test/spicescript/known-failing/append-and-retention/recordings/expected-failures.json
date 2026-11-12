@@ -71,30 +71,36 @@
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 2 }",
       "group": "append-and-retention"
-    }
-  ],
-  "append-iso-offset": [
+    },
     {
-      "run": "append-iso-offset",
-      "who": "keyed",
-      "key": "query: SELECT * FROM events #3",
+      "run": "append-iso-day",
+      "who": "object-native",
+      "key": "query: SELECT * FROM events #2",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 4 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
       "group": "append-and-retention"
     },
     {
-      "run": "append-iso-offset",
-      "who": "zulu",
+      "run": "append-iso-day",
+      "who": "object-native",
       "key": "query: SELECT * FROM events #3",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 4 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 3 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "object-native",
+      "key": "query: SELECT * FROM events #4",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 4 }",
       "group": "append-and-retention"
     }
   ],
   "append-negative-epoch": [
     {
       "run": "append-negative-epoch",
-      "who": "default",
+      "who": "as-written",
       "key": "refresh: old",
       "kind": "other",
       "signature": "refresh of 'old' failed: Integer time column value -133200000 is negative and cannot be used as a timestamp.",
@@ -102,7 +108,23 @@
     },
     {
       "run": "append-negative-epoch",
-      "who": "default",
+      "who": "as-written",
+      "key": "query: SELECT * FROM old #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-negative-epoch",
+      "who": "object-native",
+      "key": "refresh: old",
+      "kind": "other",
+      "signature": "refresh of 'old' failed: Integer time column value -133200000 is negative and cannot be used as a timestamp.",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-negative-epoch",
+      "who": "object-native",
       "key": "query: SELECT * FROM old #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
@@ -112,7 +134,15 @@
   "append-null-time": [
     {
       "run": "append-null-time",
-      "who": "default",
+      "who": "as-written",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-null-time",
+      "who": "object-native",
       "key": "query: SELECT * FROM events #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
@@ -135,12 +165,30 @@
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
       "group": "append-and-retention"
+    },
+    {
+      "run": "append-same-time",
+      "who": "object-native",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
+    }
+  ],
+  "append-upsert-same-time": [
+    {
+      "run": "append-upsert-same-time",
+      "who": "sqlite",
+      "key": "query: SELECT id, ts, v FROM events ORDER BY id #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"new\\\"\", actual: \"\\\"old\\\"\" }",
+      "group": "append-and-retention"
     }
   ],
   "retention-epoch-formats": [
     {
       "run": "retention-epoch-formats[format=unix_seconds]",
-      "who": "default",
+      "who": "as-written",
       "key": "start: {}",
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
@@ -148,7 +196,7 @@
     },
     {
       "run": "retention-epoch-formats[format=unix_millis]",
-      "who": "default",
+      "who": "as-written",
       "key": "start: {}",
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
@@ -156,11 +204,74 @@
     },
     {
       "run": "retention-epoch-formats[format=unix_nanos]",
-      "who": "default",
+      "who": "as-written",
       "key": "start: {}",
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
       "group": "append-and-retention"
+    },
+    {
+      "run": "retention-epoch-formats[format=unix_seconds]",
+      "who": "object-native",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "retention-epoch-formats[format=unix_millis]",
+      "who": "object-native",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "retention-epoch-formats[format=unix_nanos]",
+      "who": "object-native",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
+      "group": "append-and-retention"
+    }
+  ],
+  "retention-sql-after-append-refresh": [
+    {
+      "run": "retention-sql-after-append-refresh",
+      "who": "as-written",
+      "key": "query: SELECT id, deleted FROM widgets WHERE id > 0 ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 3 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "retention-sql-after-append-refresh",
+      "who": "object-native",
+      "key": "query: SELECT id, deleted FROM widgets WHERE id > 0 ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 3 }",
+      "group": "append-and-retention",
+      "may-pass": true
+    }
+  ],
+  "retention-sql-filtered-read": [
+    {
+      "run": "retention-sql-filtered-read",
+      "who": "cayenne",
+      "key": "query: SELECT id, deleted FROM appended WHERE deleted = true",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "append-and-retention",
+      "may-pass": true
+    },
+    {
+      "run": "retention-sql-filtered-read",
+      "who": "object-native",
+      "key": "query: SELECT id, deleted FROM appended WHERE deleted = true",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "append-and-retention",
+      "may-pass": true
     }
   ]
 }

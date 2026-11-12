@@ -41,7 +41,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     compare,
-    script::{Action, RunVariants, Script, Step, Timing, VariantSpec, matrix_combinations},
+    script::{
+        Action, RunVariants, Script, SidecarSpec, Step, Tier, Timing, VariantSpec,
+        matrix_combinations,
+    },
     source::{self, Source},
     spiced::{ContainerRun, Spiced},
     template,
@@ -75,6 +78,7 @@ mod background;
 mod checks;
 mod cluster;
 mod generators;
+mod load;
 mod query;
 mod steps;
 
@@ -82,12 +86,12 @@ use api::{http_step, refresh, source_query, spice_cli};
 use background::{start_background, stop_background};
 use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
 use cluster::{
-    cluster_args, make_cluster_ready, start_executors, undistributed_engine,
-    unpartitionable_acceleration,
+    bridge_address, check_bridged_sources, cluster_args, make_cluster_ready, published_to_bridge,
+    spicepod_for_bridge, start_executors, undistributed_engine, unpartitionable_acceleration,
 };
 use generators::{random_queries, run_slt, tlp};
 use query::{check_error_text, explain, run_query};
-use steps::{describe, one_line, run_instance_step, run_source_step};
+use steps::{describe_step, one_line, run_instance_step, run_source_step};
 
 /// Runs `work` with its output collected instead of printed, and returns
 /// both.
@@ -228,17 +232,71 @@ impl Drop for Held {
     }
 }
 
-/// The `spiced` processes one instance of `script` runs at once: itself, and
-/// its executors on a cluster.
+/// The `spiced` processes one instance of `script` runs at once: itself, its
+/// executors on a cluster, and its sidecar.
 fn instance_weight(script: &Script, options: &Options) -> u32 {
     let cluster = (options.cluster || script.defaults.cluster.is_some())
         && script.defaults.executor_args.is_none();
-    let processes = if cluster {
-        1 + script.defaults.cluster.as_ref().map_or(1, |c| c.executors)
+    let executors = if cluster {
+        script.defaults.cluster.as_ref().map_or(1, |c| c.executors)
     } else {
-        1 + usize::from(script.defaults.executor_args.is_some())
+        usize::from(script.defaults.executor_args.is_some())
     };
+    let processes = 1 + executors + usize::from(script.sidecar.is_some());
     u32::try_from(processes).unwrap_or(u32::MAX)
+}
+
+/// Whether the instances of a run have executors, which a step's
+/// `cluster:` asks about: a cluster by `--cluster` or `defaults.cluster`, or
+/// an executor started by `defaults.executor-args`.
+fn runs_executors(script: &Script, options: &Options) -> bool {
+    options.cluster || script.defaults.cluster.is_some() || script.defaults.executor_args.is_some()
+}
+
+/// Whether the instances run as a cluster: a scheduler with the executors of
+/// `defaults.cluster` (or `--cluster`), rather than `executor-args`.
+fn runs_cluster(script: &Script, options: &Options) -> bool {
+    (options.cluster || script.defaults.cluster.is_some())
+        && script.defaults.executor_args.is_none()
+}
+
+/// Whether the cluster's executors run in containers of their own.
+fn executors_in_containers(script: &Script, options: &Options) -> bool {
+    runs_cluster(script, options)
+        && script
+            .defaults
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.containers)
+}
+
+/// The most executor containers a combination's instances start: every
+/// executor and spare of every instance, where executors run in containers.
+/// Instances skipped when they are created start none, so the combination
+/// gives their share back then.
+fn executor_containers_bound(
+    script: &Script,
+    options: &Options,
+    combo: &Map<String, Value>,
+) -> u64 {
+    if !cfg!(target_os = "linux") || !executors_in_containers(script, options) {
+        return 0;
+    }
+    let per_instance = script
+        .defaults
+        .cluster
+        .as_ref()
+        .map_or(1, |c| c.executors + c.spare);
+    let variants = if script.variants.is_empty() {
+        1
+    } else {
+        script
+            .variants
+            .values()
+            .filter(|v| when_matches(&v.when, combo))
+            .count()
+    };
+    u64::try_from(per_instance * variants * options.targets.len()).unwrap_or(u64::MAX)
 }
 
 /// How a combination's instances run.
@@ -437,6 +495,10 @@ struct Instance {
     spicepod_yaml: String,
     /// The rendered spicepod, which `patch:` on a start changes.
     spicepod: Value,
+    /// Where its bridged executors reach this machine (see
+    /// [`crate::spiced::ContainerRun::bridge`]); every rendering of the
+    /// spicepod names sources there.
+    bridge: Option<std::net::IpAddr>,
     /// The namespace this instance owns in each source.
     namespaces: BTreeMap<String, String>,
     /// Set when a lifecycle step failed; later steps are skipped.
@@ -445,6 +507,9 @@ struct Instance {
     answers: BTreeMap<usize, Vec<RecordBatch>>,
     /// Answers of queries that carry an `id`.
     named: BTreeMap<String, Vec<RecordBatch>>,
+    /// Kernel key quota room the combination reserved for its executor
+    /// containers, which each gives back as it starts (see `crate::keyquota`).
+    key_room: Option<KeyRoom>,
     /// What `${…}` placeholders resolve to, in the spicepod and in step SQL.
     context: Value,
     /// The `spice` CLI that `spice` steps run.
@@ -458,6 +523,18 @@ struct Instance {
     /// When this instance began each corpus's queries, by corpus position:
     /// the start of the `eventually` limit they share.
     corpus_started: BTreeMap<usize, Instant>,
+    /// The application sidecar in front of `spiced` (`sidecar:`).
+    sidecar: Option<Sidecar>,
+}
+
+/// An instance's application sidecar: a `spiced --role sidecar` whose
+/// datasets read the instance's `spiced`, its upstream.
+struct Sidecar {
+    spiced: Spiced,
+    spicepod_yaml: String,
+    /// Where the upstream's executors wait while a step reaches the sidecar
+    /// in the upstream's place (see `steps::run_instance_step`).
+    parked_executors: Vec<Spiced>,
 }
 
 /// How long `spiced` gets to shut down after SIGTERM before `stop` and
@@ -499,6 +576,23 @@ impl Instance {
     fn sql(&self, text: &str) -> Result<String> {
         template::substitute_text(text, &self.context)
     }
+
+    /// The `spiced` a step reaches: the one its `on:` names, else the one its
+    /// action does by default; the instance's own without a sidecar.
+    fn tier(&self, step: &Step) -> Tier {
+        if self.sidecar.is_none() {
+            return Tier::Upstream;
+        }
+        step.on.unwrap_or_else(|| step.action.default_tier())
+    }
+
+    /// The `spiced` on `tier`.
+    fn spiced_on(&mut self, tier: Tier) -> &mut Spiced {
+        match (tier, self.sidecar.as_mut()) {
+            (Tier::Sidecar, Some(sidecar)) => &mut sidecar.spiced,
+            _ => &mut self.spiced,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -539,7 +633,7 @@ impl Sources {
             (a, b) if a == b => {}
             (SourceState::Running, SourceState::Stopped) => container.stop().await?,
             (SourceState::Running, SourceState::Paused) => container.pause().await?,
-            (SourceState::Stopped, SourceState::Running) => container.resume().await?,
+            (SourceState::Stopped, SourceState::Running) => container.start_stopped().await?,
             (SourceState::Paused, SourceState::Running) => container.unpause().await?,
             (SourceState::Paused, SourceState::Stopped) => {
                 container.unpause().await?;
@@ -639,17 +733,59 @@ async fn run_combination(
             .context("base release was not fetched")?;
         say!("   from   v{} ({from})", release.version);
     }
-    // The steps of this matrix combination.
+    // The steps of this matrix combination, and of a run with or without
+    // executors.
+    let with_executors = runs_executors(script, options);
     let steps: Vec<Step> = script
         .steps
         .iter()
-        .filter(|s| when_matches(&s.when, combo))
+        .filter(|s| when_matches(&s.when, combo) && s.cluster.is_none_or(|c| c == with_executors))
         .cloned()
         .collect();
     let schedule = schedule(script, &steps);
     let weight = instance_weight(script, options);
     let instance_count =
         u32::try_from(options.targets.len() * script.variants.len().max(1)).unwrap_or(u32::MAX);
+    let matrix_ctx = json!({ "matrix": combo });
+    let mut resolved = Vec::new();
+    for (name, spec) in &script.sources {
+        let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
+        let version = spec
+            .version
+            .as_deref()
+            .map(|v| template::substitute_text(v, &matrix_ctx))
+            .transpose()?;
+        resolved.push((name, spec, kind, version));
+    }
+    let mut duckdb_releases = Vec::new();
+    for (name, _, kind, version) in &resolved {
+        if matches!(kind.as_str(), "duckdb" | "ducklake") {
+            let release = source::duckdb_cli::version(version.as_deref())?;
+            duckdb_releases.push(((*name).clone(), kind.clone(), release));
+        }
+    }
+    one_duckdb_release(&duckdb_releases)?;
+    // Under a rootless Docker daemon each running container holds a key of a
+    // quota shared with every other job on the host, so a combination starts
+    // only once there is room for every container it starts: its sources and
+    // its executors (see `crate::keyquota`). Reserved, not only checked, so
+    // two combinations admitted together cannot each start part of their
+    // containers and then wait on each other's room; and reserved before the
+    // `--jobs` slots, so no combination waits for room while holding slots
+    // another needs to start the containers that hold that room. Each
+    // container gives back its share as it starts and holds a key of its own.
+    let source_containers: u64 = resolved
+        .iter()
+        .map(|(_, _, kind, _)| source::containers(kind))
+        .sum();
+    let executor_containers = executor_containers_bound(script, options, combo);
+    let key_room = Arc::new(
+        crate::keyquota::reserve_room(
+            source_containers + executor_containers,
+            &format!("the containers of {run_label}"),
+        )
+        .await?,
+    );
     // Sources start only once the first instance has its slots, so waiting
     // combinations hold no containers.
     let first_permit = slots
@@ -665,41 +801,57 @@ async fn run_combination(
         kinds: BTreeMap::new(),
     };
     let result = async {
-        let matrix_ctx = json!({ "matrix": combo });
-        let mut resolved = Vec::new();
-        for (name, spec) in &script.sources {
-            let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
-            let version = spec
-                .version
-                .as_deref()
-                .map(|v| template::substitute_text(v, &matrix_ctx))
-                .transpose()?;
-            resolved.push((name, spec, kind, version));
+        // Bridged executors reach the sources at this address, not loopback.
+        let bridge = bridge_address(script, options).await?;
+        if bridge.is_some() {
+            check_bridged_sources(
+                script,
+                resolved
+                    .iter()
+                    .map(|(name, _, kind, _)| (name.as_str(), kind.as_str())),
+            )?;
         }
-        let mut duckdb_releases = Vec::new();
-        for (name, _, kind, version) in &resolved {
-            if matches!(kind.as_str(), "duckdb" | "ducklake") {
-                let release = source::duckdb_cli::version(version.as_deref())?;
-                duckdb_releases.push(((*name).clone(), kind.clone(), release));
-            }
-        }
-        one_duckdb_release(&duckdb_releases)?;
         for (name, spec, kind, version) in resolved {
-            let src = source::start(
-                name,
-                run_id,
-                &kind,
-                version.as_deref(),
-                &options.work_dir.join(run_id).join("sources"),
-                spec,
+            let src = crate::docker::publishing_also_on(
+                bridge.filter(|_| published_to_bridge(&kind)),
+                source::start(
+                    name,
+                    run_id,
+                    &kind,
+                    version.as_deref(),
+                    &options.work_dir.join(run_id).join("sources"),
+                    spec,
+                ),
             )
             .await
             .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
             sources.by_name.insert(name.clone(), Arc::from(src));
             sources.state.insert(name.clone(), SourceState::Running);
+            key_room.release(source::containers(&kind));
             sources.kinds.insert(name.clone(), kind);
         }
         let mut instances = create_instances(script, options, combo, run_id, &sources).await?;
+        // Instances that were skipped start no executors: give their share
+        // back, and let each remaining executor give back its own as it starts.
+        let created: u64 = instances
+            .iter()
+            .flat_map(|instance| &instance.executors)
+            .filter(|executor| executor.container_name().is_some())
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        key_room.release(executor_containers.saturating_sub(created));
+        for instance in &mut instances {
+            let unstarted = instance
+                .executors
+                .iter()
+                .map(|executor| executor.container_name().is_some())
+                .collect();
+            instance.key_room = Some(KeyRoom {
+                reservation: Arc::clone(&key_room),
+                unstarted,
+            });
+        }
         match schedule {
             Schedule::Lockstep => {
                 run_lockstep(
@@ -765,6 +917,9 @@ async fn run_combination(
             for executor in &mut instance.executors {
                 stopping.push(executor.stop(TEARDOWN_TIMEOUT));
             }
+            if let Some(sidecar) = &mut instance.sidecar {
+                stopping.push(sidecar.spiced.stop(TEARDOWN_TIMEOUT));
+            }
         }
         let _ = futures::future::join_all(stopping).await;
         for instance in &mut instances {
@@ -774,6 +929,13 @@ async fn run_combination(
                     instance.label,
                     instance.spiced.log_path().display()
                 );
+                if let Some(sidecar) = &instance.sidecar {
+                    say!(
+                        "   {} sidecar log: {}",
+                        instance.label,
+                        sidecar.spiced.log_path().display()
+                    );
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -944,6 +1106,17 @@ async fn create_instances(
         None
     };
     let release_binary = base_release.map(|release| &release.binary);
+    // A host-network container behind a rootless daemon cannot reach this
+    // machine's loopback, so `spiced` then also listens where it can.
+    let rootless_reach = cfg!(target_os = "linux")
+        && script.sources.values().any(|s| s.host_network)
+        && crate::docker::daemon_is_rootless().await;
+    let bridge = bridge_address(script, options).await?;
+    let host_from_container = if rootless_reach {
+        crate::docker::routable_address()?.to_string()
+    } else {
+        "host.docker.internal".to_string()
+    };
     let mut instances = Vec::new();
     for target in &options.targets {
         for (variant_name, variant) in variants {
@@ -977,12 +1150,31 @@ async fn create_instances(
                 source_ctx.insert(name.clone(), Value::Object(entry));
                 namespaces.insert(name.clone(), namespace);
             }
+            // `spiced` serves HTTP on every interface when `rootless_reach`
+            // is set, so its port must be free on the wildcard address too.
+            // A port served beyond loopback must be free there too: a loopback
+            // probe misses a listener on another address. Bridged nodes serve
+            // the scheduler and executor ports at the routable address.
+            let wide_ip: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
+            let loopback_ip: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+            let http_port = crate::docker::free_port_on(if rootless_reach || bridge.is_some() {
+                wide_ip
+            } else {
+                loopback_ip
+            })?;
+            let node_ip = if bridge.is_some() {
+                wide_ip
+            } else {
+                loopback_ip
+            };
             let context = json!({
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
-                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
-                    "executor_port": crate::docker::free_port()?, "http_port": crate::docker::free_port()? },
+                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port_on(node_ip)?,
+                    "executor_port": crate::docker::free_port_on(node_ip)?, "http_port": http_port,
+                    "flight_port": crate::docker::free_port_on(node_ip)?,
+                    "host_from_container": host_from_container },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
                 "pki": { "dir": options.pki.display().to_string() },
             });
@@ -991,20 +1183,20 @@ async fn create_instances(
                 .with_context(|| format!("variant '{variant_name}'"))?;
             let mut spicepod = template::substitute(&spicepod, &context)?;
             disable_results_cache_unless_configured(&mut spicepod);
-            let cluster = (options.cluster || script.defaults.cluster.is_some())
-                && script.defaults.executor_args.is_none();
-            let containers = cluster
-                && script
-                    .defaults
-                    .cluster
-                    .as_ref()
-                    .is_some_and(|c| c.containers);
+            let spiced_args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
+            let mut spiced_args: Vec<String> = serde_json::from_value(spiced_args)?;
+            let cluster = runs_cluster(script, options);
+            let containers = executors_in_containers(script, options);
             if cluster {
-                if spicepod.pointer("/runtime/mode").and_then(Value::as_str) == Some("sidecar") {
-                    say!(
-                        "   skip {label:<20} runtime.mode: sidecar does not run as a cluster node"
-                    );
-                    continue;
+                // The cluster run gives the instance its scheduler role, which
+                // replaces the default `--role server` but no other role.
+                match role_arg(&spiced_args) {
+                    Some("server") => strip_role_arg(&mut spiced_args),
+                    Some(role) => {
+                        say!("   skip {label:<20} `--role {role}` does not run as a cluster node");
+                        continue;
+                    }
+                    None => {}
                 }
                 if let Some(engine) = undistributed_engine(&spicepod) {
                     // A cluster accelerates only into Cayenne and Arrow.
@@ -1022,11 +1214,19 @@ async fn create_instances(
                     continue;
                 }
                 make_cluster_ready(&mut spicepod, &dir, &script.defaults.cluster_partition_by);
+                if let Some(address) = bridge {
+                    spicepod_for_bridge(&mut spicepod, address);
+                }
             }
             let context_for_steps = context.clone();
             let spicepod_yaml = yaml::to_string(&spicepod)?;
             let spicepod = spicepod.clone();
-            let mut env = variant.env.clone();
+            // Placeholders in a variant's environment name the run's sources, as in the spicepod.
+            let mut env = variant
+                .env
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), template::substitute_text(value, &context)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
             // DuckDB sources install the library matching the CLI. Make it
             // discoverable by name without changing the harness environment.
             for entry in context["sources"]
@@ -1075,6 +1275,7 @@ async fn create_instances(
                     &options.pki,
                     &context,
                     executor_count + spare_count,
+                    bridge,
                 )?)
             } else {
                 None
@@ -1121,25 +1322,45 @@ async fn create_instances(
                             // certificates, which the image has none of.
                             "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
                         ],
-                    });
+                        rootless: crate::docker::daemon_is_rootless().await,
+                        bridge,
+                    })?;
                 }
                 executors.push(executor);
             }
+            let sidecar = script
+                .sidecar
+                .as_ref()
+                .map(|spec| {
+                    new_sidecar(
+                        spec,
+                        &context,
+                        &dir,
+                        &target.binary,
+                        &format!("{run_id}-{index}-sidecar"),
+                    )
+                })
+                .transpose()
+                .context("the sidecar")?;
             let mut spiced = Spiced::new(first_binary, dir, env)?;
-            if let Some(port) = context["instance"]["http_port"]
-                .as_u64()
-                .and_then(|p| u16::try_from(p).ok())
-            {
+            let port = |name: &str| {
+                context["instance"][name]
+                    .as_u64()
+                    .and_then(|p| u16::try_from(p).ok())
+            };
+            if let Some(port) = port("http_port") {
                 spiced.set_http_port(port);
+            }
+            spiced.set_http_on_every_interface(rootless_reach);
+            if let Some(port) = port("flight_port") {
+                spiced.set_flight_port(port);
             }
             spiced.set_api_key(script.defaults.api_key.clone())?;
             spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
-            let args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
-            let mut args: Vec<String> = serde_json::from_value(args)?;
             if let Some((scheduler, _)) = &cluster_args {
-                args.extend(scheduler.iter().cloned());
+                spiced_args.extend(scheduler.iter().cloned());
             }
-            spiced.set_extra_args(args);
+            spiced.set_extra_args(spiced_args);
             instances.push(Instance {
                 label,
                 variant: variant_name.clone(),
@@ -1150,6 +1371,7 @@ async fn create_instances(
                 executors,
                 spicepod_yaml,
                 spicepod,
+                bridge,
                 namespaces,
                 broken: None,
                 answers: BTreeMap::new(),
@@ -1160,11 +1382,63 @@ async fn create_instances(
                 background: BTreeMap::new(),
                 cache_dir: options.work_dir.join("cache"),
                 corpus_started: BTreeMap::new(),
+                sidecar,
+                key_room: None,
             });
         }
     }
     Ok(instances)
 }
+
+/// The sidecar of the instance whose placeholders are `context`, in a
+/// directory of its own under the instance's `dir`. It runs `binary`, the
+/// binary under test, from the first start: a release an upgrade starts on
+/// may have no sidecar role.
+fn new_sidecar(
+    spec: &SidecarSpec,
+    context: &Value,
+    dir: &Path,
+    binary: &Path,
+    instance_id: &str,
+) -> Result<Sidecar> {
+    let mut env = spec.env.clone();
+    env.insert("SPICE_INSTANCE_ID".into(), instance_id.to_string());
+    let mut spiced = Spiced::new(binary.to_path_buf(), dir.join("sidecar"), env)?;
+    // A `spice.ai:` dataset without a key would take this one from the
+    // environment, or from a dotenv file above the run directory, and present
+    // it to an upstream that may require another.
+    if !spec.env.contains_key(SPICEAI_API_KEY) {
+        spiced.remove_env(SPICEAI_API_KEY);
+    }
+    spiced.set_api_key(spec.api_key.clone())?;
+    spiced.set_extra_args(sidecar_args(spec, context)?);
+    Ok(Sidecar {
+        spiced,
+        spicepod_yaml: sidecar_spicepod(spec, context)?,
+        parked_executors: Vec::new(),
+    })
+}
+
+/// The sidecar's spicepod with its placeholders resolved, and the results
+/// cache off unless it configures one, as for any instance.
+fn sidecar_spicepod(spec: &SidecarSpec, context: &Value) -> Result<String> {
+    let mut spicepod = template::substitute(&spec.spicepod, context)?;
+    disable_results_cache_unless_configured(&mut spicepod);
+    Ok(yaml::to_string(&spicepod)?)
+}
+
+/// The sidecar's arguments: `--role sidecar`, then its own, each placeholder
+/// rendered as text (`'${matrix.cores}'` is `2`, not a number).
+fn sidecar_args(spec: &SidecarSpec, context: &Value) -> Result<Vec<String>> {
+    let mut args = vec!["--role".to_string(), "sidecar".to_string()];
+    for arg in &spec.args {
+        args.push(template::substitute_text(arg, context)?);
+    }
+    Ok(args)
+}
+
+/// The variable a `spice.ai:` dataset's `spiceai_api_key` defaults to.
+const SPICEAI_API_KEY: &str = "SPICEAI_API_KEY";
 
 fn is_source_step(action: &Action) -> bool {
     matches!(
@@ -1296,11 +1570,36 @@ async fn run_independent(
     }
 }
 
-/// Stops an instance's `spiced` and executors together.
+/// The share of its combination's kernel key quota reservation that an
+/// instance's executor containers hold until each first starts.
+struct KeyRoom {
+    reservation: Arc<crate::keyquota::Reservation<'static>>,
+    /// By executor index: whether it runs in a container that has not yet
+    /// started, and so still holds a share.
+    unstarted: Vec<bool>,
+}
+
+impl KeyRoom {
+    /// Gives back executor `index`'s share once, the first time it starts
+    /// healthy; a restart takes a key of its own and gives back nothing, so it
+    /// cannot spend a share held for another executor.
+    fn executor_started(&mut self, index: usize) {
+        if let Some(unstarted) = self.unstarted.get_mut(index)
+            && std::mem::take(unstarted)
+        {
+            self.reservation.release(1);
+        }
+    }
+}
+
+/// Stops an instance's `spiced`, executors and sidecar together.
 async fn stop_processes(instance: &mut Instance) {
     let mut stopping = vec![instance.spiced.stop(TEARDOWN_TIMEOUT)];
     for executor in &mut instance.executors {
         stopping.push(executor.stop(TEARDOWN_TIMEOUT));
+    }
+    if let Some(sidecar) = &mut instance.sidecar {
+        stopping.push(sidecar.spiced.stop(TEARDOWN_TIMEOUT));
     }
     let _ = futures::future::join_all(stopping).await;
 }
@@ -1395,7 +1694,7 @@ fn base_release_feature_gap(log: &str, version: &str, spec: &str) -> Option<Stri
 }
 
 fn record(report: &mut Report, run_label: &str, who: &str, step: &Step, outcome: Result<String>) {
-    let what = describe(&step.action);
+    let what = describe_step(step);
     match outcome {
         Ok(detail) => {
             report.passed += 1;
@@ -1486,6 +1785,34 @@ fn when_matches(when: &Map<String, Value>, combo: &Map<String, Value>) -> bool {
         })
 }
 
+/// The value of a `--role` in `spiced` arguments, given as `--role <role>` or
+/// `--role=<role>`.
+fn role_arg(args: &[String]) -> Option<&str> {
+    args.iter()
+        .enumerate()
+        .find_map(|(i, arg)| match arg.strip_prefix("--role") {
+            Some("") => args.get(i + 1).map(String::as_str),
+            Some(value) => value.strip_prefix('='),
+            None => None,
+        })
+}
+
+/// Removes every `--role` from `spiced` arguments, with its value.
+fn strip_role_arg(args: &mut Vec<String>) {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].strip_prefix("--role") {
+            Some("") => {
+                args.drain(i..(i + 2).min(args.len()));
+            }
+            Some(value) if value.starts_with('=') => {
+                args.remove(i);
+            }
+            _ => i += 1,
+        }
+    }
+}
+
 fn disable_results_cache_unless_configured(spicepod: &mut Value) {
     let Some(root) = spicepod.as_object_mut() else {
         return;
@@ -1533,6 +1860,10 @@ fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<(
         when: Map::new(),
     };
     template::apply_variant(&mut instance.spicepod, &resolved)?;
+    // A patch renders source parameters from the context, at loopback again.
+    if let Some(address) = instance.bridge {
+        spicepod_for_bridge(&mut instance.spicepod, address);
+    }
     instance.spicepod_yaml = yaml::to_string(&instance.spicepod)?;
     Ok(())
 }
@@ -1622,6 +1953,100 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// An executor gives back its share of the combination's reservation the
+    /// first time it starts, and only then: a restart (after `kill-executor`)
+    /// must not spend a share still held for a spare that has not started.
+    #[test]
+    fn an_executor_gives_back_its_key_share_once() {
+        let pool: &'static crate::keyquota::Reservations =
+            Box::leak(Box::new(crate::keyquota::Reservations::new()));
+        let reservation = Arc::new(crate::keyquota::Reservation::held_in(pool, 2));
+        // Executor 0 and a spare, both in containers; executor 2 runs on the host.
+        let mut room = KeyRoom {
+            reservation: Arc::clone(&reservation),
+            unstarted: vec![true, true, false],
+        };
+        room.executor_started(0);
+        assert_eq!(reservation.remaining(), 1);
+        // Executor 0 restarts: the spare's share stays held.
+        room.executor_started(0);
+        assert_eq!(reservation.remaining(), 1);
+        // A host process, and an index past the executors, hold no share.
+        room.executor_started(2);
+        room.executor_started(7);
+        assert_eq!(reservation.remaining(), 1);
+        room.executor_started(1);
+        assert_eq!(reservation.remaining(), 0);
+    }
+
+    #[test]
+    fn role_args_are_found_and_stripped_in_both_spellings() {
+        let args = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (given, role, stripped) in [
+            (
+                &["--role", "server", "--http", "x"][..],
+                Some("server"),
+                &["--http", "x"][..],
+            ),
+            (
+                &["--http", "x", "--role=sidecar"][..],
+                Some("sidecar"),
+                &["--http", "x"][..],
+            ),
+            (&["--roles", "x"][..], None, &["--roles", "x"][..]),
+            (&[][..], None, &[][..]),
+        ] {
+            let mut given = args(given);
+            assert_eq!(role_arg(&given), role);
+            strip_role_arg(&mut given);
+            assert_eq!(given, args(stripped));
+        }
+    }
+
+    #[test]
+    fn a_sidecar_reads_the_upstream_ports_and_runs_as_a_sidecar() {
+        let script = Script::parse(
+            r"
+name: s
+spicepod: {}
+sidecar:
+  spicepod:
+    datasets:
+      - from: spice.ai:orders
+        name: orders
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+  args: [--cpu-cores, '${matrix.cores}']
+steps: [{ start: {} }]
+",
+        )
+        .expect("script parses");
+        let spec = script.sidecar.as_ref().expect("a sidecar");
+        let context = json!({ "instance": { "flight_port": 50061 }, "matrix": { "cores": 2 } });
+        assert_eq!(
+            sidecar_args(spec, &context).expect("args"),
+            ["--role", "sidecar", "--cpu-cores", "2"]
+        );
+        let spicepod: Value =
+            yaml::from_str(&sidecar_spicepod(spec, &context).expect("spicepod")).expect("YAML");
+        assert_eq!(
+            spicepod,
+            json!({
+                "datasets": [{
+                    "from": "spice.ai:orders",
+                    "name": "orders",
+                    "params": { "spiceai_endpoint": "http://127.0.0.1:50061" },
+                }],
+                "runtime": { "caching": { "sql_results": { "enabled": false } } },
+            })
+        );
+        let err = sidecar_spicepod(spec, &json!({ "instance": {} })).expect_err("no port");
+        assert!(
+            err.to_string()
+                .contains("unknown placeholder '${instance.flight_port}'"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn a_corpus_shares_one_eventually_limit_and_nothing_else_does() {

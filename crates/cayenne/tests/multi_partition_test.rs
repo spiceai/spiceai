@@ -82,7 +82,7 @@ async fn test_two_level_partition_basic_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -179,7 +179,7 @@ async fn test_three_level_partition_basic_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -299,7 +299,7 @@ async fn test_mixed_type_partition_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -408,7 +408,7 @@ async fn test_composite_partition_metadata_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -513,7 +513,7 @@ async fn test_partition_data_isolation_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -638,7 +638,7 @@ async fn test_multi_partition_stress_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -764,7 +764,7 @@ async fn test_partition_value_edge_cases_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -861,7 +861,7 @@ async fn test_aggregation_across_partitions_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )

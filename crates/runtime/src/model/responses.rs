@@ -20,7 +20,7 @@ use crate::model::params::azure::AzureModelParams;
 use crate::model::params::openai::OpenAiModelParams;
 use crate::model::params::xai::XaiModelParams;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
-use crate::model::wrapper::responses::ResponsesWrapper;
+use crate::model::wrapper::responses::{ResponsesRequestDefaults, ResponsesWrapper};
 use crate::tools::registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools};
 use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
@@ -114,7 +114,16 @@ pub async fn try_to_responses_model(
         Some(_) | None => model,
     };
 
-    Ok(tool_model)
+    // The Spicepod's request defaults go above the tool loop, so they apply once to each client
+    // request rather than again to each round of the loop.
+    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
+        from: component.from.clone(),
+    })?;
+    Ok(Arc::new(ResponsesRequestDefaults::new(
+        tool_model,
+        component.name.as_str(),
+        get_openai_responses_request_overrides(component, source.short_name()),
+    )))
 }
 
 async fn typed_params<P: TypedParams>(
@@ -150,7 +159,7 @@ async fn construct_model(
         ModelSource::Azure => {
             let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            azure(model_id, component.name.as_str(), &p)
+            azure(model_id, component.name.as_str(), &p).await
         }
         ModelSource::Xai => {
             let p =
@@ -177,7 +186,6 @@ async fn construct_model(
         model,
         component.name.as_str(),
         system_prompt,
-        get_openai_responses_request_overrides(component, source.short_name()),
     )))
 }
 
@@ -222,8 +230,9 @@ async fn openai(
     }
 
     let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
+    let label = format!("model '{model_name}' (openai)");
     if let Some(client) = llms::workload_identity::openai_federated_client(
-        &format!("model '{model_name}' (openai)"),
+        &label,
         &model,
         &params.federation(),
         llms::workload_identity::openai_api_key_in_spicepod(raw_params),
@@ -234,64 +243,32 @@ async fn openai(
     {
         return Ok(Arc::new(client) as Arc<dyn Responses>);
     }
+    if let Some(message) = llms::workload_identity::openai_missing_credential(
+        &label,
+        api_key,
+        params.endpoint.as_str(),
+    ) {
+        return Err(LlmError::FailedToAuthenticate {
+            source: message.into(),
+        });
+    }
 
     Ok(Arc::new(llms::openai::new_openai_client(
         model, api_base, api_key, org_id, project_id, usage_tier,
     )) as Arc<dyn Responses>)
 }
 
-fn azure(
+async fn azure(
     model_id: Option<String>,
-    model_name: &str,
+    component_name: &str,
     params: &AzureModelParams,
 ) -> Result<Arc<dyn Responses>, LlmError> {
-    let Some(model_name) = model_id else {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
-).into(),
-        });
-    };
-    let api_base = params.endpoint.as_deref();
-    let api_version = params.api_version.as_deref();
-    let deployment_name = params.deployment_name.as_deref();
-    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
-    let entra_token = params.entra_token.as_ref().map(ExposeSecret::expose_secret);
-
-    if api_base.is_none() {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-    "Azure model '{model_name}' requires the 'endpoint' parameter. See https://spiceai.org/docs/components/models/azure for details."
-).into(),
-        });
-    }
-
-    if api_key.is_some() && entra_token.is_some() {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-                "Azure model '{model_name}' allows only one of 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
-            )
-            .into(),
-        });
-    }
-
-    if api_key.is_none() && entra_token.is_none() {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
-            )
-            .into(),
-        });
-    }
-
-    Ok(Arc::new(llms::openai::new_azure_client(
-        model_name,
-        api_base,
-        api_version,
-        deployment_name,
-        entra_token,
-        api_key,
-    )) as Arc<dyn Responses>)
+    Ok(
+        match super::chat::azure_client(model_id, component_name, params).await? {
+            super::chat::AzureClient::Federated(client) => Arc::new(client) as Arc<dyn Responses>,
+            super::chat::AzureClient::Key(client) => Arc::new(client) as Arc<dyn Responses>,
+        },
+    )
 }
 
 fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Responses>, LlmError> {

@@ -89,6 +89,7 @@ use llms::chat::{
 use llms::streaming_utils::generate_stream_id;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
+mod batching;
 mod distributed;
 mod harmony;
 
@@ -143,6 +144,10 @@ fn load_weights<'a>(
 /// Tokens decoded per forward pass while reading the prompt.
 const PROMPT_BATCH: usize = 512;
 
+/// The most requests one model decodes together. A step's batch holds each one's next token and
+/// draft, which stays well within the context's batch size (`PROMPT_BATCH`).
+const MAX_CONCURRENT: u32 = 8;
+
 /// The context size when the model sets no `context_length`.
 const DEFAULT_CONTEXT: u32 = 8192;
 
@@ -194,8 +199,9 @@ fn draft_len(kind: DraftKind, mtp: i32) -> i32 {
     }
 }
 
-/// How many streamed tokens may wait for a slow client before decoding pauses.
-const STREAM_BUFFER: usize = 64;
+/// How many streamed tokens may wait for a slow client before decoding pauses. Tests read it
+/// to send a reply longer than a client that stops reading can buffer.
+pub const STREAM_BUFFER: usize = 64;
 
 /// The most choices one request may ask for, as `OpenAI`'s `n` allows.
 const MAX_CHOICES: u8 = 128;
@@ -405,6 +411,10 @@ impl LlamaCpp {
         let (freed_tx, freed_rx) = std_mpsc::channel::<()>();
         let name = options.reasoning.model_name.to_string();
         let file = file_name(&first);
+        let concurrent = options
+            .concurrent_requests
+            .map_or(1, NonZeroU32::get)
+            .min(MAX_CONCURRENT);
         thread::Builder::new()
             .name("llama-cpp".to_string())
             .spawn(move || {
@@ -413,7 +423,7 @@ impl LlamaCpp {
                     &first,
                     draft.as_deref(),
                     &devices,
-                    n_ctx,
+                    (n_ctx, concurrent),
                     ready_tx,
                     &jobs_rx,
                 );
@@ -963,13 +973,14 @@ fn render(
     .map_err(|e| e.to_string())
 }
 
-/// The decode thread: loads the model, reports readiness, then runs jobs in order.
+/// The decode thread: loads the model, reports readiness, then runs jobs: one at a time, in
+/// order, or up to `concurrent` together, each in its own sequence of one shared cache.
 fn serve(
     name: &str,
     path: &Path,
     draft: Option<&Path>,
     devices: &[llama_cpp::rpc::Device],
-    n_ctx: Option<NonZeroU32>,
+    (n_ctx, concurrent): (Option<NonZeroU32>, u32),
     ready: oneshot::Sender<std::result::Result<Loaded, ChatError>>,
     jobs: &std_mpsc::Receiver<Job>,
 ) {
@@ -1045,10 +1056,13 @@ fn serve(
     let snapshots = head.map_or(0, |(_, kind)| {
         u32::try_from(draft_len(kind, mtp_len)).unwrap_or(0)
     });
-    let context_params = ContextParams::default()
-        .with_n_ctx(n_ctx)
-        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
-        .with_n_rs_seq(snapshots);
+    let context_params = shared_cache(
+        ContextParams::default()
+            .with_n_ctx(n_ctx)
+            .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
+            .with_n_rs_seq(snapshots),
+        concurrent,
+    );
     let context = match model.new_context(backend, &context_params) {
         Ok(context) => context,
         Err(e) => {
@@ -1061,7 +1075,7 @@ fn serve(
     let context_window = context.n_ctx();
     let mut decoder = match head {
         None => Decoder::Plain(context),
-        Some((head, kind)) => match mtp(head, kind, context, mtp_len) {
+        Some((head, kind)) => match mtp(head, kind, context, (mtp_len, concurrent)) {
             Ok(spec) => Decoder::Mtp(Box::new(spec)),
             Err(message) => {
                 let _ = ready.send(Err(failed(message)));
@@ -1093,6 +1107,16 @@ fn serve(
     if ready.send(Ok(loaded)).is_err() {
         return;
     }
+    if concurrent > 1 {
+        let mut caches = vec![cache];
+        while caches.len() < usize::try_from(concurrent).unwrap_or(usize::MAX) {
+            let mut more = PromptCache::new(name, truncation);
+            more.reused = Arc::clone(&caches[0].reused);
+            caches.push(more);
+        }
+        batching::serve(&model, &mut decoder, split, caches, jobs, &eog);
+        return;
+    }
     while let Ok(job) = jobs.recv() {
         // A client that has gone, as one that stopped reading before a later choice's turn,
         // is not decoded for.
@@ -1102,7 +1126,7 @@ fn serve(
         let events = job.events.clone();
         let stopping = Arc::clone(&job.stopping);
         let result = match &mut decoder {
-            Decoder::Plain(context) => generate(&model, context, &mut cache, job, &eog),
+            Decoder::Plain(context) => generate(&model, context, split, &mut cache, job, &eog),
             Decoder::Mtp(spec) => generate_mtp(&model, spec, split, &mut cache, job, &eog),
         };
         let event = match result {
@@ -1323,11 +1347,14 @@ fn mtp<'m>(
     draft_model: &'m Model,
     kind: DraftKind,
     context: Context<'m>,
-    mtp_len: i32,
+    (mtp_len, concurrent): (i32, u32),
 ) -> std::result::Result<Mtp<'m>, String> {
-    let params = ContextParams::default()
-        .with_n_ctx(NonZeroU32::new(context.n_ctx()))
-        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX));
+    let params = shared_cache(
+        ContextParams::default()
+            .with_n_ctx(NonZeroU32::new(context.n_ctx()))
+            .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX)),
+        concurrent,
+    );
     Mtp::new(
         context,
         draft_model,
@@ -1342,6 +1369,16 @@ fn mtp<'m>(
     .map_err(|e| format!("llama.cpp could not start drafting: {e}"))
 }
 
+/// `params` for a context that holds `concurrent` sequences on one cache of `n_ctx` cells, so any
+/// one of them can still use the whole context; one sequence, as `params` stands, for one.
+fn shared_cache(params: ContextParams, concurrent: u32) -> ContextParams {
+    if concurrent > 1 {
+        params.with_n_seq_max(concurrent).with_kv_unified(true)
+    } else {
+        params
+    }
+}
+
 /// What prompt reading needs from either engine.
 trait Target<'m> {
     fn context(&self) -> &Context<'m>;
@@ -1353,6 +1390,21 @@ trait Target<'m> {
     fn clear(&mut self);
     /// Called after every target decode; the MTP head reads the batch's hidden states.
     fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String>;
+    /// Whether a draft head reads the target's hidden states, pairing each token with the state
+    /// at the position before it: a cut cache then needs the head's state for the position before
+    /// the cut (`head_state`), or the next read's first token pairs with none.
+    fn has_head(&self) -> bool;
+    /// The draft head's state that cutting the caches back does not restore, for the position
+    /// after the last one it read; `None` without a head.
+    fn head_state(&mut self) -> Option<Vec<u8>>;
+    /// Restores what `head_state` returned; false when the head does not take it.
+    fn restore_head_state(&mut self, state: &[u8]) -> bool;
+    /// The sequence of the shared cache this target reads prompts into and generates in.
+    fn seq(&self) -> i32;
+    /// The sequence's state that a truncation cannot restore (`Context::partial_state_seq`).
+    fn partial_state(&self) -> Option<Vec<u8>>;
+    /// Restores what `partial_state` returned; false when llama.cpp does not read all of it.
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool;
 }
 
 impl<'m> Target<'m> for Context<'m> {
@@ -1370,6 +1422,24 @@ impl<'m> Target<'m> for Context<'m> {
     }
     fn decoded(&mut self, _: &Batch) -> std::result::Result<(), String> {
         Ok(())
+    }
+    fn has_head(&self) -> bool {
+        false
+    }
+    fn head_state(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+    fn restore_head_state(&mut self, _: &[u8]) -> bool {
+        false
+    }
+    fn seq(&self) -> i32 {
+        0
+    }
+    fn partial_state(&self) -> Option<Vec<u8>> {
+        Context::partial_state(self)
+    }
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        Context::restore_partial_state(self, state)
     }
 }
 
@@ -1390,6 +1460,27 @@ impl<'m> Target<'m> for Mtp<'m> {
     fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String> {
         self.process(batch).map_err(|e| e.to_string())
     }
+    fn has_head(&self) -> bool {
+        // Only an MTP head pairs a token with the hidden state before it and carries that state
+        // from one read to the next. A DFlash or DSpark drafter reads its features from the batch
+        // in hand, and keeps no state to save, so its prompt cache reuses what it shares.
+        self.kind() == DraftKind::Mtp
+    }
+    fn head_state(&mut self) -> Option<Vec<u8>> {
+        self.state(0).ok().flatten()
+    }
+    fn restore_head_state(&mut self, state: &[u8]) -> bool {
+        self.restore_state(0, state).is_ok()
+    }
+    fn seq(&self) -> i32 {
+        0
+    }
+    fn partial_state(&self) -> Option<Vec<u8>> {
+        self.target().partial_state()
+    }
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        self.target_mut().restore_partial_state(state)
+    }
 }
 
 /// What the KV cache holds from the last request, so the next one decodes only the part of its
@@ -1407,6 +1498,11 @@ struct PromptCache {
     /// For a cache that cannot be cut back to any position, as a recurrent state or a
     /// compressed cache cannot.
     checkpoints: Option<Checkpoints>,
+    /// For a cache that can be cut back to any position, with a draft head: the head's state
+    /// after the last prompt's first tokens, saved where a checkpoint would be, the position after
+    /// it first. The next prompt reuses the cache up to there, or up to all of it (where the head's
+    /// live state is), so its read pairs its first token with the right hidden state.
+    head_stash: Option<(usize, Vec<u8>)>,
     /// How many prompt tokens the last request read from the cache.
     reused: Arc<AtomicUsize>,
     /// What saving a checkpoint costs against reading prompt tokens again.
@@ -1420,6 +1516,7 @@ impl PromptCache {
             tokens: Vec::new(),
             namespace: None,
             checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
+            head_stash: None,
             reused: Arc::default(),
             cost: CheckpointCost::default(),
         }
@@ -1441,8 +1538,10 @@ impl PromptCache {
         namespace: &CacheNamespace,
     ) -> usize {
         let mut cached = std::mem::take(&mut self.tokens);
+        let mut stash = self.head_stash.take();
         if self.namespace.as_ref() != Some(namespace) {
             cached.clear();
+            stash = None;
             if let Some(checkpoints) = &mut self.checkpoints {
                 checkpoints.clear();
             }
@@ -1463,12 +1562,29 @@ impl PromptCache {
         // as many of them as it has tokens, so after a shorter decode a rollback can restore a
         // snapshot that predates it.
         let truncates = self.checkpoints.is_none() || shared == cached.len();
-        let reused = if shared > 0 && truncates && truncate_to(target, shared) {
-            shared
+        // A draft head pairs a read's first token with the target's hidden state at the position
+        // before it. It holds that state for the end of the cache, so a cut there is exact; a cut
+        // anywhere else stops where the head's state was stashed, or reads the prompt from 0.
+        let (cut, head) = if truncates && target.has_head() && shared < cached.len() {
+            match stash {
+                Some((at, state)) if at <= shared => (at, Some(state)),
+                _ => (0, None),
+            }
+        } else {
+            (shared, None)
+        };
+        let reused = if cut > 0
+            && truncates
+            && truncate_to(target, cut)
+            && head
+                .as_ref()
+                .is_none_or(|state| target.restore_head_state(state))
+        {
+            cut
         } else if let Some(at) = self
             .checkpoints
             .as_ref()
-            .and_then(|checkpoints| checkpoints.restore(target.context_mut()))
+            .and_then(|checkpoints| checkpoints.restore(target))
             && truncate_to(target, at)
         {
             at
@@ -1480,9 +1596,15 @@ impl PromptCache {
             0
         };
         tracing::debug!(
-            "Model '{}' reused {reused} of its {} prompt tokens from the previous request's cache.",
+            "Model '{}' reused {reused} of its {} prompt tokens from the previous request's cache, which shared {shared} of them; {} read again{}.",
             self.model,
-            tokens.len()
+            tokens.len(),
+            shared - reused.min(shared),
+            if target.has_head() && reused > 0 && reused < shared {
+                ", where the draft head holds its state"
+            } else {
+                ""
+            }
         );
         self.reused.store(reused, Ordering::Relaxed);
         reused
@@ -1496,10 +1618,26 @@ impl PromptCache {
         (self.checkpoints.is_some() && at > start && self.cost.pays(at - start)).then_some(at)
     }
 
-    fn save_checkpoint(&mut self, context: &Context<'_>, n_tokens: usize) {
+    /// Where reading a prompt of `len` tokens from `start` on stashes the draft head's state, for
+    /// a cache that can be cut anywhere and so keeps no checkpoints: where a checkpoint would be,
+    /// before the generation prompt the next turn's prompt does not repeat.
+    fn head_stash_at<'m>(
+        &self,
+        target: &impl Target<'m>,
+        start: usize,
+        len: usize,
+    ) -> Option<usize> {
+        if self.checkpoints.is_some() || !target.has_head() {
+            return None;
+        }
+        let at = len.checked_sub(CHECKPOINT_BEFORE_END)?;
+        (at > start).then_some(at)
+    }
+
+    fn save_checkpoint<'m>(&mut self, target: &mut impl Target<'m>, n_tokens: usize) {
         if let Some(checkpoints) = &mut self.checkpoints {
             let started = Instant::now();
-            if let Some(bytes) = checkpoints.save(context, n_tokens) {
+            if let Some(bytes) = checkpoints.save(target, n_tokens) {
                 let took = started.elapsed();
                 self.cost.saved(took);
                 tracing::debug!(
@@ -1514,6 +1652,16 @@ impl PromptCache {
     /// Records that reading `tokens` prompt tokens took `took`, checkpoint saves aside.
     fn read(&mut self, tokens: usize, took: Duration) {
         self.cost.read(tokens, took);
+    }
+
+    /// Forgets everything the cache held, for a sequence whose cells were emptied: by a request
+    /// that failed, or to make room for another request's sequence.
+    fn forget(&mut self) {
+        self.tokens.clear();
+        self.head_stash = None;
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.clear();
+        }
     }
 
     /// Records `tokens` as what the caches hold for the next request, after truncating them to
@@ -1536,18 +1684,25 @@ struct Checkpoint {
     /// How many tokens the state follows.
     n_tokens: usize,
     state: Vec<u8>,
+    /// The draft head's state at the same point, if there is a head.
+    head: Option<Vec<u8>>,
 }
 
 impl Checkpoints {
     /// Saves `context`'s state after its first `n_tokens` tokens, which follow every earlier
     /// checkpoint's, and returns its size in bytes; `None` when llama.cpp saves nothing.
-    fn save(&mut self, context: &Context<'_>, n_tokens: usize) -> Option<usize> {
-        let state = context.partial_state()?;
+    fn save<'m>(&mut self, target: &mut impl Target<'m>, n_tokens: usize) -> Option<usize> {
+        let state = target.partial_state()?;
+        let head = target.head_state();
         if self.0.len() == MAX_CHECKPOINTS {
             self.0.remove(0);
         }
-        let bytes = state.len();
-        self.0.push(Checkpoint { n_tokens, state });
+        let bytes = state.len() + head.as_ref().map_or(0, Vec::len);
+        self.0.push(Checkpoint {
+            n_tokens,
+            state,
+            head,
+        });
         Some(bytes)
     }
 
@@ -1559,11 +1714,14 @@ impl Checkpoints {
     /// Restores the latest checkpoint into `context`, and returns how many tokens it follows.
     /// `None` when there is none, or llama.cpp could not restore it, which leaves `context`'s
     /// cache empty.
-    fn restore(&self, context: &mut Context<'_>) -> Option<usize> {
+    fn restore<'m>(&self, target: &mut impl Target<'m>) -> Option<usize> {
         let latest = self.0.last()?;
-        context
-            .restore_partial_state(&latest.state)
-            .then_some(latest.n_tokens)
+        let restored = target.restore_partial_state(&latest.state)
+            && latest
+                .head
+                .as_ref()
+                .is_none_or(|head| target.restore_head_state(head));
+        restored.then_some(latest.n_tokens)
     }
 
     fn clear(&mut self) {
@@ -1642,7 +1800,8 @@ fn read_prompt<'m>(
     // The prompt is read in two spans split at the checkpoint, so the state saved there
     // follows exactly the tokens before it; without one, the first span is empty.
     let checkpoint = cache.checkpoint_at(start, tokens.len());
-    let split = checkpoint.unwrap_or(start);
+    let stash_at = cache.head_stash_at(&*target, start, tokens.len());
+    let split = checkpoint.or(stash_at).unwrap_or(start);
     // Each span is timed to its computation's end, so the reading's cost and the save's stay
     // apart; sampling, and the save itself, wait for that computation anyway.
     let started = Instant::now();
@@ -1650,7 +1809,9 @@ fn read_prompt<'m>(
     target.context_mut().synchronize();
     let mut read = started.elapsed();
     if let Some(at) = checkpoint {
-        cache.save_checkpoint(target.context(), at);
+        cache.save_checkpoint(&mut *target, at);
+    } else if let Some(at) = stash_at {
+        cache.head_stash = target.head_state().map(|state| (at, state));
     }
     let resumed = Instant::now();
     decode_span(target, &mut batch, &tokens, split..tokens.len(), stopping)?;
@@ -1678,7 +1839,9 @@ fn decode_span<'m>(
         for (pos, &token) in (from..to).zip(&tokens[from..to]) {
             let last = pos + 1 == tokens.len();
             let pos = i32::try_from(pos).map_err(|e| e.to_string())?;
-            batch.add(token, pos, last).map_err(|e| e.to_string())?;
+            batch
+                .add_seq(token, pos, target.seq(), last)
+                .map_err(|e| e.to_string())?;
         }
         target
             .context_mut()
@@ -2174,6 +2337,12 @@ impl<'v> Picker<'v> {
         self.goes_on
     }
 
+    /// Whether every token of the reply is the greedy sampler's pick alone: no penalties, no
+    /// end-of-generation ban and no grammar, which a context's argmax output does not apply.
+    fn picks_greedily(&self) -> bool {
+        self.free.is_greedy() && self.constrained.is_none()
+    }
+
     fn sample(&mut self, context: &Context<'_>, index: i32, in_content: bool) -> Token {
         let (used, other) = match &mut self.constrained {
             Some(constrained) if in_content => (constrained, Some(&mut self.free)),
@@ -2205,10 +2374,13 @@ fn draw<'v>(sampling: &Sampling) -> Vec<Sampler<'v>> {
     }
 }
 
-/// Runs one request, one token per forward pass.
+/// Runs one request, one token per forward pass. On a model `split` across nodes, a request
+/// that picks greedily alone takes its picks from the context's argmax output
+/// ([`Context::set_argmax_output`]), set before its prompt is read.
 fn generate(
     model: &Model,
     context: &mut Context<'_>,
+    split: bool,
     cache: &mut PromptCache,
     job: Job,
     eog: &[Token],
@@ -2224,6 +2396,7 @@ fn generate(
         out.pending(),
     )?;
     out.begin(picker.goes_on());
+    context.set_argmax_output(split && picker.picks_greedily());
     // `tokens` grows by every reply token decoded, so it is always what the cache holds.
     let (mut tokens, mut batch) =
         read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
@@ -2253,7 +2426,8 @@ fn generate(
 /// A model `split` across nodes verifies every drafted token even when the request has fewer
 /// left, so each verify batch keeps one shape: a shorter batch at a request's end rebuilds the
 /// verify graph twice (to the short shape and back), which over RPC re-serializes every rank's
-/// graph. Tokens past the limit are verified but never emitted.
+/// graph. Tokens past the limit are verified but never emitted. A request that picks greedily
+/// alone on a split model takes its picks from the target's argmax output, as in [`generate`].
 fn generate_mtp(
     model: &Model,
     spec: &mut Mtp<'_>,
@@ -2273,12 +2447,14 @@ fn generate_mtp(
         out.pending(),
     )?;
     out.begin(picker.goes_on());
+    spec.target_mut()
+        .set_argmax_output(split && picker.picks_greedily());
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`; its cache keeps the positions the
     // target's reuses.
     let (mut history, mut batch) =
         read_prompt(model, spec, cache, (&prompt, &namespace), &out.stopping)?;
-    spec.begin(&history).map_err(|e| e.to_string())?;
+    spec.begin(0, &history).map_err(|e| e.to_string())?;
     let n_ctx = usize::try_from(spec.target().n_ctx()).unwrap_or(usize::MAX);
     let prompt_tokens = history.len();
     let mut n_past = i32::try_from(prompt_tokens).map_err(|e| e.to_string())?;
@@ -2293,7 +2469,7 @@ fn generate_mtp(
             break FinishReason::Length;
         }
         let mut draft = spec
-            .draft(n_past, id, &history)
+            .draft(0, n_past, id, &history)
             .map_err(|e| e.to_string())?;
         // `accept` is owed exactly when the head drafted something.
         let drafted = !draft.is_empty();
@@ -2346,7 +2522,7 @@ fn generate_mtp(
         };
         n_past += 1 + i32::try_from(accepted).map_err(|e| e.to_string())?;
         if drafted {
-            spec.accept(u16::try_from(accepted).unwrap_or(u16::MAX))
+            spec.accept(0, u16::try_from(accepted).unwrap_or(u16::MAX))
                 .map_err(|e| e.to_string())?;
         }
         // The rejected drafts leave both caches.

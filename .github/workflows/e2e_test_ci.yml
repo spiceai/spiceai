@@ -69,6 +69,7 @@ jobs:
   # etc.). `build` — which every test job depends on — is gated on this, so the
   # whole matrix cascades to "skipped" while the E2E Test CI gate still reports.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     # Every job here is bounded, because on a `merge_group` run an unbounded one does not
@@ -88,6 +89,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
@@ -129,6 +131,7 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
+    environment: ci
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     # A backstop above the longest step bound below, leaving room for the artifact upload
@@ -137,7 +140,7 @@ jobs:
     # compile is exactly when the sccache stats are worth having.
     timeout-minutes: 200
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     strategy:
       matrix:
@@ -186,7 +189,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -270,6 +273,8 @@ jobs:
           if-no-files-found: ignore
 
   test-bigquery:
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     name: BigQuery Regression Tests
     needs: build
     if: ${{ inputs.run_all_tests }}
@@ -277,20 +282,16 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+      # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
+      id-token: write
     env:
       SPICED_BIN: ${{ github.workspace }}/build/spiced
       ADBC_BIGQUERY_DRIVER_PATH: /etc/adbc/drivers/libadbc_driver_bigquery.so
+      # The workload identity federation credential names no project.
+      BIGQUERY_PROJECT_ID: spiceai-testing
       BIGQUERY_TEST_CLEANUP: always
       BIGQUERY_EXPECT: single
     steps:
-      - name: Require BigQuery test credentials
-        shell: bash
-        env:
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
-        run: |
-          set -euo pipefail
-          : "${BIGQUERY_SERVICE_ACCOUNT_JSON:?BIGQUERY_SERVICE_ACCOUNT_JSON is required for run_all_tests}"
-
       - name: Set test output paths
         id: test_env
         shell: bash
@@ -305,6 +306,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+
+      - name: Set up BigQuery credentials (workload identity federation)
+        uses: ./.github/actions/bigquery-credentials
+        with:
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       - name: Download Linux runtime artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -338,8 +345,6 @@ jobs:
       - name: Run BigQuery regression tests
         timeout-minutes: 60
         shell: bash
-        env:
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
           mkdir -p "$BIGQUERY_GATE_OUTPUT"
@@ -367,6 +372,7 @@ jobs:
         run: rm -rf -- "$BIGQUERY_GATE_VENV"
 
   setup-model-matrix:
+    environment: secret-free
     name: Setup model strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
@@ -511,6 +517,7 @@ jobs:
         uses: ./.github/actions/stop-spice
 
   test_hf_model:
+    environment: ci
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
@@ -552,42 +559,10 @@ jobs:
           cp ./test/models/spicepod_hf.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
-      # The Hub credential lives where hf-hub looks for it, rather than being threaded
-      # through the spicepod as an `hf_token` param. Two reasons: it authenticates the
-      # chat model and the embedding model with one mechanism, and an unset secret
-      # leaves no file behind instead of setting an empty token, which the Hub answers
-      # with 401 — worse than no token at all.
       - name: Authenticate the Hugging Face cache
-        env:
-          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
-        run: |
-          set -uo pipefail
-          umask 077
-
-          # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
-          # credential from the sibling `token` file. $HOME persists between jobs on
-          # these self-hosted runners while the _work tree does not, so once the ~3B
-          # chat model and the embedding model are on disk, later runs need no Hub
-          # round-trip at all.
-          mkdir -p "${HOME}/.cache/huggingface/hub"
-          token_file="${HOME}/.cache/huggingface/token"
-
-          # $HOME is shared by every job that lands on this host, and it outlives this
-          # one. So a token we write here must not be left behind for an unrelated job
-          # to read, and a token the host already owns must not be clobbered:
-          #   - file already present -> use it, touch nothing.
-          #   - absent + secret set  -> write it, and mark it for removal in cleanup.
-          #   - absent + no secret   -> warn; downloads are anonymous.
-          if [ -s "${token_file}" ]; then
-            echo "Using the Hugging Face token already present on this runner."
-          elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
-            printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
-            chmod 600 "${token_file}"
-            echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
-            echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
-          else
-            echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 on model config files."
-          fi
+        uses: ./.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
       # Fail here, in seconds and by name, rather than as an unexplained five-minute
       # readiness timeout. The retries ride out the transient per-IP 401/429 responses
@@ -603,15 +578,20 @@ jobs:
             exit 0
           fi
 
+          # The same token spiced will use: `HF_TOKEN`, else the runner's token file.
+          token="${HF_TOKEN:-}"
           token_file="${HOME}/.cache/huggingface/token"
+          if [ -z "${token}" ] && [ -s "${token_file}" ]; then
+            token="$(cat "${token_file}")"
+          fi
 
           # The token goes to curl through a config on stdin rather than an -H argument,
           # so it never appears in this process's argv. `printf` is a shell builtin, so
           # it spawns nothing that could carry it either. curl drops the header on a
           # cross-host redirect by default, which is what keeps `-L` safe here.
           probe() {
-            if [ -s "${token_file}" ]; then
-              printf 'header = "Authorization: Bearer %s"\n' "$(cat "${token_file}")" |
+            if [ -n "${token}" ]; then
+              printf 'header = "Authorization: Bearer %s"\n' "${token}" |
                 curl -K - -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
             else
               curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
@@ -724,16 +704,8 @@ jobs:
         if: always()
         uses: ./.github/actions/stop-spice
 
-      # Only fires when the step above wrote the token itself; a credential the runner
-      # already owned is left alone. Without this, a secret would outlive the job in a
-      # $HOME that every later job on this host can read.
-      - name: Remove the job-scoped Hugging Face token
-        if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
-        run: |
-          rm -f "${SPICE_REMOVE_HF_TOKEN}"
-          echo "Removed the job-scoped Hugging Face token."
-
   test_quickstart_dremio:
+    environment: secret-free
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
@@ -812,6 +784,7 @@ jobs:
   test_quickstart_spiceai:
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
@@ -877,6 +850,7 @@ jobs:
   test_quickstart_s3:
     name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
@@ -969,12 +943,16 @@ jobs:
           working-directory: test_app
 
   test_cold_start_unkeyed_append:
+    environment: ci
     name: 'Cold start: unkeyed Cayenne append loads without rewriting itself'
     # The nightly `testoperator run cold-start` workflow times every acceleration shape
     # against the previous release; this is its timing-free bound, cheap enough for the
     # merge queue. A load into an empty table must not trigger a full compaction.
     if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     needs:
       - build
     timeout-minutes: 20
@@ -992,12 +970,21 @@ jobs:
         with:
           build-path: ./build
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '1200'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Check for the fixture
         run: |
@@ -1013,9 +1000,10 @@ jobs:
           cd cold_start_app
           spiced --cpu-cores 2 --metrics 127.0.0.1:9095 &> spice.log &
         env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Wait for the dataset to be ready
         uses: ./.github/actions/wait-for-spice-ready
@@ -1041,6 +1029,7 @@ jobs:
           working-directory: cold_start_app
 
   test_quickstart_data_postgres:
+    environment: secret-free
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1055,7 +1044,6 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
           ]
@@ -1202,6 +1190,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_data_mysql:
+    environment: secret-free
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1216,7 +1205,6 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
           ]
@@ -1425,6 +1413,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_clickhouse:
+    environment: secret-free
     name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1465,7 +1454,7 @@ jobs:
         run: |
           CLICKHOUSE_VERSION="26.3.9.8-lts"
           BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
           mv clickhouse-macos-aarch64 clickhouse
           chmod +x clickhouse
           sudo ./clickhouse install --noninteractive
@@ -1547,6 +1536,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_duckdb:
+    environment: secret-free
     env:
       duckdb_version: v0.10.2
     name: 'Test DuckDB quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -1566,14 +1556,14 @@ jobs:
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
           unzip duckdb_cli-linux-amd64.zip
           chmod +x ./duckdb
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'darwin'
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
           unzip duckdb_cli-osx-universal.zip
           chmod +x ./duckdb
 
@@ -1635,6 +1625,7 @@ jobs:
           working-directory: duckdb-app
 
   test_local_acceleration:
+    environment: secret-free
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1649,8 +1640,6 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
-            { engine: duckdb, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
           ]
@@ -1780,6 +1769,7 @@ jobs:
           working-directory: test_app
 
   test_results_caching:
+    environment: secret-free
     name: 'Test results caching on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1973,6 +1963,7 @@ jobs:
           working-directory: test_app
 
   test_results_caching_source_down:
+    environment: secret-free
     name: 'Test results caching with the source down'
     # Linux only: what it checks, that a cache miss reads the acceleration while the
     # source is unreadable, does not depend on the platform.
@@ -2135,6 +2126,7 @@ jobs:
           working-directory: test_app
 
   gh_connector_quickstart:
+    environment: secret-free
     name: 'Test GitHub connector on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2230,6 +2222,7 @@ jobs:
           working-directory: test_app
 
   hf_connector_live:
+    environment: ci
     name: 'Test Hugging Face connector against the live Hub'
     # Reads pinned commits of public datasets through the Hub and compares every answer
     # with one recorded from DuckDB's own `hf://` reader (test/huggingface/check_live.py).
@@ -2275,6 +2268,7 @@ jobs:
           path: hf-live-results/
 
   mssql_connector_quickstart:
+    environment: secret-free
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
     # The Microsoft apt list below is the Ubuntu 24.04 repository. ubuntu-latest
     # moves on its own, so this Linux-only job stays on ubuntu-24.04.
@@ -2399,6 +2393,10 @@ jobs:
       - build
       - setup-matrix
     timeout-minutes: 5
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
 
     strategy:
       matrix:
@@ -2436,19 +2434,34 @@ jobs:
           echo "      mode: delta_lake" >> spicepod.yaml
           echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
           echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_aws_session_token: \${ secrets:AWS_DATABRICKS_DELTA_SESSION_TOKEN }" >> spicepod.yaml
+          echo "      databricks_aws_region: us-west-2" >> spicepod.yaml
           echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
-          echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
+          echo "      databricks_client_id: \${ secrets:DATABRICKS_OIDC_CLIENT_ID }" >> spicepod.yaml
+          echo "      databricks_token_audience: \${ secrets:DATABRICKS_OIDC_AUDIENCE }" >> spicepod.yaml
 
           cat spicepod.yaml
+
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          DATABRICKS_ENDPOINT: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
         run: |
           spice run &> spice.log &
           # time to initialize added datasets
@@ -2483,6 +2496,7 @@ jobs:
           working-directory: test_app
 
   graceful_shutdown_test_append:
+    environment: secret-free
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2513,9 +2527,9 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         spicepod:
           [
-            duckdb_append_with_pk_and_indexes.yaml,
-            duckdb_append_with_pk.yaml,
-            duckdb_append_with_indexes.yaml,
+            cayenne_append_with_pk_and_indexes.yaml,
+            cayenne_append_with_pk.yaml,
+            cayenne_append_with_indexes.yaml,
           ]
         # run only on "Linux x64"
         exclude:
@@ -2546,7 +2560,12 @@ jobs:
 
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
+          # GitHub release downloads answer 504 in bursts longer than a fixed 5s x 5
+          # retry outlasts. With no --retry-delay, curl waits 1s and doubles each time,
+          # so 8 retries span about 4 minutes; --retry-max-time 300 bounds that.
+          # Every GitHub release download in this file's own steps uses these flags;
+          # composite actions such as install-protoc keep their own.
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
           echo "b5bad3ec8bf689885f8270ebd8e0f507e4f671f37dabf6127c09b19960389f96  duckdb_cli.zip" | sha256sum -c
           unzip duckdb_cli.zip
           chmod +x ./duckdb
@@ -2563,7 +2582,7 @@ jobs:
         run: |
           # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
           # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
-          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+          curl --fail --silent --show-error --location --retry 8 --retry-all-errors --retry-max-time 300 \
             -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
           echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
@@ -2661,25 +2680,34 @@ jobs:
           # Allow filesystem to sync after process exits
           sleep 2
 
-      - name: Verify local DuckDB database
+      - name: Verify the Cayenne acceleration was persisted
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          ls -la .spice/data
+          ls -laR .spice/data
 
-          if [ -f .spice/data/accelerated_duckdb.db ]; then
-            echo "Verification successful: accelerated_duckdb.db exists."
+          # A file-mode Cayenne acceleration keeps its metastore in
+          # .spice/data/metadata/cayenne.db and a directory per dataset. Small
+          # tables can live entirely in the metastore, so the dataset directories
+          # may hold no data files. A SQLite -wal file left beside the metastore is
+          # replayed when it is next opened, so it is not checked here; the restart
+          # below checks that every dataset loads again.
+          if [ -f .spice/data/metadata/cayenne.db ]; then
+            echo "Verification successful: the Cayenne metastore exists."
           else
-            echo "Verification failed: accelerated_duckdb.db does not exist."
+            echo "Verification failed: .spice/data/metadata/cayenne.db does not exist."
             exit 1
           fi
 
-          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
-            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
-          else
-            echo "Verification failed: accelerated_duckdb.db.wal exists."
-            ls -la .spice/data/accelerated_duckdb.db.wal
-            exit 1
-          fi
+          missing=0
+          for dataset in $(grep -E '^    name:' spicepod.yaml | awk '{print $2}'); do
+            if [ -d ".spice/data/$dataset" ]; then
+              echo "Verification successful: .spice/data/$dataset exists."
+            else
+              echo "Verification failed: .spice/data/$dataset does not exist."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Stop the append simulator
         if: always()
@@ -2723,6 +2751,7 @@ jobs:
           allow: ${{ env.PARQUET_RENAME_RACE_ALLOW }}
 
   graceful_shutdown_test_full:
+    environment: secret-free
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2736,9 +2765,9 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         spicepod:
           [
-            duckdb_full_with_pk_and_indexes.yaml,
-            duckdb_full_with_pk.yaml,
-            duckdb_full_with_indexes.yaml,
+            cayenne_full_with_pk_and_indexes.yaml,
+            cayenne_full_with_pk.yaml,
+            cayenne_full_with_indexes.yaml,
           ]
         # run only on "Linux x64"
         exclude:
@@ -2778,7 +2807,7 @@ jobs:
         run: |
           # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
           # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
-          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+          curl --fail --silent --show-error --location --retry 8 --retry-all-errors --retry-max-time 300 \
             -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
           echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
@@ -2826,25 +2855,34 @@ jobs:
           SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           sleep 2
 
-      - name: Verify local DuckDB database
+      - name: Verify the Cayenne acceleration was persisted
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          ls -la .spice/data
+          ls -laR .spice/data
 
-          if [ -f .spice/data/accelerated_duckdb.db ]; then
-            echo "Verification successful: accelerated_duckdb.db exists."
+          # A file-mode Cayenne acceleration keeps its metastore in
+          # .spice/data/metadata/cayenne.db and a directory per dataset. Small
+          # tables can live entirely in the metastore, so the dataset directories
+          # may hold no data files. A SQLite -wal file left beside the metastore is
+          # replayed when it is next opened, so it is not checked here; the restart
+          # below checks that every dataset loads again.
+          if [ -f .spice/data/metadata/cayenne.db ]; then
+            echo "Verification successful: the Cayenne metastore exists."
           else
-            echo "Verification failed: accelerated_duckdb.db does not exist."
+            echo "Verification failed: .spice/data/metadata/cayenne.db does not exist."
             exit 1
           fi
 
-          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
-            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
-          else
-            echo "Verification failed: accelerated_duckdb.db.wal exists."
-            ls -la .spice/data/accelerated_duckdb.db.wal
-            exit 1
-          fi
+          missing=0
+          for dataset in $(grep -E '^    name:' spicepod.yaml | awk '{print $2}'); do
+            if [ -d ".spice/data/$dataset" ]; then
+              echo "Verification successful: .spice/data/$dataset exists."
+            else
+              echo "Verification failed: .spice/data/$dataset does not exist."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Check logs
         if: always()
@@ -2880,20 +2918,33 @@ jobs:
   # The runner for the scenario scripts in test/spicescript. Built beside spiced
   # rather than after it, so it adds nothing to the run's critical path.
   build_spicescript:
+    environment: ci
     name: Build spicescript
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '1800'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Check documented SQL cases
         run: |
@@ -2910,7 +2961,14 @@ jobs:
     name: ${{ matrix.name }}
     needs: [build, build_spicescript]
     runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials, and the tokens of the live scripts
     timeout-minutes: 60
+    env:
+      HAS_OPENAI_WIF: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID != '' }}
+      HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -2931,6 +2989,9 @@ jobs:
           # release test/duckdb_versions.json lists; this one runs the scripts
           # with DuckDB sources again on each older listed release.
           - { name: 'spicescript: older DuckDB releases', partition: 1/1, older_duckdb: true }
+          # test/spicescript/live: real providers through static credential params, with
+          # tokens minted from this job's GitHub OIDC token just before the run.
+          - { name: 'spicescript: live', live: true }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -2945,12 +3006,21 @@ jobs:
         with:
           build-path: ./build
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download spicescript
         id: spicescript
@@ -2958,13 +3028,16 @@ jobs:
         with:
           package: spicescript
 
-      # Sources run in containers; log in so image pulls are not rate limited.
+      # Sources run in containers; log in so image pulls are not rate limited. Scripts pull
+      # images as they start, so the login has to last the whole job.
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       # Object-store sources (rustfs) are managed with the aws CLI.
       - name: Install the AWS CLI
@@ -2980,10 +3053,18 @@ jobs:
       # DuckLake source fetches the release matching spiced's embedded DuckDB.
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/duckdb.zip" \
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -o "$RUNNER_TEMP/duckdb.zip" \
             https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+
+      # The search and embedding scripts download a Hub model at startup. Without
+      # a token they share the pool's anonymous per-IP quota, and a rate limit fails
+      # every one of them at once as "model 'potion' … failed to load".
+      - name: Authenticate the Hugging Face cache
+        uses: ./.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
       - name: Check harness rejects incorrect answers
         if: ${{ matrix.partition == '1/4' }}
@@ -2998,7 +3079,7 @@ jobs:
       # and downloads each release it needs into ~/.cache/spicescript, so no
       # `--from` is passed here. The token is for the releases API's rate limit.
       - name: Run scenario scripts
-        if: ${{ !matrix.older_duckdb }}
+        if: ${{ !matrix.older_duckdb && !matrix.live }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -3010,6 +3091,55 @@ jobs:
             --results "$RUNNER_TEMP/spicescript-results.json" \
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
             ${{ matrix.args }}
+
+      # Each minted token expires about 5 minutes later, so all are minted right before the
+      # one run, which runs the scripts side by side.
+      - name: Mint an OpenAI access token
+        if: ${{ matrix.live && env.HAS_OPENAI_WIF == 'true' }}
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
+      - name: Mint an Anthropic access token
+        if: ${{ matrix.live && env.HAS_ANTHROPIC_WIF == 'true' }}
+        uses: ./.github/actions/anthropic-token
+        with:
+          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta
+        if: ${{ matrix.live }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Run live scripts
+        if: ${{ !cancelled() && matrix.live }}
+        env:
+          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
+        run: |
+          DATABRICKS_TOKEN="$(bash .github/scripts/databricks_oidc_token.sh)"
+          export DATABRICKS_TOKEN
+          "${{ steps.spicescript.outputs.path }}" --jobs 3 \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            test/spicescript/live
 
       # The combinations whose source is DuckDB or DuckLake (matrix keys
       # backend, src and source), then the DuckDB and DuckLake scripts without
@@ -3071,6 +3201,7 @@ jobs:
   # along with every job it summarises, so the required check reads `skipped`,
   # not a `success` nothing ran for (#13841).
   e2e-gate:
+    environment: secret-free
     name: E2E Test CI
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && github.event_name != 'pull_request' }}

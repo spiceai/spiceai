@@ -554,8 +554,8 @@ mod tests {
         );
     }
 
-    /// Each piece of advice that depends on whether Spice loads the component again: a model
-    /// is retried, an embedding model or reranker is loaded once.
+    /// Each piece of advice that depends on whether Spice loads the component again after a
+    /// failed download.
     #[test]
     fn advice_says_whether_spice_retries() {
         let unavailable = || {

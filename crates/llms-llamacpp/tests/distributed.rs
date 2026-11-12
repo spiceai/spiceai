@@ -22,6 +22,7 @@ limitations under the License.
 //! one-answer prompts don't feel.
 
 use std::io::Write;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,7 @@ use llms::chat::{
 };
 use serde_json::json;
 
+use crate::batching::{self, PROMPTS as TOGETHER_PROMPTS, SERVED_WITHIN};
 use crate::{FILE, MODEL, REVISION, request};
 
 /// Set in rank 1's environment: there `rank_one` lends the GPU instead of returning.
@@ -49,6 +51,9 @@ const SILENT_RANK: &str = "SPICE_LLAMACPP_TEST_SILENT_RANK";
 
 /// Set in the environment of the process `rank_three_on_a_taken_port` runs in.
 const PORT_TAKEN: &str = "SPICE_LLAMACPP_TEST_PORT_TAKEN";
+
+/// Set in the environment of the process `head_of_two_ranks_decoding_together` runs in.
+const HEAD_TOGETHER: &str = "SPICE_LLAMACPP_TEST_HEAD_TOGETHER";
 
 /// `world` nodes on this machine, as spiced sees them with `--allow-insecure-connections`,
 /// which a model split over llama.cpp RPC needs.
@@ -467,6 +472,126 @@ fn run_head(name: &str, env: &str) -> std::process::ExitStatus {
 #[tokio::test]
 async fn a_model_split_across_two_ranks_answers_as_on_one() {
     let status = run_head("distributed::head_of_two_ranks", HEAD_OF_TWO);
+    assert!(status.success(), "the head's checks failed: {status}");
+}
+
+/// The head of `a_split_model_decoding_requests_together_answers_as_on_one`, run only by it in a
+/// process of its own. Without `HEAD_TOGETHER` it does nothing.
+#[tokio::test]
+async fn head_of_two_ranks_decoding_together() {
+    if std::env::var_os(HEAD_TOGETHER).is_none() {
+        return;
+    }
+    let weights = [local_gguf().await];
+    let engine = llms::chat::engine::engine_for(&weights).expect("a .gguf goes to llama.cpp");
+    let name = "qwen3-0.6b";
+    let greedy = |prompt: &str| batching::body(name, prompt, 96);
+    // a penalty is what a pick from the argmax output would leave out
+    let penalized = |prompt: &str| {
+        let mut body = batching::body(name, prompt, 96);
+        body["frequency_penalty"] = json!(1.5);
+        body
+    };
+
+    // what one node replies to each request alone
+    let single: Arc<dyn Chat> = (engine.load)(&weights, options(None))
+        .await
+        .expect("the model loads on one node");
+    let mut alone = Vec::new();
+    for prompt in &TOGETHER_PROMPTS[..2] {
+        alone.push(batching::reply(&single, greedy(prompt)).await);
+    }
+    let counted = batching::streamed(&single, greedy(TOGETHER_PROMPTS[0])).await;
+    let penalized_alone = batching::reply(&single, penalized(TOGETHER_PROMPTS[0])).await;
+    drop(single);
+    assert!(
+        counted.chunks > llms_llamacpp::STREAM_BUFFER,
+        "the reply streams {} chunks, which a client that stops reading buffers whole ({}), so \
+         it could end before the penalized request arrives",
+        counted.chunks,
+        llms_llamacpp::STREAM_BUFFER
+    );
+    assert_ne!(
+        penalized_alone, counted.text,
+        "the penalty changes the reply, so a request picked by the argmax output would show"
+    );
+
+    let _rank_one = RankOne(
+        Command::new(std::env::current_exe().expect("the test binary's path"))
+            .args(["--exact", "distributed::rank_one", "--nocapture"])
+            .env(RANK_ONE, "1")
+            .spawn()
+            .expect("rank 1 starts"),
+    );
+    let cfg = topology(0, 2);
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let writer = Arc::clone(&log);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || Capture(Arc::clone(&writer)))
+        .with_ansi(false)
+        .finish();
+    let split: Arc<dyn Chat> = {
+        let _capture = tracing::subscriber::set_default(subscriber);
+        (engine.load)(
+            &weights,
+            LocalModelOptions {
+                concurrent_requests: NonZeroU32::new(2),
+                ..options(Some(&cfg))
+            },
+        )
+        .await
+        .expect("the model loads split across the two ranks")
+    };
+    let log = String::from_utf8_lossy(&log.lock().expect("the log")).into_owned();
+    assert!(
+        log.contains("Model 'qwen3-0.6b' is split across 2 GPUs on 2 nodes"),
+        "the head's log: {log}"
+    );
+
+    // two greedy requests decode together, taking their picks from the argmax output
+    let together = futures::future::join_all(
+        TOGETHER_PROMPTS[..2]
+            .iter()
+            .map(|prompt| batching::reply(&split, greedy(prompt))),
+    )
+    .await;
+    assert_eq!(
+        together, alone,
+        "greedy replies decoded together on the split model, against one node's alone"
+    );
+
+    // A penalized request joins a greedy one after its first chunk, which then waits on its
+    // client, and leaves before it: the argmax output is on for the greedy request's first
+    // tokens, off while the penalized one runs, and on again for the rest.
+    let mut first = split
+        .chat_stream(request(greedy(TOGETHER_PROMPTS[0])))
+        .await
+        .expect("a stream");
+    let mut first_text = batching::first_content(&mut first).await;
+    let joined = tokio::time::timeout(
+        SERVED_WITHIN,
+        batching::reply(&split, penalized(TOGETHER_PROMPTS[0])),
+    )
+    .await
+    .expect("the penalized request replies while the greedy one's client is not reading");
+    first_text.push_str(&batching::rest(first).await);
+    assert_eq!(
+        (first_text, joined),
+        (counted.text, penalized_alone),
+        "a greedy reply and a penalized one beside it on the split model, against one node's alone"
+    );
+}
+
+/// A model split across two ranks replies as one node does alone while it decodes several
+/// requests together: two greedy requests, which take their picks from the argmax output, and a
+/// penalized request that joins a greedy one mid reply and leaves before it, which turns the
+/// argmax output off while it runs and on again after.
+#[tokio::test]
+async fn a_split_model_decoding_requests_together_answers_as_on_one() {
+    let status = run_head(
+        "distributed::head_of_two_ranks_decoding_together",
+        HEAD_TOGETHER,
+    );
     assert!(status.success(), "the head's checks failed: {status}");
 }
 

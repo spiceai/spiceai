@@ -445,6 +445,18 @@ pub trait CommitChange {
     fn is_no_op(&self) -> bool {
         false
     }
+
+    /// Write the source position this commit acknowledges to the dataset's
+    /// position store, without acknowledging the source. An accelerator whose
+    /// metastore commits the position in the same record as the data it covers
+    /// runs the returned future inside that commit, before [`Self::commit`].
+    /// `None` when the source keeps no such position. The future owns what it
+    /// needs, so no lock is held while it runs.
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<(), CommitError>>> {
+        None
+    }
 }
 
 /// Destination-passing-style source of the change rows carried by a

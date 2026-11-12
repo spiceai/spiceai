@@ -63,13 +63,10 @@ jobs:
     # other event: a debug build of the harness, then an SF 1 run that takes
     # about 11 seconds.
     runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
+    environment: ci
     timeout-minutes: 60
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
-      # MinIO is only the fallback cache, and only on push: merge_group checks
-      # out the queue merge commit, which contains the queued pull request, and
-      # a spiceio miss must not fall through to those credentials.
-      HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
     steps:
       - name: Checkout spiceai
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -99,7 +96,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -113,10 +110,7 @@ jobs:
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ENDPOINT || '' }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ACCESS_KEY || '' }}
-          minio_secret_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_SECRET_KEY || '' }}
 
       - name: Run Mode A TPC-H at SF 1
         # Per-query FAIL/ERROR already exit 0 (report-only pass rate).
@@ -162,6 +156,7 @@ jobs:
           if-no-files-found: ignore
 
   mode_b_tpch:
+    environment: ci
     name: Mode B TPC-H (${{ matrix.engine }}, ${{ matrix.mode }})
     # Nightly and on manual dispatch only. Mode B serves the suite from a trunk
     # spiced (`setup-spiced` takes the newest build among the last 10 trunk
@@ -174,6 +169,9 @@ jobs:
     # in-cluster MinIO, which only these runners can resolve, and the trunk
     # builds stored there are linux-x86_64 only.
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -196,14 +194,6 @@ jobs:
             layouts: >-
               primary_key,indexes sort,time_column primary_key,cluster
               primary_key,indexes,sort,time_column
-          - engine: duckdb
-            mode: file
-            layouts: >-
-              primary_key indexes sort primary_key,indexes primary_key,sort
-              primary_key,indexes,sort,time_column
-          - engine: duckdb
-            mode: memory
-            layouts: primary_key,indexes primary_key,indexes,sort,time_column
           - engine: arrow
             mode: memory
             layouts: >-
@@ -242,19 +232,29 @@ jobs:
       - name: Install Protoc
         uses: ./.github/actions/install-protoc
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '10800'
+          export-env: 'false'
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
         id: setup-spiced

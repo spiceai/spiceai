@@ -77,19 +77,29 @@ jobs:
             echo "SQL pipeline is inline SQL"
           fi
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
         run: |
@@ -107,9 +117,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Extract spicepod filename path
         id: extract_spicepod_filename
@@ -118,14 +129,33 @@ jobs:
           SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
+      # Short-lived AWS credentials, kept out of the job's environment and passed to the step below.
+      - name: Assume the S3 Vectors role
+        id: aws-s3-vectors
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
+          role-session-name: gha-s3-vectors-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         env:
           SQL_PIPELINE: ${{ github.event.inputs.sql_pipeline }}
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          # spiced downloads the spicepod's Hugging Face embedding models (model2vec, hf). Without a
+          # token those downloads share the Hub's anonymous per-IP quota with every other job on
+          # the runner pool, and a sweep of search legs gets `429 Too Many Requests` until the
+          # ready wait runs out. spiced sends `HF_TOKEN` only to the Hub.
+          HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          AWS_S3_VECTORS_KEY: ${{ steps.aws-s3-vectors.outputs.aws-access-key-id }}
+          AWS_S3_VECTORS_SECRET: ${{ steps.aws-s3-vectors.outputs.aws-secret-access-key }}
+          AWS_S3_VECTORS_SESSION_TOKEN: ${{ steps.aws-s3-vectors.outputs.aws-session-token }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
         run: |

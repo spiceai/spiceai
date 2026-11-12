@@ -83,8 +83,7 @@ impl TeiRerank {
             kind: "reranker",
             name: name.clone(),
             docs_url: DOCS_URL,
-            // Spice loads a reranker once.
-            retried: false,
+            retried: true,
         };
         let model_root = async {
             let snapshot = crate::hf::open_model(requester, model_id, revision, hub).await?;

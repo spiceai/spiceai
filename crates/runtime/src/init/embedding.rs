@@ -30,7 +30,7 @@ use snafu::prelude::*;
 use spicepod::component::embeddings::Embeddings;
 
 /// How long a Spicepod change waits for each model it loads before it applies the rest of the
-/// change. The datasets that use a model still loading retry until it loads.
+/// change. The datasets that use a model still loading retry until it loads; the views fail.
 pub(crate) const LOAD_WAIT_IN_APPLY: Duration = Duration::from_mins(2);
 
 impl Runtime {
@@ -149,10 +149,20 @@ impl Runtime {
     }
 
     /// Applies the `embeddings:` of `new_app`: loads the added models, reloads the changed ones
-    /// and unloads the removed ones. The datasets that use them reload in
-    /// [`Runtime::apply_dataset_diff`].
-    pub(crate) async fn apply_embedding_diff(self: &Arc<Self>, current_app: &App, new_app: &App) {
+    /// and unloads the removed ones. The datasets and views that use them reload in
+    /// [`Runtime::apply_dataset_diff`] and [`Runtime::apply_view_diff`].
+    pub(crate) async fn apply_embedding_diff(
+        self: &Arc<Self>,
+        current_app: &Arc<App>,
+        new_app: &App,
+    ) {
         let changed = changed_embeddings(current_app, new_app);
+        // A dataset or view that embeds with a changed model stops serving first, so a query that
+        // the new model embeds does not search the vectors that the old model wrote in memory.
+        self.unload_datasets_using_embeddings(current_app, &changed)
+            .await;
+        self.unload_views_using_embeddings(current_app, &changed)
+            .await;
         for in_embed in &new_app.embeddings {
             if !changed.contains(&in_embed.name) {
                 continue;
@@ -225,6 +235,10 @@ fn is_permanent_embedding_failure(err: &crate::Error) -> bool {
                 || source
                     .downcast_ref::<EmbedError>()
                     .is_some_and(EmbedError::is_configuration_error)
+                // Workload identity params fail as model errors.
+                || source
+                    .downcast_ref::<llms::chat::Error>()
+                    .is_some_and(llms::chat::Error::is_configuration_error)
         }
         Some(err) => err.is_configuration_error(),
         None => false,
@@ -251,12 +265,17 @@ pub(crate) mod tests {
     use super::*;
 
     /// An embedding and rerank provider that refuses every request, as an account without
-    /// credits does, until `accepting` is set.
+    /// credits does, until `accepting` is set. While `held` is set, it holds each embeddings
+    /// request it accepts; while `held_rows` is set, each one that embeds [`HELD_ROW`].
     #[derive(Default)]
     pub(crate) struct Provider {
         pub(crate) accepting: AtomicBool,
+        pub(crate) held: AtomicBool,
+        pub(crate) held_rows: AtomicBool,
         pub(crate) requests: AtomicUsize,
     }
+
+    const HELD_ROW: &str = "a row the provider holds";
 
     impl Provider {
         pub(crate) fn accepting() -> Arc<Self> {
@@ -281,6 +300,12 @@ pub(crate) mod tests {
     ) -> Response {
         if let Some(refusal) = provider.refusal() {
             return refusal;
+        }
+        let row = body["input"].to_string().contains(HELD_ROW);
+        while provider.held.load(Ordering::SeqCst)
+            || (row && provider.held_rows.load(Ordering::SeqCst))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let inputs = body["input"].as_array().map_or(1, Vec::len);
         let data: Vec<Value> = (0..inputs)
@@ -372,6 +397,16 @@ pub(crate) mod tests {
             .try_load_embedding(&invalid)
             .await
             .expect_err("an invalid param fails the load");
+        assert!(is_permanent_embedding_failure(&err), "{err}");
+        let mut key_and_federation = embedding("key_and_federation", &url);
+        key_and_federation.params.insert(
+            "openai_identity_provider_id".to_string(),
+            Value::String("pool".to_string()),
+        );
+        let err = rt
+            .try_load_embedding(&key_and_federation)
+            .await
+            .expect_err("a key beside federation params fails the load");
         assert!(is_permanent_embedding_failure(&err), "{err}");
         let err = rt
             .try_load_embedding(&embedding("refused", &url))
@@ -466,5 +501,140 @@ pub(crate) mod tests {
             rt.status.get_embedding_status("removed"),
             Some(status::ComponentStatus::Disabled)
         ));
+    }
+
+    /// A dataset or view holds vectors from the embedding model it loaded with, so a Spicepod
+    /// change to that model unloads them before the new model loads: a query that the new model
+    /// embeds never searches vectors from the old one.
+    #[tokio::test]
+    async fn a_change_to_an_embedding_model_unloads_its_datasets_and_views_before_it_loads() {
+        let new = Provider::accepting();
+        new.held.store(true, Ordering::SeqCst);
+        let (old_url, new_url) = (serve(&Provider::accepting()).await, serve(&new).await);
+        let embedded = json!([{"name": "body", "embeddings": [{"from": "e"}]}]);
+        let app = |url: &str| {
+            Arc::new(
+                AppBuilder::new("embedding_dependents")
+                    .with_embedding(embedding("e", url))
+                    .with_dataset(
+                        serde_json::from_value(
+                            json!({"from": "file:docs.csv", "name": "docs", "columns": embedded.clone()}),
+                        )
+                        .expect("a valid dataset"),
+                    )
+                    .with_dataset(
+                        serde_json::from_value(json!({"from": "file:plain.csv", "name": "plain"}))
+                            .expect("a valid dataset"),
+                    )
+                    .with_view(
+                        serde_json::from_value(
+                            json!({"name": "vdocs", "sql": "SELECT * FROM plain", "columns": embedded.clone()}),
+                        )
+                        .expect("a valid view"),
+                    )
+                    .build(),
+            )
+        };
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app(app(&old_url).as_ref().clone())
+                .build()
+                .await,
+        );
+        rt.load_embeddings().await;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "body",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+        for name in ["docs", "plain", "vdocs"] {
+            let table =
+                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                    .expect("an empty table");
+            rt.df
+                .ctx
+                .register_table(name, Arc::new(table))
+                .expect("the table registers");
+        }
+        let registered = |name: &str| {
+            rt.df
+                .table_exists(&datafusion::common::TableReference::bare(name))
+        };
+
+        let apply = tokio::spawn(Arc::clone(&rt).apply_app(app(&new_url)));
+        wait_until(
+            "the changed model never reached its new provider",
+            async || new.requests.load(Ordering::SeqCst) > 0,
+        )
+        .await;
+        assert!(
+            !registered("docs"),
+            "a dataset that embeds with the changed model serves while the new model loads"
+        );
+        assert!(
+            !registered("vdocs"),
+            "a view that embeds with the changed model serves while the new model loads"
+        );
+        assert!(registered("plain"));
+
+        new.held.store(false, Ordering::SeqCst);
+        assert!(apply.await.expect("the apply finishes"));
+    }
+
+    /// A dataset that a change to its embedding model unloaded has no table to keep serving, so
+    /// it registers again at once: the change does not wait while its rows are embedded.
+    #[tokio::test]
+    async fn a_change_to_an_embedding_model_does_not_wait_for_its_datasets_to_embed() {
+        let new = Provider::accepting();
+        new.held_rows.store(true, Ordering::SeqCst);
+        let (old_url, new_url) = (serve(&Provider::accepting()).await, serve(&new).await);
+        let dir = tempfile::tempdir().expect("a data directory");
+        let csv = dir.path().join("docs.csv");
+        std::fs::write(&csv, format!("body\n{HELD_ROW}\n")).expect("the data is written");
+        let app = |url: &str| {
+            Arc::new(
+                AppBuilder::new("embedding_dependent_load")
+                    .with_embedding(embedding("e", url))
+                    .with_dataset(
+                        serde_json::from_value(json!({
+                            "from": format!("file:{}", csv.display()),
+                            "name": "docs",
+                            "columns": [{"name": "body", "embeddings": [{"from": "e"}]}],
+                            "acceleration": {"enabled": true, "engine": "arrow"},
+                        }))
+                        .expect("a valid dataset"),
+                    )
+                    .build(),
+            )
+        };
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app(AppBuilder::new("embedding_dependent_load").build())
+                .build()
+                .await,
+        );
+        let docs = datafusion::common::TableReference::bare("docs");
+        let ready = || {
+            matches!(
+                rt.status.get_dataset_status(&docs),
+                Some(status::ComponentStatus::Ready)
+            )
+        };
+        assert!(Arc::clone(&rt).apply_app(app(&old_url)).await);
+        wait_until("the dataset never loaded", async || ready()).await;
+
+        let applied = tokio::time::timeout(
+            Duration::from_secs(20),
+            Arc::clone(&rt).apply_app(app(&new_url)),
+        )
+        .await;
+        assert!(
+            matches!(applied, Ok(true)),
+            "the change waited while the dataset embedded its rows again"
+        );
+        assert!(!ready());
+
+        new.held_rows.store(false, Ordering::SeqCst);
+        wait_until("the dataset never loaded again", async || ready()).await;
     }
 }

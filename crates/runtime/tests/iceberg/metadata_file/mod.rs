@@ -26,8 +26,6 @@ use std::time::Duration;
 use app::AppBuilder;
 use arrow::array::AsArray as _;
 use arrow::datatypes::Int64Type;
-use aws_sdk_s3::config::{Credentials, Region};
-use bollard::secret::HealthConfig;
 use datafusion::prelude::SessionContext;
 use iceberg::io::{LocalFsStorageFactory, StorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -43,9 +41,10 @@ use spicepod::{
 };
 
 use crate::{
-    configure_test_datafusion,
-    docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port},
-    init_tracing,
+    configure_test_datafusion, init_tracing,
+    rustfs::{
+        S3_ACCESS_KEY, S3_BUCKET, S3_SECRET_KEY, create_bucket, s3_client, start_object_store,
+    },
     utils::{run_query, test_request_context, wait_until_true},
 };
 
@@ -520,73 +519,6 @@ async fn a_from_with_no_metadata_files_is_refused_with_what_a_table_root_holds()
         .await
 }
 
-pub(crate) const S3_ACCESS_KEY: &str = "spiceadmin";
-pub(crate) const S3_SECRET_KEY: &str = "spiceintegrationsecret";
-pub(crate) const S3_BUCKET: &str = "lake";
-
-/// A `RustFS` object store in a container, healthy and reachable on its published port.
-pub(crate) async fn start_object_store(name: &str) -> anyhow::Result<RunningContainer> {
-    let container = ContainerRunnerBuilder::new(name)
-        .image("rustfs/rustfs:latest".to_string())
-        .publish_port(9000)
-        .add_env_var("RUSTFS_ACCESS_KEY", S3_ACCESS_KEY)
-        .add_env_var("RUSTFS_SECRET_KEY", S3_SECRET_KEY)
-        .command(["/data"])
-        .healthcheck(HealthConfig {
-            test: Some(vec![
-                "CMD-SHELL".to_string(),
-                "netstat -tulpn | grep 9000 || exit 1".to_string(),
-            ]),
-            interval: Some(500_000_000),
-            timeout: Some(1_000_000_000),
-            retries: Some(20),
-            start_period: Some(2_000_000_000),
-            start_interval: None,
-        })
-        .build()?
-        .run(Some(Duration::from_mins(2)))
-        .await?;
-    wait_for_tcp_port(
-        "127.0.0.1",
-        container.host_port(9000)?,
-        Duration::from_mins(1),
-    )
-    .await?;
-    Ok(container)
-}
-
-fn s3_client(endpoint: &str) -> aws_sdk_s3::Client {
-    aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::Config::builder()
-            .credentials_provider(Credentials::new(
-                S3_ACCESS_KEY,
-                S3_SECRET_KEY,
-                None,
-                None,
-                "test",
-            ))
-            .region(Region::new("us-east-1"))
-            .endpoint_url(endpoint)
-            .force_path_style(true)
-            .behavior_version_latest()
-            .build(),
-    )
-}
-
-pub(crate) async fn create_bucket(endpoint: &str) -> anyhow::Result<()> {
-    let s3 = s3_client(endpoint);
-    // The store can accept connections a moment before it accepts requests.
-    let mut last_error = None;
-    for _ in 0..50 {
-        match s3.create_bucket().bucket(S3_BUCKET).send().await {
-            Ok(_) => return Ok(()),
-            Err(e) => last_error = Some(e.to_string()),
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    anyhow::bail!("could not create bucket {S3_BUCKET}: {last_error:?}")
-}
-
 const S3_METADATA_PREFIX: &str = "warehouse/db/events/metadata/";
 
 /// [`write_table`] into the bucket, at `s3://lake/warehouse/db/events`.
@@ -832,7 +764,7 @@ pub(crate) async fn glue_metadata_location(namespace: &str, table: &str) -> anyh
         .credentials_provider(aws_sdk_glue::config::Credentials::new(
             env("AWS_ICEBERG_ACCESS_KEY_ID")?,
             env("AWS_ICEBERG_SECRET_ACCESS_KEY")?,
-            None,
+            crate::utils::nonempty_env("AWS_ICEBERG_SESSION_TOKEN"),
             None,
             "iceberg-test",
         ))

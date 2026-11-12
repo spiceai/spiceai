@@ -32,7 +32,7 @@ mod moved_tests;
 // (`crate::component::dataset::{DatasetSpec, Acceleration, acceleration, ...}`).
 pub use runtime_component::dataset::{
     CheckAvailability, DatasetSpec, Error, FullTextSearchDatasetConfig, InvalidColumnTypeSnafu,
-    InvalidConfigurationSnafu, OnSchemaChange, ReadyState, Result, TimeFormat,
+    InvalidConfigurationSnafu, OnSchemaChange, ReadyState, ResolvedTimeColumns, Result, TimeFormat,
     UnsupportedTypeAction, acceleration, declared_schema, declared_type, metadata, replication,
     schema_inference,
 };
@@ -247,18 +247,6 @@ impl AccelerationSource for Dataset {
                     .into_iter()
                     .map(|ds| ds as Arc<dyn runtime_acceleration::AccelerationSource>)
                     .collect();
-            #[cfg(feature = "duckdb")]
-            {
-                let views: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
-                    Arc::clone(&runtime)
-                        .get_initialized_views(&app, crate::LogErrors(false))
-                        .await
-                        .into_iter()
-                        .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
-                        .collect();
-                datasets.into_iter().chain(views).collect()
-            }
-            #[cfg(not(feature = "duckdb"))]
             datasets
         })
     }

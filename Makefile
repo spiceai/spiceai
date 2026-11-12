@@ -176,13 +176,13 @@ endif
 # silently never built it — selection looked complete while three lanes never
 # ran. See `crates/cayenne/tests/correctness/README.md`.
 #
-# Scoped to `cayenne` deliberately. `runtime/duckdb,runtime/sqlite` would also
-# unlock runtime's accelerator-parity binary, but the feature flows through the
+# Scoped to `cayenne` deliberately. `runtime/sqlite` would also unlock runtime's
+# accelerator-parity binary, but the feature flows through the
 # whole `--all` build: every runtime test binary the gate builds relinks with
 # them, and those link at hundreds of megabytes each. That is a
 # large, permanent cost on every sign-off and merge-queue run to gain two
 # micro-shape comparisons — the thinnest of the five lanes. It belongs in the
-# integration workflow, which already builds with `duckdb,sqlite`.
+# integration workflow, which already builds with `adbc,sqlite`.
 #
 # The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
 # build script fetches over the network, so folding it into the gate would make
@@ -238,7 +238,10 @@ print-rust-gate-features:
 # every DuckDB result-correctness lane compares against: Arrow types, NULLs and
 # settings round-trip through ADBC, and a database file reopens. It loads the
 # libduckdb `nextest` installs, needing no credentials and no service.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use))
+# `runtime-datafusion`'s `is_distinct_from_precedence` binary is self-contained
+# (in-memory SessionContext, no credentials) and gates the vendored sqlparser
+# fix that binds `IS [NOT] DISTINCT FROM` tighter than `AND` / `OR`.
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -318,19 +321,20 @@ nextest-packages:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite --no-capture
+	# The `adbc::` tests need the SQLite ADBC driver; run them with `dbc install sqlite` and `-E 'test(/^adbc::/)'`, as integration_adbc.yml does.
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(/^adbc::/)'
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite --no-capture -E 'not test(spiceai_integration_test)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
 
 .PHONY: test-integration-models
 test-integration-models:
-	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture
+	@cargo test -p runtime --test integration_models --features models -- --nocapture
 
 .PHONY: test-integration-models-without-openai
 test-integration-models-without-openai:
-	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture --skip openai_test
+	@cargo test -p runtime --test integration_models --features models -- --nocapture --skip openai_test
 
 .PHONY: test-bench
 test-bench:
@@ -342,7 +346,7 @@ test-bench:
 ## workspace-wide linting (unless PACKAGES is set, then uses package defaults —
 ## workspace features like `models` are not valid on every crate).
 ## Example: make lint-rust PACKAGES="runtime data_components"
-## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
+## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="adbc,postgres"
 PACKAGES ?=
 FEATURES ?=
 # Use strip non-empty checks (not bare ifdef): PACKAGES/FEATURES are always
@@ -454,7 +458,6 @@ lint-rust-fix:
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
 	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
-	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
 	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
 	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
@@ -523,7 +526,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # and it is not `default` minus `models`: it is an independent list maintained by hand right here,
 # so a feature added to `default` does not reach `make install-data-only` until it is added below
 # too, and no check reports the omission. The two currently differ in both directions, which is why
-# reading this list as "default, less the model bits" is wrong: -data is also an ADBC-less build
+# reading this list as "default, less the model bits" is wrong: -data is also a build
 # without any of the three feature-gated secret stores `default` turns on (aws-secrets-manager,
 # azure-keyvault and keyring-secret-store) — the env and Kubernetes stores are not feature-gated
 # at all, so a -data build still reads secrets from both of those — and it carries the PostgreSQL
@@ -532,7 +535,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # `default = [...]` array in bin/spiced/Cargo.toml.
 #
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
+SPICED_DATA_FEATURES := adbc,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build

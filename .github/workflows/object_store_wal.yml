@@ -30,6 +30,7 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: spiceai-dev-runners
+    environment: ci
     # A merge group's checkout takes the full history, sized for a cold runner
     # cloning from scratch.
     timeout-minutes: 45
@@ -78,7 +79,7 @@ jobs:
         env:
           RELEVANT: ${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}
           SPICEIO_RELEVANT: ${{ github.event_name == 'workflow_dispatch' || steps.spiceio.outputs.relevant == 'true' }}
-          HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+          HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
         with:
           script: |
             // Every leg runs in parallel. The disk legs qualify the local
@@ -111,7 +112,7 @@ jobs:
               return legs.filter((leg) => leg.store !== 'spiceio');
             }
             if (process.env.HAS_SPICEIO_SECRET !== 'true') {
-              core.warning('UNAS_SMB_PASS is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
+              core.warning('SMB_PASSWORD is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
               return legs.filter((leg) => leg.store !== 'spiceio');
             }
             return legs;
@@ -125,19 +126,13 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.legs) }}
     runs-on: ${{ matrix.runner }}
+    environment: ci
     timeout-minutes: 45
     services:
       redis:
-        # GitHub service containers require Linux. An empty image skips macOS.
-        image: ${{ matrix.os == 'Linux' && 'redis:7.4.11-bookworm' || '' }}
-        # Pull as the Docker Hub account integration.yml logs in with. An
-        # anonymous pull counts against Docker Hub's unauthenticated rate
-        # limit, and a 429 there fails the job before any step runs. The plan
-        # job's `if:` keeps fork and Dependabot PRs out, so the secrets are
-        # set wherever this job runs.
-        credentials:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        # GitHub service containers require Linux. An empty image skips macOS. A service
+        # starts before any step can log in, so it pulls from ECR Public, not Docker Hub.
+        image: ${{ matrix.os == 'Linux' && 'public.ecr.aws/docker/library/redis:7.4.11-bookworm' || '' }}
         ports:
           - 6379/tcp
         options: >-
@@ -194,7 +189,12 @@ jobs:
           echo "$RUNNER_TEMP/wal-oracle/bin" >> "$GITHUB_PATH"
       - name: Test state protocol and cancellation
         if: matrix.store == 'disk'
-        run: cargo test --locked --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation -- --nocapture
+        # The test-name filters select integration modules; the library's own
+        # tests run unfiltered in the first command.
+        run: |
+          set -euo pipefail
+          cargo test --locked --profile dev -p object_store_occ --lib -- --nocapture
+          cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture state_store:: transactional_wal:: local_cancellation::
       - name: Build the process worker
         run: cargo build --locked --profile dev -p object_store_occ --example wal_test_driver
 
@@ -338,7 +338,7 @@ jobs:
         env:
           SPICEIO_SMB_SERVER: 192.168.3.148
           SPICEIO_SMB_USER: runner
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ai_platform_dev
           SPICEIO_BUCKET: ${{ env.WAL_BUCKET }}
           # spiceio moves to the next port when this one is taken.
@@ -381,7 +381,9 @@ jobs:
         env:
           AWS_S3_BUCKET: ${{ env.WAL_BUCKET }}
           AWS_S3_PREFIX: ${{ env.WAL_PREFIX }}/s3_integration
-        run: cargo test --locked --profile dev -p object_store_occ --test s3_integration -- --nocapture
+        # A block scalar: YAML reads a plain value ending in `:` as a mapping key.
+        run: |
+          cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture s3_integration::
       - name: Run process histories against ${{ matrix.store }}
         timeout-minutes: 30
         env:

@@ -8,13 +8,20 @@ description: >
   beside them serves. A Cayenne dataset that still names the retired Turso
   metastore loads on the SQLite metastore it shares with a healthy one, and
   is warned once to drop the param. A dataset and a view that set the removed
-  `turso` acceleration engine each fail to load with one error naming the fix,
-  and are never switched to Cayenne. A dataset that still selects the removed
+  `turso` or `duckdb` acceleration engine each fail to load with one error
+  naming the fix, and are never switched to Cayenne, while the Cayenne
+  datasets beside them answer. A dataset that still selects the removed
   duckdb vector engine fails to load with one error naming the Cayenne fix,
   while a Cayenne dataset beside it answers vector_search.
 
 sources:
   src: { kind: postgres }
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod
@@ -38,8 +45,10 @@ spicepod:
     - { from: 'postgres:public.t', name: cayenne_vectors, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne }, columns: [{ name: v, embeddings: [{ from: potion, row_id: [id] }] }] }
     - { from: 'postgres:public.t', name: turso_param_memory, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: memory, params: { cayenne_metastore: turso } } }
     - { from: 'postgres:public.t', name: turso_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: turso } }
+    - { from: 'postgres:public.t', name: duckdb_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: duckdb, mode: file } }
   views:
     - { name: turso_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: turso } }
+    - { name: duckdb_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: duckdb } }
 steps:
   - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
   - start: { ready: false }
@@ -81,6 +90,10 @@ steps:
         "Dataset 'turso_param' sets `cayenne_metastore: turso`, which is no longer supported and has no effect: the dataset uses the built-in metastore. Remove `cayenne_metastore` from this dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration": 1
         "Dataset 'turso_param_memory' sets `cayenne_metastore: turso`, which is no longer supported and has no effect": 1
   - assert-files: { contains: ['^meta/cayenne\.db$'], lacks: ['^meta/cayenne\.db-log$'] }
+    only: as-written
+  # The object-native metastore writes no SQLite catalog for file-mode datasets.
+  - assert-files: { lacks: ['^meta/cayenne\.db$', '^meta/cayenne\.db-log$'] }
+    only: object-native
   # The `turso` acceleration engine is removed. Only the dataset and the view
   # that set it fail to load, each with one error, and neither is rebuilt on
   # Cayenne behind the user's back: a dataset that falls back to Cayenne would
@@ -94,6 +107,21 @@ steps:
         "ERROR .*Failed to load dataset 'turso_engine': the acceleration engine `turso` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration dataset=\"turso_engine\"$": 1
         "ERROR .*Failed to load view 'turso_view': the acceleration engine `turso` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration view=\"turso_view\"$": 1
       lacks: ["deprecated .*turso_(engine|view)", "Unknown acceleration engine 'turso'"]
+  # The `duckdb` acceleration engine is removed the same way: one error for the
+  # dataset and one for the view, no deprecation warning, and no fallback to
+  # Cayenne, while the Cayenne dataset beside them answers.
+  - query: SELECT * FROM duckdb_engine
+    expect-error: duckdb_engine
+  - query: SELECT * FROM duckdb_view
+    expect-error: duckdb_view
+  - query: SELECT * FROM healthy_cayenne
+    expect: { rows: [['1', a]] }
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 'duckdb_engine': the acceleration engine `duckdb` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration dataset=\"duckdb_engine\"$": 1
+        "ERROR .*Failed to load view 'duckdb_view': the acceleration engine `duckdb` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration view=\"duckdb_view\"$": 1
+        "ERROR .*duckdb_(engine|view)": 2
+      lacks: ["deprecated .*duckdb_(engine|view)", "Unknown acceleration engine 'duckdb'"]
   # The duckdb vector engine is removed: the dataset that selects it fails with
   # exactly one error, and the Cayenne dataset indexes its embeddings itself.
   - query: SELECT id FROM vector_search(cayenne_vectors, 'a') ORDER BY _score DESC, id

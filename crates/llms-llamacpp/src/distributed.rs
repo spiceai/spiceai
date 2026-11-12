@@ -19,7 +19,8 @@ limitations under the License.
 //! it reaches every node's GPU, its own included, and splits each weight across them. The
 //! nodes add up their partial results over direct connections between every pair of them.
 
-use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{ErrorKind, Read};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -48,18 +49,57 @@ const RANK_WAIT_NOTE: Duration = Duration::from_secs(30);
 /// Threads llama.cpp's RPC server uses for work it runs on the CPU.
 const RPC_THREADS: usize = 4;
 
-/// How long one probe of a rank's port waits for the connection.
+/// How long one probe of a rank's port waits for the connection, and then for the server to
+/// close it.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long this node's GPU server has to start accepting connections.
 const SERVE_START: Duration = Duration::from_secs(30);
 
-/// Whether something accepts connections at `endpoint`. llama.cpp's RPC client aborts the
-/// process when it cannot connect, so a rank is reached only once this says it listens.
+/// Whether something accepts connections at `endpoint`.
 fn listening(endpoint: &str) -> bool {
     endpoint.to_socket_addrs().is_ok_and(|mut addrs| {
         addrs.any(|addr| TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
     })
+}
+
+/// Whether the server at `endpoint` took a connection and is done with it: the probe connects,
+/// sends nothing, and waits for the server to close the connection, as llama.cpp's RPC server
+/// does once it reads no request. The head connects to a rank only once this holds.
+///
+/// llama.cpp's RPC client aborts the process when it cannot connect. Its server takes one
+/// connection at a time with a backlog of one, and on macOS a connection that arrives while
+/// another waits for `accept` is reset. A probe that only connected would wait there while the
+/// server is busy with another client, such as the rank's own [`listening`] check, and the
+/// connection right after it would be reset. Once the server has closed this probe, nothing of
+/// the head's waits in its queue.
+fn took_probe(endpoint: &str) -> bool {
+    endpoint.to_socket_addrs().is_ok_and(|mut addrs| {
+        addrs.any(|addr| {
+            let deadline = Instant::now() + PROBE_TIMEOUT;
+            TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok_and(|mut probe| {
+                probe.shutdown(Shutdown::Write).is_ok() && closed_by_peer(&mut probe, deadline)
+            })
+        })
+    })
+}
+
+/// Reads `stream` until its peer closes it: true at the close, false on an error, or when the
+/// peer is still sending or silent at `deadline`.
+fn closed_by_peer(stream: &mut TcpStream, deadline: Instant) -> bool {
+    let mut buf = [0_u8; 64];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return false;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
 }
 
 fn port(rank: usize) -> Result<u16> {
@@ -351,13 +391,11 @@ pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<V
                 Some(attempt) => attempts[rank] = Some(attempt),
                 None => {
                     let at = endpoint.clone();
-                    // llama.cpp's server takes one connection at a time with a backlog of one,
-                    // and its client aborts the process when it cannot connect. Another rank's
-                    // server is probed first; the head's own is already known to listen, and a
-                    // probe right before the connection could fill that backlog.
-                    let probe = rank > 0;
+                    // llama.cpp's client aborts the process when it cannot connect, so every
+                    // rank's server is probed first, the head's own included: a check of its
+                    // own port can still wait in its queue.
                     attempts[rank] = Some(tokio::task::spawn_blocking(move || {
-                        (!probe || listening(&at))
+                        took_probe(&at)
                             .then(|| rpc::connect(Backend::get(), &at).ok())
                             .flatten()
                     }));
@@ -404,7 +442,9 @@ pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<V
 /// Where the ranks reach each other for the all-reduce: the split's device `i` first reaches device
 /// `j` at the node `nodes` lists for it, and llama.cpp moves the pair to the fastest link the two
 /// share. Device `d` is rank `d`. Every rank sums the partials in the same order in F32, so all
-/// hold the same sum. A setting already in the environment wins.
+/// hold the same sum. The head also queues its reads and writes of the ranks' tensors instead of
+/// waiting on each one's round trip, which llama.cpp leaves off for other RPC clients; only the
+/// split reaches the ranks over RPC. A setting already in the environment wins.
 fn configure_comm(cfg: &DistributedConfig) {
     let set = |key: &str, value: String| {
         if std::env::var_os(key).is_none() {
@@ -414,6 +454,8 @@ fn configure_comm(cfg: &DistributedConfig) {
         }
     };
     set("GGML_RPC_COMM_MESH", "1".to_string());
+    set("GGML_RPC_GET_ASYNC", "1".to_string());
+    set("GGML_RPC_SET_ASYNC", "1".to_string());
     let mut hosts = Vec::new();
     for i in 1..cfg.world_size() {
         for j in 0..i {
@@ -425,7 +467,12 @@ fn configure_comm(cfg: &DistributedConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{head_gpu_address, host, served_by_head};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{PROBE_TIMEOUT, head_gpu_address, host, listening, served_by_head, took_probe};
     use llms::chat::{DistributedBackend, DistributedConfig};
 
     #[test]
@@ -459,5 +506,123 @@ mod tests {
         assert_eq!(host("spark-a:8090"), "spark-a");
         // an IPv6 literal is not split at its colons
         assert_eq!(host("fe80::1"), "fe80::1");
+    }
+
+    /// A server shaped like llama.cpp's RPC server: a backlog of one, one client at a time, and
+    /// a close for a client that sends no request. It stays with its first client for `busy`,
+    /// answers the first client that sends a byte, and then stops.
+    fn one_client_at_a_time(busy: Duration) -> (String, thread::JoinHandle<()>) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a port");
+        let listener = socket
+            .listen(1)
+            .expect("the socket listens")
+            .into_std()
+            .expect("a std listener");
+        listener
+            .set_nonblocking(false)
+            .expect("a blocking listener");
+        let endpoint = listener.local_addr().expect("its address").to_string();
+        let server = thread::spawn(move || {
+            for (index, client) in listener.incoming().enumerate() {
+                let Ok(mut client) = client else { return };
+                if index == 0 {
+                    thread::sleep(busy);
+                    continue;
+                }
+                let mut byte = [0_u8; 1];
+                if matches!(client.read(&mut byte), Ok(1)) {
+                    client.write_all(&byte).expect("the reply");
+                    return;
+                }
+            }
+        });
+        (endpoint, server)
+    }
+
+    /// The connection a head makes right after its probe reaches a rank whose server is busy
+    /// with another client. On macOS, a second connection waiting for `accept` beside one
+    /// already queued is reset, so a probe that only connects and closes leaves itself queued
+    /// and the connection after it is reset, which llama.cpp's client aborts the process on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_connection_after_a_probe_reaches_a_busy_server() {
+        let (endpoint, server) = one_client_at_a_time(Duration::from_millis(200));
+        let other = TcpStream::connect(&endpoint).expect("the server's first client");
+        // the server takes it and stays with it
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            took_probe(&endpoint),
+            "the probe is served once the server is free"
+        );
+        let mut head =
+            TcpStream::connect(&endpoint).expect("the connection after the probe is not refused");
+        head.write_all(b"h")
+            .expect("the connection after the probe is not reset");
+        let mut reply = [0_u8; 1];
+        head.read_exact(&mut reply)
+            .expect("the server answers the connection after the probe");
+        assert_eq!(&reply, b"h");
+        drop(other);
+        server.join().expect("the server ends");
+    }
+
+    /// A rank's own check of its port counts its server as listening while the server is busy
+    /// with another client, such as a head that connected first, for longer than a probe waits.
+    /// The head's probe, which waits for the server to finish with it, gives up at its deadline
+    /// instead, so a rank that checked itself with it would report its server stopped while the
+    /// server serves the head. Each check gets a server of its own: a check that only connects
+    /// leaves its connection queued, and the next connection would be reset behind it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rank_serving_the_head_still_counts_its_server_listening() {
+        let busy = || {
+            let (endpoint, server) = one_client_at_a_time(PROBE_TIMEOUT * 3);
+            let head = TcpStream::connect(&endpoint).expect("the server's first client");
+            // the server takes it and stays with it
+            thread::sleep(Duration::from_millis(20));
+            (endpoint, server, head)
+        };
+        let (endpoint, _server, _head) = busy();
+        assert!(
+            listening(&endpoint),
+            "the rank's check sees its server listening"
+        );
+        let (endpoint, _server, _head) = busy();
+        let started = std::time::Instant::now();
+        assert!(
+            !took_probe(&endpoint),
+            "the head's probe is not served while the server is busy"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= PROBE_TIMEOUT / 2 && waited < PROBE_TIMEOUT * 2,
+            "the head's probe gives up at its deadline, after {waited:?}"
+        );
+    }
+
+    /// A peer that keeps sending past the probe's deadline does not stretch the probe: it ends
+    /// at its deadline, unanswered, even when the peer closes the connection soon after.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_ends_at_its_deadline_while_the_peer_still_sends() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let endpoint = listener.local_addr().expect("its address").to_string();
+        let peer = thread::spawn(move || {
+            let (mut client, _) = listener.accept().expect("the probe");
+            thread::sleep(PROBE_TIMEOUT * 7 / 10);
+            client.write_all(b"x").expect("a byte before the deadline");
+            thread::sleep(PROBE_TIMEOUT * 6 / 10);
+        });
+        let started = std::time::Instant::now();
+        assert!(
+            !took_probe(&endpoint),
+            "a peer that closes only after the deadline has not finished with the probe"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited < PROBE_TIMEOUT * 6 / 5,
+            "the probe ends at its deadline, after {waited:?}"
+        );
+        peer.join().expect("the peer ends");
     }
 }

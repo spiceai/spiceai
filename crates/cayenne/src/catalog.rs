@@ -240,6 +240,28 @@ pub enum CatalogError {
     ))]
     SettingsChangeRequiresRebuild { table_name: String, changes: String },
 
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it (a file is missing, has a different size, or the
+    /// snapshot directory is gone), and the caller asked for such a table to be
+    /// rebuilt from the source ([`crate::metadata::SettingsChangeAction::Rebuild`]).
+    /// Worded as the cause clause the caller's message embeds.
+    #[snafu(display(
+        "the existing acceleration of dataset '{table_name}' does not match its Cayenne metastore ({damage})"
+    ))]
+    StoredDataFilesRequireRebuild { table_name: String, damage: String },
+
+    /// The data files of the table's current snapshot do not match the files the
+    /// metastore records for it, and the table cannot be rebuilt from the source
+    /// now, so serving it would answer queries with missing rows or fail them.
+    #[snafu(display(
+        "Failed to load table '{table_name}': its acceleration does not match its Cayenne metastore ({damage}), so it cannot be served. {remedy}"
+    ))]
+    StoredDataFilesDamaged {
+        table_name: String,
+        damage: String,
+        remedy: String,
+    },
+
     #[snafu(display(
         "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Revert 'cayenne_datalake_location' to '{stored}', or delete the acceleration and re-register the dataset to publish to the new location."
     ))]
@@ -284,23 +306,177 @@ pub struct SnapshotSequenceCommit {
     pub sequence_number: i64,
 }
 
-// Transaction support is currently not exposed at the catalog level.
-// Each catalog implementation can use backend-specific transactions internally
-// to ensure atomicity of operations.
-//
-// Future work: Expose catalog-level transactions when needed.
+/// The durable effects of one mem-tier seal or checkpoint.
+#[derive(Debug, Default)]
+pub struct MemTierDurableCommit {
+    /// Table receiving the mutation.
+    pub table_id: String,
+    /// Delete-only vectors, without a reinsert stamp.
+    pub pure_delete_files: Vec<DeleteFile>,
+    /// Vectors whose keys are reinserted at `sequence_number`.
+    pub reinsert_delete_files: Vec<DeleteFile>,
+    /// Reinsert keys (used to gate the per-vector reinsert stamp).
+    pub insert_pk_bytes: Vec<Vec<u8>>,
+    /// Reserved shadow/reinsert sequence, above every tombstone sequence.
+    pub sequence_number: i64,
+    /// Protected snapshot registration for a data-bearing checkpoint.
+    pub snapshot_sequence: Option<SnapshotSequenceCommit>,
+    /// Unpublished seal shadow rows, stamped with `sequence_number`.
+    pub inline_data: Vec<InlinedData>,
+    /// Clear the superseded inline corpus AND its deletion markers.
+    pub clear_inlined: bool,
+}
+
+/// One table's durable append publication. A slice is one atomic transaction.
+///
+/// It borrows from the prepared write it publishes: a commit runs once per CDC
+/// batch, and the replaced keys alone are one entry per changed row.
+#[derive(Clone, Debug)]
+pub struct CatalogPublication<'a> {
+    /// Table whose state changes.
+    pub table_id: &'a str,
+    /// Replacement files registered as a protected snapshot.
+    pub snapshot_id: &'a str,
+    /// Visibility sequence of the protected snapshot.
+    pub snapshot_sequence: i64,
+    /// Sequence of replacement primary keys, if present.
+    pub insert_sequence: Option<i64>,
+    /// Durable deletion vectors.
+    pub delete_files: &'a [DeleteFile],
+    /// Primary keys replaced by the publication.
+    pub insert_pk_bytes: &'a [Vec<u8>],
+    /// Inline deletion marker committed with the replacement snapshot.
+    pub inline_tombstone: Option<&'a InlinedDelete>,
+    /// Existing inline deletion markers to activate.
+    pub pending_durable_flips: &'a [String],
+    /// Primary keys requiring federated write-back.
+    pub dirty_pk_bytes: std::borrow::Cow<'a, [Vec<u8>]>,
+}
+
+/// How the metastore changes of the current task commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitScope {
+    /// Buffered until the scope's owner calls [`MetadataCatalog::commit_pending`].
+    Deferred,
+    /// As `Deferred`, and a write path's own acknowledgement point
+    /// ([`commit_at_acknowledgement`]) also waits for the owner, so the whole
+    /// scope, including what the owner adds last, commits as one record.
+    SameRecord,
+}
+
+tokio::task_local! {
+    static DEFERRED_COMMITS: CommitScope;
+}
+
+/// Run `work` with its metastore changes deferred: a catalog that buffers may
+/// commit them as one record at the next [`MetadataCatalog::commit_pending`],
+/// instead of one commit per change. The caller must call `commit_pending`
+/// before acknowledging anything that depends on them.
+pub async fn with_deferred_commits<F: std::future::Future>(work: F) -> F::Output {
+    DEFERRED_COMMITS.scope(CommitScope::Deferred, work).await
+}
+
+/// [`with_deferred_commits`], where a write path inside `work` that would commit
+/// at its own acknowledgement point leaves that to the caller, so everything
+/// `work` changes commits in the caller's one record. Use it only where the
+/// caller acknowledges nothing until its `commit_pending` returns, and where
+/// nothing inside `work` deletes an object after one of its own commits.
+pub async fn with_same_record_commits<F: std::future::Future>(work: F) -> F::Output {
+    DEFERRED_COMMITS.scope(CommitScope::SameRecord, work).await
+}
+
+/// Whether the current task is inside [`with_deferred_commits`] or
+/// [`with_same_record_commits`].
+#[must_use]
+pub fn commits_deferred() -> bool {
+    DEFERRED_COMMITS.try_with(|_| ()).is_ok()
+}
+
+/// Commit a write path's metastore changes at its acknowledgement point, unless
+/// the task is inside [`with_same_record_commits`], whose owner commits them.
+///
+/// # Errors
+///
+/// Returns the catalog's error when the commit is not accepted.
+pub async fn commit_at_acknowledgement(catalog: &dyn MetadataCatalog) -> CatalogResult<()> {
+    if DEFERRED_COMMITS.try_with(|scope| *scope) == Ok(CommitScope::SameRecord) {
+        return Ok(());
+    }
+    catalog.commit_pending().await
+}
+
+/// [`commit_at_acknowledgement`] for a write to one table: other tables'
+/// pending changes stay pending, so they still commit with their own
+/// acknowledgement points.
+///
+/// # Errors
+///
+/// Returns the catalog's error when the commit is not accepted.
+pub async fn commit_at_acknowledgement_for(
+    catalog: &dyn MetadataCatalog,
+    table_id: &str,
+) -> CatalogResult<()> {
+    if DEFERRED_COMMITS.try_with(|scope| *scope) == Ok(CommitScope::SameRecord) {
+        return Ok(());
+    }
+    catalog.commit_pending_for(table_id).await
+}
 
 /// Trait for metadata catalog operations.
 ///
 /// This trait provides the core operations needed to manage a Cayenne catalog,
 /// including table creation and file tracking.
+///
+/// A catalog may defer committing a change only inside [`with_deferred_commits`];
+/// everywhere else, a change is durable when its method returns.
 #[async_trait]
 pub trait MetadataCatalog: Send + Sync {
-    /// Downcast hook so a caller holding `Arc<dyn MetadataCatalog>` can reach
-    /// concrete methods needed for atomic multi-table transaction commit
-    /// (`begin_transaction`, `apply_prepared_on_conflict_in_txn`), mirroring how the
-    /// overwrite path takes a concrete `&CayenneCatalog`.
+    /// Access backend-specific operations through a concrete catalog reference.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Commit every table publication together, or leave all tables unchanged.
+    async fn commit_publications(
+        &self,
+        publications: &[CatalogPublication<'_>],
+    ) -> CatalogResult<()>;
+
+    /// Make every change accepted so far durable, before something that depends
+    /// on it is acknowledged: a source position, a returned write. A catalog that
+    /// makes each change durable as it is accepted returns at once. No default, so
+    /// every implementation (and every wrapper) answers it explicitly.
+    async fn commit_pending(&self) -> CatalogResult<()>;
+
+    /// As [`Self::commit_pending`], for the changes to one table: what a
+    /// single dataset's acknowledgement depends on. Changes to other tables may
+    /// stay pending. No default, as for [`Self::commit_pending`].
+    async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Whether this catalog commits a dataset's source position in the same
+    /// record as the data it covers. When it does, a CDC write stages its
+    /// position with its changes, and a checkpoint records the position before
+    /// [`Self::commit_pending_for`], so the source is acknowledged only once both
+    /// are durable together. Otherwise the source's own checkpoint store saves
+    /// the position after the data commits. No default, as for
+    /// [`Self::commit_pending`].
+    fn commits_source_positions(&self) -> bool;
+
+    /// Page undelivered write-back markers by sequence and primary key.
+    async fn list_pending_write_back(
+        &self,
+        table_id: &str,
+        limit: usize,
+        after: Option<&(i64, Vec<u8>)>,
+    ) -> CatalogResult<Vec<(Vec<u8>, i64)>>;
+
+    /// Clear delivered markers only when no newer sequence has replaced them.
+    async fn clear_pending_write_back(
+        &self,
+        table_id: &str,
+        keys: &[(Vec<u8>, i64)],
+    ) -> CatalogResult<()>;
+
+    /// Count undelivered write-back markers.
+    async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64>;
 
     /// Initialize the catalog, creating necessary tables if they don't exist.
     async fn init(&self) -> CatalogResult<()>;
@@ -411,6 +587,10 @@ pub trait MetadataCatalog: Send + Sync {
         deleted_inlined_ids: Vec<String>,
         replaced_delete_file_ids: Vec<String>,
     ) -> CatalogResult<()>;
+
+    /// Atomically persist all metadata effects of one mem-tier seal or checkpoint.
+    /// Failure leaves the catalog unchanged; visibility publication remains the caller's job.
+    async fn commit_mem_tier_durable(&self, commit: MemTierDurableCommit) -> CatalogResult<()>;
 
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
@@ -860,6 +1040,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all manifest rows for a table.
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Drop the manifest rows of `file_names` (snapshot-relative file names) from
+    /// one snapshot's manifest, for files removed from the snapshot in place (for
+    /// example by file-based retention), so the manifest keeps naming only files
+    /// the snapshot still holds.
+    async fn remove_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_names: &[String],
+    ) -> CatalogResult<()>;
+
+    /// Check, when reopening an existing table outside `create_table` (as
+    /// partition children are), that the data files its live snapshots record
+    /// are still on disk, with the non-rebuildable (`KeepStored`) handling:
+    /// a missing snapshot directory or a resized file is an error, and files
+    /// that are only missing are logged at WARN.
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()>;
 
     /// List every cold-tier file for a table (the cold scan's file source).
     /// Read under the scan's listing fence so the cold file set is captured

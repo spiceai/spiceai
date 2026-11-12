@@ -182,8 +182,6 @@ mod tests {
     use app::AppBuilder;
     use serde_json::json;
 
-    use llms::rerank::Rerank;
-
     use super::*;
     use crate::init::embedding::tests::{Provider, serve, wait_until};
 

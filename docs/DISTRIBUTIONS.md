@@ -41,7 +41,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 **Included Features:**
 
 - All standard data connectors (PostgreSQL, MySQL, DuckDB, SQLite, ClickHouse, etc.)
-- Embedded data accelerators (Spice Cayenne, DuckDB, SQLite)
+- Embedded data accelerators (Spice Cayenne, SQLite)
 - AI/ML model inference (LLMs, embeddings)
 - Search capabilities (Vector and BM-25 Full-Text-Search)
 - Inline SQL user-defined scalar and table functions
@@ -277,7 +277,7 @@ You can build custom distributions with specific feature combinations:
 
 ```bash
 # Build with specific features
-SPICED_CUSTOM_FEATURES="duckdb,postgres,sqlite,models" make build-runtime
+SPICED_CUSTOM_FEATURES="adbc,postgres,sqlite,models" make build-runtime
 
 # Build with HTTP-backed function servers
 SPICED_NON_DEFAULT_FEATURES="http-functions" make install

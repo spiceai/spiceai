@@ -40,20 +40,31 @@ use crate::{
 };
 
 const USER: &str = "spicescript";
-const PASSWORD: &str = "spicescript-secret";
 
-fn spec(name: String) -> ContainerSpec {
+/// A secret of the store's own: 128 bits from two `SipHash` instances that the
+/// standard library keys from the operating system's randomness, so nothing
+/// outside this process can predict it. A fixed one would let anyone who
+/// reaches the store's port, published on every interface for bridged cluster
+/// executors (see `crate::runner::cluster`), read and rewrite its objects.
+fn store_secret() -> String {
+    use std::hash::BuildHasher;
+    let half = || std::collections::hash_map::RandomState::new().hash_one(USER);
+    format!("{:016x}{:016x}", half(), half())
+}
+
+fn spec(name: String, secret: &str) -> ContainerSpec {
     ContainerSpec {
         name,
         image: "rustfs/rustfs:1.0.1".into(),
         env: vec![
             ("RUSTFS_ACCESS_KEY".into(), USER.into()),
-            ("RUSTFS_SECRET_KEY".into(), PASSWORD.into()),
+            ("RUSTFS_SECRET_KEY".into(), secret.into()),
         ],
         command: Some(vec!["/data".into()]),
         ports: vec![9000],
         healthcheck: Some(healthcheck("curl -fs http://127.0.0.1:9000/health")),
         network: None,
+        alias: None,
     }
 }
 
@@ -61,13 +72,21 @@ pub struct ObjectStore {
     container: Container,
     /// Where part files are written before they are uploaded.
     staging: PathBuf,
+    /// The secret key of [`USER`], this store's own (see [`store_secret`]).
+    secret: String,
 }
 
 impl ObjectStore {
     pub async fn start(name: &str, run_id: &str, staging: PathBuf) -> Result<Self> {
-        let container = Container::start(spec(format!("spicescript-{run_id}-{name}"))).await?;
+        let secret = store_secret();
+        let container =
+            Container::start(spec(format!("spicescript-{run_id}-{name}"), &secret)).await?;
         std::fs::create_dir_all(&staging)?;
-        Ok(Self { container, staging })
+        Ok(Self {
+            container,
+            staging,
+            secret,
+        })
     }
 
     fn endpoint(&self) -> Result<String> {
@@ -83,7 +102,7 @@ impl ObjectStore {
             .args(args)
             .args(["--endpoint-url", &self.endpoint()?])
             .env("AWS_ACCESS_KEY_ID", USER)
-            .env("AWS_SECRET_ACCESS_KEY", PASSWORD)
+            .env("AWS_SECRET_ACCESS_KEY", &self.secret)
             .env("AWS_DEFAULT_REGION", "us-east-1")
             .env("AWS_EC2_METADATA_DISABLED", "true")
             .output()
@@ -175,7 +194,7 @@ impl Source for ObjectStore {
         extra.insert("shared_bucket".into(), json!(SHARED_BUCKET));
         extra.insert("endpoint".into(), json!(endpoint));
         extra.insert("key".into(), json!(USER));
-        extra.insert("secret".into(), json!(PASSWORD));
+        extra.insert("secret".into(), json!(self.secret));
         Ok(super::Namespace {
             params: json!({
                 "s3_endpoint": endpoint,
@@ -183,7 +202,7 @@ impl Source for ObjectStore {
                 "s3_url_style": "path",
                 "s3_auth": "key",
                 "s3_key": USER,
-                "s3_secret": PASSWORD,
+                "s3_secret": self.secret,
                 "allow_http": "true",
             }),
             extra,

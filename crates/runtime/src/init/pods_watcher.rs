@@ -79,7 +79,6 @@ fn start_time_only_changes(
         source_rate_control,
         drasi,
         functions: _,
-        mode: _,
     } = new;
 
     [
@@ -315,15 +314,6 @@ impl Runtime {
         // mutates the app during the diff phase, so a write lock is not needed
         // until the final swap.
         let current_app = self.read_app().await;
-        let mut new_app = new_app;
-        if new_app.runtime.mode != self.mode {
-            tracing::warn!(
-                "runtime.mode changed from '{}' to '{}'. Restart spiced to apply the new mode.",
-                self.mode,
-                new_app.runtime.mode
-            );
-            Arc::make_mut(&mut new_app).runtime.mode = self.mode;
-        }
         Arc::clone(&self)
             .apply_app_diff(current_app.as_ref(), new_app)
             .await
@@ -395,6 +385,7 @@ impl Runtime {
         }
 
         *self.app.write().await = Some(Arc::clone(&new_app));
+        self.search_primary_keys.update(Arc::clone(&self.app)).await;
 
         // After the swap: `auto` and `all` resolve against the installed app's `tools:`.
         if let Some((changed_tools, changed_function_tools, changed_embeddings, loaded_models)) =
@@ -1058,5 +1049,38 @@ mod tests {
             .with_dataset(accelerated_dataset("events", "cayenne"))
             .build();
         assert_eq!(reload_deprecated_engines_warning(&current, &migrated), None);
+    }
+
+    /// `/v1/search` and `vector_search` read the `row_id` keys of the installed app.
+    #[tokio::test]
+    async fn a_reload_updates_the_search_primary_keys() {
+        let docs: spicepod::component::dataset::Dataset = serde_json::from_value(serde_json::json!({
+            "from": "file:data.csv",
+            "name": "docs",
+            "columns": [{"name": "body", "full_text_search": {"enabled": true, "row_id": "id"}}],
+        }))
+        .expect("a valid dataset");
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let docs_ref = datafusion::common::TableReference::parse_str("docs")
+            .resolve(
+                crate::datafusion::SPICE_DEFAULT_CATALOG,
+                crate::datafusion::SPICE_DEFAULT_SCHEMA,
+            )
+            .into();
+
+        assert!(
+            Arc::clone(&rt)
+                .apply_app(Arc::new(
+                    app::AppBuilder::new("search_keys")
+                        .with_dataset(docs)
+                        .build()
+                ))
+                .await
+        );
+
+        assert_eq!(
+            rt.search_primary_keys.get(&docs_ref),
+            Some(vec!["id".to_string()])
+        );
     }
 }

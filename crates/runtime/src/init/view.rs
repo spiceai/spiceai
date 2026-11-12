@@ -22,6 +22,7 @@ use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
+    dataaccelerator::AccelerationSource,
     datafusion::{DeferredRefreshOutcome, TableInstance, resolve_table_reference},
     secrets::Secrets,
     status,
@@ -32,8 +33,6 @@ use datafusion::{
     common::{ResolvedTableReference, TableReference},
     sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect},
 };
-#[cfg(feature = "duckdb")]
-use futures::stream::StreamExt;
 use itertools::Itertools;
 use runtime_metrics as metrics;
 use snafu::prelude::*;
@@ -180,6 +179,14 @@ fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<
             .map(|table| (resolve_table_reference(table.clone()), table))
             .collect(),
     )
+}
+
+/// Whether `view` embeds a column with one of `models`.
+fn view_uses_embedding_model(view: &View, models: &HashSet<String>) -> bool {
+    view.columns
+        .iter()
+        .flat_map(|c| &c.embeddings)
+        .any(|e| models.contains(&e.model))
 }
 
 /// The views in a cycle of views reading each other, and the views that read,
@@ -589,34 +596,6 @@ impl Runtime {
             .collect()
     }
 
-    #[cfg(feature = "duckdb")]
-    pub(crate) async fn get_initialized_views(
-        self: Arc<Self>,
-        app: &Arc<App>,
-        log_errors: LogErrors,
-    ) -> Vec<Arc<View>> {
-        let valid_views = Arc::clone(&self).get_valid_views(app, log_errors);
-        futures::stream::iter(valid_views)
-            .filter_map(|validated_view| async move {
-                let view = &validated_view.view;
-                match (view.is_accelerated(), view.is_accelerator_initialized().await) {
-                    (true, true) | (false, _) => Some(Arc::clone(view)),
-                    (true, false) => {
-                        if log_errors.0 {
-                            metrics::views::LOAD_ERROR.add(1, &[]);
-                            tracing::error!(
-                                "View {view_name} is accelerated but the accelerator failed to initialize.",
-                                view_name = &view.name.to_string(),
-                            );
-                        }
-                        None
-                    }
-                }
-            })
-            .collect()
-            .await
-    }
-
     /// Initialize views configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `DuckDB`).
@@ -926,6 +905,39 @@ impl Runtime {
         let _ = self.load_view(view, secrets);
     }
 
+    /// Unloads the views of `app` that embed with one of `models`.
+    /// [`Self::apply_view_diff`] loads again the ones that are valid in the new app.
+    pub(crate) async fn unload_views_using_embeddings(
+        self: &Arc<Self>,
+        app: &Arc<App>,
+        models: &HashSet<String>,
+    ) {
+        if models.is_empty() {
+            return;
+        }
+        for vv in Arc::clone(self).get_valid_views(app, LogErrors(false)) {
+            if !view_uses_embedding_model(&vv.view, models) {
+                continue;
+            }
+            // `file_create` discards the stored rows when the view loads again.
+            if vv.view.is_file_accelerated()
+                && vv.view.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.mode != crate::component::dataset::acceleration::Mode::FileCreate
+                })
+            {
+                tracing::warn!(
+                    "View {} keeps the embeddings that its file acceleration stored with the previous configuration of its embedding model. A row is embedded with the new configuration only when a refresh writes it again.",
+                    vv.view.name
+                );
+            }
+            if self.df.table_exists(&vv.view.name) {
+                self.status
+                    .update_view(&vv.view.name, status::ComponentStatus::Refreshing);
+                Arc::clone(self).remove_view(&vv.view.name).await;
+            }
+        }
+    }
+
     /// Update views based on changed between the current and new app.
     /// This function will update views that have changed, and remove views that are no longer in the app.
     /// It will also update views that have dependencies that have changed, and views
@@ -985,12 +997,7 @@ impl Runtime {
                     .is_some_and(|tables| {
                         tables.keys().any(|table| reloaded_datasets.contains(table))
                     })
-                    || vv
-                        .view
-                        .columns
-                        .iter()
-                        .flat_map(|c| &c.embeddings)
-                        .any(|e| changed_embeddings.contains(&e.model)))
+                    || view_uses_embedding_model(&vv.view, &changed_embeddings))
             {
                 views_that_changed.push(vv.view.name.clone());
             }
