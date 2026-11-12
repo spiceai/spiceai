@@ -41,6 +41,7 @@ pub(crate) const PROMPTS: [&str; 4] = [
     "List the months of the year starting from January, one per line. Reply with only the months.",
 ];
 
+/// Loads `gguf` serving up to `concurrent` requests at once, or the engine's own ceiling for 0.
 async fn load(gguf: &Path, name: &'static str, concurrent: u32, context: usize) -> Arc<dyn Chat> {
     let path = gguf.to_str().expect("a UTF-8 path").to_string();
     llms::chat::create_local_model(
@@ -263,7 +264,8 @@ async fn idle_caches_give_up_their_room_to_a_request_that_needs_it() {
 /// that client would stall it too. Served together, the second reply arrives whole while the
 /// first is paused, and both replies are as alone. The prompt is the one confident reply longer
 /// than a client's buffer, so both requests send it; replies of different prompts are kept apart
-/// in `requests_served_together_reply_as_each_does_alone`.
+/// in `requests_served_together_reply_as_each_does_alone`. The model served together sets no
+/// ceiling, so the engine's own serves the requests together.
 #[tokio::test]
 async fn a_request_arriving_mid_reply_streams_before_the_first_one_ends() {
     let gguf = qwen3_gguf().await;
@@ -277,7 +279,7 @@ async fn a_request_arriving_mid_reply_streams_before_the_first_one_ends() {
          ({STREAM_BUFFER}), so it could end without its client",
         alone.chunks
     );
-    let model = load(&gguf, "qwen3-0.6b", 2, 4096).await;
+    let model = load(&gguf, "qwen3-0.6b", 0, 4096).await;
     let mut first = model
         .chat_stream(request(body("qwen3-0.6b", PROMPTS[0], 96)))
         .await

@@ -639,12 +639,25 @@ async fn a_streamed_request_reuses_only_its_callers_prompts() {
     assert_eq!(bob, cold, "bob's streamed reply against an empty cache's");
 }
 
-/// `n` choices run one after another on the same prompt, so every choice after the first
-/// reuses the whole prompt but its last token, and greedy, all choices are the same reply.
+/// On a model that serves one request at a time, as one whose memory holds no more does, `n`
+/// choices run one after another on the same prompt, so every choice after the first reuses the
+/// whole prompt but its last token, and greedy, all choices are the same reply.
 #[tokio::test]
 async fn each_further_choice_reuses_the_prompt() {
     let gguf = crate::qwen3_gguf().await;
-    let model = load(&gguf, "qwen3-0.6b-choices").await;
+    let model = LlamaCpp::from(
+        &[gguf.clone()],
+        LocalModelOptions {
+            reasoning: ReasoningDefault {
+                model_name: "qwen3-0.6b-choices",
+                effort: None,
+            },
+            concurrent_requests: std::num::NonZeroU32::new(1),
+            ..LocalModelOptions::default()
+        },
+    )
+    .await
+    .expect("the model loads on llama.cpp");
     let reply = model
         .chat_request(request(json!({
             "model": "qwen3-0.6b-choices",
