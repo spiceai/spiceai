@@ -20,6 +20,8 @@ sources:
 variants:
   federated: {}
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
   cayenne-memory: cayenne-memory
 
 spicepod:
@@ -230,7 +232,7 @@ steps:
   # names a microsecond instant with arrow_cast, because a `TIMESTAMP` literal
   # is nanoseconds in Spice, which cannot reach 9999.
   - assert-files: { contains: '(^|/)\.spice/data/far/.*\.vortex$' }
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - query: SELECT id, ts, ts_ms, ts_s, tz, dt FROM far
     protocols: [flight, flightsql, http]
     expect: { oracle: src }

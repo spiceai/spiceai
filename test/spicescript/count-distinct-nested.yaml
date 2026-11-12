@@ -12,6 +12,8 @@ sources:
 variants:
   federated: {}
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
 
 spicepod:
   version: v1

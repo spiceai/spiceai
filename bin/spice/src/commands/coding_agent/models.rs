@@ -395,6 +395,7 @@ mod tests {
             metadata: None,
             context_window: None,
             max_output_tokens: None,
+            node_rank: None,
         }
     }
 

@@ -31,6 +31,91 @@ use datafusion_common::Result as DFResult;
 use datafusion_expr::dml::InsertOp;
 use tempfile::TempDir;
 
+pub type FixtureCatalog = dyn MetadataCatalog;
+
+/// In-memory object stores for `CAYENNE_TEST_CATALOG=native`, one per fixture, so a
+/// test that reopens its catalog finds the same objects.
+static NATIVE_STORES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Arc<object_store::memory::InMemory>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Select a catalog only inside the integration harness. Reopens use the same
+/// object store; the native branches never construct a SQL catalog.
+///
+/// - `native`: an in-memory object store, so suite speed does not depend on fsync.
+/// - `native-durable`: an fsync'd local directory, for durable-write coverage.
+/// - `native-nosync`: the same directory without fsync, to measure what durability costs.
+pub async fn fixture_catalog(
+    connection_string: String,
+) -> Result<Arc<FixtureCatalog>, Box<dyn std::error::Error>> {
+    match std::env::var("CAYENNE_TEST_CATALOG").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("sqlite") => {
+            Ok(Arc::new(CayenneCatalog::new(connection_string)?))
+        }
+        Ok(selection @ ("native" | "native-durable" | "native-nosync")) => {
+            use cayenne::metastore::object_native::ObjectNativeCatalog;
+            use object_store::{ObjectStore, ObjectStoreExt, path::Path};
+            let database = connection_string
+                .strip_prefix("sqlite://")
+                .ok_or("native harness requires a local SQLite fixture path")?;
+            let directory = std::path::PathBuf::from(format!("{database}.native"));
+            tokio::fs::create_dir_all(&directory).await?;
+            let store: Arc<dyn ObjectStore> = match selection {
+                "native" => Arc::clone(
+                    NATIVE_STORES
+                        .lock()
+                        .entry(database.to_string())
+                        .or_insert_with(|| Arc::new(object_store::memory::InMemory::new())),
+                ) as Arc<dyn ObjectStore>,
+                "native-nosync" => {
+                    Arc::new(object_store_occ::LocalConditionalPut::new(&directory)?)
+                }
+                _ => Arc::new(object_store_occ::LocalConditionalPut::new_durable(
+                    &directory,
+                )?),
+            };
+            let prefix = Path::from("catalog");
+            // Tiny batches and a checkpoint at every sealed batch, so the suites
+            // seal, checkpoint and reopen from checkpoint roots constantly.
+            let config = cayenne::metastore::object_native::NativeCatalogConfig {
+                log: object_store_occ::headlog::HeadLogConfig {
+                    batch_max_records: 2,
+                    ..object_store_occ::headlog::HeadLogConfig::default()
+                },
+                checkpoint_after_batches: 1,
+                ..cayenne::metastore::object_native::NativeCatalogConfig::default()
+            };
+            let catalog = match store.head(&prefix.clone().join("head")).await {
+                Ok(_) => {
+                    ObjectNativeCatalog::open_with_config(
+                        Arc::clone(&store),
+                        prefix.clone(),
+                        config,
+                    )
+                    .await?
+                }
+                Err(object_store::Error::NotFound { .. }) => {
+                    ObjectNativeCatalog::create_with_config(
+                        Arc::clone(&store),
+                        prefix.clone(),
+                        config,
+                    )
+                    .await?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let head = store.head(&prefix.join("head")).await?;
+            assert!(head.size > 0, "native catalog must persist a head object");
+            eprintln!(
+                "CAYENNE_TEST_CATALOG={selection}: head {} ({} bytes)",
+                head.location, head.size
+            );
+            Ok(Arc::new(catalog))
+        }
+        value => Err(format!("invalid CAYENNE_TEST_CATALOG selection: {value:?}").into()),
+    }
+}
+
 /// Backend type for parameterized tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
@@ -47,8 +132,12 @@ impl BackendType {
 
 /// Test fixture that sets up a temporary directory and catalog
 pub struct TestFixture {
-    pub temp_dir: TempDir,
-    pub catalog: Arc<CayenneCatalog>,
+    /// Shared with [`run_with_backend`], which keeps the directory until the
+    /// test's future completes: an `async move` body that names only some of
+    /// the fixture's fields captures only those, and would otherwise delete the
+    /// directory as soon as the future is built.
+    pub temp_dir: Arc<TempDir>,
+    pub catalog: Arc<FixtureCatalog>,
     pub data_path: std::path::PathBuf,
     pub backend_type: BackendType,
 }
@@ -56,7 +145,7 @@ pub struct TestFixture {
 impl TestFixture {
     /// Create a new test fixture with the specified backend
     pub async fn new(backend: BackendType) -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
+        let temp_dir = Arc::new(TempDir::new()?);
         let data_path = temp_dir.path().join("data");
         std::fs::create_dir_all(&data_path)?;
 
@@ -67,7 +156,7 @@ impl TestFixture {
             }
         };
 
-        let catalog = Arc::new(CayenneCatalog::new(connection_string)?);
+        let catalog = fixture_catalog(connection_string).await?;
         catalog.init().await?;
 
         Ok(Self {
@@ -153,6 +242,7 @@ where
     Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
 {
     let fixture = TestFixture::new(backend).await?;
+    let _directory = Arc::clone(&fixture.temp_dir);
     test_fn(fixture).await
 }
 
@@ -255,10 +345,9 @@ pub async fn write_batches(
 /// against that task. This helper gives the background task a bounded
 /// window to complete before failing the test.
 pub async fn poll_inlined_data_count_zero(
-    catalog: &Arc<CayenneCatalog>,
+    catalog: &Arc<impl MetadataCatalog + ?Sized>,
     table_id: &str,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    use cayenne::MetadataCatalog;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     let started = std::time::Instant::now();
@@ -278,11 +367,10 @@ pub async fn poll_inlined_data_count_zero(
 /// same background task: the reclamation that drains `cayenne_inlined_delete`
 /// runs in a `tokio::spawn` scheduled from the write path.
 pub async fn poll_inlined_delete_count_at_most(
-    catalog: &Arc<CayenneCatalog>,
+    catalog: &Arc<impl MetadataCatalog + ?Sized>,
     table_id: &str,
     limit: i64,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    use cayenne::MetadataCatalog;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     let started = std::time::Instant::now();

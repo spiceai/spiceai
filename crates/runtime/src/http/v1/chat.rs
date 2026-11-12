@@ -305,6 +305,7 @@ pub(crate) fn create_working_stream_payload(
             finish_reason: None,
             logprobs: None,
             delta: ChatCompletionStreamResponseDelta {
+                reasoning_content: None,
                 content: Some(content),
                 function_call: None,
                 tool_calls: None,

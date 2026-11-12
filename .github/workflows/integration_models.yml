@@ -46,7 +46,7 @@ jobs:
   build:
     name: Build Test Binary (macOS)
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
@@ -190,6 +190,7 @@ jobs:
       HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
       HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
+      HAS_TYPESAFE_SECRET: ${{ secrets.TYPESAFE_API_KEY != '' }}
       # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
       # for provider access tokens with these IDs, and exchange again before each expires.
       OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
@@ -431,6 +432,47 @@ jobs:
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
 
+      # Decision model tests
+      - name: Run decisions rejection tests (no credentials)
+        if: ${{ !cancelled() }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::decisions_reject_what_the_runtime_cannot_route/)'
+
+      # Only the OpenAI chat model: `openai:gpt-6-luna` takes only an API key, and this job
+      # authenticates OpenAI with workload identity federation.
+      - name: Run OpenAI decisions tests
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*openai_chat/)'
+
+      - name: Run Anthropic decisions tests
+        if: ${{ !cancelled() && env.HAS_ANTHROPIC_WIF == 'true' }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*anthropic/)'
+
+      - name: Run xAI decisions tests
+        if: ${{ !cancelled() && env.HAS_XAI_SECRET == 'true' }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*xai/)'
+
+      - name: Run TypeSafe decisions tests
+        if: ${{ !cancelled() && env.HAS_TYPESAFE_SECRET == 'true' }}
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*typesafe/)'
+
+      - name: Run decisions routing test
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::decisions_route_by_model_name/)'
+
       - name: Push snapshots to branch
         if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
         timeout-minutes: 10
@@ -447,7 +489,7 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
@@ -638,6 +680,17 @@ jobs:
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
 
+      - name: Run Bedrock decisions tests
+        if: ${{ !cancelled() }}
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          AWS_BEDROCK_KEY: ${{ steps.bedrock-role.outputs.aws-access-key-id }}
+          AWS_BEDROCK_SECRET: ${{ steps.bedrock-role.outputs.aws-secret-access-key }}
+          AWS_BEDROCK_SESSION_TOKEN: ${{ steps.bedrock-role.outputs.aws-session-token }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*bedrock/)'
+
       # The path EKS (IRSA) and any other OIDC token file take: no key at all, only
       # `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`, which spiced's AWS credential chain
       # exchanges with STS itself. A GitHub OIDC token lives 5 minutes, which this one test
@@ -675,7 +728,7 @@ jobs:
   build-extended:
     name: Build Test Binary (Extended)
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 

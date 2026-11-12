@@ -7,18 +7,57 @@ description: >
 
 sources:
   src: { kind: postgres }
+  # The state location of the object-native-rustfs variant.
+  lake: { kind: rustfs }
 
 variants:
   sqlite-key:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key } } } }
   sqlite-position:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: position } } } }
+  # The prototype object-native metastore: a head log in a local directory,
+  # with no SQL metastore. The in-memory CDC tier flushes on every 1 s tick
+  # instead of waiting for 32 MiB or 10 s, so the catalog commits (and the head
+  # log seals and checkpoints) many times in a short run.
+  object-native-key:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+  object-native-position:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+  # The object-native metastore in an S3-compatible store: its head log is kept
+  # under `runtime.state.location`, in the location's `cayenne/v1/` folder, while
+  # data files stay on local disk.
+  object-native-rustfs:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+  # The same flush cadence on SQLite, so the comparison isolates the metastore.
+  sqlite-key-flush:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
   # CDC batches written to files before the source is acknowledged, instead
   # of the default in-memory tier.
   file-durability:
     datasets: { '*': { acceleration: { params: { cayenne_cdc_durability: file } } } }
   # File accelerations partitioned on the primary key (#14947).
   partitioned:
+    datasets:
+      orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
+      customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
+  # `partitioned` with the flag: a partitioned table stays on the SQLite
+  # metastore, and keeps serving its rows across the kill and restart below.
+  partitioned-object-native:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
     datasets:
       orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
       customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
@@ -123,6 +162,37 @@ steps:
       src: UPDATE orders SET o_qty = (o_qty + 1) % 50, o_updated = o_updated + INTERVAL '1 day' WHERE o_id % 3 = 0
   - query: SELECT * FROM orders
     eventually: 90s
+
+  # Sustained changes: one committed transaction a second for 90 s, so the
+  # metastore commits often enough to seal and checkpoint its log before the
+  # restart and the kill below.
+  - source-exec:
+      src: |
+        DO $$
+        BEGIN
+          FOR i IN 1..90 LOOP
+            UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 90 = i % 90;
+            UPDATE customers SET c_balance = c_balance + 1 WHERE c_id % 90 = i % 90;
+            COMMIT;
+            PERFORM pg_sleep(1);
+          END LOOP;
+        END $$;
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  # The rustfs variant's metastore is in its bucket, under the state location's
+  # cayenne/v1/ folder: the name registry's head, and each dataset's own log
+  # (datasets/<name>-<id>/) with its head, sealed batches and checkpoints.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/catalog/head, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /head, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /wal/, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /checkpoints/, min: 1 }
+    only: object-native-rustfs
 
   # Changes made while spiced is stopped arrive after it starts again.
   - stop: {}
