@@ -3156,6 +3156,10 @@ impl MetadataCatalog for CayenneCatalog {
                 .inline_data
                 .iter()
                 .any(|data| data.table_id != *table_id)
+            || commit
+                .table_statistics
+                .as_ref()
+                .is_some_and(|stats| stats.table_id != *table_id)
         {
             return Err(CatalogError::InvalidOperationNoSource {
                 message: format!("Mem-tier commit rows must belong to table '{table_id}'"),
@@ -3201,6 +3205,42 @@ impl MetadataCatalog for CayenneCatalog {
                             })
                             .await?;
                         }
+                    }
+                    // Three parameters per row, below SQLite's 32 766 limit.
+                    for chunk in commit.insert_records.chunks(32_000 / 3) {
+                        let (sql, params) = Self::build_insert_records_chunk_sql(
+                            table_id,
+                            chunk,
+                            commit.sequence_number,
+                        );
+                        tx.execute(ExecuteParams { sql: &sql, params }).await?;
+                    }
+                    if let Some(stats) = &commit.table_statistics {
+                        tx.execute(ExecuteParams {
+                            sql: TABLE_STATISTICS_UPSERT_SQL,
+                            params: vec![
+                                MetastoreValue::Text(stats.table_id.clone()),
+                                MetastoreValue::Blob(stats.statistics_blob.clone()),
+                                MetastoreValue::Integer(stats.num_rows),
+                                stats
+                                    .ndv_sketches
+                                    .clone()
+                                    .map_or(MetastoreValue::Null, MetastoreValue::Blob),
+                                MetastoreValue::Integer(i64::from(stats.num_rows_exact)),
+                            ],
+                        })
+                        .await?;
+                    }
+                    if let Some(snapshot_id) = &commit.keep_file_statistics_of {
+                        tx.execute(ExecuteParams {
+                            sql: "DELETE FROM cayenne_snapshot_file_statistics \
+                                  WHERE table_id = ?1 AND snapshot_id != ?2",
+                            params: vec![
+                                MetastoreValue::Text(table_id.clone()),
+                                MetastoreValue::Text(snapshot_id.clone()),
+                            ],
+                        })
+                        .await?;
                     }
                     CatalogResult::Ok(())
                 }
