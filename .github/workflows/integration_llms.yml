@@ -314,9 +314,9 @@ jobs:
           # still run, and the run says, as a warning annotation, which provider it did not test.
           # A run that asked for nothing but such providers fails, because it would test nothing.
           skip_unprovisioned() {
-            local model="$1" secret="$2" provisioned="$3"
+            local model="$1" secret="$2" provisioned="$3" remedy="$4"
             if [[ ",${MODEL_ALLOWLIST}," == *",${model},"* && "${provisioned}" != "true" ]]; then
-              echo "::warning::${secret} is not set in the ci environment, so this run does not test ${model}. Set the secret in the ci environment."
+              echo "::warning::${secret} is not set in the ci environment, so this run does not test ${model}. ${remedy}"
               MODEL_ALLOWLIST=$(printf '%s' "$MODEL_ALLOWLIST" | tr ',' '\n' | grep -vx "$model" | paste -sd, - || true)
               if [ -z "$MODEL_ALLOWLIST" ]; then
                 echo "::error::This run tests only providers whose secrets the ci environment lacks; ${model} needs ${secret}."
@@ -324,8 +324,10 @@ jobs:
               fi
             fi
           }
-          skip_unprovisioned bedrock AWS_BEDROCK_ROLE_ARN "${HAS_BEDROCK_ROLE}"
-          skip_unprovisioned typesafe TYPESAFE_API_KEY "$([ -n "${TYPESAFE_API_KEY:-}" ] && echo true || echo false)"
+          skip_unprovisioned bedrock AWS_BEDROCK_ROLE_ARN "${HAS_BEDROCK_ROLE}" \
+            "Create the Bedrock CI role and set the secret."
+          skip_unprovisioned typesafe TYPESAFE_API_KEY "$([ -n "${TYPESAFE_API_KEY:-}" ] && echo true || echo false)" \
+            "Set the secret in the ci environment."
           export MODEL_ALLOWLIST
           # Each provider's credential is required only when the run tests that provider.
           runs() { [[ ",${MODEL_ALLOWLIST}," == *",$1,"* ]]; }
