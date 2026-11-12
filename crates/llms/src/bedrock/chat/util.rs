@@ -209,6 +209,7 @@ pub(super) fn chat_choice_stream(
     ChatChoiceStream {
         index: 0,
         delta: ChatCompletionStreamResponseDelta {
+            reasoning_content: None,
             content,
             function_call: None,
             tool_calls,
