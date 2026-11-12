@@ -985,7 +985,9 @@ jobs:
       pull-requests: write
       # Approves the snapshot PR's held pull_request runs.
       actions: write
-    runs-on: spiceai-dev-runners
+    # GitHub-hosted (a fresh VM per job): the self-hosted pool just ran the
+    # branch's tests, and this is the job that holds the write token.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
