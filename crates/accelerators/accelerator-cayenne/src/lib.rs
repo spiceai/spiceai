@@ -1428,9 +1428,9 @@ async fn object_store_table_prefixes(
 /// What an operator reads when a dataset whose data is in the state location
 /// drops its acceleration: for `mode: file_create` (`recreate`), or when the
 /// acceleration is rebuilt or removed. The object-native catalog deletes the
-/// dataset's previous folder once no query on this instance reads it, or, when
-/// Spice stops first, at a start at least an hour after the drop, so nothing is
-/// left for the operator to do.
+/// dataset's previous folder once the data-file retention has passed and no
+/// query reads it. If Spice stops first, it is deleted at a later start, so
+/// nothing is left for the operator to do.
 fn placed_acceleration_dropped_message(dataset: &str, folder: &str, recreate: bool) -> String {
     let what = if recreate {
         "dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location"
@@ -1438,7 +1438,7 @@ fn placed_acceleration_dropped_message(dataset: &str, folder: &str, recreate: bo
         "dropped its acceleration"
     };
     format!(
-        "Dataset '{dataset}' (cayenne) {what}. Its previous folder '{folder}' is deleted once no query reads it, or at a start at least an hour after this drop if Spice stops first. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{dataset}' (cayenne) {what}. Its previous folder '{folder}' is deleted once the data-file retention has passed and no query reads it; if Spice stops first, it is deleted at a later start. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -8287,11 +8287,11 @@ mod tests {
         );
         assert_eq!(
             placed_acceleration_dropped_message("orders", folder, true),
-            "Dataset 'orders' (cayenne) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is deleted once no query reads it, or at a start at least an hour after this drop if Spice stops first. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "Dataset 'orders' (cayenne) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is deleted once the data-file retention has passed and no query reads it; if Spice stops first, it is deleted at a later start. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
         assert_eq!(
             placed_acceleration_dropped_message("orders", folder, false),
-            "Dataset 'orders' (cayenne) dropped its acceleration. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is deleted once no query reads it, or at a start at least an hour after this drop if Spice stops first. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "Dataset 'orders' (cayenne) dropped its acceleration. Its previous folder 's3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000' is deleted once the data-file retention has passed and no query reads it; if Spice stops first, it is deleted at a later start. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
     }
 
