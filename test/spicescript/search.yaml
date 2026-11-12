@@ -30,6 +30,15 @@ spicepod:
         - name: body
           full_text_search: { enabled: true, row_id: [id] }
           embeddings: [{ from: potion, row_id: [id] }]
+  views:
+    # A LATERAL table function in an accelerated view: refreshing it must not
+    # need the plan written back as SQL (spiceai/datafusion#294).
+    - name: term_hits
+      dependsOn: [docs]
+      sql: >-
+        SELECT q.term, s.id FROM (VALUES ('fox'), ('dog')) AS q(term)
+        CROSS JOIN LATERAL text_search(docs, q.term) s
+      acceleration: { enabled: true, engine: arrow }
 
 defaults:
   # A cluster buckets each acceleration on this column (--cluster).
@@ -79,6 +88,30 @@ steps:
     expect: { same-as: scores }
   - query: SELECT count(*) AS n FROM vector_search(docs, 'dog')
     oracle-sql: SELECT count(*) FROM docs WHERE body IS NOT NULL
+
+  # LATERAL: text_search runs once for each row of the left relation, with
+  # that row's term (spiceai/datafusion#294). The plan has no protobuf form yet,
+  # so these steps do not run distributed.
+  - query: >-
+      SELECT q.term, s.id FROM (VALUES ('fox'), ('dog')) AS q(term)
+      CROSS JOIN LATERAL text_search(docs, q.term) s
+    oracle-sql: >-
+      SELECT 'fox' AS term, id FROM docs WHERE fox > 0 AND body IS NOT NULL
+      UNION ALL SELECT 'dog', id FROM docs WHERE dog > 0 AND body IS NOT NULL
+    cluster: false
+  # A term with no match keeps its row under LEFT JOIN, with a NULL id.
+  - query: >-
+      SELECT q.term, s.id FROM (VALUES ('fox'), ('unicorn')) AS q(term)
+      LEFT JOIN LATERAL text_search(docs, q.term) s ON true
+    oracle-sql: >-
+      SELECT 'fox' AS term, id FROM docs WHERE fox > 0 AND body IS NOT NULL
+      UNION ALL SELECT 'unicorn', NULL::integer
+    cluster: false
+  - query: SELECT term, id FROM term_hits
+    oracle-sql: >-
+      SELECT 'fox' AS term, id FROM docs WHERE fox > 0 AND body IS NOT NULL
+      UNION ALL SELECT 'dog', id FROM docs WHERE dog > 0 AND body IS NOT NULL
+    cluster: false
 
   # The indexes follow the source: a new document is found, a deleted one is not.
   - source-exec:
