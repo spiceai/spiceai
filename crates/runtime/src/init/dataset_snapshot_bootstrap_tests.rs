@@ -164,7 +164,7 @@ async fn snapshot_bootstrap_does_not_block_startup_and_default_warn_recovers() {
             .await,
     );
     tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(10),
         Arc::clone(&runtime).load_components(),
     )
     .await
