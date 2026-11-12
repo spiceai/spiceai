@@ -681,8 +681,7 @@ impl std::fmt::Display for EngineType {
 impl EngineType {
     fn to_acceleration_engine(self) -> AccelerationEngine {
         match self {
-            Self::CayenneFile => AccelerationEngine::Cayenne,
-            Self::Cayenne => AccelerationEngine::Cayenne,
+            Self::CayenneFile | Self::Cayenne => AccelerationEngine::Cayenne,
         }
     }
 }
