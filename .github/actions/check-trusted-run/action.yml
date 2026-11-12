@@ -43,9 +43,13 @@ runs:
       run: |
         set -euo pipefail
         [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
-        # `gh run view --json` has no head repository field, so read the run from the API.
+        # `gh run view --json` has no head repository field, so read the run from the API. A pull
+        # request run takes its name from the author's workflow file, so a name could carry line
+        # breaks to forge the fields read after it: flatten them, and require one line per field.
         info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
-          -q '.name, .event, (.head_repository.full_name // ""), (.head_branch // ""), .head_sha')
+          -q '.name, .event, (.head_repository.full_name // ""), (.head_branch // ""), .head_sha
+            | tostring | gsub("[\r\n]"; " ")')
+        [ "$(wc -l <<<"$info")" -eq 5 ] || { echo "::error::Run $RUN_ID returned an unexpected metadata record"; exit 1; }
         { read -r workflow; read -r event; read -r head_repo; read -r head_branch; read -r head_sha; } <<<"$info"
         refuse() {
           echo "::error::Run $RUN_ID ($workflow, $event event, $head_repo @ $head_branch) $1"
