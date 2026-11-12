@@ -215,6 +215,7 @@ jobs:
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 --no-fail-fast -E "$SUITES"
       # What Cayenne's data path needs from an S3-compatible store.
       - name: Run the S3 store conformance test
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 -E 'test(/^rustfs_store_conformance_test::/)'
 
       - name: Stop RustFS
