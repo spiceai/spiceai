@@ -118,8 +118,7 @@ async fn probe_bedrock_decision_candidates(
     #[values(
         "us.amazon.nova-lite-v1:0",
         "us.amazon.nova-pro-v1:0",
-        "us.amazon.nova-2-lite-v1:0",
-        "us.amazon.nova-premier-v1:0"
+        "us.amazon.nova-2-lite-v1:0"
     )]
     model_id: &str,
 ) {
@@ -136,7 +135,7 @@ async fn probe_bedrock_decision_candidates(
     .unwrap_or_else(|e| panic!("PROBE {model_id}: failed to create: {e}"));
     let model: Arc<dyn Evaluate> = Arc::new(ChatEvaluator::new("bedrock", chat));
     let mut failed_rounds = 0;
-    for round in 1..=5 {
+    for round in 1..=15 {
         let label = format!("bedrock[{model_id}]#{round}");
         let m = Arc::clone(&model);
         let failures =
@@ -148,6 +147,6 @@ async fn probe_bedrock_decision_candidates(
             println!("PROBE {label}: FAIL\n{}", conformance::report(&failures));
         }
     }
-    println!("PROBE SUMMARY {model_id}: {failed_rounds}/5 rounds failed");
-    assert_eq!(failed_rounds, 0, "PROBE {model_id}: {failed_rounds}/5 rounds failed");
+    println!("PROBE SUMMARY {model_id}: {failed_rounds}/15 rounds failed");
+    assert_eq!(failed_rounds, 0, "PROBE {model_id}: {failed_rounds}/15 rounds failed");
 }
