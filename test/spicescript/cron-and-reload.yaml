@@ -4,9 +4,9 @@ description: >
   refresh, an append and an accelerated view each follow the source with no
   manual refresh. With the spicepod watched, edits take effect without a
   restart: a slower cron made faster, a dataset added and one removed, and a
-  view's SQL changed. A dataset and a view added by an edit with the removed
-  `postgres` acceleration engine each fail to load with the removal error,
-  while the dataset added beside them loads.
+  view's SQL changed. A dataset edited to the removed `postgres` acceleration
+  engine, and a dataset and a view added by an edit with it, each fail to load
+  with the removal error, while the dataset added beside them loads.
 
 sources:
   src: { kind: postgres }
@@ -86,6 +86,18 @@ steps:
   - query: SELECT id, v FROM slow_cron
     oracle-sql: SELECT id, v FROM t
     eventually: 60s
+  # An existing dataset edited to the removed `postgres` engine fails to reload
+  # with the removal error rather than being switched to Cayenne.
+  - edit-spicepod:
+      datasets:
+        removed_later: { acceleration: { enabled: true, engine: postgres } }
+  - query: SELECT count(*) FROM removed_later
+    expect-error: removed_later
+    eventually: 60s
+  - assert-log:
+      count:
+        "ERROR .*'removed_later': the acceleration engine `postgres` is no longer supported as of v2\\.5 and cannot be used\\.": '>=1'
+      lacks: ["deprecated .*removed_later", "Unknown acceleration engine 'postgres"]
   - edit-spicepod:
       spicepod:
         datasets:
