@@ -37,6 +37,26 @@
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Input/output error: `Other error: `Unsupported column type \\\"Decimal(38, 10)\\\".``\": code: 'Client specified an invalid argument', message: \"Fai",
       "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-decimals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, d FROM wide ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for wide: Acceleration not ready; loading initial data for wide",
+      "varies": true,
+      "group": "clickhouse",
+      "may-pass": true
+    },
+    {
+      "run": "clickhouse-decimals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM wide WHERE d > 0 ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for wide: Acceleration not ready; loading initial data for wide",
+      "varies": true,
+      "group": "clickhouse",
+      "may-pass": true
     }
   ],
   "clickhouse-literals-known": [

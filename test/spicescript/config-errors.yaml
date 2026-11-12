@@ -16,6 +16,12 @@ description: >
 
 sources:
   src: { kind: postgres }
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod
@@ -84,6 +90,10 @@ steps:
         "Dataset 'turso_param' sets `cayenne_metastore: turso`, which is no longer supported and has no effect: the dataset uses the built-in metastore. Remove `cayenne_metastore` from this dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration": 1
         "Dataset 'turso_param_memory' sets `cayenne_metastore: turso`, which is no longer supported and has no effect": 1
   - assert-files: { contains: ['^meta/cayenne\.db$'], lacks: ['^meta/cayenne\.db-log$'] }
+    only: as-written
+  # The object-native metastore writes no SQLite catalog for file-mode datasets.
+  - assert-files: { lacks: ['^meta/cayenne\.db$', '^meta/cayenne\.db-log$'] }
+    only: object-native
   # The `turso` acceleration engine is removed. Only the dataset and the view
   # that set it fail to load, each with one error, and neither is rebuilt on
   # Cayenne behind the user's back: a dataset that falls back to Cayenne would

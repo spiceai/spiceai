@@ -55,6 +55,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before pulling so we use the authenticated
@@ -68,11 +70,11 @@ jobs:
           username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Pull MySQL Docker image
-        run: docker pull mysql:latest
+        run: docker pull mysql:26.10.0@sha256:3819b2b23835c4a73c8b022fafc33c8095c0f81c929a8b7a84613d2fba6c52f5
 
       - name: Start temporary MySQL server
         run: |
-          docker run --name spice-mysql-tpcds-bench-temp -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 -d mysql:latest --local-infile=1
+          docker run --name spice-mysql-tpcds-bench-temp -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 -d mysql:26.10.0@sha256:3819b2b23835c4a73c8b022fafc33c8095c0f81c929a8b7a84613d2fba6c52f5 --local-infile=1
 
       - name: Install necessary tools
         run: sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y && sudo apt-get update && sudo apt-get install -y make flex bison byacc git g++-9 gcc-9

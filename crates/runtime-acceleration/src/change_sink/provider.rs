@@ -459,6 +459,9 @@ impl ChangeSinkBackend for ProviderChangeSinkBackend {
         batch: ChangeBatch,
         options: WriteOptions,
         ctx: &SessionContext,
+        // A generic provider commits each write on its own; the committer saves
+        // the position afterwards.
+        _positions: Vec<super::PositionWrite>,
     ) -> Result<BackendWrite> {
         if batch.replaced_scopes().next().is_some()
             && self.replacement == ReplacementSupport::Unsupported

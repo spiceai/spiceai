@@ -66,6 +66,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # The schema and GH CLI steps below call apt-get directly
+      # (postgresql-client, git, make, gh). This removes the runner image's
+      # git-core PPA, whose outages otherwise fail `apt-get install git` with
+      # exit 100, and gives the Ubuntu archives mirror failover, as
+      # testoperator_run_bench.yml does.
+      - name: Configure apt mirrors
+        uses: ./.github/actions/configure-apt
+
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
 

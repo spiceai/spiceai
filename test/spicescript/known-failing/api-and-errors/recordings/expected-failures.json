@@ -47,9 +47,9 @@
       "who": "default",
       "key": "assert-status: {\"dataset\":\"kf_bad_topic\",\"message-contains\":\"no_such_topic\",\"status\":\"Error\"}",
       "kind": "error",
-      "signature": "expected a message containing 'no_such_topic', saw status=Error ready=false message=Failed to load the dataset kf_bad_topic (kafka). Unable to receive message from Kafka: Message consumption error: BrokerTransportFailure (Local: Broker transpor…",
+      "signature": "expected a message containing 'no_such_topic', saw status=Error ready=false message=Failed to load the dataset kf_bad_topic (kafka). Unable to receive message from Kafka: Message consumption error: BrokerTransportFailure (Local: Broker transpor\u2026",
       "also": [
-        "expected a message containing 'no_such_topic', saw status=Error ready=false message=Failed to load the dataset kf_bad_topic (kafka). Unable to receive message from Kafka: Message consumption error: UnknownTopicOrPartition (Broker: Unknown topic…"
+        "expected a message containing 'no_such_topic', saw status=Error ready=false message=Failed to load the dataset kf_bad_topic (kafka). Unable to receive message from Kafka: Message consumption error: UnknownTopicOrPartition (Broker: Unknown topic\u2026"
       ],
       "varies": true,
       "group": "api-and-errors"
@@ -59,7 +59,7 @@
       "who": "default",
       "key": "assert-status: {\"dataset\":\"s3_bad_secret\",\"message-contains\":\"Authentication failed\",\"status\":\"Error\"}",
       "kind": "error",
-      "signature": "expected a message containing 'Authentication failed', saw status=Error ready=false message=Cannot connect to the dataset s3_bad_secret (s3). Object Store error: Generic S3 error: Error performing list request: Error performing GET http://127.0.0.1:<port>…",
+      "signature": "expected a message containing 'Authentication failed', saw status=Error ready=false message=Cannot connect to the dataset s3_bad_secret (s3). Object Store error: Generic S3 error: Error performing list request: Error performing GET http://127.0.0.1:<port>\u2026",
       "group": "api-and-errors"
     },
     {
@@ -67,7 +67,7 @@
       "who": "default",
       "key": "assert-status: {\"dataset\":\"mg_bad_host\",\"message-contains\":\"Ensure that the host and port are correctly configured\",\"status\":\"Error\"}",
       "kind": "error",
-      "signature": "expected a message containing 'Ensure that the host and port are correctly configured', saw status=Error ready=false message=Failed to initialize data connector: Cannot connect to the dataset mg_bad_host (mongodb). Failed to connect to MongoDB: Kind: Server selection timeout: No avail…",
+      "signature": "expected a message containing 'Ensure that the host and port are correctly configured', saw status=Error ready=false message=Failed to initialize data connector: Cannot connect to the dataset mg_bad_host (mongodb). Failed to connect to MongoDB: Kind: Server selection timeout: No avail\u2026",
       "group": "api-and-errors"
     },
     {
@@ -100,7 +100,15 @@
   "refresh-api-changes": [
     {
       "run": "refresh-api-changes",
-      "who": "default",
+      "who": "as-written",
+      "key": "http: {\"method\":\"POST\",\"path\":\"/v1/datasets/c/acceleration/refresh\"}",
+      "kind": "status",
+      "signature": "status 500, expected 400; body does not match /changes/: {\"message\":\"Failed to refresh the dataset c. Manual refresh is not supported for `append` mode. Only `full` refresh mode supports manual refreshes.\"}; body matches /`append` mode/ at '`append` mode'",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "refresh-api-changes",
+      "who": "object-native",
       "key": "http: {\"method\":\"POST\",\"path\":\"/v1/datasets/c/acceleration/refresh\"}",
       "kind": "status",
       "signature": "status 500, expected 400; body does not match /changes/: {\"message\":\"Failed to refresh the dataset c. Manual refresh is not supported for `append` mode. Only `full` refresh mode supports manual refreshes.\"}; body matches /`append` mode/ at '`append` mode'",
@@ -119,6 +127,14 @@
     {
       "run": "refresh-api-invalid-sql",
       "who": "full",
+      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"DELETE FROM t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"PATCH\",\"path\":\"/v1/datasets/t/acceleration\"}",
+      "kind": "status",
+      "signature": "status 500, expected 400",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "refresh-api-invalid-sql",
+      "who": "object-native",
       "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"DELETE FROM t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"PATCH\",\"path\":\"/v1/datasets/t/acceleration\"}",
       "kind": "status",
       "signature": "status 500, expected 400",

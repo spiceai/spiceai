@@ -11,6 +11,14 @@ variants:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key } } } }
   sqlite-position:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: position } } } }
+  # The prototype object-native metastore: a head log in a local directory, with
+  # the binlog position kept in it, and no SQL metastore.
+  object-native-key:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key } } } }
+  object-native-position:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position } } } }
   cayenne-memory:
     datasets: { '*': { acceleration: { mode: memory } } }
 

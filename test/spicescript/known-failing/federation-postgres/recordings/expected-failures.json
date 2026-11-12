@@ -31,6 +31,22 @@
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nFailed to build record batch: Invalid argument error: all columns in a record batch mus",
       "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-timestamp-before-epoch",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, ts FROM p",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for p: Acceleration not ready; loading initial data for p",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-timestamp-before-epoch",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, ts FROM p WHERE ts < TIMESTAMP '1970-01-01 00:00:00'",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for p: Acceleration not ready; loading initial data for p",
+      "group": "federation-postgres"
     }
   ],
   "postgres-type-coverage": [

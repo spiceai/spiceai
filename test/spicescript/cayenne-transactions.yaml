@@ -1,0 +1,121 @@
+name: cayenne-transactions
+description: >
+  A SQL transaction (`BEGIN; SELECT assert(<gate>); UPDATE …; INSERT …;
+  COMMIT;`) that writes two Cayenne accelerations commits both or neither,
+  with each answer checked against the same transactions run on PostgreSQL. A
+  gate that fails after both writes leaves both tables as they were. The
+  committed state survives a graceful restart and a kill. The SQLite metastore
+  and the object-native one, local and in an S3 state location, give
+  identical answers. In the object-native metastore each dataset has its own
+  log, so the commit crosses two logs, and a committed transaction leaves no
+  transaction records behind.
+
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+
+variants:
+  sqlite: {}
+  object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+  object-native-rustfs:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-transactions
+  datasets:
+    - from: postgres:public.accounts
+      name: accounts
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, write_mode: acceleration, primary_key: id }
+    - from: postgres:public.ledger
+      name: ledger
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, write_mode: acceleration, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL);
+        INSERT INTO accounts VALUES (1, 100), (2, 0);
+        CREATE TABLE ledger (id bigint PRIMARY KEY, account bigint NOT NULL, amount bigint NOT NULL);
+        INSERT INTO ledger VALUES (1, 1, 100);
+        CREATE TABLE accounts_model AS SELECT * FROM accounts;
+        CREATE TABLE ledger_model AS SELECT * FROM ledger;
+  - start: {}
+  - query: SELECT id, balance FROM accounts
+    oracle-sql: SELECT id, balance FROM accounts_model
+  - query: SELECT id, account, amount FROM ledger
+    oracle-sql: SELECT id, account, amount FROM ledger_model
+
+  # A transfer whose gate holds commits on both tables.
+  - spice-exec: 'BEGIN; SELECT assert((SELECT balance FROM accounts WHERE id = 1) >= 30); UPDATE accounts SET balance = balance - 30 WHERE id = 1; INSERT INTO ledger VALUES (2, 1, -30); COMMIT;'
+  - source-exec: { src: 'BEGIN; UPDATE accounts_model SET balance = balance - 30 WHERE id = 1; INSERT INTO ledger_model VALUES (2, 1, -30); COMMIT;' }
+  - query: SELECT id, balance FROM accounts
+    oracle-sql: SELECT id, balance FROM accounts_model
+  - query: SELECT id, account, amount FROM ledger
+    oracle-sql: SELECT id, account, amount FROM ledger_model
+
+  # A gate that fails after both writes leaves both tables as they were.
+  - spice-exec: 'BEGIN; UPDATE accounts SET balance = balance - 500 WHERE id = 1; INSERT INTO ledger VALUES (3, 1, -500); SELECT assert((SELECT balance FROM accounts WHERE id = 1) >= 500); COMMIT;'
+    expect-error: true
+  - query: SELECT id, balance FROM accounts
+    oracle-sql: SELECT id, balance FROM accounts_model
+  - query: SELECT id, account, amount FROM ledger
+    oracle-sql: SELECT id, account, amount FROM ledger_model
+
+  # The second account, then both tables again.
+  # A transaction writes each table once.
+  - spice-exec: 'BEGIN; SELECT assert((SELECT balance FROM accounts WHERE id = 1) >= 20); UPDATE accounts SET balance = balance + CASE WHEN id = 1 THEN -20 ELSE 20 END WHERE id IN (1, 2); INSERT INTO ledger VALUES (3, 1, -20), (4, 2, 20); COMMIT;'
+  - source-exec: { src: 'BEGIN; UPDATE accounts_model SET balance = balance - 20 WHERE id = 1; UPDATE accounts_model SET balance = balance + 20 WHERE id = 2; INSERT INTO ledger_model VALUES (3, 1, -20), (4, 2, 20); COMMIT;' }
+  - query: SELECT id, balance FROM accounts
+    oracle-sql: SELECT id, balance FROM accounts_model
+  - query: SELECT id, account, amount FROM ledger
+    oracle-sql: SELECT id, account, amount FROM ledger_model
+
+  # Each dataset has its own log, so the commits crossed two logs, and nothing
+  # of the committed transactions is left in `transactions/`.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/accounts-, contains: /head, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/ledger-, contains: /head, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/transactions/, max: 0 }
+    only: object-native-rustfs
+
+  # The committed state survives a graceful restart and a kill.
+  - restart: {}
+  - query: SELECT id, balance FROM accounts
+    oracle-sql: SELECT id, balance FROM accounts_model
+  - query: SELECT id, account, amount FROM ledger
+    oracle-sql: SELECT id, account, amount FROM ledger_model
+  - kill-spiced: {}
+  - start: {}
+  - query: SELECT id, balance FROM accounts
+    oracle-sql: SELECT id, balance FROM accounts_model
+  - query: SELECT id, account, amount FROM ledger
+    oracle-sql: SELECT id, account, amount FROM ledger_model
+
+  # And both tables still take transactions after it.
+  - spice-exec: 'BEGIN; SELECT assert((SELECT balance FROM accounts WHERE id = 2) >= 5); UPDATE accounts SET balance = balance - 5 WHERE id = 2; INSERT INTO ledger VALUES (5, 2, -5); COMMIT;'
+  - source-exec: { src: 'BEGIN; UPDATE accounts_model SET balance = balance - 5 WHERE id = 2; INSERT INTO ledger_model VALUES (5, 2, -5); COMMIT;' }
+  - query: SELECT id, balance FROM accounts
+    oracle-sql: SELECT id, balance FROM accounts_model
+  - query: SELECT id, account, amount FROM ledger
+    oracle-sql: SELECT id, account, amount FROM ledger_model

@@ -11,6 +11,8 @@ sources:
 variants:
   zulu: {}
   keyed: { datasets: { events: { acceleration: { primary_key: id, on_conflict: { id: upsert } } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 spicepod:
   version: v1
   kind: Spicepod
