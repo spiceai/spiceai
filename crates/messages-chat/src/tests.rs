@@ -287,7 +287,7 @@ fn function_line(name: &str) -> String {
 
 /// Claude Code's tool search, as it sends it: tools it has not loaded are left out but for a
 /// deferred placeholder, and a loaded tool is listed with `defer_loading` still set, in name
-/// order, once a ToolSearch result has referenced it. A deferred tool is offered only once
+/// order, once a `ToolSearch` result has referenced it. A deferred tool is offered only once
 /// referenced, after the tools that were never deferred, and the reference reads as its
 /// definition.
 #[test]
