@@ -874,6 +874,232 @@ impl Model for Protocol {
         }
         Some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Upsert(k, v) => format!("CDC upsert k{k} = v{v} (or its redelivery)"),
+            Action::Delete(k) => format!("CDC delete k{k} (or its redelivery)"),
+            Action::SealCapture => "seal: capture the memory tier".into(),
+            Action::SealReserve => "seal: reserve its sequence number".into(),
+            Action::SealStage => "seal: stage inline shadow rows (and tombstones)".into(),
+            Action::SealStageRest => "seal: stage the tombstones separately".into(),
+            Action::SealEnd => "seal: publish, then acknowledge the source".into(),
+            Action::CkCapture => "checkpoint: capture the memory tier".into(),
+            Action::CkPrecompute => "checkpoint: choose the keys that need insert records".into(),
+            Action::CkStage => "checkpoint: stage its snapshot, deletes and insert records".into(),
+            Action::CkStageRest => "checkpoint: stage insert records separately".into(),
+            Action::CkPublish => "checkpoint: apply to the in-memory index".into(),
+            Action::CkEnd => "checkpoint: publish, then acknowledge the source".into(),
+            Action::Flush => "flush pending changes to the metastore".into(),
+            Action::Bake => "bake protected snapshots into one".into(),
+            Action::FullRewriteCapture => "full rewrite: capture rows to rewrite".into(),
+            Action::FullRewrite => "full rewrite: publish the new current file".into(),
+            Action::Crash => "the process crashes (memory lost)".into(),
+            Action::Recover => "the process recovers from the metastore".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        Some(crate::explorer::summary(&[
+            format!("live rows:      {}", rows_text(&visible(&s))),
+            format!("after restart:  {}", rows_text(&Self::recovered_rows(&s))),
+            format!("source says:    {}", rows_text(&reference(&s.source))),
+            format!(
+                "sequence high {} (watermark {}); acknowledged position {} of {}",
+                s.high,
+                s.watermark,
+                s.ack,
+                s.source.len()
+            ),
+            format!("seals {}, checkpoints {}", s.seals, s.checkpoints),
+            crate::explorer::flags(&[
+                ("crashed", s.crashed),
+                ("baked", s.baked),
+                ("full rewrite committed", s.rewritten),
+                ("rewrite interleaved with apply", s.rewrite_interleaved),
+                (
+                    "rewrite kept a later protected snapshot",
+                    s.rewrite_preserved,
+                ),
+                (
+                    "flush between checkpoint stage and end",
+                    s.flushed_checkpoint,
+                ),
+                (
+                    "crash between checkpoint stage and publish",
+                    s.crashed_stage,
+                ),
+                ("seal shadow recovered", s.recovered_shadow),
+                ("reinsert checkpointed", s.checkpointed_reinsert),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Svg, Timeline, Tone, row, steps};
+        let s = path.last_state().clone();
+        let mut svg = Svg::new();
+        let live = visible(&s);
+        let recovered = Self::recovered_rows(&s);
+        let expected = reference(&s.source);
+        let source: Vec<String> = s
+            .source
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                format!(
+                    "{}. k{k} {}{}",
+                    i + 1,
+                    v.map_or("delete".into(), |v| format!("= v{v}")),
+                    if i < s.ack { " (acknowledged)" } else { "" }
+                )
+            })
+            .collect();
+        let mut outcome = vec![
+            (
+                "SOURCE (CDC changes)".to_string(),
+                if source.is_empty() {
+                    vec!["no changes".into()]
+                } else {
+                    source
+                },
+                Tone::Actor,
+            ),
+            (
+                if s.crashed {
+                    "LIVE (process CRASHED)".into()
+                } else {
+                    "LIVE (what a query sees)".into()
+                },
+                vec![rows_text(&live)],
+                if s.crashed {
+                    Tone::Gone
+                } else if live == expected {
+                    Tone::Live
+                } else {
+                    Tone::Bad
+                },
+            ),
+            (
+                "AFTER A RESTART".into(),
+                vec![
+                    rows_text(&recovered),
+                    format!("source says {}", rows_text(&expected)),
+                ],
+                if recovered == expected {
+                    Tone::Live
+                } else {
+                    Tone::Bad
+                },
+            ),
+        ];
+        let segments: Vec<String> = s
+            .tier
+            .iter()
+            .map(|seg| {
+                let mut parts = vec![format!("pos {}:", seg.position)];
+                if let Some(r) = &seg.row {
+                    parts.push(format!("k{} = v{} seq {}", r.key, r.value, r.seq));
+                }
+                for (k, &(d, i)) in seg.deletes.iter().enumerate() {
+                    if d > 0 {
+                        parts.push(format!("delete k{k} <= {d} (insert {i})"));
+                    }
+                }
+                if seg.sealed {
+                    parts.push("[sealed]".into());
+                }
+                parts.join(" ")
+            })
+            .collect();
+        outcome.push((
+            "MEMORY TIER (lost on crash)".into(),
+            if segments.is_empty() {
+                vec!["empty".into()]
+            } else {
+                segments
+            },
+            Tone::Staged,
+        ));
+        if let Some(c) = &s.capture {
+            outcome.push((
+                format!(
+                    "{} IN FLIGHT (phase {})",
+                    if c.checkpoint { "CHECKPOINT" } else { "SEAL" },
+                    c.phase
+                ),
+                vec![
+                    format!(
+                        "sequence {}, through segment {}, position {}",
+                        c.sequence, c.through, c.position
+                    ),
+                    format!("corpus {}", rows_seq_text(&c.corpus)),
+                ],
+                Tone::Staged,
+            ));
+        }
+        if !s.pending.is_empty() {
+            outcome.push((
+                "STAGED, NOT PUBLISHED".into(),
+                s.pending.iter().map(change_text).collect(),
+                Tone::Staged,
+            ));
+        }
+        let mut y = row(&mut svg, 0, &outcome) + 30;
+        y = draw_catalog(&mut svg, y, &s.durable_catalog) + 30;
+        let (src, tier, capture, store, process) = (0, 1, 2, 3, 4);
+        let lane_names = [
+            "source",
+            "memory tier",
+            "seal / checkpoint",
+            "metastore",
+            "process",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            let published = after.durable_catalog != before.durable_catalog;
+            events.push(match action {
+                Action::Upsert(..) | Action::Delete(_) => {
+                    let replay =
+                        before.replay.is_some() || before.source.len() == after.source.len();
+                    Event::on(
+                        src,
+                        if replay {
+                            format!("redeliver: {label}")
+                        } else {
+                            label
+                        },
+                    )
+                    .to(tier)
+                }
+                Action::SealCapture | Action::CkCapture | Action::FullRewriteCapture => {
+                    Event::on(capture, label).to(tier).tone(Tone::Actor)
+                }
+                Action::SealReserve | Action::CkPrecompute | Action::CkPublish => {
+                    Event::on(capture, label)
+                }
+                Action::SealStage
+                | Action::SealStageRest
+                | Action::CkStage
+                | Action::CkStageRest => Event::on(capture, label).to(store).tone(Tone::Staged),
+                Action::SealEnd | Action::CkEnd | Action::FullRewrite => Event::on(capture, label)
+                    .to(store)
+                    .tone(if published { Tone::Live } else { Tone::Gone }),
+                Action::Flush | Action::Bake => Event::on(tier, label)
+                    .to(store)
+                    .tone(if published { Tone::Live } else { Tone::Gone }),
+                Action::Crash => Event::on(process, "CRASH").tone(Tone::Bad),
+                Action::Recover => Event::on(store, label).to(process),
+            });
+        }
+        Timeline {
+            lanes: lane_names,
+            events,
+        }
+        .draw(&mut svg, 0, y);
+        Some(svg.finish())
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("live reads match the source", |_, s: &State| {
@@ -933,6 +1159,129 @@ impl Model for Protocol {
     }
 }
 
+fn rows_text(rows: &Rows) -> String {
+    if rows.is_empty() {
+        return "(no rows)".into();
+    }
+    rows.iter()
+        .map(|(k, v)| format!("k{k}=v{v}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn rows_seq_text(rows: &[Row]) -> String {
+    rows.iter()
+        .map(|r| format!("k{}=v{}@{}", r.key, r.value, r.seq))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn index_text(index: &Index) -> String {
+    index
+        .iter()
+        .enumerate()
+        .filter(|(_, (d, _))| *d > 0)
+        .map(|(k, (d, i))| format!("k{k}: delete <= {d}, insert stamp {i}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+fn change_text(change: &Change) -> String {
+    match change {
+        Change::High(n) => format!("sequence high {n}"),
+        Change::Inline(rows) => format!("inline shadow rows {}", rows_seq_text(rows)),
+        Change::Deletes(index) => format!("delete vector {}", index_text(index)),
+        Change::Snapshot(snap) => format!(
+            "protected snapshot @{} {}",
+            snap.sequence,
+            rows_seq_text(&snap.rows)
+        ),
+        Change::Inserts(keys, seq) => format!("insert records {keys:?} at {seq}"),
+        Change::ClearInline => "clear inline rows".into(),
+        Change::Bake(snap) => format!("bake into snapshot @{}", snap.sequence),
+        Change::Position(n) => format!("source position {n}"),
+        Change::FullRewrite(r) => format!(
+            "full rewrite through {} -> current {}",
+            r.cutoff,
+            rows_seq_text(&r.rows)
+        ),
+    }
+}
+/// Draws the durable catalog: the head's fields, then every row-holding part
+/// (current file, protected snapshots, inline shadow) and the delete vectors,
+/// each delete pointing at the rows of its key at or below its sequence.
+fn draw_catalog(svg: &mut crate::explorer::Svg, y: usize, catalog: &Catalog) -> usize {
+    use crate::explorer::Tone;
+    svg.heading(0, y, "DURABLE CATALOG (survives a restart)");
+    let y = y + 22;
+    let mut lines = vec![
+        format!("sequence high {}", catalog.high),
+        format!("source position {}", catalog.position),
+        format!(
+            "insert records: k0 {}, k1 {}",
+            catalog.inserts[0], catalog.inserts[1]
+        ),
+    ];
+    let vectors_at = lines.len();
+    for v in &catalog.vectors {
+        lines.push(format!("delete vector {}", index_text(v)));
+    }
+    let head = svg.node(0, y, 0, "CATALOG HEAD", &lines, Tone::Live);
+    let col = head.right() + 90;
+    let mut cy = y;
+    let mut parts: Vec<(String, Vec<Row>)> = vec![];
+    if !catalog.current.is_empty() {
+        parts.push((
+            format!("current file (min seq {:?})", catalog.current_min),
+            catalog.current.clone(),
+        ));
+    }
+    for snap in &catalog.snapshots {
+        parts.push((
+            format!(
+                "protected snapshot @{} (min {})",
+                snap.sequence, snap.min_sequence
+            ),
+            snap.rows.clone(),
+        ));
+    }
+    if !catalog.inline.is_empty() {
+        parts.push(("inline shadow rows".into(), catalog.inline.clone()));
+    }
+    let mut placed = vec![];
+    for (title, rows) in parts {
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|r| format!("k{} = v{} seq {}", r.key, r.value, r.seq))
+            .collect();
+        let node = svg.node(col, cy, 0, &title, &lines, Tone::Live);
+        svg.arrow(
+            (head.right(), head.line_y(0)),
+            (node.x, node.mid_y()),
+            Tone::Live,
+            None,
+        );
+        cy = node.bottom() + 10;
+        placed.push((rows, node));
+    }
+    for (i, v) in catalog.vectors.iter().enumerate() {
+        for (key, &(d, _)) in v.iter().enumerate() {
+            if d == 0 {
+                continue;
+            }
+            for (rows, node) in &placed {
+                for (j, r) in rows.iter().enumerate() {
+                    if r.key == key && r.seq <= d {
+                        svg.arrow(
+                            (head.right(), head.line_y(vectors_at + i)),
+                            (node.x, node.line_y(j)),
+                            Tone::Gone,
+                            Some("covers"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    head.bottom().max(cy)
+}
 /// Modeled data-content projection, with physical row multiplicity retained.
 /// Vector entries are flattened per key so physical vector-file grouping is immaterial.
 #[derive(Clone, Debug, PartialEq, Eq)]
