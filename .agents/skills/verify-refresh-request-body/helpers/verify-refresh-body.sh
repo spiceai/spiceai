@@ -13,7 +13,12 @@ else
   HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:18391}"
   FLIGHT_ADDR="${FLIGHT_ADDR:-127.0.0.1:15391}"
   METRICS_ADDR="${METRICS_ADDR:-127.0.0.1:19391}"
-  WORK_DIR="${WORK_DIR:-$(mktemp -d /tmp/verify-refresh-body-XXXX)}"
+  # Only a work directory this script created is removed; a WORK_DIR you pass is yours.
+  OWN_WORK_DIR=0
+  if [[ -z "${WORK_DIR:-}" ]]; then
+    WORK_DIR="$(mktemp -d /tmp/verify-refresh-body-XXXX)"
+    OWN_WORK_DIR=1
+  fi
   mkdir -p "$WORK_DIR/data"
   # Absolute, so the CSV path in the Spicepod and the log redirect work after `cd`.
   WORK_DIR="$(cd "$WORK_DIR" && pwd)"
@@ -32,7 +37,7 @@ YAML
     if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
       kill "$PID"; wait "$PID" 2>/dev/null || true
     fi
-    [[ "${KEEP:-0}" == 1 ]] || rm -rf "$WORK_DIR"
+    if [[ "$OWN_WORK_DIR" == 1 && "${KEEP:-0}" != 1 ]]; then rm -rf "$WORK_DIR"; fi
   }
   trap cleanup EXIT
   (cd "$WORK_DIR" && exec "$SPICED" --telemetry-enabled=false \
