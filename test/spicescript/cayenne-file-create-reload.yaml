@@ -74,7 +74,7 @@ steps:
   - query: SELECT id, v FROM file_create_reload
     oracle-sql: SELECT id, v FROM fc
     eventually: 60s
-  - stop-background: { id: reader, allow: ['.'] }
+  - stop-background: { id: reader, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection'] }
   - explain: SELECT id, v FROM file_create_reload
     contains: CayenneAccelerationExec
 
