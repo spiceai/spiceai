@@ -113,6 +113,23 @@ type DeferredCommitQueue =
 type DeferredCommitDrain =
     futures::future::BoxFuture<'static, std::result::Result<(), cdc::CommitError>>;
 
+/// Holds [`RefreshTask::ready_deferred_to_stream`] set for one rebuild's full
+/// refresh, and clears it however that refresh ends, cancellation included.
+struct ReadyDeferredToStream<'a>(&'a AtomicBool);
+
+impl<'a> ReadyDeferredToStream<'a> {
+    fn set(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for ReadyDeferredToStream<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 struct SourceDurabilityObserver {
     queue: DeferredCommitQueue,
     durable_fence: AtomicU64,
@@ -1222,6 +1239,14 @@ impl RefreshTask {
     /// catch-up lag. What could *not* converge, and is what this exists to fix,
     /// is a row deleted at the source while the history was gone: no change row
     /// for it will ever arrive, so only re-reading the table removes it.
+    ///
+    /// Because the replay is stale until it catches up, a rebuild during the
+    /// initial load does not mark the dataset `Ready`, as the full refresh it
+    /// runs otherwise would: queries would then read the table mid-replay, such
+    /// as the rows of an INSERT whose later TRUNCATE has not been applied yet
+    /// (#16292). The stream marks it `Ready` once its source reports it has
+    /// caught up ([`Self::signal_dataset_ready`]), as on any other start. A
+    /// dataset that is already `Ready` stays so.
     async fn rebuild_from_source(&self, context: &ApplyContext<'_>) -> bool {
         let mut refresh = context.refresh.read().await.clone();
         refresh.mode = RefreshMode::Full;
@@ -1231,6 +1256,8 @@ impl RefreshTask {
             context.dataset_name,
         );
 
+        let _deferred = (!context.initial_load_completed.load(Ordering::Acquire))
+            .then(|| ReadyDeferredToStream::set(&self.ready_deferred_to_stream));
         if let Err(e) = self.run(refresh).await {
             let error_message = format!(
                 "Failed to rebuild the acceleration for {} from the source after its change history became unavailable: {e}",
@@ -6733,6 +6760,96 @@ mod tests {
             "a rebuild must be timed as one full refresh of '{dataset}', or a changes-mode \
              dataset re-reads its whole source with nothing to show for it"
         );
+    }
+
+    /// Applies a rebuild signal to a fresh changes-mode dataset whose initial
+    /// load has (`loaded`) or has not completed, then a heartbeat saying the
+    /// source has caught up. Returns the dataset's status and initial-load flag
+    /// after each.
+    async fn status_after_rebuild_then_caught_up(
+        dataset: &str,
+        loaded: bool,
+    ) -> [(Option<status::ComponentStatus>, bool); 2] {
+        let task = make_refresh_task_named(dataset, make_mem_table() as Arc<dyn TableProvider>);
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(loaded));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+        let schema = Arc::new(create_test_data_schema());
+        let observe = |task: &RefreshTask| {
+            (
+                task.runtime_status.get_dataset_status(&dataset_name),
+                initial_load_completed.load(Ordering::Acquire),
+            )
+        };
+
+        let signal =
+            cdc::build_history_unavailable_envelope(&schema).expect("rebuild signal builds");
+        assert!(task.apply_envelope_run(&mut context, vec![signal]).await);
+        let after_rebuild = observe(&task);
+
+        let caught_up =
+            cdc::build_heartbeat_envelope(&schema, None, true).expect("heartbeat builds");
+        assert!(task.apply_envelope_run(&mut context, vec![caught_up]).await);
+        [after_rebuild, observe(&task)]
+    }
+
+    /// The source resumes from wherever its log still starts, so the changes a
+    /// rebuild is followed by can predate its re-read: an INSERT whose later
+    /// TRUNCATE is still to come. Marked `Ready` by the rebuild, a restarted
+    /// dataset served those rows until the replay caught up (#16292). Its
+    /// readiness waits for the source to say it has caught up instead.
+    #[tokio::test]
+    async fn a_rebuild_during_the_initial_load_waits_for_the_stream_to_catch_up_to_be_ready() {
+        let [after_rebuild, after_caught_up] =
+            status_after_rebuild_then_caught_up("rebuild_defers_ready_to_stream", false).await;
+        assert_ne!(
+            after_rebuild.0,
+            Some(status::ComponentStatus::Ready),
+            "the rebuild's full refresh must not mark the dataset Ready while the stream \
+             still has to replay the changes that follow it"
+        );
+        assert!(
+            !after_rebuild.1,
+            "scans must not treat the initial load as complete before the replay catches up"
+        );
+        assert_eq!(
+            after_caught_up,
+            (Some(status::ComponentStatus::Ready), true),
+            "the stream marks the dataset Ready once its source reports it has caught up"
+        );
+    }
+
+    /// Control for the test above: a dataset that has finished its initial load
+    /// is not taken out of `Ready` by a rebuild, so the full refresh still
+    /// reports it `Ready`.
+    #[tokio::test]
+    async fn a_rebuild_after_the_initial_load_keeps_the_dataset_ready() {
+        let [after_rebuild, _] =
+            status_after_rebuild_then_caught_up("rebuild_after_initial_load", true).await;
+        assert_eq!(after_rebuild, (Some(status::ComponentStatus::Ready), true));
     }
 
     /// Coverage for a `refresh_sql` dataset, whose accelerator is created with

@@ -552,6 +552,7 @@ impl RefreshTaskBuilder {
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
             last_updated_at: self.last_updated_at,
             initial_load_completed: self.initial_load_completed,
+            ready_deferred_to_stream: AtomicBool::new(false),
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             engine_type_rewrites: self.engine_type_rewrites,
             snapshot_refresh_state: self.snapshot_refresh_state,
@@ -637,6 +638,12 @@ pub struct RefreshTask {
     last_updated_at: Arc<AtomicI64>,
     /// Shared flag set to `true` just before status transitions to `Ready`.
     initial_load_completed: Option<Arc<AtomicBool>>,
+    /// Set while a change stream rebuilds an acceleration that has not finished
+    /// its initial load, so the rebuild's full refresh does not mark the dataset
+    /// `Ready`: the stream still has to replay the changes that follow the
+    /// re-read, and it reports readiness itself once it has caught up. See
+    /// `RefreshTask::rebuild_from_source`.
+    ready_deferred_to_stream: AtomicBool,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     /// The acceleration engine's own creation-time type rewrites. The CDC
@@ -3383,16 +3390,27 @@ impl RefreshTask {
 
     async fn set_refresh_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
         let is_ready = status == status::ComponentStatus::Ready;
+        // A change stream's rebuild during initial load leaves `Ready`, and the
+        // initial-load flag with it, to the stream (see `ready_deferred_to_stream`).
+        let ready_deferred = is_ready
+            && self
+                .ready_deferred_to_stream
+                .load(std::sync::atomic::Ordering::Acquire);
 
         // Mark initial load complete BEFORE updating the runtime status to Ready.
         // This closes the race window where `is_ready()` returns true but
         // `AcceleratedTable::scan` still sees `initial_load_completed == false`.
-        if is_ready && let Some(flag) = &self.initial_load_completed {
+        if is_ready
+            && !ready_deferred
+            && let Some(flag) = &self.initial_load_completed
+        {
             flag.store(true, std::sync::atomic::Ordering::Release);
         }
 
         // runtime status update
-        self.update_component_status(status).await;
+        if !ready_deferred {
+            self.update_component_status(status).await;
+        }
 
         // telemetry update
         for dataset_name in self.get_dataset_names().await {
