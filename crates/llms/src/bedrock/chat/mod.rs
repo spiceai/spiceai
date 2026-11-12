@@ -30,7 +30,7 @@ use crate::bedrock::model_id::ModelId;
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::streaming_utils::{create_stream_response, generate_stream_id};
-use async_openai::error::OpenAIError;
+use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::chat::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
@@ -429,25 +429,59 @@ impl BedrockConverse {
         )
     }
 
+    fn invalid_inference_request(message: impl Into<String>) -> OpenAIError {
+        OpenAIError::ApiError(ApiError {
+            message: message.into(),
+            r#type: Some("invalid_request_error".to_string()),
+            param: None,
+            code: Some("invalid_argument".to_string()),
+        })
+    }
+
     /// `reasoning` replaces the request's `max_tokens` when its thinking budget needs room.
-    #[expect(clippy::cast_possible_wrap)]
     fn inference_cfg(
         req: &CreateChatCompletionRequest,
         reasoning: Option<&ReasoningRequest>,
-    ) -> InferenceConfiguration {
-        let max_tokens = match reasoning {
+    ) -> Result<InferenceConfiguration, OpenAIError> {
+        let requested_max_tokens = match reasoning {
             Some(r) => r.max_tokens,
             None => Self::max_tokens(req),
         };
-        InferenceConfiguration::builder()
-            .set_max_tokens(max_tokens.map(|u| u as i32))
+        let reject_inference_parameters = reasoning.is_some_and(|r| r.reject_inference_parameters);
+        if reject_inference_parameters
+            && (Self::max_tokens(req).is_some() || req.temperature.is_some() || req.top_p.is_some())
+        {
+            return Err(Self::invalid_inference_request(format!(
+                "Model '{}' does not support `max_completion_tokens`, `max_tokens`, `temperature` or `top_p` when `reasoning_effort` is `high` or `xhigh`. Remove those parameters or set `reasoning_effort` to `low` or `medium`. See: https://spiceai.org/docs/components/models/aws-bedrock",
+                req.model
+            )));
+        }
+        let max_tokens = if reject_inference_parameters {
+            None
+        } else {
+            requested_max_tokens
+        }
+        .map(|max_tokens| {
+            i32::try_from(max_tokens).map_err(|_| {
+                Self::invalid_inference_request(format!(
+                    "Model '{}' cannot accept a token limit of {}; Bedrock supports values up to {}. Set a smaller `max_completion_tokens` or `max_tokens` value.",
+                    req.model,
+                    max_tokens,
+                    i32::MAX
+                ))
+            })
+        })
+        .transpose()?;
+
+        Ok(InferenceConfiguration::builder()
+            .set_max_tokens(max_tokens)
             .set_stop_sequences(req.stop.as_ref().map(|stop| match stop {
                 StopConfiguration::String(s) => vec![s.clone()],
                 StopConfiguration::StringArray(arr) => arr.clone(),
             }))
             .set_temperature(req.temperature)
             .set_top_p(req.top_p)
-            .build()
+            .build())
     }
 
     fn to_converse_stream(
@@ -456,7 +490,7 @@ impl BedrockConverse {
         req: CreateChatCompletionRequest,
     ) -> Result<ConverseStreamFluentBuilder, OpenAIError> {
         let reasoning = self.reasoning_request(&req)?;
-        let inf_cfg = Self::inference_cfg(&req, reasoning.as_ref());
+        let inf_cfg = Self::inference_cfg(&req, reasoning.as_ref())?;
         let CreateChatCompletionRequest {
             messages,
             metadata,
@@ -526,7 +560,7 @@ impl BedrockConverse {
         req: CreateChatCompletionRequest,
     ) -> Result<ConverseFluentBuilder, OpenAIError> {
         let reasoning = self.reasoning_request(&req)?;
-        let inf_cfg = Self::inference_cfg(&req, reasoning.as_ref());
+        let inf_cfg = Self::inference_cfg(&req, reasoning.as_ref())?;
         let CreateChatCompletionRequest {
             messages,
             metadata,
@@ -886,6 +920,7 @@ impl Chat for BedrockConverse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::ApiErrorKind;
     use async_openai::types::chat::ChatCompletionRequestUserMessageArgs;
     use aws_config::{BehaviorVersion, Region, SdkConfig};
     use aws_sdk_bedrockruntime::types::{ReasoningContentBlock, ReasoningTextBlock};
@@ -1031,6 +1066,69 @@ mod tests {
             Some(SystemContentBlock::CachePoint(cache_point))
                 if cache_point.r#type == CachePointType::Default
         ));
+    }
+
+    #[test]
+    fn nova_high_reasoning_omits_incompatible_inference_parameters() {
+        // Regression test for #15665: Nova 2 Lite rejects these fields with high reasoning.
+        let chat = converse("us.amazon.nova-2-lite-v1:0");
+        let mut req = CreateChatCompletionRequest::default();
+        req.model = "us.amazon.nova-2-lite-v1:0".to_string();
+        req.reasoning_effort = Some(async_openai::types::chat::ReasoningEffort::High);
+        req.stop = Some(StopConfiguration::String("done".to_string()));
+
+        let reasoning = chat
+            .reasoning_request(&req)
+            .expect("reasoning request should build")
+            .expect("Nova high should enable reasoning");
+        let config = BedrockConverse::inference_cfg(&req, Some(&reasoning))
+            .expect("Nova high reasoning without conflicting parameters should build");
+
+        assert_eq!(config.max_tokens(), None);
+        assert_eq!(config.temperature(), None);
+        assert_eq!(config.top_p(), None);
+        assert_eq!(config.stop_sequences(), &["done".to_string()][..]);
+    }
+
+    #[test]
+    fn nova_medium_reasoning_keeps_inference_parameters() {
+        let chat = converse("us.amazon.nova-2-lite-v1:0");
+        let mut req = CreateChatCompletionRequest::default();
+        req.model = "us.amazon.nova-2-lite-v1:0".to_string();
+        req.reasoning_effort = Some(async_openai::types::chat::ReasoningEffort::Medium);
+        req.max_completion_tokens = Some(1024);
+        req.temperature = Some(0.5);
+        req.top_p = Some(0.9);
+
+        let reasoning = chat
+            .reasoning_request(&req)
+            .expect("reasoning request should build")
+            .expect("Nova medium should enable reasoning");
+        let config = BedrockConverse::inference_cfg(&req, Some(&reasoning))
+            .expect("Nova medium reasoning should keep inference parameters");
+
+        assert_eq!(config.max_tokens(), Some(1024));
+        assert_eq!(config.temperature(), Some(0.5));
+        assert_eq!(config.top_p(), Some(0.9));
+    }
+
+    #[test]
+    fn inference_cfg_rejects_max_tokens_that_exceed_bedrock_limit_type() {
+        let mut req = CreateChatCompletionRequest::default();
+        req.model = "us.amazon.nova-2-lite-v1:0".to_string();
+        req.max_completion_tokens = Some(2_147_483_648);
+
+        let error = BedrockConverse::inference_cfg(&req, None)
+            .expect_err("a token limit above the Bedrock integer range should be rejected");
+        let OpenAIError::ApiError(error) = error else {
+            panic!("expected a client API error, got {error:?}");
+        };
+
+        assert_eq!(
+            error.message,
+            "Model 'us.amazon.nova-2-lite-v1:0' cannot accept a token limit of 2147483648; Bedrock supports values up to 2147483647. Set a smaller `max_completion_tokens` or `max_tokens` value."
+        );
+        assert_eq!(ApiErrorKind::of(&error), Some(ApiErrorKind::InvalidRequest));
     }
 }
 
