@@ -25,6 +25,10 @@ env:
   PREVIOUS_STABLE_VERSION: v1.11.4
   PREVIEW_UPGRADE_VERSION: v2.0.0-rc.2
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   test-install:
     environment: secret-free

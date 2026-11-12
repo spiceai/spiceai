@@ -52,6 +52,10 @@ env:
   HAS_RUSTFS_ACCESS: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
   INTEGRATION_TESTS_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-tests-archive/integration_tests.tar.zst
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # The suite runs on `push`, `merge_group` and `workflow_dispatch`. On a pull
   # request every job is skipped at the job level, so each required check is

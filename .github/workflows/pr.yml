@@ -53,6 +53,10 @@ env:
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: clang
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # On a pull request this is the ONLY job that runs. It validates the developer
   # sign-off — the `signoff` commit status posted by `make signoff` — for the PR's
@@ -753,6 +757,10 @@ jobs:
 
   # Build and test
   build-test:
+    permissions:
+      contents: write  # push-snap-changes: git push of the snapshot-update branch, gh pr merge --auto
+      pull-requests: write  # push-snap-changes: gh pr create/close/list
+      actions: write  # approve_bot_pr_runs.sh: approve the pull_request runs held on its GITHUB_TOKEN push
     name: Build and Test
     runs-on: spiceai-macos-large
     environment: ci

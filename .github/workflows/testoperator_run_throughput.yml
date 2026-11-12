@@ -79,6 +79,9 @@ on:
         type: string
         default: '1'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-throughput:
     # The Databricks service principal's federation policy trusts this environment's subject.
