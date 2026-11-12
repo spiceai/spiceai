@@ -47,8 +47,10 @@ YAML
   URL="http://$HTTP_ADDR"
   echo "binary: $("$SPICED" --version 2>/dev/null | head -1)"
   ready=0
-  for _ in $(seq 90); do
-    if [[ "$(curl -s "$URL/v1/ready" || true)" == "ready" ]]; then ready=1; break; fi
+  deadline=$((SECONDS + 90))
+  while (( SECONDS < deadline )); do
+    # Bounded, so a listener that accepts but never answers cannot stall the 90s timeout.
+    if [[ "$(curl -s --max-time 2 "$URL/v1/ready" || true)" == "ready" ]]; then ready=1; break; fi
     kill -0 "$PID" 2>/dev/null || { echo "spiced exited"; tail -n 20 "$WORK_DIR/spiced.log"; exit 1; }
     sleep 1
   done
@@ -59,7 +61,7 @@ EP="$URL/v1/datasets/$DATASET/acceleration/refresh"
 run() {
   local label="$1"; shift
   local out
-  out="$(curl -sS -X POST "$EP" "$@" -w $'\n%{http_code}')"
+  out="$(curl -sS --max-time 30 -X POST "$EP" "$@" -w $'\n%{http_code}')"
   printf '%-58s | HTTP %s | %s\n' "$label" "${out##*$'\n'}" "${out%$'\n'*}"
 }
 
