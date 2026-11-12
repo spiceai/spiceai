@@ -109,3 +109,45 @@ async fn typesafe_jev_conforms() {
 
     assert_conforms(TYPESAFE, Arc::new(model)).await;
 }
+
+/// PROBE ONLY (never merged): runs the conformance suite three times against candidate
+/// Bedrock models, so the one the decisions test uses can be chosen from measurements.
+#[rstest]
+#[tokio::test]
+async fn probe_bedrock_decision_candidates(
+    #[values(
+        "us.amazon.nova-lite-v1:0",
+        "us.amazon.nova-pro-v1:0",
+        "us.amazon.nova-2-lite-v1:0",
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    )]
+    model_id: &str,
+) {
+    LazyLock::force(&DOTENV);
+    let _tracing_guard = init_tracing(None);
+    if TEST_ARGS.skip_model("bedrock") {
+        return;
+    }
+    let chat = on_shared_runtime({
+        let model_id = model_id.to_string();
+        async move { super::create::create_bedrock(&model_id).await }
+    })
+    .await
+    .unwrap_or_else(|e| panic!("PROBE {model_id}: failed to create: {e}"));
+    let model: Arc<dyn Evaluate> = Arc::new(ChatEvaluator::new("bedrock", chat));
+    let mut failed_rounds = 0;
+    for round in 1..=3 {
+        let label = format!("bedrock[{model_id}]#{round}");
+        let m = Arc::clone(&model);
+        let l = label.clone();
+        let failures = on_shared_runtime(async move { conformance::run_all(m.as_ref(), &l).await }).await;
+        if failures.is_empty() {
+            println!("PROBE {label}: PASS");
+        } else {
+            failed_rounds += 1;
+            println!("PROBE {label}: FAIL\n{}", conformance::report(&failures));
+        }
+    }
+    println!("PROBE SUMMARY {model_id}: {failed_rounds}/3 rounds failed");
+    assert_eq!(failed_rounds, 0, "PROBE {model_id}: {failed_rounds}/3 rounds failed");
+}
