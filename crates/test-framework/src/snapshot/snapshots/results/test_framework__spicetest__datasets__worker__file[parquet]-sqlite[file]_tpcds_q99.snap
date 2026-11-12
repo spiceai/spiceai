@@ -2,13 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q99"
 ---
-+-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
-| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type   | cc_name  | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
-+-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
-| Conventional childr                                   | EXPRESS   | NY Metro | 241     | 271        | 261        | 0           | 0         |
-| Conventional childr                                   | LIBRARY   | NY Metro | 178     | 185        | 178        | 0           | 0         |
-| Conventional childr                                   | NEXT DAY  | NY Metro | 274     | 244        | 267        | 0           | 0         |
-| Conventional childr                                   | OVERNIGHT | NY Metro | 201     | 177        | 199        | 0           | 0         |
-| Conventional childr                                   | REGULAR   | NY Metro | 183     | 199        | 194        | 0           | 0         |
-| Conventional childr                                   | TWO DAY   | NY Metro | 182     | 173        | 191        | 0           | 0         |
-+-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
++-------------------------------------------------------+-----------+--------------+---------+------------+------------+-------------+-----------+
+| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type   | cc_name      | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++-------------------------------------------------------+-----------+--------------+---------+------------+------------+-------------+-----------+
+| Conventional childr                                   | EXPRESS   | Mid Atlantic | 572     | 614        | 566        | 0           | 0         |
+| Conventional childr                                   | EXPRESS   | NY Metro     | 579     | 576        | 575        | 0           | 0         |
+| Conventional childr                                   | LIBRARY   | Mid Atlantic | 434     | 423        | 478        | 0           | 0         |
+| Conventional childr                                   | LIBRARY   | NY Metro     | 418     | 417        | 480        | 0           | 0         |
+| Conventional childr                                   | NEXT DAY  | Mid Atlantic | 531     | 552        | 626        | 0           | 0         |
+| Conventional childr                                   | NEXT DAY  | NY Metro     | 585     | 631        | 539        | 0           | 0         |
+| Conventional childr                                   | OVERNIGHT | Mid Atlantic | 384     | 481        | 455        | 0           | 0         |
+| Conventional childr                                   | OVERNIGHT | NY Metro     | 474     | 416        | 437        | 0           | 0         |
+| Conventional childr                                   | REGULAR   | Mid Atlantic | 419     | 450        | 443        | 0           | 0         |
+| Conventional childr                                   | REGULAR   | NY Metro     | 372     | 443        | 418        | 0           | 0         |
++-------------------------------------------------------+-----------+--------------+---------+------------+------------+-------------+-----------+
