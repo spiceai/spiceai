@@ -144,7 +144,12 @@ impl Source for Files {
 }
 
 pub(crate) fn write_parts(dir: &Path, first: usize, spec: &TableSpec) -> Result<u64> {
-    let files = u64::from(spec.files.max(1));
+    // `files: 0` writes no part files. After `mode: replace` this leaves an
+    // empty table directory, which is how a script removes the source files.
+    if spec.files == 0 {
+        return Ok(0);
+    }
+    let files = u64::from(spec.files);
     let per_file = spec.rows.div_ceil(files);
     let mut rows = crate::generate::rows(spec)?;
     let mut written = 0;
@@ -159,6 +164,12 @@ pub(crate) fn write_parts(dir: &Path, first: usize, spec: &TableSpec) -> Result<
             .with_context(|| format!("Failed to create {}", path.display()))?;
         let mut writer = Writer::new(spec.format, file, spec)?;
         let mut left = per_file.min(spec.rows - written);
+        // A part with no rows still needs a schema-bearing file (CSV header or
+        // empty parquet). Otherwise `listed_object_is_data_file` rejects a
+        // zero-byte part as if the source were missing.
+        if left == 0 {
+            writer.write(&crate::generate::to_batch(&spec.columns, &[])?)?;
+        }
         while left > 0 {
             #[expect(clippy::cast_possible_truncation, reason = "bounded by BATCH_ROWS")]
             let take = left.min(BATCH_ROWS as u64) as usize;
@@ -208,5 +219,72 @@ impl Writer {
             Self::Csv(_) => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(yaml: &str) -> TableSpec {
+        yaml::from_str(yaml).expect("spec parses")
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spicescript-write-parts-{}-{}",
+            std::process::id(),
+            label
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn write_parts_zero_rows_writes_schema_bearing_files() {
+        let dir = scratch("csv");
+        let csv = spec(
+            "table: facts\nrows: 0\nfiles: 1\nformat: csv\ncolumns: [{ name: id, sequence: 1 }]",
+        );
+        assert_eq!(write_parts(&dir, 0, &csv).expect("csv write"), 0);
+        let csv_path = dir.join("part-00000.csv");
+        let csv_bytes = std::fs::read(&csv_path).expect("read csv");
+        assert!(!csv_bytes.is_empty(), "zero-row CSV must not be empty");
+        assert!(
+            std::str::from_utf8(&csv_bytes)
+                .expect("csv utf8")
+                .starts_with("id"),
+            "zero-row CSV must include a header, got {csv_bytes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let parquet_dir = scratch("parquet");
+        let parquet = spec(
+            "table: facts\nrows: 0\nfiles: 1\nformat: parquet\ncolumns: [{ name: id, sequence: 1 }]",
+        );
+        assert_eq!(
+            write_parts(&parquet_dir, 0, &parquet).expect("parquet write"),
+            0
+        );
+        let parquet_path = parquet_dir.join("part-00000.parquet");
+        let parquet_len = std::fs::metadata(&parquet_path)
+            .expect("stat parquet")
+            .len();
+        assert!(parquet_len > 0, "zero-row parquet must not be empty");
+        let _ = std::fs::remove_dir_all(&parquet_dir);
+
+        let empty_dir = scratch("none");
+        let none = spec(
+            "table: facts\nrows: 0\nfiles: 0\nformat: csv\ncolumns: [{ name: id, sequence: 1 }]",
+        );
+        assert_eq!(write_parts(&empty_dir, 0, &none).expect("no files"), 0);
+        assert!(
+            std::fs::read_dir(&empty_dir)
+                .expect("read empty dir")
+                .next()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&empty_dir);
     }
 }
