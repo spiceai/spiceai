@@ -32,6 +32,9 @@ jobs:
   check_changes:
     environment: secret-free
     name: Check for code changes
+    permissions:
+      contents: read
+      pull-requests: read  # dorny/paths-filter (check-code-changes) lists the PR's files via the API on pull_request
     runs-on: spiceai-macos
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
