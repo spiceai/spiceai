@@ -1,0 +1,23 @@
+{"kind":"witness","run":"window-storage-6-exhaust","family":"window","mode":"storage","property":"byte and count cuts","status":"REACHED","valid":true,"initial_index":0,"actions":["Append(0)","Append(1)","Append(0)","Observe","Create(0)","Append(0)","Append(0)","Observe","Create(1)","Append(0)"]}
+{"kind":"witness","run":"window-storage-6-exhaust","family":"window","mode":"storage","property":"head byte and count budgets both force drops","status":"REACHED","valid":true,"initial_index":0,"actions":["Append(0)","Append(1)","Append(0)","Observe","Create(0)","Append(1)"]}
+{"kind":"witness","run":"window-storage-6-exhaust","family":"window","mode":"storage","property":"delayed seal after GC","status":"REACHED","valid":true,"initial_index":0,"actions":["Append(0)","Append(1)","Append(0)","Observe","Create(0)","Append(0)","Checkpoint(2)","Append(0)","Gc","Create(0)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":0,"initial_index":0,"failed":[],"actions":["Query","Append(0)","Append(1)","Append(0)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":1,"initial_index":0,"failed":[],"actions":[]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":2,"initial_index":0,"failed":[],"actions":["Append(1)","Query","Append(0)","Append(1)","Observe"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":3,"initial_index":0,"failed":[],"actions":["Append(0)","Append(1)","Query","Append(1)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":4,"initial_index":0,"failed":[],"actions":["Append(0)","Append(0)","Query","Append(0)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":5,"initial_index":0,"failed":[],"actions":[]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":6,"initial_index":0,"failed":[],"actions":["Append(1)","Query","Append(1)","Observe"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":7,"initial_index":0,"failed":[],"actions":["Query","Append(1)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":8,"initial_index":0,"failed":[],"actions":["Append(1)","Append(1)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":9,"initial_index":0,"failed":[],"actions":["Append(1)","Query"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":10,"initial_index":0,"failed":[],"actions":[]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":11,"initial_index":0,"failed":[],"actions":["Query"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":12,"initial_index":0,"failed":[],"actions":[]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":13,"initial_index":0,"failed":[],"actions":["Query","Append(0)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":14,"initial_index":0,"failed":[],"actions":["Append(0)","Append(1)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":15,"initial_index":0,"failed":[],"actions":["Query","Append(1)","Append(0)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":16,"initial_index":0,"failed":[],"actions":["Query","Append(1)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":17,"initial_index":0,"failed":[],"actions":[]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":18,"initial_index":0,"failed":[],"actions":["Append(1)","Query","Append(0)","Append(1)"]}
+{"kind":"walk","run":"window-storage-6-exhaust","family":"window","mode":"storage","seed":42,"walk":19,"initial_index":0,"failed":[],"actions":["Append(1)","Query","Append(0)","Append(1)","Observe"]}

@@ -64,6 +64,13 @@ impl<'v> Sampler<'v> {
         greedy
     }
 
+    /// Whether the sampler is greedy and nothing else, so that a context's argmax output
+    /// ([`Context::set_argmax_output`]) picks what it would.
+    #[must_use]
+    pub fn is_greedy(&self) -> bool {
+        self.greedy
+    }
+
     /// A draw from the distribution, seeded.
     #[must_use]
     pub fn dist(seed: u32) -> Self {
@@ -241,10 +248,22 @@ impl<'v> Sampler<'v> {
             .any(|d| d.id == token.0 && d.logit.is_finite())
     }
 
-    /// Picks the token for output row `index` of the last decoded batch.
+    /// Picks the token for output row `index` of the last decoded batch. A greedy sampler takes
+    /// a context's argmax output when it is on, which has no logits to read.
     pub fn sample(&mut self, context: &Context<'_>, index: i32) -> Token {
+        debug_assert!(
+            self.greedy || !context.argmax_output(),
+            "only a greedy sampler picks from a context's argmax output, which has no logits"
+        );
+        let greedy_pick = || {
+            if context.argmax_output() {
+                context.argmax(index)
+            } else {
+                context.logits(index).and_then(first_max)
+            }
+        };
         if self.greedy
-            && let Some(token) = context.logits(index).and_then(first_max)
+            && let Some(token) = greedy_pick()
         {
             // SAFETY: the sampler is live. `llama_sampler_sample` tells the sampler of its pick
             // the same way, which leaves a greedy sampler as it was.

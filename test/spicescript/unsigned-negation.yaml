@@ -7,9 +7,10 @@ sources:
   src: { kind: postgres }
 
 variants:
-  arrow: arrow
   cayenne: cayenne-file
-  duckdb: duckdb
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
+  cayenne-memory: cayenne-memory
   federated: {}
 
 spicepod:

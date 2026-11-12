@@ -14,9 +14,9 @@ sources:
 variants:
   federated: {}
   cayenne: cayenne-file
-  duckdb: duckdb-file
-  sqlite: sqlite-file
-  arrow: arrow
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
+  cayenne-memory: cayenne-memory
 
 spicepod:
   version: v1

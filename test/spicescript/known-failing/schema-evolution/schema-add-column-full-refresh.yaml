@@ -16,6 +16,8 @@ variants:
   block: {}
   append-new-columns: { datasets: { t: { on_schema_change: append_new_columns } } }
   sync-all-columns: { datasets: { t: { on_schema_change: sync_all_columns } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
@@ -44,7 +46,7 @@ steps:
   - restart: {}
   - source-exec: { src: "UPDATE t SET v = v + 1" }
   - refresh: t
-    only: block
+    only: [block, object-native]
   - query: SELECT * FROM t
     oracle-sql: SELECT id, v, s FROM t
-    only: block
+    only: [block, object-native]

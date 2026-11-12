@@ -423,9 +423,16 @@ async fn a_waiting_publish_does_not_hold_back_the_other_partitions_impl(
         prepared
             .push(tokio::time::timeout(WAIT_LIMIT, table.begin_overwrite(replacement, 1)).await??);
     }
-    let mut txn = fixture.catalog.begin_transaction().await?;
+    let sql_catalog = fixture
+        .catalog
+        .as_any()
+        .downcast_ref::<cayenne::CayenneCatalog>()
+        .ok_or(cayenne::catalog::CatalogError::NotImplemented {
+            function: "SQL transaction test requires CayenneCatalog".to_string(),
+        })?;
+    let mut txn = sql_catalog.begin_transaction().await?;
     for prep in &prepared {
-        prep.apply_in_txn(&fixture.catalog, &mut *txn).await?;
+        prep.apply_in_txn(sql_catalog, &mut *txn).await?;
     }
     txn.commit().await?;
     let committed = catalog
@@ -529,3 +536,269 @@ async fn an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl(
 }
 
 test_with_backends!(an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl);
+
+/// Records the highest durable epoch a checkpoint reported.
+#[derive(Default)]
+struct RecordingSlotAdvancer {
+    durable: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl SlotAdvancer for RecordingSlotAdvancer {
+    async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+        self.durable.fetch_max(durable_epoch, Ordering::SeqCst);
+    }
+}
+
+/// A checkpoint acknowledges its source only after the metastore changes it made
+/// are committed. Once the slot has advanced, a crash (no shutdown) followed by a
+/// reopen of the metastore from storage must still serve every checkpointed row:
+/// the source will not send them again.
+async fn a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    const NAME: &str = "checkpoint_before_ack";
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            catalog,
+            memory_tier_options(&fixture, NAME, &id_value_schema()),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let advancer = Arc::new(RecordingSlotAdvancer::default());
+    table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
+
+    cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;
+    table.checkpoint_mem_tier().await?;
+    assert!(
+        advancer.durable.load(Ordering::SeqCst) > 0,
+        "precondition: the checkpoint must acknowledge the source"
+    );
+
+    // Crash: the provider goes away without a shutdown, so nothing is flushed on
+    // the way out, and the metastore is reopened from what was committed.
+    drop(table);
+    let reopened_catalog = common::fixture_catalog(fixture.connection_string()).await?;
+    reopened_catalog.init().await?;
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(reopened_catalog, ctx.runtime_env())
+            .open(NAME)
+            .await?,
+    );
+    assert_eq!(
+        table_rows(&reopened).await?,
+        ["1,10", "2,20"],
+        "rows whose source was acknowledged must survive a crash"
+    );
+    Ok(())
+}
+
+test_with_backends!(a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl);
+
+/// Saves the position a checkpoint covers through the object-native catalog, as
+/// a source's position store does, and records the epoch it acknowledges.
+struct PositionSavingAdvancer {
+    catalog: Arc<cayenne::metastore::object_native::ObjectNativeCatalog>,
+    /// `<store>/<dataset>`, as a source's position store names it.
+    key: String,
+    durable: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl SlotAdvancer for PositionSavingAdvancer {
+    async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+        self.durable.fetch_max(durable_epoch, Ordering::SeqCst);
+    }
+
+    async fn record_position(&self, durable_epoch: u64) -> Result<(), String> {
+        self.catalog
+            .set_sidecar_value(&self.key, Some(durable_epoch.to_be_bytes().to_vec()))
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The prefix of `dataset`'s log in the catalog at `catalog/`.
+async fn dataset_log(
+    store: &Arc<dyn object_store::ObjectStore>,
+    dataset: &str,
+) -> TestResult<object_store::path::Path> {
+    Ok(cayenne::metastore::object_native::dataset_log_at(
+        Arc::clone(store),
+        &object_store::path::Path::from("catalog"),
+        dataset,
+    )
+    .await?
+    .ok_or("the dataset has a log")?)
+}
+
+/// The action kinds of each record committed to `dataset`'s log after `after`,
+/// oldest first.
+async fn records_after(
+    store: &Arc<dyn object_store::ObjectStore>,
+    dataset: &str,
+    after: u64,
+) -> TestResult<Vec<Vec<&'static str>>> {
+    use prost::Message;
+    let (_, opened) = object_store_occ::headlog::Reader::open(
+        Arc::clone(store),
+        dataset_log(store, dataset).await?,
+    )
+    .await?;
+    let mut records = Vec::new();
+    for entry in opened
+        .records
+        .into_iter()
+        .filter(|entry| entry.commit > after)
+    {
+        let mut kinds = Vec::new();
+        for payload in object_store_occ::headlog::Group::decode(entry.record.payload)?.payloads {
+            let record = cayenne_metastore_actions::Record::decode(payload)?;
+            kinds.extend(
+                record
+                    .actions
+                    .iter()
+                    .map(cayenne_metastore_actions::Action::name),
+            );
+        }
+        records.push(kinds);
+    }
+    Ok(records)
+}
+
+/// With the object-native metastore, a checkpoint commits the source position it
+/// covers in the same record as its data, before the source is acknowledged: no
+/// record holds a position without the data it covers.
+#[tokio::test]
+async fn an_object_native_checkpoint_commits_its_position_with_its_data() -> TestResult<()> {
+    const NAME: &str = "position_with_data";
+    let fixture = TestFixture::new(common::BackendType::Sqlite).await?;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let catalog = Arc::new(
+        cayenne::metastore::object_native::ObjectNativeCatalog::create(
+            Arc::clone(&store),
+            object_store::path::Path::from("catalog"),
+        )
+        .await?,
+    );
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            memory_tier_options(&fixture, NAME, &id_value_schema()),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let advancer = Arc::new(PositionSavingAdvancer {
+        catalog: Arc::clone(&catalog),
+        key: format!("spice_sys_applied_lsn/{NAME}"),
+        durable: std::sync::atomic::AtomicU64::new(0),
+    });
+    table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
+    let (reader, _) = object_store_occ::headlog::Reader::open(
+        Arc::clone(&store),
+        dataset_log(&store, NAME).await?,
+    )
+    .await?;
+    let before = reader.state().head.commit;
+
+    cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;
+    table.checkpoint_mem_tier().await?;
+    let durable = advancer.durable.load(Ordering::SeqCst);
+    assert!(
+        durable > 0,
+        "precondition: the checkpoint must acknowledge the source"
+    );
+
+    let records = records_after(&store, NAME, before).await?;
+    let with_position: Vec<_> = records
+        .iter()
+        .filter(|kinds| kinds.contains(&"AdvanceSourcePosition"))
+        .collect();
+    assert_eq!(with_position.len(), 1, "records: {records:?}");
+    assert!(
+        with_position[0]
+            .iter()
+            .any(|kind| *kind != "AdvanceSourcePosition"),
+        "the position must commit with the data it covers, records: {records:?}"
+    );
+    // The checkpoint's snapshot sequence protects the snapshot it wrote, and is
+    // part of the data the position covers.
+    assert!(
+        with_position[0].contains(&"SetGroup"),
+        "the position must commit with the checkpoint's snapshot sequence, records: {records:?}"
+    );
+    assert_eq!(
+        catalog
+            .sidecar_value(&format!("spice_sys_applied_lsn/{NAME}"))
+            .await?,
+        Some(durable.to_be_bytes().to_vec())
+    );
+    Ok(())
+}
+
+/// A seal writes the in-memory tier's unsealed rows to the durable inline store
+/// and then acknowledges the source, so with the object-native metastore it too
+/// commits the position in the same record as those rows.
+#[tokio::test]
+async fn an_object_native_seal_commits_its_position_with_its_data() -> TestResult<()> {
+    const NAME: &str = "seal_position_with_data";
+    let fixture = TestFixture::new(common::BackendType::Sqlite).await?;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let catalog = Arc::new(
+        cayenne::metastore::object_native::ObjectNativeCatalog::create(
+            Arc::clone(&store),
+            object_store::path::Path::from("catalog"),
+        )
+        .await?,
+    );
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            memory_tier_options(&fixture, NAME, &id_value_schema()),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let advancer = Arc::new(PositionSavingAdvancer {
+        catalog: Arc::clone(&catalog),
+        key: format!("spice_sys_applied_lsn/{NAME}"),
+        durable: std::sync::atomic::AtomicU64::new(0),
+    });
+    table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
+    let (reader, _) = object_store_occ::headlog::Reader::open(
+        Arc::clone(&store),
+        dataset_log(&store, NAME).await?,
+    )
+    .await?;
+    let before = reader.state().head.commit;
+
+    cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;
+    let sealed = table.seal_mem_tier_durable().await?;
+    assert!(
+        sealed > 0,
+        "precondition: the seal must write the unsealed rows"
+    );
+    assert!(
+        advancer.durable.load(Ordering::SeqCst) > 0,
+        "precondition: the seal must acknowledge the source"
+    );
+
+    let records = records_after(&store, NAME, before).await?;
+    let with_position: Vec<_> = records
+        .iter()
+        .filter(|kinds| kinds.contains(&"AdvanceSourcePosition"))
+        .collect();
+    assert_eq!(with_position.len(), 1, "records: {records:?}");
+    assert!(
+        with_position[0].contains(&"AddInlinedData"),
+        "the position must commit with the rows the seal wrote, records: {records:?}"
+    );
+    Ok(())
+}

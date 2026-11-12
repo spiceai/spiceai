@@ -1028,8 +1028,12 @@ mod tests {
     /// - `mssql`, `mssql[catalog]` and `odbc[athena]`: their TPC-H tables hold
     ///   different text columns than the parquet the TPC-H answer files were
     ///   computed from, so no answer file is their oracle.
+    /// - The TPC-H sources that hold `DuckDB` 1.x data — Databricks, Glue, Oracle,
+    ///   Spice Cloud, Snowflake, `DynamoDB` and `BigQuery`: `DuckDB` 1.x writes
+    ///   different free-text columns than `dbgen`, so Q2, Q10, Q13 and Q20 cannot
+    ///   match the answer files.
     ///
-    /// - The six `ClickBench` arms whose acceleration holds only part of the
+    /// - The four `ClickBench` arms whose acceleration holds only part of the
     ///   source, because a runner cannot hold all of it: their `refresh_sql` keeps
     ///   a subset, while the `__test_reference.*` clone drops acceleration and
     ///   reads every row, so it answers a different question. A `LIMIT` subset
@@ -1041,13 +1045,26 @@ mod tests {
         "clickbench/sf1/accelerated/s3[parquet]-arrow.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-arrow-partitioned.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-cayenne[memory].yaml",
-        "clickbench/sf1/accelerated/s3[parquet]-postgres.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-sqlite[memory].yaml",
+        "tpch/sf1/accelerated/databricks[delta_lake]-cayenne[file].yaml",
+        "tpch/sf1/federated/adbc[bigquery].yaml",
+        "tpch/sf1/federated/databricks[catalog].yaml",
+        "tpch/sf1/federated/databricks[delta_lake].yaml",
+        "tpch/sf1/federated/databricks[spark_connect].yaml",
+        "tpch/sf1/federated/databricks[sql_warehouse].yaml",
+        "tpch/sf1/federated/dynamodb.yaml",
+        "tpch/sf1/federated/glue[catalog].yaml",
         "tpch/sf1/federated/glue[csv].yaml",
+        "tpch/sf1/federated/glue[parquet].yaml",
         "tpch/sf1/federated/iceberg[hadoop].yaml",
         "tpch/sf1/federated/mssql.yaml",
         "tpch/sf1/federated/mssql[catalog].yaml",
         "tpch/sf1/federated/odbc[athena].yaml",
+        "tpch/sf1/federated/oracle.yaml",
+        "tpch/sf1/federated/oracle[catalog].yaml",
+        "tpch/sf1/federated/snowflake[catalog].yaml",
+        "tpch/sf1/federated/spicecloud.yaml",
+        "tpch/sf1/federated/spicecloud[catalog].yaml",
     ];
 
     /// rustc `--test` names this module's tests `commands::tests::<fn>`.
@@ -1101,9 +1118,8 @@ mod tests {
         query_set == "chbench"
             || (spicepod.contains("postgres")
                 && !spicepod.contains("ducklake")
-                && (((query_set.starts_with("tpch") || query_set == "tpcds")
-                    && (scale_factor == "1" || scale_factor == "10"))
-                    || (query_set == "clickbench" && spicepod.contains("s3[parquet]-postgres"))))
+                && (query_set.starts_with("tpch") || query_set == "tpcds")
+                && (scale_factor == "1" || scale_factor == "10"))
     }
 
     /// Every CH-benCH HTAP dispatch config names source versions its source
@@ -1172,7 +1188,7 @@ mod tests {
                         assert_eq!(
                             bench.validate_results,
                             Some(false),
-                            "{dispatch_name} is opted out of result validation because TPC-H Q6 is known-wrong; keep `validate_results: false`"
+                            "{dispatch_name} is opted out of result validation for the reason in its dispatch file; keep `validate_results: false`"
                         );
                         checked += 1;
                     }
@@ -1229,7 +1245,7 @@ mod tests {
                                 scale_factor,
                                 &bench.spicepod_path.to_string_lossy()
                             ),
-                            "{dispatch_name} sets `postgres_version`, but testoperator_run_bench.yml starts its local postgres_tpch service only for a `postgres` spicepod (not DuckLake) on TPC-H or TPC-DS at scale factor 1 or 10, or for ClickBench's s3[parquet]-postgres, so the version would not apply"
+                            "{dispatch_name} sets `postgres_version`, but testoperator_run_bench.yml starts its local postgres_tpch service only for a `postgres` spicepod (not DuckLake) on TPC-H or TPC-DS at scale factor 1 or 10, so the version would not apply"
                         );
                     }
                     // testoperator_run_bench.yml's path: CH-benCH spicepods carry no

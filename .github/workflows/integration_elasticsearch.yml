@@ -10,6 +10,9 @@ on:
       - 'crates/data_components/src/elasticsearch/**'
       - 'crates/data-connectors/connector-elasticsearch/**'
       - 'crates/search/src/index/elasticsearch/**'
+      - 'crates/search/tests/elasticsearch_full_refresh.rs'
+      - 'crates/search/tests/integration.rs'
+      - 'crates/search/Cargo.toml'
       - 'crates/runtime/src/embeddings/index/elasticsearch/**'
   merge_group:
     branches:
@@ -57,6 +60,9 @@ jobs:
               - 'crates/data_components/src/elasticsearch/**'
               - 'crates/data-connectors/connector-elasticsearch/**'
               - 'crates/search/src/index/elasticsearch/**'
+              - 'crates/search/tests/elasticsearch_full_refresh.rs'
+              - 'crates/search/tests/integration.rs'
+              - 'crates/search/Cargo.toml'
               - 'crates/runtime/src/embeddings/index/elasticsearch/**'
 
   test-elasticsearch:
@@ -119,3 +125,9 @@ jobs:
           ELASTICSEARCH_URL: http://localhost:9200
         run: |
           RUSTC_WRAPPER="" cargo test -p data_components --features elasticsearch --test integration -- elasticsearch_test:: --nocapture
+
+      - name: Run elasticsearch search index tests
+        env:
+          ELASTICSEARCH_URL: http://localhost:9200
+        run: |
+          RUSTC_WRAPPER="" cargo test -p search --features elasticsearch --test integration -- elasticsearch_full_refresh:: --nocapture

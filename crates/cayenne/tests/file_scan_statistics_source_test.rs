@@ -34,7 +34,7 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, SnapshotFileStatistics, VortexConfig};
-use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use datafusion_common::stats::Precision;
@@ -210,7 +210,7 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     // Session 2 — a fresh catalog connection and a fresh provider over the same
     // metastore and the same files: the restart case, where every file is served
     // from the persisted blob rather than its footer.
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(
@@ -349,7 +349,7 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     );
 
     // A fresh provider over that metastore must not serve the legacy row.
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(
@@ -515,7 +515,7 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
         "the footer scan must have persisted a row to poison, or this test proves nothing"
     );
 
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(
@@ -709,7 +709,7 @@ async fn open_cold(
     SessionContext,
     Arc<FooterReadCounter>,
 )> {
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
         .with_metadata_cache_limit(0)

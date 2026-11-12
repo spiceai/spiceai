@@ -127,11 +127,11 @@ Next, connect your own sources with the [data connector docs](https://spiceai.or
 | [Vector search](https://spiceai.org/docs/features/search/vector-search)    | Spice Cayenne vector indexes, Amazon S3 Vectors, Elasticsearch                                  |
 | [Secret stores](https://spiceai.org/docs/components/secret-stores)         | Environment, Kubernetes, OS keyring, AWS Secrets Manager, HashiCorp Vault, Azure Key Vault      |
 
-Each component page lists every supported option and its release status. Spice Cayenne is the default accelerator; the Arrow, DuckDB, SQLite, and PostgreSQL accelerators are deprecated in v2.4 and removed in v2.5. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
+Each component page lists every supported option and its release status. Spice Cayenne is the default accelerator. The DuckDB and Turso accelerators were removed in v2.5, and the Arrow, SQLite, and PostgreSQL accelerators are deprecated and will be removed. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
 
 ## Deploy anywhere
 
-Run Spice.ai Open Source locally, at the edge, or on the fully managed [Spice.ai Cloud Platform](https://spice.ai). Spice runs as a single node, as a sidecar next to each app or agent, or as a multi-node cluster.
+Run Spice.ai Open Source locally, at the edge, or on the fully managed [Spice.ai Cloud Platform](https://spice.ai). Spice runs as a single node, as a sidecar next to each app or agent (`spiced --role sidecar`, see the [cluster-sidecar docs](docs/features/cluster-sidecar.md)), or as a multi-node cluster.
 
 ```bash
 docker pull spiceai/spiceai                                                             # Docker

@@ -22,7 +22,7 @@ This document covers the second path: `from: cdc:…` + `POST /v1/datasets/{name
   spiced  POST /v1/datasets/{name}/cdc
            │  decode → ChangeBatch
            ▼
-  accelerator (Cayenne / DuckDB / Arrow / …)
+  accelerator (Cayenne / SQLite / Arrow / …)
 ```
 
 Kafka is optional. If you already run Debezium → Kafka, continue using `from: debezium:…`. For greenfield multi-source capture without a bus, use this push path.
@@ -42,7 +42,7 @@ datasets:
         type: float64
     acceleration:
       enabled: true
-      engine: cayenne   # or duckdb, arrow, …
+      engine: cayenne   # or sqlite, arrow, …
       mode: file
       refresh_mode: changes
       primary_key: id

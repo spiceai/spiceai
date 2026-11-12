@@ -54,8 +54,6 @@ pub mod debezium;
 pub mod debezium_kafka;
 #[cfg(feature = "delta_lake")]
 pub mod delta_lake;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "adbc")]
 pub mod ducklake;
 #[cfg(feature = "elasticsearch")]

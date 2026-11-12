@@ -2,8 +2,8 @@ name: mysql-types-acceleration
 description: >
   A MySQL table with every common type (bit, unsigned, time, blob, set, JSON
   among them), NULLs in each, answers through Spice exactly as MySQL answers:
-  federated, and accelerated by full and append refresh into every engine with
-  a `refresh_sql` filter (keyed and indexed where the engine supports it), and
+  federated, and accelerated by full and append refresh into Cayenne (file mode keyed
+  and indexed, and memory mode) with a `refresh_sql` filter, and
   after rows are appended at the source. The log reports no errors.
 
 sources:
@@ -11,13 +11,11 @@ sources:
 
 variants:
   federated: {}
-  arrow: arrow-memory
-  duckdb: { datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: file,
-      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
-  sqlite: { datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: file,
-      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
+  cayenne-memory: cayenne-memory
   cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file,
       primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file, primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
 
 spicepod:
   version: v1

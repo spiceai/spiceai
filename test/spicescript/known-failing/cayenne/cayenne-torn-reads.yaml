@@ -19,6 +19,8 @@ variants:
   file: {}
   memory: { datasets: { '*': { acceleration: { mode: memory } } } }
   partitioned: { datasets: { '*': { acceleration: { partition_by: [{ bucket: 'bucket(4, id)' }] } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

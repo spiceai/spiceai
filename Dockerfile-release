@@ -1,14 +1,15 @@
-#syntax=docker/dockerfile:1.7
+#syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-ARG BASE_IMAGE=debian:trixie-slim
-
-FROM ${BASE_IMAGE} AS binary
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS binary
 
 ARG REL_VERSION
 ARG BINARY_VARIANT=default
 ARG TARGETOS
 ARG TARGETARCH
 ARG GITHUB_REPOSITORY=spiceai/spiceai
+# sha256 of the downloaded release asset. When set, the build fails on any
+# other file. spiced_docker.yml passes the sha256 publish_release recorded.
+ARG SPICED_SHA256=
 
 RUN if [ -z "$REL_VERSION" ]; then echo "REL_VERSION build-arg is required" >&2; exit 1; fi
 
@@ -47,6 +48,7 @@ RUN set -eux; \
         exit 1; \
       fi; \
     fi; \
+    if [ -n "${SPICED_SHA256}" ]; then echo "${SPICED_SHA256}  /tmp/spiced.tar.gz" | sha256sum -c -; fi; \
     tar -C /root -xzf /tmp/spiced.tar.gz; \
     chmod +x /root/spiced; \
     rm -f /tmp/spiced.tar.gz
@@ -84,7 +86,7 @@ RUN set -eux; \
     tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so; \
     rm -f /tmp/libduckdb.tar.gz
 
-FROM ${BASE_IMAGE} AS sandbox-setup
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS sandbox-setup
 
 ARG CARGO_FEATURES=default
 ARG INSTALL_ORACLE_ODPIC=false

@@ -74,7 +74,9 @@ pub mod caching_eviction;
 mod caching_scan_tests;
 pub mod checkpoint_primary_key;
 pub mod fallback_retention;
-pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
+pub use fallback_retention::{
+    Error as FallbackRetentionKeepError, FallbackRetentionKeep, ensure_no_fallible_implicit_cast,
+};
 pub(crate) mod exact_string_time;
 pub mod federation;
 pub(crate) mod index_rebuild;
@@ -2320,7 +2322,14 @@ impl AcceleratedTable {
                 let mut batch_write_tx = self.batch_write_tx.clone().ok_or_else(|| {
                     DataFusionError::Internal("batch_write_tx missing in caching mode".to_string())
                 })?;
+                // Neither reads the accelerator before the origin answers, so the
+                // scan is planned only if a failing fetch needs it.
                 let input = if caching::uses_source_first(
+                    filters,
+                    self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
+                ) || caching::passes_through(
                     filters,
                     self.cache_ttl,
                     self.cache_stale_while_revalidate_ttl,

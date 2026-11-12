@@ -222,6 +222,10 @@ pub enum Error {
     #[snafu(display("Invalid argument: {message}"))]
     InvalidArgument { message: String },
 
+    /// A nightly build could not be found, downloaded or installed
+    #[snafu(display("Failed to install the Spice nightly build: {message}"))]
+    NightlyInstall { message: String },
+
     /// Invalid command usage that should use Clap's usage-error exit code.
     #[snafu(display("Invalid argument: {message}"))]
     InvalidUsage { message: String },

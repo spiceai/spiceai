@@ -922,3 +922,101 @@ async fn a_cast_to_a_mixed_array_and_struct_type_past_the_limit_is_refused() {
         "{error}"
     );
 }
+
+/// spiceai/datafusion#287. With more than one `COUNT(DISTINCT …)` the plan keeps
+/// the generic `ScalarValue` set per aggregate instead of rewriting a single
+/// distinct into a `GROUP BY`. A list or struct value read from a batch is a
+/// one-row slice that shares the batch's buffers, so each stored distinct value
+/// must be a compacted copy: kept as a slice, each one is charged the whole
+/// batch, and 50,000 three-element lists asked for tens of GB and failed with
+/// `ResourcesExhausted`.
+///
+/// Spilling is disabled and the pool is 256 MiB, which the real distinct state
+/// (a few MB per aggregate) fits many times over. Four partitions run the
+/// partial and final aggregates, so the merged state's values are checked too.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_count_distinct_over_nested_values_charge_each_value_once() {
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+    const POOL_BYTES: usize = 256 * 1024 * 1024;
+
+    let mut config = get_df_default_config();
+    config.options_mut().execution.target_partitions = 4;
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(POOL_BYTES, 1.0)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build_arc()
+        .expect("runtime builds");
+    let ctx = SessionContext::new_with_config_rt(config, runtime);
+    run_statements(
+        &ctx,
+        &["CREATE TABLE distinct_nested AS SELECT value AS id, \
+           [value, value + 1, value % 7] AS l, \
+           named_struct('a', value, 'b', value % 7) AS s, \
+           CAST(value % 5 AS INT) AS grp \
+           FROM generate_series(0, 49999)"],
+    )
+    .await;
+
+    for (sql, expected) in [
+        (
+            "SELECT count(DISTINCT l), count(DISTINCT grp) FROM distinct_nested",
+            vec!["50000,5".to_string()],
+        ),
+        (
+            "SELECT count(DISTINCT s), count(DISTINCT grp) FROM distinct_nested",
+            vec!["50000,5".to_string()],
+        ),
+        (
+            "SELECT grp, count(DISTINCT l), count(DISTINCT s) FROM distinct_nested \
+             GROUP BY grp ORDER BY grp",
+            (0..5).map(|grp| format!("{grp},10000,10000")).collect(),
+        ),
+    ] {
+        assert_eq!(
+            answer(&ctx, sql).await,
+            Ok(expected),
+            "{sql} must fit in a {POOL_BYTES}-byte pool"
+        );
+    }
+}
+
+/// spiceai/datafusion#283. A grouped `TopK` aggregation sizes its hash table and
+/// heap to the groups it sees, not to its `LIMIT`, so a `LIMIT` far above the
+/// row count still answers. Unpatched, a `LIMIT` this large fails at once on a
+/// capacity overflow, before anything is allocated.
+#[tokio::test(flavor = "multi_thread")]
+async fn topk_aggregation_with_a_limit_far_above_its_groups_answers() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &["CREATE TABLE topk_large_limit(s VARCHAR, y BIGINT) AS VALUES ('a', 1), ('b', 3), ('b', 4), ('c', 2)"],
+    )
+    .await;
+    let limit = i64::MAX;
+    for (sql, expected) in [
+        (
+            format!("SELECT DISTINCT s FROM topk_large_limit ORDER BY s DESC LIMIT {limit}"),
+            owned(&["c", "b", "a"]),
+        ),
+        (
+            format!(
+                "SELECT s, max(y) FROM topk_large_limit GROUP BY s ORDER BY max(y) DESC NULLS LAST LIMIT {limit}"
+            ),
+            owned(&["b,4", "c,2", "a,1"]),
+        ),
+    ] {
+        let plan = answer(&ctx, &format!("EXPLAIN {sql}"))
+            .await
+            .expect("plan")
+            .join("\n");
+        assert!(
+            plan.contains(&format!("lim=[{limit}]")),
+            "the query must plan a TopK aggregation:\n{plan}"
+        );
+        assert_eq!(answer(&ctx, &sql).await, Ok(expected), "{sql}");
+    }
+}
