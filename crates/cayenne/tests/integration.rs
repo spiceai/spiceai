@@ -107,6 +107,7 @@ mod multi_partition_test;
 mod mutation_model_test;
 mod mutation_property_test;
 mod mutation_roundtrip_test;
+mod not_in_null_union_file_test;
 mod null_equal_join_dynamic_filter_test;
 mod object_native_commit_fault_test;
 mod object_native_source_replay_test;

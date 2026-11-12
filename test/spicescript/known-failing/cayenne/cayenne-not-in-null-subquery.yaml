@@ -1,0 +1,71 @@
+# Known failing: on a Cayenne *file* acceleration, `x NOT IN (subquery)` whose
+# subquery is a same-table scan `UNION ALL SELECT NULL` fails with
+# "Column 'count(*)' is declared as non-nullable but contains null values"
+# (first seen in the #15538 / #15618 exploration; no issue of its own yet).
+# Cayenne memory and federated PostgreSQL answer 0, as PostgreSQL does. A
+# three-row table did not reproduce it, so the table is large enough to span
+# several files and partitions. `cayenne-rules-none` turns the Cayenne
+# optimizer rules off; move this script up to `test/spicescript/` once fixed.
+name: cayenne-not-in-null-subquery
+description: >
+  NOT IN over a subquery that contains a NULL selects no row, and its
+  count(*) is 0, on Cayenne file and memory accelerations and federated.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+  cayenne-memory: cayenne-memory
+  # Bisection aid: the same file acceleration with every Cayenne optimizer
+  # rule off.
+  cayenne-rules-none:
+    datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }
+    spicepod: { runtime: { params: { cayenne_optimizer_rules: none } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-not-in-null-subquery
+  datasets:
+    - { from: 'postgres:public.ev', name: ev, params: '${sources.src.params}' }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE ev (id int PRIMARY KEY, qty int, region text);
+        INSERT INTO ev
+        SELECT g, ((g * 17) % 50 - 5)::int,
+               CASE WHEN g % 11 = 0 THEN NULL ELSE (ARRAY['us','eu','apac','latam'])[1 + (g * 31) % 4] END
+        FROM generate_series(1, 100000) g;
+  - start: {}
+  # The failing shape: a NULL among the subquery's values, from a UNION ALL
+  # branch, over the same table.
+  - query: >-
+      SELECT count(*) AS n FROM ev WHERE qty NOT IN
+      (SELECT qty FROM ev x WHERE x.id IN (1, 2, 3) UNION ALL SELECT CAST(NULL AS int))
+  # The rows, not only the count: none qualify.
+  - query: >-
+      SELECT id FROM ev WHERE qty NOT IN
+      (SELECT qty FROM ev x WHERE x.id IN (1, 2, 3) UNION ALL SELECT CAST(NULL AS int))
+    expect-empty: true
+  # Controls.
+  - query: >-
+      SELECT count(*) AS n FROM ev WHERE qty NOT IN
+      (SELECT qty FROM ev x WHERE x.id IN (1, 2, 3))
+  - query: >-
+      SELECT count(*) AS n FROM ev WHERE qty NOT IN
+      (SELECT qty FROM ev x WHERE x.id IN (1, 2, 3) UNION ALL SELECT 7)
+  - query: >-
+      SELECT count(*) AS n FROM ev e WHERE NOT EXISTS
+      (SELECT 1 FROM (SELECT qty FROM ev x WHERE x.id IN (1, 2, 3) UNION ALL SELECT CAST(NULL AS int)) s
+       WHERE s.qty = e.qty)
+  - query: >-
+      SELECT count(*) AS n FROM ev WHERE qty NOT IN (SELECT CAST(NULL AS int))
+  - query: >-
+      SELECT count(*) AS n, sum(qty) AS s FROM ev WHERE qty NOT IN
+      (SELECT qty FROM ev x WHERE x.id IN (1, 2, 3) UNION ALL SELECT CAST(NULL AS int))
