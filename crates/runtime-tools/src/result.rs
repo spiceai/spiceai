@@ -533,10 +533,11 @@ fn offset_to_usize<O: TryInto<usize> + Copy + Display>(offset: O) -> Result<usiz
 
 /// Writes `value` as a JSON string.
 fn write_json_string(value: &str, out: &mut Vec<u8>) {
-    match serde_json::to_string(value) {
-        Ok(json) => out.extend_from_slice(json.as_bytes()),
-        // Serializing a `str` cannot fail; `null` keeps the output valid JSON regardless.
-        Err(_) => out.extend_from_slice(b"null"),
+    let start = out.len();
+    if serde_json::to_writer(&mut *out, value).is_err() {
+        // Writing a `str` into a `Vec` cannot fail; `null` keeps the output valid JSON regardless.
+        out.truncate(start);
+        out.extend_from_slice(b"null");
     }
 }
 
@@ -586,7 +587,7 @@ struct FloatEncoder<'a, T: arrow::datatypes::ArrowPrimitiveType> {
 
 /// Writes a float as the shortest decimal that reads back as the same value, or as a string when
 /// it is not finite, so that no JSON parser reads it as `null`.
-fn write_float(value: impl Into<f64> + Copy + std::fmt::Debug, out: &mut Vec<u8>) {
+fn write_float(value: impl Into<f64> + Copy + serde::Serialize, out: &mut Vec<u8>) {
     let wide: f64 = value.into();
     if wide.is_nan() {
         out.extend_from_slice(b"\"NaN\"");
@@ -597,9 +598,13 @@ fn write_float(value: impl Into<f64> + Copy + std::fmt::Debug, out: &mut Vec<u8>
             b"\"-Infinity\""
         });
     } else {
-        // `Debug` writes the shortest decimal that round-trips for the value's own width, which
-        // is also a valid JSON number (`0.1`, `1e21`, `-2.5e-8`).
-        out.extend_from_slice(format!("{value:?}").as_bytes());
+        // `serde_json` writes a finite float as the shortest decimal that round-trips for the
+        // value's own width (`0.1` for an `f32` 0.1, not its `f64` widening).
+        let start = out.len();
+        if serde_json::to_writer(&mut *out, &value).is_err() {
+            out.truncate(start);
+            out.extend_from_slice(b"null");
+        }
     }
 }
 
