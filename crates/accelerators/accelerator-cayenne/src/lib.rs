@@ -79,6 +79,7 @@ use runtime_parameters::ParameterSpec;
 use search::index::native_vector::NativeVectorIndex;
 use spice_table::{Index, IndexLayer, LayerWalk, find_concrete};
 use spicepod::acceleration as spicepod_acceleration;
+use spicepod::component::runtime::{StateLocation, StateSource};
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -1973,14 +1974,16 @@ impl CayenneAccelerator {
         source: &dyn AccelerationSource,
         data_dir: &str,
     ) -> Result<()> {
-        // With `cayenne_vnext` enabled, the object-native metastore lives under a local
-        // `runtime.state.location` rather than the metadata directory when one is set.
+        // With `cayenne_vnext` enabled, the object-native metastore lives in the state
+        // location, which is `.spice/data` when `runtime.state.location` is unset.
         // Disabled, Cayenne reads no metastore there, so the state location is not
         // checked.
-        let app = source.app();
-        let state_dir = Self::vnext_enabled(source)?
-            .then_some(app.runtime.state.as_ref())
-            .flatten()
+        let state_dir = if Self::vnext_enabled(source)? {
+            Some(effective_state_location(&source.app())?)
+        } else {
+            None
+        };
+        let state_dir = state_dir
             .and_then(|state| url::Url::parse(&state.location).ok())
             .filter(|url| url.scheme() == "file")
             .and_then(|url| url.to_file_path().ok())
@@ -3194,15 +3197,12 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
         if vnext && !partitioned {
-            let location_supported = source
-                .app()
-                .runtime
-                .state
-                .as_ref()
-                .and_then(|state| url::Url::parse(&state.location).ok())
-                .is_some_and(|location| {
-                    location_datasets_url(&location, &object_store::path::Path::default()).is_some()
-                });
+            let location_supported = url::Url::parse(
+                &effective_state_location(&source.app())?.location,
+            )
+            .is_ok_and(|location| {
+                location_datasets_url(&location, &object_store::path::Path::default()).is_some()
+            });
             ensure!(
                 location_supported && object_native_data_unsupported(source).is_none(),
                 InvalidConfigurationSnafu {
@@ -3212,8 +3212,8 @@ impl CayenneAccelerator {
                 }
             );
         }
-        // The local `object_native` directory holds the catalog, or records that this
-        // instance uses one in `runtime.state.location`.
+        // With the flag off, the catalog in the state location is looked up only when
+        // the metadata directory has an `object_native` folder.
         let in_native = (vnext || path_exists(format!("{metadata_dir}/object_native")).await)
             && self
                 .existing_native_catalog_holds(metadata_dir, source, &table_name)
@@ -3298,23 +3298,12 @@ impl CayenneAccelerator {
         use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
 
         if metastore_type == "object_native" {
-            let head = format!("{metadata_dir}/object_native/catalog/head");
-            // A catalog in `runtime.state.location` is checked when it is opened.
-            if open_option == OpenOption::OpenExisting
-                && source.app().runtime.state.is_none()
-                && !path_exists(&head).await
-            {
-                return Err(CheckpointError::Store {
-                    source: format!("Cayenne object-native catalog does not exist at {head}")
-                        .into(),
-                });
-            }
-            let catalog =
-                Self::init_object_native_catalog(&self.native_catalog, metadata_dir, source)
-                    .await
-                    .map_err(|source| CheckpointError::Store {
-                        source: Box::new(source),
-                    })?;
+            // The catalog in the state location is checked when it is opened.
+            let catalog = Self::init_object_native_catalog(&self.native_catalog, source)
+                .await
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
             return Ok(Arc::new(native_sidecar::NativeSidecar::new(
                 catalog,
                 source.name().to_string(),
@@ -3508,13 +3497,9 @@ impl CayenneAccelerator {
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let connection_string = match metastore_type {
             "object_native" => {
-                return Self::init_object_native_catalog(
-                    &self.native_catalog,
-                    metadata_dir,
-                    source,
-                )
-                .await
-                .map(|catalog| catalog as Arc<dyn cayenne::MetadataCatalog>);
+                return Self::init_object_native_catalog(&self.native_catalog, source)
+                    .await
+                    .map(|catalog| catalog as Arc<dyn cayenne::MetadataCatalog>);
             }
             _ => format!("sqlite://{metadata_dir}/{METASTORE_DB_FILE}"),
         };
@@ -3593,12 +3578,8 @@ impl CayenneAccelerator {
                 table_name,
             )),
         };
-        let app = source.app();
-        let datasets_url = app
-            .runtime
-            .state
-            .as_ref()
-            .and_then(|state| url::Url::parse(&state.location).ok())
+        let datasets_url = url::Url::parse(&effective_state_location(&source.app())?.location)
+            .ok()
             .and_then(|location| location_datasets_url(&location, native.datasets_prefix()))
             .ok_or_else(refusal)?;
         ensure!(
@@ -3656,13 +3637,8 @@ impl CayenneAccelerator {
         {
             return Ok(LocationPlacement::Elsewhere);
         }
-        let in_object_store = source
-            .app()
-            .runtime
-            .state
-            .as_ref()
-            .and_then(|state| url::Url::parse(&state.location).ok())
-            .is_some_and(|location| {
+        let in_object_store = url::Url::parse(&effective_state_location(&source.app())?.location)
+            .is_ok_and(|location| {
                 location_datasets_url(&location, &object_store::path::Path::default()).is_some()
             });
         ensure!(
@@ -3698,108 +3674,72 @@ impl CayenneAccelerator {
         table_name: &str,
     ) -> Result<bool> {
         if self.native_catalog.get().is_none() {
-            let exists = match source.app().runtime.state.clone() {
-                Some(state) => {
-                    let location = spicepod::component::runtime::StateLocation {
-                        location: state.location.clone(),
-                        params: state.params.clone(),
-                        source: spicepod::component::runtime::StateSource::RuntimeState,
-                    };
-                    let (store, prefix) = runtime_state_location::build_unmetered_object_store(
-                        source.secrets(),
-                        tokio::runtime::Handle::current(),
-                        &location,
-                        runtime_state_location::StateFeature::CayenneMetastore,
-                    )
-                    .await
-                    .boxed()
-                    .context(AccelerationInitializationFailedSnafu)?;
-                    let head = object_store::path::Path::from(prefix)
-                        .join("v1")
-                        .join("catalog")
-                        .join("head");
-                    match object_store::ObjectStoreExt::head(store.as_ref(), &head).await {
-                        Ok(_) => true,
-                        Err(object_store::Error::NotFound { .. }) => false,
-                        Err(error) => {
-                            return Err(error)
-                                .boxed()
-                                .context(AccelerationInitializationFailedSnafu);
-                        }
-                    }
+            let location = effective_state_location(&source.app())?;
+            let (store, prefix) = runtime_state_location::build_unmetered_object_store(
+                source.secrets(),
+                tokio::runtime::Handle::current(),
+                &location,
+                runtime_state_location::StateFeature::CayenneMetastore,
+            )
+            .await
+            .boxed()
+            .context(AccelerationInitializationFailedSnafu)?;
+            let head = object_store::path::Path::from(prefix)
+                .join("v1")
+                .join("catalog")
+                .join("head");
+            match object_store::ObjectStoreExt::head(store.as_ref(), &head).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => return Ok(false),
+                Err(error) => {
+                    return Err(error)
+                        .boxed()
+                        .context(AccelerationInitializationFailedSnafu);
                 }
-                None => {
-                    path_exists(
-                        PathBuf::from(metadata_dir)
-                            .join("object_native")
-                            .join("catalog")
-                            .join("head"),
-                    )
-                    .await
-                }
-            };
-            if !exists {
-                return Ok(false);
             }
         }
         self.catalog_holds(metadata_dir, "object_native", source, table_name)
             .await
     }
 
-    /// Get or create the object-native catalog, with no SQL metastore. With
-    /// `runtime.state.location` set, its head log is kept in the location's
-    /// `cayenne/v1/` folder; otherwise in `{metadata_dir}/object_native`.
+    /// Get or create the object-native catalog, with no SQL metastore. Its head log
+    /// is kept in the `cayenne/v1/` folder of the state location
+    /// ([`effective_state_location`]): `runtime.state.location`, or `.spice/data`
+    /// when that is unset.
     async fn init_object_native_catalog(
         cell: &OnceCell<Arc<cayenne::metastore::object_native::ObjectNativeCatalog>>,
-        metadata_dir: &str,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<cayenne::metastore::object_native::ObjectNativeCatalog>> {
-        let directory = PathBuf::from(metadata_dir).join("object_native");
-        let state = source.app().runtime.state.clone();
+        let location = effective_state_location(&source.app())?;
         let secrets = source.secrets();
         cell.get_or_try_init(move || async move {
-            let native = match state {
-                Some(state) => {
-                    let location = spicepod::component::runtime::StateLocation {
-                        location: state.location.clone(),
-                        params: state.params.clone(),
-                        source: spicepod::component::runtime::StateSource::RuntimeState,
-                    };
-                    // One client for the location; the logs' requests and the data
-                    // files' are measured apart.
-                    let (store, prefix) = runtime_state_location::build_unmetered_object_store(
-                        Arc::clone(&secrets),
-                        tokio::runtime::Handle::current(),
-                        &location,
-                        runtime_state_location::StateFeature::CayenneMetastore,
-                    )
-                    .await
-                    .boxed()
-                    .context(AccelerationInitializationFailedSnafu)?;
-                    let data_store = runtime_state_location::metrics::metered(
-                        Arc::clone(&store),
-                        runtime_state_location::StateFeature::CayenneData,
-                    );
-                    cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
-                        runtime_state_location::metrics::metered(
-                            store,
-                            runtime_state_location::StateFeature::CayenneMetastore,
-                        ),
-                        object_store::path::Path::from(prefix)
-                            .join("v1")
-                            .join("catalog"),
-                        &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
-                    )
-                    .await
-                    .map(|native| native.with_data_store(data_store))
-                }
-                None => {
-                    cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(
-                        &directory,
-                    )
-                    .await
-                }
-            };
+            // One client for the location; the logs' requests and the data files'
+            // are measured apart.
+            let (store, prefix) = runtime_state_location::build_unmetered_object_store(
+                Arc::clone(&secrets),
+                tokio::runtime::Handle::current(),
+                &location,
+                runtime_state_location::StateFeature::CayenneMetastore,
+            )
+            .await
+            .boxed()
+            .context(AccelerationInitializationFailedSnafu)?;
+            let data_store = runtime_state_location::metrics::metered(
+                Arc::clone(&store),
+                runtime_state_location::StateFeature::CayenneData,
+            );
+            let native = cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
+                runtime_state_location::metrics::metered(
+                    store,
+                    runtime_state_location::StateFeature::CayenneMetastore,
+                ),
+                object_store::path::Path::from(prefix)
+                    .join("v1")
+                    .join("catalog"),
+                &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
+            )
+            .await
+            .map(|native| native.with_data_store(data_store));
             let catalog = Arc::new(
                 native
                     .boxed()
@@ -4303,6 +4243,33 @@ impl CayenneAccelerator {
 /// whose store is keyed from the bucket's root, or a local directory, whose
 /// store is keyed by absolute paths (`runtime_state_location`), so the
 /// `file://` URL of the same path names the same objects.
+/// The state location the object-native metastore keeps its logs and its
+/// datasets' data files in: `runtime.state` when it is set, otherwise the local
+/// `.spice/data` directory as a `file://` location. Both take the same
+/// object-store path, so a local install needs no object store or credentials.
+fn effective_state_location(app: &app::App) -> Result<StateLocation> {
+    if let Some(state) = app.runtime.state.as_ref() {
+        return Ok(StateLocation {
+            location: state.location.clone(),
+            params: state.params.clone(),
+            source: StateSource::RuntimeState,
+        });
+    }
+    let directory = spice_data_base_path();
+    let location = url::Url::from_directory_path(&directory).map_err(|()| {
+        Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "The default state location '{directory}' is not an absolute directory. Set `runtime.state.location` to a local directory or an S3 location."
+            )),
+        }
+    })?;
+    Ok(StateLocation {
+        location: location.into(),
+        params: None,
+        source: StateSource::RuntimeState,
+    })
+}
+
 fn location_datasets_url(
     location: &url::Url,
     datasets_prefix: &object_store::path::Path,
@@ -7367,12 +7334,76 @@ mod tests {
     /// instance in the same process would be a second live writer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_local_state_location_places_a_new_dataset_in_its_folder() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state = directory.path().join("state");
+        let files = write_a_new_dataset(
+            Some(spicepod::component::runtime::RuntimeState {
+                location: format!("file://{}/", state.display()),
+                params: None,
+            }),
+            directory.path(),
+        )
+        .await;
+        assert_data_files_in_dataset_folder(&files, "state/");
+    }
+
+    /// With `runtime.params.cayenne_vnext` on and `runtime.state` unset, the state
+    /// location is the local `.spice/data`: the catalog's head log and a new
+    /// dataset's data files are in its `cayenne/v1/` folder, exactly as with
+    /// `runtime.state.location` set to that directory, and nothing is written to the
+    /// metadata directory's `object_native` folder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unset_state_location_places_a_new_dataset_in_spice_data() {
+        // `.spice/data` is resolved against the working directory, which this test
+        // changes for the whole process.
+        assert!(
+            std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+            "this test changes the working directory, so it must run in a process of its own: run it with `cargo nextest run -p accelerator-cayenne --lib`"
+        );
+        let directory = tempfile::tempdir().expect("temp dir");
+        std::env::set_current_dir(directory.path()).expect("change the working directory");
+        let files = write_a_new_dataset(None, directory.path()).await;
+        assert_data_files_in_dataset_folder(&files, ".spice/data/");
+        assert!(
+            directory
+                .path()
+                .join(".spice/data/cayenne/v1/catalog/head")
+                .is_file(),
+            "the catalog's head log is in `.spice/data/cayenne/v1/catalog`"
+        );
+        assert!(
+            !directory.path().join("metadata/object_native").exists(),
+            "no catalog in the metadata directory"
+        );
+    }
+
+    /// Every `.vortex` file in `files` (relative to the test directory) is in the
+    /// `orders` dataset folder of the state location at `location_dir`.
+    fn assert_data_files_in_dataset_folder(files: &[String], location_dir: &str) {
+        assert!(!files.is_empty(), "no data file was written");
+        let folder = format!("{location_dir}cayenne/v1/datasets/orders-");
+        let outside: Vec<&String> = files
+            .iter()
+            .filter(|file| !(file.starts_with(&folder) && file.contains("/data/")))
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "data files outside the dataset folder in the location: {outside:?}"
+        );
+    }
+
+    /// Opens a new file-mode `orders` dataset with `runtime.params.cayenne_vnext` on,
+    /// `state` as `runtime.state` and its metadata directory under `directory`,
+    /// writes 2000 rows and reads them back, and returns the `.vortex` files under
+    /// `directory`, relative to it.
+    async fn write_a_new_dataset(
+        state: Option<spicepod::component::runtime::RuntimeState>,
+        directory: &std::path::Path,
+    ) -> Vec<String> {
         use data_accelerator_api::AcceleratorEngineRegistry;
         use datafusion::common::TableReference;
         use datafusion::prelude::SessionContext;
 
-        let directory = tempfile::tempdir().expect("temp dir");
-        let state = directory.path().join("state");
         let mut app = AppBuilder::new("test")
             .with_runtime_params(
                 [(CAYENNE_VNEXT_PARAM.to_string(), "enabled".to_string())]
@@ -7380,14 +7411,11 @@ mod tests {
                     .collect(),
             )
             .build();
-        app.runtime.state = Some(spicepod::component::runtime::RuntimeState {
-            location: format!("file://{}/", state.display()),
-            params: None,
-        });
+        app.runtime.state = state;
         let app = Arc::new(app);
         let open = |ctx: SessionContext, label: &'static str| {
             let app = Arc::clone(&app);
-            let directory = directory.path().to_path_buf();
+            let directory = directory.to_path_buf();
             async move {
                 let source = TestAccelerationSource::new("orders")
                     .with_app(app)
@@ -7477,7 +7505,7 @@ mod tests {
         assert_eq!(count_and_sum(ctx.clone()).await, expected);
 
         let mut files = Vec::new();
-        let mut pending = vec![directory.path().to_path_buf()];
+        let mut pending = vec![directory.to_path_buf()];
         while let Some(current) = pending.pop() {
             for entry in std::fs::read_dir(&current).expect("read directory") {
                 let path = entry.expect("entry").path();
@@ -7488,7 +7516,7 @@ mod tests {
                     .is_some_and(|extension| extension == "vortex")
                 {
                     files.push(
-                        path.strip_prefix(directory.path())
+                        path.strip_prefix(directory)
                             .expect("under the directory")
                             .to_string_lossy()
                             .into_owned(),
@@ -7496,24 +7524,20 @@ mod tests {
                 }
             }
         }
-        assert!(!files.is_empty(), "no data file was written");
-        let outside: Vec<&String> = files
-            .iter()
-            .filter(|file| {
-                !(file.starts_with("state/cayenne/v1/datasets/orders-") && file.contains("/data/"))
-            })
-            .collect();
-        assert!(
-            outside.is_empty(),
-            "data files outside the dataset folder in the location: {outside:?}"
-        );
+        files
     }
 
     #[tokio::test]
     async fn unplaced_object_native_data_is_refused_at_dataset_load() {
         let directory = tempfile::tempdir().expect("temp directory");
-        for (location, explicit_path) in [("file:///tmp/state", true), ("gs://bucket/state", false)]
-        {
+        // `None`: `runtime.state` unset, so the location is the local `.spice/data`,
+        // which takes data but not a dataset's own `cayenne_file_path`. The refusal
+        // comes before anything is opened there.
+        for (location, explicit_path) in [
+            (Some("file:///tmp/state"), true),
+            (Some("gs://bucket/state"), false),
+            (None, true),
+        ] {
             let mut app = AppBuilder::new("test")
                 .with_runtime_params(
                     [(CAYENNE_VNEXT_PARAM.to_string(), "enabled".to_string())]
@@ -7521,10 +7545,11 @@ mod tests {
                         .collect(),
                 )
                 .build();
-            app.runtime.state = Some(spicepod::component::runtime::RuntimeState {
-                location: location.to_string(),
-                params: None,
-            });
+            app.runtime.state =
+                location.map(|location| spicepod::component::runtime::RuntimeState {
+                    location: location.to_string(),
+                    params: None,
+                });
             let mut params = std::collections::HashMap::from([(
                 "cayenne_metadata_dir".to_string(),
                 directory.path().to_string_lossy().into_owned(),
