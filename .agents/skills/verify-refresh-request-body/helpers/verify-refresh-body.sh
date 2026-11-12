@@ -15,6 +15,8 @@ else
   METRICS_ADDR="${METRICS_ADDR:-127.0.0.1:19391}"
   WORK_DIR="${WORK_DIR:-$(mktemp -d /tmp/verify-refresh-body-XXXX)}"
   mkdir -p "$WORK_DIR/data"
+  # Absolute, so the CSV path in the Spicepod and the log redirect work after `cd`.
+  WORK_DIR="$(cd "$WORK_DIR" && pwd)"
   printf 'id,name\n1,a\n2,b\n' > "$WORK_DIR/data/events.csv"
   cat > "$WORK_DIR/spicepod.yaml" <<YAML
 version: v1
