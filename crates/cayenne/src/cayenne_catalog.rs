@@ -2430,6 +2430,19 @@ impl MetadataCatalog for CayenneCatalog {
         }
         let mut txn = self.begin_transaction().await?;
         for publication in publications {
+            if !publication.files.is_empty()
+                && let Err(error) = self
+                    .replace_snapshot_files_in_txn(
+                        txn.as_mut(),
+                        publication.table_id,
+                        publication.snapshot_id,
+                        publication.files,
+                    )
+                    .await
+            {
+                let _ = txn.rollback().await;
+                return Err(error);
+            }
             // Only the delete files are stamped, so only they are copied; the
             // replaced keys, one per changed row, are only counted.
             let mut delete_files = publication.delete_files.to_vec();
@@ -2657,7 +2670,7 @@ impl MetadataCatalog for CayenneCatalog {
         // Memory mode (`mode: memory`) writes nothing to disk — the mem-tier is the
         // store and the metastore is an in-RAM memdb — so skip creating the initial
         // snapshot directory entirely.
-        if !base_path.starts_with("s3://") && !options.vortex_config.memory_mode {
+        if !crate::is_object_store_path(&base_path) && !options.vortex_config.memory_mode {
             let table_root = std::path::PathBuf::from(&base_path).join(&table_id);
             let snapshot_dir = table_root.join(&initial_snapshot_id);
 
@@ -3228,6 +3241,13 @@ impl MetadataCatalog for CayenneCatalog {
                                     .map_or(MetastoreValue::Null, MetastoreValue::Blob),
                                 MetastoreValue::Integer(i64::from(stats.num_rows_exact)),
                             ],
+                        })
+                        .await?;
+                    }
+                    for file in &commit.manifest_files {
+                        tx.execute(ExecuteParams {
+                            sql: SNAPSHOT_FILE_UPSERT_SQL,
+                            params: snapshot_file_params(file),
                         })
                         .await?;
                     }
@@ -4482,6 +4502,52 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    fn keeps_retirement_record(&self) -> bool {
+        false
+    }
+    async fn retired_files(&self, _table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+        // The SQLite metastore keeps no retirement record; its tables sweep the
+        // directories they retired in this process.
+        Ok(None)
+    }
+    async fn committed_file_keys(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<std::collections::BTreeSet<String>>> {
+        let (table_path, path_is_relative) = self
+            .metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT path, path_is_relative FROM cayenne_table WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| Ok((row.get_string(0)?, row.get_bool(1)?)),
+            )
+            .await?;
+        let mut keys: std::collections::BTreeSet<String> = self
+            .get_all_snapshot_files(table_id)
+            .await?
+            .into_iter()
+            .map(|row| format!("{}/{}", row.snapshot_id, row.file_path))
+            .collect();
+        keys.extend(
+            self.get_table_delete_files(table_id)
+                .await?
+                .into_iter()
+                .map(|file| {
+                    cayenne_metastore_actions::state::delete_file_key(
+                        &table_path,
+                        path_is_relative,
+                        &file.path,
+                        file.path_is_relative,
+                    )
+                }),
+        );
+        Ok(Some(keys))
+    }
+    async fn forget_retired_files(&self, _table_id: &str, _keys: &[String]) -> CatalogResult<bool> {
+        Ok(false)
+    }
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
         self.metastore
             .query_helper(
@@ -6324,7 +6390,12 @@ pub(crate) async fn verify_stored_data_files_in<C: MetadataCatalog + ?Sized>(
     memory_mode: bool,
     settings_change: SettingsChangeAction,
 ) -> CatalogResult<()> {
-    if table.path.starts_with("s3://") || memory_mode {
+    // A table whose data is in the object-native location has no folder per
+    // snapshot to compare, and its committed state is its only file record.
+    if table.path.starts_with("s3://")
+        || memory_mode
+        || crate::metastore_layout::is_object_native_data_path(&table.path)
+    {
         return Ok(());
     }
     // Scans read the current snapshot and every protected one (rows staged
@@ -6449,7 +6520,7 @@ async fn inspect_stored_data_files(
 }
 
 async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResult<()> {
-    if table.path.starts_with("s3://") {
+    if crate::is_object_store_path(&table.path) {
         return Ok(());
     }
 

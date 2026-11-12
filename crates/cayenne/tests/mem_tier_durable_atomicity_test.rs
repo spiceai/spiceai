@@ -49,7 +49,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 const TABLE: &str = "atomic";
-const PREFIX: &str = "catalog";
+const PREFIX: &str = crate::common::LOCATION_CATALOG;
 /// A snapshot other than the current one, whose per-file statistics a
 /// checkpoint drops.
 const STALE_SNAPSHOT: &str = "01900000-0000-7000-8000-000000000001";
@@ -493,7 +493,9 @@ impl Native {
         .await
         .expect("create the catalog");
         let table_id = catalog
-            .create_table(table_options("/tmp/unused/atomic".to_string()))
+            .create_table(table_options(crate::common::location_data_url(
+                &catalog, TABLE,
+            )))
             .await
             .expect("table");
         plant(&catalog, &table_id).await;
@@ -579,7 +581,7 @@ async fn native_atomicity(
     assert!(
         refused
             .to_string()
-            .contains("catalog publication outcome is uncertain; reopen before reading"),
+            .contains("is reading its state back after a change whose outcome is unknown"),
         "{failure:?}: unexpected error: {refused}"
     );
     native.reopen().await

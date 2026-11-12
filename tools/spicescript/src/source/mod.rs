@@ -121,6 +121,11 @@ pub trait Source: Send + Sync {
         anyhow::bail!("this source has no objects to list under '{prefix}'")
     }
 
+    /// The objects (or files) under `prefix` in this namespace, with their sizes.
+    async fn sizes(&self, _namespace: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
+        anyhow::bail!("this source has no objects to list under '{prefix}'")
+    }
+
     /// Writes a generated table: by default creates it (unless appending) and
     /// loads the rows.
     async fn generate(&self, namespace: &str, spec: &crate::generate::TableSpec) -> Result<u64> {
@@ -183,6 +188,10 @@ pub async fn start(
     spec: &crate::script::SourceSpec,
 ) -> Result<Box<dyn Source>> {
     let dir = work.join(name);
+    anyhow::ensure!(
+        spec.latency.is_none() || kind == "rustfs",
+        "source '{name}': `latency` is for `rustfs` sources, not '{kind}'"
+    );
     let source: Box<dyn Source> = match kind {
         "kafka" | "mongodb" | "dynamodb" => {
             Box::new(document::Document::start(name, run_id, kind, version).await?)
@@ -191,7 +200,9 @@ pub async fn start(
         "postgres" => Box::new(postgres::Postgres::start(name, run_id, version).await?),
         "mysql" => Box::new(mysql::Mysql::start(name, run_id, version).await?),
         "files" => Box::new(files::Files::new(dir)?),
-        "rustfs" => Box::new(object_store::ObjectStore::start(name, run_id, dir).await?),
+        "rustfs" => {
+            Box::new(object_store::ObjectStore::start(name, run_id, dir, spec.latency).await?)
+        }
         "iceberg" => Box::new(iceberg::Iceberg::start(name, run_id, dir).await?),
         "clickhouse" => Box::new(clickhouse::ClickHouse::start(name, run_id, version).await?),
         "mock-http" => Box::new(mock_http::MockHttp::start().await?),

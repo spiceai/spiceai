@@ -248,6 +248,9 @@ impl CompactionTrigger {
 pub(crate) enum MaintenanceOp {
     /// Reclaim of key-based deletion vectors that shadow nothing live.
     OrphanDvSweep,
+    /// Deletion of objects in a table's object-native location that no commit
+    /// names, past the orphan age floor.
+    OrphanFileSweep,
     /// Application of the table's retention filters.
     Retention,
     /// Physical deletion of retired snapshot directories past their grace.
@@ -258,12 +261,17 @@ impl MaintenanceOp {
     /// Every variant. Iterated by `register_all` as well as the tests, so this
     /// one is not `cfg(test)` — a new operation is registered at zero the moment
     /// it is added to the list.
-    pub(crate) const ALL: &'static [Self] =
-        &[Self::OrphanDvSweep, Self::Retention, Self::RetiredDirSweep];
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::OrphanDvSweep,
+        Self::OrphanFileSweep,
+        Self::Retention,
+        Self::RetiredDirSweep,
+    ];
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::OrphanDvSweep => "orphan_dv_sweep",
+            Self::OrphanFileSweep => "orphan_file_sweep",
             Self::Retention => "retention",
             Self::RetiredDirSweep => "retired_dir_sweep",
         }
