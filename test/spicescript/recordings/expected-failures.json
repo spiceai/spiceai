@@ -199,7 +199,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_replace(s, '\\d', 'X') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"xyX\\\"\", actual: \"\\\"xy١\\\"\" }",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"xyX\\\"\", actual: \"\\\"xy\u0661\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -253,9 +253,9 @@
     {
       "run": "builtins",
       "who": "variants",
-      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\1١') AS v FROM rx ORDER BY id",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\1\u0661') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a١\\\"\" }",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a\u0661\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -263,7 +263,7 @@
       "who": "variants",
       "key": "query: SELECT nth_value(customer, 2 ORDER BY customer) AS n FROM cust WHERE region = 'eu'",
       "kind": "wrong-answer",
-      "signature": "federated vs cayenne-memory: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"carol\\\"\", actual: \"\\\"Ångström\\\"\" }",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"carol\\\"\", actual: \"\\\"\u00c5ngstr\u00f6m\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -303,35 +303,11 @@
     {
       "run": "cayenne-transactions",
       "who": "object-native-local",
-      "key": "assert-files: {\"contains\":[\"^state/cayenne/v1/datasets/accounts-[^/]+/data/\",\"^state/cayenne/v1/datasets/ledger-[^/]+/data/\"]}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/accounts-[^/]+/data//; no file matches /^state/cayenne/v1/datasets/ledger-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "cayenne-transactions",
-      "who": "object-native-local",
-      "key": "query: SELECT id, balance FROM accounts #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.accounts' not found: table 'spice.public.accounts' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "cayenne-transactions",
-      "who": "object-native-local",
-      "key": "query: SELECT id, account, amount FROM ledger #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.ledger' not found: table 'spice.public.ledger' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "cayenne-transactions",
-      "who": "object-native-local",
       "key": "spice-exec: BEGIN; SELECT assert((SELECT balance FROM accounts WHERE id = 1) >= 10); UPDATE accounts SET balance = balance - 10 WHERE id = 1; INSERT INTO ledger VALUES (6, 1, -10); COMMIT;",
       "kind": "error",
       "signature": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
-      "group": "cayenne",
       "pattern": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
+      "group": "cayenne",
       "may-pass": true
     },
     {
@@ -340,8 +316,8 @@
       "key": "spice-exec: BEGIN; SELECT assert((SELECT balance FROM accounts WHERE id = 1) >= 10); UPDATE accounts SET balance = balance - 10 WHERE id = 1; INSERT INTO ledger VALUES (6, 1, -10); COMMIT;",
       "kind": "error",
       "signature": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
-      "group": "cayenne",
       "pattern": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
+      "group": "cayenne",
       "may-pass": true
     },
     {
@@ -350,8 +326,8 @@
       "key": "query: SELECT id, balance FROM accounts #10",
       "kind": "error",
       "signature": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
-      "group": "cayenne",
       "pattern": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
+      "group": "cayenne",
       "may-pass": true
     },
     {
@@ -360,8 +336,8 @@
       "key": "query: SELECT id, balance FROM accounts #10",
       "kind": "error",
       "signature": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
-      "group": "cayenne",
       "pattern": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
+      "group": "cayenne",
       "may-pass": true
     },
     {
@@ -370,8 +346,8 @@
       "key": "query: SELECT id, account, amount FROM ledger #10",
       "kind": "wrong-answer",
       "signature": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
-      "group": "cayenne",
       "pattern": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
+      "group": "cayenne",
       "may-pass": true
     },
     {
@@ -380,9 +356,53 @@
       "key": "query: SELECT id, account, amount FROM ledger #10",
       "kind": "error",
       "signature": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
-      "group": "cayenne",
       "pattern": "table 'spice\\.public\\.(accounts|ledger)' not found|answer differs from the expected one",
+      "group": "cayenne",
       "may-pass": true
+    }
+  ],
+  "cayenne-vnext": [
+    {
+      "run": "cayenne-vnext",
+      "who": "default",
+      "key": "restart: {\"patch\":{\"spicepod\":{\"runtime\":{\"params\":{\"cayenne_vnext\":\"disabled\"}}}}}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"The accelerator engine cayenne failed to initialize: Invalid Cayenne acceleration configuration: Dataset 'before_flag' is accelerated",
+      "group": "cayenne"
+    }
+  ],
+  "cayenne-vnext-recreate": [
+    {
+      "run": "cayenne-vnext-recreate",
+      "who": "default",
+      "key": "query: SELECT * FROM b_ds",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.b_ds' not found: table 'spice.public.b_ds' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-vnext-recreate",
+      "who": "default",
+      "key": "assert-log: {\"count\":{\"Created the Cayenne object-native metastore\":1}}",
+      "kind": "other",
+      "signature": "1 log problem in <path>",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-vnext-recreate",
+      "who": "default",
+      "key": "assert-log: {\"count\":{\"Created the Cayenne object-native metastore\":1,\"Opened the Cayenne object-native metastore\":\">=1\"}}",
+      "kind": "other",
+      "signature": "2 log problems in <path>",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-vnext-recreate",
+      "who": "default",
+      "key": "query: SELECT * FROM b_ds #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.b_ds' not found: table 'spice.public.b_ds' not found",
+      "group": "cayenne"
     }
   ],
   "clickhouse-literals": [
@@ -707,6 +727,32 @@
       "group": "clickhouse"
     }
   ],
+  "config-errors": [
+    {
+      "run": "config-errors",
+      "who": "object-native",
+      "key": "query: SELECT * FROM healthy_cayenne",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.healthy_cayenne' not found: table 'spice.public.healthy_cayenne' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "config-errors",
+      "who": "object-native",
+      "key": "query: SELECT * FROM turso_param",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.turso_param' not found: table 'spice.public.turso_param' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "config-errors",
+      "who": "object-native",
+      "key": "query: SELECT * FROM healthy_cayenne #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. table 'spice.public.healthy_cayenne' not found: table 'spice.public.healthy_cayenne' not found",
+      "group": "cayenne"
+    }
+  ],
   "debezium-offset-recovery": [
     {
       "run": "debezium-offset-recovery",
@@ -717,6 +763,16 @@
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
       "group": "debezium",
       "may-pass": true
+    }
+  ],
+  "duckdb-types-acceleration": [
+    {
+      "run": "duckdb-types-acceleration",
+      "who": "cayenne-object-native",
+      "key": "assert-files: {\"contains\":\"(^|/)\\\\.spice/data/far/.*\\\\.vortex$\"}",
+      "kind": "other",
+      "signature": "no file matches /(^|/)\\.spice/data/far/.*\\.vortex$/",
+      "group": "cayenne"
     }
   ],
   "ducklake-coverage": [
@@ -831,209 +887,25 @@
       "may-pass": true
     }
   ],
-  "full-refresh-chaos": [
+  "http-caching-columns": [
     {
-      "run": "full-refresh-chaos[src=postgres]",
-      "who": "object-native-local",
-      "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/facts-[^/]+/data/\"}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/facts-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=postgres]",
-      "who": "object-native-local",
-      "key": "query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts #3",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"50000\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=postgres]",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM facts WHERE grp = 17 ORDER BY id #2",
-      "kind": "empty",
-      "signature": "Spice returned no rows, expected 251",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=mysql]",
-      "who": "object-native-local",
-      "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/facts-[^/]+/data/\"}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/facts-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=mysql]",
-      "who": "object-native-local",
-      "key": "query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts #3",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"50000\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=mysql]",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM facts WHERE grp = 17 ORDER BY id #2",
-      "kind": "empty",
-      "signature": "Spice returned no rows, expected 251",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=clickhouse]",
-      "who": "object-native-local",
-      "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/facts-[^/]+/data/\"}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/facts-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=clickhouse]",
-      "who": "object-native-local",
-      "key": "query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts #3",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"50000\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=clickhouse]",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM facts WHERE grp = 17 ORDER BY id #2",
-      "kind": "empty",
-      "signature": "Spice returned no rows, expected 251",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=ducklake]",
-      "who": "object-native-local",
-      "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/facts-[^/]+/data/\"}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/facts-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=ducklake]",
-      "who": "object-native-local",
-      "key": "query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts #3",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"50000\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=ducklake]",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM facts WHERE grp = 17 ORDER BY id #2",
-      "kind": "empty",
-      "signature": "Spice returned no rows, expected 251",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=rustfs]",
-      "who": "object-native-local",
-      "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/facts-[^/]+/data/\"}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/facts-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=rustfs]",
-      "who": "object-native-local",
-      "key": "query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts #3",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"50000\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=rustfs]",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM facts WHERE grp = 17 ORDER BY id #2",
-      "kind": "empty",
-      "signature": "Spice returned no rows, expected 251",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=files]",
-      "who": "object-native-local",
-      "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/facts-[^/]+/data/\"}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/facts-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=iceberg]",
-      "who": "object-native-local",
-      "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/facts-[^/]+/data/\"}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/facts-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=iceberg]",
-      "who": "object-native-s3",
-      "key": "assert-objects: {\"contains\":\"/data/\",\"min\":1,\"prefix\":\"state/cayenne/v1/datasets/facts-\",\"source\":\"lake\"}",
-      "kind": "other",
-      "signature": "expected at least 1 objects under 'state/cayenne/v1/datasets/facts-' containing '/data/' in 'lake', found 0: []",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=iceberg]",
-      "who": "object-native-s3-latency",
-      "key": "assert-objects: {\"contains\":\"/data/\",\"min\":1,\"prefix\":\"state/cayenne/v1/datasets/facts-\",\"source\":\"slow-lake\"}",
-      "kind": "other",
-      "signature": "expected at least 1 objects under 'state/cayenne/v1/datasets/facts-' containing '/data/' in 'slow-lake', found 0: []",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=iceberg]",
-      "who": "object-native-local",
-      "key": "query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts #3",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"50000\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=iceberg]",
-      "who": "object-native-s3",
-      "key": "query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts #3",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"50000\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=iceberg]",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts #3",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"50000\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=iceberg]",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM facts WHERE grp = 17 ORDER BY id #2",
-      "kind": "empty",
-      "signature": "Spice returned no rows, expected 251",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=iceberg]",
-      "who": "object-native-s3",
-      "key": "query: SELECT * FROM facts WHERE grp = 17 ORDER BY id #2",
-      "kind": "empty",
-      "signature": "Spice returned no rows, expected 251",
-      "group": "cayenne"
-    },
-    {
-      "run": "full-refresh-chaos[src=iceberg]",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT * FROM facts WHERE grp = 17 ORDER BY id #2",
-      "kind": "empty",
-      "signature": "Spice returned no rows, expected 251",
+      "run": "http-caching-columns",
+      "who": "object-native",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"The accelerator engine cayenne failed to initialize: Invalid Cayenne acceleration configuration: Failed to load dataset 'd' (cayenne)",
       "group": "cayenne"
     }
   ],
   "http-caching-keys": [
+    {
+      "run": "http-caching-keys",
+      "who": "object-native",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"The accelerator engine cayenne failed to initialize: Invalid Cayenne acceleration configuration: Failed to load dataset 'q' (cayenne)",
+      "group": "cayenne"
+    },
     {
       "run": "http-caching-keys",
       "who": "as-written",
@@ -1059,23 +931,7 @@
     {
       "run": "mysql-cdc-parity",
       "who": "object-native-local",
-      "key": "assert-files: {\"contains\":[\"^state/cayenne/v1/datasets/orders-[^/]+/data/\",\"^state/cayenne/v1/datasets/customers-[^/]+/data/\"]}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/orders-[^/]+/data//; no file matches /^state/cayenne/v1/datasets/customers-[^/]+/data//",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM customers #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM orders #9",
+      "key": "query: SELECT * FROM orders #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
       "group": "cayenne"
@@ -1083,25 +939,33 @@
     {
       "run": "mysql-cdc-parity",
       "who": "object-native-s3",
-      "key": "query: SELECT * FROM orders #9",
+      "key": "query: SELECT * FROM orders #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "object-native-s3",
-      "key": "query: SELECT * FROM customers #8",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
       "group": "cayenne"
     },
     {
       "run": "mysql-cdc-parity",
       "who": "object-native-s3-latency",
-      "key": "query: SELECT * FROM orders #9",
+      "key": "query: SELECT * FROM orders #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-local",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
       "group": "cayenne"
     },
     {
@@ -1117,17 +981,41 @@
       "who": "object-native-local",
       "key": "query: SELECT * FROM customers #9",
       "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for customers: Acceleration not ready; loading initial data for customers",
       "group": "cayenne",
       "may-pass": true
     },
     {
       "run": "mysql-cdc-parity",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM orders #10",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM customers #9",
       "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for customers: Acceleration not ready; loading initial data for customers",
       "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM customers #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for customers: Acceleration not ready; loading initial data for customers",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3",
+      "key": "start: {\"ready-timeout\":\"60s\"}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "start: {\"ready-timeout\":\"60s\"}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
     }
   ],
   "mysql-cdc-shared-binlog": [
@@ -1650,7 +1538,7 @@
     {
       "run": "mysql-literals",
       "who": "federated",
-      "key": "query: SELECT id FROM m WHERE s IN ('a''b\"c_d%e', 'naïve') ORDER BY id",
+      "key": "query: SELECT id FROM m WHERE s IN ('a''b\"c_d%e', 'na\u00efve') ORDER BY id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
       "group": "federation-mysql"
@@ -1658,10 +1546,20 @@
     {
       "run": "mysql-literals",
       "who": "federated",
-      "key": "query: SELECT id FROM m WHERE s BETWEEN 'a''b\"c_d%e' AND 'naïve' ORDER BY id",
+      "key": "query: SELECT id FROM m WHERE s BETWEEN 'a''b\"c_d%e' AND 'na\u00efve' ORDER BY id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
       "group": "federation-mysql"
+    }
+  ],
+  "object-native-data": [
+    {
+      "run": "object-native-data",
+      "who": "object-native-s3",
+      "key": "assert-log: {\"contains\":[\"Dataset 'facts' \\\\(cayenne\\\\) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location\\\\. Its previous folder 's3://[^']+/moved/cayenne/v1/datasets/facts-[^']+' is deleted once no query reads it\"],\"lacks\":[\"Deleted the acceleration data directory\",\"were not removed from the object store\"]}",
+      "kind": "other",
+      "signature": "1 log problem in <path>",
+      "group": "cayenne"
     }
   ],
   "postgres-cdc-atomicity": [
@@ -1886,10 +1784,114 @@
   "postgres-cdc-parity": [
     {
       "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT * FROM orders",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20000",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT * FROM customers",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 500",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT * FROM orders #2",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 19794",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT * FROM customers #2",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 501",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT * FROM orders #3",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 19794",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT * FROM orders #4",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 19794",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT * FROM customers #3",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 501",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT * FROM orders #6",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 18449, actual: 14758 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT * FROM customers #5",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 480",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT o_status, count(*), sum(o_total), min(o_placed), max(o_updated) FROM orders GROUP BY o_status ORDER BY o_status NULLS LAST",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"5967\\\"\", actual: \"\\\"4771\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "partitioned-object-native",
+      "key": "query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 4",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
       "who": "object-native-local",
-      "key": "assert-files: {\"contains\":\"^state/cayenne/v1/datasets/orders-[^/]+/data/\"}",
-      "kind": "other",
-      "signature": "no file matches /^state/cayenne/v1/datasets/orders-[^/]+/data//",
+      "key": "query: SELECT * FROM orders #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM orders #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM orders #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
       "group": "cayenne"
     },
     {
@@ -1902,10 +1904,18 @@
     },
     {
       "run": "postgres-cdc-parity",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM orders #9",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM customers #7",
       "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM customers #7",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
       "group": "cayenne"
     },
     {
@@ -1916,46 +1926,6 @@
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
       "group": "cayenne",
       "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3",
-      "key": "query: SELECT * FROM orders #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3",
-      "key": "query: SELECT * FROM customers #7",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT * FROM orders #9",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3-latency",
-      "key": "query: SELECT * FROM customers #7",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-local",
-      "key": "query: SELECT * FROM orders #10",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
-      "group": "cayenne"
     }
   ],
   "postgres-literals": [
@@ -2434,7 +2404,7 @@
       "who": "federated",
       "key": "query: SELECT id, concat(s, '-', id) AS c1, s || '!' AS c2 FROM t WHERE id < 40",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"c2\", row_number: 1, expected: \"\\\"naïve!\\\"\", actual: \"\\\"0\\\"\" }",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"c2\", row_number: 1, expected: \"\\\"na\u00efve!\\\"\", actual: \"\\\"0\\\"\" }",
       "group": "federation-mysql"
     },
     {
@@ -2888,7 +2858,7 @@
     {
       "run": "surface",
       "who": "federated",
-      "key": "query: SELECT id, starts_with(s, 'Ga') AS sw, ends_with(s, 'é') AS ew FROM ev WHERE s IS NOT NULL",
+      "key": "query: SELECT id, starts_with(s, 'Ga') AS sw, ends_with(s, '\u00e9') AS ew FROM ev WHERE s IS NOT NULL",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function ends_with(text, unknown) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type ",
       "group": "federation-postgres"
