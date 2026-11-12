@@ -86,16 +86,25 @@ def extract(archive_dir: Path, dest: Path) -> int:
         for err in errors:
             print(f"::error::refusing snapshot artifact: {err}")
         return 1
+    # One pass per archive: reopening the gzip stream for every member would
+    # rescan it from the start each time.
+    by_archive: dict[Path, dict[str, Path]] = {}
     for archive, name, target in planned:
+        by_archive.setdefault(archive, {})[name] = target
+    for archive, targets in by_archive.items():
         with tarfile.open(archive, "r:gz") as tar:
-            src = tar.extractfile(tar.getmember(name))
-            assert src is not None
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # O_NOFOLLOW: refuse a symlink that appeared after the check above.
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
-            with os.fdopen(fd, "wb") as out:
-                out.write(src.read())
-        print(f"extracted {name}")
+            for member in tar:
+                target = targets.get(member.name)
+                if target is None:
+                    continue
+                src = tar.extractfile(member)
+                assert src is not None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # O_NOFOLLOW: refuse a symlink that appeared after the check above.
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+                with os.fdopen(fd, "wb") as out:
+                    out.write(src.read())
+                print(f"extracted {member.name}")
     print(f"{len(planned)} snapshot file(s) from {len(archives)} archive(s)")
     return 0
 
