@@ -14,25 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Inline SQL table-function arguments used as the query text of search
-//! UDTFs (`vector_search`, `text_search`) before `DataFusion` plans the
-//! function body.
+//! Inline SQL table-function arguments used as arguments of search UDTFs
+//! (`vector_search`, `text_search`) before `DataFusion` plans the function
+//! body.
 //!
-//! Search UDTFs inspect their query argument while the table function
-//! itself is being constructed during planning
-//! (`runtime-search::rrf::parse_search_args`,
-//! `runtime-search::full_text_udtf`, `runtime::embeddings::udtf`), and all
-//! three require that argument in the *second positional* slot — none of
-//! them consult a named `query` argument. A SQL-tier function's own
-//! arguments, by contrast, are only replaced with literal values in
-//! [`super::args_inliner::inline_args_into_plan`], which runs on the
-//! logical plan *after* planning. That's too late for these UDTFs.
+//! Search UDTFs inspect their arguments while the table function itself is
+//! being constructed during planning (`runtime-search::rrf::parse_search_args`,
+//! `runtime-search::full_text_udtf`, `runtime::embeddings::udtf`), and only
+//! accept literals there. All three also require the query in the *second
+//! positional* slot — none of them consult a named `query` argument. A
+//! SQL-tier function's own arguments, by contrast, are only replaced with
+//! literal values in [`super::args_inliner::inline_args_into_plan`], which
+//! runs on the logical plan *after* planning. That's too late for these
+//! UDTFs: `text_search(docs, q, limit => k)` would see `k` as a column.
 //!
-//! This module closes the gap by rewriting the parsed SQL text: any
-//! argument in the search UDTF's query position — whether already
-//! positional or passed as `query => ...` — that resolves to a known
-//! string-valued function argument is normalized into the second
-//! positional slot as a literal, before the body is planned.
+//! This module closes the gap by rewriting the parsed SQL text. For every
+//! search UDTF call, an identifier that names a function argument is
+//! replaced with that argument's value as a literal when it is:
+//!
+//! - the query, positional or `query => ...` (string values only); it is
+//!   always normalized into the second positional slot;
+//! - any other named argument (`limit => k`, `include_score => s`,
+//!   `rank_weight => w`, ...) except `column => ...`; it stays named;
+//! - a positional argument after the column slot (`limit`, then
+//!   `include_score`).
+//!
+//! The table slot, the positional column slot and `column => ...` are never
+//! rewritten, even if a function argument shares the identifier's name, as
+//! they name a table or column. A `NULL` argument value is written as SQL
+//! `NULL`, so the UDTF reports it rather than seeing an unknown column.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -97,7 +107,7 @@ impl VisitorMut for SearchQueryArgRewriter<'_> {
         let ast::FunctionArguments::List(arguments) = &mut function.args else {
             return ControlFlow::Continue(());
         };
-        normalize_query_argument(&mut arguments.args, self.values);
+        inline_search_arguments(&mut arguments.args, self.values);
         ControlFlow::Continue(())
     }
 
@@ -119,7 +129,7 @@ impl VisitorMut for SearchQueryArgRewriter<'_> {
         if !is_search_udtf(&name.to_string()) {
             return ControlFlow::Continue(());
         }
-        normalize_query_argument(&mut table_args.args, self.values);
+        inline_search_arguments(&mut table_args.args, self.values);
         ControlFlow::Continue(())
     }
 }
@@ -158,21 +168,153 @@ fn arg_expr_mut(arg: &mut ast::FunctionArg) -> &mut ast::FunctionArgExpr {
     }
 }
 
-/// If `expr` is an identifier bound to a known `Utf8` argument value,
-/// returns the literal `FunctionArgExpr` it should be replaced with.
+/// A function-argument value that can be written back into SQL text as a
+/// literal, so the planner produces the same typed `Expr::Literal` a user
+/// would get by writing the value inline.
+#[derive(Debug, Clone, PartialEq)]
+enum SqlLiteral {
+    Null,
+    Boolean(bool),
+    Integer(i128),
+    /// Always finite; see [`SqlLiteral::from_scalar`].
+    Float(f64),
+    String(String),
+}
+
+impl SqlLiteral {
+    /// `None` for values with no plain SQL literal form (lists, structs,
+    /// timestamps, non-finite floats, ...). Such identifiers are left as
+    /// written, and the UDTF reports them during planning.
+    fn from_scalar(value: &ScalarValue) -> Option<Self> {
+        if value.is_null() {
+            return Some(Self::Null);
+        }
+        match value {
+            ScalarValue::Boolean(Some(v)) => Some(Self::Boolean(*v)),
+            ScalarValue::Int8(Some(v)) => Some(Self::Integer(i128::from(*v))),
+            ScalarValue::Int16(Some(v)) => Some(Self::Integer(i128::from(*v))),
+            ScalarValue::Int32(Some(v)) => Some(Self::Integer(i128::from(*v))),
+            ScalarValue::Int64(Some(v)) => Some(Self::Integer(i128::from(*v))),
+            ScalarValue::UInt8(Some(v)) => Some(Self::Integer(i128::from(*v))),
+            ScalarValue::UInt16(Some(v)) => Some(Self::Integer(i128::from(*v))),
+            ScalarValue::UInt32(Some(v)) => Some(Self::Integer(i128::from(*v))),
+            ScalarValue::UInt64(Some(v)) => Some(Self::Integer(i128::from(*v))),
+            ScalarValue::Float32(Some(v)) => Self::finite_float(f64::from(*v)),
+            ScalarValue::Float64(Some(v)) => Self::finite_float(*v),
+            ScalarValue::Utf8(Some(v))
+            | ScalarValue::LargeUtf8(Some(v))
+            | ScalarValue::Utf8View(Some(v)) => Some(Self::String(v.clone())),
+            _ => None,
+        }
+    }
+
+    fn finite_float(value: f64) -> Option<Self> {
+        value.is_finite().then_some(Self::Float(value))
+    }
+
+    fn into_arg_expr(self) -> ast::FunctionArgExpr {
+        let value = match self {
+            Self::Null => ast::Value::Null,
+            Self::Boolean(v) => ast::Value::Boolean(v),
+            Self::Integer(v) => ast::Value::Number(v.to_string(), false),
+            Self::Float(v) => {
+                // `f64` display never uses an exponent, but drops the
+                // fraction of whole numbers. Keep a `.0` so the value is
+                // planned as a float, not an integer.
+                let mut text = v.to_string();
+                if !text.contains('.') {
+                    text.push_str(".0");
+                }
+                ast::Value::Number(text, false)
+            }
+            Self::String(v) => ast::Value::SingleQuotedString(v),
+        };
+        ast::FunctionArgExpr::Expr(ast::Expr::Value(ast::ValueWithSpan::from(value)))
+    }
+}
+
+/// If `expr` is a bare identifier bound to a function argument, returns
+/// that argument's value as a literal.
+fn resolve_identifier(
+    expr: &ast::FunctionArgExpr,
+    values: &HashMap<String, ScalarValue>,
+) -> Option<SqlLiteral> {
+    let ast::FunctionArgExpr::Expr(ast::Expr::Identifier(identifier)) = expr else {
+        return None;
+    };
+    SqlLiteral::from_scalar(values.get(&identifier.value.to_ascii_lowercase())?)
+}
+
+/// Like [`resolve_identifier`], but only for string values: the only kind
+/// a search query can be.
 fn resolve_identifier_literal(
     expr: &ast::FunctionArgExpr,
     values: &HashMap<String, ScalarValue>,
 ) -> Option<ast::FunctionArgExpr> {
-    let ast::FunctionArgExpr::Expr(ast::Expr::Identifier(identifier)) = expr else {
-        return None;
-    };
-    let ScalarValue::Utf8(Some(query)) = values.get(&identifier.value.to_ascii_lowercase())? else {
-        return None;
-    };
-    Some(ast::FunctionArgExpr::Expr(ast::Expr::Value(
-        ast::ValueWithSpan::from(ast::Value::SingleQuotedString(query.clone())),
-    )))
+    match resolve_identifier(expr, values)? {
+        literal @ SqlLiteral::String(_) => Some(literal.into_arg_expr()),
+        _ => None,
+    }
+}
+
+/// Where a positional argument sits in the search UDTF signature
+/// `(table, query, [column, limit, include_score])`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PositionalSlot {
+    Table,
+    Query,
+    Column,
+    /// `limit` or `include_score`: always a scalar value.
+    Scalar,
+}
+
+impl PositionalSlot {
+    /// `query_is_named` is true when the query is still passed as
+    /// `query => ...`, so it does not take a positional slot.
+    fn at(index: usize, query_is_named: bool) -> Self {
+        match (index, query_is_named) {
+            (0, _) => Self::Table,
+            (1, false) => Self::Query,
+            (1, true) | (2, false) => Self::Column,
+            _ => Self::Scalar,
+        }
+    }
+}
+
+fn is_named_key(arg: &ast::FunctionArg, key: &str) -> bool {
+    named_key(arg).is_some_and(|name| name.eq_ignore_ascii_case(key))
+}
+
+/// Inline function arguments into one search UDTF call; see the module
+/// docs for which argument positions are rewritten.
+fn inline_search_arguments(
+    args: &mut Vec<ast::FunctionArg>,
+    values: &HashMap<String, ScalarValue>,
+) {
+    normalize_query_argument(args, values);
+
+    let query_is_named = args.iter().any(|arg| is_named_key(arg, "query"));
+    let mut positional_index = 0;
+    for arg in args.iter_mut() {
+        let rewrite = if is_named(arg) {
+            // A key that is not a plain identifier, or a `query`/`column`
+            // key, is left as written.
+            named_key(arg).is_some_and(|name| {
+                !name.eq_ignore_ascii_case("query") && !name.eq_ignore_ascii_case("column")
+            })
+        } else {
+            let slot = PositionalSlot::at(positional_index, query_is_named);
+            positional_index += 1;
+            slot == PositionalSlot::Scalar
+        };
+        if !rewrite {
+            continue;
+        }
+        let expr = arg_expr_mut(arg);
+        if let Some(literal) = resolve_identifier(expr, values) {
+            *expr = literal.into_arg_expr();
+        }
+    }
 }
 
 /// Ensure the search UDTF's query argument ends up as a literal in the
@@ -208,10 +350,7 @@ fn normalize_query_argument(
         return;
     }
 
-    let Some(query_idx) = args
-        .iter()
-        .position(|arg| named_key(arg).is_some_and(|name| name.eq_ignore_ascii_case("query")))
-    else {
+    let Some(query_idx) = args.iter().position(|arg| is_named_key(arg, "query")) else {
         return;
     };
     let Some(literal) = resolve_identifier_literal(arg_expr_mut(&mut args[query_idx]), values)
@@ -235,12 +374,34 @@ mod tests {
 
     use super::*;
 
+    /// `text` deliberately shares its name with a column of `docs`.
     fn schema() -> Schema {
-        Schema::new(vec![Field::new("q", DataType::Utf8, true)])
+        Schema::new(vec![
+            Field::new("q", DataType::Utf8, true),
+            Field::new("k", DataType::Int64, true),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("s", DataType::Boolean, true),
+            Field::new("w", DataType::Float64, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("u", DataType::UInt64, true),
+        ])
     }
 
     fn values() -> Vec<ScalarValue> {
-        vec![ScalarValue::Utf8(Some("hybrid search".to_string()))]
+        vec![
+            ScalarValue::Utf8(Some("hybrid search".to_string())),
+            ScalarValue::Int64(Some(5)),
+            ScalarValue::Utf8(Some("not a column".to_string())),
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Float64(Some(2.0)),
+            ScalarValue::Int64(None),
+            ScalarValue::UInt64(Some(7)),
+        ]
+    }
+
+    fn rewrite(body: &str) -> String {
+        inline_search_query_args(body, &GenericDialect {}, &schema(), &values())
+            .unwrap_or_else(|e| panic!("rewrite of {body:?} failed: {e}"))
     }
 
     /// Table-driven over the call shapes search UDTFs must accept: plain
@@ -282,6 +443,124 @@ mod tests {
                 "expected {rewritten:?} to contain {expected_fragment:?}"
             );
         }
+    }
+
+    /// Table-driven over the non-query argument shapes: named and positional
+    /// `limit`/`include_score`, other named options, nesting in `rrf`, and
+    /// every literal kind. Each function argument must become a literal in
+    /// the same position, since search UDTFs only accept literals there.
+    #[test]
+    fn inlines_scalar_arguments_of_every_search_udtf_shape() {
+        let cases = [
+            (
+                "SELECT * FROM text_search(docs, q, limit => k)",
+                "text_search(docs, 'hybrid search', limit => 5)",
+            ),
+            (
+                "SELECT * FROM text_search(docs, query => q, limit => k)",
+                "text_search(docs, 'hybrid search', limit => 5)",
+            ),
+            (
+                "SELECT * FROM text_search(docs, q, text, k)",
+                "text_search(docs, 'hybrid search', text, 5)",
+            ),
+            (
+                "SELECT * FROM text_search(docs, q, text, k, s)",
+                "text_search(docs, 'hybrid search', text, 5, false)",
+            ),
+            (
+                "SELECT * FROM text_search(docs, q, include_score => s)",
+                "text_search(docs, 'hybrid search', include_score => false)",
+            ),
+            (
+                "SELECT * FROM vector_search(docs, q, limit => k)",
+                "vector_search(docs, 'hybrid search', limit => 5)",
+            ),
+            (
+                "SELECT * FROM vector_search(docs, q, text, u)",
+                "vector_search(docs, 'hybrid search', text, 7)",
+            ),
+            (
+                "SELECT * FROM rrf(vector_search(docs, q, limit => k), text_search(docs, q, text, k, rank_weight => w))",
+                "rrf(vector_search(docs, 'hybrid search', limit => 5), text_search(docs, 'hybrid search', text, 5, rank_weight => 2.0))",
+            ),
+            (
+                "SELECT * FROM text_search(docs, q, limit => n)",
+                "text_search(docs, 'hybrid search', limit => NULL)",
+            ),
+        ];
+
+        for (body, expected_fragment) in cases {
+            let rewritten = rewrite(body);
+            assert!(
+                rewritten.contains(expected_fragment),
+                "expected {rewritten:?} to contain {expected_fragment:?}"
+            );
+        }
+    }
+
+    /// The table slot, the positional column slot and `column => ...` name
+    /// a table or column, so a function argument with the same name must
+    /// not replace them.
+    #[test]
+    fn leaves_table_and_column_arguments_untouched() {
+        let cases = [
+            (
+                "SELECT * FROM text_search(docs, q, text, k)",
+                "(docs, 'hybrid search', text, 5)",
+            ),
+            (
+                "SELECT * FROM text_search(docs, q, column => text, limit => k)",
+                "text_search(docs, 'hybrid search', column => text, limit => 5)",
+            ),
+            (
+                "SELECT * FROM text_search(text, q)",
+                "text_search(text, 'hybrid search')",
+            ),
+            (
+                "SELECT * FROM vector_search(docs, q, text)",
+                "vector_search(docs, 'hybrid search', text)",
+            ),
+        ];
+
+        for (body, expected_fragment) in cases {
+            let rewritten = rewrite(body);
+            assert!(
+                rewritten.contains(expected_fragment),
+                "expected {rewritten:?} to contain {expected_fragment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_unknown_identifiers_and_non_search_arguments_untouched() {
+        let rewritten =
+            rewrite("SELECT k FROM text_search(docs, q, limit => other) WHERE _score > w");
+        assert!(rewritten.contains("text_search(docs, 'hybrid search', limit => other)"));
+        assert!(rewritten.contains("SELECT k FROM"));
+        assert!(rewritten.contains("_score > w"));
+    }
+
+    #[test]
+    fn sql_literal_maps_scalars_to_typed_literals() {
+        assert_eq!(
+            SqlLiteral::from_scalar(&ScalarValue::UInt64(Some(u64::MAX))),
+            Some(SqlLiteral::Integer(i128::from(u64::MAX)))
+        );
+        assert_eq!(
+            SqlLiteral::from_scalar(&ScalarValue::Utf8View(Some("x".to_string()))),
+            Some(SqlLiteral::String("x".to_string()))
+        );
+        assert_eq!(
+            SqlLiteral::from_scalar(&ScalarValue::Boolean(None)),
+            Some(SqlLiteral::Null)
+        );
+        assert_eq!(
+            SqlLiteral::from_scalar(&ScalarValue::Float64(Some(f64::NAN))),
+            None
+        );
+        assert_eq!(SqlLiteral::Float(0.5).into_arg_expr().to_string(), "0.5");
+        assert_eq!(SqlLiteral::Integer(-3).into_arg_expr().to_string(), "-3");
     }
 
     #[test]
