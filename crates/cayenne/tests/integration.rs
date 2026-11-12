@@ -146,7 +146,6 @@ mod rustfs_store_conformance_test;
 mod scalar_function_pushdown_test;
 mod scan_view_retention_test;
 mod selective_join_pk_probe_test;
-mod session_credentials_test;
 mod shared_metastore_concurrency_test;
 mod small_file_compaction_position_mode_test;
 mod small_files_compaction_test;

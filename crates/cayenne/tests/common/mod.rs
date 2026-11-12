@@ -380,7 +380,7 @@ impl FixtureDataStore {
         else {
             return Err(format!(
                 "CAYENNE_TEST_DATA_STORE is 'rustfs', but {} {} not set. Start RustFS, create a bucket, and set them; \
-                 .github/workflows/cayenne_data_store.yml shows how",
+                 .github/workflows/cayenne_object_native.yml shows how",
                 unset.join(", "),
                 if unset.len() == 1 { "is" } else { "are" }
             )
@@ -543,17 +543,6 @@ impl TestFixture {
             backend_type: backend,
             data_store,
         })
-    }
-
-    /// This fixture's test on local data files: a SQLite fixture as it is, and in
-    /// place of an object-native one a new SQLite fixture, since local data files
-    /// pair with the SQLite metastore. For a test of behavior only a local table
-    /// has.
-    pub async fn on_local_store(self) -> Result<Self, Box<dyn std::error::Error>> {
-        match self.backend_type {
-            BackendType::Sqlite => Ok(self),
-            BackendType::ObjectNative => Self::new(BackendType::Sqlite).await,
-        }
     }
 
     /// Get the database path for SQLite-specific verification

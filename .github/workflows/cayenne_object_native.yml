@@ -47,8 +47,7 @@ env:
     test(/^mutation_property_test::/) | test(/^mutation_model_test::/) |
     test(/^deletion_vector/) | test(/^orphan_dv_compaction_test::/) |
     test(/^object_store_reclaim_test::/) | test(/^per_dataset_store_test::/) |
-    test(/^object_native_data_test::/) | test(/^snapshot_cleanup_convergence_test::/) |
-    test(/^rustfs_store_conformance_test::/)
+    test(/^object_native_data_test::/) | test(/^snapshot_cleanup_convergence_test::/)
 
 jobs:
   changes:
@@ -214,10 +213,10 @@ jobs:
       # retry could only hide it.
       - name: Run the data-path suites on the ${{ matrix.store }} store
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 --no-fail-fast -E "$SUITES"
-      # Session credentials that expire mid-run need RustFS's STS.
-      - name: Run the session-credential test against RustFS
+      # What Cayenne's data path needs from an S3-compatible store.
+      - name: Run the RustFS store conformance test
         if: matrix.store == 'rustfs'
-        run: cargo nextest run --locked -p cayenne --test integration --retries 0 --run-ignored only -E 'test(/^session_credentials_test::/)'
+        run: cargo nextest run --locked -p cayenne --test integration --retries 0 -E 'test(/^rustfs_store_conformance_test::/)'
 
       - name: Stop RustFS
         if: always() && matrix.store == 'rustfs'

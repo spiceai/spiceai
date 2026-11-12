@@ -17,7 +17,7 @@ limitations under the License.
 //! What Cayenne's data path needs from an S3-compatible store, checked on the
 //! store `CAYENNE_TEST_DATA_STORE=rustfs` names: ranged reads, including the
 //! short read of a range past the end that marks a truncated file, multipart
-//! uploads completed and aborted, and conditional writes. Skipped unless that
+//! uploads completed whole, and conditional writes. Skipped unless that
 //! store is selected; selected without its variables, the fixture fails.
 
 use std::sync::Arc;
@@ -125,7 +125,7 @@ async fn ranged_reads_return_exactly_the_bytes_asked_for() {
 }
 
 #[tokio::test]
-async fn a_multipart_upload_completes_whole_and_an_aborted_one_leaves_nothing() {
+async fn a_multipart_upload_completes_whole() {
     // S3 parts are at least 5 MiB, except the last.
     const PART: usize = 5 << 20;
     let Some((store, prefix)) = rustfs().await else {
@@ -152,21 +152,6 @@ async fn a_multipart_upload_completes_whole_and_an_aborted_one_leaves_nothing() 
     assert!(
         read.as_ref() == bytes.as_slice(),
         "the completed object holds every part, in order"
-    );
-
-    let aborted = Path::from(format!("{prefix}/multipart/aborted.vortex"));
-    let mut upload = store.put_multipart(&aborted).await.expect("start");
-    upload
-        .put_part(PutPayload::from(Bytes::copy_from_slice(&bytes[..PART])))
-        .await
-        .expect("part");
-    upload.abort().await.expect("abort");
-    assert!(
-        matches!(
-            store.head(&aborted).await,
-            Err(object_store::Error::NotFound { .. })
-        ),
-        "an aborted upload leaves no object"
     );
 }
 

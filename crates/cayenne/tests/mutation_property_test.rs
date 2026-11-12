@@ -1116,16 +1116,17 @@ async fn run_concurrent(
 }
 
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
-    let fixture = if matches!(w.mode, Mode::AutoCrossing) || w.cold {
-        // A table in an object store starts on key deletes (its storage class
-        // tunes it so), so the crossing from position deletes exists only for a
-        // table on a local directory. The runtime never places a dataset with a
-        // datalake tier in the object-native location, so a cold walk runs on
-        // local data files too.
-        fixture.on_local_store().await?
-    } else {
-        fixture
-    };
+    // `auto` adapts only a table on a local directory: a table whose data files
+    // are in an object store, a local-directory location included, stays on key
+    // deletes (`resolve_pk_deletion_mode`), so the crossing from position deletes
+    // exists only on the SQLite metastore's local files. The runtime never places
+    // a dataset with a datalake tier in the object-native location, so a cold walk
+    // runs on local data files too. Those tests run on SQLite only.
+    assert!(
+        matches!(fixture.backend_type, BackendType::Sqlite)
+            || !(matches!(w.mode, Mode::AutoCrossing) || w.cold),
+        "AutoCrossing and cold walks need local data files: register the test on SQLite"
+    );
     let mut seeds_that_left_positions = 0usize;
     for seed in 0..w.seeds {
         let mut history = Vec::new();
@@ -1477,8 +1478,6 @@ async fn prop_auto_crossing_observes_position_then_key_switch_impl(
 ) -> TestResult<()> {
     // `AutoCrossing`'s bound: its 1 MiB target file size / 32.
     const BOUND: u64 = 32 * 1024;
-    // Only a table on a local directory starts on position deletes; see `run_workload`.
-    let f = f.on_local_store().await?;
     let name = "auto_crossing_mode_switch";
     let (table, _ctx) =
         create_table(&f, name, Mode::AutoCrossing, Durability::File, None, false).await?;
@@ -1541,7 +1540,9 @@ async fn prop_auto_crossing_observes_position_then_key_switch_impl(
     );
     Ok(())
 }
-test_on_data_store!(prop_auto_crossing_observes_position_then_key_switch_impl);
+// SQLite only: only a table on a local directory starts on position deletes; see
+// `run_workload`.
+test_with_backends!(prop_auto_crossing_observes_position_then_key_switch_impl);
 
 // --- Sequential convergence (GREEN) ---
 async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
@@ -1559,7 +1560,7 @@ async fn prop_sequential_auto_crossing_impl(f: TestFixture) -> TestResult<()> {
 test_on_data_store!(prop_sequential_key_impl);
 test_on_data_store!(prop_sequential_position_impl);
 test_on_data_store!(prop_sequential_auto_impl);
-test_on_data_store!(prop_sequential_auto_crossing_impl);
+test_with_backends!(prop_sequential_auto_crossing_impl);
 
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
 //
@@ -1678,12 +1679,12 @@ async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
 async fn prop_sequential_cold_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_cold()).await
 }
-test_on_data_store!(prop_sequential_cold_impl);
+test_with_backends!(prop_sequential_cold_impl);
 
 // Foreground promotions + restarts with a background compactor/bake loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::for_data_store(), |f| {
+    common::run_with_backend(BackendType::Sqlite, |f| {
         run_workload(f, concurrent_cold())
     })
     .await
@@ -1825,7 +1826,7 @@ async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_auto_crossing_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::for_data_store(), |f| {
+    common::run_with_backend(BackendType::Sqlite, |f| {
         run_workload(f, concurrent_mixed(Mode::AutoCrossing))
     })
     .await
@@ -1841,7 +1842,7 @@ async fn prop_concurrent_mixed_dense_auto_sqlite() -> TestResult<()> {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_mixed_dense_auto_crossing_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::for_data_store(), |f| {
+    common::run_with_backend(BackendType::Sqlite, |f| {
         run_workload(f, concurrent_mixed_dense(Mode::AutoCrossing, None))
     })
     .await
