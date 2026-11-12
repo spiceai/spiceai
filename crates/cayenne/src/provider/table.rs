@@ -52184,7 +52184,7 @@ mod tests {
     /// are live too, and its commit's live-rows delta was already folded into the
     /// count the rewrite then replaced — so `Set`ting the rewrite's count serves a
     /// number short by that snapshot's rows as `Exact`, which a distributed
-    /// `COUNT(*)` folds. Found by `prop_concurrent_mixed_key_sqlite`, which served
+    /// `COUNT(*)` folds. Found by `prop_concurrent_mixed_key`, which served
     /// `Exact(15)` with 16 rows live.
     ///
     /// Driven in key mode, where an insert can publish inside the window. A

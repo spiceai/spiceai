@@ -1659,7 +1659,7 @@ test_on_data_store!(durable_upsert_after_mem_tier_checkpoint_impl);
 test_on_data_store!(mem_tier_checkpoint_after_durable_upsert_impl);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
+async fn prop_concurrent_memory() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_memory())
     })
@@ -1720,7 +1720,7 @@ test_on_data_store!(reupsert_after_overwrite_delete_is_visible_impl);
 
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_upsert_only_key_sqlite() -> TestResult<()> {
+async fn prop_concurrent_upsert_only_key() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Key))
     })
@@ -1728,7 +1728,7 @@ async fn prop_concurrent_upsert_only_key_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_upsert_only_position_sqlite() -> TestResult<()> {
+async fn prop_concurrent_upsert_only_position() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Position))
     })
@@ -1748,7 +1748,7 @@ async fn prop_concurrent_upsert_only_position_sqlite() -> TestResult<()> {
 // by publishing every deletion-index update through `ArcSwap::rcu` (no lost
 // updates), so these now converge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_key_sqlite() -> TestResult<()> {
+async fn prop_concurrent_mixed_key() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Key))
     })
@@ -1756,7 +1756,7 @@ async fn prop_concurrent_mixed_key_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
+async fn prop_concurrent_mixed_position() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Position))
     })
@@ -1770,7 +1770,7 @@ async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
 // over-budget bloom existence filter (`pk_keyset_cache_mb = Some(0)`), since the
 // re-insert-over-tombstone handling differs between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_key_sqlite() -> TestResult<()> {
+async fn prop_concurrent_mixed_dense_key() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Key, None))
     })
@@ -1778,7 +1778,7 @@ async fn prop_concurrent_mixed_dense_key_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_position_sqlite() -> TestResult<()> {
+async fn prop_concurrent_mixed_dense_position() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Position, None))
     })
@@ -1787,7 +1787,7 @@ async fn prop_concurrent_mixed_dense_position_sqlite() -> TestResult<()> {
 }
 // Same dense stress, but forcing the bloom existence-filter conflict path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_bloom_key_sqlite() -> TestResult<()> {
+async fn prop_concurrent_mixed_dense_bloom_key() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Key, Some(0)))
     })
@@ -1795,7 +1795,7 @@ async fn prop_concurrent_mixed_dense_bloom_key_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
+async fn prop_concurrent_mixed_dense_bloom_position() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Position, Some(0)))
     })
@@ -1807,7 +1807,7 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
 // reclaims that run alongside the writers, and (crossing) the switch to key
 // deletes under them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
+async fn prop_concurrent_upsert_only_auto() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Auto))
     })
@@ -1815,7 +1815,7 @@ async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
+async fn prop_concurrent_mixed_auto() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Auto))
     })
@@ -1831,7 +1831,7 @@ async fn prop_concurrent_mixed_auto_crossing_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_auto_sqlite() -> TestResult<()> {
+async fn prop_concurrent_mixed_dense_auto() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Auto, None))
     })
@@ -1847,7 +1847,7 @@ async fn prop_concurrent_mixed_dense_auto_crossing_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_bloom_auto_sqlite() -> TestResult<()> {
+async fn prop_concurrent_mixed_dense_bloom_auto() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Auto, Some(0)))
     })
@@ -1941,7 +1941,7 @@ async fn run_concurrent_reads_mode(fixture: &TestFixture, mode: Mode) -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestResult<()> {
+async fn prop_concurrent_reads_observe_consistent_snapshot_key() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Key).await
     })
@@ -1949,7 +1949,7 @@ async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestR
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> TestResult<()> {
+async fn prop_concurrent_reads_observe_consistent_snapshot_position() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Position).await
     })
@@ -1957,7 +1957,7 @@ async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> 
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_reads_observe_consistent_snapshot_auto_sqlite() -> TestResult<()> {
+async fn prop_concurrent_reads_observe_consistent_snapshot_auto() -> TestResult<()> {
     common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Auto).await
     })

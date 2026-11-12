@@ -616,13 +616,13 @@ macro_rules! test_with_backends {
 /// Run a test whose tables keep their data files where `fixture.data_store`
 /// says on [`BackendType::for_data_store`]: on the SQLite backend with the local
 /// store, and on the object-native backend with any other. The generated test
-/// keeps the `_sqlite` name of its local run.
+/// is named `<test_fn>_on_data_store`, since its backend follows the store.
 #[macro_export]
 macro_rules! test_on_data_store {
     ($test_fn:ident) => {
         paste::paste! {
             #[test]
-            fn [<$test_fn _sqlite>]() -> Result<(), String> {
+            fn [<$test_fn _on_data_store>]() -> Result<(), String> {
                 common::run_with_backend_blocking(common::BackendType::for_data_store(), $test_fn)
             }
         }
