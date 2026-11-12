@@ -41,12 +41,12 @@ initial_index=0. Walks use seed 42, count 20, max_steps 40.
 | source-positions | 3 | 20 | 0 |
 | commits-no-persist / commits | 6 | 0 | 2 |
 | window-no-exists / window | 5 | 0 | 3 |
-| window-gc-early / window | 5 | 0 | 1 |
+| window-gc-early / window | 4 | 0 | 1 |
 | source-ack-early / source-positions | 7 | 0 | 4 |
 | source-no-skip / source-positions | 6 | 0 | 4 |
 | source-position-before-data / source-positions | 4 | 0 | 2 |
 
-The window set holds 26 Gc, 11 Query, 16 Tick and 6 Restart actions.
+The window set holds 29 Gc, 11 Query, 17 Tick and 6 Restart actions.
 
 Control tests select FAIL witnesses for the named invariant: I2 for persistence
 and early acknowledgement, I4 for batch existence, I7 for a collection that
@@ -142,7 +142,9 @@ the head log. The replay prints a `CUTS` line for each trace (`--no-capture`).
 For the witness of a collection that deletes while a reader of an older head is
 within its retention, the collector must have deleted at least one object while
 that reader waited at the read gate (a `READER` line), and the reader must then
-return its original snapshot exactly.
+return its original snapshot exactly. For the witness of a collector restarted
+after losing a floor stamp, the new collector must delete at least one object
+(a `RESTART` line).
 
 After every positive window trace the batch objects (`wal/`, by first commit)
 and checkpoint objects in storage must also equal those the model's collector

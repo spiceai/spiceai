@@ -146,6 +146,8 @@ struct Replay {
     collected: usize,
     /// Objects the collector deleted while a query waited at the read gate.
     collected_while_reading: usize,
+    /// Objects a collector started by `Restart` deleted.
+    collected_after_restart: Option<usize>,
 }
 impl Replay {
     fn object_store(&self) -> Arc<dyn ObjectStore> {
@@ -215,6 +217,7 @@ impl Replay {
             query: None,
             collected: 0,
             collected_while_reading: 0,
+            collected_after_restart: None,
         }
     }
     fn collector(store: Arc<FaultStore>, control: Control) -> Collector {
@@ -909,6 +912,9 @@ impl Replay {
                     if self.query.is_some() {
                         self.collected_while_reading += collected.deleted;
                     }
+                    if let Some(after) = &mut self.collected_after_restart {
+                        *after += collected.deleted;
+                    }
                 }
             }
             "Query" => self.start_query().await?,
@@ -918,7 +924,10 @@ impl Replay {
                 self.finish_query().await?;
                 self.store.advance_clock(RETENTION);
             }
-            "Restart" => self.collector = Self::collector(Arc::clone(&self.store), self.control),
+            "Restart" => {
+                self.collector = Self::collector(Arc::clone(&self.store), self.control);
+                self.collected_after_restart = Some(0);
+            }
             other => return Err(format!("unmapped window action {other}")),
         }
         Ok(())
@@ -1018,6 +1027,21 @@ async fn replay(
             "READER backend={} deleted_while_reading={}",
             if local { "durable-local" } else { "memory" },
             replay.collected_while_reading
+        );
+    }
+    if trace.property == "collector restarted after losing a stamp collects" {
+        // The restarted collector, which knows none of the stamps the old one
+        // held, must still delete below the floor once it is due again.
+        let deleted = replay.collected_after_restart.unwrap_or(0);
+        require(deleted > 0, || {
+            format!(
+                "trace={} {:?} expected objects deleted after the restart; actual none",
+                trace.run, trace.property
+            )
+        })?;
+        println!(
+            "RESTART backend={} deleted_after_restart={deleted}",
+            if local { "durable-local" } else { "memory" }
         );
     }
     if window && trace.status != "FAIL" {

@@ -2824,7 +2824,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             "batches and a checkpoint collected"
                 | "collection deletes while a reader of an older head is within retention"
                 | "expired reader of an older head finds an object collected"
-                | "restarted collector collects"
+                | "collector restarted after losing a stamp collects"
         );
     window_required
         || intent_required

@@ -8,7 +8,7 @@ use stateright::{Model, Property};
 /// retention.
 const LAST_TIME: u8 = 2;
 const MAX_CHECKPOINTS: u8 = 2;
-const MAX_GCS: u8 = 3;
+const MAX_GCS: u8 = 5;
 
 /// Deletion below the floor, as the head log's collector does it. Its clock
 /// is the head's store time, which moves only when the head is written, so a
@@ -57,6 +57,8 @@ pub struct State {
     /// The floor the collector last deleted below.
     collected: usize,
     restarted: bool,
+    /// The restart discarded at least one floor stamp.
+    restart_lost_stamp: bool,
     root_collected: bool,
     collected_after_restart: bool,
     /// A collection deleted objects while a reader of an older head was
@@ -126,6 +128,7 @@ impl Model for Protocol {
             retired: vec![],
             collected: 0,
             restarted: false,
+            restart_lost_stamp: false,
             root_collected: false,
             collected_after_restart: false,
             gc_during_query: false,
@@ -195,6 +198,7 @@ impl Model for Protocol {
             }
             Action::Tick => next.time += 1,
             Action::Restart => {
+                next.restart_lost_stamp = next.retired.iter().any(|(_, _, s)| s.is_some());
                 next.retired.clear();
                 next.collected = 0;
                 next.restarted = true;
@@ -260,9 +264,10 @@ impl Model for Protocol {
                         && state.read_query().is_none()
                 },
             ),
-            Property::sometimes("restarted collector collects", |_, state: &State| {
-                state.collected_after_restart
-            }),
+            Property::sometimes(
+                "collector restarted after losing a stamp collects",
+                |_, state: &State| state.collected_after_restart,
+            ),
         ]
     }
 }
@@ -313,7 +318,7 @@ impl Protocol {
         // The witnesses below need objects actually deleted, not a floor that
         // merely came due with nothing under it.
         let deleted = !doomed.is_empty() || next.roots.len() < before;
-        next.collected_after_restart |= deleted && next.restarted;
+        next.collected_after_restart |= deleted && next.restart_lost_stamp;
         next.gc_during_query |= deleted
             && next
                 .query
