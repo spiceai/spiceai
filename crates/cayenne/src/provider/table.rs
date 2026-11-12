@@ -1268,6 +1268,10 @@ pub(crate) struct CapturedSnapshotFiles {
     dir_generation: u64,
     listing_epoch: u64,
     files: Arc<Vec<PartitionedFile>>,
+    /// Whether `files` is the snapshot's whole file set. Only a whole one may
+    /// become [`CayenneTableProvider::cached_snapshot_listing`], which every
+    /// later scan of the snapshot plans from.
+    whole_snapshot: bool,
     /// These files with their statistics, built once for every scan that shares
     /// this capture — every scan of one [`ScanView`] — instead of once per scan.
     /// See [`CayenneTableProvider::snapshot_files_with_stats`].
@@ -1275,12 +1279,24 @@ pub(crate) struct CapturedSnapshotFiles {
 }
 
 impl CapturedSnapshotFiles {
+    /// The whole file set of a snapshot.
     fn new(dir_generation: u64, listing_epoch: u64, files: Arc<Vec<PartitionedFile>>) -> Self {
         Self {
             dir_generation,
             listing_epoch,
             files,
+            whole_snapshot: true,
             with_statistics: Arc::default(),
+        }
+    }
+
+    /// Some of a snapshot's files, such as the ones a compaction picked to
+    /// merge: a scan of them reads only them, and no other scan reuses their
+    /// listing as the snapshot's.
+    fn subset(dir_generation: u64, listing_epoch: u64, files: Arc<Vec<PartitionedFile>>) -> Self {
+        Self {
+            whole_snapshot: false,
+            ..Self::new(dir_generation, listing_epoch, files)
         }
     }
 }
@@ -9455,7 +9471,8 @@ impl CayenneTableProvider {
     /// Whether `id`'s files are directly under the table's directory: a snapshot
     /// of a table whose data is in the object-native location.
     fn is_flat(table_path: &str, id: &str) -> bool {
-        crate::metastore_layout::is_object_native_data_path(table_path) && !Self::is_reserved_dir(id)
+        crate::metastore_layout::is_object_native_data_path(table_path)
+            && !Self::is_reserved_dir(id)
     }
 
     /// Whether the cleanup a commit schedules takes the snapshots it reclaims
@@ -24716,7 +24733,7 @@ impl CayenneTableProvider {
             .map_err(|source| Error::DataFusion { source })?;
         let files = Self::manifest_files_as_partitioned_files(url.prefix(), picked_rows);
         Ok((
-            CapturedSnapshotFiles::new(
+            CapturedSnapshotFiles::subset(
                 self.current_dir_generation.load(Ordering::Acquire),
                 self.listing_cache_epoch.load(Ordering::Acquire),
                 Arc::new(files),
@@ -44347,11 +44364,11 @@ impl CayenneTableProvider {
             let shared = captured
                 .with_statistics
                 .get_or_try_init(|| async {
-                    let (files, stored) = self
+                    let (files, current) = self
                         .build_snapshot_files_with_stats(request, true, dir_generation)
                         .await
                         .map_err(SharedListingError::Failed)?;
-                    if stored {
+                    if current {
                         Ok(SnapshotFilesWithStatistics {
                             statistics_schema: Arc::clone(&request.file_statistics_schema),
                             files,
@@ -44391,8 +44408,11 @@ impl CayenneTableProvider {
     /// memory instead of re-LISTing, and so a new view of the same snapshot —
     /// which CDC writes mint without changing its files — starts from it.
     ///
-    /// Also returns whether the listing is the slot's: a hit, or a build that
-    /// was stored because no generation or epoch change overtook it.
+    /// Also returns whether the listing is still current: a hit, or a build
+    /// that no generation or epoch change overtook. Such a build is stored in
+    /// the slot unless it lists a [`CapturedSnapshotFiles::subset`], which is
+    /// not the snapshot's file set: a scan that planned from it would miss
+    /// every file the subset leaves out.
     async fn build_snapshot_files_with_stats(
         &self,
         request: &SnapshotScanListingRequest<'_>,
@@ -44475,26 +44495,31 @@ impl CayenneTableProvider {
         }
         #[cfg(test)]
         self.run_test_post_snapshot_list_hook().await;
-        let mut stored = false;
+        let mut current = false;
         if collect_stats && !truncated {
             let gen_after = self.current_dir_generation.load(Ordering::Acquire);
             let epoch_after = self.listing_cache_epoch.load(Ordering::Acquire);
             if gen_after == dir_generation && epoch_after == listing_epoch {
-                self.cached_snapshot_listing
-                    .store(Some(Arc::new(CachedSnapshotListing {
-                        statistics_schema: Arc::clone(&request.file_statistics_schema),
-                        snapshot_id: request.snapshot_id.to_string(),
-                        dir_generation,
-                        listing_epoch,
-                        files: Arc::clone(&files),
-                        source_files: request
-                            .captured_files
-                            .map(|captured| Arc::clone(&captured.files)),
-                    })));
-                stored = true;
+                if request
+                    .captured_files
+                    .is_none_or(|captured| captured.whole_snapshot)
+                {
+                    self.cached_snapshot_listing
+                        .store(Some(Arc::new(CachedSnapshotListing {
+                            statistics_schema: Arc::clone(&request.file_statistics_schema),
+                            snapshot_id: request.snapshot_id.to_string(),
+                            dir_generation,
+                            listing_epoch,
+                            files: Arc::clone(&files),
+                            source_files: request
+                                .captured_files
+                                .map(|captured| Arc::clone(&captured.files)),
+                        })));
+                }
+                current = true;
             }
         }
-        Ok((files, stored))
+        Ok((files, current))
     }
 
     fn file_group_with_limit(
@@ -48883,7 +48908,11 @@ mod tests {
                 format!("{base}/table/")
             );
             let staged_write = format!("{STAGING_DIR_NAME}/write");
-            for reserved in [STAGING_DIR_NAME, staged_write.as_str(), LOOKUP_INDEX_DIR_NAME] {
+            for reserved in [
+                STAGING_DIR_NAME,
+                staged_write.as_str(),
+                LOOKUP_INDEX_DIR_NAME,
+            ] {
                 assert_eq!(
                     CayenneTableProvider::snapshot_dir_url(base, "table", reserved),
                     format!("{base}/table/{reserved}/")

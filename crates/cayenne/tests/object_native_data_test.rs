@@ -3815,6 +3815,12 @@ async fn a_subset_compaction_copies_nothing() {
         ),
         "compacted by the subset path, copies, a new snapshot, the picked files retired ({retired:?}) and the others named ({named:?}), the earlier reader's rows, rows"
     );
+    // The pass schedules a follow-up pass, which can commit after the sweep
+    // above observed the retired files and retire more. Let it finish and keep
+    // further passes off, and observe what it retired, so the retention
+    // elapsed below covers every retired file.
+    let settled = table.hold_compaction().await;
+    table.sweep_retired_files_now().await;
     table.elapse_data_file_retention();
     table.sweep_retired_files_now().await;
     assert_eq!(
@@ -3828,6 +3834,119 @@ async fn a_subset_compaction_copies_nothing() {
         count_and_sum(&ctx, "events").await,
         (6000, expected_sum(1, 6000))
     );
+    drop(settled);
+}
+
+/// A query that runs while a subset compaction is encoding reads every file of
+/// the current snapshot, not only the files the pass picked to merge: the
+/// pass's read of its picked files is not the snapshot's listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_query_during_a_subset_compaction_reads_every_file() {
+    let (setup, _catalog, table, ctx) = create_with_config(
+        "events",
+        VortexConfig {
+            compaction_trigger_files: 4,
+            target_vortex_file_size_mb: 1,
+            compaction_max_levels: 1,
+            compaction_max_files_per_pick: 4,
+            compaction_background_interval_ms: 0,
+            ..vortex_config()
+        },
+    )
+    .await;
+    let held = table.hold_compaction().await;
+    for first in (1..=6000).step_by(500) {
+        run(
+            &ctx,
+            &format!(
+                "INSERT INTO events SELECT value AS id, value * 10 AS v FROM generate_series({first}, {})",
+                first + 499
+            ),
+        )
+        .await;
+    }
+    // No query runs before the pass: a scan reuses the files it captured
+    // until the snapshot changes, so the query below lists the snapshot afresh.
+    let scanned = "SELECT count(*), coalesce(sum(v), 0) FROM events WHERE v > 0";
+    drop(held);
+
+    // Hold the pass's output upload: by then it has planned its read of the
+    // files it picked, and it has not yet published the new snapshot.
+    for op in [Op::Put, Op::MultipartComplete] {
+        let data_prefix = setup.data_prefix.clone();
+        setup.faults.arm(
+            op,
+            move |path: &Path| {
+                path.as_ref().starts_with(&data_prefix) && path.as_ref().ends_with(".vortex")
+            },
+            Fault::Hold,
+        );
+    }
+    let compaction = tokio::spawn({
+        let table = Arc::clone(&table);
+        async move { table.maybe_compact_small_files().await }
+    });
+    let upload = tokio::time::timeout(Duration::from_secs(30), setup.faults.wait_held(None))
+        .await
+        .expect("the compaction uploads its output");
+    let during = tokio::time::timeout(Duration::from_secs(30), async {
+        (
+            count_and_sum(&ctx, "events").await,
+            count_and_sum_of(&ctx, scanned).await,
+        )
+    })
+    .await
+    .expect("a query does not wait for the compaction");
+    setup.faults.clear_rules();
+    setup
+        .faults
+        .deliver(upload)
+        .await
+        .expect("deliver the upload");
+    setup.faults.respond(upload).expect("release the upload");
+    let compacted = compaction.await.expect("compaction task").expect("compact");
+    let after = (
+        count_and_sum(&ctx, "events").await,
+        count_and_sum_of(&ctx, scanned).await,
+    );
+
+    let all = (6000, expected_sum(1, 6000));
+    assert_eq!(
+        (
+            during,
+            compacted,
+            table.last_small_file_compact_path(),
+            after
+        ),
+        (
+            (all, all),
+            true,
+            cayenne::LastSmallFileCompactPath::Subset,
+            (all, all),
+        ),
+        "rows during and after the subset compaction"
+    );
+}
+
+/// `count(*)` and `sum(v)` of the single row `sql` returns.
+async fn count_and_sum_of(ctx: &SessionContext, sql: &str) -> (i64, i64) {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("execute");
+    let batch = &batches[0];
+    let value = |index: usize| {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("an Int64 column")
+            .value(0)
+    };
+    (value(0), value(1))
 }
 
 /// A write or a maintenance pass of a placed table that the fault test fails
