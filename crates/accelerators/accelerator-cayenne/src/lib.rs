@@ -1726,6 +1726,12 @@ async fn catalog_directly_inside(
 /// Async equivalent of [`Path::exists`]: `true` only when the path is present.
 /// I/O errors (including permission denied) are `false`, matching `Path::exists`,
 /// so converting the accelerator's existence gates does not change who proceeds.
+/// The local directory recording that this metadata directory's instance has used
+/// the object-native catalog in the state location.
+fn native_marker_dir(metadata_dir: &str) -> PathBuf {
+    Path::new(metadata_dir).join("object_native")
+}
+
 async fn path_exists(path: impl AsRef<Path>) -> bool {
     matches!(tokio::fs::try_exists(path).await, Ok(true))
 }
@@ -3214,7 +3220,8 @@ impl CayenneAccelerator {
         }
         // Whatever the flag, a table the object-native catalog holds stays there: with the
         // flag off it is refused rather than opened on SQLite, which may hold an older
-        // copy. The catalog is in the state location, so this reads its head there.
+        // copy. With the flag off, the state location is read only on an instance that
+        // has used the catalog.
         let in_native = self
             .existing_native_catalog_holds(metadata_dir, source, &table_name)
             .await?;
@@ -3299,7 +3306,7 @@ impl CayenneAccelerator {
 
         if metastore_type == "object_native" {
             // The catalog in the state location is checked when it is opened.
-            let catalog = Self::init_object_native_catalog(&self.native_catalog, source)
+            let catalog = Self::init_object_native_catalog(&self.native_catalog, metadata_dir, source)
                 .await
                 .map_err(|source| CheckpointError::Store {
                     source: Box::new(source),
@@ -3497,7 +3504,7 @@ impl CayenneAccelerator {
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let connection_string = match metastore_type {
             "object_native" => {
-                return Self::init_object_native_catalog(&self.native_catalog, source)
+                return Self::init_object_native_catalog(&self.native_catalog, metadata_dir, source)
                     .await
                     .map(|catalog| catalog as Arc<dyn cayenne::MetadataCatalog>);
             }
@@ -3674,6 +3681,13 @@ impl CayenneAccelerator {
         table_name: &str,
     ) -> Result<bool> {
         if self.native_catalog.get().is_none() {
+            // With the flag off, only an instance that has opened the object-native
+            // catalog (its local marker) asks the state location; any other flag-off
+            // dataset is decided by one local check and never reads the location.
+            let vnext = Self::vnext_enabled(source)? && self.cluster_role.is_none();
+            if !vnext && !path_exists(native_marker_dir(metadata_dir)).await {
+                return Ok(false);
+            }
             let location = effective_state_location(&source.app())?;
             let (store, prefix) = runtime_state_location::build_unmetered_object_store(
                 source.secrets(),
@@ -3708,11 +3722,13 @@ impl CayenneAccelerator {
     /// when that is unset.
     async fn init_object_native_catalog(
         cell: &OnceCell<Arc<cayenne::metastore::object_native::ObjectNativeCatalog>>,
+        metadata_dir: &str,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<cayenne::metastore::object_native::ObjectNativeCatalog>> {
         let location = effective_state_location(&source.app())?;
+        let location_url = location.location.clone();
         let secrets = source.secrets();
-        cell.get_or_try_init(move || async move {
+        let catalog = cell.get_or_try_init(move || async move {
             // One client for the location; the logs' requests and the data files'
             // are measured apart.
             let (store, prefix) = runtime_state_location::build_unmetered_object_store(
@@ -3752,7 +3768,22 @@ impl CayenneAccelerator {
             Ok::<_, Error>(catalog)
         })
         .await
-        .map(Arc::clone)
+        .map(Arc::clone)?;
+        // A local record that this instance uses the catalog in the state location, so
+        // a start with `cayenne_vnext` disabled finds it on local disk and reads the
+        // state location only then.
+        let marker = native_marker_dir(metadata_dir);
+        if !path_exists(marker.join("state_location")).await {
+            tokio::fs::create_dir_all(&marker)
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?;
+            tokio::fs::write(marker.join("state_location"), &location_url)
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?;
+        }
+        Ok(catalog)
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
@@ -7372,8 +7403,15 @@ mod tests {
             "the catalog's head log is in `.spice/data/cayenne/v1/catalog`"
         );
         assert!(
-            !directory.path().join("metadata/object_native").exists(),
+            !directory.path().join("metadata/object_native/catalog").exists(),
             "no catalog in the metadata directory"
+        );
+        assert!(
+            directory
+                .path()
+                .join("metadata/object_native/state_location")
+                .is_file(),
+            "the metadata directory records that it uses the catalog in the state location"
         );
     }
 
