@@ -3306,11 +3306,12 @@ impl CayenneAccelerator {
 
         if metastore_type == "object_native" {
             // The catalog in the state location is checked when it is opened.
-            let catalog = Self::init_object_native_catalog(&self.native_catalog, metadata_dir, source)
-                .await
-                .map_err(|source| CheckpointError::Store {
-                    source: Box::new(source),
-                })?;
+            let catalog =
+                Self::init_object_native_catalog(&self.native_catalog, metadata_dir, source)
+                    .await
+                    .map_err(|source| CheckpointError::Store {
+                        source: Box::new(source),
+                    })?;
             return Ok(Arc::new(native_sidecar::NativeSidecar::new(
                 catalog,
                 source.name().to_string(),
@@ -3504,9 +3505,13 @@ impl CayenneAccelerator {
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let connection_string = match metastore_type {
             "object_native" => {
-                return Self::init_object_native_catalog(&self.native_catalog, metadata_dir, source)
-                    .await
-                    .map(|catalog| catalog as Arc<dyn cayenne::MetadataCatalog>);
+                return Self::init_object_native_catalog(
+                    &self.native_catalog,
+                    metadata_dir,
+                    source,
+                )
+                .await
+                .map(|catalog| catalog as Arc<dyn cayenne::MetadataCatalog>);
             }
             _ => format!("sqlite://{metadata_dir}/{METASTORE_DB_FILE}"),
         };
@@ -3728,47 +3733,49 @@ impl CayenneAccelerator {
         let location = effective_state_location(&source.app())?;
         let location_url = location.location.clone();
         let secrets = source.secrets();
-        let catalog = cell.get_or_try_init(move || async move {
-            // One client for the location; the logs' requests and the data files'
-            // are measured apart.
-            let (store, prefix) = runtime_state_location::build_unmetered_object_store(
-                Arc::clone(&secrets),
-                tokio::runtime::Handle::current(),
-                &location,
-                runtime_state_location::StateFeature::CayenneMetastore,
-            )
-            .await
-            .boxed()
-            .context(AccelerationInitializationFailedSnafu)?;
-            let data_store = runtime_state_location::metrics::metered(
-                Arc::clone(&store),
-                runtime_state_location::StateFeature::CayenneData,
-            );
-            let native = cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
-                runtime_state_location::metrics::metered(
-                    store,
+        let catalog = cell
+            .get_or_try_init(move || async move {
+                // One client for the location; the logs' requests and the data files'
+                // are measured apart.
+                let (store, prefix) = runtime_state_location::build_unmetered_object_store(
+                    Arc::clone(&secrets),
+                    tokio::runtime::Handle::current(),
+                    &location,
                     runtime_state_location::StateFeature::CayenneMetastore,
-                ),
-                object_store::path::Path::from(prefix)
-                    .join("v1")
-                    .join("catalog"),
-                &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
-            )
-            .await
-            .map(|native| native.with_data_store(data_store));
-            let catalog = Arc::new(
-                native
-                    .boxed()
-                    .context(AccelerationInitializationFailedSnafu)?,
-            );
-            cayenne::MetadataCatalog::init(catalog.as_ref())
+                )
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
-            Ok::<_, Error>(catalog)
-        })
-        .await
-        .map(Arc::clone)?;
+                let data_store = runtime_state_location::metrics::metered(
+                    Arc::clone(&store),
+                    runtime_state_location::StateFeature::CayenneData,
+                );
+                let native =
+                    cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
+                        runtime_state_location::metrics::metered(
+                            store,
+                            runtime_state_location::StateFeature::CayenneMetastore,
+                        ),
+                        object_store::path::Path::from(prefix)
+                            .join("v1")
+                            .join("catalog"),
+                        &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
+                    )
+                    .await
+                    .map(|native| native.with_data_store(data_store));
+                let catalog = Arc::new(
+                    native
+                        .boxed()
+                        .context(AccelerationInitializationFailedSnafu)?,
+                );
+                cayenne::MetadataCatalog::init(catalog.as_ref())
+                    .await
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
+                Ok::<_, Error>(catalog)
+            })
+            .await
+            .map(Arc::clone)?;
         // A local record that this instance uses the catalog in the state location, so
         // a start with `cayenne_vnext` disabled finds it on local disk and reads the
         // state location only then.
@@ -7403,7 +7410,10 @@ mod tests {
             "the catalog's head log is in `.spice/data/cayenne/v1/catalog`"
         );
         assert!(
-            !directory.path().join("metadata/object_native/catalog").exists(),
+            !directory
+                .path()
+                .join("metadata/object_native/catalog")
+                .exists(),
             "no catalog in the metadata directory"
         );
         assert!(
