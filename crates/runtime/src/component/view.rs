@@ -159,9 +159,6 @@ impl AccelerationSource for View {
 
     fn is_file_accelerated(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
-            if acceleration.engine == acceleration::Engine::PostgreSQL {
-                return false;
-            }
             return acceleration.enabled
                 && matches!(
                     acceleration.mode,

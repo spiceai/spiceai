@@ -335,7 +335,7 @@ When upgrading, ensure all these tests pass. If adding a new patch to a fork, ad
 
 | Patch/Feature            | Test Location                                          | What It Verifies                      |
 | ------------------------ | ------------------------------------------------------ | ------------------------------------- |
-| Federated query pushdown | `crates/runtime/tests/acceleration/query_push_down.rs` | Queries pushed to source databases    |
+| Federated query pushdown | `crates/runtime/tests/pushdown_roundtrip/`              | Queries pushed to source databases    |
 | Multi-source federation  | Various connector tests                                | Joining across different data sources |
 
 ### DataFusion Table Providers (`datafusion-contrib/datafusion-table-providers`)

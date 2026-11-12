@@ -222,8 +222,7 @@ jobs:
       cancel-in-progress: false
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
-      # Internal builds include PostgreSQL acceleration for benchmarks; release builds omit it.
-      SPICED_FEATURES: ${{ matrix.target.is_release && 'release,models' || 'release,models,postgres-accel' }}
+      SPICED_FEATURES: release,models
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true

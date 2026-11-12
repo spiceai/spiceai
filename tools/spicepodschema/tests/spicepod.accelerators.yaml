@@ -54,28 +54,6 @@ datasets:
         file_watcher: "true"
 
   # ===========================================================================
-  # PostgreSQL Accelerator
-  # Runtime params: file_watcher, connection_pool_size
-  # ===========================================================================
-  - name: accel_postgres
-    from: duckdb:source.parquet
-    params:
-      duckdb_open: data/source.db
-    acceleration:
-      enabled: true
-      engine: postgres
-      refresh_mode: full
-      params:
-        pg_host: localhost
-        pg_port: "5432"
-        pg_db: accel_db
-        pg_user: postgres
-        pg_pass: secret
-        pg_connection_pool_min_idle: "2"
-        file_watcher: "false"
-        connection_pool_size: "15"
-
-  # ===========================================================================
   # Cayenne Accelerator (if enabled)
   # Runtime params: file_watcher
   # ===========================================================================

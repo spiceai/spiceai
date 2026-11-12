@@ -8,7 +8,8 @@ description: >
   beside them serves. A Cayenne dataset that still names the retired Turso
   metastore loads on the SQLite metastore it shares with a healthy one, and
   is warned once to drop the param. A dataset and a view that set the removed
-  `turso` or `duckdb` acceleration engine each fail to load with one error
+  `turso`, `duckdb` or `postgres` acceleration engine (`postgresql` too) each
+  fail to load with one error
   naming the fix, and are never switched to Cayenne, while the Cayenne
   datasets beside them answer. A dataset that still selects the removed
   duckdb vector engine fails to load with one error naming the Cayenne fix,
@@ -40,9 +41,12 @@ spicepod:
     - { from: 'postgres:public.t', name: turso_param_memory, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: memory, params: { cayenne_metastore: turso } } }
     - { from: 'postgres:public.t', name: turso_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: turso } }
     - { from: 'postgres:public.t', name: duckdb_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: duckdb, mode: file } }
+    - { from: 'postgres:public.t', name: postgres_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: postgres } }
+    - { from: 'postgres:public.t', name: postgresql_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: postgresql } }
   views:
     - { name: turso_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: turso } }
     - { name: duckdb_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: duckdb } }
+    - { name: postgres_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: postgres } }
 steps:
   - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
   - start: { ready: false }
@@ -112,6 +116,23 @@ steps:
         "ERROR .*Failed to load view 'duckdb_view': the acceleration engine `duckdb` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration view=\"duckdb_view\"$": 1
         "ERROR .*duckdb_(engine|view)": 2
       lacks: ["deprecated .*duckdb_(engine|view)", "Unknown acceleration engine 'duckdb'"]
+  # The `postgres` acceleration engine is removed the same way, and its
+  # `postgresql` spelling gets the same error, naming `postgres`.
+  - query: SELECT * FROM postgres_engine
+    expect-error: postgres_engine
+  - query: SELECT * FROM postgresql_engine
+    expect-error: postgresql_engine
+  - query: SELECT * FROM postgres_view
+    expect-error: postgres_view
+  - query: SELECT * FROM healthy_cayenne
+    expect: { rows: [['1', a]] }
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 'postgres_engine': the acceleration engine `postgres` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration dataset=\"postgres_engine\"$": 1
+        "ERROR .*Failed to load dataset 'postgresql_engine': the acceleration engine `postgres` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration dataset=\"postgresql_engine\"$": 1
+        "ERROR .*Failed to load view 'postgres_view': the acceleration engine `postgres` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration view=\"postgres_view\"$": 1
+        "ERROR .*postgres(ql)?_(engine|view)": 3
+      lacks: ["deprecated .*postgres(ql)?_(engine|view)", "Unknown acceleration engine 'postgres"]
   # The duckdb vector engine is removed: the dataset that selects it fails with
   # exactly one error, and the Cayenne dataset indexes its embeddings itself.
   - query: SELECT id FROM vector_search(cayenne_vectors, 'a') ORDER BY _score DESC, id
