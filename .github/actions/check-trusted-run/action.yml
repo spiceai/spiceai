@@ -11,9 +11,10 @@ description: >-
     - triggered by push, merge_group, workflow_dispatch, schedule or release, never pull_request
       or pull_request_target;
     - built from this repository, not a fork;
-    - built from trunk, a release branch (release/X.Y, release/X.Y.Z, optionally -rc.N), a merge
-      queue branch for one of those (merge_group only), or a release tag (vX.Y.Z, optionally
-      -rc.N and -enterprise) of this repository that points at the commit the run built.
+    - built from trunk, a release branch (release/X.Y or release/X.Y.Z, optionally -rc.N or
+      -rcN), a merge queue branch gh-readonly-queue/<one of those>/pr-<number>-<sha>
+      (merge_group only), or a release tag (vX.Y.Z, optionally -rc.N or -rcN, optionally
+      -enterprise) of this repository that points at the commit the run built. Nothing else.
 
 inputs:
   run-id:
