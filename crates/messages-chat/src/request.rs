@@ -810,8 +810,9 @@ fn chat_tool(model: &str, tool: ToolParam) -> Result<(FunctionObject, bool), Mes
                 ],
                 &format!("on the tool '{name}'"),
             )?;
+            // Only an absent `defer_loading` defaults: an explicit `null` is not `true` or `false`.
             let deferred = match other.get("defer_loading") {
-                None | Some(Value::Null) => false,
+                None => false,
                 Some(Value::Bool(deferred)) => *deferred,
                 Some(value) => {
                     return Err(MessagesError::invalid_request(format!(

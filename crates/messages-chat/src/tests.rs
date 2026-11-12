@@ -437,14 +437,18 @@ fn a_tool_reference_that_cannot_be_loaded_is_refused() {
         )),
         "Model 'gpt' serves the Messages API by translating requests into chat completions, which cannot carry `citations` on a tool_reference block. Remove `citations`, or use a model with `from: anthropic`. See: https://spiceai.org/docs/components/models"
     );
-    let mut deferred = tool("WebFetch", None);
-    deferred["defer_loading"] = json!("yes");
-    assert_eq!(
-        refusal(
-            &json!({"model": "gpt", "max_tokens": 10, "tools": [deferred], "messages": [{"role": "user", "content": "hi"}]})
-        ),
-        "`defer_loading` on the tool 'WebFetch' is \"yes\", and must be `true` or `false`."
-    );
+    for (value, shown) in [(json!("yes"), "\"yes\""), (Value::Null, "null")] {
+        let mut deferred = tool("WebFetch", None);
+        deferred["defer_loading"] = value;
+        assert_eq!(
+            refusal(
+                &json!({"model": "gpt", "max_tokens": 10, "tools": [deferred], "messages": [{"role": "user", "content": "hi"}]})
+            ),
+            format!(
+                "`defer_loading` on the tool 'WebFetch' is {shown}, and must be `true` or `false`."
+            )
+        );
+    }
 }
 
 #[test]
