@@ -21,8 +21,10 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(feature = "models")]
 use llms::evaluate::Evaluate;
 use model_capabilities::FoundKind;
+#[cfg(feature = "models")]
 use runtime_rate_control::RateController;
 use runtime_secrets::Secrets;
 use secrecy::SecretString;
