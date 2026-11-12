@@ -121,8 +121,8 @@ pub async fn get_data(
         tracing::trace!("Data refresh plan for {}:\n{}", table_name, explained);
     }
 
-    // The SQL is only a task-history label. A plan the unparser cannot write as
-    // SQL (for example a LATERAL table function call) must still refresh.
+    // The SQL is only a task-history label. For a plan the unparser cannot write as
+    // SQL (for example a LATERAL table function call), do not propagate error.
     match Unparser::default().plan_to_sql(df.logical_plan()) {
         Ok(sql) => tracing::info!(target: "task_history", sql = %sql, "labels"),
         Err(e) => tracing::debug!("Refresh plan for {table_name} has no SQL form: {e}"),
