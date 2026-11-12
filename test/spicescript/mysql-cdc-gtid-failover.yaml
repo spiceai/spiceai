@@ -18,6 +18,12 @@ matrix:
   exit: [stop, kill, kill-late]
   rotate: [none, flush]
 
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod
@@ -36,8 +42,15 @@ spicepod:
 steps:
   # The replica replays the primary's whole history, CREATE DATABASE included,
   # so it starts without the instance database (dropped outside its binlog).
+  # Every instance shares the replica and runs this step at the same time, so
+  # each takes a lock on it, then stops it before reconfiguring it: MySQL
+  # refuses CHANGE REPLICATION SOURCE on a running replica. An earlier
+  # instance's replay can stop on this instance's CREATE DATABASE; the DROP
+  # below and START REPLICA then let it resume from that transaction.
   - source-exec:
       replica: |
+        DO GET_LOCK('spicescript-replica-setup', 120);
+        STOP REPLICA;
         SET GLOBAL server_id = 2;
         SET SESSION sql_log_bin = 0;
         DROP DATABASE ${sources.replica.namespace};
@@ -50,6 +63,7 @@ steps:
           SOURCE_SSL = 1,
           SOURCE_AUTO_POSITION = 1;
         START REPLICA;
+        DO RELEASE_LOCK('spicescript-replica-setup');
   - source-exec:
       primary: |
         CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(32) NOT NULL);

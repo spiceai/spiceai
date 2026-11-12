@@ -102,3 +102,137 @@ async fn conditional_writes_to_the_same_file_have_one_winner() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_to_other_directories_do_not_wait_behind_a_blocked_publication() {
+    let directory = tempfile::tempdir().expect("state directory");
+    let store = std::sync::Arc::new(
+        LocalConditionalPut::new_durable(directory.path()).expect("durable state store"),
+    );
+    // Holding the batch directory's lock blocks its publication after staging,
+    // as a slow publication would, for as long as the test keeps it.
+    let wal = directory.path().join("log").join("wal");
+    std::fs::create_dir_all(&wal).expect("batch directory");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(wal.join(".spice-occ-lock"))
+        .expect("batch directory lock");
+    held.lock().expect("hold the batch directory lock");
+    let blocked = {
+        let store = std::sync::Arc::clone(&store);
+        tokio::spawn(async move {
+            conditional_put(
+                store.as_ref(),
+                &Path::from("log/wal/00000000000000000001"),
+                Bytes::from_static(b"batch").into(),
+                &Expected::Absent,
+            )
+            .await
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::read_dir(&wal)
+        .expect("list batch directory")
+        .filter_map(Result::ok)
+        .all(|entry| !entry.file_name().to_string_lossy().contains('#'))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the blocked write never started staging"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    // Writes to many other directories, so that one queued behind the blocked
+    // publication would show, wherever directories are assigned to workers.
+    let others = (0..64).map(|index| {
+        let store = std::sync::Arc::clone(&store);
+        let path = Path::from(format!("log-{index}/head"));
+        async move {
+            let written = conditional_put(
+                store.as_ref(),
+                &path,
+                Bytes::from_static(b"head").into(),
+                &Expected::Absent,
+            );
+            (
+                path.clone(),
+                tokio::time::timeout(std::time::Duration::from_secs(60), written).await,
+            )
+        }
+    });
+    for (path, written) in futures::future::join_all(others).await {
+        written
+            .unwrap_or_else(|_| panic!("the write to {path} waited behind the blocked publication"))
+            .expect("write to another directory");
+    }
+    assert!(
+        !blocked.is_finished(),
+        "the batch published under a held lock"
+    );
+    held.unlock().expect("release the batch directory lock");
+    blocked
+        .await
+        .expect("batch task")
+        .expect("the batch publishes once its lock is free");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_waiting_on_one_directory_do_not_hold_back_another() {
+    let directory = tempfile::tempdir().expect("state directory");
+    let store = std::sync::Arc::new(
+        LocalConditionalPut::new_durable(directory.path()).expect("durable state store"),
+    );
+    let blocked_dir = directory.path().join("a");
+    std::fs::create_dir_all(&blocked_dir).expect("blocked directory");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(blocked_dir.join(".spice-occ-lock"))
+        .expect("blocked directory lock");
+    held.lock().expect("hold the blocked directory lock");
+    // More writes to the blocked directory than there are workers: one
+    // publishing under the held lock, the rest waiting behind it. Polling each
+    // once queues it, or leaves it waiting to be admitted.
+    let paths: Vec<_> = (0..12)
+        .map(|index| Path::from(format!("a/{index}")))
+        .collect();
+    let mut waiting: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            Box::pin(conditional_put(
+                store.as_ref(),
+                path,
+                Bytes::from_static(b"waiting").into(),
+                &Expected::Absent,
+            ))
+        })
+        .collect();
+    for write in &mut waiting {
+        assert!(
+            futures::poll!(write).is_pending(),
+            "a write to the blocked directory finished under its held lock"
+        );
+    }
+    let other = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        conditional_put(
+            store.as_ref(),
+            &Path::from("b/head"),
+            Bytes::from_static(b"head").into(),
+            &Expected::Absent,
+        ),
+    )
+    .await;
+    held.unlock().expect("release the blocked directory lock");
+    other
+        .expect("the write to another directory waited behind the blocked one")
+        .expect("write to another directory");
+    for write in futures::future::join_all(waiting).await {
+        write.expect("a waiting write publishes once its lock is free");
+    }
+}

@@ -83,6 +83,9 @@ async fn aws_sdk_config_allows_unauthenticated_access() {
     std::fs::write(&config_file, "").expect("write fake config file");
 
     // Preserve existing environment variables so we can restore them after the test.
+    // Every link of the credential chain reads one of these. The job that runs this test sets
+    // `AWS_ROLE_ARN` and has `id-token: write`, so with `AWS_WEB_IDENTITY_TOKEN_FILE` cleared the
+    // GitHub Actions link would otherwise sign in as that role.
     let vars_to_clear = [
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
@@ -91,6 +94,11 @@ async fn aws_sdk_config_allows_unauthenticated_access() {
         "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_CONFIG_FILE",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
         "AWS_EC2_METADATA_DISABLED",
     ];
 

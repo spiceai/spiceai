@@ -220,21 +220,6 @@ pub async fn mongo_checkpoint_store(
         .mongo_checkpoint_store()
 }
 
-/// Records that the caching engine fetched this dataset just now.
-///
-/// # Errors
-///
-/// Returns [`CheckpointError::Store`] when the sidecar cannot be resolved, or when the
-/// dataset's engine does not serve cached results.
-pub async fn update_caching_engine_fetched_at(
-    dataset: &crate::component::dataset::Dataset,
-) -> Result<(), CheckpointError> {
-    dataset_sidecar(dataset, OpenOption::OpenExisting)
-        .await?
-        .update_caching_engine_fetched_at()
-        .await
-}
-
 /// A [`DatasetCheckpointerFactory`] over `source`'s acceleration checkpoint, opened
 /// read-only.
 ///

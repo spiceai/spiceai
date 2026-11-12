@@ -486,6 +486,28 @@ impl CommitChange for MongoResumeTokenCommitter {
                 source: Box::new(error),
             })
     }
+
+    /// The same save as [`Self::commit`], for an accelerator that commits it with
+    /// the data it covers. `commit` then saves an unchanged token.
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<(), CommitError>>> {
+        let store = Arc::clone(&self.mongo_sys);
+        let metadata = MongoCheckpointMetadata {
+            resume_token_json: self.resume_token_json.clone(),
+            cluster_time_ts: self.cluster_time_ts,
+            schema_json: self.schema_json.clone(),
+            updated_at: None,
+        };
+        Some(Box::pin(async move {
+            store
+                .upsert(&metadata)
+                .await
+                .map_err(|error| CommitError::UnableToCommitChange {
+                    source: Box::new(error),
+                })
+        }))
+    }
 }
 
 async fn try_open_change_stream(
@@ -806,7 +828,7 @@ mod tests {
         );
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(primary_key),
             on_conflict,
@@ -859,7 +881,7 @@ mod tests {
     fn rejects_missing_primary_key() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             ..Default::default()
         };
@@ -875,7 +897,7 @@ mod tests {
     fn rejects_missing_upsert() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(ColumnReference::new(vec!["_id".to_string()])),
             ..Default::default()
@@ -913,7 +935,7 @@ mod tests {
         );
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(primary_key),
             on_conflict,
@@ -930,7 +952,7 @@ mod tests {
     fn rejects_composite_primary_key_before_missing_upsert() {
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(ColumnReference::new(vec![
                 "_id".to_string(),
@@ -956,7 +978,7 @@ mod tests {
         );
         let acceleration = Acceleration {
             enabled: true,
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key: Some(primary_key),
             on_conflict,

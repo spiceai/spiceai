@@ -68,6 +68,20 @@ Docker must be running. The `aws` CLI is needed for object-store sources, and
 fetch the DuckDB release they use into `~/.cache/spicescript/` (see
 **DuckDB releases** below).
 
+Under a rootless Docker daemon, every running container holds one kernel key
+charged to the daemon's uid. That uid's quota (`kernel.keys.maxkeys` and
+`kernel.keys.maxbytes`, 200 keys and 20000 bytes by default) is shared with
+everything else running as it on the host, and when it is full runc refuses
+to start a container ("unable to join session keyring … disk quota
+exceeded"). On Linux the runner reads the quota from `/proc/key-users`. Before
+a matrix combination takes its `--jobs` slots, it reserves room for every
+container it starts (its sources, and its executors when they run in
+containers), so it never holds slots while it waits for room. Every container
+start also waits for room, and a start refused for the quota is retried. A
+wait is reported in the script's output. After 15 minutes without room the
+script fails, naming the quota and the fix; time spent waiting on room that
+this run's other combinations have reserved does not count toward that.
+
 | Option | Meaning |
 | --- | --- |
 | `<SCRIPTS>…` | Script files, or directories of `*.yaml` scripts (not their subdirectories, except that `known-failing/` includes its group directories). |
@@ -222,9 +236,9 @@ A variant may name a shared variant instead of writing the patch:
 `cayenne: cayenne-file`. Shared variants are defined, each as its full patch, in
 the `variants.yaml` in the script's directory or the nearest directory above it
 ([`test/spicescript/variants.yaml`](../../test/spicescript/variants.yaml) for the
-suite): `federated` (the spicepod as written), and an engine and mode that set
-`acceleration: { enabled: true, engine, mode }` on every dataset, such as
-`cayenne-file`, `duckdb-memory` or `arrow`. A name the file does not define
+suite): `federated` (the spicepod as written), and `cayenne-file` and
+`cayenne-memory`, which set `acceleration: { enabled: true, engine: cayenne,
+mode }` on every dataset. A name the file does not define
 fails `--check`. A variant used by one script only is written in that script.
 
 `$merge: '${…}'` spreads a mapping placeholder into a mapping, with the
@@ -270,7 +284,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |
 | `assert-log: { contains, lacks, count, clean, allow }` | Check the instance's `spiced.log` with regular expressions; `count: { <pattern>: N \| '>=N' }`. |
 | `assert-files: { contains, lacks }` | Check files under the instance's directory. |
-| `assert-objects: { source, prefix, min }` | Require objects under a prefix of an object store or files source. |
+| `assert-objects: { source, prefix, contains, min, max }` | Require objects under a prefix of an object store or files source; `contains` counts only keys containing that text. `min` defaults to 1, or to 0 when `max` is given (`max: 0` requires none). |
 | `mark-metrics: <id>` | Keep a `/metrics` scrape for a later `wait-metric … since:`. |
 | `wait-metric: { name, labels, above \| below \| increases \| increased-by, since, timeout, drive }` | Wait for a series to meet a condition. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
 | `background: { id, query \| source-exec, concurrency, every, expect }` | Loop a query or a source write until `stop-background: <id>`. `expect: { column: value }` is an invariant every answer must keep. `${round}` counts iterations. |
@@ -639,7 +653,7 @@ Defaults (`defaults:`):
 - **Comparing variants:** `compare-variants: false` turns off agreement between variants; `compare-to: <variant>` compares every variant with one.
 - **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `also-async: true` also runs every query as a `/v1/queries` job (a distributed job on a cluster) and requires the same answer; `api-key`; `tls: { ca }`.
 - **Running spiced:** `spiced-args`, `executor-args`.
-- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
+- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Behind a rootless Docker daemon, whose host network is not this machine's, the executors run on the bridge network instead: their ports and the script's object store sources are published on every interface, which reaches them at this machine's routable address as well as loopback, the nodes advertise that address, and the spicepod names the sources at it. Each object store then has a secret of its own. The spicepod of such a script may name only `rustfs`, `files` and `duckdb` sources; its other sources, such as an oracle, stay on loopback, and a spicepod that names one is refused. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
 - **Scheduling:**
   - `exclusive: true` runs the script alone, its instances one after another;
   - `run-variants: side-by-side` runs variants that work together (a snapshot writer and its reader) a step at a time, as one job.
@@ -806,6 +820,7 @@ fails anywhere.
 | `source/document.rs` | Kafka, MongoDB and DynamoDB containers and batched row application. |
 | `source/` | One module per source kind; `mod.rs` holds the `Source` trait. |
 | `docker.rs` | Containers on fixed host ports, so a restarted container keeps its address. |
+| `keyquota.rs` | The kernel key quota a rootless Docker daemon's containers share: waiting for room before starting them. |
 | `ledger.rs` | Expected failures: recording, signatures, judging a run against them. |
 | `compare.rs`, `template.rs` | Answer comparison glue, placeholders and merge patches. |
 | `generate.rs`, `tpch.rs` | Seeded generated tables, TPC-H loading. |

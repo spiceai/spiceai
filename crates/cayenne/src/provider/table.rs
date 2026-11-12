@@ -77,7 +77,9 @@ use super::scan_file_statistics::{
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
-use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
+use crate::catalog::{
+    CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
+};
 use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
@@ -1688,6 +1690,12 @@ struct ScanView {
     /// bundle. Fence-serialized snapshot events (truncate / full-delete /
     /// `INSERT OVERWRITE` / reopen) bump only `scan_input_version`.
     structural_version: u64,
+    /// The capture held no rows at all: no snapshot files, no inline entries and
+    /// no visible mem-tier segments. Such a view is lag-reused only while nothing
+    /// has been published since it was captured (see
+    /// [`ScanViewCache::try_serve_latest`]). Errs towards `false`, which only
+    /// keeps the ordinary lag reuse.
+    captured_nothing: bool,
 }
 
 /// A completed, cached scan view plus its identity and ordering metadata. Held by
@@ -2105,6 +2113,15 @@ impl ScanViewCache {
                 // Zero when the view was captured at or after the request.
                 requested_at.saturating_duration_since(current.captured_at) <= lag
                     && current.view.structural_version == structural
+                    // An empty capture is reused only while nothing has been
+                    // published since. Otherwise a table's first load (a CDC
+                    // snapshot) stays invisible for up to `lag` after it lands,
+                    // and a dataset marked ready on that load answers with no
+                    // rows (#15038). Lag is an allowance for change, not for
+                    // missing the initial data; an empty view is cheap to
+                    // capture again.
+                    && (!current.view.captured_nothing
+                        || (version_before == version_after && current.order == version_after))
             }
         };
         if !servable {
@@ -10905,14 +10922,6 @@ impl CayenneTableProvider {
         Arc::clone(self.context.runtime_env())
     }
 
-    /// Downcast the metadata catalog to the concrete Cayenne catalog — the
-    /// write-back marker CRUD is a Cayenne-specific concern (not on the trait).
-    fn cayenne_catalog(&self) -> Option<&crate::CayenneCatalog> {
-        self.catalog
-            .as_any()
-            .downcast_ref::<crate::CayenneCatalog>()
-    }
-
     /// List up to `limit` undelivered write-back markers in delivery order
     /// (oldest commit first, then key) starting after `after`, or at the oldest
     /// marker when that is `None`, as `(pk_bytes, sequence_number)`.
@@ -10922,6 +10931,14 @@ impl CayenneTableProvider {
     /// encodings — feed them back to [`Self::decode_pk_keys`] /
     /// [`Self::clear_dirty_keys`].
     ///
+    /// Every marker returned belongs to a commit whose rows a scan started
+    /// afterwards reads. A commit holds the visibility lock from its durable
+    /// metastore write, which records its markers, until its rows are published
+    /// in memory, and the listing takes the same lock. Without it, a delivery
+    /// could claim a marker whose rows are not readable yet, send the key's
+    /// previous value, and clear the marker at the newer sequence, so the newer
+    /// value would never reach the source.
+    ///
     /// # Errors
     /// Propagates the underlying metastore error.
     pub async fn list_dirty_keys(
@@ -10929,9 +10946,8 @@ impl CayenneTableProvider {
         limit: usize,
         after: Option<&(i64, Vec<u8>)>,
     ) -> Result<Vec<(Vec<u8>, i64)>> {
-        let Some(catalog) = self.cayenne_catalog() else {
-            return Ok(Vec::new());
-        };
+        let _visibility = self.visibility_lock_arc().lock_owned().await;
+        let catalog = self.catalog.as_ref();
         Ok(catalog
             .list_pending_write_back(self.table_id(), limit, after)
             .await?)
@@ -10943,9 +10959,7 @@ impl CayenneTableProvider {
     /// # Errors
     /// Propagates the underlying metastore error.
     pub async fn clear_dirty_keys(&self, keys: &[(Vec<u8>, i64)]) -> Result<()> {
-        let Some(catalog) = self.cayenne_catalog() else {
-            return Ok(());
-        };
+        let catalog = self.catalog.as_ref();
         catalog
             .clear_pending_write_back(self.table_id(), keys)
             .await?;
@@ -10957,9 +10971,7 @@ impl CayenneTableProvider {
     /// # Errors
     /// Propagates the underlying metastore error.
     pub async fn dirty_key_count(&self) -> Result<i64> {
-        let Some(catalog) = self.cayenne_catalog() else {
-            return Ok(0);
-        };
+        let catalog = self.catalog.as_ref();
         Ok(catalog.pending_write_back_count(self.table_id()).await?)
     }
 
@@ -18621,7 +18633,7 @@ impl CayenneTableProvider {
             .collect())
     }
 
-    /// Durably commit one mem-tier checkpoint's deletion metadata, splitting
+    /// Durably commit one mem-tier seal or checkpoint, splitting
     /// the tier's tombstones by flushed-corpus membership:
     ///
     /// - REINSERTED keys (a visible row for the key is in the flushed corpus —
@@ -18635,19 +18647,24 @@ impl CayenneTableProvider {
     ///   on the main scan path (`InsertRecordHandling::Apply`) and resurrect
     ///   the key's older durable copies.
     ///
-    /// The groups need SEPARATE catalog commits because
-    /// `commit_on_conflict_deletions` stamps its per-commit reinsert sequence
-    /// on every key-based delete file it carries. Pure deletes commit first;
-    /// the reinsert commit carries the protected-snapshot registration
-    /// (`target_snapshot_id`, `None` for a tombstones-only flush with no data
-    /// files). A crash between the two leaves the slot un-advanced, so the
-    /// replayed tail re-commits idempotently (per-side max merge).
+    /// Both groups, the protected-snapshot registration (`target_snapshot_id`,
+    /// `None` for a tombstones-only flush with no data files), any inline
+    /// shadow rows, and the clearing of the inline rows the snapshot replaces
+    /// commit in ONE metastore transaction (`commit_mem_tier_durable`), which
+    /// stamps the reinsert sequence on the reinsert group only and leaves pure
+    /// deletes delete-only. Splitting them into separate commits lets a crash
+    /// between them persist a state no single version of the table had, such as
+    /// new row versions without the tombstones that hide the old ones, or baked
+    /// file rows alongside the inline shadows they replace: duplicate keys
+    /// after restart (#16147).
     async fn commit_mem_tier_checkpoint_metadata(
         &self,
         snapshot: &crate::provider::mem_tier::MemTier,
         target_snapshot_id: Option<&str>,
         snapshot_sequence: i64,
         corpus_keys: &CheckpointCorpusKeys,
+        inline_data: Vec<InlinedData>,
+        clear_inlined: bool,
     ) -> CatalogResult<OnConflictUpdate> {
         let mut pure_delete_files: Vec<crate::metadata::DeleteFile> = Vec::new();
         let mut reinsert_delete_files: Vec<crate::metadata::DeleteFile> = Vec::new();
@@ -18747,53 +18764,21 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::PositionBased { .. } => OnConflictDeletionUpdate::None,
         };
 
-        // Pure deletes first: delete-only durable encoding (no reinsert stamp,
-        // no snapshot registration).
-        if !pure_delete_files.is_empty() {
-            self.catalog
-                .commit_on_conflict_deletions(
-                    pure_delete_files,
-                    &self.table_metadata.table_id,
-                    Vec::new(),
-                    snapshot_sequence,
-                    None,
-                )
-                .await
-                .map_err(|err| CatalogError::InvalidOperationNoSource {
-                    message: format!(
-                        "Failed to commit in-memory CDC checkpoint delete-only metadata for table {}: {err}",
-                        self.table_metadata.table_name
-                    ),
-                })?;
-        }
-
-        // Reinserted keys + the protected-snapshot registration. Also issued
-        // with no tombstones at all when data files were written — the new
-        // snapshot still needs its sequence registered.
-        let snapshot_commit = target_snapshot_id.map(|snapshot_id| SnapshotSequenceCommit {
-            snapshot_id: snapshot_id.to_string(),
-            sequence_number: snapshot_sequence,
-        });
-        if !reinsert_delete_files.is_empty()
-            || !insert_pk_bytes.is_empty()
-            || snapshot_commit.is_some()
-        {
-            self.catalog
-                .commit_on_conflict_deletions(
-                    reinsert_delete_files,
-                    &self.table_metadata.table_id,
-                    insert_pk_bytes,
-                    snapshot_sequence,
-                    snapshot_commit,
-                )
-                .await
-                .map_err(|err| CatalogError::InvalidOperationNoSource {
-                    message: format!(
-                        "Failed to commit in-memory CDC checkpoint metadata for table {}: {err}",
-                        self.table_metadata.table_name
-                    ),
-                })?;
-        }
+        self.catalog
+            .commit_mem_tier_durable(MemTierDurableCommit {
+                table_id: self.table_metadata.table_id.clone(),
+                pure_delete_files,
+                reinsert_delete_files,
+                insert_pk_bytes,
+                sequence_number: snapshot_sequence,
+                snapshot_sequence: target_snapshot_id.map(|snapshot_id| SnapshotSequenceCommit {
+                    snapshot_id: snapshot_id.to_string(),
+                    sequence_number: snapshot_sequence,
+                }),
+                inline_data,
+                clear_inlined,
+            })
+            .await?;
 
         Ok(OnConflictUpdate::from_deletion_update(deletion_update))
     }
@@ -34310,12 +34295,20 @@ impl CayenneTableProvider {
             self.visible_mem_tier_segments_for_build(&raw.mem_tier_shards, &raw.deletion_snapshot)?;
         let union_tombstones =
             crate::provider::mem_tier::ShardedMemTier::union_tombstones(&raw.mem_tier_shards);
+        let captured_nothing = raw.warm_files.files.is_empty()
+            && raw
+                .protected_files
+                .values()
+                .all(|captured| captured.files.is_empty())
+            && raw.inlined_view.is_empty()
+            && visible_segments.is_empty();
         Ok(ScanView {
             raw,
             merged_deletions,
             visible_segments,
             union_tombstones,
             structural_version,
+            captured_nothing,
         })
     }
 
@@ -36208,7 +36201,17 @@ impl CayenneTableProvider {
             // lifecycle; pass only the capture-scoped `write` guard to `inner`.
             let write = guards.write.take();
             let inner_start = Instant::now();
-            let result = self.checkpoint_mem_tier_inner(write).await;
+            // The checkpoint's metastore changes commit as one record, before
+            // `fire_slot_advancer` acknowledges the source.
+            let result =
+                crate::catalog::with_deferred_commits(self.checkpoint_mem_tier_inner(write)).await;
+            let result = match (
+                result,
+                self.catalog().commit_pending_for(self.table_id()).await,
+            ) {
+                (Ok(_), Err(error)) => Err(error.into()),
+                (result, _) => result,
+            };
             (
                 result,
                 capture_lock_ms,
@@ -36535,6 +36538,10 @@ impl CayenneTableProvider {
         // N>1 it is the shared per-apply `durable_epoch` MAX computed above.
         let flushed_epoch = durable_epoch.unwrap_or(snapshot.epoch);
         let inlined_view = self.cached_inlined_view().await?;
+        let clear_inlined = !inlined_view.is_empty()
+            || self
+                .mem_tier_shadow_present
+                .load(std::sync::atomic::Ordering::Acquire);
         // The inline removal map is the WHOLE-TIER tombstone union (carried on
         // `snapshot.tombstones` — shard 0's at N==1, the cross-shard union at N>1),
         // so the global inline corpus is hidden by every shard's deletes.
@@ -36602,6 +36609,8 @@ impl CayenneTableProvider {
                         None,
                         sequence_number,
                         &corpus_keys,
+                        Vec::new(),
+                        clear_inlined,
                     )
                     .await?;
                 // The deletion-cache publish and the tier clear must be
@@ -36615,14 +36624,20 @@ impl CayenneTableProvider {
                 // All-shards clear (acquires each shard's publish lock itself).
                 self.clear_flushed_mem_tier_state_all_shards(
                     &flushed_counts,
-                    !inlined_view.is_empty()
-                        || self
-                            .mem_tier_shadow_present
-                            .load(std::sync::atomic::Ordering::Acquire),
+                    clear_inlined,
                     Vec::new(),
                 )
                 .await?;
             } else {
+                if clear_inlined {
+                    self.catalog
+                        .commit_mem_tier_durable(MemTierDurableCommit {
+                            table_id: self.table_metadata.table_id.clone(),
+                            clear_inlined,
+                            ..Default::default()
+                        })
+                        .await?;
+                }
                 // No tombstones to persist: clear and advance only. The clear
                 // mutates each shard's mem-tier (survivor-only `retain_after`), so
                 // it takes each shard's publish lock to stay mutually exclusive with
@@ -36631,10 +36646,7 @@ impl CayenneTableProvider {
                 // needed.
                 self.clear_flushed_mem_tier_state_all_shards(
                     &flushed_counts,
-                    !inlined_view.is_empty()
-                        || self
-                            .mem_tier_shadow_present
-                            .load(std::sync::atomic::Ordering::Acquire),
+                    clear_inlined,
                     Vec::new(),
                 )
                 .await?;
@@ -36727,6 +36739,15 @@ impl CayenneTableProvider {
                     super::delta_encoding::WritePolicy::DELTA,
                 )
                 .await?;
+            if clear_inlined {
+                self.catalog
+                    .commit_mem_tier_durable(MemTierDurableCommit {
+                        table_id: self.table_metadata.table_id.clone(),
+                        clear_inlined,
+                        ..Default::default()
+                    })
+                    .await?;
+            }
             // Clear under the publish locks (inner to the held fence), uniform
             // with phase 2. Position-based tables never engage `append_to_mem_tier`
             // (`is_cdc_memory_mode()` is false for them — always a single shard),
@@ -36736,10 +36757,7 @@ impl CayenneTableProvider {
             // (inner), same as phase 2.
             self.clear_flushed_mem_tier_state_all_shards(
                 &flushed_counts,
-                !inlined_view.is_empty()
-                    || self
-                        .mem_tier_shadow_present
-                        .load(std::sync::atomic::Ordering::Acquire),
+                clear_inlined,
                 Vec::new(),
             )
             .await?;
@@ -36817,6 +36835,8 @@ impl CayenneTableProvider {
                     Some(&new_snapshot_id),
                     sequence_number,
                     &corpus_keys,
+                    Vec::new(),
+                    clear_inlined,
                 )
                 .await?;
             // Folding every key the corpus supersedes into the deletion index is
@@ -36850,12 +36870,7 @@ impl CayenneTableProvider {
             // OUTSIDE both) take them in this order, so no opposing acquire order
             // exists.
             //
-            // PARTIAL-SWAP GUARD (§3.4 Fix 3): the per-shard swaps are infallible;
-            // if the inline-metadata clear inside `clear_flushed_mem_tier_state_all_shards`
-            // errors it propagates via `?` here, BEFORE the post-fence
-            // `fire_slot_advancer` — so the slot is never advanced on a failed
-            // clear, and any un-swapped shard replays from the (already-durable)
-            // union file on restart.
+            // All durable effects committed before this infallible RAM-tier swap.
             {
                 let _fence = self.listing_fence.write().await;
                 self.commit_on_conflict_publish_prepared(
@@ -36880,10 +36895,7 @@ impl CayenneTableProvider {
                 }
                 self.clear_flushed_mem_tier_state_all_shards(
                     &flushed_counts,
-                    !inlined_view.is_empty()
-                        || self
-                            .mem_tier_shadow_present
-                            .load(std::sync::atomic::Ordering::Acquire),
+                    clear_inlined,
                     prepared_retains,
                 )
                 .await?;
@@ -37057,7 +37069,7 @@ impl CayenneTableProvider {
     /// 1. Capture each active piece (`segments[sealed_segments..]`) and the epoch it
     ///    makes durable, BEFORE the off-lock commit — appends after this stay active.
     /// 2. Persist its VISIBLE rows (post merge-on-read) as ONE durable-but-
-    ///    unpublished inline-corpus BLOB ([`Self::commit_inlined_data_durable`] with
+    ///    unpublished inline-corpus BLOB (in the same catalog transaction as step 3, with
     ///    no [`Self::publish_inlined_mutation`], so `published_inlined_seq` stays
     ///    below the seal sequence and the shadow is invisible to live scans; on
     ///    restart the watermark reseeds from the durable `current_sequence_number`
@@ -37084,6 +37096,21 @@ impl CayenneTableProvider {
     /// it from the background tick via [`Self::seal_due`].
     #[doc(hidden)]
     pub async fn seal_mem_tier_durable(&self) -> Result<u64> {
+        // The seal's metastore changes and the source position it acknowledges
+        // commit as one record, as a checkpoint's do: `fire_slot_advancer` stages
+        // the position into this scope and commits the table's changes.
+        let result =
+            crate::catalog::with_deferred_commits(self.seal_mem_tier_durable_inner()).await;
+        match (
+            result,
+            self.catalog().commit_pending_for(self.table_id()).await,
+        ) {
+            (Ok(_), Err(error)) => Err(error.into()),
+            (result, _) => result,
+        }
+    }
+
+    async fn seal_mem_tier_durable_inner(&self) -> Result<u64> {
         // Memory mode (`mode: memory`) never seals to the durable inline corpus: the
         // in-memory metastore is itself ephemeral (so the recovery shadow is
         // pointless), and sealing advances the source slot — which would break the
@@ -37200,52 +37227,45 @@ impl CayenneTableProvider {
         // pure tombstone split, same as the checkpoint.
         let corpus_keys = self.checkpoint_corpus_pk_keys(&union_visible)?;
 
-        // (a) Durable INSERTS → ONE unpublished inline-corpus BLOB over the
-        // concatenated cross-shard visible rows. Durable commit only — NO
-        // `publish_inlined_mutation`, so no `inlined_generation` bump, no watermark
-        // advance, and live scans keep serving the RAM tier (the shadow is a pure
-        // recovery artifact until restart).
-        if !union_visible.is_empty() {
-            let ipc_bytes =
-                serialize_batches_to_ipc(&union_visible).map_err(|e| Error::Arrow { source: e })?;
-            self.commit_inlined_data_durable(
-                InlinedDataRewrite::default(),
-                vec![InlinedData::pending_catalog_insert(
-                    self.table_metadata.table_id.clone(),
-                    None,
-                    ipc_bytes,
-                    i64::try_from(sealed_rows).unwrap_or(i64::MAX),
-                )],
-                Some(seal_sequence),
+        // Shadow inserts and both kinds of tombstones commit together. Durable
+        // commit only: NO `publish_inlined_mutation`, generation bump, or watermark
+        // advance, so live scans keep serving the RAM tier. The shadow's seal
+        // sequence exceeds every active tombstone sequence; the target snapshot
+        // is None because the inserts live in the inline BLOB. Drop the returned
+        // update: reads hide deleted rows via RAM tombstones until restart.
+        // A later bake may re-commit the tombstones (the index merges by max
+        // sequence). At N==1 the view is shard 0's delta; at N>1 it is the
+        // disjoint-key union, exactly as in the sharded checkpoint.
+        let inline_data = if union_visible.is_empty() {
+            Vec::new()
+        } else {
+            let ipc_bytes = serialize_batches_to_ipc(&union_visible)
+                .map_err(|source| Error::Arrow { source })?;
+            vec![InlinedData::pending_catalog_insert(
+                self.table_metadata.table_id.clone(),
+                None,
+                ipc_bytes,
+                i64::try_from(sealed_rows).unwrap_or(i64::MAX),
+            )]
+        };
+        let union_view = if n == 1 {
+            Arc::clone(&deltas[0])
+        } else {
+            Arc::new(
+                crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(&deltas, seal_epoch),
+            )
+        };
+        let _unpublished = self
+            .commit_mem_tier_checkpoint_metadata(
+                &union_view,
+                None,
+                seal_sequence,
+                &corpus_keys,
+                inline_data,
+                false,
             )
             .await
             .map_err(|source| Error::Catalog { source })?;
-        }
-
-        // (b) Durable TOMBSTONES → delete vectors + metastore commit over the
-        // cross-shard UNION of the active deltas' tombstones, UNPUBLISHED (drop the
-        // returned `OnConflictUpdate`). `target_snapshot_id = None`: the inserts live
-        // in the inline BLOB, not a Vortex snapshot. Idempotent w.r.t. a later bake
-        // that re-commits the same tombstones (the deletion index merges by max
-        // sequence). Reads keep hiding these rows via the RAM tier's merge-on-read
-        // tombstones; the durable index is consulted only on restart. At N==1 the
-        // view IS shard 0's delta (byte-identical); at N>1 it is the disjoint-key
-        // union, the same synthetic view the sharded checkpoint builds.
-        if any_tombstones {
-            let union_view = if n == 1 {
-                Arc::clone(&deltas[0])
-            } else {
-                Arc::new(
-                    crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(
-                        &deltas, seal_epoch,
-                    ),
-                )
-            };
-            let _unpublished = self
-                .commit_mem_tier_checkpoint_metadata(&union_view, None, seal_sequence, &corpus_keys)
-                .await
-                .map_err(|source| Error::Catalog { source })?;
-        }
 
         // Flag the durable-but-unpublished shadow so the next bake clears it (its
         // published inline view is empty, so the bake's usual clear gate would miss
@@ -37449,7 +37469,7 @@ impl CayenneTableProvider {
         crate::provider::mem_tier_budget::release_bytes(released_total);
         self.bump_inlined_structural_epoch();
         if inlined_view_nonempty {
-            self.clear_inlined_metadata_after_checkpoint().await?;
+            self.clear_inlined_state_after_checkpoint();
             self.flip_inlined_keyset_entries_to_file_unlocated();
         }
         let remaining_mem_rows = self.mem_tier.total_rows();
@@ -37721,6 +37741,31 @@ impl CayenneTableProvider {
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
     pub(crate) async fn fire_slot_advancer(&self, durable_epoch: u64) {
+        let advancer = self.slot_advancer.lock().clone();
+        // A metastore that commits the source position in the same record as the
+        // data it covers stages it here; it commits just below, and only then is
+        // the source acknowledged.
+        if let Some(advancer) = &advancer
+            && self.catalog().commits_source_positions()
+            && let Err(error) =
+                crate::catalog::with_deferred_commits(advancer.record_position(durable_epoch)).await
+        {
+            tracing::error!(
+                "Dataset '{}' could not record its source position with its checkpoint, so its source is not acknowledged and replays these changes after a restart: {error}",
+                self.table_name()
+            );
+            return;
+        }
+        // The source is acknowledged below, so the metastore changes this
+        // checkpoint made must be committed first. A failed commit acknowledges
+        // nothing: the source replays from its last acknowledged position.
+        if let Err(error) = self.catalog().commit_pending_for(self.table_id()).await {
+            tracing::error!(
+                "Dataset '{}' could not commit its checkpoint to the metastore, so its source is not acknowledged and replays these changes after a restart: {error}",
+                self.table_name()
+            );
+            return;
+        }
         // Record the durable high-watermark (encoded `epoch + 1`, monotone via
         // `fetch_max`) so the `nothing_to_flush` path can RE-fire the advancer for
         // a source committer queued after this flush already drained its epoch —
@@ -37745,7 +37790,6 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
-        let advancer = self.slot_advancer.lock().clone();
         if let Some(advancer) = advancer {
             self.trace_slot_advance(advancer.as_ref(), durable_epoch, "advance")
                 .await;
@@ -38648,12 +38692,12 @@ impl CayenneTableProvider {
 
     fn clear_inlined_state_after_checkpoint(&self) {
         self.inlined_row_count.store(0, Ordering::Relaxed);
-        // `clear_inlined_data_and_deletes` emptied `cayenne_inlined_delete` too.
+        // The checkpoint transaction emptied `cayenne_inlined_delete` too.
         self.inlined_tombstone_bytes.store(0, Ordering::Relaxed);
         // The durable corpus is now empty: arm the zero-corpus rebuild fast
         // path (the structural bump below forces that rebuild).
         self.durable_inlined_row_count.store(0, Ordering::Relaxed);
-        // The catalog `clear_inlined_data_and_deletes` above deleted every inline
+        // The checkpoint transaction deleted every inline
         // row for this table, INCLUDING any unpublished seal shadow — so the bake
         // no longer needs to force the clear. Reset the flag (`AcqRel`: the result is
         // read below, and it pairs with the bake/seal Acquire loads). A seal cannot race
@@ -38661,7 +38705,7 @@ impl CayenneTableProvider {
         let cleared_seal_shadow = self
             .mem_tier_shadow_present
             .swap(false, std::sync::atomic::Ordering::AcqRel);
-        // b1★ (cycle-4): the catalog `DELETE FROM cayenne_inlined_delete` above
+        // b1★ (cycle-4): the catalog `DELETE FROM cayenne_inlined_delete`
         // removed EVERY tombstone for this table, including any whose durable
         // `published = 1` flip was still deferred (recorded in
         // `inlined_locally_published` / `pending_durable_tombstone_flips`). Their
@@ -67883,12 +67927,14 @@ mod tests {
         };
 
         // A query captures a scan view, which this table keeps reusing for an
-        // hour whatever is written after it.
+        // hour whatever is written after it. The view holds a row because an
+        // empty view is not reused once a write has published.
+        write(&[1], &[10]).await;
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "ma_rebuild_reused_view").await,
-            vec![],
+            vec![(1, 10)],
         );
-        write(&[1, 2], &[10, 20]).await;
+        write(&[2], &[20]).await;
         // Stale, as after a durable delete; the next write's delta is dropped.
         provider.mark_maintained_aggregates_stale();
         write(&[3], &[30]).await;
@@ -67902,7 +67948,7 @@ mod tests {
         );
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "ma_rebuild_reused_view").await,
-            vec![],
+            vec![(1, 10)],
             "precondition: the table's scans still answer from the view captured before the writes"
         );
 

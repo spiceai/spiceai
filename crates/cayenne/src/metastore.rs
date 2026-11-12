@@ -19,8 +19,11 @@ limitations under the License.
 //! This module provides a trait-based abstraction over the database that stores
 //! Cayenne metadata. `sqlite::SqliteMetastore` implements it.
 
+pub(crate) mod actions;
+pub mod object_native;
 pub mod snapshot;
 pub mod sqlite;
+pub(crate) mod state_reader;
 
 use std::collections::HashSet;
 use std::fmt::Display;

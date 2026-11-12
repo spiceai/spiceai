@@ -93,7 +93,7 @@ jobs:
           MISTRALRS_METAL_PRECOMPILE: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: |
-          FEATURES="flightsql,models,metal,s3_vectors,kafka,duckdb"
+          FEATURES="flightsql,models,metal,s3_vectors,kafka"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
@@ -190,6 +190,7 @@ jobs:
       HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
       HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
+      HAS_TYPESAFE_SECRET: ${{ secrets.TYPESAFE_API_KEY != '' }}
       # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
       # for provider access tokens with these IDs, and exchange again before each expires.
       OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
@@ -248,6 +249,23 @@ jobs:
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           printf 'SPICE_XAI_API_KEY="%s"\n' "$SPICE_XAI_API_KEY" > .env
+
+      # This workflow runs only on schedule and workflow_dispatch, never for a fork, so a
+      # missing credential means the environment is broken. The test steps below that need
+      # one are skipped without it, which would leave this job green with those tests unrun.
+      # Fail here instead, naming what is missing; the steps that need nothing still run.
+      - name: Require the test credentials
+        run: |
+          missing=""
+          [ "${HAS_OPENAI_WIF:-}" = "true" ] || missing="$missing OPENAI_IDENTITY_PROVIDER_ID"
+          [ "${HAS_ANTHROPIC_WIF:-}" = "true" ] || missing="$missing ANTHROPIC_FEDERATION_RULE_ID"
+          [ "${HAS_XAI_SECRET:-}" = "true" ] || missing="$missing SPICE_SECRET_XAI_API_KEY"
+          [ "${HAS_HF_SECRET:-}" = "true" ] || missing="$missing SPICE_SECRET_HF_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::The '${GITHUB_JOB}' job's environment does not provide:${missing}. The test steps that need them are skipped, so this job would otherwise pass without running them."
+            exit 1
+          fi
+          echo "Every test credential is present."
 
       # OpenAI tests
       - name: Run OpenAI integration test
@@ -360,7 +378,9 @@ jobs:
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- models::messages::
 
-      # NOTE: Step-level `if:` conditionals on secret-requiring AI test steps (OpenAI, workers, search, xAI/HF UDFs, etc.) cause the step to report "skipped" (neutral, job succeeds) on PRs where secrets are intentionally unavailable for security (forks/external PRs). When a step *does* execute (schedule/workflow_dispatch with secrets present), an explicit fast-fail guard at the start of `run:` errors immediately if a required key is missing, preserving the original intent. This is intentional and confirmed for schedule + workflow_dispatch (incl. `run_all_tests`). See Copilot review threads for context; prevents spurious reds unrelated to code.
+      # NOTE: A step-level `if:` on a secret-requiring AI test step skips it when its credential
+      # is absent, and a skipped step does not fail the job. "Require the test credentials"
+      # above is what turns a missing credential into a red job.
       - name: Run AI UDF LEFT truncate test
         if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' && env.HAS_XAI_SECRET == 'true' }}
         env:
@@ -411,6 +431,47 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
+
+      # Decision model tests
+      - name: Run decisions rejection tests (no credentials)
+        if: ${{ !cancelled() }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::decisions_reject_what_the_runtime_cannot_route/)'
+
+      # Only the OpenAI chat model: `openai:gpt-6-luna` takes only an API key, and this job
+      # authenticates OpenAI with workload identity federation.
+      - name: Run OpenAI decisions tests
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*openai_chat/)'
+
+      - name: Run Anthropic decisions tests
+        if: ${{ !cancelled() && env.HAS_ANTHROPIC_WIF == 'true' }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*anthropic/)'
+
+      - name: Run xAI decisions tests
+        if: ${{ !cancelled() && env.HAS_XAI_SECRET == 'true' }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*xai/)'
+
+      - name: Run TypeSafe decisions tests
+        if: ${{ !cancelled() && env.HAS_TYPESAFE_SECRET == 'true' }}
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*typesafe/)'
+
+      - name: Run decisions routing test
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::decisions_route_by_model_name/)'
 
       - name: Push snapshots to branch
         if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
@@ -476,6 +537,15 @@ jobs:
         with:
           name: ai-integration-test-archive
           path: ./integration_test
+
+      # The test steps below are skipped without the token; see `test-models`.
+      - name: Require the Hugging Face token
+        run: |
+          if [ "${HAS_HF_SECRET:-}" != "true" ]; then
+            echo "::error::The '${GITHUB_JOB}' job's environment does not provide: SPICE_SECRET_HF_TOKEN. The test steps that need it are skipped, so this job would otherwise pass without running them."
+            exit 1
+          fi
+          echo "The Hugging Face token is present."
 
       - name: Run integration test
         if: ${{ !cancelled() && env.HAS_HF_SECRET == 'true' }}
@@ -610,6 +680,17 @@ jobs:
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
 
+      - name: Run Bedrock decisions tests
+        if: ${{ !cancelled() }}
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          AWS_BEDROCK_KEY: ${{ steps.bedrock-role.outputs.aws-access-key-id }}
+          AWS_BEDROCK_SECRET: ${{ steps.bedrock-role.outputs.aws-secret-access-key }}
+          AWS_BEDROCK_SESSION_TOKEN: ${{ steps.bedrock-role.outputs.aws-session-token }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*bedrock/)'
+
       # The path EKS (IRSA) and any other OIDC token file take: no key at all, only
       # `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`, which spiced's AWS credential chain
       # exchanges with STS itself. A GitHub OIDC token lives 5 minutes, which this one test
@@ -691,7 +772,7 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: |
-          FEATURES="flightsql,models,s3_vectors,kafka,duckdb"
+          FEATURES="flightsql,models,s3_vectors,kafka"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"

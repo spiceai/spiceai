@@ -559,42 +559,10 @@ jobs:
           cp ./test/models/spicepod_hf.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
-      # The Hub credential lives where hf-hub looks for it, rather than being threaded
-      # through the spicepod as an `hf_token` param. Two reasons: it authenticates the
-      # chat model and the embedding model with one mechanism, and an unset secret
-      # leaves no file behind instead of setting an empty token, which the Hub answers
-      # with 401 — worse than no token at all.
       - name: Authenticate the Hugging Face cache
-        env:
-          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
-        run: |
-          set -uo pipefail
-          umask 077
-
-          # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
-          # credential from the sibling `token` file. $HOME persists between jobs on
-          # these self-hosted runners while the _work tree does not, so once the ~3B
-          # chat model and the embedding model are on disk, later runs need no Hub
-          # round-trip at all.
-          mkdir -p "${HOME}/.cache/huggingface/hub"
-          token_file="${HOME}/.cache/huggingface/token"
-
-          # $HOME is shared by every job that lands on this host, and it outlives this
-          # one. So a token we write here must not be left behind for an unrelated job
-          # to read, and a token the host already owns must not be clobbered:
-          #   - file already present -> use it, touch nothing.
-          #   - absent + secret set  -> write it, and mark it for removal in cleanup.
-          #   - absent + no secret   -> warn; downloads are anonymous.
-          if [ -s "${token_file}" ]; then
-            echo "Using the Hugging Face token already present on this runner."
-          elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
-            printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
-            chmod 600 "${token_file}"
-            echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
-            echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
-          else
-            echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 on model config files."
-          fi
+        uses: ./.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
       # Fail here, in seconds and by name, rather than as an unexplained five-minute
       # readiness timeout. The retries ride out the transient per-IP 401/429 responses
@@ -610,15 +578,20 @@ jobs:
             exit 0
           fi
 
+          # The same token spiced will use: `HF_TOKEN`, else the runner's token file.
+          token="${HF_TOKEN:-}"
           token_file="${HOME}/.cache/huggingface/token"
+          if [ -z "${token}" ] && [ -s "${token_file}" ]; then
+            token="$(cat "${token_file}")"
+          fi
 
           # The token goes to curl through a config on stdin rather than an -H argument,
           # so it never appears in this process's argv. `printf` is a shell builtin, so
           # it spawns nothing that could carry it either. curl drops the header on a
           # cross-host redirect by default, which is what keeps `-L` safe here.
           probe() {
-            if [ -s "${token_file}" ]; then
-              printf 'header = "Authorization: Bearer %s"\n' "$(cat "${token_file}")" |
+            if [ -n "${token}" ]; then
+              printf 'header = "Authorization: Bearer %s"\n' "${token}" |
                 curl -K - -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
             else
               curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
@@ -730,15 +703,6 @@ jobs:
       - name: Stop spice and check logs
         if: always()
         uses: ./.github/actions/stop-spice
-
-      # Only fires when the step above wrote the token itself; a credential the runner
-      # already owned is left alone. Without this, a secret would outlive the job in a
-      # $HOME that every later job on this host can read.
-      - name: Remove the job-scoped Hugging Face token
-        if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
-        run: |
-          rm -f "${SPICE_REMOVE_HF_TOKEN}"
-          echo "Removed the job-scoped Hugging Face token."
 
   test_quickstart_dremio:
     environment: secret-free
@@ -1490,7 +1454,7 @@ jobs:
         run: |
           CLICKHOUSE_VERSION="26.3.9.8-lts"
           BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
           mv clickhouse-macos-aarch64 clickhouse
           chmod +x clickhouse
           sudo ./clickhouse install --noninteractive
@@ -1592,14 +1556,14 @@ jobs:
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
           unzip duckdb_cli-linux-amd64.zip
           chmod +x ./duckdb
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'darwin'
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
           unzip duckdb_cli-osx-universal.zip
           chmod +x ./duckdb
 
@@ -2596,7 +2560,12 @@ jobs:
 
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
+          # GitHub release downloads answer 504 in bursts longer than a fixed 5s x 5
+          # retry outlasts. With no --retry-delay, curl waits 1s and doubles each time,
+          # so 8 retries span about 4 minutes; --retry-max-time 300 bounds that.
+          # Every GitHub release download in this file's own steps uses these flags;
+          # composite actions such as install-protoc keep their own.
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
           echo "b5bad3ec8bf689885f8270ebd8e0f507e4f671f37dabf6127c09b19960389f96  duckdb_cli.zip" | sha256sum -c
           unzip duckdb_cli.zip
           chmod +x ./duckdb
@@ -2613,7 +2582,7 @@ jobs:
         run: |
           # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
           # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
-          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+          curl --fail --silent --show-error --location --retry 8 --retry-all-errors --retry-max-time 300 \
             -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
           echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
@@ -2838,7 +2807,7 @@ jobs:
         run: |
           # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
           # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
-          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+          curl --fail --silent --show-error --location --retry 8 --retry-all-errors --retry-max-time 300 \
             -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
           echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
@@ -3063,7 +3032,7 @@ jobs:
       # images as they start, so the login has to last the whole job.
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           DOCKERHUB_OIDC_EXPIREIN: '21600'
@@ -3084,10 +3053,18 @@ jobs:
       # DuckLake source fetches the release matching spiced's embedded DuckDB.
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/duckdb.zip" \
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -o "$RUNNER_TEMP/duckdb.zip" \
             https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+
+      # The search and embedding scripts download a Hub model at startup. Without
+      # a token they share the pool's anonymous per-IP quota, and a rate limit fails
+      # every one of them at once as "model 'potion' … failed to load".
+      - name: Authenticate the Hugging Face cache
+        uses: ./.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
       - name: Check harness rejects incorrect answers
         if: ${{ matrix.partition == '1/4' }}

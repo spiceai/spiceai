@@ -1126,7 +1126,7 @@ fn serve(
         let events = job.events.clone();
         let stopping = Arc::clone(&job.stopping);
         let result = match &mut decoder {
-            Decoder::Plain(context) => generate(&model, context, &mut cache, job, &eog),
+            Decoder::Plain(context) => generate(&model, context, split, &mut cache, job, &eog),
             Decoder::Mtp(spec) => generate_mtp(&model, spec, split, &mut cache, job, &eog),
         };
         let event = match result {
@@ -2337,6 +2337,12 @@ impl<'v> Picker<'v> {
         self.goes_on
     }
 
+    /// Whether every token of the reply is the greedy sampler's pick alone: no penalties, no
+    /// end-of-generation ban and no grammar, which a context's argmax output does not apply.
+    fn picks_greedily(&self) -> bool {
+        self.free.is_greedy() && self.constrained.is_none()
+    }
+
     fn sample(&mut self, context: &Context<'_>, index: i32, in_content: bool) -> Token {
         let (used, other) = match &mut self.constrained {
             Some(constrained) if in_content => (constrained, Some(&mut self.free)),
@@ -2368,10 +2374,13 @@ fn draw<'v>(sampling: &Sampling) -> Vec<Sampler<'v>> {
     }
 }
 
-/// Runs one request, one token per forward pass.
+/// Runs one request, one token per forward pass. On a model `split` across nodes, a request
+/// that picks greedily alone takes its picks from the context's argmax output
+/// ([`Context::set_argmax_output`]), set before its prompt is read.
 fn generate(
     model: &Model,
     context: &mut Context<'_>,
+    split: bool,
     cache: &mut PromptCache,
     job: Job,
     eog: &[Token],
@@ -2387,6 +2396,7 @@ fn generate(
         out.pending(),
     )?;
     out.begin(picker.goes_on());
+    context.set_argmax_output(split && picker.picks_greedily());
     // `tokens` grows by every reply token decoded, so it is always what the cache holds.
     let (mut tokens, mut batch) =
         read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
@@ -2416,7 +2426,8 @@ fn generate(
 /// A model `split` across nodes verifies every drafted token even when the request has fewer
 /// left, so each verify batch keeps one shape: a shorter batch at a request's end rebuilds the
 /// verify graph twice (to the short shape and back), which over RPC re-serializes every rank's
-/// graph. Tokens past the limit are verified but never emitted.
+/// graph. Tokens past the limit are verified but never emitted. A request that picks greedily
+/// alone on a split model takes its picks from the target's argmax output, as in [`generate`].
 fn generate_mtp(
     model: &Model,
     spec: &mut Mtp<'_>,
@@ -2436,6 +2447,8 @@ fn generate_mtp(
         out.pending(),
     )?;
     out.begin(picker.goes_on());
+    spec.target_mut()
+        .set_argmax_output(split && picker.picks_greedily());
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`; its cache keeps the positions the
     // target's reuses.

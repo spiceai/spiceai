@@ -9,6 +9,10 @@ version.workspace = true
 autotests = false
 
 [dependencies]
+blake3 = { workspace = true }
+object_store_occ = { path = "../object_store_occ" }
+prost.workspace = true
+cayenne-metastore-actions = { path = "../cayenne-metastore-actions" }
 cpu-budget = { path = "../cpu-budget" }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
@@ -115,6 +119,9 @@ result-correctness-duckdb = []
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+# Steps the model's transactions traces for the object-native catalog's replay.
+cayenne-metastore-model = { path = "../cayenne-metastore-model" }
+object_store_sim = { path = "../object_store_sim" }
 duckdb-oracle = { path = "../duckdb-oracle" }
 # getrusage for the `wide_column_point_lookup` bench, and the allocators it can run under: the
 # two `spiced` can be built with (`snmalloc-rs` is its default).

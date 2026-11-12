@@ -14,6 +14,12 @@ sources:
 matrix:
   run: [1, 2, 3, 4, 5]
 
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod
@@ -37,6 +43,9 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # Each variant drives its own source until its own compaction starts, so
+  # their rows differ by design; each is checked against its own source instead.
+  compare-variants: false
 
 steps:
   - source-exec:
