@@ -8,15 +8,15 @@ description: >
   same rows; a data file that is truncated, then deleted, fails the query with
   its error each time, and `mode: file_create` reloads the dataset. The
   `today` variant (no flag, local data) gives the same answers where it takes
-  part; the steps that need the location are for object-native-data-rustfs only.
+  part; the steps that need the location are for object-native-s3 only.
 
 sources:
   src: { kind: postgres }
-  # The state location of object-native-data-rustfs.
+  # The state location of object-native-s3.
   lake: { kind: rustfs }
 
 variants:
-  object-native-data-rustfs: object-native-data-rustfs
+  object-native-s3: object-native-s3
   today: {}
 
 spicepod:
@@ -57,7 +57,7 @@ steps:
   # Placement: the data files are in the dataset's folder in the location,
   # nothing is at a local `s3:` path, and no local data directory exists.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
-    only: &in-location object-native-data-rustfs
+    only: &in-location object-native-s3
   - assert-files: { lacks: ['(^|/)s3:', '\.vortex$'], lacks-dirs: ['^\.spice/data/facts/'] }
     only: *in-location
 

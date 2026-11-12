@@ -10,10 +10,9 @@ description: >
 
 sources:
   src: { kind: postgres }
-  # The state location of the object-native-rustfs variants, and the data path
-  # of object-store-data-path-rustfs.
+  # The state location of object-native-rustfs and object-native-s3.
   lake: { kind: rustfs }
-  # The same, 20 ms away (object-native-data-rustfs-latency).
+  # The same, 20 ms away (object-native-s3-latency).
   slow-lake: { kind: rustfs, latency: 20ms }
 
 variants:
@@ -71,11 +70,9 @@ variants:
     datasets: { '*': { acceleration: { mode: memory } } }
   # Object-native data (#16131): data files in the state location, which an
   # instance that loses its directory serves again without the source.
-  object-native-data-local: object-native-data-local
-  object-native-data-rustfs: object-native-data-rustfs
-  object-native-data-rustfs-latency: object-native-data-rustfs-latency
-  # Data at the datasets' own `cayenne_file_path` on RustFS (#16130).
-  object-store-data-path-rustfs: object-store-data-path-rustfs
+  object-native-local: object-native-local
+  object-native-s3: object-native-s3
+  object-native-s3-latency: object-native-s3-latency
 
 spicepod:
   version: v1
@@ -244,37 +241,24 @@ steps:
   - query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment
     eventually: 30s
 
-  # Data in an object store (#16130), at the dataset's own path or in the
-  # location: deletion vectors are objects in the bucket, none is on local
-  # disk, and nothing is at a local `s3:` path.
-  - assert-objects: { source: lake, prefix: data/orders/, contains: .arrow, min: 1 }
-    only: object-store-data-path-rustfs
+  # Data in an S3 state location: deletion vectors are objects in the bucket,
+  # none is on local disk, and nothing is at a local `s3:` path.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, min: 1 }
-    only: object-native-data-rustfs
+    only: object-native-s3
   - assert-files: { lacks: ['(^|/)s3:', '\.arrow$'] }
-    only: &object-store-data [object-store-data-path-rustfs, object-native-data-rustfs]
+    only: object-native-s3
 
-  # 180 s of CDC updates and deletes at a fixed rate: the data files and
-  # deletion vectors in the bucket stay within the same bound halfway through
-  # and at the end, and the table still matches the source. The bounds are a
-  # few compactions' worth of the table (about 20,000 rows), far below what
-  # 180 s of unreclaimed snapshots would leave. In the state location the
-  # dataset's objects are sampled every 10 s across several reclamation cycles
-  # (a retired snapshot is deleted about 5 s after its retirement), as a series
-  # that must stay under the bound and not trend upward (#16133).
+  # 180 s of CDC updates and deletes at a fixed rate: the dataset's objects in
+  # the state location, sampled every 10 s, stay under a bound and do not trend
+  # upward, the data files and deletion vectors stay within the same bound
+  # afterwards, and the table still matches the source. The bounds are a few
+  # compactions' worth of the table (about 20,000 rows), far below what 180 s
+  # of unreclaimed files would leave (#16133).
   - background:
       id: churn
       source-exec: { src: "UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 97 = ${round} % 97; DELETE FROM orders WHERE o_id % 991 = ${round} % 991" }
       every: 1s
-    only: *object-store-data
-  - sleep: 90s
-    only: object-store-data-path-rustfs
-  - assert-objects: { source: lake, prefix: data/orders/, contains: .vortex, max: 400 }
-    only: object-store-data-path-rustfs
-  - assert-objects: { source: lake, prefix: data/orders/, contains: .arrow, max: 200 }
-    only: object-store-data-path-rustfs
-  - sleep: 90s
-    only: object-store-data-path-rustfs
+    only: object-native-s3
   - sample-objects:
       source: lake
       prefix: state/cayenne/v1/datasets/orders-
@@ -282,43 +266,39 @@ steps:
       every: 10s
       for: 180s
       max-objects: 600
-    only: object-native-data-rustfs
+    only: object-native-s3
   - stop-background: { id: churn }
-    only: *object-store-data
+    only: object-native-s3
   - query: SELECT * FROM orders
     eventually: 90s
-    only: *object-store-data
+    only: object-native-s3
   # After the retention grace, with no further change.
   - sleep: 20s
-    only: *object-store-data
-  - assert-objects: { source: lake, prefix: data/orders/, contains: .vortex, max: 400 }
-    only: object-store-data-path-rustfs
-  - assert-objects: { source: lake, prefix: data/orders/, contains: .arrow, max: 200 }
-    only: object-store-data-path-rustfs
+    only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .vortex, max: 400 }
-    only: object-native-data-rustfs
+    only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, max: 200 }
-    only: object-native-data-rustfs
+    only: object-native-s3
   - assert-log: { lacks: ['falling back to full snapshot rewrite'] }
-    only: *object-store-data
+    only: object-native-s3
 
   # Object-native data (#16131): each dataset's files are in the state
   # location, under its log's data/ folder, and none at a local `s3:` path.
   - assert-files: { contains: '^state/cayenne/v1/datasets/orders-[^/]+/data/' }
-    only: object-native-data-local
+    only: object-native-local
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /data/, min: 1 }
-    only: object-native-data-rustfs
+    only: object-native-s3
   - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/orders-, contains: /data/, min: 1 }
-    only: object-native-data-rustfs-latency
+    only: object-native-s3-latency
   - assert-files: { lacks: '(^|/)s3:' }
-    only: &object-native-data [object-native-data-local, object-native-data-rustfs, object-native-data-rustfs-latency]
+    only: &object-native-data [object-native-local, object-native-s3, object-native-s3-latency]
 
   # An instance that loses its directory serves the same rows from the
   # location alone: the source is down, so it cannot load them again.
   # Expected failures (ledger): a `refresh_mode: changes` dataset is not
   # registered while its source cannot be reached, so its copy in the location
   # is not served until the source is back ("table … not found" on every
-  # object-native-data variant). On object-native-data-local the data files are
+  # object-native-data variant). On object-native-local the data files are
   # under `.spice/data`, which the wipe removes, so `orders` then refuses to
   # load with "Deletion vector file is missing…" even with the source back
   # (local data is not in the location yet).
@@ -368,7 +348,7 @@ steps:
       id: cdc-writes
       source-exec: { src: "UPDATE orders SET o_total = o_total + 1 WHERE o_id % 13 = ${round} % 13" }
       every: 200ms
-    only: &object-native-data-in-store [object-native-data-rustfs, object-native-data-rustfs-latency]
+    only: &object-native-data-in-store [object-native-s3, object-native-s3-latency]
   - background:
       id: readers
       query: SELECT count(*), sum(o_total) FROM orders

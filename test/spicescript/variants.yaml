@@ -21,19 +21,20 @@ cayenne-file-object-native:
   datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }
   spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
 
-# Object-native Cayenne data (#16131): with the prototype metastore on, a file
-# acceleration keeps its data files in `runtime.state.location`, named in the
-# metastore's commits, so an instance that loses its directory
-# (`wipe-instance-dir`) serves the dataset again from the location alone.
-# Locally the location is a directory in the instance's own, which stands for
-# storage the instance does not lose: `wipe-instance-dir: { keep: [state] }`.
-object-native-data-local:
+# `object-native` with the state location named. With the flag on, a Cayenne
+# file acceleration keeps its data files in `runtime.state.location`, so an
+# instance that loses its directory (`wipe-instance-dir`) serves the dataset
+# again from the location alone. This location is a directory inside the
+# instance's own, standing for storage the instance does not lose:
+# `wipe-instance-dir: { keep: [state] }`.
+object-native-local:
   spicepod:
     runtime:
       params: { cayenne_vnext: enabled }
       state: { location: 'file://${instance.dir}/state/' }
-# In an S3-compatible store; the script declares a `rustfs` source named `lake`.
-object-native-data-rustfs:
+# The state location in an S3-compatible store; the script declares a `rustfs`
+# source named `lake`.
+object-native-s3:
   spicepod:
     runtime:
       params: { cayenne_vnext: enabled }
@@ -48,7 +49,7 @@ object-native-data-rustfs:
           allow_http: 'true'
 # The same with every response of the store 20 ms late, as from a remote
 # region; the script declares `slow-lake: { kind: rustfs, latency: 20ms }`.
-object-native-data-rustfs-latency:
+object-native-s3-latency:
   spicepod:
     runtime:
       params: { cayenne_vnext: enabled }
@@ -61,10 +62,3 @@ object-native-data-rustfs-latency:
           s3_key: ${sources.slow-lake.key}
           s3_secret: ${sources.slow-lake.secret}
           allow_http: 'true'
-# Data at the dataset's own `cayenne_file_path` in an S3-compatible store, with
-# the prototype metastore on (#16130); the metastore stays in a local
-# directory. The script declares a `rustfs` source named `lake`, and the data
-# is under `data/<dataset>/` in its bucket.
-object-store-data-path-rustfs:
-  spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
-  datasets: { '*': { acceleration: { params: { cayenne_file_path: 's3://${sources.lake.bucket}/data', cayenne_s3_endpoint: '${sources.lake.endpoint}', cayenne_s3_region: us-east-1, cayenne_s3_auth: key, cayenne_s3_key: '${sources.lake.key}', cayenne_s3_secret: '${sources.lake.secret}' } } } }

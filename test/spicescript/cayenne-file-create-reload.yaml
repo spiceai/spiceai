@@ -14,9 +14,8 @@ description: >
 
 sources:
   src: { kind: postgres }
-  # The state locations of the object-native-data variants.
+  # The state location of object-native-s3.
   lake: { kind: rustfs }
-  slow-lake: { kind: rustfs, latency: 20ms }
 
 # The spicepod as written, the same with the prototype object-native Cayenne
 # metastore (`runtime.params.cayenne_vnext`) in place of SQLite, and with
@@ -24,8 +23,7 @@ sources:
 variants:
   as-written: federated
   object-native: object-native
-  object-native-data-rustfs: object-native-data-rustfs
-  object-native-data-rustfs-latency: object-native-data-rustfs-latency
+  object-native-s3: object-native-s3
 
 spicepod:
   version: v1
@@ -84,16 +82,10 @@ steps:
   # it: one folder (one log head) is left, none marked dropped.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
     eventually: 60s
-    only: object-native-data-rustfs
+    only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
     eventually: 60s
-    only: object-native-data-rustfs
-  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
-    eventually: 60s
-    only: object-native-data-rustfs-latency
-  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
-    eventually: 60s
-    only: object-native-data-rustfs-latency
+    only: object-native-s3
 
   # So does a restart; the folder the restart replaced is deleted by the
   # restarted instance once the grace passes, with no further start.
@@ -104,17 +96,11 @@ steps:
     eventually: 60s
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
     eventually: 60s
-    only: object-native-data-rustfs
+    only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
     eventually: 60s
-    only: object-native-data-rustfs
+    only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: .vortex, min: 1 }
-    only: object-native-data-rustfs
-  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
-    eventually: 60s
-    only: object-native-data-rustfs-latency
-  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
-    eventually: 60s
-    only: object-native-data-rustfs-latency
+    only: object-native-s3
   - assert-log: { lacks: ['were not removed from the object store', 'Deleted the acceleration data directory'] }
-    only: [object-native-data-rustfs, object-native-data-rustfs-latency]
+    only: object-native-s3

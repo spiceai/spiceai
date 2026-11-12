@@ -28,8 +28,8 @@ matrix:
 variants:
   as-written: federated
   object-native: object-native
-  object-native-data-rustfs: object-native-data-rustfs
-  object-native-data-rustfs-latency: object-native-data-rustfs-latency
+  object-native-s3: object-native-s3
+  object-native-s3-latency: object-native-s3-latency
 
 spicepod:
   version: v1
@@ -180,7 +180,7 @@ steps:
   # passed is covered by the engine's tests, which elapse it.)
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 2 }
     eventually: 60s
-    only: object-native-data-rustfs
+    only: object-native-s3
   - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 2 }
     eventually: 60s
-    only: object-native-data-rustfs-latency
+    only: object-native-s3-latency

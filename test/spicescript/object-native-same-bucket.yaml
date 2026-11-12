@@ -31,7 +31,7 @@ variants:
             s3_key: ${sources.src.key}
             s3_secret: ${sources.src.secret}
             allow_http: 'true'
-  other-store: object-native-data-rustfs
+  other-store: object-native-s3
   no-state-location: {}
 
 spicepod:

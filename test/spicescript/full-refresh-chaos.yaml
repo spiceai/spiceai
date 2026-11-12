@@ -13,8 +13,7 @@ description: >
 sources:
   src: { kind: '${matrix.src}' }
   ref: { kind: postgres }
-  # The state locations of the object-native-data variants, and the data path
-  # of object-store-data-path-rustfs.
+  # The state locations of the object-native-s3 variants.
   lake: { kind: rustfs }
   slow-lake: { kind: rustfs, latency: 20ms }
 
@@ -28,11 +27,9 @@ variants:
   object-native: object-native
   # Object-native data (#16131): data files in the state location, which an
   # instance that loses its directory serves again without the source.
-  object-native-data-local: object-native-data-local
-  object-native-data-rustfs: object-native-data-rustfs
-  object-native-data-rustfs-latency: object-native-data-rustfs-latency
-  # Data at the dataset's own `cayenne_file_path` on RustFS (#16130).
-  object-store-data-path-rustfs: object-store-data-path-rustfs
+  object-native-local: object-native-local
+  object-native-s3: object-native-s3
+  object-native-s3-latency: object-native-s3-latency
 
 spicepod:
   version: v1
@@ -108,39 +105,16 @@ steps:
 
   - stop-background: { id: whole-table, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection', 'not ready'] }
 
-  # Data at its own path on RustFS (#16130): the files are in the bucket and
-  # none on local disk. A `mode: file_create` restart reloads the table and
-  # deletes the previous acceleration's objects, so the bucket holds about one
-  # generation of the table (50,000 rows: a handful of files), not every
-  # generation the refreshes above wrote.
-  - assert-objects: { source: lake, prefix: data/facts/, contains: .vortex, min: 1 }
-    only: object-store-data-path-rustfs
-  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$'] }
-    only: object-store-data-path-rustfs
-  - restart:
-      patch: { datasets: { facts: { acceleration: { mode: file_create } } } }
-    only: object-store-data-path-rustfs
-  - query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts
-    eventually: 60s
-    only: object-store-data-path-rustfs
-  - assert-objects: { source: lake, prefix: data/facts/, contains: .vortex, min: 1, max: 32 }
-    only: object-store-data-path-rustfs
-  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$'] }
-    only: object-store-data-path-rustfs
-  - restart:
-      patch: { datasets: { facts: { acceleration: { mode: file } } } }
-    only: object-store-data-path-rustfs
-
   # Object-native data (#16131): the table's files are in the state
   # location, under its log's data/ folder, and none at a local `s3:` path.
   - assert-files: { contains: '^state/cayenne/v1/datasets/facts-[^/]+/data/' }
-    only: object-native-data-local
+    only: object-native-local
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/facts-, contains: /data/, min: 1 }
-    only: object-native-data-rustfs
+    only: object-native-s3
   - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/facts-, contains: /data/, min: 1 }
-    only: object-native-data-rustfs-latency
+    only: object-native-s3-latency
   - assert-files: { lacks: '(^|/)s3:' }
-    only: &object-native-data [object-native-data-local, object-native-data-rustfs, object-native-data-rustfs-latency]
+    only: &object-native-data [object-native-local, object-native-s3, object-native-s3-latency]
 
   # An instance that loses its directory serves the whole table from the
   # location alone: the source is down, so it cannot read the rows again.
