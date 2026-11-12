@@ -27,7 +27,7 @@ The helper:
 2. Starts only this `spiced` on `HTTP_ADDR` (default `127.0.0.1:18391`) plus side ports, logging to `$WORK_DIR/spiced.log`, and records its pid.
 3. Waits for `GET /v1/ready` to be `200` (90s timeout). An open port is not ready.
 4. Sends each body shape and prints one line per case: `case | HTTP status | body`.
-5. Stops the pid it started (never `pkill`) and removes the work directory unless `KEEP=1`.
+5. Stops the pid it started (never `pkill`) and removes the work directory it created unless `KEEP=1`. A `WORK_DIR` you pass is never removed.
 
 To point it at an already-running instance, pass `--url http://host:port` instead of a binary; it then skips launch and teardown. Use a dataset name with `DATASET=` if it is not `events`.
 
