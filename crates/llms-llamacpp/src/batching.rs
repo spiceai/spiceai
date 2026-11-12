@@ -790,7 +790,13 @@ impl HostCache {
         if bytes > budget {
             return false;
         }
-        while self.bytes + bytes > budget {
+        self.shrink_to(budget - bytes)
+    }
+
+    /// Moves out the prompts saved longest ago until what the cache holds fits in `budget`
+    /// bytes, and says whether it does.
+    fn shrink_to(&mut self, budget: usize) -> bool {
+        while self.bytes > budget {
             let Some(oldest) = self
                 .saved
                 .iter()
@@ -854,13 +860,19 @@ impl HostCache {
     }
 
     /// Returns a prompt [`HostCache::take_best`] took and a request continued only part of, so
-    /// its conversation can still continue all of it, within the memory it held before.
+    /// its conversation can still continue all of it. What the cache holds stays within the
+    /// memory it may use: the sequence's own prompt may have taken the room this one left, so
+    /// the prompts saved longest ago leave, this one among them, until everything fits.
     fn put_back(&mut self, saved: Saved) {
-        let bytes = saved.bytes();
-        if bytes <= host_budget(self.bytes) {
-            self.bytes += bytes;
-            self.saved.push(saved);
-        }
+        let budget = host_budget(self.bytes);
+        self.put_back_within(saved, budget);
+    }
+
+    /// [`HostCache::put_back`] within `budget` bytes.
+    fn put_back_within(&mut self, saved: Saved, budget: usize) {
+        self.bytes += saved.bytes();
+        self.saved.push(saved);
+        self.shrink_to(budget);
     }
 }
 
@@ -1336,6 +1348,30 @@ mod tests {
         // against 100 tokens x 0.1 ms = 10 ms, it pays
         assert!(host.admits_within(1_000, 100, Some(1e-4), 10_000));
         assert_eq!(ticks(&host), [1]);
+    }
+
+    /// A prompt a request continued only part of goes back within the budget, though the
+    /// sequence's own prompt took the room its taking left: the prompt saved longest ago leaves.
+    #[test]
+    fn a_partly_continued_prompt_goes_back_within_the_budget() {
+        let mut host = holding(&[(400, 1), (400, 3)]);
+        // the request takes the prompt saved at 3 ...
+        let index = host
+            .saved
+            .iter()
+            .position(|saved| saved.last_used == 3)
+            .expect("the prompt saved at 3");
+        let taken = host.saved.swap_remove(index);
+        host.bytes -= taken.bytes();
+        // ... its sequence's own prompt moves out into the room that left ...
+        assert!(host.admits_within(500, 10, None, 1_000));
+        let own = saved(500, 4);
+        host.keep(own.prompt, own.state, 4, std::time::Duration::ZERO);
+        assert_eq!(host.bytes, 900);
+        // ... and the taken prompt goes back
+        host.put_back_within(taken, 1_000);
+        assert_eq!(ticks(&host), [3, 4]);
+        assert_eq!(host.bytes, 900);
     }
 
     /// What `pick_slot` reads of each free sequence: an empty cache, idle since `last_used`.
