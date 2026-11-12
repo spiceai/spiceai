@@ -74,7 +74,7 @@ async fn sustained(retention: Duration) -> (Vec<usize>, Arc<dyn ObjectStore>, St
     let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
     let catalog = ObjectNativeCatalog::create_with_config(
         Arc::clone(&store),
-        Path::from("catalog"),
+        Path::from(crate::common::LOCATION_CATALOG),
         config(retention),
     )
     .await
@@ -87,7 +87,7 @@ async fn sustained(retention: Duration) -> (Vec<usize>, Arc<dyn ObjectStore>, St
             ])),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/unused/orders".to_string(),
+            base_path: crate::common::location_data_url(&catalog, "orders"),
             partition_column: None,
             vortex_config: VortexConfig::default(),
         })
@@ -150,7 +150,7 @@ async fn sustained_commits_keep_log_objects_bounded_and_every_row() {
     // Reopened from storage alone, the catalog holds every row in order.
     let reopened = ObjectNativeCatalog::open_with_config(
         Arc::clone(&store),
-        Path::from("catalog"),
+        Path::from(crate::common::LOCATION_CATALOG),
         config(RETENTION),
     )
     .await

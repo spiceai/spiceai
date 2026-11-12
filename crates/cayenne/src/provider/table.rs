@@ -4612,6 +4612,8 @@ struct CheckpointCommitExtras {
     table_statistics: Option<TableStatistics>,
     /// The current snapshot, whose per-file statistics are kept.
     keep_file_statistics_of: Option<String>,
+    /// See [`MemTierDurableCommit::manifest_files`].
+    manifest_files: Vec<SnapshotFile>,
 }
 
 /// Outcome of a best-effort [`CayenneTableProvider::try_checkpoint_mem_tier`].
@@ -9543,6 +9545,31 @@ impl CayenneTableProvider {
         )
         .await
         .map(|_| ())
+    }
+
+    /// The manifest rows [`Self::record_new_protected_snapshot_files`] would
+    /// record, for a commit that names them itself; empty for a table outside
+    /// the object-native location. The files stay in the writer's record until
+    /// that commit lands.
+    async fn new_protected_snapshot_manifest(
+        &self,
+        snapshot_id: &str,
+        sequence: i64,
+    ) -> CatalogResult<Vec<SnapshotFile>> {
+        if !self.data_in_object_native_location() {
+            return Ok(Vec::new());
+        }
+        let (_, rows) = self
+            .snapshot_manifest_rows(
+                snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: sequence,
+                    max: sequence,
+                },
+                Vec::new(),
+            )
+            .await?;
+        Ok(rows)
     }
 
     /// Records `files` (`(file name, size)` in `snapshot_id`'s directory) in the
@@ -20820,6 +20847,7 @@ impl CayenneTableProvider {
                 insert_records: extras.insert_records,
                 table_statistics: extras.table_statistics,
                 keep_file_statistics_of: extras.keep_file_statistics_of,
+                manifest_files: extras.manifest_files,
             })
             .await?;
 
@@ -27688,6 +27716,26 @@ impl CayenneTableProvider {
         tag: ManifestSequenceTag,
         carried: Vec<SnapshotFile>,
     ) -> CatalogResult<Vec<(String, u64)>> {
+        let table_id = self.table_metadata.table_id.clone();
+        let (files, replacement) = self
+            .snapshot_manifest_rows(snapshot_id, tag, carried)
+            .await?;
+        self.catalog
+            .replace_snapshot_files(&table_id, snapshot_id, &replacement)
+            .await?;
+        self.uncommitted_files.forget(snapshot_id);
+
+        Ok(files)
+    }
+
+    /// The files of `snapshot_id` and its complete manifest rows, as
+    /// [`Self::upsert_snapshot_manifest_carrying`] records them.
+    async fn snapshot_manifest_rows(
+        &self,
+        snapshot_id: &str,
+        tag: ManifestSequenceTag,
+        carried: Vec<SnapshotFile>,
+    ) -> CatalogResult<(Vec<(String, u64)>, Vec<SnapshotFile>)> {
         let mut files = self
             .list_snapshot_files_with_sizes(snapshot_id)
             .await
@@ -27776,12 +27824,7 @@ impl CayenneTableProvider {
             });
         }
 
-        self.catalog
-            .replace_snapshot_files(&table_id, snapshot_id, &replacement)
-            .await?;
-        self.uncommitted_files.forget(snapshot_id);
-
-        Ok(files)
+        Ok((files, replacement))
     }
 
     /// The manifest row of `file_name` (`size` bytes) in `snapshot_id`, tagged
@@ -40350,9 +40393,10 @@ impl CayenneTableProvider {
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
             }
             // A table in the object-native location scans only its manifest: the
-            // checkpoint snapshot's files are recorded before the commit that
-            // registers it.
-            self.record_new_protected_snapshot_files(&new_snapshot_id, sequence_number)
+            // checkpoint snapshot's files are named in the commit that registers
+            // it, so they never publish apart from the clear of their rows.
+            let manifest_files = self
+                .new_protected_snapshot_manifest(&new_snapshot_id, sequence_number)
                 .await?;
 
             // The snapshot holds every row of the inline corpus and of a seal
@@ -40409,6 +40453,7 @@ impl CayenneTableProvider {
                         insert_records,
                         table_statistics: table_statistics.clone(),
                         keep_file_statistics_of: Some(self.get_current_snapshot_id()),
+                        manifest_files,
                     },
                 )
                 .await;
@@ -40417,6 +40462,8 @@ impl CayenneTableProvider {
                 inlined_tombstone_written,
             } = match committed {
                 Ok(update) => {
+                    // The commit named the snapshot's files.
+                    self.uncommitted_files.forget(&new_snapshot_id);
                     if let Some(table_statistics) = table_statistics {
                         self.table_stats_recorded(table_statistics);
                     }

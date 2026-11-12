@@ -1107,6 +1107,7 @@ impl MetadataCatalog for Domain {
             insert_records,
             table_statistics,
             keep_file_statistics_of,
+            manifest_files,
         } = commit;
         if !insert_pk_bytes.is_empty()
             && !reinsert_delete_files
@@ -1135,6 +1136,7 @@ impl MetadataCatalog for Domain {
             || table_statistics
                 .as_ref()
                 .is_some_and(|stats| stats.table_id != table_id)
+            || manifest_files.iter().any(|f| f.table_id != table_id)
         {
             return Err(invalid(format!(
                 "Mem-tier commit rows must belong to table '{table_id}'"
@@ -1154,6 +1156,19 @@ impl MetadataCatalog for Domain {
             .collect();
         let (_, deletes) = inner.delete_batch(&pure_delete_files)?;
         batch.extend(deletes);
+        let mut by_snapshot: Vec<(&str, Vec<SnapshotFile>)> = Vec::new();
+        for file in &manifest_files {
+            match by_snapshot
+                .iter_mut()
+                .find(|(snapshot, _)| *snapshot == file.snapshot_id)
+            {
+                Some((_, rows)) => rows.push(file.clone()),
+                None => by_snapshot.push((&file.snapshot_id, vec![file.clone()])),
+            }
+        }
+        for (snapshot, rows) in &by_snapshot {
+            batch.push(actions::add_files(&table_id, snapshot, rows, true));
+        }
         if let Some(snapshot) = snapshot_sequence {
             batch.push(actions::set_group(
                 &table_id,

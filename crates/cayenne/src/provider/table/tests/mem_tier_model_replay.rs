@@ -198,6 +198,11 @@ fn batch_rows(batches: &[RecordBatch]) -> Rows {
 }
 async fn physical_rows(table: &CayenneTableProvider, snapshot: &str) -> Rows {
     let ctx = SessionContext::new();
+    // A table whose data is in the object-native location reads it through its
+    // own store, which this session must know.
+    if let Some(storage) = table.dataset_storage() {
+        storage.register(&ctx.runtime_env());
+    }
     let plan = table
         .create_snapshot_scan_plan(&ctx.state(), snapshot, None, &[], None)
         .await
@@ -216,7 +221,13 @@ enum Backend {
 }
 struct Disk {
     root: TempDir,
+    /// The table's data directory: the dataset's `data` folder in the local
+    /// object-native location (`file://…`) for the object-native metastore, a
+    /// plain directory for SQLite.
     data: PathBuf,
+    /// The catalog's key prefix in `store`, beside the dataset folders of the
+    /// location `data` is in.
+    prefix: String,
     db: PathBuf,
     store: Arc<dyn ObjectStore>,
     backend: Backend,
@@ -231,8 +242,19 @@ impl Disk {
     fn new(backend: Backend) -> Self {
         let root =
             tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("workspace tempdir");
+        let location = root.path().join("state").join("cayenne").join("v1");
+        let data = match backend {
+            Backend::Object => location
+                .join("datasets")
+                .join(crate::metastore::object_native::new_dataset_folder(
+                    "replay",
+                ))
+                .join("data"),
+            Backend::Sqlite => root.path().join("data"),
+        };
         Self {
-            data: root.path().join("data"),
+            data,
+            prefix: format!("{}/catalog", location.to_string_lossy().trim_matches('/')),
             db: root.path().join("catalog.db"),
             root,
             store: Arc::new(InMemory::new()),
@@ -244,7 +266,7 @@ impl Disk {
             Backend::Object => Arc::new(if create {
                 ObjectNativeCatalog::create_with_config(
                     Arc::clone(&self.store),
-                    ObjectPath::from("catalog"),
+                    ObjectPath::from(self.prefix.as_str()),
                     config(),
                 )
                 .await
@@ -252,7 +274,7 @@ impl Disk {
             } else {
                 ObjectNativeCatalog::open_with_config(
                     Arc::clone(&self.store),
-                    ObjectPath::from("catalog"),
+                    ObjectPath::from(self.prefix.as_str()),
                     config(),
                 )
                 .await
@@ -272,7 +294,10 @@ impl Disk {
         acknowledged: usize,
         sequences: &BTreeMap<i64, usize>,
     ) -> Probe {
-        let clone = Self::new(self.backend);
+        let mut clone = Self::new(self.backend);
+        // The copied objects keep their keys, so the clone's catalog is at the
+        // same prefix; the table reads the data directory restored below.
+        clone.prefix.clone_from(&self.prefix);
         let objects = self
             .store
             .list(None)
@@ -351,7 +376,14 @@ impl Disk {
         let mut delete_entries = Vec::new();
         for file in deletes {
             let reader = arrow_ipc::reader::FileReader::try_new(
-                std::fs::File::open(&file.path).expect("vector file"),
+                // A data path in a local location is a `file://` URL.
+                std::fs::File::open(
+                    url::Url::parse(&file.path)
+                        .ok()
+                        .and_then(|url| url.to_file_path().ok())
+                        .unwrap_or_else(|| PathBuf::from(&file.path)),
+                )
+                .expect("vector file"),
                 None,
             )
             .expect("vector IPC");
@@ -373,7 +405,7 @@ impl Disk {
             }
         }
         delete_entries.sort_unstable();
-        let table = open(catalog).await;
+        let table = open(self, catalog).await;
         table.quiesce().await;
         let current_rows = physical_rows(&table, &table.get_current_snapshot_id()).await;
         let mut protected_rows = Vec::new();
@@ -421,23 +453,39 @@ impl Drop for Restore {
         std::fs::rename(&self.saved, &self.live).expect("restore original data");
     }
 }
-async fn open(catalog: Arc<dyn MetadataCatalog>) -> Arc<CayenneTableProvider> {
-    let table = CayenneTableProviderBuilder::new(catalog, SessionContext::new().runtime_env())
-        .open("replay")
-        .await
-        .expect("reopen");
+/// The builder for the table on `disk`: with its data in the object-native
+/// location, the store a `file://` location's data is read through.
+fn builder(disk: &Disk, catalog: Arc<dyn MetadataCatalog>) -> CayenneTableProviderBuilder {
+    let builder = CayenneTableProviderBuilder::new(catalog, SessionContext::new().runtime_env());
+    match disk.backend {
+        Backend::Object => builder.with_object_store(crate::metadata::ObjectStoreConfig {
+            url: url::Url::from_directory_path(&disk.data).expect("data url"),
+            store: crate::dataset_storage::local_directory_store(),
+        }),
+        Backend::Sqlite => builder,
+    }
+}
+fn base_path(disk: &Disk) -> String {
+    match disk.backend {
+        Backend::Object => url::Url::from_file_path(&disk.data)
+            .expect("data url")
+            .to_string(),
+        Backend::Sqlite => disk.data.to_string_lossy().into_owned(),
+    }
+}
+async fn open(disk: &Disk, catalog: Arc<dyn MetadataCatalog>) -> Arc<CayenneTableProvider> {
+    let table = builder(disk, catalog).open("replay").await.expect("reopen");
     table.install_slot_advancer(Arc::new(Ack::default()));
     Arc::new(table)
 }
 async fn initial(disk: &Disk, catalog: Arc<dyn MetadataCatalog>) -> Arc<CayenneTableProvider> {
-    let table = CayenneTableProvider::create_table(
-        Arc::clone(&catalog),
-        CreateTableOptions {
+    let table = builder(disk, Arc::clone(&catalog))
+        .create(CreateTableOptions {
             table_name: "replay".into(),
             schema: schema(),
             primary_key: vec!["id".into()],
             on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".into()]))),
-            base_path: disk.data.to_string_lossy().into_owned(),
+            base_path: base_path(disk),
             partition_column: None,
             vortex_config: VortexConfig {
                 cdc_durability: CdcDurability::Memory,
@@ -452,11 +500,9 @@ async fn initial(disk: &Disk, catalog: Arc<dyn MetadataCatalog>) -> Arc<CayenneT
                 compaction_background_interval_ms: 3_600_000,
                 ..VortexConfig::default()
             },
-        },
-        SessionContext::new().runtime_env(),
-    )
-    .await
-    .expect("create table");
+        })
+        .await
+        .expect("create table");
     // Seed the model's genesis through the real file writer, at exactly S=1.
     let sequence = table
         .reserve_sequences_local(1)
@@ -696,7 +742,7 @@ async fn replay(
             }
             "Recover" => {
                 catalog = Some(disk.catalog(false).await);
-                let reopened = open(Arc::clone(catalog.as_ref().expect("catalog"))).await;
+                let reopened = open(&disk, Arc::clone(catalog.as_ref().expect("catalog"))).await;
                 reopened.install_slot_advancer(Arc::clone(&ack) as Arc<dyn SlotAdvancer>);
                 table = Some(reopened);
                 redelivery = (ack.position() < source.len()).then_some(ack.position());
@@ -917,7 +963,7 @@ async fn mem_tier_model_replay_control_one_call() {
 async fn log_records(disk: &Disk, label: &str) -> Vec<(u64, Vec<&'static str>)> {
     let log = crate::metastore::object_native::dataset_log_at(
         Arc::clone(&disk.store),
-        &ObjectPath::from("catalog"),
+        &ObjectPath::from(disk.prefix.as_str()),
         "replay",
     )
     .await

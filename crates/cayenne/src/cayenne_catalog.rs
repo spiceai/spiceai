@@ -3253,6 +3253,13 @@ impl MetadataCatalog for CayenneCatalog {
                         })
                         .await?;
                     }
+                    for file in &commit.manifest_files {
+                        tx.execute(ExecuteParams {
+                            sql: SNAPSHOT_FILE_UPSERT_SQL,
+                            params: snapshot_file_params(file),
+                        })
+                        .await?;
+                    }
                     if let Some(snapshot_id) = &commit.keep_file_statistics_of {
                         tx.execute(ExecuteParams {
                             sql: "DELETE FROM cayenne_snapshot_file_statistics \

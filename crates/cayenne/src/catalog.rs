@@ -332,6 +332,11 @@ pub struct MemTierDurableCommit {
     pub table_statistics: Option<TableStatistics>,
     /// Drop the per-file statistics of every snapshot except this one.
     pub keep_file_statistics_of: Option<String>,
+    /// Manifest rows of the data files this commit's rows landed in, upserted
+    /// with it: a table whose data is in the object-native location scans only
+    /// its manifest, so its files and the clear of the rows they hold commit
+    /// together.
+    pub manifest_files: Vec<SnapshotFile>,
 }
 
 /// One table's durable append publication. A slice is one atomic transaction.
