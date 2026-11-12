@@ -6,10 +6,19 @@ description: >-
   before they touch its artifacts. One list for every caller, identical in spiceai/spiceai and
   spicehq/spiceai so the OSS merge stays clean; a workflow name a repository lacks matches nothing.
   The run must be all of:
-    - from E2E Test CI, build_release, build_and_release, build_nightly, build_and_release_cuda,
-      Enterprise Release or release_from_run (display names);
-    - triggered by push, merge_group, workflow_dispatch, schedule or release, never pull_request
-      or pull_request_target;
+    - from one of these workflows, matched by display name and by the file the run ran (the run's
+      `path`, any @ref suffix stripped), on only the events that workflow uses (`on:`, less
+      pull_request and workflow_call). spicehq/spiceai runs its own ent_*.yml copies of four; a
+      file a repository lacks matches nothing.
+        name                    file in spiceai/spiceai      file in spicehq/spiceai         events
+        E2E Test CI             e2e_test_ci.yml              ent_e2e_test_ci.yml             push, merge_group
+        build_release           build_release.yml            ent_build_release.yml           push, workflow_dispatch
+        build_and_release       build_and_release.yml        ent_build_and_release.yml       push, workflow_dispatch
+        build_and_release_cuda  build_and_release_cuda.yml   ent_build_and_release_cuda.yml  push, workflow_dispatch
+        build_nightly           build_nightly.yml            build_nightly.yml               schedule, workflow_dispatch
+        Enterprise Release      enterprise_release.yml       enterprise_release.yml          workflow_dispatch
+        release_from_run        release_from_run.yml         release_from_run.yml            workflow_dispatch
+      (all under .github/workflows/). Never pull_request or pull_request_target;
     - built from this repository, not a fork;
     - built from trunk or a release branch (release/X.Y or release/X.Y.Z, optionally -rc.N or
       -rcN) and on that branch's history; from a merge queue branch
@@ -53,26 +62,36 @@ runs:
         # request run takes its name from the author's workflow file, so a name could carry line
         # breaks to forge the fields read after it: flatten them, and require one line per field.
         info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
-          -q '.name, .event, (.head_repository.full_name // ""), (.head_branch // ""), .head_sha
+          -q '.name, (.path // ""), .event, (.head_repository.full_name // ""), (.head_branch // ""), .head_sha
             | tostring | gsub("[\r\n]"; " ")')
-        [ "$(wc -l <<<"$info")" -eq 5 ] || { echo "::error::Run $RUN_ID returned an unexpected metadata record"; exit 1; }
-        { read -r workflow; read -r event; read -r head_repo; read -r head_branch; read -r head_sha; } <<<"$info"
+        [ "$(wc -l <<<"$info")" -eq 6 ] || { echo "::error::Run $RUN_ID returned an unexpected metadata record"; exit 1; }
+        { read -r workflow; read -r path; read -r event; read -r head_repo; read -r head_branch; read -r head_sha; } <<<"$info"
+        path=${path%%@*}
         refuse() {
           echo "::error::Run $RUN_ID ($workflow, $event event, $head_repo @ $head_branch) $1"
           exit 1
         }
 
+        # Each allowed workflow: the one file it must come from and the events it may run on, from
+        # its `on:` block less pull_request and workflow_call (a called workflow's run is its caller's).
+        # spicehq/spiceai keeps upstream copies of four of these disabled and runs ent_*.yml instead.
+        case "$GITHUB_REPOSITORY" in spicehq/spiceai) ent=ent_ ;; *) ent="" ;; esac
         case "$workflow" in
-          "E2E Test CI" | build_release | build_and_release | build_nightly | build_and_release_cuda | \
-            "Enterprise Release" | release_from_run) ;;
+          "E2E Test CI")          file=${ent}e2e_test_ci.yml;            events="push merge_group" ;;
+          build_release)          file=${ent}build_release.yml;          events="push workflow_dispatch" ;;
+          build_and_release)      file=${ent}build_and_release.yml;      events="push workflow_dispatch" ;;
+          build_and_release_cuda) file=${ent}build_and_release_cuda.yml; events="push workflow_dispatch" ;;
+          build_nightly)          file=build_nightly.yml;                events="schedule workflow_dispatch" ;;
+          "Enterprise Release")   file=enterprise_release.yml;           events="workflow_dispatch" ;;
+          release_from_run)       file=release_from_run.yml;             events="workflow_dispatch" ;;
           *) refuse "is not from E2E Test CI, build_release, build_and_release, build_nightly, build_and_release_cuda, Enterprise Release or release_from_run" ;;
         esac
+        [ "$path" = ".github/workflows/$file" ] || refuse "ran ${path:-no workflow file}, not .github/workflows/$file"
 
         case "$event" in
-          push | merge_group | workflow_dispatch | schedule | release) ;;
           pull_request | pull_request_target) refuse "is a pull request run, whose build its author controls" ;;
-          *) refuse "was triggered by $event; only push, merge_group, workflow_dispatch, schedule and release are accepted" ;;
         esac
+        [[ " $events " == *" $event "* ]] || refuse "was triggered by $event; $workflow runs are accepted only from ${events// / or }"
 
         [ "$head_repo" = "$GITHUB_REPOSITORY" ] || refuse "was not built from $GITHUB_REPOSITORY"
 

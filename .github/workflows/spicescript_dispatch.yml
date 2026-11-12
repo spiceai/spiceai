@@ -226,7 +226,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SCRIPTS: ${{ inputs.scripts }}
         run: |
-          # shellcheck disable=SC2086 # SCRIPTS is a space-separated list
+          # SCRIPTS is a space-separated list of script paths, never options: anyone who can dispatch
+          # could otherwise pass flags such as --spiced. Split it without globbing, refuse an entry
+          # that starts with `-`, and end the options with `--` before it.
+          read -r -d '' -a script_paths <<<"$SCRIPTS" || true # every line; read returns 1 at the end
+          for entry in "${script_paths[@]}"; do
+            [[ "$entry" != -* ]] || { echo "::error::scripts entry '$entry' starts with '-'; give script paths only"; exit 1; }
+          done
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
             --partition ${{ matrix.partition }} \
             --spiced "$SPICED" \
@@ -234,7 +240,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/spicescript" \
             --results "$RUNNER_TEMP/spicescript-results.json" \
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
-            $SCRIPTS
+            -- "${script_paths[@]}"
 
       - name: Upload script results
         if: ${{ !cancelled() }}
