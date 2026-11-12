@@ -58,6 +58,7 @@
   "feed-chaos": 232,
   "feed-generate": 38,
   "feed-write-boundaries": 10,
+  "file-source-removed-keeps-acceleration": 60,
   "file-tables-federated-freshness": 15,
   "file-tables-refresh": 76,
   "files-coverage": 38,

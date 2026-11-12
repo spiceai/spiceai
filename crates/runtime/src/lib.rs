@@ -978,6 +978,12 @@ impl Runtime {
         self.llm_runtime_stores.rate_controllers()
     }
 
+    /// This node's rank in each loaded model split across several nodes, by model name.
+    #[must_use]
+    pub fn model_node_ranks(&self) -> Arc<RwLock<HashMap<String, usize>>> {
+        self.llm_runtime_stores.node_ranks()
+    }
+
     #[must_use]
     pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
         self.llm_runtime_stores.responses_llms()

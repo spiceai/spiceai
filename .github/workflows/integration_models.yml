@@ -46,7 +46,7 @@ jobs:
   build:
     name: Build Test Binary (macOS)
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
@@ -489,7 +489,7 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
@@ -728,7 +728,7 @@ jobs:
   build-extended:
     name: Build Test Binary (Extended)
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
