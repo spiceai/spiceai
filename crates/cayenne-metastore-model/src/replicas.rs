@@ -119,6 +119,14 @@ pub(crate) enum Action {
     ReplicaExpire(usize),
     ReplicaSweep(usize),
 }
+/// The members of a bit set of objects or versions.
+fn set_label(set: u8, n: usize) -> String {
+    let members: Vec<String> = (0..n)
+        .filter(|i| set & bit(*i) != 0)
+        .map(|i| i.to_string())
+        .collect();
+    format!("{{{}}}", members.join(", "))
+}
 const fn bit(o: usize) -> u8 {
     1 << o
 }
@@ -426,6 +434,163 @@ impl Model for Protocol {
             }
         }
         if n == *s { None } else { Some(n) }
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Tick => "the clock ticks".into(),
+            Action::Upload(o) => format!("the writer uploads object {o} at the source"),
+            Action::Publish(o) => format!("the writer commits a reference to object {o}"),
+            Action::Remove(o) => format!("the writer removes object {o} from the head"),
+            Action::Bump => "the source GC's empty commit moves the head".into(),
+            Action::SourceExpire(o) => {
+                format!("source GC deletes removed object {o} after retention")
+            }
+            Action::SourceSweep(o) => format!("source GC deletes orphan upload {o}"),
+            Action::CopyObject(o) => format!("replication copies object {o} to the replica"),
+            Action::CopyHead(v) => format!("replication copies head version {v} to the replica"),
+            Action::Adopt => "the replica reader adopts the replicated head".into(),
+            Action::Confirm => {
+                "the replica reader sends a conditional GET on the source head".into()
+            }
+            Action::Respond => "the source head GET responds".into(),
+            Action::Start => "a query starts from the confirmed head".into(),
+            Action::Get(o) => format!("the query reads object {o} from the replica"),
+            Action::ReplicaRead => "replica GC reads the replicated removals".into(),
+            Action::ReplicaExpire(o) => {
+                format!("replica GC deletes its copy of removed object {o}")
+            }
+            Action::ReplicaSweep(o) => {
+                format!("replica GC deletes its copy of object {o} the source no longer has")
+            }
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        Some(crate::explorer::summary(&[
+            format!(
+                "retention T = {T}, staleness S = {S}, upload age T_O = {T_O}; clock {}",
+                s.now
+            ),
+            format!("head versions at the replica: {}", set_label(s.arrived, V)),
+            crate::explorer::flags(&[
+                ("reader waited", s.waited),
+                ("reader lagging", s.lagging),
+                ("query error after retention", s.late_error),
+                ("removed object collected", s.removed_collected),
+                ("orphan collected", s.orphan_collected),
+                ("BAD adopt", s.bad_adopt),
+                ("BAD lower-version adopt", s.lower_adopt),
+                ("BAD confirm", s.bad_confirm),
+                ("BAD availability", s.bad_availability),
+                ("BAD rows", s.bad_rows),
+                ("BAD committed object deleted", s.committed_deleted),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let last = path.last_state().clone();
+        let n = self.objects();
+        let refs = |v: u8| last.live[usize::from(v)];
+        let replica_refs = refs(last.replica_head);
+        let mut boxes = vec![
+            (
+                format!("SOURCE HEAD v{} (at {})", last.version, last.head_time),
+                vec![format!("references {}", set_label(refs(last.version), n))],
+                Tone::Live,
+            ),
+            (
+                "SOURCE STORE".into(),
+                vec![format!("objects {}", set_label(last.source, n))],
+                Tone::Live,
+            ),
+            (
+                format!("REPLICA HEAD v{}", last.replica_head),
+                vec![format!("references {}", set_label(replica_refs, n))],
+                if replica_refs & !last.replica == 0 {
+                    Tone::Live
+                } else {
+                    Tone::Bad
+                },
+            ),
+            (
+                "REPLICA STORE".into(),
+                vec![format!("objects {}", set_label(last.replica, n))],
+                Tone::Live,
+            ),
+        ];
+        if self.readers() {
+            let mut lines = vec![format!("holds v{}", last.held)];
+            if let Some((at, v)) = last.confirmed {
+                lines.push(format!("confirmed v{v} at {at}"));
+            }
+            if let Some((start, v)) = last.query {
+                lines.push(format!(
+                    "query on v{v} started {start}: {}",
+                    match last.result {
+                        None => "running",
+                        Some(true) => "rows",
+                        Some(false) => "error",
+                    }
+                ));
+            }
+            boxes.push(("REPLICA READER".into(), lines, Tone::Actor));
+        }
+        let (writer, source, replication, replica, reader, gc) = (0, 1, 2, 3, 4, 5);
+        let lanes = ["writer", "source", "replication", "replica", "reader", "GC"]
+            .map(String::from)
+            .to_vec();
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            events.push(match action {
+                Action::Tick => {
+                    Event::on(source, format!("clock -> {}", after.now)).tone(Tone::Gone)
+                }
+                Action::Upload(_) | Action::Publish(_) | Action::Remove(_) => {
+                    Event::on(writer, label).to(source)
+                }
+                Action::Bump | Action::SourceExpire(_) | Action::SourceSweep(_) => {
+                    Event::on(gc, label).to(source)
+                }
+                Action::CopyObject(_) | Action::CopyHead(_) => {
+                    Event::on(replication, label).to(replica)
+                }
+                Action::Adopt => {
+                    let ok = after.held != before.held;
+                    Event::on(
+                        reader,
+                        if ok {
+                            format!("adopt v{}", after.held)
+                        } else {
+                            "adopt: nothing newer".into()
+                        },
+                    )
+                    .to(replica)
+                    .tone(if ok { Tone::Actor } else { Tone::Gone })
+                }
+                Action::Confirm => Event::on(reader, label).to(source).tone(Tone::Staged),
+                Action::Respond => Event::on(source, label).to(reader),
+                Action::Start => Event::on(reader, label).tone(Tone::Actor),
+                Action::Get(o) => {
+                    let ok = before.replica & bit(o) != 0;
+                    Event::on(
+                        reader,
+                        if ok {
+                            label
+                        } else {
+                            format!("object {o} MISSING at the replica")
+                        },
+                    )
+                    .to(replica)
+                    .tone(if ok { Tone::Actor } else { Tone::Bad })
+                }
+                Action::ReplicaRead | Action::ReplicaExpire(_) | Action::ReplicaSweep(_) => {
+                    Event::on(gc, label).to(replica)
+                }
+            });
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
     }
     fn properties(&self) -> Vec<Property<Self>> {
         let mut properties = vec![Property::always(

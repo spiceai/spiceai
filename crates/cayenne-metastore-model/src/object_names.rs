@@ -46,6 +46,19 @@ struct Owner {
 type Name = (Option<Kind>, u8, u8, u8);
 /// An object's bytes, unique per holding and counter; equal bytes are one write.
 type Bytes = (u8, u8);
+fn kind_letter(kind: Option<Kind>) -> &'static str {
+    match kind {
+        Some(Kind::Writer) => "w",
+        Some(Kind::Maintenance) => "m",
+        None => "",
+    }
+}
+fn name_label((kind, id, generation, counter): Name) -> String {
+    match kind {
+        Some(_) => format!("{}{id}.{generation}-{counter}", kind_letter(kind)),
+        None => format!("{generation}-{counter}"),
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Hold {
     /// Index of the unit in the dataset state.
@@ -281,6 +294,132 @@ impl Model for Protocol {
             }
         }
         (next != *s).then_some(next)
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Take(i, u) => {
+                format!("node {i} takes unit {u}'s lease (head commit raises its generation)")
+            }
+            Action::Create(i) => format!("node {i} creates its next object (create if absent)"),
+            Action::Retry(i) => format!("node {i} resends an upload whose response was lost"),
+            Action::Commit(i) => format!("node {i} commits a reference to its upload"),
+            Action::Retire(u) => format!("maintenance unit {u} is retired"),
+            Action::Allocate => "a new maintenance unit is created".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        Some(crate::explorer::summary(&[
+            "names: <kind><unit>.<generation>-<counter>; bytes: (holding, counter)".into(),
+            format!(
+                "takeovers {} of {TAKES}; units created {} of {CREATED}",
+                s.takes, s.created
+            ),
+            crate::explorer::flags(&[
+                ("BAD name collision (different bytes)", s.collision),
+                ("holder fenced", s.fenced),
+                ("replacement unit created an object", s.replacement_created),
+                ("upload retried", s.retried),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Svg, Tone, row};
+        let s = path.last_state();
+        let mut svg = Svg::new();
+        let mut lines: Vec<String> = s
+            .units
+            .iter()
+            .enumerate()
+            .map(|(slot, u)| {
+                format!(
+                    "unit {slot} = {}{} gen {}{}",
+                    kind_letter(Some(u.kind)),
+                    u.id,
+                    u.generation,
+                    if u.active { "" } else { " (retired)" }
+                )
+            })
+            .collect();
+        let refs_at = lines.len();
+        lines.extend(
+            s.refs
+                .iter()
+                .map(|(n, b)| format!("ref {} digest {b:?}", name_label(*n))),
+        );
+        svg.heading(0, 0, "HEAD REFERENCES -> IMMUTABLE OBJECTS");
+        let head = svg.node(0, 22, 0, "HEAD", &lines, Tone::Live);
+        let col = head.right() + 80;
+        let mut y = 22;
+        let mut placed = vec![];
+        for (name, bytes, owner) in &s.store {
+            let referenced = s.refs.iter().any(|(n, _)| n == name);
+            let node = svg.node(
+                col,
+                y,
+                0,
+                &name_label(*name),
+                &[format!(
+                    "bytes {bytes:?} by {}{} gen {}",
+                    kind_letter(Some(owner.kind)),
+                    owner.id,
+                    owner.generation
+                )],
+                if referenced { Tone::Live } else { Tone::Staged },
+            );
+            y = node.bottom() + 8;
+            placed.push((*name, *bytes, node));
+        }
+        for (i, (name, digest)) in s.refs.iter().enumerate() {
+            if let Some((_, bytes, node)) = placed.iter().find(|(n, _, _)| n == name) {
+                svg.arrow(
+                    (head.right(), head.line_y(refs_at + i)),
+                    (node.x, node.mid_y()),
+                    if bytes == digest {
+                        Tone::Live
+                    } else {
+                        Tone::Bad
+                    },
+                    None,
+                );
+            } else {
+                let node = svg.node(
+                    col,
+                    y,
+                    0,
+                    &format!("{} MISSING", name_label(*name)),
+                    &[String::new()],
+                    Tone::Bad,
+                );
+                y = node.bottom() + 8;
+                svg.arrow(
+                    (head.right(), head.line_y(refs_at + i)),
+                    (node.x, node.mid_y()),
+                    Tone::Bad,
+                    None,
+                );
+            }
+        }
+        let boxes: Vec<(String, Vec<String>, Tone)> =
+            s.nodes
+                .iter()
+                .enumerate()
+                .map(|(i, node)| {
+                    let mut lines = vec![match node.hold {
+                        Some(h) => format!(
+                            "holds unit {} at gen {} (next counter {})",
+                            h.slot, h.generation, h.counter
+                        ),
+                        None => "holds nothing".into(),
+                    }];
+                    lines.extend(node.uploads.iter().map(|(n, b)| {
+                        format!("uploaded, not referenced: {} {b:?}", name_label(*n))
+                    }));
+                    (format!("NODE {i}"), lines, Tone::Actor)
+                })
+                .collect();
+        row(&mut svg, head.bottom().max(y) + 24, &boxes);
+        Some(svg.finish())
     }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![

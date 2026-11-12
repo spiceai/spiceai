@@ -59,6 +59,21 @@ impl Rec {
         }
     }
 }
+fn rec_label(r: Rec) -> String {
+    let tx = |tx: u8| format!("p{}.t{}", part_of(tx), seq_of(tx));
+    match r {
+        Rec::Txn {
+            tx: t,
+            epoch,
+            at,
+            plan,
+        } => {
+            format!("Txn {} + intent for B@{plan} [epoch {epoch} @{at}]", tx(t))
+        }
+        Rec::Apply { tx: t, epoch, at } => format!("Apply {} [epoch {epoch} @{at}]", tx(t)),
+        Rec::Done { tx: t, epoch, at } => format!("Done {} [epoch {epoch} @{at}]", tx(t)),
+    }
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 struct Dataset {
     log: Vec<Rec>,
@@ -764,6 +779,216 @@ impl Model for Protocol {
         }
         Self::forget_dead_requests(&mut next)?;
         (next != *s).then_some(next)
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Ingest(w) => {
+                format!("writer {w} sends A: its partition's actions, position and intent")
+            }
+            Action::IssueApply(w) => {
+                format!("writer {w} sends B: apply the intent under its transaction id")
+            }
+            Action::IssueDone(w) => format!("writer {w} sends A: mark the intent done"),
+            Action::SkipDone(w) => format!("writer {w} skips the done marker"),
+            Action::Recover(w) => {
+                format!("writer {w} rolls its partition's pending intents forward")
+            }
+            Action::Acquire(w) => format!("writer {w} records its generation in the next head"),
+            Action::Check(w) => format!("writer {w} resolves its lost response by attempt id"),
+            Action::Deliver(i, 0) => format!("request {i} arrives"),
+            Action::Deliver(i, _) => format!("a duplicate of request {i} arrives"),
+            Action::Crash(w) => format!("writer {w} crashes"),
+            Action::Takeover(p) => format!("a new owner takes partition {p} over"),
+            Action::Handoff(p) => format!("partition {p}'s live owner hands it off"),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        Some(crate::explorer::summary(&[
+            format!(
+                "acknowledged per partition: {:?}; owner writer per partition: {:?}; crashes {:?}",
+                s.acknowledged, s.owner, s.crashes
+            ),
+            crate::explorer::flags(&[
+                ("partitions committed concurrently", s.concurrent),
+                (
+                    "recovered while the other partition committed",
+                    s.recovered_while_other_committed,
+                ),
+                ("other partition's write rebased past", s.other_rebased),
+                ("fenced on B", s.fenced_on_b),
+                ("outcome resolved by attempt id", s.resolved_by_id),
+                ("handoff drained", s.handoff_drained),
+                ("BAD stale-generation commit accepted", s.stale_accepted),
+                ("BAD resolution", s.bad_resolution),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Svg, Timeline, Tone, row, steps};
+        let last = path.last_state().clone();
+        let mut svg = Svg::new();
+        let lines = |d: &Dataset| -> Vec<String> {
+            let mut out = vec![format!("partition generations {:?}", d.generation)];
+            out.extend(
+                d.log
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| format!("{}. {}", i + 1, rec_label(*r))),
+            );
+            out
+        };
+        svg.heading(0, 0, "DATASET LOGS (intent in A -> apply in B)");
+        let log_a = svg.node(0, 22, 0, "A", &lines(&last.ds[0]), Tone::Live);
+        let log_b = svg.node(
+            log_a.right() + 120,
+            22,
+            0,
+            "B",
+            &lines(&last.ds[1]),
+            Tone::Live,
+        );
+        for (i, r) in last.ds[0].log.iter().enumerate() {
+            if let Rec::Txn { tx, .. } = r {
+                let found: Vec<usize> = last.ds[1]
+                    .log
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, x)| matches!(x, Rec::Apply { tx: t, .. } if t == tx))
+                    .map(|(j, _)| j + 1)
+                    .collect();
+                if found.is_empty() {
+                    svg.arrow(
+                        (log_a.right(), log_a.line_y(i + 1)),
+                        (log_b.x, log_b.bottom() - 8),
+                        Tone::Staged,
+                        Some("pending"),
+                    );
+                }
+                let tone = if found.len() > 1 {
+                    Tone::Bad
+                } else {
+                    Tone::Live
+                };
+                for j in found {
+                    svg.arrow(
+                        (log_a.right(), log_a.line_y(i + 1)),
+                        (log_b.x, log_b.line_y(j)),
+                        tone,
+                        Some("applied"),
+                    );
+                }
+            }
+        }
+        let mut boxes: Vec<(String, Vec<String>, Tone)> = last
+            .writers
+            .iter()
+            .enumerate()
+            .map(|(w, wr)| {
+                (
+                    format!("WRITER {w} (partition {}, epoch {})", wr.part, wr.epoch),
+                    vec![
+                        if wr.alive {
+                            "alive".into()
+                        } else {
+                            "crashed".into()
+                        },
+                        format!("{:?}", wr.phase),
+                    ],
+                    if wr.alive && !wr.handed {
+                        Tone::Actor
+                    } else {
+                        Tone::Gone
+                    },
+                )
+            })
+            .collect();
+        for (i, r) in last.reqs.iter().enumerate() {
+            boxes.push((
+                format!("REQUEST {i} to {}", if r.ds == 0 { "A" } else { "B" }),
+                vec![
+                    rec_label(r.rec),
+                    format!(
+                        "on (pos {}, generations {:?})",
+                        r.base.pos, r.base.generation
+                    ),
+                    format!("copies sent {:02b} landed {:02b}", r.sent, r.done),
+                ],
+                Tone::Staged,
+            ));
+        }
+        let trace_y = row(&mut svg, log_a.bottom().max(log_b.bottom()) + 24, &boxes) + 24;
+        let writer_count = last.writers.len();
+        let (lane_a, lane_b) = (writer_count, writer_count + 1);
+        let mut lane_names: Vec<String> = last
+            .writers
+            .iter()
+            .enumerate()
+            .map(|(w, wr)| format!("w{w} (p{})", wr.part))
+            .collect();
+        lane_names.extend(["A".to_string(), "B".to_string()]);
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            events.push(match action {
+                Action::Ingest(w) => Event::on(w, "send Txn + intent")
+                    .to(lane_a)
+                    .tone(Tone::Staged),
+                Action::IssueApply(w) => Event::on(w, "send Apply").to(lane_b).tone(Tone::Staged),
+                Action::IssueDone(w) => Event::on(w, "send Done").to(lane_a).tone(Tone::Staged),
+                Action::SkipDone(w) => Event::on(w, "skip Done"),
+                Action::Recover(w) => Event::on(w, "roll pending intents forward")
+                    .to(lane_a)
+                    .tone(Tone::Actor),
+                Action::Acquire(w) => {
+                    let to = if matches!(before.writers[w].phase, Phase::Acquire(1)) {
+                        lane_b
+                    } else {
+                        lane_a
+                    };
+                    Event::on(w, "record generation in head").to(to)
+                }
+                Action::Check(w) => Event::on(w, "resolve by attempt id").tone(Tone::Actor),
+                Action::Deliver(i, q) => {
+                    let r = before.reqs[i];
+                    let ds = usize::from(r.ds);
+                    let landed = after.ds[ds].log.len() > before.ds[ds].log.len();
+                    let w = before
+                        .writers
+                        .iter()
+                        .position(|w| {
+                            w.epoch == r.rec.epoch() && usize::from(w.part) == part_of(r.rec.tx())
+                        })
+                        .unwrap_or(0);
+                    let copy = if q == 0 { "" } else { "duplicate " };
+                    Event::on(
+                        w,
+                        if landed {
+                            format!("{copy}{} lands", rec_label(r.rec))
+                        } else {
+                            format!("{copy}{} refused", rec_label(r.rec))
+                        },
+                    )
+                    .to(if ds == 0 { lane_a } else { lane_b })
+                    .tone(if landed { Tone::Live } else { Tone::Gone })
+                }
+                Action::Crash(w) => Event::on(w, "CRASH").tone(Tone::Bad),
+                Action::Takeover(p) => {
+                    Event::on(after.writers.len() - 1, format!("takes partition {p} over"))
+                        .tone(Tone::Actor)
+                }
+                Action::Handoff(p) => Event::on(
+                    after.writers.len() - 1,
+                    format!("receives partition {p} by handoff"),
+                )
+                .tone(Tone::Actor),
+            });
+        }
+        Timeline {
+            lanes: lane_names,
+            events,
+        }
+        .draw(&mut svg, 0, trace_y);
+        Some(svg.finish())
     }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![

@@ -182,6 +182,51 @@ impl Model for Protocol {
         }
         if next == *state { None } else { Some(next) }
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Append(z) => format!("commit a record (variant {z}) into the head"),
+            Action::Observe => "observe a stable cut of the inline window".into(),
+            Action::Create(j) => format!("upload observed cut {j} as a batch (create if absent)"),
+            Action::Floor(c) => format!("publish a checkpoint and move the floor to {c}"),
+            Action::Poll => "reader polls the head".into(),
+            Action::Read => "reader reads from its polled head".into(),
+            Action::Query => "start a query on the current head".into(),
+            Action::Scan => "collector lists batches below the floor".into(),
+            Action::Delete => "collector deletes the listed batches".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let state = self.next_state(last_state, action)?;
+        let log: Vec<String> = state
+            .log
+            .iter()
+            .map(|r| crate::explorer::record_id(*r))
+            .collect();
+        let queue: Vec<String> = state.queue.iter().map(|b| format!("@{b}")).collect();
+        Some(crate::explorer::summary(&[
+            format!("serial history: {}", log.join(" ")),
+            format!("collector's delete list: [{}]", queue.join(", ")),
+            crate::explorer::flags(&[
+                ("checkpoint published", state.published),
+                ("listed", state.scan),
+                ("deleted", state.deleted),
+                ("batch re-created after collection", state.store.revived),
+                ("BAD reader result", state.bad_read),
+                ("BAD query result", state.bad_query),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        let state = path.last_state();
+        let mut view = crate::explorer::StoreView::of(
+            "OBJECT STORE",
+            &state.store,
+            crate::explorer::record_id,
+        );
+        view.pin("reader's polled head", state.captured.as_ref());
+        view.pin("running query", state.query.as_ref());
+        Some(crate::explorer::stacked(&[view]))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("I4 cold open exact bytes", |model, state: &State| {

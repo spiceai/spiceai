@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Immutable conditional requests, lost responses and retained acceptance evidence.
-use super::{Action as LocalAction, Protocol as Local, State as LocalState, Writer};
+use super::{Action as LocalAction, Protocol as Local, State as LocalState, Writer, program_text};
 use stateright::{Model, Property};
 
 #[derive(Clone, Debug)]
@@ -165,6 +165,45 @@ impl Model for Protocol {
             }
         }
         (n != *s).then_some(n)
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Local(a) => self.local.format_action(a),
+            Action::Issue(w) => format!("writer {w} sends its publication request"),
+            Action::Deliver(i, 0) => format!("request {i} arrives"),
+            Action::Deliver(i, _) => format!("a delayed identical copy of request {i} arrives"),
+            Action::Check(w) => format!("writer {w} reads the head to resolve its request"),
+            Action::RetryIdentical(w) => format!("writer {w} resends the identical request"),
+            Action::Unknown(w) => format!("writer {w}'s response is lost (outcome unknown)"),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let mut lines = vec![];
+        for (i, r) in s.requests.iter().enumerate() {
+            lines.push(format!(
+                "request {i} from writer {}: {} | sent {:02b} landed {:02b} answer {}{}",
+                r.writer,
+                program_text(&r.payload.program),
+                r.sent,
+                r.done,
+                match r.answer {
+                    0 => "unresolved",
+                    1 => "accepted",
+                    _ => "rejected",
+                },
+                if s.accepted.contains(&i) {
+                    "; in head"
+                } else {
+                    ""
+                }
+            ));
+        }
+        lines.push(crate::explorer::flags(&[
+            ("unknown outcome used", s.unknown_used),
+            ("duplicate delivered", s.duplicate_delivered),
+        ]));
+        Some(crate::explorer::summary(&lines))
     }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![

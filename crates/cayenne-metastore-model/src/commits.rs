@@ -120,6 +120,14 @@ pub enum Action {
     /// A checkpoint drops attempt ids older than the evidence horizon.
     Expire,
 }
+/// A history entry: an attempt id, an unrelated commit, or a non-identical resend.
+fn commit_label(id: usize) -> String {
+    match id {
+        90.. => "o".into(),
+        20.. => format!("a{}'", id - 20),
+        _ => format!("a{id}"),
+    }
+}
 /// The evidence horizon `T_O`, in head store-time units.
 const HORIZON: usize = 2;
 impl Protocol {
@@ -672,6 +680,158 @@ impl Model for Protocol {
             }
         }
         if next == *state { None } else { Some(next) }
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Issue(w) => {
+                format!("writer {w} sends a commit attempt (CAS on the head it read)")
+            }
+            Action::Buffer(w) => format!("writer {w} buffers a source change"),
+            Action::Persist(w) => format!("writer {w} persists its attempt id before sending"),
+            Action::Send(w) => format!("writer {w} sends its persisted attempt"),
+            Action::Restart => "the writer process restarts (memory lost)".into(),
+            Action::Restore => "the writer restores persisted attempt ids".into(),
+            Action::Deliver(w, i, 0) => format!("writer {w}'s attempt {i} arrives"),
+            Action::Deliver(w, i, _) => format!("writer {w}'s resent attempt {i} arrives"),
+            Action::Resolve(w) => format!("writer {w} reads the head to resolve its attempt"),
+            Action::Unreadable(w) => format!("writer {w}'s head read fails"),
+            Action::FailedResend(w) => format!("writer {w} reads its failed resend as rejection"),
+            Action::Response(w) => format!("writer {w} receives a success response"),
+            Action::Ack(w) => format!("writer {w} acknowledges the source"),
+            Action::Copy(i) => format!("upload observed batch {i} (create if absent)"),
+            Action::Observe => "observe the full inline window as a batch".into(),
+            Action::Fence => "a takeover raises the lease (head commit)".into(),
+            Action::Poll => "a reader polls and decodes the head".into(),
+            Action::Parts => "write checkpoint parts".into(),
+            Action::Root => "write the checkpoint root".into(),
+            Action::Floor => "publish the checkpoint floor".into(),
+            Action::Scan => "collector lists batches below the floor".into(),
+            Action::Delete => "collector deletes the first batch".into(),
+            Action::Query => "start a query on the current head".into(),
+            Action::Snapshot => "the query reads its snapshot".into(),
+            Action::Recover => "recover from the head".into(),
+            Action::Lagging => "a lagging reader replays from the start".into(),
+            Action::Advance => "an unrelated commit lands".into(),
+            Action::Expire => "a checkpoint drops attempt ids past the evidence horizon".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        let history: Vec<String> = s.history.iter().map(|id| commit_label(*id)).collect();
+        Some(crate::explorer::summary(&[
+            "records: a<n> attempt id n, o unrelated commit, a<n>' non-identical resend".into(),
+            format!("serial history: {}", history.join(" ")),
+            format!(
+                "acknowledged writers: {:02b}; attempt ids persisted {:?}, in memory {:?}",
+                s.ack, s.persisted, s.memory
+            ),
+            crate::explorer::flags(&[
+                ("restarted", s.restarted),
+                ("resolved from window", s.window_resolution),
+                ("resolved from batch", s.batch_resolution),
+                ("checkpoint folded", s.folded),
+                ("batch re-created after collection", s.revived),
+                ("conflicting batch bytes", s.conflict),
+                ("stale collector", s.stale),
+                ("BAD position (I1)", s.bad_i1),
+                ("BAD fence (I3)", s.bad_fence),
+                ("BAD read", s.bad_read),
+                ("BAD replay", s.bad_replay),
+                ("BAD query", s.bad_query),
+                ("BAD recovery", s.bad_recovery),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{StoreView, Tone, stacked_with};
+        let s = path.last_state();
+        let k = self.k;
+        let labels = |ids: &[usize]| ids.iter().map(|id| commit_label(*id)).collect::<Vec<_>>();
+        let first = s.pos - s.window.len();
+        let created = |b: usize| !s.batches[b].is_empty();
+        let mut view = StoreView {
+            title: "OBJECT STORE".into(),
+            head: vec![format!(
+                "commit {} lease {} etag {} store time {}",
+                s.pos, s.lease, s.etag, s.time
+            )],
+            floor: s.floor,
+            first,
+            window: labels(&s.window),
+            index: (0..s.batches.len())
+                .filter(|b| b * k >= s.floor && (b + 1) * k <= first)
+                .map(|b| (b * k, (b + 1) * k))
+                .collect(),
+            batches: (0..s.batches.len())
+                .filter(|b| created(*b))
+                .map(|b| (b * k, labels(&s.batches[b])))
+                .collect(),
+            pending: s.pending.iter().map(|(b, v)| (b * k, labels(v))).collect(),
+            root: labels(&s.root[..s.floor.min(s.root.len())]),
+            staged: (s.stage == 2 && s.floor < s.root.len())
+                .then(|| (s.root.len(), labels(&s.root))),
+            deleted: if s.deleted && !created(0) {
+                vec![0]
+            } else {
+                vec![]
+            },
+            snapshots: vec![],
+        };
+        if s.evidence_floor > 0 {
+            view.head.push(format!(
+                "attempt ids dropped through commit {}",
+                s.evidence_floor
+            ));
+        }
+        if s.stage == 1 {
+            view.head.push(format!(
+                "checkpoint parts written: {}",
+                labels(&s.parts).join(" ")
+            ));
+        }
+        if s.query {
+            view.snapshots.push((
+                format!(
+                    "running query (commits {}..{})",
+                    s.query_base, s.query_target
+                ),
+                (0..s.batches.len())
+                    .filter(|b| b * k >= s.query_base && (b + 1) * k <= s.query_target.min(first))
+                    .map(|b| (b * k, (b + 1) * k))
+                    .collect(),
+            ));
+        }
+        let header: Vec<(String, Vec<String>, Tone)> = s
+            .requests
+            .iter()
+            .enumerate()
+            .map(|(w, attempts)| {
+                let lines: Vec<String> = if attempts.is_empty() {
+                    vec!["no attempts".into()]
+                } else {
+                    attempts
+                        .iter()
+                        .map(|r| {
+                            let outcome = if r.unknown {
+                                "outcome UNKNOWN (evidence expired)"
+                            } else {
+                                match r.answer {
+                                    0 => "unresolved",
+                                    1 => "accepted",
+                                    _ => "rejected",
+                                }
+                            };
+                            format!(
+                                "a{} for commit {} on (commit {}, lease {}); sent {:02b} landed {:02b}; {outcome}",
+                                r.id, r.pos, r.base.pos, r.lease, r.sent, r.done
+                            )
+                        })
+                        .collect()
+                };
+                (format!("WRITER {w}"), lines, Tone::Actor)
+            })
+            .collect();
+        Some(stacked_with(&header, &[view]))
     }
     fn properties(&self) -> Vec<Property<Self>> {
         let mut p = vec![

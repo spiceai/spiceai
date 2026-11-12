@@ -560,6 +560,212 @@ impl Model for Protocol {
         }
         if n == *s { None } else { Some(n) }
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Tick => "the store clock ticks".into(),
+            Action::Jump => "the store clock jumps ahead of the writer's clock".into(),
+            Action::Upload(o, 0) => format!("the writer uploads object {o}"),
+            Action::Upload(o, skew) => {
+                format!("the writer uploads object {o} (timestamp lags by {skew})")
+            }
+            Action::Dispatch(o) => format!("the writer sends a commit referencing object {o}"),
+            Action::Refuse(o) => format!("the writer refuses to reference object {o} (too old)"),
+            Action::Land => "the writer's commit arrives".into(),
+            Action::Remove(o) => format!("a commit removes object {o} from the head"),
+            Action::Bump => "an empty commit moves the head".into(),
+            Action::GcDispatch => "remote GC sends its empty commit".into(),
+            Action::GcLand => "remote GC's commit arrives".into(),
+            Action::GcTakeover => "another node takes over the GC lease".into(),
+            Action::Checkpoint => "the writer writes a checkpoint (moves the floor)".into(),
+            Action::Takeover => "a writer takeover".into(),
+            Action::Expire(o) => {
+                format!("object {o}'s removal passes retention; GC issues its delete")
+            }
+            Action::Collect(o) => format!("the delete of object {o} lands"),
+            Action::List => "GC lists stored objects".into(),
+            Action::Select => "GC selects old unreferenced uploads".into(),
+            Action::Delete(o) => format!("GC deletes orphan object {o}"),
+            Action::Confirm => "the reader sends a head GET".into(),
+            Action::Respond => "the head GET responds".into(),
+            Action::Start => "a query starts from the confirmed head".into(),
+            Action::Get(o) => format!("the query reads object {o}"),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        Some(crate::explorer::summary(&[
+            format!(
+                "retention T = {T}, staleness S = {S}, upload age T_O = {T_O}, timestamp error {DRIFT}"
+            ),
+            format!(
+                "store clock {} (ahead of writer by {}); head version {} written at {}; writer leases {}, GC leases {}",
+                s.now, s.lag, s.version, s.head_time, s.leases, s.gc_leases
+            ),
+            format!("checkpoints {}; sweeps {}", s.checkpoints, s.sweeps),
+            crate::explorer::flags(&[
+                ("orphan collected", s.orphan_collected),
+                ("removed object collected", s.removed_collected),
+                ("GC timers restarted", s.restarted_timers),
+                ("GC lost its commit", s.gc_lost),
+                ("GC retried", s.gc_retried),
+                ("stale delete landed", s.stale_landed),
+                ("pending set rebuilt from root", s.rebuilt_from_root),
+                ("late GET response", s.late_response),
+                ("query error after retention", s.late_error),
+                ("BAD rows", s.bad_rows),
+                ("BAD availability", s.bad_availability),
+                ("BAD young upload collected", s.collected_young_upload),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let last = path.last_state().clone();
+        let mut boxes = vec![(
+            format!(
+                "HEAD (version {}, written at {})",
+                last.version, last.head_time
+            ),
+            vec![
+                format!(
+                    "live: {}",
+                    (0..N)
+                        .filter(|o| last.live[*o])
+                        .map(|o| format!("object {o}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                format!("store clock {}", last.now),
+            ],
+            Tone::Live,
+        )];
+        for o in 0..N {
+            if !last.used[o] {
+                continue;
+            }
+            let mut lines = vec![format!(
+                "{} (LastModified {})",
+                if last.present[o] { "stored" } else { "deleted" },
+                last.modified[o]
+            )];
+            if let Some(at) = last.removed[o] {
+                lines.push(format!(
+                    "removed at {at}; deletable at {}",
+                    at + self.retention()
+                ));
+            }
+            if let Some(at) = last.started[o] {
+                lines.push(format!("writer's own upload, started >= {at}"));
+            }
+            if last.collecting[o] {
+                lines.push("delete issued, not landed".into());
+            }
+            if last.stale[o] {
+                lines.push("delete issued by a GC node that lost its lease".into());
+            }
+            if last.logged[o] {
+                lines.push("removal recorded after the floor".into());
+            }
+            if last.rooted[o] {
+                lines.push("removal listed in the checkpoint root".into());
+            }
+            let tone = if !last.present[o] {
+                if last.live[o] { Tone::Bad } else { Tone::Gone }
+            } else if last.live[o] {
+                Tone::Live
+            } else {
+                Tone::Staged
+            };
+            boxes.push((format!("OBJECT {o}"), lines, tone));
+        }
+        if let Some((start, set)) = last.query {
+            let needs: Vec<String> = (0..N).filter(|o| set[*o]).map(|o| format!("{o}")).collect();
+            boxes.push((
+                format!("QUERY (started {start})"),
+                vec![
+                    format!("reads objects {}", needs.join(", ")),
+                    match last.result {
+                        None => "running".into(),
+                        Some(true) => "rows".into(),
+                        Some(false) => "error".into(),
+                    },
+                ],
+                if last.result == Some(false) {
+                    Tone::Bad
+                } else {
+                    Tone::Actor
+                },
+            ));
+        }
+        let (writer, head, gc, store, reader) = (0, 1, 2, 3, 4);
+        let lanes = ["writer", "head", "GC", "object store", "reader"]
+            .map(String::from)
+            .to_vec();
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            events.push(match action {
+                Action::Tick | Action::Jump => {
+                    Event::on(store, format!("clock -> {}", after.now)).tone(Tone::Gone)
+                }
+                Action::Upload(..) => Event::on(writer, label).to(store).tone(Tone::Staged),
+                Action::Dispatch(_) => Event::on(writer, label).to(head).tone(Tone::Staged),
+                Action::Refuse(_) => Event::on(writer, label).tone(Tone::Gone),
+                Action::Land => {
+                    let ok = after.version > before.version;
+                    Event::on(
+                        writer,
+                        if ok {
+                            "commit lands"
+                        } else {
+                            "commit refused (head moved)"
+                        },
+                    )
+                    .to(head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::Remove(_) | Action::Bump | Action::Checkpoint | Action::Takeover => {
+                    Event::on(writer, label).to(head)
+                }
+                Action::GcDispatch => Event::on(gc, label).to(head).tone(Tone::Staged),
+                Action::GcLand => {
+                    let ok = after.version > before.version;
+                    Event::on(
+                        gc,
+                        if ok {
+                            "GC commit lands"
+                        } else {
+                            "GC commit lost the race"
+                        },
+                    )
+                    .to(head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::GcTakeover => Event::on(gc, label).tone(Tone::Actor),
+                Action::Expire(_) | Action::Delete(_) | Action::List | Action::Select => {
+                    Event::on(gc, label).to(store)
+                }
+                Action::Collect(_) => Event::on(store, label),
+                Action::Confirm => Event::on(reader, label).to(head).tone(Tone::Staged),
+                Action::Respond => Event::on(head, label).to(reader),
+                Action::Start => Event::on(reader, label).tone(Tone::Actor),
+                Action::Get(o) => {
+                    let ok = before.present[o];
+                    Event::on(
+                        reader,
+                        if ok {
+                            label
+                        } else {
+                            format!("object {o} is MISSING")
+                        },
+                    )
+                    .to(store)
+                    .tone(if ok { Tone::Actor } else { Tone::Bad })
+                }
+            });
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         let mut properties = vec![
             Property::always(

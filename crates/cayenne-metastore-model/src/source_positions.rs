@@ -213,6 +213,133 @@ impl Model for Protocol {
         }
         (next != *state).then_some(next)
     }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Receive => "the writer receives the next source change".into(),
+            Action::Issue => "the writer sends a commit of its buffer and source position".into(),
+            Action::Deliver(i, 0) => format!("attempt {i} arrives"),
+            Action::Deliver(i, _) => format!("the resent attempt {i} arrives"),
+            Action::Resolve => "the writer reads the head to resolve its attempt".into(),
+            Action::Unknown => "the response is lost (outcome unknown)".into(),
+            Action::Acknowledge => "the writer acknowledges the source".into(),
+            Action::Crash => "the writer crashes".into(),
+            Action::Takeover => "another writer takes over".into(),
+            Action::Acquire => "the restarted writer reacquires the lease".into(),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        Some(crate::explorer::summary(&[
+            format!(
+                "source: next change {}, acknowledged through {}",
+                s.cursor, s.acknowledged
+            ),
+            format!("buffered: {:?}", s.buffer),
+            crate::explorer::flags(&[
+                ("redelivery skipped", s.skipped),
+                ("outcome unknown", s.unknown),
+                ("crashed", s.crashed),
+                ("half-acknowledged", s.half),
+                ("needs lease", s.needs_lease),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let last = path.last_state().clone();
+        let mut boxes = vec![
+            (
+                "SOURCE".into(),
+                vec![
+                    format!("next change to deliver: {}", last.cursor),
+                    format!("acknowledged through {}", last.acknowledged),
+                ],
+                Tone::Actor,
+            ),
+            (
+                "WRITER".into(),
+                vec![
+                    format!("buffered changes {:?}", last.buffer),
+                    format!("active attempt {:?}", last.active),
+                ],
+                if last.needs_lease {
+                    Tone::Gone
+                } else {
+                    Tone::Actor
+                },
+            ),
+            (
+                format!("HEAD (commit {}, lease {})", last.head.pos, last.head.lease),
+                vec![
+                    format!("rows {:?}", last.rows),
+                    format!("source position {}", last.position),
+                ],
+                Tone::Live,
+            ),
+        ];
+        for (i, a) in last.attempts.iter().enumerate() {
+            let accepted = last.accepted.contains(&i);
+            boxes.push((
+                format!("ATTEMPT {i}"),
+                vec![
+                    format!("rows {:?} position {}", a.rows, a.position),
+                    format!("on (commit {}, lease {})", a.base.pos, a.base.lease),
+                    format!(
+                        "landed copies {:02b}{}",
+                        a.delivered,
+                        if accepted { "; accepted" } else { "" }
+                    ),
+                ],
+                if accepted { Tone::Live } else { Tone::Staged },
+            ));
+        }
+        let (source, writer, head) = (0, 1, 2);
+        let lanes = ["source", "writer", "head"].map(String::from).to_vec();
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            events.push(match action {
+                Action::Receive => {
+                    let label = if after.buffer.len() > before.buffer.len() {
+                        format!("deliver change {}", before.cursor)
+                    } else {
+                        format!(
+                            "redeliver change {} (skipped: already positioned)",
+                            before.cursor
+                        )
+                    };
+                    Event::on(source, label).to(writer)
+                }
+                Action::Issue => Event::on(writer, "send commit").to(head).tone(Tone::Staged),
+                Action::Deliver(i, q) => {
+                    let ok = after.head.pos > before.head.pos;
+                    let copy = if q == 0 { "attempt" } else { "resent attempt" };
+                    Event::on(
+                        writer,
+                        if ok {
+                            format!("{copy} {i} lands (position {})", after.position)
+                        } else {
+                            format!("{copy} {i} refused")
+                        },
+                    )
+                    .to(head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::Resolve => Event::on(writer, "read head to resolve")
+                    .to(head)
+                    .tone(Tone::Actor),
+                Action::Unknown => Event::on(writer, "response lost").tone(Tone::Bad),
+                Action::Acknowledge => Event::on(
+                    writer,
+                    format!("acknowledge through {}", after.acknowledged),
+                )
+                .to(source),
+                Action::Crash => Event::on(writer, "CRASH").tone(Tone::Bad),
+                Action::Takeover => Event::on(writer, "takeover (new lease)").to(head),
+                Action::Acquire => Event::on(writer, "reacquire lease").to(head),
+            });
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+    }
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("at most one live row per source key", |_, s: &State| {
