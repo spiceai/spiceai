@@ -1,0 +1,75 @@
+# Known failing (#16321).
+name: reload-failed-dataset-removal
+description: >
+  A dataset edited in a watched spicepod to a configuration that fails to
+  load, here an acceleration engine that does not exist, keeps answering
+  with its previous definition and logs the error. Removing it from the
+  spicepod afterwards unregisters it, as removing a dataset that loaded does.
+  (It does not: unloading re-reads the failed definition, fails with
+  "Unable to unload dataset", and the removed dataset keeps answering.)
+
+sources:
+  lake: { kind: files }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: reload-failed-dataset-removal
+  datasets:
+    - from: 'file://${sources.lake.path}/t/'
+      name: keep
+      params: { file_format: csv }
+    - from: 'file://${sources.lake.path}/t/'
+      name: victim
+      params: { file_format: csv }
+    - from: 'file://${sources.lake.path}/t/'
+      name: control
+      params: { file_format: csv }
+
+defaults:
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - generate:
+      lake:
+        table: t
+        rows: 3
+        seed: 7
+        format: csv
+        files: 1
+        columns:
+          - { name: id, sequence: 1 }
+  - start: {}
+  - query: SELECT count(*) AS n FROM victim
+    expect: { rows: [['3']] }
+  # A dataset that loaded is unregistered when it is removed.
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - { from: 'file://${sources.lake.path}/t/', name: keep, params: { file_format: csv } }
+          - { from: 'file://${sources.lake.path}/t/', name: victim, params: { file_format: csv } }
+  - query: SELECT count(*) AS n FROM control
+    expect-error: control
+    eventually: 30s
+  # An edit that fails to load leaves the previous definition answering.
+  - edit-spicepod:
+      datasets:
+        victim: { acceleration: { enabled: true, engine: nosuchengine } }
+  - assert-log:
+      count:
+        "ERROR .*Unknown acceleration engine 'nosuchengine'": '>=1'
+    eventually: 30s
+  - query: SELECT count(*) AS n FROM victim
+    expect: { rows: [['3']] }
+  # Removing it must unregister it like any other dataset.
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - { from: 'file://${sources.lake.path}/t/', name: keep, params: { file_format: csv } }
+  - query: SELECT count(*) AS n FROM victim
+    expect-error: victim
+    eventually: 30s
+  - query: SELECT count(*) AS n FROM keep
+    expect: { rows: [['3']] }
+  - assert-log:
+      lacks: ['Unable to unload dataset victim']
