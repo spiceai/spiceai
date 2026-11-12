@@ -527,19 +527,6 @@ async fn run_file_update_csv_phases(
         .await
 }
 
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_file_update_csv_sqlite() -> Result<(), anyhow::Error> {
-    let temp_dir = tempfile::tempdir()?;
-    let accel_file = temp_dir.path().join("sample.db");
-    let csv_file = temp_dir.path().join("sample.csv");
-    let params = HashMap::from([(
-        "sqlite_file".to_string(),
-        accel_file.to_string_lossy().to_string(),
-    )]);
-    run_file_update_csv_phases("sqlite", params, &csv_file.to_string_lossy()).await
-}
-
 #[tokio::test]
 async fn test_file_update_csv_cayenne() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
@@ -668,19 +655,6 @@ async fn run_drop_recreate_csv_phases(
             Ok(())
         })
         .await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_drop_recreate_full_csv_sqlite() -> Result<(), anyhow::Error> {
-    let temp_dir = tempfile::tempdir()?;
-    let accel_file = temp_dir.path().join("sample.db");
-    let csv_file = temp_dir.path().join("sample.csv");
-    let params = HashMap::from([(
-        "sqlite_file".to_string(),
-        accel_file.to_string_lossy().to_string(),
-    )]);
-    run_drop_recreate_csv_phases("sqlite", params, &csv_file.to_string_lossy()).await
 }
 
 #[tokio::test]

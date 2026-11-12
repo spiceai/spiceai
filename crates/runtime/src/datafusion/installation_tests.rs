@@ -420,36 +420,24 @@ struct InitializationCase {
     expected_error: &'static str,
 }
 
-fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 2] {
+fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 1] {
     use crate::component::dataset::acceleration::Engine;
 
-    let invalid_file = storage
-        .join("invalid.extension")
-        .to_string_lossy()
-        .into_owned();
-    [
-        InitializationCase {
-            engine: Engine::Cayenne,
-            accelerator: Arc::new(accelerator_cayenne::CayenneAccelerator::new()),
-            params: vec![
-                ("cayenne_file_path", storage.to_string_lossy().into_owned()),
-                (
-                    "cayenne_metadata_dir",
-                    storage
-                        .join("initialization_test/catalog")
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-            ],
-            expected_error: "contains the Cayenne metastore directory",
-        },
-        InitializationCase {
-            engine: Engine::Sqlite,
-            accelerator: Arc::new(accelerator_sqlite::SqliteAccelerator::new()),
-            params: vec![("sqlite_file", invalid_file)],
-            expected_error: "extension",
-        },
-    ]
+    [InitializationCase {
+        engine: Engine::Cayenne,
+        accelerator: Arc::new(accelerator_cayenne::CayenneAccelerator::new()),
+        params: vec![
+            ("cayenne_file_path", storage.to_string_lossy().into_owned()),
+            (
+                "cayenne_metadata_dir",
+                storage
+                    .join("initialization_test/catalog")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ],
+        expected_error: "contains the Cayenne metastore directory",
+    }]
 }
 
 /// A Cayenne build that rejects its settings releases the dataset's generation: a

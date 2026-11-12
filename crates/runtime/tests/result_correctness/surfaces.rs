@@ -37,7 +37,8 @@ use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use tonic::transport::Channel;
 
 use super::{
-    compare, make_dim, make_fact, micro_queries, sqlite_accel, standalone_duckdb, write_parquet,
+    compare, make_dim, make_fact, micro_queries, standalone_duckdb, standalone_sqlite,
+    write_parquet,
 };
 use crate::configure_test_datafusion;
 use crate::utils::{
@@ -180,7 +181,7 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
     )
     .expect("the spicepod must be written");
 
-    let (_sqlite_dir, sqlite) = sqlite_accel::load_standalone_sqlite(&tables);
+    let (_sqlite_dir, sqlite) = standalone_sqlite::load_standalone_sqlite(&tables);
     let (_duckdb_dir, duckdb) = standalone_duckdb::load_standalone_duckdb(&tables);
 
     register_test_connectors().await;
@@ -243,7 +244,7 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
             ),
             (
                 "standalone-sqlite",
-                sqlite_accel::standalone_query(&sqlite, &q.sql)
+                standalone_sqlite::standalone_query(&sqlite, &q.sql)
                     .unwrap_or_else(|e| panic!("sqlite sql {}: {e}", q.name)),
             ),
         ];
@@ -330,11 +331,6 @@ async fn run(engine: &'static str, storage: Storage) {
 #[tokio::test(flavor = "multi_thread")]
 async fn arrow_surfaces_vs_standalone_engines() {
     run("arrow", Storage::Memory).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn sqlite_surfaces_vs_standalone_engines() {
-    run("sqlite", Storage::Memory).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

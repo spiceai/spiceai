@@ -1116,9 +1116,9 @@ mod tests {
         let registry = Arc::new(SnapshotSourceRegistry::default());
         let modules = TableReference::bare("modules");
         let orders = TableReference::bare("orders");
-        registry.record(&modules, "s3://bucket/a/", Engine::Sqlite);
+        registry.record(&modules, "s3://bucket/a/", Engine::Cayenne);
         registry.record(&modules, "s3://bucket/b/", Engine::Cayenne);
-        registry.record(&orders, "s3://bucket/a/", Engine::Sqlite);
+        registry.record(&orders, "s3://bucket/a/", Engine::Cayenne);
         let resolution = registry.begin_resolution(&modules);
 
         registry.forget(&modules);
@@ -1128,7 +1128,7 @@ mod tests {
         assert!(resolution.is_superseded(), "an in-flight resolution stops");
         assert_eq!(
             registry.engine(&orders, "s3://bucket/a/"),
-            Some(Engine::Sqlite),
+            Some(Engine::Cayenne),
             "other datasets are kept"
         );
     }

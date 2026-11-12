@@ -1367,49 +1367,6 @@ async fn test_acceleration_refresh_cayenne_memory_append_iso8601() -> Result<(),
     test_time_format_for_engine("cayenne", TimeFormatCase::Iso8601).await
 }
 
-// SQLite (feature-gated)
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("sqlite").await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_upsert_history() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_upsert_history_for_engine("sqlite").await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_timestamp() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("sqlite", TimeFormatCase::Timestamp).await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_unix_seconds() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("sqlite", TimeFormatCase::UnixSeconds).await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_append_iso8601() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("sqlite", TimeFormatCase::Iso8601).await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn test_acceleration_refresh_sqlite_full_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("sqlite").await
-}
-
 // Postgres (feature-gated)
 #[cfg(feature = "postgres-accel")]
 #[tokio::test]

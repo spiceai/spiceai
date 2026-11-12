@@ -634,7 +634,7 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
 /// This test creates real accelerator instances for each supported engine type
 /// and measures the lock contention impact when snapshots are created during query load.
 ///
-/// Run with: `cargo test -p runtime --features "snapshots sqlite" test_lock_contention_across_accelerator_engines -- --ignored --nocapture`
+/// Run with: `cargo test -p runtime --features snapshots test_lock_contention_across_accelerator_engines -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "Performance test - requires accelerator features and manual execution"]
 async fn test_lock_contention_across_accelerator_engines() -> anyhow::Result<()> {
@@ -646,14 +646,6 @@ async fn test_lock_contention_across_accelerator_engines() -> anyhow::Result<()>
         println!("--- Testing Cayenne file Engine ---");
         if let Err(e) = run_engine_contention_test(EngineType::CayenneFile).await {
             println!("Cayenne file test failed: {e}");
-        }
-    }
-
-    #[cfg(feature = "sqlite")]
-    {
-        println!("\n--- Testing SQLite Engine ---");
-        if let Err(e) = run_engine_contention_test(EngineType::Sqlite).await {
-            println!("SQLite test failed: {e}");
         }
     }
 
@@ -674,8 +666,6 @@ async fn test_lock_contention_across_accelerator_engines() -> anyhow::Result<()>
 #[derive(Debug, Clone, Copy)]
 enum EngineType {
     CayenneFile,
-    #[cfg(feature = "sqlite")]
-    Sqlite,
     Cayenne,
 }
 
@@ -683,8 +673,6 @@ impl std::fmt::Display for EngineType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CayenneFile => write!(f, "Cayenne file"),
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite => write!(f, "SQLite"),
             Self::Cayenne => write!(f, "Cayenne"),
         }
     }
@@ -694,8 +682,6 @@ impl EngineType {
     fn to_acceleration_engine(self) -> AccelerationEngine {
         match self {
             Self::CayenneFile => AccelerationEngine::Cayenne,
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite => AccelerationEngine::Sqlite,
             Self::Cayenne => AccelerationEngine::Cayenne,
         }
     }
@@ -703,15 +689,6 @@ impl EngineType {
 
 /// Run contention test for a specific engine type
 async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<()> {
-    #[cfg(feature = "sqlite")]
-    use data_accelerator_api::DataAccelerator;
-    #[cfg(feature = "sqlite")]
-    use datafusion::common::{Constraints, ToDFSchema};
-    #[cfg(feature = "sqlite")]
-    use datafusion_expr::CreateExternalTable;
-    #[cfg(feature = "sqlite")]
-    use std::collections::HashMap;
-
     let temp_root = unique_temp_dir(&format!("lock_contention_{engine_type}"));
     let snapshot_dir = temp_root.join("snapshots");
     let db_file = temp_root.join(format!("acceleration.{engine_type}"));
@@ -724,9 +701,6 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
         Field::new("name", DataType::Utf8, false),
         Field::new("value", DataType::Int32, false),
     ]));
-
-    #[cfg(feature = "sqlite")]
-    let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))?;
 
     // Create engine-specific accelerator
     let accelerator: Arc<dyn TableProvider> = match engine_type {
@@ -753,37 +727,6 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
                     .await?,
             )
         }
-        #[cfg(feature = "sqlite")]
-        EngineType::Sqlite => {
-            use accelerator_sqlite::SqliteAccelerator;
-            use datafusion::common::TableReference;
-
-            let mut options = HashMap::new();
-            options.insert("file".to_string(), db_file.display().to_string());
-
-            let cmd = CreateExternalTable {
-                schema: df_schema,
-                name: TableReference::bare("test_table"),
-                locations: vec![],
-                file_type: String::new(),
-                table_partition_cols: vec![],
-                if_not_exists: true,
-                or_replace: false,
-                definition: None,
-                order_exprs: vec![],
-                unbounded: false,
-                options,
-                constraints: Constraints::new_unverified(vec![]),
-                column_defaults: HashMap::default(),
-                temporary: false,
-            };
-
-            let engine = SqliteAccelerator::new();
-            engine
-                .create_external_table(cmd, None, vec![], None)
-                .await
-                .map_err(|e| anyhow::anyhow!("SQLite table creation failed: {e}"))?
-        }
         EngineType::Cayenne => {
             // For Cayenne/Arrow, use MemTable as it's in-memory
             create_test_accelerator(10_000)?
@@ -791,15 +734,8 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     };
 
     // Insert test data for file-based engines
-    match engine_type {
-        EngineType::CayenneFile => {
-            insert_test_data(&accelerator, &schema, 10_000).await?;
-        }
-        #[cfg(feature = "sqlite")]
-        EngineType::Sqlite => {
-            insert_test_data(&accelerator, &schema, 10_000).await?;
-        }
-        _ => {}
+    if matches!(engine_type, EngineType::CayenneFile) {
+        insert_test_data(&accelerator, &schema, 10_000).await?;
     }
 
     // Set up snapshot infrastructure
