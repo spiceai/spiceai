@@ -250,12 +250,16 @@ async fn datasets_in_a_shared_bucket_reach_only_their_own_store() -> TestResult 
     let in_b = keys(&store_b).await?;
     assert!(
         in_a.iter().any(|key| key.ends_with(".vortex"))
-            && in_a.iter().all(|key| key.starts_with("state/cayenne/v1/datasets/orders/data/")),
+            && in_a
+                .iter()
+                .all(|key| key.starts_with("state/cayenne/v1/datasets/orders/data/")),
         "the orders store holds only orders' data: {in_a:?}"
     );
     assert!(
         in_b.iter().any(|key| key.ends_with(".vortex"))
-            && in_b.iter().all(|key| key.starts_with("state/cayenne/v1/datasets/events/data/")),
+            && in_b
+                .iter()
+                .all(|key| key.starts_with("state/cayenne/v1/datasets/events/data/")),
         "the events store holds only events' data: {in_b:?}"
     );
     assert_eq!(
@@ -337,7 +341,9 @@ async fn a_local_dataset_store_leaves_the_shared_file_store_alone() -> TestResul
         .object_store(ObjectStoreUrl::local_filesystem())?;
 
     // The dataset's data directory in a local state location.
-    let dir = fixture.data_path.join("state/cayenne/v1/datasets/local_orders/data");
+    let dir = fixture
+        .data_path
+        .join("state/cayenne/v1/datasets/local_orders/data");
     std::fs::create_dir_all(&dir)?;
     let dir = std::fs::canonicalize(&dir)?;
     let dir_url = url::Url::from_directory_path(&dir).map_err(|()| "directory URL")?;

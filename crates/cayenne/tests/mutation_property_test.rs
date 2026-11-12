@@ -1684,11 +1684,9 @@ test_with_backends!(prop_sequential_cold_impl);
 // Foreground promotions + restarts with a background compactor/bake loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
-        run_workload(f, concurrent_cold())
-    })
-    .await
-    .map_err(|e| -> Box<dyn std::error::Error> { e })
+    common::run_with_backend(BackendType::Sqlite, |f| run_workload(f, concurrent_cold()))
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
 // --- Focused regression: re-upsert after overwrite+delete stays visible ---
