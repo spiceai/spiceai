@@ -1,0 +1,88 @@
+name: Check a run is a trusted build
+description: >-
+  Fails unless a workflow run of this repository is one whose artifacts a privileged job may
+  download and run or publish. A fork's pull request run uploads whatever its author built, so
+  spicescript_dispatch, spicescript_long and release_from_run check the run they are given here
+  before they touch its artifacts. One list for every caller, identical in spiceai/spiceai and
+  spicehq/spiceai so the OSS merge stays clean; a workflow name a repository lacks matches nothing.
+  The run must be all of:
+    - from E2E Test CI, build_release, build_and_release, build_nightly, build_and_release_cuda,
+      Enterprise Release or release_from_run (display names);
+    - triggered by push, merge_group, workflow_dispatch, schedule or release, never pull_request
+      or pull_request_target;
+    - built from this repository, not a fork;
+    - built from trunk, a release branch (release/X.Y, release/X.Y.Z, optionally -rc.N), a merge
+      queue branch for one of those (merge_group only), or a release tag (vX.Y.Z, optionally
+      -rc.N and -enterprise) that exists in this repository.
+
+inputs:
+  run-id:
+    description: Workflow run ID to check. Must be numeric.
+    required: true
+  token:
+    description: Token that can read this repository's Actions runs and tags.
+    required: true
+
+outputs:
+  workflow:
+    description: The run's workflow display name.
+    value: ${{ steps.check.outputs.workflow }}
+  event:
+    description: The event that triggered the run.
+    value: ${{ steps.check.outputs.event }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the run
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        RUN_ID: ${{ inputs.run-id }}
+      run: |
+        set -euo pipefail
+        [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
+        # `gh run view --json` has no head repository field, so read the run from the API.
+        info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+          -q '.name, .event, (.head_repository.full_name // ""), (.head_branch // "")')
+        { read -r workflow; read -r event; read -r head_repo; read -r head_branch; } <<<"$info"
+        refuse() {
+          echo "::error::Run $RUN_ID ($workflow, $event event, $head_repo @ $head_branch) $1"
+          exit 1
+        }
+
+        case "$workflow" in
+          "E2E Test CI" | build_release | build_and_release | build_nightly | build_and_release_cuda | \
+            "Enterprise Release" | release_from_run) ;;
+          *) refuse "is not from E2E Test CI, build_release, build_and_release, build_nightly, build_and_release_cuda, Enterprise Release or release_from_run" ;;
+        esac
+
+        case "$event" in
+          push | merge_group | workflow_dispatch | schedule | release) ;;
+          pull_request | pull_request_target) refuse "is a pull request run, whose build its author controls" ;;
+          *) refuse "was triggered by $event; only push, merge_group, workflow_dispatch, schedule and release are accepted" ;;
+        esac
+
+        [ "$head_repo" = "$GITHUB_REPOSITORY" ] || refuse "was not built from $GITHUB_REPOSITORY"
+
+        release_branch='release/[0-9]+\.[0-9]+(\.[0-9]+)?(-rc\.?[0-9]+)?'
+        release_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.?[0-9]+)?(-enterprise)?$'
+        if [ "$head_branch" = trunk ] || [[ "$head_branch" =~ ^${release_branch}$ ]]; then
+          :
+        elif [[ "$head_branch" =~ ^gh-readonly-queue/(trunk|${release_branch})/pr-[0-9]+-[0-9a-f]{40}$ ]]; then
+          [ "$event" = merge_group ] || refuse "is on a merge queue branch but was not a merge_group run"
+        elif [[ "$head_branch" =~ $release_tag ]]; then
+          # A tag build reports the tag name as head_branch; a branch can carry the same name, so
+          # the tag has to exist here too.
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$head_branch" -q .ref >/dev/null 2>&1 \
+            || refuse "names $head_branch, which is not a tag of $GITHUB_REPOSITORY"
+        else
+          refuse "was built from $head_branch, not trunk, a release branch or a release tag"
+        fi
+
+        echo "Run $RUN_ID is a $workflow $event run of $GITHUB_REPOSITORY @ $head_branch"
+        {
+          echo "workflow=$workflow"
+          echo "event=$event"
+        } >> "$GITHUB_OUTPUT"

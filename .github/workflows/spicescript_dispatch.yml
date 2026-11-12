@@ -37,35 +37,17 @@ jobs:
       workflow: ${{ steps.find.outputs.workflow }}
     steps:
       # The test job runs the chosen run's spiced on the self-hosted runners with id-token: write,
-      # so run_id must name a build this repo made. A pull_request run from a fork uploads a spiced
-      # its author built, so it is refused, as is any run from another repo or another workflow.
+      # so run_id must name a build this repo made; see the action for the rules.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/check-trusted-run
+
       - name: Check the run is a trusted build
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID: ${{ inputs.run_id }}
-        run: |
-          set -euo pipefail
-          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
-          # `gh run view --json` has no head repository field, so read the run from the API.
-          info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
-            -q '.event, (.head_repository.full_name // ""), .name')
-          { read -r event; read -r head_repo; read -r workflow; } <<<"$info"
-          refuse() { echo "::error::Run $RUN_ID ($workflow, $event event, head repo '$head_repo') $1"; exit 1; }
-          case "$event" in
-            pull_request|pull_request_target) refuse "is a pull request run, whose build its author controls" ;;
-          esac
-          [ "$head_repo" = "$GITHUB_REPOSITORY" ] || refuse "was not built from $GITHUB_REPOSITORY"
-          case "$workflow" in
-            "E2E Test CI")
-              case "$event" in
-                push|merge_group) ;;
-                *) refuse "is an E2E Test CI run; only push and merge_group runs are accepted" ;;
-              esac
-              ;;
-            build_release|build_and_release|build_nightly) ;;
-            *) refuse "is not from E2E Test CI, build_release, build_and_release or build_nightly" ;;
-          esac
-          echo "Run $RUN_ID is a $workflow $event run of $GITHUB_REPOSITORY"
+        uses: ./.github/actions/check-trusted-run
+        with:
+          run-id: ${{ inputs.run_id }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Find the build's artifacts
         id: find
