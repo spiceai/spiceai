@@ -18,6 +18,9 @@ else
   if [[ -z "${WORK_DIR:-}" ]]; then
     WORK_DIR="$(mktemp -d /tmp/verify-refresh-body-XXXX)"
     OWN_WORK_DIR=1
+  elif [[ -e "$WORK_DIR" && -n "$(ls -A "$WORK_DIR" 2>/dev/null)" ]]; then
+    # The helper writes data/ and spicepod.yaml; never overwrite a caller's files.
+    echo "WORK_DIR $WORK_DIR is not empty; pass an empty or new directory"; exit 2
   fi
   mkdir -p "$WORK_DIR/data"
   # Absolute, so the CSV path in the Spicepod and the log redirect work after `cd`.
@@ -40,6 +43,11 @@ YAML
     if [[ "$OWN_WORK_DIR" == 1 && "${KEEP:-0}" != 1 ]]; then rm -rf "$WORK_DIR"; fi
   }
   trap cleanup EXIT
+  # Refuse to start if something already answers on HTTP_ADDR: the results would come
+  # from that process, not from the binary under test.
+  if curl -s -o /dev/null --max-time 2 "http://$HTTP_ADDR/v1/ready"; then
+    echo "something is already listening on $HTTP_ADDR; stop it or set HTTP_ADDR"; exit 2
+  fi
   (cd "$WORK_DIR" && exec "$SPICED" --telemetry-enabled=false \
     --http "$HTTP_ADDR" --flight "$FLIGHT_ADDR" --metrics "$METRICS_ADDR" . \
     > "$WORK_DIR/spiced.log" 2>&1) &
