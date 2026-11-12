@@ -40,7 +40,9 @@ use bytes::Bytes;
 use cayenne::metadata::{
     CdcDurability, CreateTableOptions, DeletionMode, ObjectStoreConfig, VortexConfig,
 };
-use cayenne::metastore::object_native::{ObjectNativeCatalog, new_dataset_folder};
+use cayenne::metastore::object_native::{
+    NativeCatalogConfig, ObjectNativeCatalog, new_dataset_folder,
+};
 use cayenne::{CayenneContext, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::common::TableReference;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -488,6 +490,16 @@ fn stack(bottom: &Arc<InMemory>) -> (Arc<Instance>, Arc<dyn ObjectStore>) {
     (instance, store)
 }
 
+/// Crash tests exhaust the real resolve-and-retry path against a permanently dead
+/// instance. Keep every retry, but shorten its waits: elapsed backoff time is not
+/// under test, and quiesce must drain pending publication before the next reopen.
+fn crash_catalog_config() -> NativeCatalogConfig {
+    NativeCatalogConfig {
+        retry_delay: Duration::from_millis(1),
+        ..NativeCatalogConfig::default()
+    }
+}
+
 impl Location {
     fn builder(
         &self,
@@ -529,10 +541,11 @@ impl Location {
         let bottom = Arc::new(InMemory::new());
         let (instance, store) = stack(&bottom);
         let catalog = Arc::new(
-            ObjectNativeCatalog::open_or_create_at(
+            ObjectNativeCatalog::open_or_create_at_with_config(
                 Arc::clone(&store),
                 Path::from(CATALOG),
                 LOCATION,
+                crash_catalog_config(),
             )
             .await
             .expect("create the object-native catalog"),
@@ -607,10 +620,11 @@ impl Location {
     ) -> Process {
         let (instance, store) = stack(&self.bottom);
         let catalog = Arc::new(
-            ObjectNativeCatalog::open_or_create_at(
+            ObjectNativeCatalog::open_or_create_at_with_config(
                 Arc::clone(&store),
                 Path::from(CATALOG),
                 LOCATION,
+                crash_catalog_config(),
             )
             .await
             .expect("open the object-native catalog"),
@@ -2787,11 +2801,15 @@ async fn an_inline_burst_buffered_while_a_staged_burst_commits_is_all_or_nothing
 // inside a burst, and what the source is told
 // ---------------------------------------------------------------------------
 
-/// Held for writing by a test that installs the process-wide in-memory tier
-/// budget, and for reading by every other test whose CDC writes reserve from
-/// it, so that no test's writes are refused by another's budget.
-pub(super) static MEM_TIER_BUDGET: std::sync::LazyLock<tokio::sync::RwLock<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
+/// Require nextest's process isolation before changing the global CDC tier budget.
+fn require_process_per_test(why: &str) {
+    assert!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+        "{why}, so it must run in a process of its own. Run it with \
+         `cargo nextest run -p accelerator-cayenne --lib <test name>`: plain \
+         `cargo test` runs tests on threads of one process"
+    );
+}
 
 /// Bytes the in-memory tier budget admits: an upsert of a few rows fits, a
 /// delete that names [`OVERFLOW_KEYS`] keys (16 bytes a key) does not, so it
@@ -3046,7 +3064,7 @@ fn saved_round(position: Option<&str>) -> std::result::Result<i64, String> {
 /// saved and acknowledged.
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_mode_bursts_whose_deletes_overflow_the_tier_budget_commit_exactly() {
-    let _budget = MEM_TIER_BUDGET.write().await;
+    require_process_per_test("this test installs the process-global in-memory CDC tier budget");
     let (location, process) = memory_location().await;
     assert!(
         process.table.is_cdc_memory_mode(),
@@ -3177,7 +3195,7 @@ async fn run_memory_until_killed(
 /// ahead of the durable rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_request_of_memory_mode_bursts_loses_no_acknowledged_change() {
-    let _budget = MEM_TIER_BUDGET.write().await;
+    require_process_per_test("this test installs the process-global in-memory CDC tier budget");
     let rounds = memory_rounds();
     let (_location, process) = memory_location().await;
     let before = process.rows().await;
@@ -3506,7 +3524,6 @@ async fn run_ticked_until_killed(
 /// bursts' outcome, before and after a reopen.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_periodic_checkpoint_of_the_in_memory_tier_commits_as_one_record() {
-    let _budget = MEM_TIER_BUDGET.read().await;
     let (location, process) = tick_location().await;
     let before = process.rows().await;
     let rounds = tick_rounds();
@@ -3583,7 +3600,6 @@ async fn a_periodic_checkpoint_of_the_in_memory_tier_commits_as_one_record() {
 /// replays the rest, and then holds exactly every burst's outcome.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_at_any_storage_write_of_a_periodic_checkpoint_loses_no_change() {
-    let _budget = MEM_TIER_BUDGET.read().await;
     let rounds = tick_rounds();
     let (location, process) = tick_location().await;
     let before = process.rows().await;
