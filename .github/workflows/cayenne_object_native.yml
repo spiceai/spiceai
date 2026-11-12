@@ -28,11 +28,6 @@ on:
         type: choice
         options: [quick, all]
         default: quick
-      store:
-        description: 'the data store the data-path suites run on (nightly runs both)'
-        type: choice
-        options: [memory, rustfs, both]
-        default: memory
 
 permissions:
   contents: read
@@ -143,30 +138,28 @@ jobs:
           EXHAUST: ${{ env.SET == 'all' && '1' || '' }}
         run: target/release/cayenne-metastore-model "$SET"
 
-  stores:
+  # The data-path suites on an S3-compatible store: a RustFS container stands
+  # in for S3, so the suites see real HTTP, conditional writes and ranged reads.
+  s3:
     needs: changes
     concurrency:
-      group: cayenne-data-store-${{ matrix.store }}-${{ github.ref }}-${{ github.event_name }}
+      group: cayenne-data-store-s3-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
-    name: Data store (${{ matrix.store }})
+    name: S3 data store
     # Runs the change's code on persistent self-hosted runners, so fork and
     # Dependabot pull requests run it only from the merge queue.
     if: >-
-      needs.changes.outputs.stores == 'true' &&
+      needs.changes.outputs.stores == 'true' && github.event_name != 'schedule' &&
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]'))
-    strategy:
-      fail-fast: false
-      matrix:
-        store: ${{ (github.event_name == 'schedule' || inputs.store == 'both') && fromJson('["memory","rustfs"]') || (inputs.store == 'rustfs' && fromJson('["rustfs"]')) || fromJson('["memory"]') }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 120
     env:
-      CAYENNE_TEST_DATA_STORE: ${{ matrix.store }}
-      # Bounded seeds on pull requests and the queue; full depth nightly.
-      CAYENNE_PROPTEST_SCALE: ${{ github.event_name == 'schedule' && '1.0' || '0.25' }}
-      CAYENNE_PROPTEST_OPS_SCALE: ${{ github.event_name == 'schedule' && '1.0' || '0.25' }}
+      CAYENNE_TEST_DATA_STORE: rustfs
+      # Bounded seeds: the job runs on every qualifying pull request.
+      CAYENNE_PROPTEST_SCALE: '0.25'
+      CAYENNE_PROPTEST_OPS_SCALE: '0.25'
       RUSTFS_CONTAINER: cayenne-data-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -180,7 +173,6 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Start RustFS
-        if: matrix.store == 'rustfs'
         env:
           ACCESS_KEY: cayenne-data
           SECRET_KEY: cayenne-data-secret
@@ -216,15 +208,14 @@ jobs:
 
       # retries = 0: a seeded walk that fails prints its seed and history, and a
       # retry could only hide it.
-      - name: Run the data-path suites on the ${{ matrix.store }} store
+      - name: Run the data-path suites on S3
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 --no-fail-fast -E "$SUITES"
       # What Cayenne's data path needs from an S3-compatible store.
-      - name: Run the RustFS store conformance test
-        if: matrix.store == 'rustfs'
+      - name: Run the S3 store conformance test
         run: cargo nextest run --locked -p cayenne --test integration --retries 0 -E 'test(/^rustfs_store_conformance_test::/)'
 
       - name: Stop RustFS
-        if: always() && matrix.store == 'rustfs'
+        if: always()
         run: |
           docker logs "$RUSTFS_CONTAINER" 2>&1 | tail -n 200 || true
           docker rm -f "$RUSTFS_CONTAINER" > /dev/null 2>&1 || true
