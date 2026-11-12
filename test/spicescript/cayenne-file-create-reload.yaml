@@ -8,9 +8,10 @@ description: >
   deleted acceleration held and not with nothing. A query running while the
   watched change reloads the dataset answers with every row of the old copy or
   of the new one, or fails; never with part of either. With object-native data
-  (#16133), each reload writes a new folder in the state location and the
-  instance deletes the previous one once no query reads it, so after the grace
-  only the current folder is left and no folder is marked dropped.
+  (#16133), each reload writes a new folder in the state location and marks the
+  previous one dropped; the previous folder is kept for the data-file retention
+  (an hour), so a query that started on it can finish. Its deletion after the
+  retention is covered by `data_file_lifecycle_test`, which shortens it.
 
 sources:
   src: { kind: postgres }
@@ -78,27 +79,25 @@ steps:
   - explain: SELECT id, v FROM file_create_reload
     contains: CayenneAccelerationExec
 
-  # The previous copy's folder is deleted by this instance once no query reads
-  # it: one folder (one log head) is left, none marked dropped.
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
+  # The previous copy's folder is marked dropped and kept for the retention:
+  # two folders (two log heads), one of them dropped.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, min: 1 }
     eventually: 60s
     only: object-native-s3
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
-    eventually: 60s
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 2 }
     only: object-native-s3
 
-  # So does a restart; the folder the restart replaced is deleted by the
-  # restarted instance once the grace passes, with no further start.
+  # So does a restart, which replaces the copy again: three folders, the two
+  # earlier ones dropped and kept for the retention.
   - source-exec: { src: "INSERT INTO fc SELECT i, 'v' || i FROM generate_series(17, 24) i" }
   - restart: {}
   - query: SELECT id, v FROM file_create_reload
     oracle-sql: SELECT id, v FROM fc
     eventually: 60s
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, max: 0 }
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, min: 2 }
     eventually: 60s
     only: object-native-s3
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 1, max: 1 }
-    eventually: 60s
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 3 }
     only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: .vortex, min: 1 }
     only: object-native-s3
