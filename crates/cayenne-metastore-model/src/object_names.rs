@@ -400,24 +400,40 @@ impl Model for Protocol {
                 );
             }
         }
-        let boxes: Vec<(String, Vec<String>, Tone)> =
-            s.nodes
-                .iter()
-                .enumerate()
-                .map(|(i, node)| {
-                    let mut lines = vec![match node.hold {
-                        Some(h) => format!(
-                            "holds unit {} at gen {} (next counter {})",
-                            h.slot, h.generation, h.counter
-                        ),
-                        None => "holds nothing".into(),
-                    }];
-                    lines.extend(node.uploads.iter().map(|(n, b)| {
-                        format!("uploaded, not referenced: {} {b:?}", name_label(*n))
-                    }));
-                    (format!("NODE {i}"), lines, Tone::Actor)
-                })
-                .collect();
+        let boxes: Vec<(String, Vec<String>, Tone)> = s
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let mut lines = vec![match node.hold {
+                    Some(h) => format!(
+                        "holds unit {} at gen {} (next counter {})",
+                        h.slot, h.generation, h.counter
+                    ),
+                    None => "holds nothing".into(),
+                }];
+                // Create-if-absent kept another holder's bytes under this name.
+                let mut collided = false;
+                for (n, b) in &node.uploads {
+                    let taken = s
+                        .store
+                        .iter()
+                        .any(|(stored, bytes, _)| stored == n && bytes != b);
+                    collided |= taken;
+                    lines.push(format!(
+                        "uploaded, not referenced: {} {b:?}{}",
+                        name_label(*n),
+                        if taken {
+                            " - NAME HOLDS OTHER BYTES"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                let tone = if collided { Tone::Bad } else { Tone::Actor };
+                (format!("NODE {i}"), lines, tone)
+            })
+            .collect();
         row(&mut svg, head.bottom().max(y) + 24, &boxes);
         Some(svg.finish())
     }
