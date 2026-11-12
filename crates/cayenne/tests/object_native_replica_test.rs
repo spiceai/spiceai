@@ -229,7 +229,7 @@ async fn writer_and_replica(shape: Shape) {
     assert!(
         refused
             .to_string()
-            .contains("is written by another Spice instance"),
+            .contains("accepts no change from this table"),
         "{shape:?}: {refused}"
     );
     assert_eq!(
