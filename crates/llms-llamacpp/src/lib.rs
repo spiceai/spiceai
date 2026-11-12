@@ -52,7 +52,8 @@ use async_openai::{
         ChatCompletionRequestMessage, ChatCompletionResponseMessage, ChatCompletionResponseStream,
         ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionRequest,
         CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
-        FunctionCall, FunctionCallStream, FunctionType, ResponseFormat, Role, StopConfiguration,
+        FunctionCall, FunctionCallStream, FunctionType, PromptTokensDetails, ResponseFormat, Role,
+        StopConfiguration,
     },
 };
 use async_trait::async_trait;
@@ -147,6 +148,15 @@ const PROMPT_BATCH: usize = 512;
 /// The most requests one model decodes together. A step's batch holds each one's next token and
 /// draft, which stays well within the context's batch size (`PROMPT_BATCH`).
 const MAX_CONCURRENT: u32 = 8;
+
+/// How many prompts a model keeps cached, each in its own sequence of one shared cache, however
+/// many requests it decodes at once. A request reuses the cached prompt that shares the longest
+/// prefix with its own, so a request with another prefix (a coding agent's permission check or
+/// subagent, another conversation) leaves a conversation's cache for its next turn instead of
+/// replacing it, as llama-server keeps one prompt per slot. Idle prompts give up their room
+/// when a request needs it, longest unused first, so one request can still use the whole
+/// context.
+const CACHED_PROMPTS: u32 = 4;
 
 /// The context size when the model sets no `context_length`.
 const DEFAULT_CONTEXT: u32 = 8192;
@@ -348,6 +358,8 @@ enum Event {
 struct Outcome {
     finish: FinishReason,
     prompt_tokens: u32,
+    /// How many of the prompt's tokens were read from the cache rather than decoded.
+    cached_tokens: u32,
     completion_tokens: u32,
 }
 
@@ -756,6 +768,7 @@ impl Chat for LlamaCpp {
             choices,
             index: 0,
             first: true,
+            prompt: None,
             completion_tokens: 0,
             done: false,
         };
@@ -807,6 +820,7 @@ impl Chat for LlamaCpp {
                         }
                         Some(Event::Done(outcome)) => {
                             state.choices.pop_front();
+                            let prompt = *state.prompt.get_or_insert(outcome);
                             state.completion_tokens = state
                                 .completion_tokens
                                 .saturating_add(outcome.completion_tokens);
@@ -815,9 +829,7 @@ impl Chat for LlamaCpp {
                             state.done = state.choices.is_empty();
                             state.index += 1;
                             state.first = true;
-                            let usage = state
-                                .done
-                                .then(|| usage(outcome.prompt_tokens, state.completion_tokens));
+                            let usage = state.done.then(|| usage(&prompt, state.completion_tokens));
                             break Ok(chunk(
                                 &id,
                                 &model,
@@ -855,7 +867,7 @@ impl Chat for LlamaCpp {
         req: CreateChatCompletionRequest,
     ) -> std::result::Result<CreateChatCompletionResponse, OpenAIError> {
         let mut choices = Vec::new();
-        let (mut prompt_tokens, mut completion_tokens) = (0, 0_u32);
+        let (mut prompt, mut completion_tokens) = (None, 0_u32);
         let namespace = caller().await;
         for (index, mut rx) in (0..).zip(self.submit(&req, &namespace)?) {
             let (mut reasoning, mut content, mut tool_calls) =
@@ -889,8 +901,8 @@ impl Chat for LlamaCpp {
                 function_call: None,
                 audio: None,
             };
-            // Every choice reads the same prompt, which counts once.
-            prompt_tokens = outcome.prompt_tokens;
+            // Every choice reads the same prompt, which counts once, as the first read it.
+            prompt.get_or_insert(outcome);
             completion_tokens = completion_tokens.saturating_add(outcome.completion_tokens);
             choices.push(ChatChoice {
                 index,
@@ -905,7 +917,7 @@ impl Chat for LlamaCpp {
             created: now(),
             model: req.model,
             choices,
-            usage: Some(usage(prompt_tokens, completion_tokens)),
+            usage: prompt.map(|prompt| usage(&prompt, completion_tokens)),
             service_tier: None,
             system_fingerprint: None,
         })
@@ -919,6 +931,8 @@ struct StreamState {
     index: u32,
     /// Whether the front choice has sent nothing yet, so its next chunk names the role.
     first: bool,
+    /// The first choice's outcome, whose prompt the usage counts.
+    prompt: Option<Outcome>,
     /// The completion tokens of the choices streamed so far.
     completion_tokens: u32,
     done: bool,
@@ -974,7 +988,8 @@ fn render(
 }
 
 /// The decode thread: loads the model, reports readiness, then runs jobs: one at a time, in
-/// order, or up to `concurrent` together, each in its own sequence of one shared cache.
+/// order, or up to `concurrent` together, each in the sequence of one shared cache whose cached
+/// prompt shares the longest prefix with its own, of up to [`CACHED_PROMPTS`] sequences.
 fn serve(
     name: &str,
     path: &Path,
@@ -1056,26 +1071,46 @@ fn serve(
     let snapshots = head.map_or(0, |(_, kind)| {
         u32::try_from(draft_len(kind, mtp_len)).unwrap_or(0)
     });
-    let context_params = shared_cache(
-        ContextParams::default()
-            .with_n_ctx(n_ctx)
-            .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
-            .with_n_rs_seq(snapshots),
-        concurrent,
-    );
-    let context = match model.new_context(backend, &context_params) {
-        Ok(context) => context,
-        Err(e) => {
-            let _ = ready.send(Err(failed(format!(
-                "llama.cpp could not create a context: {e}"
-            ))));
-            return;
-        }
+    let params = ContextParams::default()
+        .with_n_ctx(n_ctx)
+        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
+        .with_n_rs_seq(snapshots);
+    // The sequences share one cache of `n_ctx` cells, so keeping more prompts than requests
+    // costs only each sequence's own state, such as a recurrent layer's. A model whose context
+    // llama.cpp cannot create with them, or creates giving each sequence less than the whole
+    // context, keeps one prompt per request instead.
+    let sequences = concurrent.max(CACHED_PROMPTS);
+    let several = (sequences > concurrent)
+        .then(|| {
+            model
+                .new_context(backend, &shared_cache(params, sequences))
+                .ok()
+                .filter(|context| context.n_ctx_seq() == context.n_ctx())
+        })
+        .flatten();
+    let (context, sequences) = match several {
+        Some(context) => (context, sequences),
+        None => match model.new_context(backend, &shared_cache(params, concurrent)) {
+            Ok(context) => {
+                if sequences > concurrent {
+                    tracing::debug!(
+                        "Model '{name}' keeps {concurrent} cached prompt(s): llama.cpp could not give {sequences} sequences the whole context each."
+                    );
+                }
+                (context, concurrent)
+            }
+            Err(e) => {
+                let _ = ready.send(Err(failed(format!(
+                    "llama.cpp could not create a context: {e}"
+                ))));
+                return;
+            }
+        },
     };
     let context_window = context.n_ctx();
     let mut decoder = match head {
         None => Decoder::Plain(context),
-        Some((head, kind)) => match mtp(head, kind, context, (mtp_len, concurrent)) {
+        Some((head, kind)) => match mtp(head, kind, context, (mtp_len, sequences)) {
             Ok(spec) => Decoder::Mtp(Box::new(spec)),
             Err(message) => {
                 let _ = ready.send(Err(failed(message)));
@@ -1107,14 +1142,15 @@ fn serve(
     if ready.send(Ok(loaded)).is_err() {
         return;
     }
-    if concurrent > 1 {
+    if sequences > 1 {
         let mut caches = vec![cache];
-        while caches.len() < usize::try_from(concurrent).unwrap_or(usize::MAX) {
+        while caches.len() < usize::try_from(sequences).unwrap_or(usize::MAX) {
             let mut more = PromptCache::new(name, truncation);
             more.reused = Arc::clone(&caches[0].reused);
             caches.push(more);
         }
-        batching::serve(&model, &mut decoder, split, caches, jobs, &eog);
+        let running = usize::try_from(concurrent).unwrap_or(1);
+        batching::serve(&model, &mut decoder, split, (caches, running), jobs, &eog);
         return;
     }
     while let Ok(job) = jobs.recv() {
@@ -1773,14 +1809,15 @@ fn count(tokens: usize) -> f64 {
 }
 
 /// Tokenizes the prompt and decodes the part of it the cache does not already hold, returning
-/// the tokens and the batch whose last logits predict the first generated token.
+/// the tokens, the batch whose last logits predict the first generated token, and how many of
+/// the tokens the cache held.
 fn read_prompt<'m>(
     model: &Model,
     target: &mut impl Target<'m>,
     cache: &mut PromptCache,
     (prompt, namespace): (&str, &CacheNamespace),
     stopping: &AtomicBool,
-) -> std::result::Result<(Vec<Token>, Batch), String> {
+) -> std::result::Result<(Vec<Token>, Batch, usize), String> {
     let tokens = model
         .vocab()
         .tokenize(prompt, false, true)
@@ -1818,7 +1855,7 @@ fn read_prompt<'m>(
     target.context_mut().synchronize();
     read += resumed.elapsed();
     cache.read(tokens.len() - start, read);
-    Ok((tokens, batch))
+    Ok((tokens, batch, start))
 }
 
 /// Decodes `tokens[span]` at their positions, in batches of at most `PROMPT_BATCH`, asking for
@@ -1870,6 +1907,8 @@ struct Output {
     /// Why reading the tool calls failed, which fails the request.
     failure: Option<String>,
     stopping: Arc<AtomicBool>,
+    /// How many prompt tokens the request read from the cache.
+    cached: usize,
 }
 
 impl Output {
@@ -1887,6 +1926,7 @@ impl Output {
             called: false,
             failure: None,
             stopping: job.stopping,
+            cached: 0,
         };
         (job.prompt, job.sampling, output)
     }
@@ -2142,6 +2182,7 @@ impl Output {
         Ok(Outcome {
             finish,
             prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+            cached_tokens: u32::try_from(self.cached).unwrap_or(u32::MAX),
             completion_tokens: self.produced,
         })
     }
@@ -2398,8 +2439,9 @@ fn generate(
     out.begin(picker.goes_on());
     context.set_argmax_output(split && picker.picks_greedily());
     // `tokens` grows by every reply token decoded, so it is always what the cache holds.
-    let (mut tokens, mut batch) =
+    let (mut tokens, mut batch, cached) =
         read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
+    out.cached = cached;
     let prompt_tokens = tokens.len();
     let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
     let finish = loop {
@@ -2452,8 +2494,9 @@ fn generate_mtp(
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`; its cache keeps the positions the
     // target's reuses.
-    let (mut history, mut batch) =
+    let (mut history, mut batch, cached) =
         read_prompt(model, spec, cache, (&prompt, &namespace), &out.stopping)?;
+    out.cached = cached;
     spec.begin(0, &history).map_err(|e| e.to_string())?;
     let n_ctx = usize::try_from(spec.target().n_ctx()).unwrap_or(usize::MAX);
     let prompt_tokens = history.len();
@@ -3074,14 +3117,18 @@ fn chunk(
     }
 }
 
-/// A reply's usage: its prompt, which counts once however many choices read it, and the
-/// completion tokens of every choice.
-fn usage(prompt_tokens: u32, completion_tokens: u32) -> CompletionUsage {
+/// A reply's usage: its prompt, which counts once however many choices read it, with how many
+/// of its tokens the first choice read from the cache, and the completion tokens of every
+/// choice.
+fn usage(prompt: &Outcome, completion_tokens: u32) -> CompletionUsage {
     CompletionUsage {
-        prompt_tokens,
+        prompt_tokens: prompt.prompt_tokens,
         completion_tokens,
-        total_tokens: prompt_tokens.saturating_add(completion_tokens),
-        prompt_tokens_details: None,
+        total_tokens: prompt.prompt_tokens.saturating_add(completion_tokens),
+        prompt_tokens_details: Some(PromptTokensDetails {
+            audio_tokens: None,
+            cached_tokens: Some(prompt.cached_tokens),
+        }),
         completion_tokens_details: None,
     }
 }

@@ -45,19 +45,21 @@ use super::{
 /// How long the decode thread waits when every running request waits on its client.
 const PAUSED_POLL: Duration = Duration::from_millis(1);
 
-/// Serves `jobs` up to `caches.len()` at a time, each request in the sequence of the cache it
-/// reuses, until the queue closes and every request has finished.
+/// Serves `jobs` up to `running` at a time, each request in the sequence of the cache it
+/// reuses, until the queue closes and every request has finished. Each of `caches` keeps a
+/// prompt cached in its own sequence, so with more caches than `running` the idle ones keep
+/// the prompts of earlier requests for later ones to reuse.
 pub(super) fn serve<'m>(
     model: &'m Model,
     decoder: &mut Decoder<'m>,
     split: bool,
-    caches: Vec<PromptCache>,
+    (caches, running): (Vec<PromptCache>, usize),
     jobs: &std_mpsc::Receiver<Job>,
     eog: &[Token],
 ) {
     match decoder {
-        Decoder::Plain(context) => run(model, context, split, caches, jobs, eog),
-        Decoder::Mtp(spec) => run(model, spec.as_mut(), split, caches, jobs, eog),
+        Decoder::Plain(context) => run(model, context, split, (caches, running), jobs, eog),
+        Decoder::Mtp(spec) => run(model, spec.as_mut(), split, (caches, running), jobs, eog),
     }
 }
 
@@ -267,7 +269,7 @@ fn run<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
     split: bool,
-    caches: Vec<PromptCache>,
+    (caches, max_running): (Vec<PromptCache>, usize),
     jobs: &std_mpsc::Receiver<Job>,
     eog: &[Token],
 ) {
@@ -311,7 +313,7 @@ fn run<'m, S: Shared<'m>>(
             model,
             shared,
             split,
-            &mut slots,
+            (&mut slots, max_running),
             &mut waiting,
             eog,
             &mut tick,
@@ -322,12 +324,13 @@ fn run<'m, S: Shared<'m>>(
     }
 }
 
-/// Starts as many waiting requests, in order, as there are free sequences and room for.
+/// Starts as many waiting requests, in order, as there are free sequences and room for, while
+/// fewer than `max_running` run.
 fn admit<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
     split: bool,
-    slots: &mut [Slot<'m>],
+    (slots, max_running): (&mut [Slot<'m>], usize),
     waiting: &mut VecDeque<Job>,
     eog: &[Token],
     tick: &mut u64,
@@ -339,6 +342,9 @@ fn admit<'m, S: Shared<'m>>(
         if job.events.is_closed() {
             waiting.pop_front();
             continue;
+        }
+        if slots.iter().filter(|slot| slot.running.is_some()).count() >= max_running {
+            return;
         }
         let Some(free) = choose_slot(model, slots, job) else {
             return;
@@ -513,7 +519,10 @@ fn start<'m, S: Shared<'m>>(
         &out.stopping,
     );
     let (history, batch) = match read {
-        Ok(read) => read,
+        Ok((history, batch, cached)) => {
+            out.cached = cached;
+            (history, batch)
+        }
         Err(message) => {
             target.clear();
             slot.cache.forget();
