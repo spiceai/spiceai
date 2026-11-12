@@ -100,6 +100,7 @@ mod mem_tier_budget_fallback_upsert_test;
 mod mem_tier_budget_sharded_release_test;
 mod mem_tier_durable_atomicity_test;
 mod mem_tier_overwrite_retention_test;
+mod mem_tier_seal_restart_test;
 mod memory_accounting_test;
 mod memory_mode_cdc_delete_test;
 mod memory_mode_dml_semantics_test;
