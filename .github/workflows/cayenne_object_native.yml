@@ -51,6 +51,7 @@ env:
 
 jobs:
   changes:
+    environment: secret-free
     runs-on: spiceai-dev-runners
     permissions:
       contents: read
@@ -111,6 +112,7 @@ jobs:
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]'))
+    environment: secret-free
     runs-on: spiceai-dev-runners
     # `quick` took 40 s on a 16-core Mac; `all` is not yet timed.
     timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.set == 'all') && 720 || 60 }}
@@ -153,6 +155,7 @@ jobs:
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]'))
+    environment: secret-free
     runs-on: spiceai-dev-runners
     timeout-minutes: 120
     env:
@@ -233,6 +236,7 @@ jobs:
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]'))
+    environment: secret-free
     runs-on: spiceai-dev-runners
     timeout-minutes: 60
     steps:
