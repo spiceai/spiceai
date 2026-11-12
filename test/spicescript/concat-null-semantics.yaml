@@ -1,0 +1,64 @@
+name: concat-null-semantics
+description: >
+  `concat` is Spark's (NULL when any argument is NULL) wherever the query runs:
+  locally, in Cayenne file and memory, in DuckDB and SQLite accelerations, and
+  federated to PostgreSQL or DuckDB, where it is rendered as `||` (#13849,
+  #13875). `concat_ws` keeps skipping NULL arguments. A `concat` over an operand
+  whose text differs between engines (a float) stays local on PostgreSQL and
+  answers what the local engine answers.
+
+sources:
+  src: { kind: '${matrix.src}' }
+
+matrix:
+  src: [postgres, duckdb]
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+  cayenne-memory: cayenne-memory
+  duckdb-file:
+    datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: file } } }
+  sqlite-file:
+    datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: file } } }
+  sqlite-memory:
+    datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: memory } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: concat-null-semantics
+  datasets:
+    - { from: '${matrix.src}:t', name: t, params: '${sources.src.params}' }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, s text, n int, f float8);
+        INSERT INTO t VALUES (1, 'a', 1, 1.5), (2, NULL, 2, NULL), (3, 'c', NULL, 2.5);
+  - start: {}
+  # Federated, the call is sent to the source as `||` rather than `concat(`.
+  - explain: SELECT id, concat(s, '-', n) AS c FROM t
+    contains: ['VirtualExecutionPlan', '||']
+    only: federated
+  - query: SELECT concat(NULL, '-', 1) AS c
+    expect: { rows: [[null]] }
+  - query: SELECT concat('a', NULL, 'b') AS c
+    expect: { rows: [[null]] }
+  - query: SELECT id, concat(s, '-', n) AS c FROM t ORDER BY id
+    expect: { rows: [['1', 'a-1'], ['2', null], ['3', null]] }
+  - query: SELECT id, concat('x', s) AS c FROM t ORDER BY id
+    expect: { rows: [['1', 'xa'], ['2', null], ['3', 'xc']] }
+  - query: SELECT id, concat(n, n) AS c FROM t ORDER BY id
+    expect: { rows: [['1', '11'], ['2', '22'], ['3', null]] }
+  - query: SELECT count(*) AS k FROM t WHERE concat(s, '-', n) IS NULL
+    expect: { rows: [['2']] }
+  # Mixed types: an integer is cast to text the same way everywhere.
+  - query: SELECT id, concat(s, CAST(n AS BIGINT)) AS c FROM t ORDER BY id
+    expect: { rows: [['1', 'a1'], ['2', null], ['3', null]] }
+  # A float's text differs between engines, so PostgreSQL keeps it local.
+  - query: SELECT id, concat(s, f) AS c FROM t ORDER BY id
+    expect: { rows: [['1', 'a1.5'], ['2', null], ['3', 'c2.5']] }
+  # `concat_ws` is the built-in and skips NULL arguments everywhere.
+  - query: SELECT id, concat_ws('-', s, n) AS c FROM t ORDER BY id
+    expect: { rows: [['1', 'a-1'], ['2', '2'], ['3', 'c']] }

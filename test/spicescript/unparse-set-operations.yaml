@@ -61,3 +61,24 @@ steps:
   - query: >-
       SELECT count(*) AS n, sum(x) AS s FROM (SELECT y + 1 AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE label IS NOT NULL EXCEPT SELECT y + 1 AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE y > 0) r
   - query: SELECT count(*) AS n FROM (SELECT a + 1 FROM w INTERSECT SELECT a + 1 FROM w WHERE id > 1) q
+  # A branch that is only literals (`SELECT 'x'`) has no FROM; the correlation
+  # must compare against the literal rather than name the branch's output
+  # (`column "Utf8("x")" does not exist`).
+  - explain: SELECT s FROM w EXCEPT SELECT 'x'
+    contains: VirtualExecutionPlan
+    omits: [HashJoinExec, NestedLoopJoinExec]
+    only: federated
+  - query: SELECT s FROM w EXCEPT SELECT 'x'
+  - query: SELECT s FROM w INTERSECT SELECT 'x'
+  - query: SELECT a FROM w EXCEPT SELECT NULL
+  - query: SELECT a FROM w INTERSECT SELECT NULL
+  - query: SELECT a, s FROM w EXCEPT SELECT 1, 'x'
+  - query: SELECT a, s FROM w INTERSECT SELECT 1, 'x'
+  - query: SELECT s FROM w EXCEPT SELECT 'x' EXCEPT SELECT 'y'
+  - query: SELECT s FROM w WHERE a IS NOT NULL INTERSECT SELECT s FROM w WHERE id < 5 EXCEPT SELECT 'x'
+  - query: SELECT s FROM w2 WHERE a > 0 INTERSECT SELECT s FROM w2 WHERE id > 10 EXCEPT SELECT 'z'
+  - query: SELECT 'x' AS s EXCEPT SELECT s FROM w2
+  - query: SELECT 'y' AS s EXCEPT SELECT s FROM w2
+    expect-empty: true
+  - query: SELECT s FROM w UNION SELECT 'q'
+  - query: SELECT a FROM w UNION ALL SELECT NULL

@@ -2176,9 +2176,11 @@ enum Keep {
 ///   NULL where the built-in skips the argument. The `DuckDB` dialect renders
 ///   the call to match (`||`, `concat_to_string_concat`, #13849), so flipping
 ///   it would make a `DuckDB`-accelerated `concat` disagree with the local
-///   result. The `PostgreSQL` and `SQLite` renderings do **not** match yet:
-///   they still skip a NULL argument and diverge from the local result
-///   (#13875, unresolved), so they are not evidence for either side here.
+///   result. Federated `PostgreSQL` renders it as `||` over text casts too
+///   (`runtime_datafusion::dialect::new_postgres_dialect`, #13875), keeping a
+///   call local when an operand's text differs between the engines; `SQLite`
+///   and the `PostgreSQL` accelerator have no dialect seam, so their deny-lists
+///   keep `concat` local.
 ///   The fork patch it carries (fork PR #217, `docs/dev/fork_patches.md`) is
 ///   guarded by `the_built_session_concatenates_an_untyped_null`.
 /// - `date_part` (also `datepart`): Spark's is a simplify stub that counts
@@ -3467,8 +3469,9 @@ mod tests {
     /// dialect renders the call to match (`||`, #13849). This pins the
     /// `Keep::Spark` entry in `SPARK_SCALAR_COLLISIONS`: were it flipped,
     /// `concat('a', NULL, 'b')` would answer `'ab'` locally and NULL once
-    /// accelerated in `DuckDB`. The `PostgreSQL` and `SQLite` renderings still
-    /// skip the NULL (#13875, unresolved).
+    /// accelerated in `DuckDB` or federated to `PostgreSQL` (both render
+    /// `||`); `SQLite` and the `PostgreSQL` accelerator keep `concat` local
+    /// (#13875).
     #[tokio::test]
     async fn the_built_session_keeps_spark_concat_over_the_built_in() {
         let df = DataFusionBuilder::new(

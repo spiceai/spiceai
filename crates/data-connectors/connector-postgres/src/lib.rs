@@ -34,7 +34,6 @@ use data_connector_api::{
 };
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::postgres::{DynPostgresConnectionPool, PostgresTableFactory};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
 use datafusion_table_providers::sql::db_connection_pool::{
@@ -46,6 +45,7 @@ use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::checked_arithmetic::with_plain_arithmetic_writes;
+use runtime_datafusion::dialect::new_postgres_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -1028,7 +1028,7 @@ async fn federated_postgres_table_provider(
     )
     .await
     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-    .with_dialect(Arc::new(PostgreSqlDialect {}));
+    .with_dialect(new_postgres_dialect());
 
     let schema = sql_table.schema();
     Ok(Arc::new(create_spice_federated_table_provider(

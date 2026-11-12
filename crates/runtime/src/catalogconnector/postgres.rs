@@ -35,12 +35,12 @@ use data_components::{Read, RefreshableCatalogProvider};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
+use runtime_datafusion::dialect::new_postgres_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use snafu::Snafu;
 use std::any::Any;
@@ -169,7 +169,7 @@ impl FederatedPostgresTableFactory {
         table: SqlTable<T, P>,
         table_reference: TableReference,
     ) -> Arc<dyn TableProvider + 'static> {
-        let table = table.with_dialect(Arc::new(PostgreSqlDialect {}));
+        let table = table.with_dialect(new_postgres_dialect());
         let schema = table.schema();
         Arc::new(create_spice_federated_table_provider(
             table,

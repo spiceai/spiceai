@@ -40,7 +40,7 @@ use runtime_acceleration::Engine;
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_checkpoint_api::CheckpointError;
 use runtime_checkpoint_postgres::PostgresSidecar;
-use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
+use runtime_datafusion::function_support::deny_spice_functions_for_postgres_accelerator;
 use runtime_parameters::{Diagnostics, ParameterSpec};
 
 #[derive(Debug, Snafu)]
@@ -83,7 +83,7 @@ impl PostgresAccelerator {
             // failing in `Postgres`. Wired before the `DataFusion` 53 upgrade
             // (#11118) dropped it; see issue #10703.
             postgres_factory: PostgresTableProviderFactory::new()
-                .with_function_support(deny_spice_functions_for_postgres_table_providers()),
+                .with_function_support(deny_spice_functions_for_postgres_accelerator()),
         }
     }
 }

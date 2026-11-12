@@ -488,7 +488,7 @@ fn is_rendered_as_hex_string(value: &ScalarValue) -> bool {
 /// value — including one a cast has since retyped as text.
 ///
 /// With no `scope`, a column's type cannot be read, so it counts as binary.
-fn operand_reaches_binary(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+pub(crate) fn operand_reaches_binary(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     let empty = DFSchema::empty();
     let scope = scope.unwrap_or(&empty);
     let mut reaches = false;

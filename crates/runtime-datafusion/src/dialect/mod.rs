@@ -30,6 +30,7 @@ use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
 mod bigquery;
 mod duckdb;
 mod duckdb_dialect;
+mod postgres_dialect;
 mod re2;
 mod string_literal;
 
@@ -39,7 +40,7 @@ pub use bigquery::SpiceBigQueryDialect;
 
 pub(crate) const BTRIM_NAME: &str = "btrim";
 const TO_HEX_NAME: &str = "to_hex";
-const CONCAT_NAME: &str = "concat";
+pub(crate) const CONCAT_NAME: &str = "concat";
 const SHA256_NAME: &str = "sha256";
 const ENCODE_NAME: &str = "encode";
 
@@ -469,6 +470,67 @@ pub fn postgres_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -
     integer_cast_is_renderable(expr, scope) && string_timestamp_cast_is_renderable(expr, scope)
 }
 
+/// Creates the `PostgreSQL` unparser dialect federated `PostgreSQL` tables use:
+/// `DataFusion`'s [`datafusion::sql::unparser::dialect::PostgreSqlDialect`]
+/// plus the rewrites in `postgres_dialect` (today, `concat` as `||`, so a
+/// pushed-down `concat` keeps Spice's NULL-propagating semantics).
+///
+/// Install it together with
+/// [`crate::function_support::deny_spice_functions_for_postgres_table_providers`],
+/// whose [`postgres_can_translate`] keeps the `concat` calls this rewrite
+/// cannot render faithfully local. A `PostgreSQL` table that cannot install
+/// this dialect must use
+/// [`crate::function_support::deny_spice_functions_for_postgres_accelerator`],
+/// which keeps every `concat` local instead.
+#[must_use]
+pub fn new_postgres_dialect() -> Arc<dyn Dialect + Send + Sync> {
+    Arc::new(postgres_dialect::SpicePostgreSqlDialect::new())
+}
+
+/// Whether [`new_postgres_dialect`] renders this scalar call with the answer
+/// `DataFusion` computes. Only `concat` is checked; everything else defers.
+#[must_use]
+pub fn postgres_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> bool {
+    call.func.name() != CONCAT_NAME || postgres_concat_arguments_are_renderable(&call.args, scope)
+}
+
+/// Whether every `concat` operand renders to the same text through
+/// `CAST(x AS VARCHAR)` in `PostgreSQL` as Spark's `concat` produces locally.
+///
+/// Strings and integers do; a NULL literal does (it propagates through `||`).
+/// Floats, decimals, booleans, dates, timestamps, intervals and nested types are
+/// formatted differently by the two engines (`1.0` vs `1`, `t`/`true`, the
+/// timestamp separator and offset), and binary is decoded differently (`\x..`
+/// escape vs UTF-8 validation), so a call with any of them stays local. An
+/// operand whose type cannot be read is refused rather than assumed.
+#[must_use]
+pub(crate) fn postgres_concat_arguments_are_renderable(
+    args: &[Expr],
+    scope: Option<&DFSchema>,
+) -> bool {
+    let empty = DFSchema::empty();
+    let scope_or_empty = scope.unwrap_or(&empty);
+    args.iter().all(|arg| {
+        !duckdb::operand_reaches_binary(arg, scope)
+            && operand_type(arg, scope_or_empty).is_some_and(|data_type| {
+                matches!(
+                    data_type,
+                    DataType::Null
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Utf8View
+                        | DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                )
+            })
+    })
+}
+
 /// Whether `MySQL` evaluates this non-function expression node the way
 /// `DataFusion` does — today, a cast from a fractional value into an integer is
 /// the one shape it does not (see [`integer_cast_is_renderable`]).
@@ -684,7 +746,8 @@ mod tests {
         bigquery, bigquery_native_function_names, duckdb, duckdb_builtin_scalar_overrides,
         duckdb_can_evaluate_expression, duckdb_can_translate, duckdb_native_function_names,
         integer_cast_is_renderable, mysql_can_evaluate_expression, new_duckdb_dialect,
-        postgres_can_evaluate_expression, string_timestamp_cast_is_renderable,
+        new_postgres_dialect, postgres_can_evaluate_expression, postgres_can_translate,
+        string_timestamp_cast_is_renderable,
     };
     use crate::function_support::bigquery_can_evaluate_expression;
     use arrow_schema::{DataType, Field, Schema};
@@ -720,6 +783,105 @@ mod tests {
             .map(|(name, data_type)| Field::new(*name, data_type.clone(), true))
             .collect();
         DFSchema::try_from(Schema::new(fields)).expect("a schema of plain columns")
+    }
+
+    /// Issue #13875: federated `PostgreSQL` gets `concat` as `||` over text
+    /// casts, which propagates NULL the way Spark's `concat` (`Keep::Spark`)
+    /// does, where `PostgreSQL`'s own `concat` skips the NULL. A string
+    /// literal is left uncast; everything else is cast so `||` always resolves
+    /// to `text || text`.
+    #[test]
+    fn postgres_dialect_renders_concat_as_null_propagating_text_concat() {
+        let dialect = new_postgres_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let render = |expr: Expr| {
+            unparser
+                .expr_to_sql(&expr)
+                .expect("concat unparses for PostgreSQL")
+                .to_string()
+        };
+
+        assert_eq!(
+            render(concat(vec![col("s"), lit("-"), col("n")])),
+            r#"(CAST("s" AS VARCHAR) || '-' || CAST("n" AS VARCHAR))"#
+        );
+        assert_eq!(
+            render(concat(vec![
+                Expr::Literal(ScalarValue::Null, None),
+                lit("-"),
+                lit(1_i64)
+            ])),
+            "(CAST(NULL AS VARCHAR) || '-' || CAST(1 AS VARCHAR))"
+        );
+        assert_eq!(render(concat(vec![lit("a"), lit("b")])), "('a' || 'b')");
+        // Other PostgreSQL rewrites still apply (delegation, not replacement).
+        assert_eq!(
+            render(concat(vec![upper(col("s"))])),
+            r#"(CAST(upper("s") AS VARCHAR))"#
+        );
+    }
+
+    /// The `PostgreSQL` rewrite casts operands to text, which formats strings
+    /// and integers the way Spark's `concat` does, and floats, decimals,
+    /// booleans, dates, timestamps and binary differently. Only the former
+    /// federate; an operand whose type cannot be read stays local.
+    #[test]
+    fn postgres_concat_federates_only_operands_whose_text_agrees() {
+        let scope = scope_of(&[
+            ("s", DataType::Utf8),
+            ("v", DataType::Utf8View),
+            ("i", DataType::Int32),
+            ("l", DataType::Int64),
+            ("f", DataType::Float64),
+            ("d", DataType::Decimal128(10, 2)),
+            ("b", DataType::Boolean),
+            ("dt", DataType::Date32),
+            (
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            ("bin", DataType::Binary),
+        ]);
+        let can = |args: Vec<Expr>, scope: Option<&DFSchema>| {
+            postgres_can_translate(&call_of(concat(args)), scope)
+        };
+
+        for agreed in [
+            vec![col("s"), lit("-"), col("i")],
+            vec![col("v"), col("l")],
+            vec![Expr::Literal(ScalarValue::Null, None), lit("-"), lit(1_i64)],
+        ] {
+            assert!(
+                can(agreed.clone(), Some(&scope)),
+                "{agreed:?} should federate"
+            );
+        }
+        for differs in ["f", "d", "b", "dt", "ts", "bin"] {
+            assert!(
+                !can(vec![col("s"), col(differs)], Some(&scope)),
+                "a concat over `{differs}` must stay local"
+            );
+        }
+        assert!(
+            !can(
+                vec![cast(col("bin"), DataType::Utf8), lit("z")],
+                Some(&scope)
+            ),
+            "a binary operand laundered through a cast must stay local"
+        );
+        assert!(
+            !can(vec![col("s"), lit("z")], None),
+            "a column whose type cannot be read must stay local"
+        );
+        assert!(
+            can(vec![lit("a"), lit(1_i64)], None),
+            "literals carry their own type"
+        );
+        // Every other function defers.
+        assert!(postgres_can_translate(
+            &call_of(upper(col("f"))),
+            Some(&scope)
+        ));
     }
 
     /// Regression test for #13915: `concat_to_string_concat` renders `||`,

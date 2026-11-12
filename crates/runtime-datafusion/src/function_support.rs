@@ -607,23 +607,49 @@ pub const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
 ];
 
 /// Postgres-flavored deny-list as a value: every Spice function, plus the
-/// `DataFusion` array functions `PostgreSQL` can't execute. Used with
-/// `PostgresTableProviderFactory::with_function_support` (accelerator) and the
-/// `PostgreSQL` connector's federation deny-list. See issue #10703.
+/// `DataFusion` array functions `PostgreSQL` can't execute. Used with the
+/// `PostgreSQL` connector's and catalog's federation, which unparse through
+/// [`crate::dialect::new_postgres_dialect`]. See issue #10703.
 ///
 /// A cast from a fractional value into an integer stays local too, because
 /// `PostgreSQL` rounds it where `DataFusion` truncates
 /// ([`crate::dialect::postgres_can_evaluate_expression`]).
+///
+/// `concat` federates only where [`crate::dialect::postgres_can_translate`]
+/// says the dialect's `||` rewrite answers what Spark's `concat` answers; a
+/// table that does not unparse through that dialect must use
+/// [`deny_spice_functions_for_postgres_accelerator`] instead.
 #[must_use]
 pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
-    let unsupported_arrays = datafusion_nested_function_names()
-        .iter()
-        .filter(|name| !POSTGRES_PUSHABLE_ARRAY_FUNCTIONS.contains(&name.as_str()))
-        .cloned();
     FunctionSupportBuilder::new()
-        .deny_also(unsupported_arrays)
+        .deny_also(postgres_unsupported_array_functions())
+        .scalar_call(Arc::new(crate::dialect::postgres_can_translate))
         .expression(Arc::new(crate::dialect::postgres_can_evaluate_expression))
         .build()
+}
+
+/// [`deny_spice_functions_for_postgres_table_providers`] for a `PostgreSQL`
+/// table whose unparser dialect is fixed inside `datafusion-table-providers`
+/// (`PostgresTableProviderFactory`, i.e. the `PostgreSQL` accelerator), so the
+/// `concat` rewrite cannot be installed. `PostgreSQL`'s own `concat` skips a
+/// NULL argument where Spark's returns NULL (issue #13875), so `concat` stays
+/// local there, as it does for `SQLite` ([`SQLITE_DENIED_BUILTINS`]).
+#[must_use]
+pub fn deny_spice_functions_for_postgres_accelerator() -> FunctionSupport {
+    FunctionSupportBuilder::new()
+        .deny_also(
+            postgres_unsupported_array_functions()
+                .chain(std::iter::once(crate::dialect::CONCAT_NAME.to_string())),
+        )
+        .expression(Arc::new(crate::dialect::postgres_can_evaluate_expression))
+        .build()
+}
+
+fn postgres_unsupported_array_functions() -> impl Iterator<Item = String> {
+    datafusion_nested_function_names()
+        .iter()
+        .filter(|name| !POSTGRES_PUSHABLE_ARRAY_FUNCTIONS.contains(&name.as_str()))
+        .cloned()
 }
 
 #[cfg(test)]
