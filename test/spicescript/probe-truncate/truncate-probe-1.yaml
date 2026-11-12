@@ -23,7 +23,7 @@ defaults:
   cluster-partition-by: { '*': id }
   expect: { oracle: src }
   compare-variants: false
-  spiced-args: ["-v"]
+
 steps:
   - source-exec:
       src: |
@@ -84,3 +84,36 @@ steps:
   - query: SELECT * FROM a
     expect-empty: true
     eventually: 15s
+  - source-exec: { src: "INSERT INTO a VALUES (5, 'new5'), (2000, 'new2000')" }
+  - query: SELECT * FROM a
+    eventually: 30s
+  - source-exec: { src: "BEGIN; TRUNCATE a; INSERT INTO a SELECT i, 'again' || i FROM generate_series(1, 10) i; COMMIT" }
+  - query: SELECT * FROM a
+    eventually: 30s
+  - source-exec: { src: "TRUNCATE a, b; INSERT INTO b VALUES (1, 'b-after')" }
+  - query: SELECT * FROM a
+    expect-empty: true
+    eventually: 30s
+  - restart: {}
+  - query: SELECT * FROM a
+    expect-empty: true
+  - query: SELECT * FROM a
+    expect-empty: true
+    eventually: 15s
+  - source-exec: { src: "INSERT INTO a VALUES (5, 'new5'), (2000, 'new2000')" }
+  - query: SELECT * FROM a
+    eventually: 30s
+  - source-exec: { src: "BEGIN; TRUNCATE a; INSERT INTO a SELECT i, 'again' || i FROM generate_series(1, 10) i; COMMIT" }
+  - query: SELECT * FROM a
+    eventually: 30s
+  - source-exec: { src: "TRUNCATE a, b; INSERT INTO b VALUES (1, 'b-after')" }
+  - query: SELECT * FROM a
+    expect-empty: true
+    eventually: 30s
+  - restart: {}
+  - query: SELECT * FROM a
+    expect-empty: true
+  - query: SELECT * FROM a
+    expect-empty: true
+    eventually: 15s
+  - source-exec: { src: "SELECT force_log_upload_probe()" }
