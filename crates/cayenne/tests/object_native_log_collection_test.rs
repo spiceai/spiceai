@@ -162,7 +162,9 @@ async fn sustained_commits_keep_log_objects_bounded_and_every_row() {
     rows.sort_by_key(|row| row.sequence_number);
     let total = i64::try_from(ROUNDS * COMMITS_PER_ROUND).expect("small");
     assert_eq!(
-        rows.iter().map(|row| row.sequence_number).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|row| row.sequence_number)
+            .collect::<Vec<_>>(),
         (1..=total).collect::<Vec<_>>()
     );
     for row in &rows {
@@ -178,7 +180,7 @@ async fn sustained_commits_keep_log_objects_bounded_and_every_row() {
 /// Without a collection that comes due, the same history keeps every object.
 #[tokio::test]
 async fn sustained_commits_without_collection_grow_without_bound() {
-    let (counts, _, _) = sustained(Duration::from_secs(100 * 365 * 24 * 3600)).await;
+    let (counts, _, _) = sustained(Duration::from_hours(100 * 365 * 24)).await;
     eprintln!("LOG_OBJECTS uncollected={counts:?}");
     assert!(
         counts.windows(2).all(|pair| pair[1] > pair[0]),

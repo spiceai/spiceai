@@ -5,6 +5,7 @@
 #![expect(clippy::expect_used, reason = "integration setup and trace assertions")]
 
 use bytes::Bytes;
+use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutOptions, PutPayload, path::Path};
 use object_store_occ::{
     Expected, LocalConditionalPut, conditional_put,
@@ -19,7 +20,6 @@ use object_store_sim::{
 };
 use prost::Message;
 use serde::Deserialize;
-use futures::TryStreamExt;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 

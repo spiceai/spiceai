@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
 use crate::{Expected, conditional_put, probe_conditional_writes};
+pub use collect::{Collected, Collector, DEFAULT_RETENTION};
 use format::{Batch, Checkpoint, decode_record};
 pub use format::{Group, Head, HeadLogConfig, Record, Spilled, WindowRecord};
-pub use collect::{Collected, Collector, DEFAULT_RETENTION};
 pub use reader::{DEFAULT_READ_CONCURRENCY, Opened, Poll, Reader, RecordWithCommit};
 
 /// A protocol, transport, or encoding error. An error never implies rejection.
@@ -767,7 +767,14 @@ fn ensure_version(version: &UpdateVersion) -> Result<()> {
 /// attempt that proposed it, so every record has its own object and the
 /// collector can tell from the name alone whether it is below a floor.
 fn spilled_path(prefix: &Path, commit: u64, attempt_id: &[u8]) -> Path {
-    let attempt: String = attempt_id.iter().map(|b| format!("{b:02x}")).collect();
+    let attempt =
+        attempt_id
+            .iter()
+            .fold(String::with_capacity(2 * attempt_id.len()), |mut hex, b| {
+                use std::fmt::Write;
+                let _ = write!(hex, "{b:02x}");
+                hex
+            });
     prefix
         .clone()
         .join(SPILLED)

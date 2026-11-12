@@ -13,18 +13,18 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
-use futures::TryStreamExt;
 use object_store_occ::headlog::{
     Collected, Collector, DEFAULT_RETENTION, HeadLog, HeadLogConfig, Outcome, Poll,
     PreparedAttempt, Reader, Record, Writer,
 };
-use object_store_sim::fault::FaultStore as GatedStore;
 use object_store_occ::{Expected, LocalConditionalPut, conditional_put};
+use object_store_sim::fault::FaultStore as GatedStore;
 use prost::Message;
 
 fn config() -> HeadLogConfig {
@@ -1108,7 +1108,11 @@ async fn headlog_attempt_evidence_expires_after_the_horizon() {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes.iter().fold(String::new(), |mut hex, b| {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+        hex
+    })
 }
 
 /// The numbers that name the objects in one of a log's directories: a batch's
@@ -1193,7 +1197,11 @@ async fn headlog_collects_objects_below_the_floor_after_the_retention() {
             .publish_checkpoint(floor, Bytes::from_static(b"second root"))
             .await
             .expect("stage second checkpoint");
-        append(&mut writer, Bytes::from_static(b"publishes the second floor")).await;
+        append(
+            &mut writer,
+            Bytes::from_static(b"publishes the second floor"),
+        )
+        .await;
         assert_eq!(floor, 12);
         let batches = numbered(&backend, "wal").await;
         let spilled = numbered(&backend, "records").await;
@@ -1239,13 +1247,12 @@ async fn headlog_collects_objects_below_the_floor_after_the_retention() {
         let (_, opened) = Reader::open(Arc::clone(&backend.store), backend.prefix.clone())
             .await
             .expect("cold open after collection");
-        assert_eq!(opened.checkpoint_root, Some(Bytes::from_static(b"second root")));
         assert_eq!(
-            opened
-                .records
-                .iter()
-                .map(|r| r.commit)
-                .collect::<Vec<_>>(),
+            opened.checkpoint_root,
+            Some(Bytes::from_static(b"second root"))
+        );
+        assert_eq!(
+            opened.records.iter().map(|r| r.commit).collect::<Vec<_>>(),
             vec![13, 14, 15, 16, 17, 18]
         );
         assert_eq!(opened.records[0].record.payload, payloads[12]);
@@ -1280,7 +1287,11 @@ async fn headlog_open_overtaken_by_collection_reopens_from_the_newer_head() {
             .publish_checkpoint(newer, Bytes::from_static(b"newer root"))
             .await
             .expect("stage newer checkpoint");
-        append(&mut writer, Bytes::from_static(b"publishes the newer floor")).await;
+        append(
+            &mut writer,
+            Bytes::from_static(b"publishes the newer floor"),
+        )
+        .await;
         let mut collector = Collector::new(
             Arc::clone(&backend.store),
             backend.prefix.clone(),
@@ -1297,7 +1308,10 @@ async fn headlog_open_overtaken_by_collection_reopens_from_the_newer_head() {
         let (reader, opened) = open.await.expect("join").expect("open retries");
         assert_eq!(reader.state().head.floor, newer);
         assert_eq!(opened.floor, newer);
-        assert_eq!(opened.checkpoint_root, Some(Bytes::from_static(b"newer root")));
+        assert_eq!(
+            opened.checkpoint_root,
+            Some(Bytes::from_static(b"newer root"))
+        );
         let expected: Vec<u64> = (newer + 1..=15).collect();
         assert_eq!(
             opened.records.iter().map(|r| r.commit).collect::<Vec<_>>(),

@@ -222,9 +222,7 @@ impl Model for Protocol {
                 "I7 expired query reads its snapshot or finds an object missing",
                 |_, state: &State| {
                     state.query.as_ref().is_none_or(|(p, _)| {
-                        state
-                            .read_query()
-                            .is_none_or(|v| v == state.snapshot(p))
+                        state.read_query().is_none_or(|v| v == state.snapshot(p))
                     })
                 },
             ),
@@ -298,7 +296,7 @@ impl Protocol {
             .batches
             .iter()
             .map(|(action, _)| *action)
-            .filter(|action| action + 1 <= due)
+            .filter(|&action| action < due)
             .collect();
         next.store
             .batches
