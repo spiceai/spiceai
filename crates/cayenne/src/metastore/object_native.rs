@@ -43,6 +43,16 @@ struct Domain {
     /// Open while this instance writes the log, so its tables' stores accept
     /// data writes; closed on a replica.
     data_writes: crate::catalog::DataWriteGate,
+    /// The writer lease that decides whether this instance writes the log,
+    /// under [`Access::Leased`].
+    lease: Option<WriterLease>,
+}
+
+/// A log's writer lease, as this instance holds or watches it.
+struct WriterLease {
+    lease: object_store_occ::lease::Lease,
+    path: object_store::path::Path,
+    store: Arc<dyn object_store::ObjectStore>,
 }
 
 /// What opening the catalog found, for the startup log.
@@ -70,11 +80,54 @@ pub enum Access {
     /// Read each log without taking it over: write nothing to the location,
     /// and follow the commits of the instance that writes it.
     Replica,
+    /// A writer lease on each log decides: the instance holding it writes, the
+    /// others follow as replicas, and one of them takes over once the holder's
+    /// lease lapses or it hands the lease back.
+    Leased(LeaseSettings),
+}
+
+/// The writer lease of [`Access::Leased`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseSettings {
+    /// How long a lease lasts without renewal. Renewed every third of it.
+    pub duration: std::time::Duration,
+    /// The instance identity the lease names; `None` for this process's
+    /// [`util::instance_id::instance_id`]. Tests give each instance its own.
+    pub identity: Option<&'static str>,
+}
+
+impl Default for LeaseSettings {
+    fn default() -> Self {
+        Self {
+            duration: std::time::Duration::from_secs(30),
+            identity: None,
+        }
+    }
+}
+
+/// The part of a dataset one writer holds a lease on. Today a whole dataset;
+/// a source partition or a key range gets its own lease object later, beside
+/// it, and its generation in the dataset state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteUnit {
+    Dataset,
+}
+
+impl WriteUnit {
+    /// The lease object of this unit in the log at `prefix`.
+    fn lease_path(self, prefix: &object_store::path::Path) -> object_store::path::Path {
+        match self {
+            Self::Dataset => prefix.clone().join("leases").join("writer.json"),
+        }
+    }
 }
 
 struct Inner {
     reader: DatasetStateReader,
     head: Head,
+    /// The log's [`Domain::data_writes`], closed the moment this instance
+    /// stops writing the log.
+    data_writes: crate::catalog::DataWriteGate,
     /// Why this log accepts no change, when it does not.
     stop: Option<Stop>,
     /// A background task is resolving [`Stop::Unresolved`] or reloading after
@@ -317,10 +370,37 @@ pub(crate) fn refused_change_message(dataset: &str, cause: &str) -> String {
     )
 }
 
-/// Logged when another instance took the log over.
+/// Logged when another instance took the log over: *Handed over writing*
+/// (#16245). `holder` names that instance when its lease does.
 pub(crate) fn fenced_message(dataset: &str) -> String {
+    handed_over_message(dataset, None)
+}
+
+/// The refusal of a write by a table that may not write now: another instance
+/// writes the dataset, or this one took it over after the table opened.
+pub(crate) fn not_writer_message(dataset: &str) -> String {
     format!(
-        "{} stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again.",
+        "{} accepts no change from this table: either another Spice instance writes the dataset, or this instance took it over after the table opened and reloads it before writing. Retry the change.",
+        subject(dataset)
+    )
+}
+
+/// *Handed over writing* (#16245).
+pub(crate) fn handed_over_message(dataset: &str, holder: Option<&str>) -> String {
+    let writer = holder.map_or_else(
+        || "another instance".to_string(),
+        |holder| format!("instance '{holder}'"),
+    );
+    format!(
+        "{} is now written by {writer}. This instance keeps serving queries, and takes over again if that instance stops.",
+        subject(dataset)
+    )
+}
+
+/// *Took over writing* (#16245).
+pub(crate) fn took_over_message(dataset: &str, location: &str) -> String {
+    format!(
+        "{} is now written by this instance, resuming its source from the last commit at '{location}'.",
         subject(dataset)
     )
 }
@@ -345,7 +425,8 @@ fn validate_uuid(name: &str, value: &str) -> CatalogResult<()> {
 #[cfg(test)]
 mod commit_outcome_message_tests {
     use super::{
-        fenced_message, refused_change_message, unknown_outcome_message, unresolved_commit_message,
+        fenced_message, handed_over_message, refused_change_message, took_over_message,
+        unknown_outcome_message, unresolved_commit_message,
     };
 
     #[test]
@@ -360,10 +441,18 @@ mod commit_outcome_message_tests {
         );
         assert_eq!(
             fenced_message("orders"),
-            "Dataset 'orders' (cayenne) stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again."
+            "Dataset 'orders' (cayenne) is now written by another instance. This instance keeps serving queries, and takes over again if that instance stops."
+        );
+        assert_eq!(
+            handed_over_message("orders", Some("pod-b")),
+            "Dataset 'orders' (cayenne) is now written by instance 'pod-b'. This instance keeps serving queries, and takes over again if that instance stops."
+        );
+        assert_eq!(
+            took_over_message("orders", "s3://bucket/state"),
+            "Dataset 'orders' (cayenne) is now written by this instance, resuming its source from the last commit at 's3://bucket/state'."
         );
         assert!(
-            fenced_message("").starts_with("The Cayenne object-native metastore stopped writing")
+            fenced_message("").starts_with("The Cayenne object-native metastore is now written by")
         );
         assert_eq!(
             unknown_outcome_message("orders", "connection reset"),

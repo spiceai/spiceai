@@ -19,7 +19,8 @@ limitations under the License.
 use super::{
     super::{actions, state_reader, state_reader::DatasetStateReader},
     Access, Domain, FENCED_ON_REOPEN, Head, Inner, NativeCatalogConfig, OpenSummary, Stop,
-    ValueChange, fenced_message, invalid, refused_change_message, replica_change_message,
+    ValueChange, WriterLease, fenced_message, invalid, refused_change_message,
+    replica_change_message,
     slot::{StateLease, StateSlot},
     subject, transactions_beside,
 };
@@ -37,7 +38,144 @@ use prost::Message;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+/// What [`WriterLease::acquire`] found this instance may do with a log.
+pub(super) enum LeaseRole {
+    /// It holds the writer lease.
+    Holder,
+    /// Another instance, `holder` when the lease names it, holds a live one.
+    Standby { holder: Option<String> },
+}
+
+impl WriterLease {
+    fn new(store: &Arc<dyn ObjectStore>, prefix: &Path, settings: super::LeaseSettings) -> Self {
+        let identity: Arc<str> = Arc::from(
+            settings
+                .identity
+                .unwrap_or_else(util::instance_id::instance_id),
+        );
+        let holder =
+            object_store_occ::lease::Holder::new(identity, uuid::Uuid::now_v7().to_string());
+        Self {
+            lease: object_store_occ::lease::Lease::new(holder, settings.duration),
+            path: super::WriteUnit::Dataset.lease_path(prefix),
+            store: Arc::clone(store),
+        }
+    }
+
+    /// Create, renew or take over the lease, or stand by while another
+    /// instance holds a live one. The lease generation only counts holders;
+    /// the generation in the head is what fences a former writer.
+    async fn acquire(&self, dataset: &str) -> CatalogResult<LeaseRole> {
+        let role = self
+            .lease
+            .acquire(
+                self.store.as_ref(),
+                &self.path,
+                &object_store_occ::ConflictRetry::default(),
+                |previous| async move {
+                    Ok::<_, std::convert::Infallible>(object_store_occ::lease::next_generation(
+                        previous,
+                    ))
+                },
+            )
+            .await
+            .map_err(|error| {
+                invalid(format!(
+                    "{} could not read or write its writer lease: {error}",
+                    subject(dataset)
+                ))
+            })?;
+        Ok(match role {
+            object_store_occ::lease::Role::Holder { .. } => LeaseRole::Holder,
+            object_store_occ::lease::Role::Standby { holder, .. } => LeaseRole::Standby { holder },
+            object_store_occ::lease::Role::Unsupported => {
+                return Err(invalid(format!(
+                    "{} cannot hold a writer lease, because its location does not support conditional writes",
+                    subject(dataset)
+                )));
+            }
+        })
+    }
+
+    /// Hand the lease back, so another instance takes over without waiting
+    /// for it to lapse.
+    async fn release(&self) {
+        if let Err(error) = self.lease.release(self.store.as_ref(), &self.path).await {
+            tracing::debug!("Failed to hand back writer lease {}: {error}", self.path);
+        }
+    }
+
+    fn renew_every(&self) -> std::time::Duration {
+        self.lease.duration() / 3
+    }
+}
+
 impl Domain {
+    /// Renew this log's writer lease, or watch another instance's: take over
+    /// as writer once it lapses or is handed back, and become a replica when
+    /// another instance took it. Returns whether the log has a lease to keep.
+    pub(super) async fn keep_lease(&self) -> bool {
+        let Some(lease) = &self.lease else {
+            return false;
+        };
+        let mut inner = self.inner.take().await;
+        let dataset = Arc::clone(&inner.dataset);
+        let role = match lease.acquire(&dataset).await {
+            Ok(role) => role,
+            Err(error) => {
+                // Safety never depends on the lease: a writer that cannot renew
+                // keeps writing until the head fences it.
+                tracing::warn!("{error}");
+                return true;
+            }
+        };
+        match (&inner.head, role) {
+            (Head::Replica(_), LeaseRole::Holder) => match inner.become_writer().await {
+                Ok(()) => {
+                    tracing::info!("{}", super::took_over_message(&dataset, &inner.location()))
+                }
+                Err(error) => tracing::warn!(
+                    "{} holds its writer lease but could not take the dataset over, so it keeps serving queries as a replica and retries. Cause: {error}",
+                    subject(&dataset)
+                ),
+            },
+            (Head::Writer(_), LeaseRole::Standby { holder }) => {
+                match inner.reload_committed().await {
+                    Ok(()) => tracing::info!(
+                        "{}",
+                        super::handed_over_message(&dataset, holder.as_deref())
+                    ),
+                    Err(error) => {
+                        inner.stop = Some(Stop::Fenced { reloaded: false });
+                        tracing::warn!(
+                            "{} {error}",
+                            super::handed_over_message(&dataset, holder.as_deref())
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Hand the writer lease back if this instance holds it.
+    pub(super) async fn release_lease(&self) {
+        let Some(lease) = &self.lease else {
+            return;
+        };
+        let inner = self.inner.take().await;
+        if matches!(inner.head, Head::Writer(_)) {
+            inner.data_writes.set(false);
+            lease.release().await;
+        }
+    }
+
+    /// How often [`Self::keep_lease`] runs, when the log has a lease.
+    pub(super) fn lease_interval(&self) -> Option<std::time::Duration> {
+        self.lease.as_ref().map(WriterLease::renew_every)
+    }
+
     /// This log's part of a transaction across datasets: commit its buffered
     /// changes, then a `Prepare` holding the publications' actions. Returns the
     /// footprint. The caller holds [`StateSlot::reserve`].
@@ -187,6 +325,23 @@ impl Domain {
         anchor: Option<Arc<str>>,
         dataset: &str,
     ) -> CatalogResult<Self> {
+        // Under a writer lease, the lease decides whether this instance opens
+        // the log as its writer or as a replica.
+        let lease = match config.access {
+            Access::Leased(settings) => Some(WriterLease::new(&store, &prefix, settings)),
+            Access::Writer | Access::Replica => None,
+        };
+        let mut config = config;
+        if let Some(lease) = &lease {
+            config.access = match lease.acquire(dataset).await? {
+                LeaseRole::Holder => Access::Writer,
+                LeaseRole::Standby { .. } => Access::Replica,
+            };
+        }
+        let data_writes = match config.access {
+            Access::Writer => crate::catalog::DataWriteGate::open(),
+            Access::Replica | Access::Leased(_) => crate::catalog::DataWriteGate::closed(),
+        };
         let (inner, opened) = Inner::open(
             store,
             prefix,
@@ -195,16 +350,14 @@ impl Domain {
             anchor,
             Arc::from(dataset),
             None,
+            data_writes.clone(),
         )
         .await?;
-        let data_writes = match config.access {
-            Access::Writer => crate::catalog::DataWriteGate::open(),
-            Access::Replica => crate::catalog::DataWriteGate::closed(),
-        };
         Ok(Self {
             opened,
             folder: String::new(),
             data_writes,
+            lease,
             inner: Arc::new(StateSlot {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
@@ -227,14 +380,24 @@ impl Inner {
         anchor: Option<Arc<str>>,
         dataset: Arc<str>,
         held: Option<u64>,
+        data_writes: crate::catalog::DataWriteGate,
     ) -> CatalogResult<(Self, OpenSummary)> {
         let (reader, opened) = Reader::open(Arc::clone(&store), prefix.clone())
             .await
             .map_err(invalid)?;
         let replayed = replay_state(opened)?;
         if config.access == Access::Replica {
+            data_writes.set(false);
             return Ok(Self::replica(
-                store, prefix, config, immediate, anchor, dataset, reader, replayed,
+                store,
+                prefix,
+                config,
+                immediate,
+                anchor,
+                dataset,
+                reader,
+                replayed,
+                data_writes,
             ));
         }
         let mut replayed = replayed;
@@ -291,6 +454,7 @@ impl Inner {
                 ))),
                 reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
                 head: Head::Writer(writer),
+                data_writes,
                 stop: None,
                 recovering: false,
                 dataset,
@@ -326,6 +490,7 @@ impl Inner {
                     self.reader.anchor.clone(),
                     Arc::clone(&self.dataset),
                     Some(held),
+                    self.data_writes.clone(),
                 )
                 .await;
                 match reopened {
@@ -394,15 +559,45 @@ impl Inner {
     /// Replace the state with the log's committed state, without taking the log
     /// over: a fenced log's reads then show only what committed.
     pub(super) async fn reload_committed(&mut self) -> CatalogResult<()> {
-        let (_, opened) = Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
-            .await
-            .map_err(invalid)?;
+        // Another instance writes the log: send no further data write, then
+        // follow its commits from what is committed now.
+        self.data_writes.set(false);
+        let (reader, opened) =
+            Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
+                .await
+                .map_err(invalid)?;
         let replayed = replay_state(opened)?;
         self.reader.state = replayed.state;
         self.floor_state = replayed.floor_state;
         self.since_floor = replayed.since_floor;
         self.pending.clear();
-        self.stop = Some(Stop::Fenced { reloaded: true });
+        self.head = Head::Replica(reader);
+        self.stop = Some(Stop::Replica);
+        self.config.access = Access::Replica;
+        Ok(())
+    }
+
+    /// Take the log over as its writer, from a replica: the same open a
+    /// writer does at startup, which raises the head's generation so the
+    /// previous writer's next commit fails, then replays what committed.
+    async fn become_writer(&mut self) -> CatalogResult<()> {
+        let mut config = self.config;
+        config.access = Access::Writer;
+        let (writer, _) = Self::open(
+            Arc::clone(&self.reader.store),
+            self.reader.prefix.clone(),
+            config,
+            self.immediate,
+            self.reader.anchor.clone(),
+            Arc::clone(&self.dataset),
+            None,
+            self.data_writes.clone(),
+        )
+        .await?;
+        *self = writer;
+        self.resolve_decided_transactions().await?;
+        // Data writes are allowed only once the head is this instance's.
+        self.data_writes.set(true);
         Ok(())
     }
     /// The error a caller gets from a log stopped for `stop`.
@@ -439,6 +634,7 @@ impl Inner {
         dataset: Arc<str>,
         reader: Reader,
         replayed: Replayed,
+        data_writes: crate::catalog::DataWriteGate,
     ) -> (Self, OpenSummary) {
         let Replayed {
             state,
@@ -458,6 +654,7 @@ impl Inner {
                 ))),
                 reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
                 head: Head::Replica(reader),
+                data_writes,
                 stop: Some(Stop::Replica),
                 recovering: false,
                 dataset,
@@ -470,6 +667,14 @@ impl Inner {
             },
             opened,
         )
+    }
+
+    /// Where the log is, for what it reports.
+    fn location(&self) -> String {
+        self.reader
+            .anchor
+            .as_deref()
+            .map_or_else(|| self.reader.prefix.to_string(), str::to_string)
     }
 
     /// The head writer, which only the instance that writes the log has.
@@ -671,6 +876,9 @@ impl Inner {
         Ok(())
     }
     pub(super) async fn blob(&self, bytes: &[u8]) -> CatalogResult<ObjRef> {
+        // A log that accepts no change could never commit a reference to the
+        // blob, so it does not upload one: a replica writes nothing.
+        self.ensure_accepting()?;
         let reference = ObjRef::of(bytes);
         let path = self
             .reader

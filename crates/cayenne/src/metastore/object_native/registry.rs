@@ -140,6 +140,24 @@ fn sibling(prefix: &Path, name: &str) -> Path {
     Path::from_iter(parts).join(name)
 }
 
+/// Keep `domain`'s writer lease, under [`super::Access::Leased`], for as long
+/// as the catalog holds the log: renew it, or take over once it lapses.
+fn keep_lease_while_open(domain: &Arc<Domain>) {
+    let Some(every) = domain.lease_interval() else {
+        return;
+    };
+    let domain = Arc::downgrade(domain);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let Some(domain) = domain.upgrade() else {
+                break;
+            };
+            domain.keep_lease().await;
+        }
+    });
+}
+
 /// A new folder for dataset `name`: its slug and a fresh `UUIDv7`. A caller that
 /// puts the dataset's data files in the location mints the folder first, so the
 /// table path it creates the dataset with (`<datasets>/<folder>/data`) names it.
@@ -410,6 +428,7 @@ impl ObjectNativeCatalog {
         let datasets = sibling(&prefix, "datasets");
         let transactions = sibling(&prefix, "transactions");
         let registry = Arc::new(registry);
+        keep_lease_while_open(&registry);
         let mut routes = Routes::default();
         routes.refresh(&registry, registry.tables().await);
         let entries = registry.positions_under(REGISTRY).await;
@@ -447,6 +466,7 @@ impl ObjectNativeCatalog {
                 continue;
             };
             let domain = Arc::new(domain);
+            keep_lease_while_open(&domain);
             routes.refresh(&domain, domain.tables().await);
             routes.datasets.insert(name, domain);
         }
@@ -738,6 +758,7 @@ impl ObjectNativeCatalog {
         .await?;
         domain.folder.clone_from(&folder);
         let domain = Arc::new(domain);
+        keep_lease_while_open(&domain);
         let id = domain.create_table(options).await?;
         // The dataset's bookkeeping kept while it had no log moves to its log,
         // which commits before the registry names it: a crash between leaves a

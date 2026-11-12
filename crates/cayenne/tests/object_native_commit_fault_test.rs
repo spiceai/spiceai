@@ -154,7 +154,7 @@ async fn a_fenced_catalog_stops_and_its_change_is_absent() {
         .expect_err("a fenced catalog refuses later work");
     assert_eq!(
         refused.to_string(),
-        "Invalid operation: The Cayenne object-native metastore stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again."
+        "Invalid operation: The Cayenne object-native metastore is written by another Spice instance; this instance serves its queries from the saved state and accepts no change."
     );
 
     assert_eq!(head_commit(&store).await, before);
@@ -845,7 +845,7 @@ mod data_path {
             .expect_err("the fenced instance's write is not saved");
         assert!(
             fenced.to_string().contains(
-                "Dataset 'orders' (cayenne) stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again."
+                "Dataset 'orders' (cayenne) is now written by another instance. This instance keeps serving queries, and takes over again if that instance stops. The change was not saved"
             ),
             "unexpected error: {fenced}"
         );
@@ -860,6 +860,13 @@ mod data_path {
             .await
             .expect("the new writer writes");
         assert_eq!(count(&successor.ctx, "orders").await.expect("count"), 1500);
+        assert_eq!(
+            count(&placed.ctx, "orders")
+                .await
+                .expect("the fenced instance reads"),
+            1500,
+            "the fenced instance follows the new writer's commits"
+        );
     }
 
     /// Arms the dataset's head so the next commit lands with its response lost

@@ -99,6 +99,12 @@ impl MetadataCatalog for Domain {
         self.data_writes.clone()
     }
     async fn follow_commits(&self, _table_id: &str) -> CatalogResult<bool> {
+        // The instance that writes the log is always current, and learns that
+        // without taking the log's lock on every query: its gate is open
+        // exactly while it writes the log.
+        if self.data_writes.allows() {
+            return Ok(false);
+        }
         self.inner.take().await.follow().await
     }
     async fn init(&self) -> CatalogResult<()> {
@@ -106,8 +112,12 @@ impl MetadataCatalog for Domain {
         Ok(())
     }
     async fn shutdown(&self) -> CatalogResult<()> {
-        let mut inner = self.inner.take().await;
-        inner.flush().await?;
+        {
+            let mut inner = self.inner.take().await;
+            inner.flush().await?;
+        }
+        // Hand the writer lease back, so another instance takes over at once.
+        self.release_lease().await;
         Ok(())
     }
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {

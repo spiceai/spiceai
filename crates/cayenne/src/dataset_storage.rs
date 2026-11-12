@@ -495,7 +495,7 @@ pub(crate) async fn delete_in_batches(
 fn replica_write(dataset: &str) -> ObjectStoreError {
     ObjectStoreError::Generic {
         store: STORE_NAME,
-        source: crate::metastore::object_native::replica_change_message(dataset).into(),
+        source: crate::metastore::object_native::not_writer_message(dataset).into(),
     }
 }
 

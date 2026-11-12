@@ -306,38 +306,96 @@ pub struct SnapshotSequenceCommit {
     pub sequence_number: i64,
 }
 
-/// Whether an instance may write a table's data files; shared by the table's
-/// store and the metastore log that decides it, so the store sees a change of
-/// writer at once. See [`MetadataCatalog::data_write_gate`].
+/// Whether an instance may write a table's data files; shared by the table and
+/// the metastore log that decides it, so the table sees a change of writer at
+/// once. See [`MetadataCatalog::data_write_gate`].
+///
+/// Each time the instance becomes the writer again the gate's generation
+/// rises. A table binds the generation it opened at ([`Self::for_table`]), so
+/// a table whose state was seeded before another instance wrote the dataset
+/// refuses writes until it is opened again from the committed state: its
+/// sequence numbers and key sets would otherwise be stale.
 #[derive(Clone, Debug)]
-pub struct DataWriteGate(std::sync::Arc<std::sync::atomic::AtomicBool>);
+pub struct DataWriteGate {
+    state: std::sync::Arc<GateState>,
+    /// The generation a table's gate was bound at; `None` for the log's own.
+    bound: Option<u64>,
+}
+
+#[derive(Debug)]
+struct GateState {
+    allowed: std::sync::atomic::AtomicBool,
+    generation: std::sync::atomic::AtomicU64,
+}
 
 impl DataWriteGate {
+    fn with(allowed: bool) -> Self {
+        Self {
+            state: std::sync::Arc::new(GateState {
+                allowed: std::sync::atomic::AtomicBool::new(allowed),
+                generation: std::sync::atomic::AtomicU64::new(0),
+            }),
+            bound: None,
+        }
+    }
+
     /// A gate that allows writes: the instance writes the table.
     #[must_use]
     pub fn open() -> Self {
-        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-            true,
-        )))
+        Self::with(true)
     }
 
     /// A gate that refuses writes: another instance writes the table.
     #[must_use]
     pub fn closed() -> Self {
-        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-            false,
-        )))
+        Self::with(false)
+    }
+
+    /// This gate for a table opening now: it allows writes only while the
+    /// instance stays the writer it is at this generation.
+    #[must_use]
+    pub fn for_table(&self) -> Self {
+        Self {
+            state: std::sync::Arc::clone(&self.state),
+            bound: Some(
+                self.state
+                    .generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
+        }
     }
 
     /// Whether a write may be sent now.
     #[must_use]
     pub fn allows(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
+        // The generation is read after `allowed`, which `set` publishes after
+        // raising it, so an allowed read never pairs with an older generation.
+        let allowed = self
+            .state
+            .allowed
+            .load(std::sync::atomic::Ordering::Acquire);
+        allowed
+            && self.bound.is_none_or(|bound| {
+                bound
+                    == self
+                        .state
+                        .generation
+                        .load(std::sync::atomic::Ordering::Acquire)
+            })
     }
 
-    /// Allow or refuse writes from now on.
+    /// Allow or refuse writes from now on. Allowing them again after a refusal
+    /// starts a new generation.
     pub fn set(&self, allows: bool) {
-        self.0.store(allows, std::sync::atomic::Ordering::Release);
+        use std::sync::atomic::Ordering;
+        if allows {
+            if !self.state.allowed.load(Ordering::Acquire) {
+                self.state.generation.fetch_add(1, Ordering::AcqRel);
+            }
+            self.state.allowed.store(true, Ordering::Release);
+        } else {
+            self.state.allowed.store(false, Ordering::Release);
+        }
     }
 }
 

@@ -1719,6 +1719,9 @@ pub(crate) struct SeqAllocator {
     next: i64,
     /// Highest value durably written to `cayenne_table.current_sequence_number`.
     persisted_hi: i64,
+    /// Whether this table may write: bound when it opened, so a table seeded
+    /// before another instance wrote the dataset refuses until it reopens.
+    writes: crate::catalog::DataWriteGate,
 }
 
 /// Reserve `count` (>= 1) consecutive sequence numbers from a shared in-memory
@@ -1740,6 +1743,14 @@ pub(crate) async fn reserve_sequences_in(
 ) -> CatalogResult<i64> {
     let count = i64::from(count.max(1));
     let mut allocator = allocator.lock().await;
+    // Every write of the table reserves its sequences here first, so a table
+    // that may not write (a replica, or one seeded before another instance
+    // wrote the dataset) refuses before it changes anything.
+    if !allocator.writes.allows() {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: crate::metastore::object_native::not_writer_message(table_name),
+        });
+    }
 
     if allocator.next + count - 1 > allocator.persisted_hi {
         let bump = std::cmp::max(SEQ_RESERVE_BLOCK, count);
@@ -11983,7 +11994,9 @@ impl CayenneTableProvider {
                     &table_metadata.path,
                     &table_metadata.table_id,
                     config.store,
-                    catalog.data_write_gate(&table_metadata.table_id),
+                    catalog
+                        .data_write_gate(&table_metadata.table_id)
+                        .for_table(),
                 )
                 .map_err(|message| Error::Internal {
                     table: table_name.to_string(),
@@ -12148,6 +12161,7 @@ impl CayenneTableProvider {
         let seq_allocator = Arc::new(tokio::sync::Mutex::new(SeqAllocator {
             next: persisted_hi + 1,
             persisted_hi,
+            writes: catalog.data_write_gate(&table_id).for_table(),
         }));
 
         let force_staging_probe_on_startup = dataset_storage.is_some();

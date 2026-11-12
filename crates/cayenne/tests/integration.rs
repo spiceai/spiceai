@@ -118,6 +118,7 @@ mod object_native_mem_tier_publication_test;
 mod object_native_replica_test;
 mod object_native_source_replay_test;
 mod object_native_transaction_test;
+mod object_native_writer_lease_test;
 mod object_store_reclaim_test;
 mod on_conflict_edge_cases_test;
 mod on_conflict_test;

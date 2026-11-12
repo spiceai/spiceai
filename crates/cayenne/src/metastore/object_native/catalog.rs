@@ -70,11 +70,6 @@ impl MetadataCatalog for ObjectNativeCatalog {
         self.for_table(table_id).data_write_gate(table_id)
     }
     async fn follow_commits(&self, table_id: &str) -> CatalogResult<bool> {
-        // The instance that writes the logs is always current; it does not take
-        // a log's lock on every query to learn that.
-        if self.config.access == super::Access::Writer {
-            return Ok(false);
-        }
         self.for_table(table_id).follow_commits(table_id).await
     }
     async fn init(&self) -> CatalogResult<()> {
