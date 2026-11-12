@@ -109,8 +109,28 @@ class ExtractSnapshotArchivesTest(unittest.TestCase):
         self.archive(lambda t: add_file(t, "crates/x.snap"))
         result = self.run_script()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("resolves outside", result.stdout)
+        self.assertIn("is a symlink in the checkout", result.stdout)
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_does_not_write_through_a_symlinked_snapshot_in_the_checkout(self):
+        script = self.dest / ".github/scripts/approve_bot_pr_runs.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("original\n")
+        os.symlink(".github/scripts/approve_bot_pr_runs.sh", self.dest / "alias.snap")
+        self.archive(lambda t: add_file(t, "alias.snap", b"payload\n"))
+        result = self.run_script()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("is a symlink in the checkout", result.stdout)
+        self.assertEqual(script.read_text(), "original\n")
+
+    def test_does_not_follow_a_symlinked_directory_inside_the_checkout(self):
+        (self.dest / "crates").mkdir()
+        os.symlink("../.github/actions", self.dest / "crates/snapshots")
+        self.archive(lambda t: add_file(t, "crates/snapshots/push-snap-changes/action.snap"))
+        result = self.run_script()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("is a symlink in the checkout", result.stdout)
+        self.assertFalse((self.dest / ".github/actions/push-snap-changes/action.snap").exists())
 
 
 if __name__ == "__main__":

@@ -7,7 +7,8 @@ snapshot-update branch holds the write token and runs no test code, so the
 archive is the only thing that crosses from test code to the write token. This
 script is the check at that boundary: every member must be a regular file
 whose relative path ends in `.snap`, with no absolute path, no `..`, and
-nothing under `.git/` or `.github/`, and it must land inside the checkout.
+nothing under `.git/` or `.github/`, and the path to it in the checkout may
+not pass through a symlink (directory or file).
 Anything else fails the step before a single file is written, so an archive
 can't replace the workflow's own scripts or actions (`push-snap-changes`,
 `approve_bot_pr_runs.sh`) or write outside the checkout.
@@ -44,6 +45,27 @@ def member_error(member: tarfile.TarInfo) -> str | None:
     return None
 
 
+def checkout_path(dest: Path, name: str) -> tuple[Path | None, str | None]:
+    """The path `name` names under `dest`, built without following any symlink.
+
+    Every component that already exists is checked with lstat: a symlinked
+    directory or a symlinked `.snap` in the checkout would otherwise point the
+    write at some other file, such as a script this job runs next.
+    """
+    target = dest
+    for part in PurePosixPath(name).parts:
+        if part == ".":
+            continue
+        target = target / part
+        if target.is_symlink():
+            return None, f"{name!r}: {target.relative_to(dest)} is a symlink in the checkout"
+        if target != dest and target.exists() and not (target.is_dir() or target.is_file()):
+            return None, f"{name!r}: {target.relative_to(dest)} is not a regular file or directory"
+    if target.exists() and not target.is_file():
+        return None, f"{name!r} names an existing directory"
+    return target, None
+
+
 def extract(archive_dir: Path, dest: Path) -> int:
     dest = dest.resolve()
     archives = sorted(archive_dir.glob("*.tar.gz")) if archive_dir.is_dir() else []
@@ -53,10 +75,9 @@ def extract(archive_dir: Path, dest: Path) -> int:
         with tarfile.open(archive, "r:gz") as tar:
             for member in tar.getmembers():
                 err = member_error(member)
+                target = None
                 if err is None:
-                    target = (dest / member.name).resolve()
-                    if dest not in target.parents:
-                        err = f"{member.name!r} resolves outside {dest}"
+                    target, err = checkout_path(dest, member.name)
                 if err:
                     errors.append(f"{archive.name}: {err}")
                 else:
@@ -70,9 +91,9 @@ def extract(archive_dir: Path, dest: Path) -> int:
             src = tar.extractfile(tar.getmember(name))
             assert src is not None
             target.parent.mkdir(parents=True, exist_ok=True)
-            if target.is_symlink():
-                target.unlink()
-            with open(target, "wb") as out:
+            # O_NOFOLLOW: refuse a symlink that appeared after the check above.
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "wb") as out:
                 out.write(src.read())
         print(f"extracted {name}")
     print(f"{len(planned)} snapshot file(s) from {len(archives)} archive(s)")
