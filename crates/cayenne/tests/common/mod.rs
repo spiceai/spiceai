@@ -847,3 +847,17 @@ fn extract_row_count(results: &[RecordBatch]) -> u64 {
         _ => 0,
     }
 }
+
+/// One data file of `snapshot`, so retiring the snapshot retires a file.
+pub fn one_file(table_id: &str, snapshot: &str) -> [cayenne::metadata::SnapshotFile; 1] {
+    [cayenne::metadata::SnapshotFile {
+        table_id: table_id.to_string(),
+        snapshot_id: snapshot.to_string(),
+        file_path: "part-0.vortex".to_string(),
+        row_count: 1,
+        file_size_bytes: 1,
+        min_sequence: 0,
+        max_sequence: 0,
+        digest: None,
+    }]
+}

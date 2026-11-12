@@ -982,7 +982,7 @@ impl CayenneTableProvider {
             // its writer recorded, never the snapshot's prefix: anything else is
             // the orphan sweep's.
             if self.data_in_object_native_location() {
-                self.discard_uncommitted_snapshot(snapshot_id).await?;
+                self.clear_snapshot_dir(snapshot_id).await?;
                 return self
                     .catalog()
                     .clear_snapshot_cached_metadata(self.table_id(), snapshot_id)

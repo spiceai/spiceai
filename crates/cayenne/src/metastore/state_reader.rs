@@ -394,6 +394,13 @@ impl MetadataCatalog for DatasetStateReader {
         // A replayed copy licenses no delete: the log it came from may move on.
         Ok(None)
     }
+    async fn committed_file_keys(
+        &self,
+        _table_id: &str,
+    ) -> CatalogResult<Option<std::collections::BTreeSet<String>>> {
+        // A replayed copy licenses no deletion against a log that may move on.
+        Ok(None)
+    }
     async fn forget_retired_files(&self, _table_id: &str, _keys: &[String]) -> CatalogResult<bool> {
         Err(invalid("the dataset state reader is read-only"))
     }

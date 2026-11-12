@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     any::Any,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, OnceLock},
 };
 
@@ -70,70 +70,79 @@ use vortex_datafusion::VortexSource;
 /// only decreases, and cleanup that observes count 0 can delete it safely.
 #[derive(Debug)]
 pub(crate) struct SnapshotScanRef {
-    refs: Arc<Mutex<HashMap<String, usize>>>,
+    refs: Arc<Mutex<SnapshotScanRefs>>,
     snapshot_ids: Vec<String>,
+    generation: u64,
 }
 
 /// The next scan generation: every [`SnapshotScanRef`] takes one, in creation
 /// order across the process.
 static SCAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// The prefix of the entry a [`SnapshotScanRef`] adds to its table's ref-count
-/// map for its generation, beside its snapshot ids. No snapshot id starts with
-/// it.
-const SCAN_PIN_PREFIX: &str = "#scan-generation/";
+/// Snapshot and generation pins, updated under one lock.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotScanRefs {
+    pub(crate) snapshots: HashMap<String, usize>,
+    generations: BTreeMap<u64, usize>,
+}
 
-/// The generation the next scan takes, read under the ref-count map's lock so
-/// it orders with every scan registered in it: a scan registered before this
-/// read has a lower generation, one registered after has this or a higher one.
-pub(crate) fn next_scan_generation(refs: &HashMap<String, usize>) -> u64 {
-    let _ = refs;
+impl SnapshotScanRefs {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.snapshots.is_empty() && self.generations.is_empty()
+    }
+}
+
+/// The generation the next scan takes. Call with the table's pin lock held
+/// to order the observation with scan registration.
+pub(crate) fn next_scan_generation() -> u64 {
     SCAN_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// The generation of the oldest scan in `refs` that has not ended.
-pub(crate) fn oldest_scan_generation(refs: &HashMap<String, usize>) -> Option<u64> {
-    refs.keys()
-        .filter_map(|key| key.strip_prefix(SCAN_PIN_PREFIX))
-        .filter_map(|generation| generation.parse().ok())
-        .min()
-}
-
-/// Whether `key` of the ref-count map is a snapshot id, not a scan's generation.
-pub(crate) fn is_snapshot_ref(key: &str) -> bool {
-    !key.starts_with(SCAN_PIN_PREFIX)
+/// The generation of the oldest scan that has not ended.
+pub(crate) fn oldest_scan_generation(refs: &SnapshotScanRefs) -> Option<u64> {
+    refs.generations
+        .first_key_value()
+        .map(|(&generation, _)| generation)
 }
 
 impl SnapshotScanRef {
     /// Increment the in-flight-scan ref-count for each snapshot id, and pin
     /// this scan's generation, and return a guard that releases both on drop.
-    pub(crate) fn new(
-        refs: Arc<Mutex<HashMap<String, usize>>>,
-        mut snapshot_ids: Vec<String>,
-    ) -> Arc<Self> {
-        {
+    pub(crate) fn new(refs: Arc<Mutex<SnapshotScanRefs>>, snapshot_ids: Vec<String>) -> Arc<Self> {
+        let generation = {
             let mut map = refs.lock();
             // Taken under the lock, so the retirement sweep, which reads the
             // next generation under it too, orders every scan against its
             // first observation of a removed file.
             let generation = SCAN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            snapshot_ids.push(format!("{SCAN_PIN_PREFIX}{generation}"));
+            *map.generations.entry(generation).or_insert(0) += 1;
             for id in &snapshot_ids {
-                *map.entry(id.clone()).or_insert(0) += 1;
+                *map.snapshots.entry(id.clone()).or_insert(0) += 1;
             }
-        }
-        Arc::new(Self { refs, snapshot_ids })
+            generation
+        };
+        Arc::new(Self {
+            refs,
+            snapshot_ids,
+            generation,
+        })
     }
 }
 
 impl Drop for SnapshotScanRef {
     fn drop(&mut self) {
         let mut map = self.refs.lock();
+        if let Some(count) = map.generations.get_mut(&self.generation) {
+            *count -= 1;
+            if *count == 0 {
+                map.generations.remove(&self.generation);
+            }
+        }
         for id in &self.snapshot_ids {
-            if let Some(count) = map.get_mut(id) {
+            if let Some(count) = map.snapshots.get_mut(id) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    map.remove(id);
+                    map.snapshots.remove(id);
                 }
             }
         }
@@ -2350,7 +2359,10 @@ mod tests {
 
         // `with_guard` marks this the outermost wrapper, so only the file-backed
         // gate can hold the accounting off.
-        let guard = SnapshotScanRef::new(Arc::new(Mutex::new(HashMap::new())), Vec::new());
+        let guard = SnapshotScanRef::new(
+            Arc::new(Mutex::new(SnapshotScanRefs::default())),
+            Vec::new(),
+        );
         let exec = CayenneAccelerationExec::with_guard(one_partition_plan(), guard);
 
         let mut stream = exec

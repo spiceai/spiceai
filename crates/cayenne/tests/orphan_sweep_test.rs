@@ -406,8 +406,8 @@ impl Rig {
         }
     }
 
-    /// `.vortex` keys under `prefix` in the bottom store.
-    async fn data_files(&self, prefix: &str) -> Vec<String> {
+    /// Keys under `prefix` in the bottom store that match `filter`.
+    async fn data_files(&self, prefix: &str, filter: impl Fn(&str) -> bool) -> Vec<String> {
         let mut keys: Vec<String> = self
             .tracking
             .inner
@@ -417,22 +417,10 @@ impl Rig {
             .await
             .expect("list")
             .into_iter()
-            .filter(|key| key.ends_with(".vortex"))
+            .filter(|key| filter(key))
             .collect();
         keys.sort();
         keys
-    }
-}
-
-impl Rig {
-    /// The stored keys that start with `prefix` (not a folder: a key prefix).
-    async fn planted(&self, prefix: &str) -> Vec<String> {
-        let folder = prefix.rsplit_once('/').map_or("", |(folder, _)| folder);
-        self.data_files(folder)
-            .await
-            .into_iter()
-            .filter(|key| key.starts_with(prefix))
-            .collect()
     }
 }
 
@@ -543,7 +531,7 @@ async fn an_orphan_of_a_fenced_writer_is_reclaimed_after_the_floor_and_never_ado
     // Its staged originals sit beside a staging WAL, which staging recovery
     // owns; the copies in the live snapshot directory are this sweep's.
     let orphans: Vec<String> = rig
-        .data_files(&second.data_prefix)
+        .data_files(&second.data_prefix, |key| key.ends_with(".vortex"))
         .await
         .into_iter()
         .filter(|key| !named.contains(key) && !key.contains("/_staging/"))
@@ -571,7 +559,9 @@ async fn an_orphan_of_a_fenced_writer_is_reclaimed_after_the_floor_and_never_ado
         .await
         .expect("the new writer writes");
     let swept = second.table.sweep_orphan_files_now().await.expect("sweep");
-    let remaining = rig.data_files(&second.data_prefix).await;
+    let remaining = rig
+        .data_files(&second.data_prefix, |key| key.ends_with(".vortex"))
+        .await;
     for orphan in &orphans {
         assert!(
             !remaining.contains(orphan),
@@ -625,7 +615,9 @@ async fn an_upload_whose_commit_outcome_is_unknown_is_not_reclaimed() {
         .insert(1001, 2000)
         .await
         .expect_err("the write is not acknowledged");
-    let before = rig.data_files(&placed.data_prefix).await;
+    let before = rig
+        .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
+        .await;
     let refused = placed.table.sweep_orphan_files_now().await;
     assert!(
         refused
@@ -633,7 +625,11 @@ async fn an_upload_whose_commit_outcome_is_unknown_is_not_reclaimed() {
             .map_or(true, |sweep| sweep.deleted.is_empty()),
         "the sweep deleted while the outcome was unknown: {refused:?}"
     );
-    assert_eq!(rig.data_files(&placed.data_prefix).await, before);
+    assert_eq!(
+        rig.data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
+            .await,
+        before
+    );
 
     rig.faults.clear_rules();
     eventually("the dataset accepts writes again", || async {
@@ -641,7 +637,9 @@ async fn an_upload_whose_commit_outcome_is_unknown_is_not_reclaimed() {
     })
     .await;
     let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
-    let remaining = rig.data_files(&placed.data_prefix).await;
+    let remaining = rig
+        .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
+        .await;
     for key in placed.named_keys().await {
         assert!(
             remaining.contains(&key),
@@ -675,7 +673,9 @@ async fn a_write_in_flight_keeps_its_uploaded_files_whatever_their_age() {
         tokio::spawn(async move { placed.insert(1001, 2000).await })
     };
     let held = rig.faults.wait_held(None).await;
-    let uploaded = rig.data_files(&placed.data_prefix).await;
+    let uploaded = rig
+        .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
+        .await;
     let sweeper = {
         let placed = Arc::clone(&placed);
         tokio::spawn(async move { placed.table.sweep_orphan_files_now().await })
@@ -688,7 +688,9 @@ async fn a_write_in_flight_keeps_its_uploaded_files_whatever_their_age() {
         swept.deleted.is_empty(),
         "the sweep deleted a write's files in flight: {swept:?}"
     );
-    let remaining = rig.data_files(&placed.data_prefix).await;
+    let remaining = rig
+        .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
+        .await;
     for key in &uploaded {
         assert!(
             remaining.contains(key),
@@ -842,7 +844,9 @@ async fn a_committed_file_the_listing_misses_is_not_dropped() {
         .drain_in_flight_maintenance()
         .await
         .expect("drain");
-    let hidden = rig.data_files(&placed.data_prefix).await;
+    let hidden = rig
+        .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
+        .await;
     assert_eq!(hidden.len(), 1, "one committed file: {hidden:?}");
     rig.tracking.hidden.lock().extend(hidden.iter().cloned());
     for i in 1..5 {
@@ -879,7 +883,9 @@ async fn a_committed_file_the_listing_misses_is_not_dropped() {
         (5000, 5000),
         "{swept:?}"
     );
-    let remaining = rig.data_files(&placed.data_prefix).await;
+    let remaining = rig
+        .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
+        .await;
     for key in placed.named_keys().await {
         assert!(
             remaining.contains(&key),
@@ -957,7 +963,9 @@ async fn an_orphan_of_a_table_that_is_not_written_again_is_reclaimed_at_open() {
         (young.clone(), Duration::from_mins(30)),
     ]);
     let named = placed.named_keys().await;
-    let before = rig.data_files(&placed.data_prefix).await;
+    let before = rig
+        .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
+        .await;
     assert!(
         before.contains(&old)
             && before.contains(&young)
@@ -972,10 +980,14 @@ async fn an_orphan_of_a_table_that_is_not_written_again_is_reclaimed_at_open() {
         .place(rig.catalog().await, "orders", Some(data_url))
         .await;
     eventually("the orphan older than the floor is reclaimed", || async {
-        !rig.data_files(&reopened.data_prefix).await.contains(&old)
+        !rig.data_files(&reopened.data_prefix, |key| key.ends_with(".vortex"))
+            .await
+            .contains(&old)
     })
     .await;
-    let remaining = rig.data_files(&reopened.data_prefix).await;
+    let remaining = rig
+        .data_files(&reopened.data_prefix, |key| key.ends_with(".vortex"))
+        .await;
     let mut lost: Vec<&String> = named
         .iter()
         .filter(|key| !remaining.contains(key))
@@ -1006,14 +1018,27 @@ async fn the_orphan_sweep_deletes_in_batched_requests() {
         .await
         .expect("drain");
     let (dir, keys) = plant_orphans(&rig, &placed, &[8; ORPHANS]).await;
-    assert_eq!(rig.planted(&dir).await, keys, "the orphans are stored");
+    assert_eq!(
+        rig.data_files(
+            dir.rsplit_once('/').map_or("", |(folder, _)| folder),
+            |key| key.ends_with(".vortex") && key.starts_with(&dir)
+        )
+        .await,
+        keys,
+        "the orphans are stored"
+    );
     placed.table.set_orphan_age_floor(Duration::ZERO);
     let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
     assert_eq!(
         (
             swept.deleted.len(),
             rig.tracking.delete_requests_under(&dir).len(),
-            rig.planted(&dir).await.len(),
+            rig.data_files(
+                dir.rsplit_once('/').map_or("", |(folder, _)| folder),
+                |key| key.ends_with(".vortex") && key.starts_with(&dir)
+            )
+            .await
+            .len(),
             placed.count().await.expect("count"),
         ),
         (ORPHANS, ORPHANS.div_ceil(1000), 0, (1000, 1000)),
@@ -1112,20 +1137,6 @@ async fn plant(rig: &Rig, key: &str) {
         .expect("plant an object");
 }
 
-/// Every stored key under `prefix`, of any kind.
-async fn stored_under(rig: &Rig, prefix: &str) -> Vec<String> {
-    let mut keys: Vec<String> = rig
-        .tracking
-        .inner
-        .list(Some(&Path::from(prefix)))
-        .map_ok(|meta| meta.location.to_string())
-        .try_collect()
-        .await
-        .expect("list");
-    keys.sort();
-    keys
-}
-
 /// A flat data file no commit names, directly under the table's directory, is
 /// kept while the store dates it younger than the floor and deleted after it.
 /// The live files and the files a compaction retired, also flat keys in that
@@ -1192,7 +1203,11 @@ async fn a_flat_orphan_is_reclaimed_after_the_floor_and_live_and_retired_keys_ar
         young.deleted.is_empty() && young.kept_young >= 1,
         "the orphan is younger than the floor: {young:?}"
     );
-    assert!(rig.data_files(&dir).await.contains(&orphan));
+    assert!(
+        rig.data_files(&dir, |key| key.ends_with(".vortex"))
+            .await
+            .contains(&orphan)
+    );
 
     tokio::time::sleep(FLOOR + Duration::from_millis(200)).await;
     placed.insert(3101, 3200).await.expect("append");
@@ -1202,7 +1217,7 @@ async fn a_flat_orphan_is_reclaimed_after_the_floor_and_live_and_retired_keys_ar
         vec![orphan[dir.len() + 1..].to_string()],
         "the flat orphan, and only it, is deleted after the floor"
     );
-    let remaining = rig.data_files(&dir).await;
+    let remaining = rig.data_files(&dir, |key| key.ends_with(".vortex")).await;
     assert!(!remaining.contains(&orphan));
     let mut lost: Vec<&String> = live
         .iter()
@@ -1247,7 +1262,7 @@ async fn the_orphan_sweep_writes_no_clock_object() {
     assert_eq!(clocks, Vec::<String>::new(), "no clock object is ever put");
     let dir = table_dir(&placed).await;
     assert!(
-        stored_under(&rig, &dir)
+        rig.data_files(&dir, |_| true)
             .await
             .iter()
             .all(|key| !key.ends_with("_store_clock")),
@@ -1280,7 +1295,11 @@ async fn an_object_newer_than_the_head_is_kept() {
         (Vec::<String>::new(), 1),
         "the object newer than the head is kept: {kept:?}"
     );
-    assert!(rig.data_files(&dir).await.contains(&orphan));
+    assert!(
+        rig.data_files(&dir, |key| key.ends_with(".vortex"))
+            .await
+            .contains(&orphan)
+    );
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     placed.insert(1001, 1100).await.expect("a later write");
@@ -1331,6 +1350,8 @@ async fn the_orphan_sweep_leaves_the_lookup_index_alone() {
         vec![orphan[dir.len() + 1..].to_string()],
         "only the flat orphan is deleted"
     );
-    let index = stored_under(&rig, &format!("{dir}/_lookup_index")).await;
+    let index = rig
+        .data_files(&format!("{dir}/_lookup_index"), |_| true)
+        .await;
     assert_eq!(index, runs.to_vec(), "the lookup index is untouched");
 }

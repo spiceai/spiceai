@@ -232,30 +232,15 @@ async fn create_placed(
             ctx.runtime_env(),
             object_store_config(store, &data_url),
         )
-        .create(CreateTableOptions {
-            table_name: name.to_string(),
-            schema: schema(),
-            primary_key: if keyed {
-                vec!["id".to_string()]
-            } else {
-                Vec::new()
-            },
-            on_conflict: keyed
-                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
-            base_path: data_url.clone(),
-            partition_column: None,
-            // Every write is data files, not rows inlined into the metastore,
-            // and each is a small file, three of which qualify for compaction.
-            vortex_config: VortexConfig {
-                inline_max_rows: 0,
-                inline_max_bytes: 0,
-                target_vortex_file_size_mb: 1,
-                compaction_trigger_files: 3,
-                compaction_max_levels: 3,
-                compaction_max_files_per_pick: 3,
-                compaction_background_interval_ms: 0,
-                ..VortexConfig::default()
-            },
+        .create({
+            let mut options = placed_options(
+                name,
+                &data_url,
+                keyed,
+                cayenne::metadata::SettingsChangeAction::default(),
+            );
+            options.vortex_config.deletion_mode = cayenne::metadata::DeletionMode::default();
+            options
         })
         .await
         .expect("create the table"),

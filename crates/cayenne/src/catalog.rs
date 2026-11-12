@@ -1241,6 +1241,13 @@ pub trait MetadataCatalog: Send + Sync {
     /// of the live set.
     async fn retired_files(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>>;
 
+    /// Committed live and retired file keys; `None` when state cannot license cleanup.
+    /// Wrappers must forward this read to the same authoritative state as retirement.
+    async fn committed_file_keys(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<std::collections::BTreeSet<String>>>;
+
     /// Whether this catalog keeps the durable retirement record that
     /// [`Self::retired_files`] reads.
     fn keeps_retirement_record(&self) -> bool;

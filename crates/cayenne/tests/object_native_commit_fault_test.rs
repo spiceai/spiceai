@@ -1467,19 +1467,7 @@ fn protected_snapshot<'a>(
     }
 }
 
-/// One data file of `snapshot`, so retiring the snapshot retires a file.
-fn one_file(table_id: &str, snapshot: &str) -> [cayenne::metadata::SnapshotFile; 1] {
-    [cayenne::metadata::SnapshotFile {
-        table_id: table_id.to_string(),
-        snapshot_id: snapshot.to_string(),
-        file_path: "part-0.vortex".to_string(),
-        row_count: 1,
-        file_size_bytes: 1,
-        min_sequence: 0,
-        max_sequence: 0,
-        digest: None,
-    }]
-}
+use crate::common::one_file;
 
 /// A retirement licenses deleting files only once it is committed. While the
 /// change that takes a protected snapshot's file out of the live set is
@@ -1507,6 +1495,15 @@ async fn retired_files_are_answered_from_committed_state_only() {
         Some(vec![])
     );
 
+    assert_eq!(
+        catalog
+            .committed_file_keys(&orders)
+            .await
+            .expect("read committed keys"),
+        Some(std::collections::BTreeSet::from([first_key.clone()])),
+        "the authoritative key read includes live files"
+    );
+
     cayenne::catalog::with_deferred_commits(async {
         assert!(
             catalog
@@ -1514,6 +1511,13 @@ async fn retired_files_are_answered_from_committed_state_only() {
                 .await
                 .expect("merge"),
             "the merge replaces the protected snapshot"
+        );
+        assert_eq!(
+            catalog
+                .committed_file_keys(&orders)
+                .await
+                .expect("read committed keys"),
+            None
         );
         assert_eq!(
             catalog.retired_files(&orders).await.expect("read"),
@@ -1534,6 +1538,15 @@ async fn retired_files_are_answered_from_committed_state_only() {
     assert_eq!(
         catalog.retired_files(&orders).await.expect("read"),
         Some(vec![first_key.clone()])
+    );
+
+    assert_eq!(
+        catalog
+            .committed_file_keys(&orders)
+            .await
+            .expect("read committed keys"),
+        Some(std::collections::BTreeSet::from([first_key.clone()])),
+        "the authoritative key read includes retired files"
     );
 
     // A successor reads the record from storage alone, and fences this catalog.

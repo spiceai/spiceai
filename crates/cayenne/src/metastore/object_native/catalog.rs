@@ -102,7 +102,7 @@ pub struct ObjectNativeCatalog {
 /// deletions. Weak, so a table that is gone reads nothing.
 #[derive(Clone, Debug)]
 pub struct TableReaders {
-    scans: std::sync::Weak<parking_lot::Mutex<HashMap<String, usize>>>,
+    scans: std::sync::Weak<parking_lot::Mutex<crate::provider::scan::SnapshotScanRefs>>,
     deletions: std::sync::Weak<tokio::sync::RwLock<()>>,
 }
 
@@ -110,8 +110,8 @@ impl TableReaders {
     /// The readers of a table whose scans count themselves in `scans` and whose
     /// restore points hold `deletions` shared.
     #[must_use]
-    pub fn new(
-        scans: &Arc<parking_lot::Mutex<HashMap<String, usize>>>,
+    pub(crate) fn new(
+        scans: &Arc<parking_lot::Mutex<crate::provider::scan::SnapshotScanRefs>>,
         deletions: &Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
         Self {
@@ -1616,11 +1616,7 @@ impl ObjectNativeCatalog {
         table_id: &str,
     ) -> CatalogResult<chrono::DateTime<chrono::Utc>> {
         let domain = self.for_table(table_id);
-        let prefix = if domain.folder.is_empty() {
-            self.prefix.clone()
-        } else {
-            self.datasets.clone().join(domain.folder.as_str())
-        };
+        let prefix = self.log_of(&domain.folder);
         Ok(self
             .store
             .head(&prefix.join("head"))
@@ -1909,6 +1905,12 @@ impl MetadataCatalog for ObjectNativeCatalog {
     }
     async fn retired_files(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
         self.for_table(table_id).retired_files(table_id).await
+    }
+    async fn committed_file_keys(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<std::collections::BTreeSet<String>>> {
+        self.for_table(table_id).committed_file_keys(table_id).await
     }
     async fn forget_retired_files(&self, table_id: &str, keys: &[String]) -> CatalogResult<bool> {
         self.for_table(table_id)

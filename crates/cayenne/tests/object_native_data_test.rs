@@ -3963,14 +3963,7 @@ async fn run_failed_operation(
 
 /// The keys under `prefix` in the bottom store.
 async fn keys_under(setup: &Setup, prefix: &str) -> std::collections::BTreeSet<String> {
-    setup
-        .counting
-        .inner
-        .list(Some(&Path::from(prefix)))
-        .map_ok(|meta| meta.location.to_string())
-        .try_collect()
-        .await
-        .expect("list objects")
+    objects_under(setup, prefix, "").await.into_iter().collect()
 }
 
 /// A placed table's append, overwrite, compaction and keyed change-stream burst,

@@ -1050,8 +1050,12 @@ impl PreparedStagedAppend {
         if !self.overlay
             && let Some(source_snapshot_id) = &self.source_snapshot_id
         {
-            self.table
-                .retire_snapshot_dirs(std::iter::once(source_snapshot_id.as_str()));
+            if self.table.reclaims_retired_files() {
+                self.table.schedule_retired_file_sweep();
+            } else {
+                self.table
+                    .retire_snapshot_dirs(std::iter::once(source_snapshot_id.as_str()));
+            }
         }
     }
 
@@ -1438,7 +1442,7 @@ impl CayenneTableProvider {
 
         let staging_snapshot_id = Self::new_staging_snapshot_id();
         setup_cleanup.snapshots.push(staging_snapshot_id.clone());
-        self.clear_staging_snapshot_dir(&staging_snapshot_id)
+        self.clear_new_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
         // A partition's append is one statement over its whole input: the keys
         // it repeats are resolved after it is staged. Its staged files move into
@@ -2345,12 +2349,20 @@ impl CayenneTableProvider {
                         .filter(|name| !reachable.contains(**name))
                         .map(|name| (*name).to_string())
                         .collect();
-                    for name in missing {
-                        match config
-                            .store
-                            .head(&crate::object_child(&target_prefix, &name))
-                            .await
-                        {
+                    let mut heads = futures::stream::iter(missing)
+                        .map(|name| {
+                            let target_prefix = &target_prefix;
+                            async move {
+                                let result = config
+                                    .store
+                                    .head(&crate::object_child(target_prefix, &name))
+                                    .await;
+                                (name, result)
+                            }
+                        })
+                        .buffer_unordered(super::table::OBJECT_STORE_MOVE_CONCURRENCY);
+                    while let Some((name, result)) = heads.next().await {
+                        match result {
                             Ok(_) => {
                                 reachable.insert(name);
                             }

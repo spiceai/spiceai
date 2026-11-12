@@ -20,22 +20,14 @@ limitations under the License.
 //! The table's data is flat: its data files sit directly under the table's
 //! directory (`<write_id>_<n>.vortex`), its deletion vectors under
 //! `deletions/`, a staged write in `_staging/<id>/`, and the lookup index in
-//! `_lookup_index/`, which this sweep never touches. Keys in a folder per
-//! snapshot (`<snapshot>/<file>`), which earlier builds wrote, are still
-//! classified by that folder.
+//! `_lookup_index/`, which this sweep never touches.
 //!
 //! A listed object is deleted only when all of these hold:
 //!
 //! - no committed entry of the table names it, live or retired: a flat data
 //!   file by its key (the manifest rows of every snapshot, and the retirement
 //!   record, whose files belong to the retirement sweep until it forgets them),
-//!   a deletion vector by its name. A key in a snapshot folder must also sit in
-//!   a live (current or protected) snapshot directory, a staging directory
-//!   without a staging WAL, a compaction's scratch directory, or a snapshot
-//!   directory nothing refers to; a retired directory, and one that is not
-//!   live and an open reader holds or listed recently, are skipped whole. A
-//!   scan reads a live snapshot's files from its committed manifest, never an
-//!   unnamed file;
+//!   a deletion vector by its name;
 //! - no write of this process still holds it ([`super::uncommitted_files`]),
 //!   whatever its age, so an upload or a commit still in flight keeps its files
 //!   (a deletion vector is held from before its upload until a commit names it,
@@ -65,7 +57,6 @@ limitations under the License.
 //! ([`crate::dataset_storage::delete_in_batches`]) and counts what it reclaimed
 //! under `op="orphan_file_sweep"`.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -131,26 +122,14 @@ pub(crate) enum Placement<'a> {
     Flat { file: &'a str },
     /// `deletions/<file>.arrow`: a deletion vector of a flat table.
     Deletion { file: &'a str },
-    /// `<snapshot>/<file>` in a current or protected snapshot directory.
-    Live { snapshot: &'a str, file: &'a str },
     /// `_staging/<id>/<file>`: `snapshot` is `_staging/<id>`.
     Staging { snapshot: String, file: &'a str },
-    /// `<scratch>/<file>` in a compaction's scratch directory.
-    Scratch { snapshot: &'a str, file: &'a str },
-    /// `<snapshot>/<file>` in a snapshot directory that is not live: an
-    /// abandoned compaction or overwrite output, or a retired one.
-    NotLive { snapshot: &'a str, file: &'a str },
     /// Anything else: the lookup index's, another sweep's, or not a data file.
     Other,
 }
 
-/// The directory names a compaction gives the snapshots it builds and scans
-/// itself before any commit names them.
-const SCRATCH_PREFIXES: [&str; 1] = ["subset-src-"];
-
-/// Classifies `relative` (a key under the table's prefix) against the table's
-/// `live` snapshot ids.
-pub(crate) fn placement<'a>(relative: &'a str, live: &HashSet<String>) -> Placement<'a> {
+/// Classifies a key under the table's prefix.
+pub(crate) fn placement(relative: &str) -> Placement<'_> {
     let mut parts = relative.split('/');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some(dir), ..) if dir == super::constants::LOOKUP_INDEX_DIR_NAME => Placement::Other,
@@ -159,17 +138,8 @@ pub(crate) fn placement<'a>(relative: &'a str, live: &HashSet<String>) -> Placem
         {
             Placement::Flat { file }
         }
-        (Some(dir), Some(file), None, None)
-            if dir == super::delete::vector_io::DELETION_DIR_NAME =>
-        {
-            if std::path::Path::new(file)
-                .extension()
-                .is_some_and(|extension| extension == "arrow")
-            {
-                Placement::Deletion { file }
-            } else {
-                Placement::Other
-            }
+        (Some(dir), Some(file), None, None) if is_deletion_vector_file(dir, file) => {
+            Placement::Deletion { file }
         }
         (Some(staging), Some(id), Some(file), None)
             if staging == super::constants::STAGING_DIR_NAME =>
@@ -179,21 +149,15 @@ pub(crate) fn placement<'a>(relative: &'a str, live: &HashSet<String>) -> Placem
                 file,
             }
         }
-        (Some(snapshot), Some(file), None, None) if live.contains(snapshot) => {
-            Placement::Live { snapshot, file }
-        }
-        (Some(snapshot), Some(file), None, None)
-            if SCRATCH_PREFIXES
-                .iter()
-                .any(|prefix| snapshot.starts_with(prefix)) =>
-        {
-            Placement::Scratch { snapshot, file }
-        }
-        (Some(snapshot), Some(file), None, None) if uuid::Uuid::parse_str(snapshot).is_ok() => {
-            Placement::NotLive { snapshot, file }
-        }
         _ => Placement::Other,
     }
+}
+
+fn is_deletion_vector_file(dir: &str, file: &str) -> bool {
+    dir == super::delete::vector_io::DELETION_DIR_NAME
+        && std::path::Path::new(file)
+            .extension()
+            .is_some_and(|extension| extension == "arrow")
 }
 
 /// The file name of a deletion vector at `relative` (a key under the dataset's
@@ -201,14 +165,7 @@ pub(crate) fn placement<'a>(relative: &'a str, live: &HashSet<String>) -> Placem
 pub(crate) fn deletion_vector_name(relative: &str) -> Option<&str> {
     let mut parts = relative.split('/');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(_), Some(dir), Some(file), None)
-            if dir == super::delete::vector_io::DELETION_DIR_NAME
-                && std::path::Path::new(file)
-                    .extension()
-                    .is_some_and(|extension| extension == "arrow") =>
-        {
-            Some(file)
-        }
+        (Some(_), Some(dir), Some(file), None) if is_deletion_vector_file(dir, file) => Some(file),
         _ => None,
     }
 }
@@ -234,66 +191,35 @@ mod tests {
 
     #[test]
     fn placement_separates_what_this_sweep_reclaims_from_other_sweeps() {
-        let live: HashSet<String> = ["cur".to_string(), "prot".to_string()].into();
+        assert_eq!(placement("cur/a.vortex"), Placement::Other);
+        assert_eq!(placement("subset-src-x/d.vortex"), Placement::Other);
         assert_eq!(
-            placement("cur/a.vortex", &live),
-            Placement::Live {
-                snapshot: "cur",
-                file: "a.vortex"
-            }
-        );
-        assert_eq!(
-            placement("prot/b.vortex", &live),
-            Placement::Live {
-                snapshot: "prot",
-                file: "b.vortex"
-            }
-        );
-        assert_eq!(
-            placement("_staging/w1/c.vortex", &live),
+            placement("_staging/w1/c.vortex"),
             Placement::Staging {
                 snapshot: "_staging/w1".to_string(),
                 file: "c.vortex"
             }
         );
-        assert_eq!(
-            placement("subset-src-x/d.vortex", &live),
-            Placement::Scratch {
-                snapshot: "subset-src-x",
-                file: "d.vortex"
-            }
-        );
-        let old = "01a1bf18-c3b4-7562-86c7-7222e98235ad";
-        assert_eq!(
-            placement(&format!("{old}/e.vortex"), &live),
-            Placement::NotLive {
-                snapshot: old,
-                file: "e.vortex"
-            }
-        );
         // A flat table's data files and deletion vectors.
         assert_eq!(
-            placement("01a1_0.vortex", &live),
+            placement("01a1_0.vortex"),
             Placement::Flat {
                 file: "01a1_0.vortex"
             }
         );
         assert_eq!(
-            placement("deletions/delete_01a1.arrow", &live),
+            placement("deletions/delete_01a1.arrow"),
             Placement::Deletion {
                 file: "delete_01a1.arrow"
             }
         );
         // The lookup index, a deeper key, another file under `deletions/`, and
         // a reserved name at the top are ignored.
-        assert_eq!(
-            placement("_lookup_index/k/run.arrow", &live),
-            Placement::Other
-        );
-        assert_eq!(placement("_lookup_index/x", &live), Placement::Other);
-        assert_eq!(placement("deletions/e.vortex", &live), Placement::Other);
-        assert_eq!(placement("cur/sub/f.vortex", &live), Placement::Other);
-        assert_eq!(placement("_store_clock", &live), Placement::Other);
+        assert_eq!(placement("_lookup_index/k/run.arrow"), Placement::Other);
+        assert_eq!(placement("_lookup_index/x"), Placement::Other);
+        assert_eq!(placement("deletions/e.vortex"), Placement::Other);
+        assert_eq!(placement("cur/sub/f.vortex"), Placement::Other);
+        assert_eq!(placement("_store_clock"), Placement::Other);
     }
 
     #[test]

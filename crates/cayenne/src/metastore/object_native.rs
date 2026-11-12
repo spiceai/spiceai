@@ -1412,6 +1412,19 @@ impl MetadataCatalog for Domain {
             inner.table(table_id)?.retired.iter().cloned().collect(),
         ))
     }
+    async fn committed_file_keys(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<std::collections::BTreeSet<String>>> {
+        let inner = self.inner.take().await;
+        if inner.stop.is_some() || inner.has_uncommitted(table_id) || inner.reserved(table_id) {
+            return Ok(None);
+        }
+        let table = inner.table(table_id)?;
+        let mut keys = table.live_keys();
+        keys.extend(table.retired.iter().cloned());
+        Ok(Some(keys))
+    }
     async fn forget_retired_files(&self, table_id: &str, keys: &[String]) -> CatalogResult<bool> {
         if keys.is_empty() {
             return Ok(true);
@@ -1617,15 +1630,17 @@ impl MetadataCatalog for Domain {
         let mut inner = self.inner.take().await;
         let (_, mut batch) =
             inner.delete_batch_after_removal(&delete_files, &replaced_delete_file_ids)?;
-        batch.insert(
-            0,
-            actions::remove_delete_files(
-                table_id,
-                proto::Select::Listed,
-                &replaced_delete_file_ids,
-                None,
-            ),
-        );
+        if !replaced_delete_file_ids.is_empty() {
+            batch.insert(
+                0,
+                actions::remove_delete_files(
+                    table_id,
+                    proto::Select::Listed,
+                    &replaced_delete_file_ids,
+                    None,
+                ),
+            );
+        }
         batch.extend(rewrite_inline(
             table_id,
             &updated_data,

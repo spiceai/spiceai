@@ -265,6 +265,7 @@ impl UncommittedFiles {
     }
 
     /// The snapshot ids still being built.
+    #[cfg(test)]
     pub(crate) fn snapshots(&self) -> HashSet<String> {
         self.by_snapshot.lock().keys().cloned().collect()
     }

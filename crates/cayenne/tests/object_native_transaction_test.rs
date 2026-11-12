@@ -111,19 +111,7 @@ fn across<'a>(orders: &'a str, audit: &'a str) -> Vec<CatalogPublication<'a>> {
     ]
 }
 
-/// One data file of `snapshot`, so retiring the snapshot retires a file.
-fn one_file(table_id: &str, snapshot: &str) -> [cayenne::metadata::SnapshotFile; 1] {
-    [cayenne::metadata::SnapshotFile {
-        table_id: table_id.to_string(),
-        snapshot_id: snapshot.to_string(),
-        file_path: "part-0.vortex".to_string(),
-        row_count: 1,
-        file_size_bytes: 1,
-        min_sequence: 0,
-        max_sequence: 0,
-        digest: None,
-    }]
-}
+use crate::common::one_file;
 
 /// Each table's sequence for its transaction snapshot.
 async fn published(catalog: &ObjectNativeCatalog, orders: &str, audit: &str) -> [Option<i64>; 2] {

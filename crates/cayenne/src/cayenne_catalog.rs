@@ -4463,6 +4463,43 @@ impl MetadataCatalog for CayenneCatalog {
         // directories they retired in this process.
         Ok(None)
     }
+    async fn committed_file_keys(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<std::collections::BTreeSet<String>>> {
+        let (table_path, path_is_relative) = self
+            .metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT path, path_is_relative FROM cayenne_table WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| Ok((row.get_string(0)?, row.get_bool(1)?)),
+            )
+            .await?;
+        let mut keys: std::collections::BTreeSet<String> = self
+            .get_all_snapshot_files(table_id)
+            .await?
+            .into_iter()
+            .map(|row| {
+                cayenne_metastore_actions::state::file_key(false, &row.snapshot_id, &row.file_path)
+            })
+            .collect();
+        keys.extend(
+            self.get_table_delete_files(table_id)
+                .await?
+                .into_iter()
+                .map(|file| {
+                    cayenne_metastore_actions::state::delete_file_key(
+                        &table_path,
+                        path_is_relative,
+                        &file.path,
+                        file.path_is_relative,
+                    )
+                }),
+        );
+        Ok(Some(keys))
+    }
     async fn forget_retired_files(&self, _table_id: &str, _keys: &[String]) -> CatalogResult<bool> {
         Ok(false)
     }

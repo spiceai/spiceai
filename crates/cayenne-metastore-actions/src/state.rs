@@ -131,12 +131,32 @@ pub struct TableState {
 }
 
 /// The key of the data file at `path` in `snapshot`: see [`TableState::file_key`].
-fn file_key(flat: bool, snapshot: &str, path: &str) -> String {
+#[must_use]
+pub fn file_key(flat: bool, snapshot: &str, path: &str) -> String {
     if flat {
         path.to_string()
     } else {
         format!("{snapshot}/{path}")
     }
+}
+
+/// A deletion vector's table-relative key when its path lies under the table.
+#[must_use]
+pub fn delete_file_key(
+    table_path: &str,
+    path_is_relative: bool,
+    path: &str,
+    relative: bool,
+) -> String {
+    if relative == path_is_relative
+        && !table_path.is_empty()
+        && let Some(rest) = path
+            .strip_prefix(table_path)
+            .and_then(|rest| rest.strip_prefix('/'))
+    {
+        return rest.to_string();
+    }
+    path.to_string()
 }
 
 impl TableState {
@@ -162,16 +182,7 @@ impl TableState {
     /// snapshot directories), and otherwise the path as recorded.
     #[must_use]
     pub fn delete_file_key(&self, dv: &DvEntry) -> String {
-        if dv.relative == self.path_is_relative
-            && !self.path.is_empty()
-            && let Some(rest) = dv
-                .path
-                .strip_prefix(self.path.as_str())
-                .and_then(|rest| rest.strip_prefix('/'))
-        {
-            return rest.to_string();
-        }
-        dv.path.clone()
+        delete_file_key(&self.path, self.path_is_relative, &dv.path, dv.relative)
     }
 
     /// The keys of every file a scan of the table can read: the data files of
@@ -189,29 +200,6 @@ impl TableState {
                     .map(|dv| self.delete_file_key(dv)),
             )
             .collect()
-    }
-
-    /// Whether `key` names a file a scan of the table can read.
-    fn is_live_key(&self, key: &str) -> bool {
-        let live = self.live_snapshots();
-        let in_live_snapshot = if self.flat {
-            live.iter().any(|snapshot| {
-                self.files
-                    .contains_key(&((*snapshot).to_string(), key.to_string()))
-            })
-        } else {
-            key.split_once('/').is_some_and(|(snapshot, path)| {
-                live.contains(snapshot)
-                    && self
-                        .files
-                        .contains_key(&(snapshot.to_string(), path.to_string()))
-            })
-        };
-        in_live_snapshot
-            || self
-                .delete_files
-                .values()
-                .any(|dv| self.delete_file_key(dv) == key)
     }
 
     /// The live data files by path, with the snapshot that holds each. This is
@@ -423,9 +411,8 @@ impl DatasetState {
                         | Kind::SetGroup(_)
                         | Kind::RemoveGroups(_)
                         | Kind::RemoveFiles(_)
-                        | Kind::RemoveDeleteFiles(_)
                 )
-            );
+            ) || matches!(&action.kind, Some(Kind::RemoveDeleteFiles(a)) if a.select != Select::Listed as i32 || !a.ids.is_empty());
             if let (true, Some(table_id)) = (changes_live, action.table_id()) {
                 before.entry(table_id.to_string()).or_insert_with(|| {
                     (
@@ -848,9 +835,10 @@ impl DatasetState {
             }
             Kind::RetireFiles(a) => {
                 let table = self.table(name, &a.table_id)?;
+                let live = table.live_keys();
                 for key in &a.keys {
                     ensure!(
-                        !table.is_live_key(key),
+                        !live.contains(key),
                         GuardSnafu {
                             action: name,
                             table_id: a.table_id.clone(),
@@ -872,15 +860,17 @@ impl DatasetState {
                     // A retired key is live nowhere, so every entry that names
                     // it goes; the live check only keeps that true if a key
                     // were somehow both.
-                    let live: BTreeSet<String> = table
-                        .live_snapshots()
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect();
+                    let mut live: BTreeSet<&str> =
+                        table.groups.keys().map(String::as_str).collect();
+                    live.insert(table.current_snapshot_id.as_str());
                     let flat = table.flat;
                     let gone = |snapshot: &String, path: &String| {
-                        !live.contains(snapshot)
-                            && forgotten.contains(file_key(flat, snapshot, path).as_str())
+                        !live.contains(snapshot.as_str())
+                            && if flat {
+                                forgotten.contains(path.as_str())
+                            } else {
+                                forgotten.contains(file_key(false, snapshot, path).as_str())
+                            }
                     };
                     table
                         .files
