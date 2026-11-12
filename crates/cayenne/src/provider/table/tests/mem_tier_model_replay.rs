@@ -395,10 +395,25 @@ impl Disk {
                     .as_any()
                     .downcast_ref::<BinaryArray>()
                     .expect("binary keys");
+                // A file holding several delete sequences gives each key its
+                // own, as the deletion index reads it; the file's sequence is
+                // the highest of them.
+                let key_sequences = batch
+                    .column_by_name(crate::provider::delete::vector_io::KEY_DELETE_SEQUENCE_COLUMN)
+                    .map(|column| {
+                        column
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .expect("Int64 delete sequences")
+                            .clone()
+                    });
                 for row in 0..batch.num_rows() {
+                    let sequence = key_sequences
+                        .as_ref()
+                        .map_or(file.sequence_number, |sequences| sequences.value(row));
                     delete_entries.push((
                         decode_key(keys.value(row)),
-                        normalize(file.sequence_number),
+                        normalize(sequence),
                         normalize(file.reinsert_sequence.unwrap_or(0)),
                     ));
                 }
