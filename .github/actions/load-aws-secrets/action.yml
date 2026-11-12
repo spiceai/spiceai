@@ -19,7 +19,7 @@ runs:
         fi
 
     - name: Authorize with AWS
-      uses: ./.github/actions/aws-authorize
+      uses: $/.github/actions/aws-authorize
       with:
         environment: sandbox
         region: us-east-1

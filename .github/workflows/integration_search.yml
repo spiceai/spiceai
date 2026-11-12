@@ -49,20 +49,20 @@ jobs:
       OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
       OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
           fetch-depth: 1
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       # The step below builds the tests before it runs them, so the credentials last as long as
       # the job's default 6-hour limit.
       - name: Assume the S3 Vectors role
         id: aws-s3-vectors
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
           role-session-name: gha-s3-vectors-${{ github.run_id }}
@@ -95,7 +95,7 @@ jobs:
         #  to make PR if 'always' update snapshots.
         if: ${{ always() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
         timeout-minutes: 10
-        uses: ./.github/actions/push-snap-changes
+        uses: $/.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           title: 'fix: Update Search integration test snapshots'

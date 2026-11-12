@@ -19,7 +19,7 @@ runs:
     # used to leave the runtime holding :8090 for the next job on the same
     # self-hosted runner (#12058).
     - name: Stop spice
-      uses: ./.github/actions/stop-spice
+      uses: $/.github/actions/stop-spice
       with:
         working-directory: ${{ inputs.working-directory }}
         print-log: 'false'

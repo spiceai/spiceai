@@ -48,14 +48,14 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
 
       - name: Check for code changes
         id: check
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
 
   test:
     environment: ci
@@ -71,7 +71,7 @@ jobs:
       contents: read
       id-token: write  # RustFS credentials
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           persist-credentials: false
@@ -82,7 +82,7 @@ jobs:
       - name: Restore Cargo registry
         id: cargo-registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -94,25 +94,25 @@ jobs:
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Install protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Get RustFS credentials
         id: rustfs
         if: needs.check_changes.outputs.relevant_changes == 'true'
         continue-on-error: true
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '9000'
@@ -120,7 +120,7 @@ jobs:
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -129,13 +129,13 @@ jobs:
 
       - name: Set up ADBC drivers
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: columnar-tech/setup-dbc@4d83cce5bf2aa1e46eedbe44f13b57bbef8f2baf # v1.0.2
+        uses: columnar-tech/setup-dbc@v1.0.2
         with:
           drivers: 'sqlite'
 
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       - name: Run ADBC integration tests
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -154,7 +154,7 @@ jobs:
       # almost never read. Merge-queue runs restore the cache trunk saves.
       - name: Save Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'merge_group' && steps.cargo-registry.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/save@v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/

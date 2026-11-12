@@ -69,7 +69,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
     steps:
       - name: Checkout spiceai
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -77,7 +77,7 @@ jobs:
       # identical to v0.1.1) plus the TPC-H q01 shipdate-cutoff correction. Keep
       # this pin, scripts/fetch-ibm.sh, and SUITE_REF in src/main.rs together.
       - name: Checkout spiceai/substrait-compliance
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           repository: spiceai/substrait-compliance
           ref: 43d31411c69ef7594887c7d759037bcf8244eeed
@@ -85,15 +85,15 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Install Protoc
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.SMB_PASSWORD }}
@@ -108,7 +108,7 @@ jobs:
           machine: ${{ runner.name }}
 
       - name: Set up sccache
-        uses: ./.github/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
@@ -135,7 +135,7 @@ jobs:
       # commit, the nightly and a dispatch still publish the reports.
       - name: Upload JSON and CSV reports
         if: ${{ !cancelled() && github.event_name != 'merge_group' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: substrait-compliance-mode-a-tpch
           path: |
@@ -149,7 +149,7 @@ jobs:
 
       - name: Upload spiceio logs
         if: always() && runner.os == 'macOS' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: spiceio-substrait-compliance-logs
           path: ${{ runner.temp }}/spiceio.log
@@ -208,13 +208,13 @@ jobs:
             layouts: ''
     steps:
       - name: Checkout spiceai
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
       # The same suite pin as Mode A; see that job.
       - name: Checkout spiceai/substrait-compliance
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           repository: spiceai/substrait-compliance
           ref: 43d31411c69ef7594887c7d759037bcf8244eeed
@@ -222,26 +222,26 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       # The Linux runner image carries no C toolchain, which the build scripts
       # of the harness's dependencies need.
       - name: Set up cc
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Install Protoc
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '10800'
           export-env: 'false'
 
       - name: Set up sccache
-        uses: ./.github/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -249,7 +249,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -258,7 +258,7 @@ jobs:
 
       - name: Setup spiced
         id: setup-spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
 
       - name: Build the harness
         run: cargo build -p spice-substrait-compliance
@@ -286,7 +286,7 @@ jobs:
 
       - name: Upload JSON and CSV reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: substrait-compliance-mode-b-tpch-${{ matrix.engine }}-${{ matrix.mode }}
           path: tools/substrait-compliance/results/mode-b

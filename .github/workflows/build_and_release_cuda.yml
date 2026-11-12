@@ -91,7 +91,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: actions/github-script@v9.0.0
         id: setup-matrix
         with:
           script: |
@@ -173,7 +173,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -181,28 +181,28 @@ jobs:
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       # setup-make runs configure-apt, which gives apt its mirror failover.
       # Keep every bare apt-get step after it, so security.ubuntu.com being
       # down cannot fail the build here.
       - name: Set up make
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Set up wget
         if: matrix.target.target_os == 'linux'
         run: sudo apt-get update && sudo apt-get install wget -y
 
       - name: Install protoc
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Run Spiced CUDA Build
-        uses: ./.github/actions/spiced-cuda-build
+        uses: $/.github/actions/spiced-cuda-build
         with:
           cuda-version: '12.6.0'
           cuda-compute-capability: ${{ matrix.target.compute_cap }}

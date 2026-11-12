@@ -62,7 +62,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -72,10 +72,10 @@ jobs:
       # exit 100, and gives the Ubuntu archives mirror failover, as
       # testoperator_run_bench.yml does.
       - name: Configure apt mirrors
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Set up Rust toolchain
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set spicepod path
         id: set_spicepod_path
@@ -93,14 +93,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '36000'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -108,7 +108,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -120,7 +120,7 @@ jobs:
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
@@ -129,7 +129,7 @@ jobs:
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -138,14 +138,14 @@ jobs:
 
       - name: Install Oracle ODPI-C
         if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
-        uses: ./.github/actions/setup-oracle-odpi
+        uses: $/.github/actions/setup-oracle-odpi
 
       # Every DuckLake spicepod (ducklake[catalog] as well as ducklake[postgres+s3])
       # reads the same local postgres catalog and MinIO bucket, so all of this setup
       # keys on 'ducklake', matching testoperator_run_bench.yml.
       - name: Install PostgreSQL for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: ./.github/actions/install-postgres
+        uses: $/.github/actions/install-postgres
         with:
           pg-db: ducklake_catalog
 
@@ -183,12 +183,12 @@ jobs:
       # testoperator_run_bench.yml. Without it spiced never becomes ready.
       - name: Install libduckdb
         if: ${{ contains(github.event.inputs.spicepod_path, 'duckdb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: ./.github/actions/setup-libduckdb
+        uses: $/.github/actions/setup-libduckdb
 
       # The dev runner image has python3 but no pip, which the bootstrap below needs.
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.12'
 
@@ -297,7 +297,7 @@ jobs:
       # Short-lived AWS credentials, kept out of the job's environment and passed to the step below.
       - name: Assume the Databricks Delta role
         id: aws-databricks-delta
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
@@ -308,7 +308,7 @@ jobs:
 
       - name: Assume the S3 and Glue role
         id: aws-s3-athena
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_S3_ATHENA_ROLE_ARN }}
           role-session-name: gha-s3-athena-${{ github.run_id }}
@@ -473,7 +473,7 @@ jobs:
         # save_unpushable_snapshots.sh leaves the snapshot commit here when
         # GitHub will not let GITHUB_TOKEN create the snapshot branch.
         if: ${{ failure() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: unpushed-snapshots
           path: ${{ runner.temp }}/unpushed-snapshots/

@@ -10,7 +10,7 @@ runs:
   steps:
     - name: Configure apt mirrors (Linux)
       if: runner.os == 'Linux'
-      uses: ./.github/actions/configure-apt
+      uses: $/.github/actions/configure-apt
 
     - name: Install PostgreSQL (Linux)
       if: runner.os == 'Linux'

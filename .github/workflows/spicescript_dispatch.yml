@@ -78,20 +78,20 @@ jobs:
       id-token: write  # RustFS credentials
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '1800'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -99,7 +99,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicescript
-        uses: ./.github/actions/build-tool
+        uses: $/.github/actions/build-tool
         with:
           package: spicescript
 
@@ -122,7 +122,7 @@ jobs:
           - { partition: 3/4, shard: 3 }
           - { partition: 4/4, shard: 4 }
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -154,14 +154,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '3600'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -170,14 +170,14 @@ jobs:
 
       - name: Download spicescript
         id: spicescript
-        uses: ./.github/actions/build-tool
+        uses: $/.github/actions/build-tool
         with:
           package: spicescript
 
       # Scripts pull images as they start, so the login has to last the whole job.
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@v4.7.0
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           DOCKERHUB_OIDC_EXPIREIN: '21600'
@@ -201,7 +201,7 @@ jobs:
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 
       - name: Authenticate the Hugging Face cache
-        uses: ./.github/actions/hf-cache-auth
+        uses: $/.github/actions/hf-cache-auth
         with:
           token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
@@ -223,7 +223,7 @@ jobs:
 
       - name: Upload script results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: spicescript-results-${{ matrix.shard }}
           path: ${{ runner.temp }}/spicescript-results.json
@@ -232,7 +232,7 @@ jobs:
 
       - name: Upload captured logs
         if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: spicescript-logs-${{ matrix.shard }}
           path: ${{ runner.temp }}/spicescript-logs
@@ -248,7 +248,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download script results
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: spicescript-results-*
           path: ${{ runner.temp }}/results

@@ -37,7 +37,7 @@ jobs:
     outputs:
       legs: ${{ steps.legs.outputs.result }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         if: github.event_name != 'workflow_dispatch'
         with:
           persist-credentials: false
@@ -49,7 +49,7 @@ jobs:
       - name: Check the merge group for WAL changes
         id: changes
         if: github.event_name == 'merge_group'
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           filters: |
             code_changes:
@@ -75,7 +75,7 @@ jobs:
           echo "relevant=$([ -n "$changed" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - name: Choose legs
         id: legs
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: actions/github-script@v9.0.0
         env:
           RELEVANT: ${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}
           SPICEIO_RELEVANT: ${{ github.event_name == 'workflow_dispatch' || steps.spiceio.outputs.relevant == 'true' }}
@@ -159,17 +159,17 @@ jobs:
       WAL_PREFIX: object_store_wal/${{ github.run_id }}-${{ github.run_attempt }}
       WAL_CONTAINER: wal-${{ matrix.store }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
       # The dev runner image has no C toolchain, and rustc links through cc. The
       # Macs already have one.
-      - uses: ./.github/actions/setup-cc
+      - uses: $/.github/actions/setup-cc
         if: runner.os == 'Linux'
       # The dev runner image has python3 but no pip. The macOS runners carry
       # Homebrew interpreters, and installing one through setup-python needs sudo.
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: actions/setup-python@v7.1.0
         if: runner.os == 'Linux'
         with:
           python-version: '3.12'
@@ -424,7 +424,7 @@ jobs:
       # history, dispatch this workflow on the branch.
       - name: Retain histories and backing stores
         if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: wal-e2e-${{ matrix.os }}-${{ matrix.store }}
           path: wal-e2e-artifacts/

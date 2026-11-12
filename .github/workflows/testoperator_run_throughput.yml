@@ -117,7 +117,7 @@ jobs:
           --health-retries 10
           --shm-size=1g
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -126,7 +126,7 @@ jobs:
       # outages otherwise fail `apt-get install git` with exit 100, and gives
       # the Ubuntu archives mirror failover, as testoperator_run_bench.yml does.
       - name: Configure apt mirrors
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Set spicepod path
         id: set_spicepod_path
@@ -146,14 +146,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '21600'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -161,7 +161,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -173,12 +173,12 @@ jobs:
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -186,7 +186,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
+        uses: $/.github/actions/setup-testoperator-data
         with:
           query_set: ${{ github.event.inputs.query_set }}
 
@@ -292,31 +292,31 @@ jobs:
 
       - name: Install ADBC BigQuery Driver
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/setup-adbc-bigquery
+        uses: $/.github/actions/setup-adbc-bigquery
 
       - name: Set up BigQuery credentials (workload identity federation)
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/bigquery-credentials
+        uses: $/.github/actions/bigquery-credentials
         with:
           workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
           service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.12'
 
       - name: Setup ScyllaDB
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
-        uses: ./.github/actions/setup-scylladb
+        uses: $/.github/actions/setup-scylladb
         with:
           keyspace: tpch_sf1
 
       # Short-lived AWS credentials, kept out of the job's environment and passed to the step below.
       - name: Assume the Databricks Delta role
         id: aws-databricks-delta
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}
@@ -327,7 +327,7 @@ jobs:
 
       - name: Assume the S3 and Glue role
         id: aws-s3-athena
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_S3_ATHENA_ROLE_ARN }}
           role-session-name: gha-s3-athena-${{ github.run_id }}
@@ -338,7 +338,7 @@ jobs:
 
       - name: Assume the DynamoDB role
         id: aws-dynamodb
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
           role-session-name: gha-dynamodb-${{ github.run_id }}
