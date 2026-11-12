@@ -45,7 +45,7 @@ const POINTWISE_INSTRUCTIONS: &str =
     "Is `document` relevant to `query`, i.e. does it help answer it?";
 
 const LISTWISE_QUESTION_ID: &str = "best";
-const LISTWISE_INSTRUCTIONS: &str = "Which document in `documents` best answers `query`? Each option is the key of one document in `documents`.";
+const LISTWISE_INSTRUCTIONS: &str = "Which document in `documents` best answers `query`? Probabilities will be used as listwise reranking score. Each option is the key of one document in `documents`.";
 
 /// Most documents one listwise request can rank: one choice option per document, and
 /// both `TypeSafe` and `OpenAI` decision models accept at most 255 options.
