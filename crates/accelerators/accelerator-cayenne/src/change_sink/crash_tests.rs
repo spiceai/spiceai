@@ -698,7 +698,10 @@ impl Process {
     }
 
     /// Every file the committed state names: the data files not retired, and
-    /// every deletion vector.
+    /// every deletion vector. The table is placed in the location, so its data
+    /// files are flat: a file of a snapshot lies in the table's directory and
+    /// is keyed by its name, and only a file of a staging write keeps its
+    /// folder (`<folder>/<name>`).
     async fn named_files(&self, location: &Location) -> BTreeSet<String> {
         let table_id = self.table.table_id().to_string();
         let retired: BTreeSet<String> = self
@@ -715,13 +718,15 @@ impl Process {
             .await
             .expect("read the manifest")
             .into_iter()
-            .filter(|file| !retired.contains(&format!("{}/{}", file.snapshot_id, file.file_path)))
             .map(|file| {
-                format!(
-                    "{}/{table_id}/{}/{}",
-                    location.data_prefix, file.snapshot_id, file.file_path
-                )
+                if uuid::Uuid::parse_str(&file.snapshot_id).is_ok() {
+                    file.file_path
+                } else {
+                    format!("{}/{}", file.snapshot_id, file.file_path)
+                }
             })
+            .filter(|key| !retired.contains(key))
+            .map(|key| format!("{}/{table_id}/{key}", location.data_prefix))
             .collect();
         for dv in self
             .catalog
