@@ -2493,6 +2493,12 @@ impl Runtime {
         self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories(self).await;
 
+        // After the servers and DataFusion, which can still be using a model. Each model is
+        // dropped here and not when the runtime is: nothing makes sure the runtime is dropped
+        // before the process exits, and llama.cpp on Metal aborts an exit with Metal memory
+        // allocated. A local model waits a bounded time for its engine to free it.
+        self.unload_all_models().await;
+
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
         // group includes only Metrics endpoints.
         let elapsed = start_time.elapsed();
