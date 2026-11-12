@@ -1,0 +1,133 @@
+name: tool-results
+description: >
+  The data tools (`sql`, `random_sample`, `top_n_sample`,
+  `sample_distinct_columns`) return `{"columns": [...], "rows": [[...]]}`
+  within the result budget. A result over 100 rows or 32 KiB shows its first
+  rows with `truncated` and a message telling the model not to compute totals
+  from them; a result of exactly 100 rows, or any result that fits, has
+  neither. Long text is shortened with a marker the message explains, and NaN,
+  NULL and decimals keep their meaning. Called with `POST /v1/tools/{name}`, as
+  an MCP client or an agent framework calls them.
+
+sources:
+  lake: { kind: files }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: tool-results
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [tool-key]
+  datasets:
+    - from: 'file://${sources.lake.path}/numbers/'
+      name: numbers
+      params: { file_format: parquet }
+    - from: 'file://${sources.lake.path}/docs/'
+      name: docs
+      params: { file_format: parquet }
+
+defaults:
+  api-key: tool-key
+
+steps:
+  - generate:
+      lake:
+        table: numbers
+        rows: 250
+        seed: 11
+        primary-key: id
+        format: parquet
+        columns:
+          - { name: id, sequence: 1 }
+  - generate:
+      lake:
+        table: docs
+        rows: 120
+        seed: 12
+        primary-key: id
+        format: parquet
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: doc, text: [1500, 1600] }
+  - start: {}
+
+  # A result over the row limit: the first 100 rows, marked truncated, and told not to total them.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT id FROM numbers ORDER BY id"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /columns, equals: [id] }
+        - { pointer: /rows, length: 100 }
+        - { pointer: /rows/0/0, equals: 1 }
+        - { pointer: /rows/99/0, equals: 100 }
+        - { pointer: /truncated, equals: true }
+        - { pointer: /message, matches: '^Showing the first 100 rows; the result has more\. Do not compute totals, counts, or averages from these rows\.' }
+
+  # Exactly 100 rows is the whole result: nothing says otherwise.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT id FROM numbers WHERE id <= 100 ORDER BY id"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /rows, length: 100 }
+        - { pointer: /rows/99/0, equals: 100 }
+        - { pointer: /truncated, exists: false }
+        - { pointer: /message, exists: false }
+
+  # The aggregate the message points to answers in one row.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT count(*) AS n, sum(id) AS total FROM numbers"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: '', equals: { columns: [n, total], rows: [[250, 31375]] } }
+
+  # Long text is shortened with a marker, and the message says how to read it in full.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT id, doc FROM docs ORDER BY id LIMIT 3"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /rows, length: 3 }
+        - { pointer: '/rows/*/1', matches: '…\[\+\d+ chars\]$' }
+        - { pointer: /message, equals: 'Some long values were shortened; select the column on its own to read it in full.' }
+        - { pointer: /truncated, exists: false }
+
+  # 100 rows of 1 KiB values are over the 32 KiB budget: the result ends at the last whole row that fits.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT id, doc FROM docs ORDER BY id"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /rows, length: '<=31' }
+        - { pointer: /rows, length: '>=20' }
+        - { pointer: /rows/0/0, equals: 1 }
+        - { pointer: /truncated, equals: true }
+        - { pointer: /message, matches: '^Showing the first \d+ rows; the result has more\..* Some long values were shortened' }
+
+  # NaN is not NULL, and no decimal digit is lost.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT CAST(''NaN'' AS DOUBLE) AS nan_value, CAST(NULL AS DOUBLE) AS null_value, CAST(''12345678901234567890.0123456789'' AS DECIMAL(38, 10)) AS wide, CAST(12.5 AS DECIMAL(10, 2)) AS narrow"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /rows/0, equals: ['NaN', null, '12345678901234567890.0123456789', 12.5] }
+
+  # The sampler tools return the same shape, within the same row limit.
+  - http: { method: POST, path: /v1/tools/random_sample, headers: { content-type: application/json }, body: '{"dataset": "numbers", "limit": 1000}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /columns, equals: [id] }
+        - { pointer: /rows, length: 100 }
+        - { pointer: /truncated, equals: true }
+  - http: { method: POST, path: /v1/tools/top_n_sample, headers: { content-type: application/json }, body: '{"dataset": "numbers", "limit": 3, "order_by": "id DESC"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: '', equals: { columns: [id], rows: [[250], [249], [248]] } }
+  - http: { method: POST, path: /v1/tools/sample_distinct_columns, headers: { content-type: application/json }, body: '{"dataset": "numbers", "limit": 2}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /columns, equals: [id] }
+        - { pointer: /rows, length: 2 }
+        - { pointer: /truncated, exists: false }

@@ -18723,6 +18723,7 @@ dependencies = [
  "bytes",
  "cache",
  "chrono",
+ "criterion 0.7.0",
  "datafusion",
  "fundu",
  "futures",

@@ -42,6 +42,7 @@ use futures::{Stream, StreamExt};
 use pin_project::pin_project;
 use serde_json::Value;
 
+use runtime_tools::result::{ResultBudget, tool_result_text, with_budget};
 use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
@@ -122,6 +123,11 @@ impl ToolUsingChat {
             recursion_limit: self.recursion_limit.map(|r| r.saturating_sub(1)),
             traces: Arc::clone(&self.traces),
         }
+    }
+
+    /// The budget for one tool result, sized from the model's context window.
+    async fn result_budget(&self) -> ResultBudget {
+        ResultBudget::for_context_window(self.inner_chat.token_limits().await.context_window)
     }
 
     /// The tools that this model sends the provider with a request.
@@ -214,7 +220,12 @@ impl ToolUsingChat {
     /// Return the result as a JSON value.
     async fn call_tool(&self, tool_call: &ChatCompletionMessageToolCall) -> Value {
         match self.as_spiced_tool(tool_call) {
-            Some(t) => match t.call(&tool_call.function.arguments).await {
+            Some(t) => match with_budget(
+                self.result_budget().await,
+                t.call(&tool_call.function.arguments),
+            )
+            .await
+            {
                 Ok(v) => {
                     tracing::info!(
                         target: "task_history",
@@ -346,7 +357,7 @@ impl ToolUsingChat {
             .iter()
             .map(|(tool_call, response_content)| {
                 Ok(ChatCompletionRequestToolMessageArgs::default()
-                    .content(response_content.to_string())
+                    .content(tool_result_text(response_content).into_owned())
                     .tool_call_id(tool_call.id.clone())
                     .build()?
                     .into())
@@ -2522,7 +2533,8 @@ mod tests {
         let tool_result = |choice: u32, index: usize, content: &str| {
             format!("tool call_{choice}_{index}: {content}")
         };
-        let not_run = |requested: usize| json!(tool_call_not_run_message(requested)).to_string();
+        // A string result reaches the model as it is, not as an escaped JSON string literal.
+        let not_run = |requested: usize| tool_call_not_run_message(requested);
 
         let mut choice_0 = vec!["user: A".to_string(), assistant(0)];
         choice_0.extend((0..MAX_SPICE_TOOL_CALLS_PER_RESPONSE).map(|i| tool_result(0, i, &ran)));

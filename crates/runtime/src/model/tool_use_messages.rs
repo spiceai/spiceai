@@ -38,6 +38,7 @@ use llms::progress::Progress;
 use messages_api::stream::event_type;
 use messages_api::{MessageStream, Messages, MessagesError, MessagesRequest};
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_tools::result::{ResultBudget, with_budget};
 use serde_json::{Map, Value, json};
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
@@ -58,6 +59,8 @@ pub struct ToolUsingMessages {
 /// Spice's tools, by the name the model calls each by.
 struct SpiceTools {
     tools: Vec<Arc<dyn SpiceModelTool>>,
+    /// The budget for one tool result, sized from the model's context window.
+    result_budget: ResultBudget,
 }
 
 impl SpiceTools {
@@ -147,7 +150,7 @@ impl SpiceTools {
         let Some(tool) = self.find(name) else {
             return ToolOutcome::Failed(format!("The tool '{name}' does not exist."));
         };
-        match tool.call(&arguments).await {
+        match with_budget(self.result_budget, tool.call(&arguments)).await {
             Ok(result) => {
                 tracing::info!(
                     target: "task_history",
@@ -186,8 +189,23 @@ impl ToolUsingMessages {
     ) -> Self {
         Self {
             inner,
-            tools: Arc::new(SpiceTools { tools }),
+            tools: Arc::new(SpiceTools {
+                tools,
+                result_budget: ResultBudget::default(),
+            }),
             recursion_limit,
+        }
+    }
+
+    /// Sizes each tool result for a model with a context window of `context_window` tokens.
+    #[must_use]
+    pub fn with_context_window(self, context_window: Option<u64>) -> Self {
+        Self {
+            tools: Arc::new(SpiceTools {
+                tools: self.tools.tools.clone(),
+                result_budget: ResultBudget::for_context_window(context_window),
+            }),
+            ..self
         }
     }
 }

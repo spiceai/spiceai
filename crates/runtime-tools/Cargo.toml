@@ -73,6 +73,7 @@ openapi = ["dep:utoipa"]
 
 [dev-dependencies]
 axum.workspace = true
+criterion = { version = "0.7", features = ["html_reports"] }
 bytes.workspace = true
 http-body-util = "0.1"
 tower.workspace = true
@@ -80,3 +81,7 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+harness = false
+name = "result_encoder"

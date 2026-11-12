@@ -40,7 +40,7 @@ const LIMIT: usize = 64;
 const ANSWER: &str = "done";
 const QUERY: &str = "SELECT 1 AS n";
 /// What the `sql` tool returns for [`QUERY`].
-const QUERY_RESULT: &str = r#"[{"n":1}]"#;
+const QUERY_RESULT: &str = r#"{"columns":["n"],"rows":[[1]]}"#;
 
 /// What the model is told for a call Spice did not run, in a response that made `calls` calls.
 fn not_run(calls: usize) -> String {
@@ -73,13 +73,9 @@ enum Api {
 }
 
 impl Api {
-    /// A tool result `text` as `self` sends it to the model: a chat completions tool message
-    /// carries it as a `JSON` string.
+    /// A tool result `text` as `self` sends it to the model: as it is, on every API.
     fn sent(self, text: &str) -> String {
-        match self {
-            Self::ChatCompletions => Value::String(text.to_string()).to_string(),
-            Self::Responses | Self::Messages => text.to_string(),
-        }
+        text.to_string()
     }
 
     /// A tool error `text` as `self` sends it to the model: the Messages API's `is_error` result

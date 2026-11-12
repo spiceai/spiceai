@@ -71,13 +71,13 @@ impl SampleTableMethod {
     pub fn description(&self) -> &str {
         match self {
             SampleTableMethod::DistinctColumns => {
-                "Return up to `limit` rows from `dataset` chosen to surface distinct values per column. Use this to quickly understand the value distribution and cardinality of columns without running a full SQL query. Specify `cols` to restrict to particular columns; otherwise all columns are sampled. Returns a JSON array of rows."
+                "Return up to `limit` rows from `dataset` chosen to surface distinct values per column. Use this to quickly understand the value distribution and cardinality of columns without running a full SQL query. Specify `cols` to restrict to particular columns; otherwise all columns are sampled. Returns `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows."
             }
             SampleTableMethod::RandomSample => {
-                "Return `limit` random rows from `dataset`. Use this to inspect representative example data when realistic row content is needed but no particular ordering or distinctness is required. Returns a JSON array of rows."
+                "Return `limit` random rows from `dataset`. Use this to inspect representative example data when realistic row content is needed but no particular ordering or distinctness is required. Returns `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows."
             }
             SampleTableMethod::TopNSample => {
-                "Return the first `limit` rows from `dataset` after applying `order_by`. Use this to inspect the largest, smallest, newest, or oldest rows by a single column. `order_by` must be a single column reference, optionally followed by `ASC` or `DESC` (e.g. `created_at DESC`); reserved-keyword column names are accepted. Returns a JSON array of rows."
+                "Return the first `limit` rows from `dataset` after applying `order_by`. Use this to inspect the largest, smallest, newest, or oldest rows by a single column. `order_by` must be a single column reference, optionally followed by `ASC` or `DESC` (e.g. `created_at DESC`); reserved-keyword column names are accepted. Returns `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows."
             }
         }
     }
@@ -118,6 +118,18 @@ impl From<&SampleTableParams> for SampleTableMethod {
 }
 
 impl SampleTableParams {
+    /// These parameters, sampling at most `max_rows` rows.
+    #[must_use]
+    pub fn with_row_limit(mut self, max_rows: usize) -> Self {
+        let limit = match &mut self {
+            SampleTableParams::DistinctColumns(params) => &mut params.limit,
+            SampleTableParams::RandomSample(params) => &mut params.limit,
+            SampleTableParams::TopNSample(params) => &mut params.limit,
+        };
+        *limit = (*limit).min(max_rows);
+        self
+    }
+
     #[must_use]
     pub fn dataset(&self) -> &str {
         match self {

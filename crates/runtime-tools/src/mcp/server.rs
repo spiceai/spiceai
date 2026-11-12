@@ -787,8 +787,14 @@ impl RuntimeServer {
             }
         };
 
-        // Tools such as `sql` already return JSON as a string; re-encoding it
-        // would make clients parse the text into a string instead of the data.
+        // A tool that declares an `outputSchema` returns an object matching it, which MCP
+        // carries as `structuredContent` and, for clients that read only text, as JSON text.
+        if resolved.tool.output_schema().is_some() && result.is_object() {
+            return Ok(CallToolResult::structured(result).into());
+        }
+
+        // Tools such as `table_schema` return text; re-encoding it as JSON would make clients
+        // parse the text into a string instead of reading it.
         let text = match result {
             Value::String(text) => text,
             other => serde_json::to_string(&other)
@@ -998,7 +1004,11 @@ fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModel
     let description: Option<Cow<'static, str>> =
         tool.description().map(|s| Cow::Owned(s.into_owned()));
     let schema = to_map(tool.parameters().unwrap_or_else(empty_input_schema));
-    Tool::new_with_raw(name.into(), description, schema)
+    let definition = Tool::new_with_raw(name.into(), description, schema);
+    match tool.output_schema() {
+        Some(output_schema) => definition.with_raw_output_schema(Arc::new(to_map(output_schema))),
+        None => definition,
+    }
 }
 
 /// 1 MiB cap for a `tools/call` payload we will execute or forward.

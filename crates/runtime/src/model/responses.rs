@@ -53,10 +53,14 @@ macro_rules! extract_secret {
 
 /// Attempt to derive a runnable Responses model from a given component from the Spicepod definition.
 #[expect(clippy::implicit_hasher)]
+///
+/// `context_window` is the model's, in tokens, when known: each of Spice's tool results is sized
+/// to a share of it.
 pub async fn try_to_responses_model(
     component: &Model,
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
+    context_window: Option<u64>,
 ) -> Result<Arc<dyn Responses>, LlmError> {
     let model = construct_model(component, params, &rt.secrets()).await?;
 
@@ -104,12 +108,15 @@ pub async fn try_to_responses_model(
             let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
                 .await
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-            Arc::new(ToolUsingResponses::new(
-                model,
-                openai_responses_tools.unwrap_or_default(),
-                tools,
-                spice_recursion_limit,
-            ))
+            Arc::new(
+                ToolUsingResponses::new(
+                    model,
+                    openai_responses_tools.unwrap_or_default(),
+                    tools,
+                    spice_recursion_limit,
+                )
+                .with_context_window(context_window),
+            )
         }
         Some(_) | None => model,
     };
@@ -341,7 +348,7 @@ mod tests {
         let params: HashMap<String, SecretString> = HashMap::new();
 
         assert!(matches!(
-            try_to_responses_model(&model, &params, Arc::new(runtime)).await,
+            try_to_responses_model(&model, &params, Arc::new(runtime), None).await,
             Err(LlmError::ResponsesNotSupported { .. })
         ));
     }

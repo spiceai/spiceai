@@ -21,5 +21,6 @@ pub mod factory;
 pub mod mcp;
 pub mod memory;
 pub mod options;
+pub mod result;
 pub mod tooling;
 pub mod utils;

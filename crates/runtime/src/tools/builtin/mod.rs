@@ -142,10 +142,7 @@ mod tests {
     /// Asserts the tool reported one inserted row and `audit` now holds
     /// exactly the row `run_insert` wrote.
     async fn assert_one_row_inserted(df: &DataFusion, result: &serde_json::Value) {
-        assert_eq!(
-            result,
-            &serde_json::Value::String(r#"[{"count":1}]"#.to_string())
-        );
+        assert_eq!(result, &json!({"columns": ["count"], "rows": [[1]]}));
         let rows = df
             .ctx
             .sql("SELECT id, name FROM audit")
