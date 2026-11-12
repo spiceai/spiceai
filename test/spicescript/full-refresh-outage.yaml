@@ -9,6 +9,11 @@ description: >
 sources:
   src: { kind: postgres }
 
+variants:
+  cayenne: {}
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod

@@ -8,6 +8,8 @@ sources:
 variants:
   federated: {}
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
   cayenne-memory: cayenne-memory
 spicepod:
   version: v1
@@ -31,7 +33,7 @@ steps:
   - query: SELECT a FROM schema_a.foo ORDER BY a
   - explain: SELECT a FROM schema_a.foo
     contains: CayenneAccelerationExec
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   # Control: a different inner alias cannot shadow the outer table name.
   - query: SELECT (SELECT (SELECT schema_a.foo.a) FROM (SELECT a FROM bar) inner_foo) AS v FROM schema_a.foo ORDER BY v
     only: federated

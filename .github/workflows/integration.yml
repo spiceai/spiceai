@@ -1031,7 +1031,7 @@ jobs:
     # in the job has taken at most 4.7 min in the same window.
     timeout-minutes: 40
     # The Entra app that signs the organization App token trusts this environment.
-    environment: ci-integration
+    environment: ci
     permissions:
       id-token: write
       # GitHub's GraphQL stargazers connection rejects contents: read, including

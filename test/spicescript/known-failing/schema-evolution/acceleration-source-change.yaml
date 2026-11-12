@@ -12,6 +12,8 @@ sources:
 
 variants:
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
 
 spicepod:
   version: v1
@@ -63,7 +65,7 @@ steps:
           - from: postgres:public.items_b
             name: items
             params: ${sources.src.params}
-            acceleration: { enabled: true, engine: '${variant.name}', mode: file }
+            acceleration: { enabled: true, engine: cayenne, mode: file }
   - query: SELECT id, name FROM items ORDER BY id
     eventually: 30s
     expect: { rows: [['20', 'y']] }

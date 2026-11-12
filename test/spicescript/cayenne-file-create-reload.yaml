@@ -1,8 +1,4 @@
-# Known failing (#15919): when a watched Spicepod changes a `mode: file_create` Cayenne
-# dataset, the reload deletes the acceleration's data directory and registers
-# the dataset again, but no refresh runs, so the dataset answers with no rows
-# until something else refreshes it. The warning it logs says the acceleration
-# "recreates the acceleration from the source on every load".
+# Regression test for #15919.
 name: cayenne-file-create-reload
 description: >
   A `mode: file_create` Cayenne acceleration is rebuilt from its source
@@ -12,6 +8,12 @@ description: >
 
 sources:
   src: { kind: postgres }
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
 
 spicepod:
   version: v1

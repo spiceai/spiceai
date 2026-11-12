@@ -91,7 +91,7 @@ async fn test_max_column_count_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -340,7 +340,7 @@ mod additional_tests {
 
         let ctx = SessionContext::new();
         let table = CayenneTableProvider::create_table(
-            Arc::<cayenne::CayenneCatalog>::clone(catalog),
+            Arc::<common::FixtureCatalog>::clone(catalog),
             table_options,
             ctx.runtime_env(),
         )

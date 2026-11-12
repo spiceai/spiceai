@@ -131,7 +131,7 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
-    environment: ci-build
+    environment: ci
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     # A backstop above the longest step bound below, leaving room for the artifact upload
@@ -3235,9 +3235,11 @@ jobs:
       - graceful_shutdown_test_full
       - test_cold_start_unkeyed_append
       - build_spicescript
-      # test_spicescript reports but does not gate merges while the scenario
-      # scripts settle on the CI runners: a run that fails there names the
-      # failing scripts in its own job.
+      # Every spicescript job gates: the passing scripts, the known-failing
+      # scripts (which must fail exactly as recorded), the older DuckDB releases
+      # and the live providers. A failing shard names its failing scripts in
+      # its own log.
+      - test_spicescript
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required

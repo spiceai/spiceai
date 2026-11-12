@@ -16,6 +16,7 @@ matrix:
 
 variants:
   block: {}
+  object-native: object-native
   append-new-columns: { datasets: { t: { on_schema_change: append_new_columns } } }
   sync-all-columns: { datasets: { t: { on_schema_change: sync_all_columns } } }
 
@@ -50,7 +51,7 @@ steps:
   - query: SELECT * FROM t
     oracle-sql: SELECT id, v, s FROM t
     eventually: 30s
-    only: block
+    only: [block, object-native]
   # Under full refresh the new column is adopted only after a restart
   # (known-failing/schema-evolution/schema-add-column-full-refresh.yaml).
   - query: SELECT * FROM t
@@ -66,7 +67,7 @@ steps:
   - query: SELECT * FROM t
     oracle-sql: SELECT id, v, s FROM t
     eventually: 30s
-    only: block
+    only: [block, object-native]
     when: { refresh_mode: changes }
   - query: SELECT * FROM t
     eventually: 30s

@@ -614,7 +614,7 @@
   "debezium-offset-recovery": [
     {
       "run": "debezium-offset-recovery",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM acct #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
@@ -697,6 +697,22 @@
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Internal error', message: \"Unable to cast column 0 'span' from Interval(MonthDayNano) to Duration(ns): Compute error: Cannot convert interval containing non-zero months or days to duration\": code: 'Internal error', message: \"Unable to cast column 0 'span",
       "group": "federation-postgres"
+    },
+    {
+      "run": "edge-values",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "edge-values",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
     }
   ],
   "feed-chaos": [
@@ -708,12 +724,31 @@
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 457, actual: 368 }",
       "group": "streaming-sources",
       "may-pass": true
+    },
+    {
+      "run": "feed-chaos[src=mongodb]",
+      "who": "mongodb-object-native",
+      "key": "query: SELECT _id, n, v, s FROM t #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 457, actual: 368 }",
+      "group": "streaming-sources",
+      "may-pass": true
     }
   ],
   "http-caching-keys": [
     {
       "run": "http-caching-keys",
-      "who": "default",
+      "who": "as-written",
+      "key": "source-query: {\"api\":\"count /v1/missing\"} #2",
+      "kind": "other",
+      "signature": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
+      "pattern": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
+      "group": "caching-http",
+      "may-pass": true
+    },
+    {
+      "run": "http-caching-keys",
+      "who": "object-native",
       "key": "source-query: {\"api\":\"count /v1/missing\"} #2",
       "kind": "other",
       "signature": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
@@ -826,6 +861,102 @@
     {
       "run": "mysql-literals",
       "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm BETWEEN TIMESTAMP '2038-01-19 03:14:08' AND TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm = TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm < TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm >= TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm <> TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm = TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm < TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm >= TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm <> TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm IN (TIMESTAMP '1000-01-01 00:00:00', TIMESTAMP '1970-01-01 00:00:00.000001') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm BETWEEN TIMESTAMP '1000-01-01 00:00:00' AND TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm IN (TIMESTAMP '2038-01-19 03:14:08', TIMESTAMP '9999-12-31 23:59:59.999999') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
       "key": "query: SELECT id FROM m WHERE dtm BETWEEN TIMESTAMP '2038-01-19 03:14:08' AND TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
@@ -1163,7 +1294,7 @@
   "postgres-cdc-atomicity": [
     {
       "run": "postgres-cdc-atomicity",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*) AS n FROM by_changes",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: .*1000.*, actual: ",
@@ -1173,7 +1304,7 @@
     },
     {
       "run": "postgres-cdc-atomicity",
-      "who": "default",
+      "who": "as-written",
       "key": "stop-background: read-changes",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
@@ -1196,14 +1327,6 @@
     },
     {
       "run": "postgres-cdc-edge-values[identity=default]",
-      "who": "cayenne-memory",
-      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=default]",
       "who": "cayenne",
       "key": "query: SELECT id, octet_length(bin) AS n FROM e",
       "kind": "error",
@@ -1212,23 +1335,7 @@
     },
     {
       "run": "postgres-cdc-edge-values[identity=default]",
-      "who": "cayenne-memory",
-      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=default]",
       "who": "cayenne",
-      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=default]",
-      "who": "cayenne-memory",
       "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
@@ -1245,6 +1352,62 @@
     {
       "run": "postgres-cdc-edge-values[identity=default]",
       "who": "cayenne-memory",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "object-native",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "object-native",
       "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
@@ -1260,14 +1423,6 @@
     },
     {
       "run": "postgres-cdc-edge-values[identity=full]",
-      "who": "cayenne-memory",
-      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=full]",
       "who": "cayenne",
       "key": "query: SELECT id, octet_length(bin) AS n FROM e",
       "kind": "error",
@@ -1276,23 +1431,7 @@
     },
     {
       "run": "postgres-cdc-edge-values[identity=full]",
-      "who": "cayenne-memory",
-      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=full]",
       "who": "cayenne",
-      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=full]",
-      "who": "cayenne-memory",
       "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
@@ -1309,6 +1448,62 @@
     {
       "run": "postgres-cdc-edge-values[identity=full]",
       "who": "cayenne-memory",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "object-native",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "object-native",
       "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
@@ -1600,7 +1795,7 @@
   "postgres-write-back-outage": [
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), sum(balance) FROM accounts #2",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -1610,7 +1805,7 @@
     },
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM accounts #2",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -1620,7 +1815,7 @@
     },
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM accounts #3",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -1630,7 +1825,7 @@
     },
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT count(*), sum(balance) FROM accounts #3",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -1640,7 +1835,7 @@
     },
     {
       "run": "postgres-write-back-outage",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT * FROM accounts #4",
       "kind": "wrong-answer",
       "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
@@ -1873,6 +2068,38 @@
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
       "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT t.id, u.label FROM t JOIN u ON t.id = u.t_id AND u.label <> 'blue' WHERE t.b",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT bool_and(b), bool_or(b), bool_and(i > -100) FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Failed to coerce arguments to satisfy a call to 'bool_and' function: coercion from Int8 to the signature Exact(Boolean) failed. No function matches the given name and argument types 'bool_and(Int8)'. You might need to add explicit type casts.",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM t WHERE i IN (SELECT i FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, d FROM t WHERE d > (SELECT avg(d) FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "cayenne"
     },
     {
       "run": "query-coverage[backend=duckdb]",
@@ -2241,6 +2468,94 @@
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Subquery(<subquery>): Unsupported Query. Unsupported operator: Subquery(<subquery>)",
       "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, CAST(tz AT TIME ZONE 'America/New_York' AS TIMESTAMP) AS ny FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"ny\", row_number: 1, expected: \"\\\"2024-03-09 08:37:00.000000000\\\"\", actual: \"\\\"2024-03-09 13:37:00.000000000\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, ts - TIMESTAMP '2000-01-01 00:00:00' < INTERVAL '30 days' AS early FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"early\", row_number: 4, expected: \"\\\"false\\\"\", actual: \"\\\"true\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, to_char(dt, 'YYYY-MM-DD') AS c FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2024-01-12\\\"\", actual: \"\\\"YYYY-MM-DD\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT j ->> 'k' AS k, count(*) FROM ev GROUP BY j ->> 'k'",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column \"ev.j\" must appear in the GROUP BY clause or must be part of an aggregate function, currently only \"j ->> 'k', count(Int64(1))\" appears in the SELECT clau",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT dst FROM edges JOIN r ON edges.src = r.n) SELECT n FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: WITH RECURSIVE r(n, depth) AS (SELECT 4, 0 UNION ALL SELECT dst, depth + 1 FROM edges JOIN r ON edges.src = r.n WHERE depth < 5) SELECT n, depth FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, abs(n) AS a, sign(n) AS s FROM ev",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Invalid function 'sign'.",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM ev WHERE n BETWEEN SYMMETRIC 20 AND -20",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Expected: AND, found: 20 at Line: 1, Column: 45: Expected: AND, found: 20 at Line: 1, Column: 45",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM ev WHERE (n, grp) IN ((1, 'red'), (-3, 'blue'), (12, 'green'))",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Only identifiers and literals are supported in tuples: Unsupported Query. Only identifiers and literals are supported in tuples",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT ev.id, l.doubled FROM ev, LATERAL (SELECT ev.id * 2 AS doubled) l WHERE ev.id < 30",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Physical plan does not support logical expression OuterReferenceColumn(Field { name: \"id\", data_type: Int32, metadata: {\"source_type\":\"integer\"} }, Column { relation: Some(Bare { table: \"ev\" }), name: \"id\" }): Unsupported Query. Ph",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM ev WHERE n > ALL (SELECT n FROM ev WHERE grp = 'red' AND n IS NOT NULL AND n < 0) AND id < 80",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 35",
+      "group": "cayenne"
     }
   ]
 }

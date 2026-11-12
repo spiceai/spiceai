@@ -18,6 +18,8 @@ variants:
   cayenne-partitioned: { datasets: { t: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
   cayenne-zstd: { datasets: { '*': { acceleration: { params: { cayenne_compression_strategy: zstd } } } } }
   cayenne-indexed: { datasets: { t: { acceleration: { indexes: { i: enabled, dt: enabled } } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

@@ -117,6 +117,8 @@ pub(crate) mod retention;
 pub(crate) mod runtime_restricted_scan;
 pub(crate) mod scan;
 pub(crate) mod scan_file_statistics;
+#[cfg(test)]
+mod seq_shift_bench;
 pub(crate) mod sink;
 pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;

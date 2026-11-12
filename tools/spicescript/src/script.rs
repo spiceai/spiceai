@@ -533,11 +533,14 @@ pub enum Action {
         mirror: Option<String>,
     },
     /// Require at least `min` objects under a prefix of a files or object
-    /// store source.
+    /// store source, counting only keys containing `contains` when it is set.
     AssertObjects {
         source: String,
         prefix: String,
+        contains: Option<String>,
         min: usize,
+        /// At most this many; `None` for no limit.
+        max: Option<usize>,
         within: Option<Duration>,
     },
     /// Wait until a `/metrics` series meets a condition.
@@ -2284,24 +2287,42 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             })
         }
         "assert-objects" => {
-            let mut inner =
-                Opts::of_mapping(arg, "`assert-objects` takes `source`, `prefix` and `min`")?;
+            let mut inner = Opts::of_mapping(
+                arg,
+                "`assert-objects` takes `source`, `prefix`, `contains`, `min` and `max`",
+            )?;
             let source = inner
                 .string("source")?
                 .context("`assert-objects` needs a `source`")?;
             let prefix = inner.string("prefix")?.unwrap_or_default();
+            let contains = inner.string("contains")?;
+            let max = inner
+                .take("max")
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .context("`max` must be a count")
+                })
+                .transpose()?;
+            // Without `max`, the step asks for objects to exist; with it, `min` is 0.
             let min = match inner.take("min") {
-                None => 1,
+                None => usize::from(max.is_none()),
                 Some(v) => v
                     .as_u64()
                     .and_then(|n| usize::try_from(n).ok())
                     .context("`min` must be a count")?,
             };
+            ensure!(
+                max.is_none_or(|max| min <= max),
+                "`assert-objects` has `min` {min} above `max`"
+            );
             inner.finish()?;
             Action::AssertObjects {
                 source,
                 prefix,
+                contains,
                 min,
+                max,
                 within: opts.duration("eventually")?,
             }
         }
