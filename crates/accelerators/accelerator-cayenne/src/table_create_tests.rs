@@ -119,6 +119,35 @@ async fn start_with(
     (accelerator, table)
 }
 
+/// A flag change must refuse the existing acceleration until explicitly recreated.
+async fn assert_native_move_refused(source: &TestAccelerationSource) {
+    let error = CayenneAccelerator::new()
+        .init(source)
+        .await
+        .expect_err("a flag change alone must not move an existing acceleration");
+    assert!(matches!(
+        error.downcast_ref::<crate::Error>(),
+        Some(crate::Error::InvalidConfiguration { .. })
+    ));
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "Dataset '{}' is accelerated in the object-native Cayenne metastore",
+            source.name()
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains("`runtime.params.cayenne_vnext` is not enabled"),
+        "{message}"
+    );
+    assert!(
+        message.contains("`acceleration.mode: file_create`"),
+        "{message}"
+    );
+    eprintln!("refused implicit metastore move: {message}");
+}
+
 /// What the runtime does after a load: write the rows, then record the load.
 async fn load(
     accelerator: &CayenneAccelerator,
@@ -186,9 +215,9 @@ async fn row_count(table: &Arc<dyn TableProvider>) -> usize {
 
 /// The `cayenne-vnext` sequence: loaded on `SQLite` with the flag off, moved to the
 /// object-native metastore by a `file_create` start with the flag on, then started with
-/// the flag off again. `SQLite` no longer holds the table, so it is created there empty,
-/// and the load recorded for the first table must not mark it loaded: the runtime
-/// would skip the initial load and serve no rows from a ready dataset.
+/// the flag off again. A plain file-mode start is refused. An explicit `file_create`
+/// moves it to `SQLite` empty, and the load recorded for the first table must not mark
+/// it loaded: the runtime must load the source before reporting a ready dataset.
 #[tokio::test]
 async fn a_table_created_empty_after_a_metastore_move_is_not_marked_loaded() {
     let base = tempfile::tempdir().expect("temp dir");
@@ -207,6 +236,8 @@ async fn a_table_created_empty_after_a_metastore_move_is_not_marked_loaded() {
     drop((accelerator, table));
 
     let back = dataset(base.path(), name, "disabled", Mode::File);
+    assert_native_move_refused(&back).await;
+    let back = dataset(base.path(), name, "disabled", Mode::FileCreate);
     let (accelerator, table) = start(&back).await;
     assert_eq!(
         (
@@ -354,11 +385,10 @@ async fn a_placed_dataset_dropped_for_file_create_says_so_at_the_default_level()
 }
 
 /// The other direction of the `cayenne-vnext` sequence: created in the object-native
-/// metastore with the flag on, loaded on `SQLite` with the flag off, then moved back by
-/// a `file_create` start with the flag on. The object-native metastore still holds the
-/// copy from before the flag was turned off, which missed every change since;
-/// `file_create` recreates the acceleration from its source, so that copy must not be
-/// served, nor marked loaded.
+/// metastore with the flag on, explicitly recreated on `SQLite` with the flag off,
+/// then moved back by a `file_create` start with the flag on. A flag change alone is
+/// refused; each explicit move starts empty and unloaded instead of serving a stale
+/// copy from the other metastore.
 #[tokio::test]
 async fn a_file_create_move_back_to_the_object_native_metastore_starts_empty() {
     let base = tempfile::tempdir().expect("temp dir");
@@ -370,8 +400,17 @@ async fn a_file_create_move_back_to_the_object_native_metastore_starts_empty() {
     drop((accelerator, table));
 
     let flag_off = dataset(base.path(), name, "disabled", Mode::File);
+    assert_native_move_refused(&flag_off).await;
+    let flag_off = dataset(base.path(), name, "disabled", Mode::FileCreate);
     let (accelerator, table) = start(&flag_off).await;
-    assert_eq!(row_count(&table).await, 0, "new on SQLite");
+    assert_eq!(
+        (
+            row_count(&table).await,
+            marked_loaded(&accelerator, &flag_off).await
+        ),
+        (0, false),
+        "file_create moves to SQLite empty and unloaded"
+    );
     load(&accelerator, &flag_off, &table, 0..2_900).await;
     drop((accelerator, table));
 
