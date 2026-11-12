@@ -100,6 +100,7 @@ impl ContentBlock {
     pub fn into_completion(self, tool_call_index: u32) -> ChatCompletionStreamResponseDelta {
         match self {
             ContentBlock::Text { text } => ChatCompletionStreamResponseDelta {
+                reasoning_content: None,
                 content: Some(text),
                 function_call: None,
                 tool_calls: None,
@@ -108,6 +109,7 @@ impl ContentBlock {
             },
             ContentBlock::ToolUse(ContentBlockToolUse { id, name, .. }) => {
                 ChatCompletionStreamResponseDelta {
+                    reasoning_content: None,
                     content: None,
                     function_call: None,
                     tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
@@ -125,6 +127,7 @@ impl ContentBlock {
             }
             ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
                 ChatCompletionStreamResponseDelta {
+                    reasoning_content: None,
                     content: None,
                     function_call: None,
                     tool_calls: None,
@@ -179,6 +182,7 @@ impl Delta {
     ) -> Option<ChatCompletionStreamResponseDelta> {
         match (self, tool_use) {
             (Delta::Text { text }, _) => Some(ChatCompletionStreamResponseDelta {
+                reasoning_content: None,
                 content: Some(text),
                 function_call: None,
                 tool_calls: None,
@@ -196,6 +200,7 @@ impl Delta {
                     tool_call_index,
                 }),
             ) => Some(ChatCompletionStreamResponseDelta {
+                reasoning_content: None,
                 content: None,
                 function_call: None,
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
@@ -218,6 +223,7 @@ impl Delta {
             // This should never happen, but we need to handle it as an 'empty' response.
             (Delta::InputJson { partial_json: _ }, None) => {
                 Some(ChatCompletionStreamResponseDelta {
+                    reasoning_content: None,
                     content: None,
                     function_call: None,
                     tool_calls: None,
@@ -384,6 +390,7 @@ pub fn transform_stream(
                                     None => None,
                                 },
                                 delta: ChatCompletionStreamResponseDelta {
+                                    reasoning_content: None,
                                     content: None,
                                     function_call: None,
                                     tool_calls: None,

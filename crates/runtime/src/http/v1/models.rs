@@ -186,6 +186,7 @@ pub(crate) async fn get(
     };
 
     let limits = chat_token_limits(&rt).await;
+    let node_ranks = rt.model_node_ranks().read().await.clone();
     let mut models = match app.read().await.as_ref() {
         Some(a) => a
             .models
@@ -223,6 +224,9 @@ pub(crate) async fn get(
                     max_output_tokens: limits
                         .get(&m.name)
                         .and_then(|limits| limits.max_output_tokens),
+                    node_rank: node_ranks
+                        .get(&m.name)
+                        .and_then(|&rank| u64::try_from(rank).ok()),
                 }
             })
             .collect::<Vec<OpenAIModel>>(),
@@ -273,6 +277,7 @@ pub(crate) async fn get(
             metadata: generate_metadata(name, &metadata_keys, &responses_models),
             context_window: limits.context_window,
             max_output_tokens: limits.max_output_tokens,
+            node_rank: None,
         }
     }));
 
@@ -322,11 +327,13 @@ pub(crate) async fn token_limits_of(
 fn convert_details_to_csv(models: &[OpenAIModel]) -> Result<String, Box<dyn std::error::Error>> {
     let mut w = Writer::from_writer(vec![]);
     for d in models {
-        // The token limits are reported in JSON only: CSV takes its columns from the first
-        // row, so a field some models have and others lack would misalign the rest.
+        // The token limits and the node rank are reported in JSON only: CSV takes its columns
+        // from the first row, so a field some models have and others lack would misalign the
+        // rest.
         let mut row = d.clone();
         row.context_window = None;
         row.max_output_tokens = None;
+        row.node_rank = None;
         let _ = w.serialize(row);
     }
     w.flush()?;

@@ -786,12 +786,26 @@ impl Chat for LlamaCpp {
                 if state.done {
                     return None;
                 }
-                // A streamed delta has no reasoning field, so reasoning is not streamed, as on
-                // the mistral.rs engine; it is in a non-streamed response's `reasoning_content`.
                 let item = loop {
                     let (index, first) = (state.index, state.first);
                     match state.choices.front_mut()?.recv().await {
-                        Some(Event::Reasoning(_)) => {}
+                        // A fragment of nothing carries nothing, so a streamed
+                        // `reasoning_content` is never empty.
+                        Some(Event::Reasoning(reasoning)) if reasoning.is_empty() => {}
+                        Some(Event::Reasoning(reasoning)) => {
+                            state.first = false;
+                            break Ok(chunk(
+                                &id,
+                                &model,
+                                created,
+                                index,
+                                first,
+                                Some(Text::Reasoning(reasoning)),
+                                None,
+                                None,
+                                None,
+                            ));
+                        }
                         Some(Event::Content(content)) => {
                             state.first = false;
                             break Ok(chunk(
@@ -800,7 +814,7 @@ impl Chat for LlamaCpp {
                                 created,
                                 index,
                                 first,
-                                Some(content),
+                                Some(Text::Answer(content)),
                                 None,
                                 None,
                                 None,
@@ -3047,6 +3061,13 @@ fn completion_limit(req: &CreateChatCompletionRequest) -> Option<usize> {
         .and_then(|limit| usize::try_from(limit).ok())
 }
 
+/// The text one streamed chunk carries: a fragment of the reasoning or of the answer, never both,
+/// in `reasoning_content` or `content`.
+enum Text {
+    Reasoning(String),
+    Answer(String),
+}
+
 #[expect(
     deprecated,
     reason = "`function_call` and `system_fingerprint` are deprecated fields of a chunk"
@@ -3061,13 +3082,19 @@ fn chunk(
     created: u32,
     index: u32,
     first: bool,
-    content: Option<String>,
+    text: Option<Text>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
     finish_reason: Option<FinishReason>,
     usage: Option<CompletionUsage>,
 ) -> CreateChatCompletionStreamResponse {
+    let (reasoning_content, content) = match text {
+        Some(Text::Reasoning(reasoning)) => (Some(reasoning), None),
+        Some(Text::Answer(answer)) => (None, Some(answer)),
+        None => (None, None),
+    };
     let delta = ChatCompletionStreamResponseDelta {
         content,
+        reasoning_content,
         function_call: None,
         tool_calls,
         role: first.then_some(Role::Assistant),
