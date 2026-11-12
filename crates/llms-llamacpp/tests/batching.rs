@@ -445,6 +445,11 @@ async fn a_preempted_request_resumes_in_place_of_one_whose_client_stopped_readin
 /// sequence shares, after its prompt.
 const SPECIFIED_HEADROOM: usize = 256;
 
+/// How far apart in the wrong order this test may read two events the engine sent in order:
+/// far beyond the microseconds between two reads in one poll, far below the seconds a request
+/// started too early leads by.
+const READ_ORDER_SLACK: Duration = Duration::from_millis(100);
+
 /// On a cache every sequence shares, a request whose prompt would leave less than
 /// [`SPECIFIED_HEADROOM`] tokens of room beside a running request does not start beside it, only
 /// to be preempted a few steps later: it waits for the running request to end, and both reply as
@@ -513,10 +518,14 @@ async fn a_request_that_would_leave_less_than_the_headroom_waits_for_room() {
         })
         .await
         .expect("both requests reply");
+    // Both instants are when this test read each stream, not when the engine sent to it: when
+    // the first's end and the second's first content are both waiting, one poll of `join!`
+    // reads both, in either order, within microseconds. A second request started beside the
+    // first leads its end by the rest of the first's reply, seconds on this model.
+    let lead = first_ended.saturating_duration_since(second_started);
     assert!(
-        second_started > first_ended,
-        "the second request's first content came {:?} before the first request ended",
-        first_ended.saturating_duration_since(second_started)
+        lead < READ_ORDER_SLACK,
+        "the second request's first content came {lead:?} before the first request ended"
     );
     first_text.push_str(&first_rest);
     let second_text = second_first + &rest(second).await;
