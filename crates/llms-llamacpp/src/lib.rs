@@ -145,9 +145,16 @@ fn load_weights<'a>(
 /// Tokens decoded per forward pass while reading the prompt.
 const PROMPT_BATCH: usize = 512;
 
-/// The most requests one model decodes together. A step's batch holds each one's next token and
-/// draft, which stays well within the context's batch size (`PROMPT_BATCH`).
+/// The most requests one model decodes together, as llama-server's default slot count is a few:
+/// a model serves this many unless its memory holds fewer ([`concurrent_context`]). A step's
+/// batch holds each one's next token and draft, which stays well within the context's batch
+/// size (`PROMPT_BATCH`).
 const MAX_CONCURRENT: u32 = 8;
+
+/// The memory a model leaves free on its GPUs (the machine's, on a unified-memory GPU) once its
+/// context is created with room for its open requests: a ceiling that leaves less is halved,
+/// so the requests' state never takes what the machine needs to keep running.
+const MIN_FREE_AFTER_CONTEXT: u64 = 2 << 30;
 
 /// The most host memory a model's idle prompts take, as llama.cpp's server bounds its prompt cache
 /// in RAM (`--cache-ram`, 8 GiB by default). A prompt is saved out of the shared cache when
@@ -425,7 +432,7 @@ impl LlamaCpp {
         let file = file_name(&first);
         let concurrent = options
             .concurrent_requests
-            .map_or(1, NonZeroU32::get)
+            .map_or(MAX_CONCURRENT, NonZeroU32::get)
             .min(MAX_CONCURRENT);
         thread::Builder::new()
             .name("llama-cpp".to_string())
@@ -1085,15 +1092,13 @@ fn serve(
     let snapshots = head.map_or(0, |(_, kind)| {
         u32::try_from(draft_len(kind, mtp_len)).unwrap_or(0)
     });
-    let context_params = shared_cache(
-        ContextParams::default()
-            .with_n_ctx(n_ctx)
-            .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
-            .with_n_rs_seq(snapshots),
-        concurrent,
-    );
-    let context = match model.new_context(backend, &context_params) {
-        Ok(context) => context,
+    let params = ContextParams::default()
+        .with_n_ctx(n_ctx)
+        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
+        .with_n_rs_seq(snapshots);
+    let ceiling = concurrent;
+    let (context, concurrent) = match concurrent_context(&model, backend, params, ceiling) {
+        Ok(created) => created,
         Err(e) => {
             let _ = ready.send(Err(failed(format!(
                 "llama.cpp could not create a context: {e}"
@@ -1101,6 +1106,13 @@ fn serve(
             return;
         }
     };
+    let layout = cache_layout(model.architecture().as_deref());
+    if ceiling > 1 {
+        tracing::info!(
+            "{}",
+            concurrency_note(name, (concurrent, ceiling), context.n_ctx(), layout)
+        );
+    }
     let context_window = context.n_ctx();
     let mut decoder = match head {
         None => Decoder::Plain(context),
@@ -1143,7 +1155,14 @@ fn serve(
         caches.push(more);
     }
     let running = usize::try_from(concurrent).unwrap_or(1);
-    batching::serve(&model, &mut decoder, split, (caches, running), jobs, &eog);
+    batching::serve(
+        &model,
+        &mut decoder,
+        split,
+        (caches, running, layout),
+        jobs,
+        &eog,
+    );
 }
 
 /// Sends `event` to its client, waiting while the client's buffer is full, and returns whether
@@ -1376,6 +1395,75 @@ fn mtp<'m>(
         },
     )
     .map_err(|e| format!("llama.cpp could not start drafting: {e}"))
+}
+
+/// A context for up to `ceiling` requests at once, and how many it holds: the ceiling, halved
+/// while llama.cpp cannot create the context, or creates it leaving less than
+/// [`MIN_FREE_AFTER_CONTEXT`] free, down to one request, whose context is created as it stands.
+fn concurrent_context<'m>(
+    model: &'m Model,
+    backend: &Backend,
+    params: ContextParams,
+    ceiling: u32,
+) -> llama_cpp::Result<(Context<'m>, u32)> {
+    let mut concurrent = ceiling.max(1);
+    loop {
+        match model.new_context(backend, &shared_cache(params, concurrent)) {
+            Ok(context)
+                if concurrent == 1
+                    || free_memory().is_none_or(|free| free >= MIN_FREE_AFTER_CONTEXT) =>
+            {
+                return Ok((context, concurrent));
+            }
+            Err(e) if concurrent == 1 => return Err(e),
+            // a context that leaves too little free is dropped here, so its memory is free for
+            // the smaller one
+            Ok(_) | Err(_) => concurrent /= 2,
+        }
+    }
+}
+
+/// How the cache of a model of `architecture` holds concurrent requests' sequences: llama.cpp's
+/// DeepSeek-V4 cache keeps a stream of the whole context per sequence even when asked for a
+/// unified one.
+fn cache_layout(architecture: Option<&str>) -> batching::CacheLayout {
+    match architecture {
+        Some("deepseek4" | "deepseek41") => batching::CacheLayout::PerSequence,
+        _ => batching::CacheLayout::Unified,
+    }
+}
+
+/// The line a model logs at load for how many requests it serves at once, `(serves, ceiling)`,
+/// with `n_ctx` tokens of context: shared by them, or each request's own when its cache is laid
+/// out per sequence.
+fn concurrency_note(
+    model: &str,
+    (serves, ceiling): (u32, u32),
+    n_ctx: u32,
+    layout: batching::CacheLayout,
+) -> String {
+    let per_request = layout == batching::CacheLayout::PerSequence;
+    let requests = if serves == 1 { "request" } else { "requests" };
+    let lowered = if serves < ceiling {
+        format!(", not {ceiling}")
+    } else {
+        String::new()
+    };
+    let context = if per_request {
+        format!(", each with its whole {n_ctx}-token context")
+    } else {
+        String::new()
+    };
+    let rest = if serves < ceiling {
+        ": more would not fit beside its weights, so further requests wait".to_string()
+    } else if per_request {
+        String::new()
+    } else {
+        format!(" from {n_ctx} tokens of shared context memory; one request can use all of it")
+    };
+    format!(
+        "Model '{model}' serves up to {serves} {requests} at once{lowered}{context}{rest}. See: https://spiceai.org/docs/components/models"
+    )
 }
 
 /// `params` for a context that holds `concurrent` sequences on one cache of `n_ctx` cells, so any
@@ -3090,6 +3178,37 @@ fn api_error(message: &str) -> OpenAIError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The load line for how many requests a model serves at once, in each of its forms.
+    #[test]
+    fn the_concurrency_line_says_how_many_requests_and_what_context() {
+        assert_eq!(
+            concurrency_note("glm", (8, 8), 131_072, batching::CacheLayout::Unified),
+            "Model 'glm' serves up to 8 requests at once from 131072 tokens of shared context memory; one request can use all of it. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            concurrency_note("qwen", (4, 8), 131_072, batching::CacheLayout::Unified),
+            "Model 'qwen' serves up to 4 requests at once, not 8: more would not fit beside its weights, so further requests wait. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            concurrency_note(
+                "deepseek",
+                (8, 8),
+                131_072,
+                batching::CacheLayout::PerSequence
+            ),
+            "Model 'deepseek' serves up to 8 requests at once, each with its whole 131072-token context. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            concurrency_note(
+                "deepseek",
+                (1, 8),
+                131_072,
+                batching::CacheLayout::PerSequence
+            ),
+            "Model 'deepseek' serves up to 1 request at once, not 8, each with its whole 131072-token context: more would not fit beside its weights, so further requests wait. See: https://spiceai.org/docs/components/models"
+        );
+    }
 
     /// An MTP head named in upper case is a draft head here as in the repository's files: a
     /// sharded one is opened as the draft, from its first shard, and never as the model ahead of

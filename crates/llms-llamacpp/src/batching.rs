@@ -24,7 +24,15 @@ limitations under the License.
 //! or the rest of the context, so a running request never runs out of cache. A request that does
 //! not fit beside the running ones waits, and the requests behind it wait in order. A model that
 //! is otherwise idle admits any request whose prompt fits the context, as one request at a time
-//! does.
+//! does. A model whose cache keeps a stream of the whole context per sequence, as DeepSeek-V4's
+//! does, gives each request that room in its own sequence, so its requests do not wait on each
+//! other's.
+//!
+//! llama.cpp decodes such sequences in one pass of the model only when their ids are
+//! consecutive, so a request takes the free sequence that keeps the running ones in the fewest
+//! runs of consecutive ids; a request placed apart from them would cost every step it shares
+//! with them a pass of its own. On a cache that every sequence shares, ids cost nothing, and a
+//! request takes the sequence whose cache it continues.
 //!
 //! An idle prompt leaves the shared cache for host memory when a request is admitted, unless
 //! that request continues it, and when a step needs its room; a request that continues a saved
@@ -52,20 +60,33 @@ use super::{
 /// How long the decode thread waits when every running request waits on its client.
 const PAUSED_POLL: Duration = Duration::from_millis(1);
 
-/// Serves `jobs` up to `running` at a time, each request in its own sequence of the shared
-/// cache, one per entry of `caches`, until the queue closes and every request has finished.
-/// Idle prompts move to host memory and back as requests need them.
+/// How a model's cache holds the sequences of the requests it serves at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CacheLayout {
+    /// One cache of `n_ctx` cells that every sequence shares (llama.cpp's unified KV cache):
+    /// the running requests' prompts and replies must fit it together.
+    Unified,
+    /// A stream of `n_ctx` cells per sequence, as DeepSeek-V4's cache keeps even when asked
+    /// for a unified one: each request has the whole context, and llama.cpp decodes sequences
+    /// together only when their ids are consecutive.
+    PerSequence,
+}
+
+/// Serves `jobs` up to `running` at a time, each request in its own sequence of a cache laid out
+/// as `layout`, one per entry of `caches`, until the queue closes and every request has
+/// finished. Idle prompts move to host memory and back as requests need them.
 pub(super) fn serve<'m>(
     model: &'m Model,
     decoder: &mut Decoder<'m>,
     split: bool,
-    (caches, running): (Vec<PromptCache>, usize),
+    (caches, running, layout): (Vec<PromptCache>, usize, CacheLayout),
     jobs: &std_mpsc::Receiver<Job>,
     eog: &[Token],
 ) {
+    let serving = (caches, running, layout);
     match decoder {
-        Decoder::Plain(context) => run(model, context, split, (caches, running), jobs, eog),
-        Decoder::Mtp(spec) => run(model, spec.as_mut(), split, (caches, running), jobs, eog),
+        Decoder::Plain(context) => run(model, context, split, serving, jobs, eog),
+        Decoder::Mtp(spec) => run(model, spec.as_mut(), split, serving, jobs, eog),
     }
 }
 
@@ -336,7 +357,7 @@ fn run<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
     split: bool,
-    (caches, max_running): (Vec<PromptCache>, usize),
+    (caches, max_running, layout): (Vec<PromptCache>, usize, CacheLayout),
     jobs: &std_mpsc::Receiver<Job>,
     eog: &[Token],
 ) {
@@ -381,12 +402,18 @@ fn run<'m, S: Shared<'m>>(
             model,
             shared,
             split,
-            (&mut slots, &mut host, max_running),
+            (&mut slots, &mut host, max_running, layout),
             &mut waiting,
             eog,
             &mut tick,
         );
-        if !step(model, shared, split, (&mut slots, &mut host), &mut tick) {
+        if !step(
+            model,
+            shared,
+            split,
+            (&mut slots, &mut host, layout),
+            &mut tick,
+        ) {
             std::thread::sleep(PAUSED_POLL);
         }
     }
@@ -398,7 +425,7 @@ fn admit<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
     split: bool,
-    (slots, host, max_running): (&mut [Slot<'m>], &mut HostCache, usize),
+    (slots, host, max_running, layout): (&mut [Slot<'m>], &mut HostCache, usize, CacheLayout),
     waiting: &mut VecDeque<Job>,
     eog: &[Token],
     tick: &mut u64,
@@ -418,7 +445,7 @@ fn admit<'m, S: Shared<'m>>(
             .vocab()
             .tokenize(&job.prompt, false, true)
             .unwrap_or_default();
-        let Some(free) = choose_slot(slots, &tokens, job) else {
+        let Some(free) = choose_slot(slots, &tokens, job, layout) else {
             return;
         };
         let prompt_len = tokens.len();
@@ -427,19 +454,21 @@ fn admit<'m, S: Shared<'m>>(
             .unwrap_or(n_ctx)
             .min(n_ctx.saturating_sub(prompt_len));
         let reserve = prompt_len + reply + shared.n_draft() + 1;
-        // The running requests' reservations and this one's must fit together, so none runs out
-        // of room mid-reply. With nothing running, the request is served as it would be alone.
+        // On a unified cache the running requests' reservations and this one's must fit
+        // together, so none runs out of room mid-reply; a stream per sequence holds each
+        // request's alone. With nothing running, the request is served as it would be alone.
         let running = slots.iter().any(|slot| slot.running.is_some());
-        let reserved: usize = slots
-            .iter()
-            .filter_map(|slot| slot.running.as_ref())
-            .map(|running| running.reserved)
-            .sum();
-        if running && reserved + reserve > n_ctx {
-            return;
-        }
-        if running_cells(slots) + prompt_len + shared.n_draft() + 1 > n_ctx && running {
-            return;
+        if running && layout == CacheLayout::Unified {
+            let reserved: usize = slots
+                .iter()
+                .filter_map(|slot| slot.running.as_ref())
+                .map(|running| running.reserved)
+                .sum();
+            if reserved + reserve > n_ctx
+                || running_cells(slots) + prompt_len + shared.n_draft() + 1 > n_ctx
+            {
+                return;
+            }
         }
         let Some(job) = waiting.pop_front() else {
             return;
@@ -504,26 +533,66 @@ fn prepare<'m, S: Shared<'m>>(
     }
 }
 
-/// The free sequence for a request reading `tokens`: the one whose prompt it continues
-/// furthest, then an empty one, then the one idle longest, then the lowest. `None` when every
-/// sequence runs a request.
-fn choose_slot(slots: &[Slot<'_>], tokens: &[Token], job: &Job) -> Option<usize> {
-    slots
-        .iter()
-        .enumerate()
-        .filter(|(_, slot)| slot.running.is_none())
-        .max_by_key(|&(index, slot)| {
+/// The free sequence for a request reading `tokens`, from a cache laid out as `layout` (see
+/// [`pick_slot`]). `None` when every sequence runs a request.
+fn choose_slot(
+    slots: &[Slot<'_>],
+    tokens: &[Token],
+    job: &Job,
+    layout: CacheLayout,
+) -> Option<usize> {
+    let running: Vec<bool> = slots.iter().map(|slot| slot.running.is_some()).collect();
+    pick_slot(&running, layout, |index| {
+        let slot = &slots[index];
+        (
+            slot.cache.shares(tokens, &job.namespace),
+            slot.cache.tokens.is_empty(),
+            slot.last_used,
+        )
+    })
+}
+
+/// The free sequence a request takes, given which sequences run requests and, for each free one,
+/// `idle(index)`: how many of the request's tokens its cache gives, whether it is empty, and
+/// when its last request finished. With a stream per sequence, first the one that leaves the
+/// running sequences in the fewest passes of the model; then the one whose prompt the request
+/// continues furthest, then an empty one, then the one idle longest, then the lowest.
+fn pick_slot(
+    running: &[bool],
+    layout: CacheLayout,
+    idle: impl Fn(usize) -> (usize, bool, u64),
+) -> Option<usize> {
+    (0..running.len())
+        .filter(|&index| !running[index])
+        .max_by_key(|&index| {
+            let (shares, empty, last_used) = idle(index);
+            // A pass more costs every step the request shares with the running ones, more than
+            // restoring its prompt from host memory costs once.
+            let passes = match layout {
+                CacheLayout::PerSequence => passes_with(running, index),
+                CacheLayout::Unified => 0,
+            };
             // An empty sequence comes before the one idle longest, however recently it was
             // used: one whose request failed, or whose client left while its reply waited for
             // room, is empty with a recent `last_used`, and taking it saves nothing.
             (
-                slot.cache.shares(tokens, &job.namespace),
-                slot.cache.tokens.is_empty(),
-                std::cmp::Reverse(slot.last_used),
+                std::cmp::Reverse(passes),
+                shares,
+                empty,
+                std::cmp::Reverse(last_used),
                 std::cmp::Reverse(index),
             )
         })
-        .map(|(index, _)| index)
+}
+
+/// How many passes of the model a step takes over the running sequences and `index`, each with a
+/// cache stream of its own: llama.cpp decodes such sequences together only when their ids are
+/// consecutive, so each run of consecutive ids is a pass.
+fn passes_with(running: &[bool], index: usize) -> usize {
+    let busy = |i: usize| i == index || running[i];
+    (0..running.len())
+        .filter(|&i| busy(i) && (i == 0 || !busy(i - 1)))
+        .count()
 }
 
 /// The cells the running requests hold.
@@ -974,7 +1043,7 @@ fn step<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
     split: bool,
-    (slots, host): (&mut [Slot<'m>], &mut HostCache),
+    (slots, host, layout): (&mut [Slot<'m>], &mut HostCache, CacheLayout),
     tick: &mut u64,
 ) -> bool {
     let n_ctx = usize::try_from(shared.context().n_ctx()).unwrap_or(usize::MAX);
@@ -1019,16 +1088,18 @@ fn step<'m, S: Shared<'m>>(
     }
     // A request's step writes its last token and a draft cut to the context, as below, which
     // idle prompts make room for by moving to host memory. The running requests' reservations
-    // fit together, so it fits.
-    let need: usize = stepping
-        .iter()
-        .filter_map(|&index| slots[index].running.as_ref())
-        .map(|running| {
-            let past = running.history.len();
-            1 + shared.n_draft().min(n_ctx.saturating_sub(past + 1))
-        })
-        .sum();
-    make_room(shared, (slots, host), need, n_ctx, *tick);
+    // fit together, so it fits. A stream per sequence holds each request's step in its own.
+    if layout == CacheLayout::Unified {
+        let need: usize = stepping
+            .iter()
+            .filter_map(|&index| slots[index].running.as_ref())
+            .map(|running| {
+                let past = running.history.len();
+                1 + shared.n_draft().min(n_ctx.saturating_sub(past + 1))
+            })
+            .sum();
+        make_room(shared, (slots, host), need, n_ctx, *tick);
+    }
     let drafts = {
         let requests: Vec<DraftRequest<'_>> = stepping
             .iter()
@@ -1199,7 +1270,7 @@ fn fail_all<'m, S: Shared<'m>>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CachedPrompt, HostCache, Saved, SeqState};
+    use super::{CacheLayout, CachedPrompt, HostCache, Saved, SeqState, pick_slot};
 
     /// A saved prompt of `bytes` bytes, saved at `tick`.
     fn saved(bytes: usize, tick: u64) -> Saved {
@@ -1265,5 +1336,49 @@ mod tests {
         // against 100 tokens x 0.1 ms = 10 ms, it pays
         assert!(host.admits_within(1_000, 100, Some(1e-4), 10_000));
         assert_eq!(ticks(&host), [1]);
+    }
+
+    /// What `pick_slot` reads of each free sequence: an empty cache, idle since `last_used`.
+    fn empty_since(last_used: &[u64]) -> impl Fn(usize) -> (usize, bool, u64) + '_ {
+        move |index| (0, true, last_used[index])
+    }
+
+    #[test]
+    fn a_request_on_a_cache_per_sequence_joins_the_running_ones_in_one_pass() {
+        // 0 runs, and 5 is the sequence idle longest, which a unified cache takes
+        let running = [true, false, false, false, false, false, false, false];
+        let last_used = [0, 9, 8, 7, 6, 1, 5, 4];
+        let per_sequence = pick_slot(&running, CacheLayout::PerSequence, empty_since(&last_used));
+        assert_eq!(per_sequence, Some(1));
+        let unified = pick_slot(&running, CacheLayout::Unified, empty_since(&last_used));
+        assert_eq!(unified, Some(5));
+        // 0 and 2 run in two passes: 1 makes them one
+        let gap = [true, false, true, false];
+        let per_sequence = pick_slot(&gap, CacheLayout::PerSequence, empty_since(&[0, 9, 0, 1]));
+        assert_eq!(per_sequence, Some(1));
+        // 2 and 3 run: 1 and 4 each keep them in one pass, and 1 is the lower
+        let high = [false, false, true, true, false];
+        let per_sequence = pick_slot(
+            &high,
+            CacheLayout::PerSequence,
+            empty_since(&[1, 9, 0, 0, 9]),
+        );
+        assert_eq!(per_sequence, Some(1));
+    }
+
+    #[test]
+    fn a_request_whose_prompt_sits_apart_from_the_running_ones_moves_only_on_a_cache_per_sequence()
+    {
+        // 0 runs, and the request continues the prompt sequence 5 holds
+        let running = [true, false, false, false, false, false, false, false];
+        let idle = |index| {
+            if index == 5 {
+                (700, false, 3)
+            } else {
+                (0, true, 0)
+            }
+        };
+        assert_eq!(pick_slot(&running, CacheLayout::Unified, idle), Some(5));
+        assert_eq!(pick_slot(&running, CacheLayout::PerSequence, idle), Some(1));
     }
 }
