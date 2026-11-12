@@ -163,7 +163,7 @@ same file.
 
     cargo build --release -p cayenne-metastore-model
     EXHAUST=1 TRACE_JSON=$R/replay-commits.jsonl target/release/cayenne-metastore-model run commits-restart-turnover
-    EXHAUST=1 TRACE_JSON=$R/replay-window.jsonl target/release/cayenne-metastore-model run window-storage-6-exhaust
+    EXHAUST=1 TRACE_JSON=$R/replay-window.jsonl target/release/cayenne-metastore-model run window-storage-7-exhaust
     EXHAUST=1 TRACE_JSON=$R/replay-source.jsonl target/release/cayenne-metastore-model run source-positions
     EXHAUST=1 TRACE_JSON=$R/replay-commits-control.jsonl target/release/cayenne-metastore-model run commits-restart-no-persist-before-send
     EXHAUST=1 TRACE_JSON=$R/replay-window-control.jsonl target/release/cayenne-metastore-model run window-storage-no-exists-5-exhaust
@@ -172,7 +172,7 @@ same file.
     EXHAUST=1 TRACE_JSON=$R/replay-source-skip-control.jsonl target/release/cayenne-metastore-model run source-no-redelivery-skip
     EXHAUST=1 TRACE_JSON=$R/replay-source-before-data-control.jsonl target/release/cayenne-metastore-model run source-position-before-data
     EXHAUST=1 WALK=42:20:40 TRACE_JSON=$R/replay-commits.jsonl target/release/cayenne-metastore-model run commits-restart-turnover
-    EXHAUST=1 WALK=42:20:40 TRACE_JSON=$R/replay-window.jsonl target/release/cayenne-metastore-model run window-storage-6-exhaust
+    EXHAUST=1 WALK=42:20:40 TRACE_JSON=$R/replay-window.jsonl target/release/cayenne-metastore-model run window-storage-7-exhaust
     EXHAUST=1 WALK=42:20:40 TRACE_JSON=$R/replay-source.jsonl target/release/cayenne-metastore-model run source-positions
 
 Each walk run must print `good=true` on its `WALKS` line.

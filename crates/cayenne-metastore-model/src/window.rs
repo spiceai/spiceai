@@ -10,7 +10,9 @@ const LAST_TIME: u8 = 2;
 const MAX_CHECKPOINTS: u8 = 2;
 const MAX_GCS: u8 = 3;
 
-/// Deletion below the floor, as the head log's collector does it. A floor the
+/// Deletion below the floor, as the head log's collector does it. Its clock
+/// is the head's store time, which moves only when the head is written, so a
+/// deletion comes due only at a collection after a later head write. A floor the
 /// collector has not seen before is noted with the commit it was seen at, and
 /// stamped with the store time of a later collection that sees a higher
 /// commit: that head was written on a base holding the floor, so after its
@@ -44,6 +46,9 @@ pub struct State {
     gcs: u8,
     /// The store clock, in retentions.
     time: u8,
+    /// The store time of the last head write. The collector knows only this:
+    /// a head's `LastModified`, which stays put while nothing writes the head.
+    head_time: u8,
     /// Checkpoint objects that exist, by the commit they are at.
     roots: Vec<usize>,
     /// Floors the collector has seen, oldest first, with the commit each was
@@ -116,6 +121,7 @@ impl Model for Protocol {
             checkpoints: 0,
             gcs: 0,
             time: 0,
+            head_time: 0,
             roots: vec![],
             retired: vec![],
             collected: 0,
@@ -163,6 +169,7 @@ impl Model for Protocol {
                     return None;
                 }
                 next.log.push(r);
+                next.head_time = state.time;
             }
             Action::Observe => next.store.observe(&self.mode),
             Action::Create(j) => next.store.create(j),
@@ -271,7 +278,8 @@ impl Protocol {
         if floor > newest {
             next.retired.push((floor, commit, None));
         }
-        let now = next.time;
+        // The collector's clock is the head it read, written at `head_time`.
+        let now = next.head_time;
         for (_, seen, stamp) in &mut next.retired {
             if commit > *seen {
                 stamp.get_or_insert(now);
@@ -286,7 +294,7 @@ impl Protocol {
         if next
             .query
             .as_ref()
-            .is_some_and(|(p, at)| *at == now && p.floor < floor)
+            .is_some_and(|(p, at)| *at == next.time && p.floor < floor)
         {
             next.gc_during_query = true;
         }

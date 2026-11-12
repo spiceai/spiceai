@@ -4,7 +4,11 @@
 //! Deterministic request delivery and response faults for protocol experiments,
 //! a read gate that holds a reader between its head and the objects it lists,
 //! and a store clock that tests can run ahead.
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture, stream::BoxStream};
@@ -66,8 +70,13 @@ struct State {
     read_gate: Option<Predicate>,
     /// GETs waiting at the gate now.
     gated: usize,
-    /// Milliseconds added to every `LastModified` a GET, HEAD or LIST returns.
+    /// How far the store's clock runs ahead of the inner store's, in
+    /// milliseconds. Each write takes the offset current when it lands.
     clock_offset_ms: i64,
+    /// The clock offset each object was last written at, which every GET, HEAD
+    /// and LIST adds to its `LastModified`, so an object's time stays fixed
+    /// until it is written again, as in a real store.
+    written_offset_ms: HashMap<Path, i64>,
 }
 
 /// Faults remain independent of caller futures: dropping a caller does not cancel
@@ -122,16 +131,18 @@ impl FaultStore {
         }
     }
 
-    /// Run the store's clock ahead: every `LastModified` it returns from now
-    /// on is `by` later, as if that much time had passed for every object.
+    /// Run the store's clock ahead by `by`: an object written from now on
+    /// carries a `LastModified` that much later than the inner store gives
+    /// it. An object already written keeps its time until it is written again.
     pub fn advance_clock(&self, by: std::time::Duration) {
         let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
         let mut state = self.state.lock();
         state.clock_offset_ms = state.clock_offset_ms.saturating_add(by);
     }
 
-    fn clock_offset(&self) -> chrono::TimeDelta {
-        chrono::TimeDelta::milliseconds(self.state.lock().clock_offset_ms)
+    /// The clock offset `path` was last written at.
+    fn written_offset(&self, path: &Path) -> chrono::TimeDelta {
+        offset_of(&self.state.lock(), path)
     }
 
     /// Wait at the read gate while it holds `path`.
@@ -254,7 +265,12 @@ impl FaultStore {
         let op = put_op(&options.mode);
         let mode = format!("{:?}", options.mode);
         let result = self.inner.put_opts(path, payload.clone(), options).await;
-        self.state.lock().log.push(Applied {
+        let mut state = self.state.lock();
+        if result.is_ok() {
+            let offset = state.clock_offset_ms;
+            state.written_offset_ms.insert(path.clone(), offset);
+        }
+        state.log.push(Applied {
             path: path.clone(),
             op,
             mode,
@@ -417,7 +433,7 @@ impl ObjectStore for FaultStore {
         let mode = format!("{options:?}");
         let mut result = self.inner.get_opts(path, options).await;
         if let Ok(answer) = &mut result {
-            answer.meta.last_modified += self.clock_offset();
+            answer.meta.last_modified += self.written_offset(path);
         }
         self.state.lock().log.push(Applied {
             path: path.clone(),
@@ -474,7 +490,6 @@ impl ObjectStore for FaultStore {
         let state = Arc::clone(&self.state);
         let applied = Arc::clone(&self.applied);
         let prefix = prefix.cloned();
-        let offset = self.clock_offset();
         futures::stream::once(async move {
             let _guard = applied.lock().await;
             let answer = inner.list(prefix.as_ref()).try_collect::<Vec<_>>().await;
@@ -487,11 +502,15 @@ impl ObjectStore for FaultStore {
                 &answer,
             );
             match answer {
-                Ok(objects) => futures::stream::iter(objects.into_iter().map(move |mut meta| {
-                    meta.last_modified += offset;
-                    Ok(meta)
-                }))
-                .boxed(),
+                Ok(mut objects) => {
+                    {
+                        let state = state.lock();
+                        for meta in &mut objects {
+                            meta.last_modified += offset_of(&state, &meta.location);
+                        }
+                    }
+                    futures::stream::iter(objects.into_iter().map(Ok)).boxed()
+                }
                 Err(error) => futures::stream::iter([Err(error)]).boxed(),
             }
         })
@@ -502,9 +521,9 @@ impl ObjectStore for FaultStore {
         let _guard = self.applied.lock().await;
         let mut answer = self.inner.list_with_delimiter(prefix).await;
         if let Ok(listed) = &mut answer {
-            let offset = self.clock_offset();
+            let state = self.state.lock();
             for meta in &mut listed.objects {
-                meta.last_modified += offset;
+                meta.last_modified += offset_of(&state, &meta.location);
             }
         }
         record(
@@ -529,6 +548,10 @@ impl ObjectStore for FaultStore {
         record(&self.state, to, Op::Copy, &mode, None, &answer);
         answer
     }
+}
+
+fn offset_of(state: &State, path: &Path) -> chrono::TimeDelta {
+    chrono::TimeDelta::milliseconds(state.written_offset_ms.get(path).copied().unwrap_or(0))
 }
 
 fn record<T>(

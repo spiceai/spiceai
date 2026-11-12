@@ -1107,10 +1107,10 @@ pub fn runs() -> Vec<Run> {
             failure: "I4 Prepare and visible objects survive",
         },
         Run {
-            name: "window-storage-6-exhaust",
+            name: "window-storage-7-exhaust",
             family: "window",
             mode: "storage",
-            bound: 6,
+            bound: 7,
             seed: None,
             failure: "",
         },

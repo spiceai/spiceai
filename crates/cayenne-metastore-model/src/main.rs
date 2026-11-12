@@ -47,7 +47,7 @@ fn main() -> Result<(), String> {
                 "commits-etag",
                 "commits-commit-focus-copy-2-exhaust",
                 "commits-storage-2-exhaust",
-                "window-storage-6-exhaust",
+                "window-storage-7-exhaust",
                 "concurrent-floor-aligned-6-exhaust",
                 "retention",
                 "window-txn-0-exhaust",
