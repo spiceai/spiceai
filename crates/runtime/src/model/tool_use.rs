@@ -28,8 +28,9 @@ use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
-    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageArgs,
     ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
@@ -42,6 +43,7 @@ use futures::{Stream, StreamExt};
 use pin_project::pin_project;
 use serde_json::Value;
 
+use runtime_tools::builtin::list_datasets::catalog_prompt_from_tool;
 use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
@@ -149,56 +151,18 @@ impl ToolUsingChat {
             .collect_vec()
     }
 
-    /// Create a new [`CreateChatCompletionRequest`] with the system prompt injected as the first message.
+    /// `req` with a system message naming the datasets the model can query, so that it can write
+    /// a query without first calling `list_datasets` (see [`catalog_prompt`]).
     async fn prepare_req(
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if let Some(list_datasets) = self.tools.iter().find(|t| t.name() == "list_datasets") {
-            let list_dataset_messages = self.create_list_dataset_messages(list_datasets).await?;
-            req.messages =
-                insert_initial_tools(req.messages, "list_datasets", &list_dataset_messages);
+        if let Some(list_datasets) = self.tools.iter().find(|t| t.name() == "list_datasets")
+            && let Some(catalog) = catalog_prompt_from_tool(list_datasets.as_ref()).await
+        {
+            req.messages = insert_catalog_message(req.messages, catalog)?;
         }
-
         Ok(req)
-    }
-
-    /// Create the messagges expected from a model if it has called the `list_datasets` tool, and recieved a response.
-    /// This is useful to prime the model as if it has already asked to list the available datasets.
-    async fn create_list_dataset_messages(
-        &self,
-        list_datasets: &Arc<dyn SpiceModelTool>,
-    ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
-        let t_resp = match list_datasets.call("").await {
-            Ok(resp) => resp,
-            Err(e) => {
-                let tool_name = list_datasets.name();
-                let error = e.to_string();
-                tracing::warn!(
-                    "Tool '{tool_name}' failed while creating initial tool-use messages: {error}"
-                );
-                tool_call_error_response(tool_name.as_ref(), error)
-            }
-        };
-        Ok(vec![
-            ChatCompletionRequestAssistantMessageArgs::default()
-                .tool_calls(vec![ChatCompletionMessageToolCalls::Function(
-                    ChatCompletionMessageToolCall {
-                        id: "initial_list_datasets".to_string(),
-                        function: FunctionCall {
-                            name: list_datasets.name().to_string(),
-                            arguments: String::new(),
-                        },
-                    },
-                )])
-                .build()?
-                .into(),
-            ChatCompletionRequestToolMessageArgs::default()
-                .content(t_resp.to_string())
-                .tool_call_id("initial_list_datasets".to_string())
-                .build()?
-                .into(),
-        ])
     }
 
     /// Check if a tool call is a spiced runtime tool.
@@ -638,7 +602,7 @@ impl Chat for ToolUsingChat {
         self.inner_chat.as_sql()
     }
 
-    /// Override health endpoint to 1. avoid passing tools in request, 2. pre-calling `list_datasets` in [`ToolUsingChat::prepare_req`].
+    /// Override health endpoint to 1. avoid passing tools in request, 2. listing datasets in [`ToolUsingChat::prepare_req`].
     async fn health(&self) -> ChatResult<()> {
         self.inner_chat.health().await
     }
@@ -836,51 +800,40 @@ pub fn combine_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     }
 }
 
-// Ensure that `tool_messages` have been added to `messages` after all initial developer/system messages and after initial user messages (i.e. not including user messages after assistant messages).
-fn insert_initial_tools(
-    messages: Vec<ChatCompletionRequestMessage>,
-    tool_name: &str,
-    tool_messages: &[ChatCompletionRequestMessage],
-) -> Vec<ChatCompletionRequestMessage> {
-    // Do not add `tool_messages` if already in `messages`.
-    if messages.iter().any(|m| {
-        let ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-            tool_calls: Some(tools),
-            ..
-        }) = m
-        else {
-            return false;
-        };
-        tools.iter().any(|t| match t {
-            ChatCompletionMessageToolCalls::Function(call) => call.function.name == tool_name,
-            ChatCompletionMessageToolCalls::Custom(_) => false,
-        })
-    }) {
-        return messages;
+/// `messages` with a system message holding `catalog`, after the leading system and developer
+/// messages (the Spicepod `system_prompt` and the client's), and before the conversation. A
+/// conversation that already holds the same message keeps the one it has.
+fn insert_catalog_message(
+    mut messages: Vec<ChatCompletionRequestMessage>,
+    catalog: String,
+) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
+    let is_catalog = |m: &ChatCompletionRequestMessage| {
+        matches!(
+            m,
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: ChatCompletionRequestSystemMessageContent::Text(text),
+                ..
+            }) if *text == catalog
+        )
+    };
+    if messages.iter().any(is_catalog) {
+        return Ok(messages);
     }
-
-    // Find index to insert at
-    let idx = messages
+    let at = messages
         .iter()
-        .enumerate()
-        .find_map(|(i, m)| {
-            if matches!(
+        .position(|m| {
+            !matches!(
                 m,
-                ChatCompletionRequestMessage::Assistant(_)
-                    | ChatCompletionRequestMessage::Tool(_)
-                    | ChatCompletionRequestMessage::Function(_)
-            ) {
-                return Some(i);
-            }
-            None
+                ChatCompletionRequestMessage::System(_)
+                    | ChatCompletionRequestMessage::Developer(_)
+            )
         })
         .unwrap_or(messages.len());
-
-    let Some((a, b)) = messages.split_at_checked(idx) else {
-        return messages;
-    };
-
-    [a, tool_messages, b].concat()
+    let message = ChatCompletionRequestSystemMessageArgs::default()
+        .content(catalog)
+        .build()?;
+    messages.insert(at, message.into());
+    Ok(messages)
 }
 
 struct CustomStream {
@@ -1795,14 +1748,6 @@ mod tests {
         assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
     }
 
-    fn create_system_message(content: &str) -> ChatCompletionRequestMessage {
-        ChatCompletionRequestSystemMessageArgs::default()
-            .content(content)
-            .build()
-            .expect("couldn't create system message")
-            .into()
-    }
-
     fn create_user_message(content: &str) -> ChatCompletionRequestMessage {
         ChatCompletionRequestUserMessageArgs::default()
             .content(content)
@@ -1811,168 +1756,65 @@ mod tests {
             .into()
     }
 
-    fn create_assistant_message_with_tool_calls(
-        tool_calls: Vec<ChatCompletionMessageToolCall>,
-    ) -> ChatCompletionRequestMessage {
-        ChatCompletionRequestAssistantMessageArgs::default()
-            .tool_calls(
-                tool_calls
-                    .into_iter()
-                    .map(ChatCompletionMessageToolCalls::Function)
-                    .collect::<Vec<_>>(),
-            )
+    #[test]
+    fn the_catalog_goes_after_the_system_messages_and_only_once() {
+        let catalog =
+            "Datasets (use these names in sql, search, and table_schema):\n- spice.public.t"
+                .to_string();
+        let system = ChatCompletionRequestSystemMessageArgs::default()
+            .content("You answer questions about sales.")
             .build()
-            .expect("couldn't create assistant message w. tools")
-            .into()
-    }
-
-    fn create_tool_message(tool_call_id: &str, content: &str) -> ChatCompletionRequestMessage {
-        ChatCompletionRequestToolMessageArgs::default()
-            .tool_call_id(tool_call_id)
-            .content(content)
+            .expect("system message")
+            .into();
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content("How many orders?")
             .build()
-            .expect("couldn't create tool message")
-            .into()
-    }
+            .expect("user message")
+            .into();
+        let messages = insert_catalog_message(vec![system, user], catalog.clone())
+            .expect("inserts the catalog");
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| match m {
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: ChatCompletionRequestSystemMessageContent::Text(text),
+                    ..
+                }) if *text == catalog => "catalog",
+                ChatCompletionRequestMessage::System(_) => "system",
+                ChatCompletionRequestMessage::User(_) => "user",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(roles, ["system", "catalog", "user"]);
 
-    fn create_list_datasets_tool_call() -> ChatCompletionMessageToolCall {
-        ChatCompletionMessageToolCall {
-            id: "test_id".to_string(),
-            function: FunctionCall {
-                name: "list_datasets".to_string(),
-                arguments: "{}".to_string(),
-            },
-        }
-    }
-
-    #[test]
-    fn test_insert_initial_tools_empty_messages() {
-        let messages = vec![];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
+        let again = insert_catalog_message(messages.clone(), catalog).expect("keeps the catalog");
+        assert_eq!(
+            again.len(),
+            messages.len(),
+            "a second round does not add it twice"
+        );
     }
 
     #[test]
-    fn test_insert_initial_tools_with_system_and_user_messages() {
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_user_message("Hello"),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
-    }
-
-    #[test]
-    fn test_insert_initial_tools_with_existing_assistant_message() {
-        let existing_tool_call = ChatCompletionMessageToolCall {
-            id: "existing_id".to_string(),
-            function: FunctionCall {
-                name: "other_tool".to_string(),
-                arguments: "{}".to_string(),
-            },
-        };
-
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_user_message("Hello"),
-            create_assistant_message_with_tool_calls(vec![existing_tool_call]),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
-    }
-
-    #[test]
-    fn test_insert_initial_tools_skips_if_tool_already_exists() {
-        let existing_list_datasets_call = create_list_datasets_tool_call();
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_user_message("Hello"),
-            create_assistant_message_with_tool_calls(vec![existing_list_datasets_call]),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]"
-        });
-    }
-
-    #[test]
-    fn test_insert_initial_tools_with_different_tool_name() {
-        let existing_tool_call = ChatCompletionMessageToolCall {
-            id: "other_id".to_string(),
-            function: FunctionCall {
-                name: "other_tool".to_string(),
-                arguments: "{}".to_string(),
-            },
-        };
-
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_assistant_message_with_tool_calls(vec![existing_tool_call]),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
-    }
-
-    #[test]
-    fn test_insert_initial_tools_insertion_point_end_of_messages() {
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_user_message("What datasets are available?"),
-            create_user_message("And what about tables?"),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
+    fn the_catalog_leads_a_conversation_without_system_messages() {
+        let user: ChatCompletionRequestMessage = ChatCompletionRequestUserMessageArgs::default()
+            .content("hi")
+            .build()
+            .expect("user message")
+            .into();
+        let messages = insert_catalog_message(
+            vec![user],
+            "No datasets are available to query.".to_string(),
+        )
+        .expect("inserts the catalog");
+        assert!(matches!(
+            &messages[0],
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: ChatCompletionRequestSystemMessageContent::Text(text),
+                ..
+            }) if text == "No datasets are available to query."
+        ));
+        assert!(matches!(messages[1], ChatCompletionRequestMessage::User(_)));
     }
 
     fn allowed_tools(mode: ToolChoiceAllowedMode) -> ChatCompletionToolChoiceOption {
@@ -2094,7 +1936,9 @@ mod tests {
             _arg: &str,
         ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(json!([format!("dataset_{call}")]))
+            Ok(
+                json!({"datasets": [{"table": format!("dataset_{call}")}], "total": 1, "has_more": false}),
+            )
         }
     }
 
@@ -2302,7 +2146,10 @@ mod tests {
     /// The steps of the round that called `sql` as request 2, summarized.
     const CALL_2: &str = "assistant calls sql#call_2";
     const RESULT_2: &str = r#"tool call_2: [{"answer":42}]"#;
-    const LIST_DATASETS: &str = "assistant calls list_datasets#initial_list_datasets";
+    /// The system message naming `dataset`, the one dataset the mock `list_datasets` returns.
+    fn catalog(dataset: &str) -> String {
+        format!("system: Datasets (use these names in sql, search, and table_schema):\n- {dataset}")
+    }
 
     fn model(provider: &Arc<ScriptedChat>, tools: Vec<Arc<dyn SpiceModelTool>>) -> ToolUsingChat {
         ToolUsingChat::new(Arc::clone(provider) as Arc<dyn Chat>, tools, None)
@@ -2841,8 +2688,10 @@ mod tests {
         );
     }
 
+    /// The datasets go to the model as one system message per turn, listed afresh each turn: no
+    /// `list_datasets` call is injected, and nothing of an earlier turn's list is replayed (#15578).
     #[tokio::test]
-    async fn test_the_initial_list_datasets_steps_are_never_stored() {
+    async fn the_dataset_list_is_a_system_message_listed_afresh_each_turn() {
         let provider =
             ScriptedChat::new(vec![Reply::CallSql, Reply::Answer("D"), Reply::Answer("F")]);
         let model = model(
@@ -2856,25 +2705,17 @@ mod tests {
         turn(&model, vec![user("A")]).await.expect("turn 1");
         assert_eq!(
             provider.messages(1),
-            [
-                "user: A",
-                LIST_DATASETS,
-                r#"tool initial_list_datasets: ["dataset_1"]"#,
-                CALL_0,
-                RESULT_0
-            ]
+            [catalog("dataset_1").as_str(), "user: A", CALL_0, RESULT_0]
         );
 
-        // Turn 2 gets new `list_datasets` steps, not a stored copy of turn 1's.
         turn(&model, vec![user("A"), assistant("D"), user("E")])
             .await
             .expect("turn 2");
         assert_eq!(
             provider.messages(2),
             [
+                catalog("dataset_2").as_str(),
                 "user: A",
-                LIST_DATASETS,
-                r#"tool initial_list_datasets: ["dataset_2"]"#,
                 CALL_0,
                 RESULT_0,
                 "assistant: D",
