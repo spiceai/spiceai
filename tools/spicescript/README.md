@@ -236,9 +236,9 @@ A variant may name a shared variant instead of writing the patch:
 `cayenne: cayenne-file`. Shared variants are defined, each as its full patch, in
 the `variants.yaml` in the script's directory or the nearest directory above it
 ([`test/spicescript/variants.yaml`](../../test/spicescript/variants.yaml) for the
-suite): `federated` (the spicepod as written), and an engine and mode that set
-`acceleration: { enabled: true, engine, mode }` on every dataset, such as
-`cayenne-file`, `duckdb-memory` or `arrow`. A name the file does not define
+suite): `federated` (the spicepod as written), and `cayenne-file` and
+`cayenne-memory`, which set `acceleration: { enabled: true, engine: cayenne,
+mode }` on every dataset. A name the file does not define
 fails `--check`. A variant used by one script only is written in that script.
 
 `$merge: '${…}'` spreads a mapping placeholder into a mapping, with the
@@ -284,7 +284,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |
 | `assert-log: { contains, lacks, count, clean, allow }` | Check the instance's `spiced.log` with regular expressions; `count: { <pattern>: N \| '>=N' }`. |
 | `assert-files: { contains, lacks }` | Check files under the instance's directory. |
-| `assert-objects: { source, prefix, min }` | Require objects under a prefix of an object store or files source. |
+| `assert-objects: { source, prefix, contains, min, max }` | Require objects under a prefix of an object store or files source; `contains` counts only keys containing that text. `min` defaults to 1, or to 0 when `max` is given (`max: 0` requires none). |
 | `mark-metrics: <id>` | Keep a `/metrics` scrape for a later `wait-metric … since:`. |
 | `wait-metric: { name, labels, above \| below \| increases \| increased-by, since, timeout, drive }` | Wait for a series to meet a condition. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
 | `background: { id, query \| source-exec, concurrency, every, expect }` | Loop a query or a source write until `stop-background: <id>`. `expect: { column: value }` is an invariant every answer must keep. `${round}` counts iterations. |

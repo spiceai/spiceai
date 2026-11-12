@@ -10922,14 +10922,6 @@ impl CayenneTableProvider {
         Arc::clone(self.context.runtime_env())
     }
 
-    /// Downcast the metadata catalog to the concrete Cayenne catalog — the
-    /// write-back marker CRUD is a Cayenne-specific concern (not on the trait).
-    fn cayenne_catalog(&self) -> Option<&crate::CayenneCatalog> {
-        self.catalog
-            .as_any()
-            .downcast_ref::<crate::CayenneCatalog>()
-    }
-
     /// List up to `limit` undelivered write-back markers in delivery order
     /// (oldest commit first, then key) starting after `after`, or at the oldest
     /// marker when that is `None`, as `(pk_bytes, sequence_number)`.
@@ -10939,6 +10931,14 @@ impl CayenneTableProvider {
     /// encodings — feed them back to [`Self::decode_pk_keys`] /
     /// [`Self::clear_dirty_keys`].
     ///
+    /// Every marker returned belongs to a commit whose rows a scan started
+    /// afterwards reads. A commit holds the visibility lock from its durable
+    /// metastore write, which records its markers, until its rows are published
+    /// in memory, and the listing takes the same lock. Without it, a delivery
+    /// could claim a marker whose rows are not readable yet, send the key's
+    /// previous value, and clear the marker at the newer sequence, so the newer
+    /// value would never reach the source.
+    ///
     /// # Errors
     /// Propagates the underlying metastore error.
     pub async fn list_dirty_keys(
@@ -10946,9 +10946,8 @@ impl CayenneTableProvider {
         limit: usize,
         after: Option<&(i64, Vec<u8>)>,
     ) -> Result<Vec<(Vec<u8>, i64)>> {
-        let Some(catalog) = self.cayenne_catalog() else {
-            return Ok(Vec::new());
-        };
+        let _visibility = self.visibility_lock_arc().lock_owned().await;
+        let catalog = self.catalog.as_ref();
         Ok(catalog
             .list_pending_write_back(self.table_id(), limit, after)
             .await?)
@@ -10960,9 +10959,7 @@ impl CayenneTableProvider {
     /// # Errors
     /// Propagates the underlying metastore error.
     pub async fn clear_dirty_keys(&self, keys: &[(Vec<u8>, i64)]) -> Result<()> {
-        let Some(catalog) = self.cayenne_catalog() else {
-            return Ok(());
-        };
+        let catalog = self.catalog.as_ref();
         catalog
             .clear_pending_write_back(self.table_id(), keys)
             .await?;
@@ -10974,9 +10971,7 @@ impl CayenneTableProvider {
     /// # Errors
     /// Propagates the underlying metastore error.
     pub async fn dirty_key_count(&self) -> Result<i64> {
-        let Some(catalog) = self.cayenne_catalog() else {
-            return Ok(0);
-        };
+        let catalog = self.catalog.as_ref();
         Ok(catalog.pending_write_back_count(self.table_id()).await?)
     }
 
@@ -36206,7 +36201,17 @@ impl CayenneTableProvider {
             // lifecycle; pass only the capture-scoped `write` guard to `inner`.
             let write = guards.write.take();
             let inner_start = Instant::now();
-            let result = self.checkpoint_mem_tier_inner(write).await;
+            // The checkpoint's metastore changes commit as one record, before
+            // `fire_slot_advancer` acknowledges the source.
+            let result =
+                crate::catalog::with_deferred_commits(self.checkpoint_mem_tier_inner(write)).await;
+            let result = match (
+                result,
+                self.catalog().commit_pending_for(self.table_id()).await,
+            ) {
+                (Ok(_), Err(error)) => Err(error.into()),
+                (result, _) => result,
+            };
             (
                 result,
                 capture_lock_ms,
@@ -37091,6 +37096,21 @@ impl CayenneTableProvider {
     /// it from the background tick via [`Self::seal_due`].
     #[doc(hidden)]
     pub async fn seal_mem_tier_durable(&self) -> Result<u64> {
+        // The seal's metastore changes and the source position it acknowledges
+        // commit as one record, as a checkpoint's do: `fire_slot_advancer` stages
+        // the position into this scope and commits the table's changes.
+        let result =
+            crate::catalog::with_deferred_commits(self.seal_mem_tier_durable_inner()).await;
+        match (
+            result,
+            self.catalog().commit_pending_for(self.table_id()).await,
+        ) {
+            (Ok(_), Err(error)) => Err(error.into()),
+            (result, _) => result,
+        }
+    }
+
+    async fn seal_mem_tier_durable_inner(&self) -> Result<u64> {
         // Memory mode (`mode: memory`) never seals to the durable inline corpus: the
         // in-memory metastore is itself ephemeral (so the recovery shadow is
         // pointless), and sealing advances the source slot — which would break the
@@ -37721,6 +37741,31 @@ impl CayenneTableProvider {
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
     pub(crate) async fn fire_slot_advancer(&self, durable_epoch: u64) {
+        let advancer = self.slot_advancer.lock().clone();
+        // A metastore that commits the source position in the same record as the
+        // data it covers stages it here; it commits just below, and only then is
+        // the source acknowledged.
+        if let Some(advancer) = &advancer
+            && self.catalog().commits_source_positions()
+            && let Err(error) =
+                crate::catalog::with_deferred_commits(advancer.record_position(durable_epoch)).await
+        {
+            tracing::error!(
+                "Dataset '{}' could not record its source position with its checkpoint, so its source is not acknowledged and replays these changes after a restart: {error}",
+                self.table_name()
+            );
+            return;
+        }
+        // The source is acknowledged below, so the metastore changes this
+        // checkpoint made must be committed first. A failed commit acknowledges
+        // nothing: the source replays from its last acknowledged position.
+        if let Err(error) = self.catalog().commit_pending_for(self.table_id()).await {
+            tracing::error!(
+                "Dataset '{}' could not commit its checkpoint to the metastore, so its source is not acknowledged and replays these changes after a restart: {error}",
+                self.table_name()
+            );
+            return;
+        }
         // Record the durable high-watermark (encoded `epoch + 1`, monotone via
         // `fetch_max`) so the `nothing_to_flush` path can RE-fire the advancer for
         // a source committer queued after this flush already drained its epoch —
@@ -37745,7 +37790,6 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
-        let advancer = self.slot_advancer.lock().clone();
         if let Some(advancer) = advancer {
             self.trace_slot_advance(advancer.as_ref(), durable_epoch, "advance")
                 .await;

@@ -23,6 +23,30 @@
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
       "group": "schema-evolution"
+    },
+    {
+      "run": "acceleration-source-change",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, name FROM items ORDER BY id #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "acceleration-source-change",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, name FROM items ORDER BY id #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "acceleration-source-change",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, name FROM items ORDER BY id #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
+      "group": "schema-evolution"
     }
   ],
   "schema-add-column-full-refresh": [
@@ -57,6 +81,22 @@
       "kind": "other",
       "signature": "the oracle returned 4 columns (id, v, s, extra) but Spice returned 3 (id, v, s)",
       "group": "schema-evolution"
+    },
+    {
+      "run": "schema-add-column-full-refresh",
+      "who": "object-native",
+      "key": "refresh: t #2",
+      "kind": "status",
+      "signature": "refresh of 't' did not finish within <duration> (status: Ready)",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "schema-add-column-full-refresh",
+      "who": "object-native",
+      "key": "query: SELECT * FROM t #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"1002\\\"\", actual: \"\\\"1001\\\"\" }",
+      "group": "schema-evolution"
     }
   ],
   "schema-frozen-status": [
@@ -83,6 +123,16 @@
     {
       "run": "schema-frozen-status",
       "who": "sync-all-columns",
+      "key": "assert-status: {\"dataset\":\"cham\",\"message-contains\":\"age\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected status Error, saw status=Ready ready=true message=",
+      "varies": true,
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-frozen-status",
+      "who": "object-native",
       "key": "assert-status: {\"dataset\":\"cham\",\"message-contains\":\"age\",\"status\":\"Error\"}",
       "kind": "error",
       "signature": "expected status Error, saw status=Ready ready=true message=",
@@ -151,6 +201,16 @@
       "pattern": "Acceleration not ready; loading initial data for t",
       "group": "schema-evolution",
       "may-pass": true
+    },
+    {
+      "run": "schema-widen[refresh_mode=changes]",
+      "who": "object-native",
+      "key": "query: SELECT * FROM t #4",
+      "kind": "error",
+      "signature": "Acceleration not ready; loading initial data for t",
+      "pattern": "Acceleration not ready; loading initial data for t",
+      "group": "schema-evolution",
+      "may-pass": true
     }
   ],
   "view-redefined-after-restart": [
@@ -165,6 +225,22 @@
     {
       "run": "view-redefined-after-restart",
       "who": "cayenne",
+      "key": "query: SELECT id, w FROM reader ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. No field named w.",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "view-redefined-after-restart",
+      "who": "object-native",
+      "key": "query: SELECT id, v, w FROM orders_view ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. No field named w.",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "view-redefined-after-restart",
+      "who": "object-native",
       "key": "query: SELECT id, w FROM reader ORDER BY id",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. No field named w.",

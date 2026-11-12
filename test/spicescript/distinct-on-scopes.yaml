@@ -6,8 +6,10 @@ sources:
   src: { kind: postgres }
 variants:
   federated: {}
-  arrow: arrow
+  cayenne-memory: cayenne-memory
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
 spicepod:
   version: v1
   kind: Spicepod
@@ -33,7 +35,7 @@ steps:
   - query: SELECT count(*) AS n FROM (SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id) q
   - explain: SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id
     contains: CayenneAccelerationExec
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - explain: SELECT a FROM (SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id) WHERE a > 0 ORDER BY a
     contains: FilterExec
     only: federated

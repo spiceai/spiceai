@@ -1,6 +1,6 @@
 name: search
 description: >
-  Full-text and vector search answer correctly on every acceleration engine:
+  Full-text and vector search answer correctly on Cayenne in file and memory mode:
   text_search returns exactly the rows containing the term, ranked by how often
   it occurs (bodies are the same length), multi-term searches match any term,
   and vector_search ranks as an exact cosine ranking over the stored
@@ -12,7 +12,9 @@ sources:
 
 variants:
   cayenne: {}
-  arrow: { datasets: { docs: { acceleration: { engine: arrow, mode: memory } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
+  cayenne-memory: { datasets: { docs: { acceleration: { engine: cayenne, mode: memory } } } }
 
 spicepod:
   version: v1

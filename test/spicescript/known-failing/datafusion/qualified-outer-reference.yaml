@@ -7,8 +7,10 @@ sources:
   src: { kind: postgres }
 variants:
   federated: {}
-  arrow: arrow
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
+  cayenne-memory: cayenne-memory
 spicepod:
   version: v1
   kind: Spicepod
@@ -31,7 +33,7 @@ steps:
   - query: SELECT a FROM schema_a.foo ORDER BY a
   - explain: SELECT a FROM schema_a.foo
     contains: CayenneAccelerationExec
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   # Control: a different inner alias cannot shadow the outer table name.
   - query: SELECT (SELECT (SELECT schema_a.foo.a) FROM (SELECT a FROM bar) inner_foo) AS v FROM schema_a.foo ORDER BY v
     only: federated
@@ -40,5 +42,5 @@ steps:
   # Unambiguous filter control for federation.
   - query: SELECT schema_a.foo.a AS v FROM schema_a.foo WHERE EXISTS (SELECT 1 FROM (SELECT a FROM bar) inner_foo WHERE EXISTS (SELECT 1 WHERE schema_a.foo.a = 1)) ORDER BY v
     only: federated
-  # The alias-capture predicate also exercises local Arrow and Cayenne planning.
+  # The alias-capture predicate also exercises local Cayenne planning.
   - query: SELECT schema_a.foo.a AS v FROM schema_a.foo WHERE EXISTS (SELECT 1 FROM (SELECT a FROM bar) foo WHERE EXISTS (SELECT 1 WHERE schema_a.foo.a = 1)) ORDER BY v

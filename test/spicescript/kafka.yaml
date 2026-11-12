@@ -15,6 +15,13 @@ sources:
     ready: rpk cluster health | grep -E 'Healthy:.+true'
   ref: { kind: postgres }
 
+# The spicepod as written, and the same with the prototype object-native Cayenne
+# metastore in place of SQLite. The variant puts its dataset in `mode: file`,
+# since `mode: memory` stays on SQLite under the flag.
+variants:
+  as-written: federated
+  object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } }, datasets: { '*': { acceleration: { mode: file } } } }
+
 spicepod:
   version: v1
   kind: Spicepod

@@ -86,11 +86,31 @@ pub enum StorageDurability {
     NotPromised,
 }
 
+/// Writes a source position to the dataset's position store without
+/// acknowledging the source. A backend whose storage commits the position with
+/// the write it follows runs it inside that commit; any other drops it, and the
+/// source's committer saves the position after the write, as before.
+pub type PositionWrite =
+    BoxFuture<'static, std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+
 /// Receives durable storage fences, including idle checkpoint progress.
 /// Implementations must preserve ordering when notifying a source.
 #[async_trait]
 pub trait DurabilityObserver: Send + Sync {
     async fn on_durable(&self, fence: u64);
+
+    /// Write the newest source position at or below `fence` to the dataset's
+    /// position store, without acknowledging the source. A storage engine that
+    /// commits that position in the same record as the data it covers calls this
+    /// inside the commit, before [`Self::on_durable`].
+    ///
+    /// # Errors
+    ///
+    /// The position store refused the write; the caller must not acknowledge.
+    async fn record_position(
+        &self,
+        fence: u64,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,11 +182,13 @@ pub trait ChangeSinkBackend: Send + Sync {
 
     fn capabilities(&self) -> ChangeCapabilities;
 
+    /// `positions` are the source positions of the inputs in `batch`, in order.
     async fn apply(
         &self,
         batch: ChangeBatch,
         options: WriteOptions,
         context: &SessionContext,
+        positions: Vec<PositionWrite>,
     ) -> Result<BackendWrite>;
 
     fn set_durability_observer(&self, observer: Arc<dyn DurabilityObserver>);

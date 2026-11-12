@@ -28,6 +28,7 @@ dependencies = [
  "byte-unit",
  "bytes",
  "cayenne",
+ "cayenne-metastore-actions",
  "cpu-budget",
  "data-accelerator-api",
  "data_components",
@@ -41,18 +42,22 @@ dependencies = [
  "itertools 0.14.0",
  "linkme",
  "object_store 0.13.2",
+ "object_store_occ",
  "object_store_spawn",
  "opentelemetry 0.32.0",
  "parking_lot",
  "paste",
+ "prost 0.14.3",
  "runtime-acceleration",
  "runtime-checkpoint-api",
  "runtime-checkpoint-sqlite",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
  "runtime-resources",
  "runtime-secrets",
+ "runtime-state-location",
  "runtime-table",
  "runtime-table-partition",
  "rusqlite",
@@ -3686,7 +3691,10 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
  "bytes",
+ "cayenne-metastore-actions",
+ "cayenne-metastore-model",
  "chdb-rust",
  "chrono",
  "cpu-budget",
@@ -3721,10 +3729,13 @@ dependencies = [
  "libc",
  "loom",
  "object_store 0.13.2",
+ "object_store_occ",
+ "object_store_sim",
  "opentelemetry 0.32.0",
  "opentelemetry_sdk 0.32.1",
  "parking_lot",
  "paste",
+ "prost 0.14.3",
  "roaring",
  "rstest 0.26.1",
  "runtime-datafusion",
@@ -3778,6 +3789,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "util",
+]
+
+[[package]]
+name = "cayenne-metastore-actions"
+version = "2.5.0-unstable"
+dependencies = [
+ "blake3",
+ "prost 0.14.3",
+ "snafu",
 ]
 
 [[package]]
@@ -11841,7 +11861,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-src"
 version = "0.1.11999"
-source = "git+https://github.com/spiceai/llama.cpp?rev=b20c7a2bee3203728ec0fbb7b3e616a60fe86d8c#b20c7a2bee3203728ec0fbb7b3e616a60fe86d8c"
+source = "git+https://github.com/spiceai/llama.cpp?rev=8829a4085c203f73ff7da86256ef9c832a12cf42#8829a4085c203f73ff7da86256ef9c832a12cf42"
 
 [[package]]
 name = "llguidance"
@@ -11882,6 +11902,7 @@ dependencies = [
  "either",
  "embed-api",
  "evaluate-api",
+ "evaluate-chat",
  "futures",
  "google-genai",
  "governor",
@@ -14021,9 +14042,12 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "cayenne-metastore-model",
  "futures",
  "object_store 0.13.2",
+ "object_store_sim",
  "parking_lot",
+ "prost 0.14.3",
  "rand 0.10.1",
  "rayon",
  "serde",
@@ -14033,6 +14057,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid 1.23.2",
+]
+
+[[package]]
+name = "object_store_sim"
+version = "2.5.0-unstable"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "object_store 0.13.2",
+ "parking_lot",
+ "rand 0.10.1",
+ "tokio",
 ]
 
 [[package]]

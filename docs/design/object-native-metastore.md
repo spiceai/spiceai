@@ -253,6 +253,14 @@ them possible.
   `reads-linearizable`, `reads-token-wait`; serving a GET sent before the query
   started fails: `reads-tick-only`). Either kind of
   strict read excludes the buffer, or the dataset publishes at commit (1.2).
+- **A lookup of a transaction's outcome by id.** When a transaction across
+  datasets ends with *outcome unknown*, the client checks its own data, which
+  works whenever the transaction wrote something it can find. A blind update
+  such as `balance = balance - 30` leaves nothing to check, and a retry may
+  apply it twice. A lookup would answer from the decision object, which
+  would then be kept for a retention window after the transaction's other
+  records are removed. Whether it is a system table or an API is a surface
+  decision for its Enhancement.
 - **Tiered storage beneath the destination:** ephemeral disk, then persistent
   disk, then S3, acknowledged once data reaches the first object store tier.
   Kept possible by acknowledgement points (decision 1.2).

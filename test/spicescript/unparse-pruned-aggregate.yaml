@@ -15,6 +15,8 @@ variants:
   mysql: { datasets: { e: { from: 'mysql:e', params: '${sources.my.params}' } } }
   duckdb: { datasets: { e: { from: 'duckdb:e', params: '${sources.duck.params}' } } }
   cayenne: { datasets: { e: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { e: { acceleration: { enabled: true, engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
 
 spicepod:
   version: v1
