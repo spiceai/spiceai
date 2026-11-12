@@ -8456,6 +8456,11 @@ mod tests {
         generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Sqlite).await;
     }
 
+    #[tokio::test]
+    async fn cayenne_an_absent_accelerator_file_fails_the_snapshot() {
+        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Cayenne).await;
+    }
+
     // ==================== OnChange Policy Tests ====================
 
     fn build_manager_with_on_change_policy(
