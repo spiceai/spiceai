@@ -1,0 +1,64 @@
+name: cayenne-vnext-restart
+description: >
+  A file-mode Cayenne acceleration in the object-native metastore writes no
+  SQLite metastore file (`cayenne.db`), and a restart still finds it: the
+  dataset is Ready and serves the rows its acceleration holds, not a reload of
+  the source, which changed while spiced was stopped. The SQLite metastore
+  variant runs the same steps and shows that the file check can see
+  `cayenne.db` where it exists.
+
+sources:
+  duck: { kind: duckdb }
+
+variants:
+  sqlite: {}
+  # The prototype object-native Cayenne metastore (`runtime.params.cayenne_vnext`).
+  object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-vnext-restart
+  datasets:
+    # No refresh schedule, and `refresh_on_startup: auto`: a start that finds the
+    # acceleration serves it rather than reading the source again.
+    - from: duckdb:items
+      name: items
+      params: ${sources.duck.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_on_startup: auto }
+
+defaults:
+  compare-variants: false
+
+steps:
+  - source-exec:
+      duck: |
+        CREATE TABLE items (id INTEGER PRIMARY KEY, v VARCHAR);
+        INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, NULL);
+  - start: {}
+  - query: SELECT id, v FROM items ORDER BY id
+    expect: { rows: [['1', 'a'], ['2', 'b'], ['3', null]] }
+  - assert-files: { contains: ['cayenne\.db$'] }
+    only: sqlite
+  - assert-files: { contains: ['object_native/catalog/head$'], lacks: ['cayenne\.db$'] }
+    only: object-native
+
+  # The source changes while spiced is stopped. A start that finds the
+  # acceleration keeps serving the rows it holds.
+  - stop: {}
+  - source-exec:
+      duck: |
+        DELETE FROM items WHERE id = 1;
+        UPDATE items SET v = 'changed' WHERE id = 2;
+        INSERT INTO items VALUES (4, 'd');
+  - start: {}
+  - assert-status: { dataset: items, status: Ready }
+  - query: SELECT id, v FROM items ORDER BY id
+    expect: { rows: [['1', 'a'], ['2', 'b'], ['3', null]] }
+  - assert-files: { lacks: ['cayenne\.db$'] }
+    only: object-native
+
+  # A refresh then reads the source's current rows.
+  - refresh: items
+  - query: SELECT id, v FROM items ORDER BY id
+    expect: { rows: [['2', 'changed'], ['3', null], ['4', 'd']] }
