@@ -42,6 +42,7 @@ pub mod object_store;
 pub mod postgres;
 pub mod write;
 
+#[derive(Clone, Debug)]
 pub struct Namespace {
     pub params: Value,
     pub extra: serde_json::Map<String, Value>,

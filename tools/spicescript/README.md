@@ -178,6 +178,12 @@ steps:
 | `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Useful for services such as Debezium Server. |
 | `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms` and `times`; `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
 
+**A source shared by every instance.** `shared: true` on a source gives every
+instance of a run the same namespace (database) instead of one each, for
+instances that act as replicas of one acceleration over one source and so
+share its replication slot, binlog or stream. A step that changes the source
+runs once per instance it reaches, so give such steps `only:`.
+
 **DuckDB releases.** `spiced` reads `duckdb:` and `ducklake:` through the
 DuckDB library installed on the host, so each `duckdb` or `ducklake` source
 writes its data and checks answers with the `duckdb` CLI of one release and

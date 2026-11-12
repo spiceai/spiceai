@@ -155,6 +155,13 @@ pub struct SourceSpec {
     /// `${instance.host_from_container}`.
     #[serde(default)]
     pub host_network: bool,
+    /// Give every instance of a run the same namespace (database, schema)
+    /// instead of one each, for instances that act as replicas of one
+    /// acceleration over one source: they then share its replication slot,
+    /// binlog or stream. A step that changes the source runs once per
+    /// instance it reaches, so such steps take `only:`.
+    #[serde(default)]
+    pub shared: bool,
     /// `rustfs` sources: put a toxiproxy in front of the store that delays
     /// every response by this long, so `spiced` (`${sources.<name>.endpoint}`
     /// and `.params`) sees a remote store's round trip. The harness's own
