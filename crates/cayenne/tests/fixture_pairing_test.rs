@@ -72,8 +72,8 @@ async fn a_sqlite_catalog_refuses_a_table_builder_on_an_object_store() {
 }
 
 /// An object-native fixture places each table in a dataset folder of its
-/// location, as the runtime places a new dataset, and fails a table it gives
-/// any other object-store path.
+/// location, as the runtime places a new dataset, and a table given any other
+/// object-store path is refused.
 #[tokio::test]
 async fn an_object_native_fixture_places_its_tables_in_the_location() {
     let fixture = TestFixture::new(BackendType::ObjectNative)
@@ -117,12 +117,15 @@ async fn an_object_native_fixture_places_its_tables_in_the_location() {
     else {
         panic!("a table outside the location's dataset folders must fail");
     };
+    // The object-native catalog refuses the unplaced path before the fixture's
+    // own placement check is reached.
     assert_eq!(
         error.to_string(),
         format!(
-            "table 'stray' keeps its data files at '{unplaced}', which is not a dataset folder of the \
-             fixture's object-native location, so it would not read the files its commits name"
-        )
+            "Invalid operation: {}",
+            cayenne::metastore_layout::object_native_data_path_refusal("stray")
+        ),
+        "data path: {unplaced}"
     );
 }
 
