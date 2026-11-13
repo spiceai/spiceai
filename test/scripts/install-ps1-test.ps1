@@ -33,23 +33,44 @@ $zero = "0" * 64
 # What the stubbed release serves. Set per test.
 $script:Release = @{}
 $script:GhCalls = @()
+# How many times each stubbed URL kind was requested: Sums, Api.
+$script:Requests = @{}
+
+# An error like the one Invoke-WebRequest and Invoke-RestMethod throw for an HTTP status, which
+# carries the response and its status code.
+function New-HttpError {
+    param([int]$Status, [string]$Message)
+    $exception = [System.Exception]::new("$Status $Message")
+    $exception | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = $Status })
+    return $exception
+}
 
 function Invoke-WebRequest {
     param([string]$Uri, [string]$OutFile, $Headers, [switch]$UseBasicParsing)
+    if ($Uri -like "*/SHA256SUMS") {
+        $script:Requests.Sums += 1
+        if ($script:Requests.Sums -le $script:Release.SumsTransient) {
+            throw (New-HttpError 504 "Gateway Timeout: $Uri")
+        }
+    }
     if ($Uri -like "*/SHA256SUMS" -and $script:Release.SumsUnreachable) {
-        throw "503 Service Unavailable: $Uri"
+        throw (New-HttpError 503 "Service Unavailable: $Uri")
     }
     if ($Uri -like "*/SHA256SUMS" -and $null -ne $script:Release.Sums) {
         Set-Content -Path $OutFile -Value $script:Release.Sums -NoNewline
         return
     }
-    throw "404 Not Found: $Uri"
+    throw (New-HttpError 404 "Not Found: $Uri")
 }
 
 function Invoke-RestMethod {
     param([string]$Uri, $Headers)
+    $script:Requests.Api += 1
+    if ($script:Requests.Api -le $script:Release.ApiTransient) {
+        throw (New-HttpError 504 "Gateway Timeout: $Uri")
+    }
     if ($script:Release.ApiFails) {
-        throw "403 rate limit exceeded"
+        throw (New-HttpError 403 "rate limit exceeded")
     }
     # A release lists SHA256SUMS among its assets exactly when it has one.
     $assets = @(
@@ -83,6 +104,7 @@ function Test-Case {
     param([string]$Name, [hashtable]$Release, [string]$Expect, [string]$Message, [switch]$AllowUnverified)
     $script:Release = $Release
     $script:GhCalls = @()
+    $script:Requests = @{ Sums = 0; Api = 0 }
     $env:SPICE_INSTALL_ALLOW_UNVERIFIED = if ($AllowUnverified) { "1" } else { $null }
     $output = ""
     $outcome = "installed"
@@ -126,6 +148,23 @@ if ($script:GhCalls.Count -ne 0) {
 
 Test-Case "stops when a listed SHA256SUMS cannot be downloaded" @{ SumsUnreachable = $true; Digest = "sha256:$digest"; Gh = "fail" } "stopped" "publishes SHA256SUMS, but downloading it failed"
 Test-Case "opt-out does not skip a listed SHA256SUMS" @{ SumsUnreachable = $true; Digest = "sha256:$digest" } "stopped" "publishes SHA256SUMS, but downloading it failed" -AllowUnverified
+
+# A brief GitHub error is retried; a 404 or a rate limit is not.
+function Assert-RequestCount {
+    param([string]$Name, [int]$Sums, [int]$Api)
+    if ($script:Requests.Sums -ne $Sums -or $script:Requests.Api -ne $Api) {
+        Write-Output "[FAIL] $Name`n  expected $Sums SHA256SUMS and $Api API request(s), got $($script:Requests.Sums) and $($script:Requests.Api)"
+        $script:failures += 1
+    }
+}
+Test-Case "retries a SHA256SUMS download that got a 504" @{ Sums = "$digest  $asset`n"; SumsTransient = 1 } "installed" "against the SHA256SUMS of release v0.0.0"
+Assert-RequestCount "retries a SHA256SUMS download that got a 504" 2 0
+Test-Case "retries a GitHub API request that got a 504" @{ Digest = "sha256:$digest"; ApiTransient = 1 } "installed" "against the sha256 GitHub recorded for $asset"
+Assert-RequestCount "retries a GitHub API request that got a 504" 1 2
+Test-Case "does not retry a missing SHA256SUMS" @{ Digest = "sha256:$digest" } "installed" "GitHub recorded"
+Assert-RequestCount "does not retry a missing SHA256SUMS" 1 1
+Test-Case "does not retry a rate-limited API request" @{ ApiFails = $true } "stopped" "the GitHub API request for its asset sha256 failed"
+Assert-RequestCount "does not retry a rate-limited API request" 1 1
 
 Remove-Item -Path $work -Recurse -Force
 $env:SPICE_INSTALL_ALLOW_UNVERIFIED = $null

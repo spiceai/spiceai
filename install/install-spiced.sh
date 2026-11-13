@@ -144,22 +144,30 @@ checkHttpRequestCLI() {
 # Release attestations are signed by build_release.yml running on a release branch.
 SPICE_ATTESTATION_SIGNER='^https://github\.com/spiceai/spiceai/\.github/workflows/build_release\.yml@refs/heads/release/'
 
-# Saves a URL to a file, sending GITHUB_TOKEN when it is set. Fails on an HTTP error.
+# Saves a URL to a file, sending GITHUB_TOKEN when it is set. Fails on an HTTP error. A request
+# that times out or gets a 408, 429 or 5xx is tried up to 3 more times, a second apart, so a
+# brief GitHub error doesn't stop the install. A 404, such as the SHA256SUMS of a release
+# without one, is not retried.
 verifyFetch() {
     local url="$1"
     local out="$2"
     local auth=()
+    local retry=()
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
         if [ -n "${GITHUB_TOKEN:-}" ]; then
             auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
         fi
-        curl --fail -sSL "${auth[@]}" "$url" -o "$out"
+        curl --fail -sSL --retry 3 --retry-delay 1 "${auth[@]}" "$url" -o "$out"
     else
         if [ -n "${GITHUB_TOKEN:-}" ]; then
             auth=(--header="Authorization: Bearer $GITHUB_TOKEN")
         fi
-        wget -q "${auth[@]}" -O "$out" "$url"
+        # GNU wget retries an HTTP error only when told which. BusyBox wget can't, and makes one try.
+        case "$(wget --help 2>&1)" in
+            *--retry-on-http-error*) retry=(--tries=4 --waitretry=1 "--retry-on-http-error=408,429,500,502,503,504") ;;
+        esac
+        wget -q "${retry[@]}" "${auth[@]}" -O "$out" "$url"
     fi
 }
 

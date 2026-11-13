@@ -50,6 +50,29 @@ function Assert-Supported {
 # uploaded, only when the release's asset list confirms it has no SHA256SUMS. Sha256 is empty,
 # with the Reason, when neither is available. Fatal is set when the release has a SHA256SUMS
 # that does not list the asset, or that could not be downloaded.
+# Runs a GitHub request, and tries it up to 3 more times, a second apart, when it got no answer
+# or a 408, 429 or 5xx, so a brief GitHub error doesn't stop the install. Any other error, such
+# as the 404 for the SHA256SUMS of a release without one, is thrown at once. Works the same in
+# Windows PowerShell 5.1 and PowerShell 7, whose errors both carry Response.StatusCode.
+function Invoke-GitHubRequest {
+    param([scriptblock]$Request)
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            return & $Request
+        } catch {
+            $status = 0
+            if ($_.Exception.Response) {
+                $status = [int]$_.Exception.Response.StatusCode
+            }
+            $transient = $status -eq 0 -or $status -eq 408 -or $status -eq 429 -or $status -ge 500
+            if (-not $transient -or $attempt -ge 4) {
+                throw
+            }
+            Start-Sleep -Seconds 1
+        }
+    }
+}
+
 function Get-ExpectedSha256 {
     param([string]$Tag, [string]$AssetName, [string]$WorkDir)
 
@@ -58,7 +81,7 @@ function Get-ExpectedSha256 {
     $sumsFile = Join-Path $WorkDir "SHA256SUMS"
     $sumsFound = $false
     try {
-        Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsFile -Headers $headers -UseBasicParsing -ErrorAction Stop
+        Invoke-GitHubRequest { Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsFile -Headers $headers -UseBasicParsing -ErrorAction Stop }
         $sumsFound = $true
     } catch {
         Write-Verbose "No SHA256SUMS at ${sumsUrl}: $($_.Exception.Message)"
@@ -75,7 +98,7 @@ function Get-ExpectedSha256 {
     }
 
     try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$spiceOrgName/$spiceRepoName/releases/tags/$Tag" -Headers $headers -ErrorAction Stop
+        $release = Invoke-GitHubRequest { Invoke-RestMethod -Uri "https://api.github.com/repos/$spiceOrgName/$spiceRepoName/releases/tags/$Tag" -Headers $headers -ErrorAction Stop }
     } catch {
         return @{ Sha256 = ""; Reason = "the SHA256SUMS of release $Tag could not be downloaded, and the GitHub API request for its asset sha256 failed (set GITHUB_TOKEN if the API rate limit was exceeded)" }
     }

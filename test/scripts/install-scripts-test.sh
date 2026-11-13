@@ -1004,6 +1004,105 @@ test_verification_block_is_identical_in_both_installers() {
     [[ -n "$cli" && "$cli" == "$spiced" ]] || { diff <(echo "$cli") <(echo "$spiced"); return 1; }
 }
 
+# A local HTTP server for verifyFetch. /flaky answers 504 to its first request and "ok" after it;
+# any other path is a 404. Each request's path is appended to $1.hits, and the port is in $1.port.
+start_flaky_server() {
+    local base="$1"
+    : > "$base.hits"
+    rm -f "$base.port"
+    python3 - "$base" <<'PY' &
+import http.server
+import sys
+
+base = sys.argv[1]
+seen = {}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        seen[self.path] = seen.get(self.path, 0) + 1
+        with open(base + ".hits", "a") as hits:
+            hits.write(self.path + "\n")
+        if self.path == "/flaky" and seen[self.path] > 1:
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(504 if self.path == "/flaky" else 404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+with open(base + ".port", "w") as port:
+    port.write(str(server.server_address[1]))
+server.serve_forever()
+PY
+    FLAKY_SERVER_PID=$!
+    for _ in $(seq 1 50); do
+        [[ -s "$base.port" ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+# Runs install.sh's verifyFetch with the given HTTP client (curl or wget). Prints its exit code.
+run_verify_fetch() {
+    local client="$1" url="$2" out="$3" rc=0
+    /bin/bash -c "$(verification_block "$INSTALL_SCRIPT")"$'\n'"SPICE_HTTP_REQUEST_CLI=$client; verifyFetch '$url' '$out'" > /dev/null 2>&1 || rc=$?
+    echo "$rc"
+}
+
+# verifyFetch against the flaky server: path $2 with client $1. Passes when the exit code is
+# zero exactly when $3 is "ok", and the server saw the path $4 times.
+check_verify_fetch() {
+    local client="$1" path="$2" expect="$3" hits="$4"
+    local base="$TEST_TMP_DIR/flaky-$client-${path#/}" rc seen
+    start_flaky_server "$base" || { echo "the test server did not start"; return 1; }
+    rc=$(run_verify_fetch "$client" "http://127.0.0.1:$(cat "$base.port")$path" "$base.out")
+    kill "$FLAKY_SERVER_PID" 2>/dev/null
+    wait "$FLAKY_SERVER_PID" 2>/dev/null
+    seen=$(grep -c "^$path\$" "$base.hits")
+    if [[ "$expect" == ok ]]; then
+        [[ "$rc" == 0 && "$(cat "$base.out")" == ok && "$seen" == "$hits" ]] && return 0
+    else
+        [[ "$rc" != 0 && "$seen" == "$hits" ]] && return 0
+    fi
+    echo "$client $path: exit $rc, $seen request(s); expected $expect after $hits"
+    return 1
+}
+
+test_verify_fetch_retries_a_transient_error_with_curl() {
+    check_verify_fetch curl /flaky ok 2
+}
+
+test_verify_fetch_does_not_retry_a_404_with_curl() {
+    check_verify_fetch curl /missing fail 1
+}
+
+# GNU wget retries an HTTP error only when told which; older wget and BusyBox wget can't.
+# Matches the help text without a pipe: under pipefail, `grep -q` closing early fails `wget --help`.
+wget_can_retry_http_errors() {
+    command -v wget > /dev/null 2>&1 || return 1
+    case "$(wget --help 2>&1)" in
+        *--retry-on-http-error*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+test_verify_fetch_retries_a_transient_error_with_wget() {
+    check_verify_fetch wget /flaky ok 2
+}
+
+test_verify_fetch_does_not_retry_a_404_with_wget() {
+    check_verify_fetch wget /missing fail 1
+}
+
 # Fails the test, printing the log, unless the log contains a line.
 log_has() {
     grep -qF -- "$2" "$1.log" || { echo "missing from $1.log: $2"; cat "$1.log"; return 1; }
@@ -1403,6 +1502,14 @@ run_all_tests() {
     # Download verification
     echo "--- Download Verification ---"
     run_test "Verification block is identical in both installers" test_verification_block_is_identical_in_both_installers
+    run_test "verifyFetch retries a transient error (curl)" test_verify_fetch_retries_a_transient_error_with_curl
+    run_test "verifyFetch does not retry a 404 (curl)" test_verify_fetch_does_not_retry_a_404_with_curl
+    if wget_can_retry_http_errors; then
+        run_test "verifyFetch retries a transient error (wget)" test_verify_fetch_retries_a_transient_error_with_wget
+        run_test "verifyFetch does not retry a 404 (wget)" test_verify_fetch_does_not_retry_a_404_with_wget
+    else
+        skip_test "verifyFetch retries (wget)" "this wget has no --retry-on-http-error"
+    fi
     run_test "install.sh stops when a listed SHA256SUMS cannot be downloaded" test_install_sh_stops_when_a_listed_sha256sums_cannot_be_downloaded
     run_test "install.sh opt-out does not skip a listed SHA256SUMS" test_install_sh_opt_out_does_not_skip_a_listed_sha256sums
     run_test "install-spiced.sh stops when a listed SHA256SUMS cannot be downloaded" test_install_spiced_sh_stops_when_a_listed_sha256sums_cannot_be_downloaded
