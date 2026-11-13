@@ -30,12 +30,12 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionCallStream, FunctionObject, FunctionType, PromptTokensDetails, ResponseFormat,
-    ToolChoiceAllowedMode, ToolChoiceOptions,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionTokensDetails, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    FinishReason, FunctionCall, FunctionCallStream, FunctionObject, FunctionType,
+    PromptTokensDetails, ResponseFormat, ToolChoiceAllowedMode, ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -802,19 +802,24 @@ pub fn combine_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
 
 /// `messages` with a system message holding `catalog`, after the leading system and developer
 /// messages (the Spicepod `system_prompt` and the client's), and before the conversation. A
-/// conversation that already holds the same message keeps the one it has.
+/// conversation that already holds the same message, as text or as one of its text parts, keeps
+/// the one it has.
 fn insert_catalog_message(
     mut messages: Vec<ChatCompletionRequestMessage>,
     catalog: String,
 ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
-    let is_catalog = |m: &ChatCompletionRequestMessage| {
-        matches!(
-            m,
-            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                content: ChatCompletionRequestSystemMessageContent::Text(text),
-                ..
-            }) if *text == catalog
-        )
+    let is_catalog = |m: &ChatCompletionRequestMessage| match m {
+        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: ChatCompletionRequestSystemMessageContent::Text(text),
+            ..
+        }) => *text == catalog,
+        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: ChatCompletionRequestSystemMessageContent::Array(parts),
+            ..
+        }) => parts
+            .iter()
+            .any(|ChatCompletionRequestSystemMessageContentPart::Text(part)| part.text == catalog),
+        _ => false,
     };
     if messages.iter().any(is_catalog) {
         return Ok(messages);
@@ -1792,6 +1797,22 @@ mod tests {
             messages.len(),
             "a second round does not add it twice"
         );
+    }
+
+    /// A client that sends the dataset list back as a system message of text parts, as the API
+    /// allows, gets it once.
+    #[test]
+    fn a_catalog_sent_back_as_text_parts_is_kept_once() {
+        let catalog =
+            "Datasets (use these names in sql, search, and table_schema):\n- spice.public.t";
+        let messages: Vec<ChatCompletionRequestMessage> = serde_json::from_value(json!([
+            {"role": "system", "content": [{"type": "text", "text": catalog}]},
+            {"role": "user", "content": "How many orders?"},
+        ]))
+        .expect("valid messages");
+        let again = insert_catalog_message(messages.clone(), catalog.to_string())
+            .expect("keeps the catalog");
+        assert_eq!(again, messages);
     }
 
     #[test]

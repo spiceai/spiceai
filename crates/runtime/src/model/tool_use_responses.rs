@@ -18,14 +18,14 @@ use async_openai::{
     error::OpenAIError,
     types::responses::{
         CodeInterpreterTool, CreateResponse, EasyInputContent, EasyInputMessage,
-        FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem,
-        InputParam, InputTokenDetails, Item, MCPToolCallStatus, MessageItem, MessageType,
-        OutputItem, OutputTokenDetails, Response, ResponseMCPCallArgumentsDeltaEvent,
-        ResponseMCPCallArgumentsDoneEvent, ResponseMCPCallCompletedEvent,
-        ResponseMCPCallFailedEvent, ResponseMCPCallInProgressEvent, ResponseOutputItemAddedEvent,
-        ResponseOutputItemDoneEvent, ResponseStream, ResponseStreamEvent, ResponseUsage, Role,
-        Tool as ToolDefinition, ToolChoiceAllowedMode, ToolChoiceOptions, ToolChoiceParam,
-        WebSearchTool,
+        FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall,
+        InputContent, InputItem, InputParam, InputRole, InputTextContent, InputTokenDetails, Item,
+        MCPToolCallStatus, MessageItem, MessageType, OutputItem, OutputTokenDetails, Response,
+        ResponseMCPCallArgumentsDeltaEvent, ResponseMCPCallArgumentsDoneEvent,
+        ResponseMCPCallCompletedEvent, ResponseMCPCallFailedEvent, ResponseMCPCallInProgressEvent,
+        ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseStream,
+        ResponseStreamEvent, ResponseUsage, Role, Tool as ToolDefinition, ToolChoiceAllowedMode,
+        ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
     },
 };
 use async_trait::async_trait;
@@ -122,12 +122,7 @@ impl ToolUsingResponses {
             return req;
         };
         let mut items = to_input_item(req.input);
-        let holds_catalog = items.iter().any(|item| {
-            matches!(item, InputItem::EasyMessage(message)
-                if matches!(message.role, Role::System)
-                    && matches!(&message.content, EasyInputContent::Text(text) if *text == catalog))
-        });
-        if !holds_catalog {
+        if !items.iter().any(|item| holds_catalog(item, &catalog)) {
             let at = items
                 .iter()
                 .position(|item| {
@@ -1140,6 +1135,30 @@ fn to_input_item(input: InputParam) -> Vec<InputItem> {
     }
 }
 
+/// Whether `item` is a system message holding `catalog`, as its text or as one of its text parts,
+/// in either message shape the Responses API accepts.
+fn holds_catalog(item: &InputItem, catalog: &str) -> bool {
+    let in_parts = |parts: &[InputContent]| {
+        parts.iter().any(
+            |part| matches!(part, InputContent::InputText(InputTextContent { text }) if text == catalog),
+        )
+    };
+    match item {
+        InputItem::EasyMessage(message) if matches!(message.role, Role::System) => {
+            match &message.content {
+                EasyInputContent::Text(text) => text == catalog,
+                EasyInputContent::ContentList(parts) => in_parts(parts),
+            }
+        }
+        InputItem::Item(Item::Message(MessageItem::Input(message)))
+            if matches!(message.role, InputRole::System) =>
+        {
+            in_parts(&message.content)
+        }
+        _ => false,
+    }
+}
+
 /// `response`, the last round's, as the response to the whole tool-use loop: the output of the
 /// earlier rounds comes first, and the usage covers every round. It keeps the last round's ID,
 /// the response whose input holds the whole exchange, so that a client continuing with
@@ -1291,6 +1310,30 @@ mod tests {
         );
         let again = input_with_catalog(input.clone()).await;
         assert_eq!(again, input, "an input that holds the list keeps it once");
+    }
+
+    /// A client that sends the dataset list back as a system message of `input_text` parts, in
+    /// either message shape the API accepts, gets it once.
+    #[tokio::test]
+    async fn a_dataset_list_sent_back_as_content_parts_is_kept_once() {
+        let catalog = "Datasets (use these names in sql, search, and table_schema):\n- spice.public.taxi_trips";
+        for system in [
+            json!({"role": "system", "content": [{"type": "input_text", "text": catalog}]}),
+            json!({"type": "message", "role": "system", "content": [{"type": "input_text", "text": catalog}]}),
+        ] {
+            let input = input_with_catalog(json!([
+                system,
+                {"type": "message", "role": "user", "content": "How many trips?"},
+            ]))
+            .await;
+            let copies = input
+                .as_array()
+                .expect("items")
+                .iter()
+                .filter(|item| item.to_string().contains("spice.public.taxi_trips"))
+                .count();
+            assert_eq!(copies, 1, "{system}: {input}");
+        }
     }
 
     /// A `failing_tool` Spice tool whose every call fails.
