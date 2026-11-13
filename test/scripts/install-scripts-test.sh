@@ -785,18 +785,18 @@ test_spiced_variant_cuda_documented() {
 # Sudo Decision Tests
 # =============================================================================
 
-# Runs install.sh end to end, piped into bash as the README one-liner does, with no
-# network and no TTY: `curl` serves a local archive holding a stub `spice`, and `sudo`
+# Runs an installer end to end, piped into bash as the README one-liner does, with no
+# network and no TTY: `curl` serves a local archive holding a stub binary, and `sudo`
 # records its arguments to $home.sudo and refuses, as sudo does without a terminal.
 # Extra arguments are VAR=value pairs passed to the installer's environment.
-run_install_offline() {
-    local home="$1"
-    shift
+run_installer_offline() {
+    local script="$1" binary="$2" home="$3"
+    shift 3
     local stubs="$home.stubs"
     mkdir -p "$stubs/pkg"
-    printf '#!/bin/sh\necho "CLI version: v0.0.0"\n' > "$stubs/pkg/spice"
-    chmod +x "$stubs/pkg/spice"
-    tar czf "$stubs/spice.tar.gz" -C "$stubs/pkg" spice
+    printf '#!/bin/sh\necho "CLI version: v0.0.0"\n' > "$stubs/pkg/$binary"
+    chmod +x "$stubs/pkg/$binary"
+    tar czf "$stubs/spice.tar.gz" -C "$stubs/pkg" "$binary"
     cat > "$stubs/curl" <<STUB
 #!/bin/sh
 while [ \$# -gt 0 ]; do
@@ -814,7 +814,14 @@ STUB
     chmod +x "$stubs/curl" "$stubs/sudo"
     : > "$home.sudo"
     env -i HOME="$home" PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin" SHELL=/bin/bash "$@" \
-        /bin/bash -c "cat '$INSTALL_SCRIPT' | /bin/bash -s -- 0.0.0" > "$home.log" 2>&1 < /dev/null
+        /bin/bash -c "cat '$script' | /bin/bash -s -- 0.0.0" > "$home.log" 2>&1 < /dev/null
+}
+
+# install.sh, offline, as run_installer_offline describes.
+run_install_offline() {
+    local home="$1"
+    shift
+    run_installer_offline "$INSTALL_SCRIPT" spice "$home" "$@"
 }
 
 # regression test for #14445: a first install, with no ~/.spice yet, must not ask for sudo
@@ -832,14 +839,76 @@ test_install_sh_unwritable_dir_uses_sudo() {
     chmod 555 "$home/locked"
     run_install_offline "$home" SPICE_CLI_INSTALL_DIR="$home/locked/new/bin" || true
     chmod 755 "$home/locked"
-    grep -q "^mkdir -p $home/locked/new/bin" "$home.sudo"
+    grep -q "^-- mkdir -p $home/locked/new/bin" "$home.sudo"
 }
 
 test_install_sh_explicit_use_sudo_is_honored() {
     local home="$TEST_TMP_DIR/explicit-sudo-home"
     mkdir -p "$home"
     run_install_offline "$home" USE_SUDO=true || true
-    grep -q "^cp .* $home/.spice/bin$" "$home.sudo"
+    grep -q "^-- cp .* $home/.spice/bin$" "$home.sudo"
+}
+
+# regression test: install-spiced.sh created its install directory with a plain mkdir before
+# getSystemInfo decided whether it needed sudo, so under `set -e` a non-root user whose
+# install directory was missing exited there, and sudo was never asked.
+test_install_spiced_sh_creates_install_dir_with_sudo_when_needed() {
+    local home="$TEST_TMP_DIR/spiced-locked-home"
+    mkdir -p "$home/locked"
+    chmod 555 "$home/locked"
+    run_installer_offline "$INSTALL_SPICED_SCRIPT" spiced "$home" \
+        USE_SUDO=true SPICED_INSTALL_DIR="$home/locked/new/bin" || true
+    chmod 755 "$home/locked"
+    grep -q "^-- mkdir -p $home/locked/new/bin$" "$home.sudo" || { cat "$home.log"; return 1; }
+}
+
+test_install_spiced_sh_missing_writable_dir_needs_no_sudo() {
+    local home="$TEST_TMP_DIR/spiced-fresh-home"
+    mkdir -p "$home"
+    run_installer_offline "$INSTALL_SPICED_SCRIPT" spiced "$home" SPICED_INSTALL_DIR="$home/new/bin" || { cat "$home.log"; return 1; }
+    [[ ! -s "$home.sudo" ]] || { echo "sudo was called: $(cat "$home.sudo")"; return 1; }
+    [[ -x "$home/new/bin/spiced" ]]
+}
+
+# Runs an installer's own runAsRoot, with and without sudo, on a directory whose name is shell
+# syntax. `sudo` is stubbed to drop a leading `--` and run the rest. The directory must be
+# created under its literal name, and the syntax in it must never run.
+run_as_root_keeps_arguments_literal() {
+    local script="$1"
+    local dir
+    dir="$TEST_TMP_DIR/run-as-root-$(basename "$script")"
+    mkdir -p "$dir/stubs"
+    cat > "$dir/stubs/sudo" <<'STUB'
+#!/bin/sh
+[ "$1" = "--" ] && shift
+exec "$@"
+STUB
+    chmod +x "$dir/stubs/sudo"
+    local use_sudo target
+    for use_sudo in false true; do
+        target="$dir/$use_sudo; touch $dir/pwned-$use_sudo"
+        PATH="$dir/stubs:$PATH" bash -c "USE_SUDO=$use_sudo
+            $(sed -n '/^runAsRoot() {/,/^}/p' "$script")
+            runAsRoot mkdir -p \"\$1\"" _ "$target" || return 1
+        [[ ! -e "$dir/pwned-$use_sudo" ]] || { echo "runAsRoot ran shell syntax from its argument (USE_SUDO=$use_sudo)"; return 1; }
+        [[ -d "$target" ]] || { echo "runAsRoot did not create the literal directory (USE_SUDO=$use_sudo)"; return 1; }
+    done
+}
+
+test_install_sh_run_as_root_keeps_arguments_literal() {
+    run_as_root_keeps_arguments_literal "$INSTALL_SCRIPT"
+}
+
+test_install_spiced_sh_run_as_root_keeps_arguments_literal() {
+    run_as_root_keeps_arguments_literal "$INSTALL_SPICED_SCRIPT"
+}
+
+test_install_nightly_sh_run_as_root_keeps_arguments_literal() {
+    run_as_root_keeps_arguments_literal "$INSTALL_NIGHTLY_SCRIPT"
+}
+
+test_installers_do_not_eval() {
+    ! grep -n "eval" "$INSTALL_SCRIPT" "$INSTALL_SPICED_SCRIPT" "$INSTALL_NIGHTLY_SCRIPT"
 }
 
 # Evaluates install-nightly.sh's getSystemInfo for one SPICED_INSTALL_DIR
@@ -1068,9 +1137,19 @@ run_all_tests() {
         run_test "install.sh: unwritable install dir uses sudo" test_install_sh_unwritable_dir_uses_sudo
         run_test "install.sh: explicit USE_SUDO=true is honored" test_install_sh_explicit_use_sudo_is_honored
         run_test "install-nightly.sh: missing parent dir needs no sudo" test_install_nightly_sh_missing_parent_needs_no_sudo
+        run_test "install-spiced.sh: creates a missing install dir with sudo when needed" test_install_spiced_sh_creates_install_dir_with_sudo_when_needed
+        run_test "install-spiced.sh: missing writable install dir needs no sudo" test_install_spiced_sh_missing_writable_dir_needs_no_sudo
     else
         skip_test "Sudo decision tests" "running as root"
     fi
+    echo ""
+
+    # runAsRoot argument handling (as root, the sudo half runs the command directly)
+    echo "--- runAsRoot Arguments ---"
+    run_test "install.sh: runAsRoot keeps its arguments literal" test_install_sh_run_as_root_keeps_arguments_literal
+    run_test "install-spiced.sh: runAsRoot keeps its arguments literal" test_install_spiced_sh_run_as_root_keeps_arguments_literal
+    run_test "install-nightly.sh: runAsRoot keeps its arguments literal" test_install_nightly_sh_run_as_root_keeps_arguments_literal
+    run_test "installers never call eval" test_installers_do_not_eval
     echo ""
 
     # Error Handling
