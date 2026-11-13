@@ -499,9 +499,19 @@ async fn resolve_failed_fused_commit(
     let mut committed = 0;
     let mut unreadable = None;
     for pc in prepared.iter() {
-        match super::append_commit::snapshot_sequence(catalog, pc.table_id(), pc.snapshot_id())
+        // A table in the object-native location reads its state back in the
+        // background after a commit whose outcome is unknown: wait for that.
+        let read_back = if pc.data_in_object_native_location() {
+            super::append_commit::snapshot_sequence_once_readable(
+                catalog,
+                pc.table_id(),
+                pc.snapshot_id(),
+            )
             .await
-        {
+        } else {
+            super::append_commit::snapshot_sequence(catalog, pc.table_id(), pc.snapshot_id()).await
+        };
+        match read_back {
             Ok(Some(sequence)) if sequence == pc.snapshot_sequence() => committed += 1,
             Ok(_) => {}
             Err(read_error) => {
@@ -522,6 +532,9 @@ async fn resolve_failed_fused_commit(
         }
         None if committed == 0 => Err(FusedFailure::Uncommitted(error)),
         _ => {
+            let refuses_queries = prepared
+                .iter()
+                .any(PreparedTxnCommit::data_in_object_native_location);
             for pc in prepared.iter_mut() {
                 pc.retain_after_unknown_outcome();
             }
@@ -537,7 +550,12 @@ async fn resolve_failed_fused_commit(
             Err(FusedFailure::Unknown(Error::IncompleteWrite {
                 table: "<transaction>".to_string(),
                 message: format!(
-                    "a transaction's commit failed ({error}), and {read_back}. Its files are kept, and writes to its tables are refused until they are reloaded from their catalog. Restart Spice to reload them"
+                    "a transaction's commit failed ({error}), and {read_back}. Its files are kept, and {} until they are reloaded from their catalog. Restart Spice to reload them",
+                    if refuses_queries {
+                        "writes to its tables, and queries of those whose data is in the state location, are refused"
+                    } else {
+                        "writes to its tables are refused"
+                    }
                 ),
             }))
         }

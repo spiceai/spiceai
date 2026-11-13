@@ -24,6 +24,8 @@ concurrency:
 
 jobs:
   verify:
+    # Uses only the job's own `github.token`, no environment secret.
+    environment: secret-free
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:

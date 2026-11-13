@@ -800,7 +800,20 @@ async fn a_small_file_landing_during_a_declined_pass_is_compacted_without_anothe
     );
 
     // Leave the coalesced worker claimed so the retry's own schedule cannot start
-    // a second pass under these assertions.
+    // a second pass under these assertions. The raced append's debounced
+    // maintenance rebuilds the manifest under the compaction lock; let it finish
+    // first, so the retry does not find the lock held and decline.
+    provider
+        .flush_pending_maintenance()
+        .await
+        .expect("drain the raced append's maintenance");
+    while provider
+        .manifest_rebuild_retry_scheduled
+        .load(Ordering::Acquire)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    drop(provider.compaction_lock.write().await);
     assert!(
         provider
             .compact_current_snapshot_small_files()
@@ -824,5 +837,250 @@ async fn a_small_file_landing_during_a_declined_pass_is_compacted_without_anothe
         ids_after_reopen(&provider, NAME).await,
         expected,
         "after a restart the table holds the same rows"
+    );
+}
+
+/// Writes whose post-write maintenance finds `compaction_lock` held arm the manifest
+/// rebuild retry, and the post-write compaction pass they schedule declines on the same
+/// held lock and ends. The table is still due a pass, and no further write comes to
+/// schedule one. Once the lock is free the retry rebuilds the manifest, and the table
+/// must then be consolidated without another write.
+#[tokio::test]
+async fn a_pass_declined_on_a_held_lock_runs_after_the_manifest_rebuild_retry() {
+    const NAME: &str = "pk_less_declined_on_held_lock";
+    let schema = id_value_schema();
+    let ctx = SessionContext::new();
+    let (provider, _temp_dir) = create_cayenne_table_with_config(
+        NAME,
+        Arc::clone(&schema),
+        four_file_count_trigger(),
+        Vec::new(),
+        ctx.runtime_env(),
+    )
+    .await;
+    let trigger = provider.context.compaction_picker_config().trigger_files;
+    assert_eq!(trigger, 4, "fixture: four files qualify the tier by count");
+
+    let held = provider.hold_compaction().await;
+    for i in 0..4 {
+        insert_batch(&provider, id_value_rows(&schema, i * 50, 50)).await;
+    }
+    provider
+        .flush_pending_maintenance()
+        .await
+        .expect("the writes' maintenance runs while the lock is held");
+    assert!(
+        provider
+            .manifest_rebuild_retry_scheduled
+            .load(Ordering::Acquire),
+        "precondition: the maintenance found the lock held and armed the manifest rebuild retry"
+    );
+    // With the lock still held, an idle worker means the scheduled pass declined and ended.
+    for _ in 0..5_000 {
+        if provider.post_write_compaction_state.load(Ordering::Acquire)
+            == super::super::COALESCED_TASK_IDLE
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        provider.post_write_compaction_state.load(Ordering::Acquire),
+        super::super::COALESCED_TASK_IDLE,
+        "precondition: the post-write pass declined on the held lock and ended"
+    );
+    assert!(
+        provider.post_write_compaction_due(),
+        "precondition: the declined pass left the table due a pass"
+    );
+    assert_eq!(
+        list_current(&provider).await.files.len(),
+        4,
+        "precondition: nothing compacted while the lock was held"
+    );
+
+    drop(held);
+    provider
+        .drain_in_flight_maintenance()
+        .await
+        .expect("drain the retry and the pass it schedules");
+    let files = list_current(&provider).await.files.len();
+    assert!(
+        files < 4,
+        "the table must be consolidated once the lock is free, with no further write; it still has {files} files"
+    );
+    let expected: Vec<i64> = (0..200).collect();
+    assert_eq!(
+        scan_sorted_ids(&provider).await,
+        expected,
+        "every row stays visible"
+    );
+    assert_eq!(
+        ids_after_reopen(&provider, NAME).await,
+        expected,
+        "after a restart the table holds the same rows"
+    );
+}
+
+/// A table whose data is in the object-native location keeps its files flat, so
+/// its subset rewrite copies nothing: it reads its picked files where they are,
+/// names the files it does not rewrite under their keys, and names a file
+/// appended during its encode, carried under the writer lock, by its committed
+/// row. No store request is a copy, the late file's key is in the new
+/// snapshot's manifest, and every row is there, now and after a reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_append_during_compaction_is_carried_without_a_copy() {
+    use crate::metadata::ObjectStoreConfig;
+    use crate::metastore::object_native::{ObjectNativeCatalog, new_dataset_folder};
+    use object_store::memory::InMemory;
+    use object_store_sim::Op;
+    use object_store_sim::fault::FaultStore;
+
+    const NAME: &str = "flat_late_append";
+    let faults = Arc::new(FaultStore::new(
+        Arc::new(InMemory::new()) as Arc<dyn ObjectStore>
+    ));
+    let bucket: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
+    let open_catalog = || async {
+        let catalog = ObjectNativeCatalog::open_or_create_at(
+            Arc::clone(&bucket),
+            ObjectStorePath::from("state/cayenne/v1/catalog"),
+            "s3://bucket/state/cayenne/v1",
+        )
+        .await
+        .expect("open the object-native catalog");
+        catalog.init().await.expect("init the catalog");
+        catalog
+    };
+    let catalog = open_catalog().await;
+    let data_url = format!(
+        "s3://bucket/{}/{}/data",
+        catalog.datasets_prefix(),
+        new_dataset_folder(NAME)
+    );
+    let store_config = || ObjectStoreConfig {
+        url: url::Url::parse(&data_url).expect("data url"),
+        store: Arc::clone(&bucket),
+    };
+    let schema = id_value_schema();
+    let ctx = SessionContext::new();
+    let provider = CayenneTableProviderBuilder::new(Arc::new(catalog), ctx.runtime_env())
+        .with_object_store(store_config())
+        .create(CreateTableOptions {
+            table_name: NAME.to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: Vec::new(),
+            on_conflict: None,
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: four_file_count_trigger(),
+        })
+        .await
+        .expect("create the placed table");
+    assert!(
+        provider.data_in_object_native_location(),
+        "precondition: the table is placed"
+    );
+    for i in 0..4 {
+        insert_batch(&provider, id_value_rows(&schema, i * 100, 100)).await;
+    }
+    let listed = list_current(&provider).await;
+    assert_eq!(listed.files.len(), 4, "fixture: one file per append");
+    let candidate = subset_candidate_of_first_two(&listed.files);
+
+    // During the encode, an append commits a file into the snapshot the pass read.
+    let racer = provider.clone_for_write();
+    let racer_schema = Arc::clone(&schema);
+    let source = listed.snapshot_id.clone();
+    let late: Arc<ParkingMutex<Vec<String>>> = Arc::default();
+    let late_seen = Arc::clone(&late);
+    *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+        Box::pin(async move {
+            let before: HashSet<String> = racer
+                .list_snapshot_files_with_sizes(&source)
+                .await
+                .expect("source files")
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            insert_batch(&racer, id_value_rows(&racer_schema, 100_000, 100)).await;
+            *late_seen.lock() = racer
+                .list_snapshot_files_with_sizes(&source)
+                .await
+                .expect("source files")
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| !before.contains(name))
+                .collect();
+        })
+    }));
+
+    let seen = faults.log().len();
+    let committed = provider
+        .rewrite_current_snapshot_small_file_subset(
+            &candidate,
+            &listed.files,
+            &listed.snapshot_id,
+            listed.generation,
+        )
+        .await
+        .expect("the subset rewrite runs");
+    let copies = faults.log()[seen..]
+        .iter()
+        .filter(|applied| matches!(applied.op, Op::Copy | Op::Rename))
+        .count();
+    let late = late.lock().clone();
+    let current = provider.get_current_snapshot_id();
+    let named: HashSet<String> = provider
+        .catalog()
+        .get_snapshot_files(provider.table_id(), &current)
+        .await
+        .expect("the new snapshot's manifest")
+        .into_iter()
+        .map(|file| file.file_path)
+        .collect();
+    let unpicked: Vec<&str> = listed
+        .files
+        .iter()
+        .skip(2)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let expected: Vec<i64> = (0..400).chain(100_000..100_100).collect();
+    let rows = scan_sorted_ids(&provider).await;
+
+    provider.quiesce().await;
+    let reopen_ctx = SessionContext::new();
+    let reopened =
+        CayenneTableProviderBuilder::new(Arc::new(open_catalog().await), reopen_ctx.runtime_env())
+            .with_object_store(store_config())
+            .open(NAME)
+            .await
+            .expect("reopen the placed table");
+    let hook_taken = provider.test_pre_rewrite_commit_hook.lock().is_none();
+    let reopened_rows = scan_sorted_ids(&reopened).await;
+    assert_eq!(
+        (
+            committed,
+            hook_taken,
+            copies,
+            late.len(),
+            late.iter().all(|name| named.contains(name)),
+            unpicked.iter().all(|name| named.contains(*name)),
+            current != listed.snapshot_id,
+            rows,
+            reopened_rows,
+        ),
+        (
+            true,
+            true,
+            0,
+            1,
+            true,
+            true,
+            true,
+            expected.clone(),
+            expected,
+        ),
+        "committed, the append raced the pass, copies, the late file named in the new snapshot {named:?}, the unpicked files named, rows now and after a reopen"
     );
 }

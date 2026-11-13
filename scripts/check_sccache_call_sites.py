@@ -24,6 +24,9 @@ import sys
 
 ROOTS = (pathlib.Path(".github/workflows"), pathlib.Path(".github/actions"))
 CREDS = ("minio_access_key", "minio_secret_key")
+# A same-repository action is called as `./.github/actions/<name>` (the checked-out tree) or
+# `$/.github/actions/<name>` (the workflow's own commit, which `actions.lock` can cover).
+LOCAL_ACTION = r"[.$]/\.github/actions/"
 
 
 def forwards_to_setup_sccache(action_yml):
@@ -36,7 +39,7 @@ def forwards_to_setup_sccache(action_yml):
         text = action_yml.read_text(encoding="utf8")
     except OSError:
         return False
-    if "./.github/actions/setup-sccache" not in text:
+    if not re.search(rf"{LOCAL_ACTION}setup-sccache\b", text):
         return False
     return all(re.search(rf"^  {c}\s*:", text, re.M) for c in CREDS)
 
@@ -57,7 +60,7 @@ def call_sites(text, names):
     """
     lines = text.split("\n")
     for i, line in enumerate(lines):
-        m = re.search(r"uses:\s*\./\.github/actions/([A-Za-z0-9_-]+)", line)
+        m = re.search(rf"uses:\s*{LOCAL_ACTION}([A-Za-z0-9_-]+)", line)
         if not m or m.group(1) not in names:
             continue
         indent = len(line) - len(line.lstrip())

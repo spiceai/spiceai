@@ -177,7 +177,7 @@ jobs:
       # Scripts pull images as they start, so the login has to last the whole job.
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@v4.7.0
+        uses: docker/login-action@v4.8.0
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           DOCKERHUB_OIDC_EXPIREIN: '21600'

@@ -1,0 +1,256 @@
+---
+name: Cayenne object-native
+
+# Checks the object-native metastore model, stores, and conditional writes.
+on:
+  pull_request:
+    paths:
+      - 'crates/cayenne-metastore-model/**'
+      - 'docs/design/object-native-metastore.md'
+      - 'docs/design/object-native-metastore-technical.md'
+      - 'crates/cayenne/**'
+      - 'crates/cayenne-metastore-actions/**'
+      - 'crates/accelerators/accelerator-cayenne/**'
+      - 'crates/object_store_occ/**'
+      - 'crates/object_store_sim/**'
+      - '.github/workflows/cayenne_object_native.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  merge_group:
+  # Nightly: every run, including the controls.
+  schedule:
+    - cron: '30 7 * * *'
+  workflow_dispatch:
+    inputs:
+      set:
+        description: 'quick (the pull-request set) or all (the nightly set)'
+        type: choice
+        options: [quick, all]
+        default: quick
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cayenne-object-native-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTC_WRAPPER: ''
+  RUSTC_WORKSPACE_WRAPPER: ''
+  # The suites that read and write data files: the property and model fuzz
+  # lanes, deletion vectors, reclamation, per-dataset stores and object-native data.
+  SUITES: >-
+    test(/^mutation_property_test::/) | test(/^mutation_model_test::/) |
+    test(/^deletion_vector/) | test(/^orphan_dv_compaction_test::/) |
+    test(/^object_store_reclaim_test::/) | test(/^per_dataset_store_test::/) |
+    test(/^object_native_data_test::/) | test(/^snapshot_cleanup_convergence_test::/)
+
+jobs:
+  changes:
+    environment: secret-free
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      model: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.model == 'true' }}
+      stores: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.stores == 'true' }}
+      object_store_occ: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.object_store_occ == 'true' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
+      - uses: dorny/paths-filter@v4.0.3
+        id: paths
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        with:
+          base: ${{ github.event.merge_group.base_sha || github.event.repository.default_branch }}
+          filters: |
+            model:
+              - 'crates/cayenne-metastore-model/**'
+              - 'docs/design/object-native-metastore.md'
+              - 'docs/design/object-native-metastore-technical.md'
+              - '.github/workflows/cayenne_object_native.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+            stores:
+              - 'crates/cayenne/**'
+              - 'crates/accelerators/accelerator-cayenne/**'
+              - 'crates/cayenne-metastore-actions/**'
+              - 'crates/object_store_occ/**'
+              - 'crates/object_store_sim/**'
+              - '.github/workflows/cayenne_object_native.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+            object_store_occ:
+              - 'crates/object_store_occ/**'
+              - 'crates/object_store_sim/**'
+              - 'crates/cayenne-metastore-actions/**'
+              - 'crates/cayenne-metastore-model/**'
+              - '.github/workflows/cayenne_object_native.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+
+  model:
+    needs: changes
+    concurrency:
+      group: cayenne-metastore-model-${{ github.ref }}-${{ github.event_name }}
+      cancel-in-progress: true
+    name: Check the metastore model (${{ (github.event_name == 'schedule' || inputs.set == 'all') && 'all' || 'quick' }})
+    # Runs the change's code on persistent self-hosted runners, so fork and
+    # Dependabot pull requests run it only from the merge queue.
+    if: >-
+      needs.changes.outputs.model == 'true' &&
+      (github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'))
+    environment: secret-free
+    runs-on: spiceai-dev-runners
+    # `quick` took 40 s on a 16-core Mac; `all` is not yet timed.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.set == 'all') && 720 || 60 }}
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTC_WRAPPER: ''
+      RUSTC_WORKSPACE_WRAPPER: ''
+      SET: ${{ (github.event_name == 'schedule' || inputs.set == 'all') && 'all' || 'quick' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          # The merge-group path filter diffs against the queue's base.
+          fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
+      - uses: $/.github/actions/setup-rust
+      # The dev runner image has no C toolchain; mimalloc builds C.
+      - uses: $/.github/actions/setup-cc
+      - name: Build the model
+        run: cargo build --locked --release -p cayenne-metastore-model
+      - name: Check the design documents' model citations
+        run: target/release/cayenne-metastore-model cite-check docs/design/object-native-metastore.md docs/design/object-native-metastore-technical.md
+      - name: Run the ${{ env.SET }} model set
+        # Controls (in `all`) require EXHAUST=1.
+        env:
+          EXHAUST: ${{ env.SET == 'all' && '1' || '' }}
+        run: target/release/cayenne-metastore-model "$SET"
+
+  # The data-path suites on an S3-compatible store: a RustFS container stands
+  # in for S3, so the suites see real HTTP, conditional writes and ranged reads.
+  s3:
+    needs: changes
+    concurrency:
+      group: cayenne-data-store-s3-${{ github.ref }}-${{ github.event_name }}
+      cancel-in-progress: true
+    name: Object-native (rustfs)
+    # Runs the change's code on persistent self-hosted runners, so fork and
+    # Dependabot pull requests run it only from the merge queue.
+    if: >-
+      needs.changes.outputs.stores == 'true' && github.event_name != 'schedule' &&
+      (github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'))
+    environment: secret-free
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 120
+    env:
+      CAYENNE_TEST_DATA_STORE: rustfs
+      # Bounded seeds: the job runs on every qualifying pull request.
+      CAYENNE_PROPTEST_SCALE: '0.25'
+      CAYENNE_PROPTEST_OPS_SCALE: '0.25'
+      RUSTFS_CONTAINER: cayenne-data-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
+      - uses: $/.github/actions/setup-rust
+      # The dev runner image has no C toolchain, and rustc links through cc.
+      - uses: $/.github/actions/setup-cc
+      - uses: $/.github/actions/install-protoc
+      - uses: $/.github/actions/setup-nextest
+
+      - name: Start RustFS
+        env:
+          ACCESS_KEY: cayenne-data
+          SECRET_KEY: cayenne-data-secret
+          BUCKET: cayenne-data
+        run: |
+          set -euo pipefail
+          image=rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+          docker run -d --name "$RUSTFS_CONTAINER" --publish 127.0.0.1::9000 \
+            -e RUSTFS_ACCESS_KEY="$ACCESS_KEY" -e RUSTFS_SECRET_KEY="$SECRET_KEY" "$image" /data
+          port=$(docker port "$RUSTFS_CONTAINER" 9000/tcp | head -n 1 | sed 's/.*://')
+          endpoint="http://127.0.0.1:${port:?no published port for the RustFS container}"
+          # The first signed request that succeeds is also the readiness check.
+          code=000
+          for _ in $(seq 1 60); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT \
+              --aws-sigv4 "aws:amz:us-east-1:s3" --user "$ACCESS_KEY:$SECRET_KEY" \
+              -H 'x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' \
+              "$endpoint/$BUCKET") || true
+            [ "$code" = 200 ] && break
+            sleep 1
+          done
+          if [ "$code" != 200 ]; then
+            echo "::error::RustFS did not create bucket '$BUCKET' at $endpoint within 60 seconds; the last answer was HTTP $code."
+            docker logs "$RUSTFS_CONTAINER" | tail -n 100
+            exit 1
+          fi
+          {
+            echo "CAYENNE_TEST_RUSTFS_ENDPOINT=$endpoint"
+            echo "CAYENNE_TEST_RUSTFS_BUCKET=$BUCKET"
+            echo "CAYENNE_TEST_RUSTFS_ACCESS_KEY=$ACCESS_KEY"
+            echo "CAYENNE_TEST_RUSTFS_SECRET_KEY=$SECRET_KEY"
+          } >> "$GITHUB_ENV"
+
+      # retries = 0: a seeded walk that fails prints its seed and history, and a
+      # retry could only hide it.
+      - name: Run the data-path suites on S3
+        # Tests named `_sqlite` run on SQLite whatever the store, so sign-off covers them.
+        run: cargo nextest run --locked -p cayenne --test integration --retries 0 --no-fail-fast -E "($SUITES) - test(/_sqlite$/)"
+      # What Cayenne's data path needs from an S3-compatible store.
+      - name: Run the S3 store conformance test
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --locked -p cayenne --test integration --retries 0 -E 'test(/^rustfs_store_conformance_test::/)'
+
+      - name: Stop RustFS
+        if: always()
+        run: |
+          docker logs "$RUSTFS_CONTAINER" 2>&1 | tail -n 200 || true
+          docker rm -f "$RUSTFS_CONTAINER" > /dev/null 2>&1 || true
+
+  object_store_occ:
+    needs: changes
+    concurrency:
+      group: cayenne-object-store-occ-${{ github.ref }}-${{ github.event_name }}
+      cancel-in-progress: true
+    name: Object store OCC
+    # Runs the change's code on persistent self-hosted runners, so fork and
+    # Dependabot pull requests run it only from the merge queue.
+    if: >-
+      needs.changes.outputs.object_store_occ == 'true' &&
+      (github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'))
+    environment: secret-free
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
+      - uses: $/.github/actions/setup-rust
+      # The dev runner image has no C toolchain, and rustc links through cc.
+      - uses: $/.github/actions/setup-cc
+      - uses: $/.github/actions/install-protoc
+      - uses: $/.github/actions/setup-nextest
+
+      - name: Run conditional-write and data-file replay tests
+        run: cargo nextest run --locked -p object_store_occ --retries 0

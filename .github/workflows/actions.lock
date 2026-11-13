@@ -35,6 +35,10 @@ workflows:
         - 'actions/setup-node@v7.1.0'
         - 'actions/setup-python@v7.1.0'
         - 'actions/upload-artifact@v7.0.2'
+    '.github/workflows/cayenne_object_native.yml':
+        - 'actions/cache@v6.1.0'
+        - 'actions/checkout@v7.0.1'
+        - 'dorny/paths-filter@v4.0.3'
     '.github/workflows/ci_git_push_guard.yml':
         - 'actions/checkout@v7.0.1'
     '.github/workflows/codeql-analysis.yml':
@@ -101,7 +105,7 @@ workflows:
         - 'actions/upload-artifact@v7.0.2'
     '.github/workflows/helm-lint.yml':
         - 'actions/checkout@v7.0.1'
-        - 'azure/setup-helm@v5.0.1'
+        - 'azure/setup-helm@v5.1.0'
         - 'dorny/paths-filter@v4.0.3'
     '.github/workflows/hf_cache_differential.yml':
         - 'actions/checkout@v7.0.1'
@@ -243,7 +247,7 @@ workflows:
         - 'actions/checkout@v7.0.1'
         - 'actions/download-artifact@v8.0.2'
         - 'actions/upload-artifact@v7.0.2'
-        - 'docker/login-action@v4.7.0'
+        - 'docker/login-action@v4.8.0'
     '.github/workflows/spicescript_long.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/upload-artifact@v7.0.2'
@@ -440,9 +444,9 @@ dependencies:
         commit: 'sha1-e1253824e5c10ff9df46874f81ed3ec929e19cfd'
         owner_id: 57468012
         repo_id: 220391287
-    'azure/setup-helm@v5.0.1':
-        ref: 'v5.0.1'
-        commit: 'sha1-9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310'
+    'azure/setup-helm@v5.1.0':
+        ref: 'v5.1.0'
+        commit: 'sha1-2f5e7bc67f1f9972ab16657bb795f36d8f04de0e'
         owner_id: 6844498
         repo_id: 210310251
     'columnar-tech/setup-dbc@v1.0.2':
@@ -457,11 +461,6 @@ dependencies:
         commit: 'sha1-c3c9e263c25d99ce0380d002d59b67737d91b0dc'
         owner_id: 5429470
         repo_id: 241092383
-    'docker/login-action@v4.7.0':
-        ref: 'v4.7.0'
-        commit: 'sha1-81c6f93d4bc991e510b342a00b419b3bb4efc5c6'
-        owner_id: 5429470
-        repo_id: 287743349
     'docker/login-action@v4.8.0':
         ref: 'v4.8.0'
         commit: 'sha1-8aa5831fb8d48d8f76594c7ddde61ae58019f550'

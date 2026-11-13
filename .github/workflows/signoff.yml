@@ -480,8 +480,10 @@ jobs:
 
       - name: Set up sccache
         uses: $/.github/actions/setup-sccache
+        # spiceio only, as in pr.yml's macOS jobs: that path signs no requests, so it
+        # needs no MinIO keys. A `minio_endpoint` fallback would sign with keys this job
+        # does not hold, and the cache pre-flight would turn it off anyway.
         with:
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc

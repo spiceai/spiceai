@@ -1139,5 +1139,187 @@
       "group": "cayenne",
       "may-pass": true
     }
+  ],
+  "postgres-cdc-kill-under-load": [
+    {
+      "run": "postgres-cdc-kill-under-load[run=1]",
+      "who": "defaults",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=1]",
+      "who": "defaults",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=1]",
+      "who": "defaults",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=1]",
+      "who": "file-durability",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=1]",
+      "who": "file-durability",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=1]",
+      "who": "file-durability",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=2]",
+      "who": "defaults",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=2]",
+      "who": "defaults",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=2]",
+      "who": "defaults",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=2]",
+      "who": "file-durability",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=2]",
+      "who": "file-durability",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=2]",
+      "who": "file-durability",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=3]",
+      "who": "defaults",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=3]",
+      "who": "defaults",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=3]",
+      "who": "defaults",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=3]",
+      "who": "file-durability",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=3]",
+      "who": "file-durability",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS sv, sum(seq) AS ss FROM cdc_t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-under-load[run=3]",
+      "who": "file-durability",
+      "key": "query: SELECT id, k, v, seq FROM cdc_t #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    }
   ]
 }
