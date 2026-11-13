@@ -361,50 +361,6 @@
       "may-pass": true
     }
   ],
-  "cayenne-vnext": [
-    {
-      "run": "cayenne-vnext",
-      "who": "default",
-      "key": "restart: {\"patch\":{\"spicepod\":{\"runtime\":{\"params\":{\"cayenne_vnext\":\"disabled\"}}}}}",
-      "kind": "error",
-      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"The accelerator engine cayenne failed to initialize: Invalid Cayenne acceleration configuration: Dataset 'before_flag' is accelerated",
-      "group": "cayenne"
-    }
-  ],
-  "cayenne-vnext-recreate": [
-    {
-      "run": "cayenne-vnext-recreate",
-      "who": "default",
-      "key": "query: SELECT * FROM b_ds",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.b_ds' not found: table 'spice.public.b_ds' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "cayenne-vnext-recreate",
-      "who": "default",
-      "key": "assert-log: {\"count\":{\"Created the Cayenne object-native metastore\":1}}",
-      "kind": "other",
-      "signature": "1 log problem in <path>",
-      "group": "cayenne"
-    },
-    {
-      "run": "cayenne-vnext-recreate",
-      "who": "default",
-      "key": "assert-log: {\"count\":{\"Created the Cayenne object-native metastore\":1,\"Opened the Cayenne object-native metastore\":\">=1\"}}",
-      "kind": "other",
-      "signature": "2 log problems in <path>",
-      "group": "cayenne"
-    },
-    {
-      "run": "cayenne-vnext-recreate",
-      "who": "default",
-      "key": "query: SELECT * FROM b_ds #2",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.b_ds' not found: table 'spice.public.b_ds' not found",
-      "group": "cayenne"
-    }
-  ],
   "clickhouse-literals": [
     {
       "run": "clickhouse-literals",
@@ -727,32 +683,6 @@
       "group": "clickhouse"
     }
   ],
-  "config-errors": [
-    {
-      "run": "config-errors",
-      "who": "object-native",
-      "key": "query: SELECT * FROM healthy_cayenne",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.healthy_cayenne' not found: table 'spice.public.healthy_cayenne' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "config-errors",
-      "who": "object-native",
-      "key": "query: SELECT * FROM turso_param",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.turso_param' not found: table 'spice.public.turso_param' not found",
-      "group": "cayenne"
-    },
-    {
-      "run": "config-errors",
-      "who": "object-native",
-      "key": "query: SELECT * FROM healthy_cayenne #2",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. table 'spice.public.healthy_cayenne' not found: table 'spice.public.healthy_cayenne' not found",
-      "group": "cayenne"
-    }
-  ],
   "debezium-offset-recovery": [
     {
       "run": "debezium-offset-recovery",
@@ -763,16 +693,6 @@
       "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
       "group": "debezium",
       "may-pass": true
-    }
-  ],
-  "duckdb-types-acceleration": [
-    {
-      "run": "duckdb-types-acceleration",
-      "who": "cayenne-object-native",
-      "key": "assert-files: {\"contains\":\"(^|/)\\\\.spice/data/far/.*\\\\.vortex$\"}",
-      "kind": "other",
-      "signature": "no file matches /(^|/)\\.spice/data/far/.*\\.vortex$/",
-      "group": "cayenne"
     }
   ],
   "ducklake-coverage": [
@@ -887,38 +807,10 @@
       "may-pass": true
     }
   ],
-  "http-caching-columns": [
-    {
-      "run": "http-caching-columns",
-      "who": "object-native",
-      "key": "start: {}",
-      "kind": "error",
-      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"The accelerator engine cayenne failed to initialize: Invalid Cayenne acceleration configuration: Failed to load dataset 'd' (cayenne)",
-      "group": "cayenne"
-    }
-  ],
   "http-caching-keys": [
     {
       "run": "http-caching-keys",
-      "who": "object-native",
-      "key": "start: {}",
-      "kind": "error",
-      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"The accelerator engine cayenne failed to initialize: Invalid Cayenne acceleration configuration: Failed to load dataset 'q' (cayenne)",
-      "group": "cayenne"
-    },
-    {
-      "run": "http-caching-keys",
       "who": "as-written",
-      "key": "source-query: {\"api\":\"count /v1/missing\"} #2",
-      "kind": "other",
-      "signature": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
-      "pattern": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
-      "group": "caching-http",
-      "may-pass": true
-    },
-    {
-      "run": "http-caching-keys",
-      "who": "object-native",
       "key": "source-query: {\"api\":\"count /v1/missing\"} #2",
       "kind": "other",
       "signature": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
@@ -1550,16 +1442,6 @@
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
       "group": "federation-mysql"
-    }
-  ],
-  "object-native-data": [
-    {
-      "run": "object-native-data",
-      "who": "object-native-s3",
-      "key": "assert-log: {\"contains\":[\"Dataset 'facts' \\\\(cayenne\\\\) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location\\\\. Its previous folder 's3://[^']+/moved/cayenne/v1/datasets/facts-[^']+' is deleted once no query reads it\"],\"lacks\":[\"Deleted the acceleration data directory\",\"were not removed from the object store\"]}",
-      "kind": "other",
-      "signature": "1 log problem in <path>",
-      "group": "cayenne"
     }
   ],
   "postgres-cdc-atomicity": [

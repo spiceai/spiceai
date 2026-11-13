@@ -2,12 +2,15 @@ name: cayenne-vnext-recreate
 description: >
   Under `runtime.params.cayenne_vnext: enabled`, recreating one dataset can
   never delete the object-native metastore that holds every dataset. With
-  `runtime.state.location` inside dataset a's data directory, where a recreate
-  of a would delete it, a is refused when it is configured, with a message
+  `runtime.state.location` inside dataset a's default data directory, where a
+  recreate of a would delete it, a is refused when it is configured (a sets
+  nothing else the flag refuses), with a message
   naming the state location, and dataset b keeps its catalog: after a restart
   it is reopened, not created again, and its answers still match the
-  PostgreSQL source. With the flag disabled, both load on SQLite as they did
-  before the flag existed, and b reloads from its source.
+  PostgreSQL source. With the flag disabled, a loads on SQLite as it did
+  before the flag existed, and b, in the object-native metastore, stops with a
+  message naming the fix until a `mode: file_create` start reloads it from its
+  source into SQLite.
 
 sources:
   src: { kind: postgres }
@@ -18,7 +21,8 @@ spicepod:
   name: cayenne-vnext-recreate
   runtime:
     params: { cayenne_vnext: enabled }
-    state: { location: 'file://${instance.dir}/data/a_ds/state' }
+    # Inside a's default data directory (`.spice/data/a_ds`).
+    state: { location: 'file://${instance.dir}/.spice/data/a_ds/state' }
   datasets:
     - from: postgres:public.a_ds
       name: a_ds
@@ -28,7 +32,7 @@ spicepod:
         engine: cayenne
         mode: file
         refresh_mode: full
-        params: { cayenne_file_path: '${instance.dir}/data', cayenne_metadata_dir: '${instance.dir}/meta' }
+    # b's data is in the state location.
     - from: postgres:public.b_ds
       name: b_ds
       params: ${sources.src.params}
@@ -37,7 +41,6 @@ spicepod:
         engine: cayenne
         mode: file
         refresh_mode: full
-        params: { cayenne_file_path: '${instance.dir}/data', cayenne_metadata_dir: '${instance.dir}/meta' }
 
 defaults:
   expect: { oracle: src }
@@ -69,12 +72,20 @@ steps:
     eventually: 60s
 
   # With the flag disabled the state location is not a metastore, so nothing is
-  # refused for it: both datasets load on SQLite as they did before the flag
-  # existed. b reloads from its source (the change made before the restart is
-  # in the answer), and its object-native copy is left as it is.
+  # refused for it: a loads on SQLite as it did before the flag existed. b is
+  # in the object-native metastore, so it stops rather than move to SQLite,
+  # until a start with `mode: file_create` reloads it from its source there
+  # (the change made before the restart is in the answer).
   - source-exec: { src: "UPDATE b_ds SET v = 'flag off' WHERE id % 9 = 0" }
   - restart:
+      ready: false
       patch: { spicepod: { runtime: { params: { cayenne_vnext: disabled } } }, datasets: { a_ds: { acceleration: { mode: file } } } }
+  - query: SELECT * FROM a_ds
+    eventually: 60s
+  - assert-status: { dataset: b_ds, status: Error, message-contains: "Dataset 'b_ds' is accelerated in the object-native Cayenne metastore, but `runtime.params.cayenne_vnext` is not enabled" }
+    eventually: 60s
+  - restart:
+      patch: { datasets: { b_ds: { acceleration: { mode: file_create } } } }
   - query: SELECT * FROM a_ds
     eventually: 60s
   - query: SELECT * FROM b_ds

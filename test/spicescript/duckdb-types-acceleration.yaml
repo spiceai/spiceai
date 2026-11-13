@@ -228,11 +228,20 @@ steps:
         - [4, null, null]
 
   # The far table, which Cayenne's file mode holds in a Vortex file: under the
-  # instance's directory, or under `executor/` in a cluster. The filter
-  # names a microsecond instant with arrow_cast, because a `TIMESTAMP` literal
-  # is nanoseconds in Spice, which cannot reach 9999.
+  # instance's directory, or under `executor/` in a cluster. With
+  # `cayenne_vnext` it is in the dataset's folder in the state location, which
+  # is `.spice/data` when `runtime.state.location` is unset; a cluster keeps
+  # the SQLite metastore and the layout without the flag. The filter names a
+  # microsecond instant with arrow_cast, because a `TIMESTAMP` literal is
+  # nanoseconds in Spice, which cannot reach 9999.
   - assert-files: { contains: '(^|/)\.spice/data/far/.*\.vortex$' }
-    only: [cayenne, cayenne-object-native]
+    only: cayenne
+  - assert-files: { contains: '(^|/)\.spice/data/cayenne/v1/datasets/far-[^/]+/data/.*\.vortex$' }
+    only: cayenne-object-native
+    cluster: false
+  - assert-files: { contains: '(^|/)\.spice/data/far/.*\.vortex$' }
+    only: cayenne-object-native
+    cluster: true
   - query: SELECT id, ts, ts_ms, ts_s, tz, dt FROM far
     protocols: [flight, flightsql, http]
     expect: { oracle: src }

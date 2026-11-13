@@ -6,16 +6,17 @@ description: >
   cached response cannot answer fetches it again, and the new response
   replaces the request's rows rather than being added beside them; a 503
   past the TTL is answered from the stale rows inside the stale-if-error
-  window, and with an unbounded window however old they are.
+  window, and with an unbounded window however old they are. With
+  `runtime.params.cayenne_vnext` enabled, a caching dataset fails to load
+  with a message naming the fix.
 
 sources:
   api: { kind: mock-http }
 
-# The spicepod as written, and the same with the prototype object-native
-# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+# The spicepod as written. `refresh_mode: caching` fails to load with
+# `runtime.params.cayenne_vnext` enabled, so there is no object-native variant.
 variants:
   as-written: federated
-  object-native: object-native
 
 spicepod:
   version: v1
@@ -99,3 +100,12 @@ steps:
     expect: { rows: [['1', f]] }
   - source-query: { api: count /v1/s }
     expect: { rows: [['2']] }
+
+  # `refresh_mode: caching` is not supported with `runtime.params.cayenne_vnext`
+  # enabled yet, so the dataset fails to load with a message naming the fix
+  # rather than moving to the object-native metastore (#16308).
+  - restart:
+      ready: false
+      patch: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+  - assert-status: { dataset: d, status: Error, message-contains: "Failed to load dataset 'd' (cayenne): With `runtime.params.cayenne_vnext` enabled, its data must be in `runtime.state.location`. Remove `cayenne_file_path`, `cayenne_s3_zone_ids`, and `cayenne_datalake_location`, use a supported refresh mode (full, append, or changes)" }
+    eventually: 30s
