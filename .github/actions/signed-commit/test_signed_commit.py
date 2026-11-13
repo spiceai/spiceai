@@ -250,16 +250,15 @@ class SignedCommitTest(unittest.TestCase):
         other = []
         self.api.before_delete = lambda: other.append(
             self.server_branch_commit("snap/1", {"snapshots/q5.snap": "q5 from another run\n"}))
-        try:
-            self.publish()
-        except sc.ApiError:
-            pass
+        # The failed commit is followed by the other run's, so this run sees a concurrent
+        # change and rebuilds its commit on top of it. Runs that share a branch, like the
+        # benchmark runs, commit only their own changes.
+        tip = self.publish(changed_since="HEAD")
         self.assertEqual(len(other), 1)
-        self.assertIn("snap/1", self.api.branches(), "the other run's branch was deleted")
-        tip = git(self.server, "rev-parse", "snap/1")
-        self.assertEqual(
-            subprocess.run(["git", "merge-base", "--is-ancestor", other[0], tip], cwd=self.server).returncode, 0,
-            "the other run's commit is no longer on the branch")
+        self.assertEqual(git(self.server, "rev-parse", "snap/1"), tip)
+        self.assertEqual(git(self.server, "rev-parse", f"{tip}^"), other[0])
+        self.assertEqual(self.server_file(tip, "snapshots/q5.snap"), "q5 from another run\n")
+        self.assertEqual(self.server_file(tip, "snapshots/q1.snap"), "q1 from this run\n")
 
     # ------------------------------------------------------------------ existing branch
 
