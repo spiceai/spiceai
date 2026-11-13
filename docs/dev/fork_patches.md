@@ -78,8 +78,9 @@ list below. `kind(=lib)` sweeps up every unit test, so the exposure is the
 integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
 the gate builds only the targets it selects, so an unnamed binary is neither
 built nor run, and nothing fails. Guards were found running nowhere for that reason, in integration-test
-targets now named there: `adbc_cancellation` for the two `arrow-adbc`
-cancellation rows (fork PRs #4 and #65, which share one test), and `spiced`'s
+targets now named there: `adbc_cancellation` for the ADBC cancellation row
+(`datafusion-table-providers` fork PR #65; the same test guards the lock-free
+statement cancel that ADBC 25 took upstream from `arrow-adbc` fork PR #4), and `spiced`'s
 `integration` binary, whose `cpu_budget` module guards vortex's
 `set_available_parallelism`. (`json_semantics` is named there too; it
 guarded the `datafusion-functions-json` fork, which is now taken from crates.io.)
@@ -106,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 
 | Fork | Pinned revision | Branch |
 |---|---|---|
-| [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
+| [arrow-adbc](#arrow-adbc) | `7caad4ccc7050b0721778a426eef38f0f151fef9` | `spiceai-25` |
 | [arrow-rs](#arrow-rs) | `510ef234e1444f2c4aaf748d0c905787738afa7a` | `spiceai-59.3.2` |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `5a67f5ecd62321b019c0daffd6613cfb9f71505e` | `spiceai-release-2.4` |
@@ -118,7 +119,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `19ecca8e06a3e764f7cf4a550f3abba7a137f3c7` | `spiceai-55-release-2.4` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `f0af9b628dc48f0227ce6daf3d323b2ead3cc8a5` | `spiceai-55-release-2.4` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `bc28b14282501d7c3bb9ee8ae7a941f86d707910` | `spiceai-55-release-2.4` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
@@ -442,7 +443,13 @@ previous one. Between `2fc4617` and `109661c` (spiceai/datafusion-federation#93 
 federated-scan rows below (`sql/executor.rs`, `sql/mod.rs`, `schema_cast/mod.rs`) and their
 tests. Between `ef2e590` and `54d9010` (spiceai/datafusion-table-providers#91 and #92,
 squash-merged), `datafusion-table-providers` adds only the `SqlTable` opt-in row below and
-its test, and moves its own federation pin:
+its test, and moves its own federation pin.
+Between `f0af9b6` and `bc28b14` (spiceai/datafusion-table-providers#122, a cherry-pick of
+spiceai/datafusion-table-providers#121 onto `spiceai-55-release-2.4`, merged), it moves its ADBC
+requirement and its own ADBC patch lines to 0.25 (`7caad4cc`, spiceai/arrow-adbc#9), and
+cancels an ADBC statement through `get_cancel_handle().try_cancel()`, which 0.25 issues without
+the statement lock (`core/src/sql/db_connection_pool/dbconnection/adbcconn.rs`). No row below
+changes.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
@@ -477,16 +484,29 @@ Between `2890f5c` and `f0af9b6` (spiceai/datafusion-table-providers#112, a backp
 ## arrow-adbc
 
 Upstream [apache/arrow-adbc](https://github.com/apache/arrow-adbc), branch
-`spiceai-24-patches`: upstream tag `apache-arrow-adbc-24` — the commit the
-`adbc_core` / `adbc_driver_manager` / `adbc_ffi` 0.24.0 crates were published from —
-merged into the previous line, so the only delta a build picks up is the patches
-below. Both were re-confirmed at the pinned revision. All three crates are replaced together through `[patch.crates-io]`: the patch changes an
-`adbc_ffi` signature that `adbc_driver_manager` calls.
+`spiceai-25`: upstream tag `apache-arrow-adbc-25` — the commit the
+`adbc_core` / `adbc_driver_manager` / `adbc_ffi` 0.25.0 crates were published from —
+merged into the previous line (`spiceai-24`), so the only delta a build picks up is the
+patch below, re-confirmed at the pinned revision. All three crates are replaced
+together through `[patch.crates-io]`: the arrow requirement below is declared once,
+in the fork's workspace, for all three.
+
+The statement-cancel patch the fork carried through ADBC 24 — `AdbcStatementCancel`
+issued without the statement lock, and statement release moved from the clonable
+handle to the shared inner (fork PR #4) — is upstream since ADBC 25:
+[apache/arrow-adbc#4858](https://github.com/apache/arrow-adbc/pull/4858), on the
+`CancelHandle` API of [#3905](https://github.com/apache/arrow-adbc/pull/3905), does the
+same for statements and connections. The merge of ADBC 25 took upstream's
+`rust/driver_manager` and `rust/ffi` verbatim, so the fork carries no source change
+there. `Statement::cancel` is deprecated in 0.25 in favour of
+`get_cancel_handle().try_cancel()`, which `datafusion-table-providers` calls. Losing it
+upstream would still be silent, so its guard stays:
+`crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection`
+(also the guard of the `datafusion-table-providers` row for fork PR #65).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| `AdbcStatementCancel` issued without the statement lock, and statement release moved from the clonable handle to the shared inner (fork PR #4) | `cancel` is serialized behind the `execute` it exists to interrupt, so it returns only once the query has finished on its own and cancels nothing. A Flight client that goes away then leaves the remote query running — billing, on BigQuery — and holds its pooled connection for the rest of that query's life, which exhausts a small pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection` |
-| Arrow requirement narrowed to the one major the workspace builds against, now `>=59.0.0, <60` (fork PR #4 set it to 58; moved to 59 in the merge of ADBC 24, where upstream's own range is `>=58, <60`) | A range spanning two majors lets a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — resolve the ADBC crates onto it while the rest of the workspace runs on 59. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the requirement is widened |
+| Arrow requirement narrowed to the one major the workspace builds against, `>=59.0.0, <60` (fork PR #4 set it to 58; moved to 59 in the merge of ADBC 24; upstream's own range is `>=58, <61` since ADBC 25) | A range spanning more than one major lets a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — resolve the ADBC crates onto it while the rest of the workspace runs on 59. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the requirement is widened |
 
 ## duckdb-rs
 
