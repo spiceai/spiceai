@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import random
@@ -307,6 +308,7 @@ class GitHub:
         self.token = token
         self.api_url = api_url.rstrip("/")
         self.graphql_url = graphql_url
+        self.timeout = 300
 
     def _request(self, method: str, url: str, payload: Optional[dict] = None):
         data = json.dumps(payload).encode() if payload is not None else None
@@ -316,15 +318,27 @@ class GitHub:
         request.add_header("X-GitHub-Api-Version", "2022-11-28")
         if data is not None:
             request.add_header("Content-Type", "application/json")
+        where = f"{method} {urllib.parse.urlparse(url).path}"
         try:
-            with urllib.request.urlopen(request, timeout=300) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 body = response.read()
         except urllib.error.HTTPError as err:
-            detail = err.read().decode(errors="replace")[:500]
-            raise ApiError(f"{method} {urllib.parse.urlparse(url).path} returned {err.code}: {detail}", err.code)
-        except urllib.error.URLError as err:
-            raise ApiError(f"{method} {urllib.parse.urlparse(url).path} failed: {err.reason}")
-        return json.loads(body) if body else None
+            try:
+                detail = err.read().decode(errors="replace")[:500]
+            except (OSError, http.client.HTTPException) as read_err:
+                detail = f"(body unreadable: {read_err!r})"
+            raise ApiError(f"{where} returned {err.code}: {detail}", err.code) from err
+        except (OSError, http.client.HTTPException) as err:
+            # URLError (connecting) is an OSError, and so is a timeout while reading the
+            # body; a body cut short is an HTTPException (IncompleteRead). Each must reach
+            # the caller as an ApiError, or neither the retry nor --patch-dir applies.
+            raise ApiError(f"{where} failed: {getattr(err, 'reason', None) or repr(err)}") from err
+        if not body:
+            return None
+        try:
+            return json.loads(body)
+        except ValueError as err:
+            raise ApiError(f"{where} returned a body that is not JSON: {body[:200]!r}") from err
 
     def _ref_url(self, branch: str) -> str:
         return f"{self.api_url}/repos/{self.repo}/git/refs/heads/{urllib.parse.quote(branch, safe='/')}"

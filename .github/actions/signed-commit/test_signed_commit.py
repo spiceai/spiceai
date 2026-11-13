@@ -27,9 +27,11 @@ import base64
 import contextlib
 import io
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -392,6 +394,29 @@ class SignedCommitTest(unittest.TestCase):
         self.assertEqual(read_file(os.path.join(clone, "snapshots/q9.snap")), "q9 regenerated\n")
         self.assertEqual(read_file(os.path.join(clone, "snapshots/q1.snap")), "q1 v2\n")
 
+    # ------------------------------------------------------------------ HTTP failures
+
+    def test_a_truncated_response_is_an_api_error(self):
+        # Promises 100 bytes of body, sends 10, and closes.
+        with raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"ref\": 1", close=True) as url:
+            api = sc.GitHub("o/r", "t", url, f"{url}/graphql")
+            with self.assertRaisesRegex(sc.ApiError, "failed"):
+                api.branch_tip("b")
+
+    def test_a_response_that_stalls_mid_body_is_an_api_error(self):
+        # Sends the headers and part of the body, then neither finishes nor closes.
+        with raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"ref\": 1", close=False) as url:
+            api = sc.GitHub("o/r", "t", url, f"{url}/graphql")
+            api.timeout = 0.5
+            with self.assertRaisesRegex(sc.ApiError, "failed"):
+                api.branch_tip("b")
+
+    def test_a_body_that_is_not_json_is_an_api_error(self):
+        with raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nnot json!", close=True) as url:
+            api = sc.GitHub("o/r", "t", url, f"{url}/graphql")
+            with self.assertRaisesRegex(sc.ApiError, "not JSON"):
+                api.branch_tip("b")
+
     # ------------------------------------------------------------------ CLI
 
     def test_the_cli_refuses_to_run_outside_the_repository_root(self):
@@ -406,6 +431,32 @@ class SignedCommitTest(unittest.TestCase):
         with chdir(self.work), patched_env({"GH_TOKEN": None, "GITHUB_TOKEN": None, "GITHUB_REPOSITORY": "o/r"}), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(sc.main(["--branch", "b", "--message", "m", "--", "*.snap"]), 2)
+
+
+@contextlib.contextmanager
+def raw_http_server(response, close):
+    """Answer one request with exactly `response` bytes; then close the connection, or hold it open."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    done = threading.Event()
+
+    def serve():
+        conn, _ = server.accept()
+        conn.recv(65536)
+        conn.sendall(response)
+        if not close:
+            done.wait(10)
+        conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.getsockname()[1]}"
+    finally:
+        done.set()
+        thread.join(10)
+        server.close()
 
 
 def read_file(path):
