@@ -18,11 +18,6 @@ limitations under the License.
 //! metastore is not opened as if nothing happened. Opening one used to serve
 //! the rows of whatever files were left, or none, with nothing logged.
 
-#![expect(
-    clippy::expect_used,
-    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
-)]
-
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
