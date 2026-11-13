@@ -538,6 +538,9 @@ jobs:
   # build_and_release_cuda's own runs.
   build-cuda:
     name: Build CUDA binaries
+    # setup-matrix validates the release dispatch (the version, the filters, and the release/*
+    # branch), so a dispatch it rejects starts no CUDA build either.
+    needs: setup-matrix
     if: inputs.release_version
     permissions:
       contents: read
