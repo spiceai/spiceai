@@ -391,6 +391,14 @@ const PARAMETERS: &[ParameterSpec] = &[
 
 #[async_trait]
 impl DataAccelerator for SqliteAccelerator {
+    async fn writer_role(
+        &self,
+        _source: &dyn data_accelerator_api::AccelerationSource,
+    ) -> Option<data_accelerator_api::WriterRole> {
+        // Only this instance writes this engine's accelerations.
+        None
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

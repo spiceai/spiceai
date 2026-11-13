@@ -326,6 +326,8 @@ pub struct DataWriteGate {
 struct GateState {
     allowed: std::sync::atomic::AtomicBool,
     generation: std::sync::atomic::AtomicU64,
+    /// Whether writes are allowed, for whoever waits for a change of writer.
+    changes: tokio::sync::watch::Sender<bool>,
 }
 
 impl DataWriteGate {
@@ -334,6 +336,7 @@ impl DataWriteGate {
             state: std::sync::Arc::new(GateState {
                 allowed: std::sync::atomic::AtomicBool::new(allowed),
                 generation: std::sync::atomic::AtomicU64::new(0),
+                changes: tokio::sync::watch::Sender::new(allowed),
             }),
             bound: None,
         }
@@ -365,6 +368,13 @@ impl DataWriteGate {
         }
     }
 
+    /// Follow whether this instance writes the table: `true` while it does.
+    /// Changes when another instance takes it over, or this one does.
+    #[must_use]
+    pub fn watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.state.changes.subscribe()
+    }
+
     /// Whether a write may be sent now.
     #[must_use]
     pub fn allows(&self) -> bool {
@@ -393,8 +403,10 @@ impl DataWriteGate {
                 self.state.generation.fetch_add(1, Ordering::AcqRel);
             }
             self.state.allowed.store(true, Ordering::Release);
+            self.state.changes.send_if_modified(|allowed| !std::mem::replace(allowed, true));
         } else {
             self.state.allowed.store(false, Ordering::Release);
+            self.state.changes.send_if_modified(|allowed| std::mem::replace(allowed, false));
         }
     }
 }

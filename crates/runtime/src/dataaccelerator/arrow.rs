@@ -109,6 +109,14 @@ pub(crate) fn enable_hash_index_for_primary_key_or_indexes(cmd: &mut CreateExter
 
 #[async_trait]
 impl DataAccelerator for ArrowAccelerator {
+    async fn writer_role(
+        &self,
+        _source: &dyn data_accelerator_api::AccelerationSource,
+    ) -> Option<data_accelerator_api::WriterRole> {
+        // Only this instance writes this engine's accelerations.
+        None
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
