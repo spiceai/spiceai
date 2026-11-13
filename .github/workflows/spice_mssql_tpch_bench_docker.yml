@@ -51,15 +51,17 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       - name: Pull MSSQL Docker image
-        run: docker pull mcr.microsoft.com/mssql/server:2022-latest
+        run: docker pull mcr.microsoft.com/mssql/server:2022-CU27-GDR2-ubuntu-22.04@sha256:11927f5edc5122658e90b3a80ee36e8aef779310bf771415c1d89271859c73fd
 
       - name: Start temporary MSSQL server
         working-directory: ./test/tpc-bench/mssql-tpch
         run: |
           mkdir -p ./data
-          docker run --name spice-mssql-bench-temp -v ./data:/data -e MSSQL_SA_PASSWORD=S3cretP@ssw0rd -e ACCEPT_EULA=Y -p 1433:1433 -d mcr.microsoft.com/mssql/server:2022-latest
+          docker run --name spice-mssql-bench-temp -v ./data:/data -e MSSQL_SA_PASSWORD=S3cretP@ssw0rd -e ACCEPT_EULA=Y -p 1433:1433 -d mcr.microsoft.com/mssql/server:2022-CU27-GDR2-ubuntu-22.04@sha256:11927f5edc5122658e90b3a80ee36e8aef779310bf771415c1d89271859c73fd
 
       - name: Install necessary tools
         run: |

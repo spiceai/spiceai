@@ -1,7 +1,7 @@
 # `duckdb:` and `ducklake:` datasets read through the DuckDB library installed
 # on the host, loaded by name at runtime. Keep DUCKDB_VERSION at the newest
 # release test/duckdb_versions.json lists.
-FROM ubuntu:26.04 AS libduckdb
+FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS libduckdb
 ARG TARGETARCH
 ARG DUCKDB_VERSION=2.0.0
 ARG DUCKDB_SHA256_AMD64=993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1
@@ -20,7 +20,7 @@ RUN set -eux; \
     tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so; \
     rm -f /tmp/libduckdb.tar.gz
 
-FROM ubuntu:26.04
+FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates libssl3 tzdata \

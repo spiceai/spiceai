@@ -62,6 +62,13 @@ pub(crate) fn remove_files(table_id: &str, select: Select, snapshot_ids: &[Strin
     }))
 }
 
+pub(crate) fn forget_retired(table_id: &str, keys: &[String]) -> Action {
+    Action::new(Kind::ForgetRetired(proto::FileKeys {
+        table_id: table_id.to_string(),
+        keys: keys.to_vec(),
+    }))
+}
+
 pub(crate) fn remove_file_stats(table_id: &str, select: Select, snapshot_ids: &[String]) -> Action {
     Action::new(Kind::RemoveFileStats(proto::RemoveBySnapshot {
         table_id: table_id.to_string(),

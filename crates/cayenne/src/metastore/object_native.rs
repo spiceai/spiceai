@@ -16,7 +16,10 @@ limitations under the License.
 //! SQL-free catalog backed by conditional-write head logs: one for the name
 //! registry and one per dataset.
 
-use super::{actions, state_reader::DatasetStateReader};
+use super::{
+    actions,
+    state_reader::{self, DatasetStateReader},
+};
 use crate::{
     catalog::{
         CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
@@ -38,12 +41,12 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Notify;
 
 mod catalog;
-pub use catalog::{ObjectNativeCatalog, dataset_log_at};
+pub use catalog::{ObjectNativeCatalog, TableDeletionHolds, dataset_log_at, new_dataset_folder};
 
 /// One head log: a serial writer and its last acknowledged state. The catalog
 /// keeps one for its name registry and one per dataset. No database is used.
 struct Domain {
-    inner: StateSlot,
+    inner: Arc<StateSlot>,
     opened: OpenSummary,
     /// The dataset folder this log is in; empty for the name registry.
     folder: String,
@@ -58,7 +61,13 @@ struct OpenSummary {
 struct Inner {
     reader: DatasetStateReader,
     writer: Writer,
-    poisoned: bool,
+    /// Why this log accepts no change, when it does not.
+    stop: Option<Stop>,
+    /// A background task is resolving [`Stop::Unresolved`] or reloading after
+    /// [`Stop::Fenced`].
+    recovering: bool,
+    /// The dataset this log holds, for what it reports; empty for the registry.
+    dataset: Arc<str>,
     config: NativeCatalogConfig,
     /// The state with every record up to the last checkpoint this catalog
     /// attempted (or opened from) applied, and the records committed after it,
@@ -75,6 +84,22 @@ struct Inner {
     pending: Vec<Pending>,
     /// Commit every change when it is made, even inside a deferred scope.
     immediate: bool,
+}
+
+/// Why a log accepts no change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// A commit's outcome is not known after its retries. Its changes are
+    /// applied here but may not be in the log, so neither changes nor reads are
+    /// served until a background task reopens the log and resumes from what
+    /// committed.
+    Unresolved,
+    /// Another instance took the log over. Writes stop; reads serve the
+    /// committed state once it is reloaded (`reloaded`).
+    Fenced { reloaded: bool },
+    /// The state refused a change this catalog made, which is a bug: the state
+    /// no longer matches the log, so the log stops until the process restarts.
+    Refused,
 }
 
 /// Buffered changes for a set of tables. Actions on different tables commute,
@@ -101,10 +126,20 @@ pub struct NativeCatalogConfig {
     /// dropped dataset's log are kept before a catalog that opens may remove
     /// them: anything newer may belong to a process still writing it.
     pub reclaim_after: std::time::Duration,
+    /// How long after a dataset is dropped the instance that dropped it waits
+    /// before it deletes the dataset's folder, once no restore point or export
+    /// holds its tables' deletions. Running scans do not extend this retention.
+    pub dropped_grace: std::time::Duration,
     /// How long the coordinator of a transaction across datasets tries to
     /// commit it before it aborts it instead, so its client gets an answer and
     /// its datasets accept other changes again.
     pub transaction_deadline: std::time::Duration,
+    /// How many times a commit whose outcome is not known is resolved and
+    /// retried before the log reopens in the background instead.
+    pub publish_attempts: u32,
+    /// The first wait between those retries, and between background reopen
+    /// attempts; each later wait doubles, up to 64 times this.
+    pub retry_delay: std::time::Duration,
 }
 
 impl Default for NativeCatalogConfig {
@@ -115,7 +150,10 @@ impl Default for NativeCatalogConfig {
             checkpoint_after_batches: 1,
             attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
             reclaim_after: std::time::Duration::from_hours(1),
+            dropped_grace: crate::metastore_layout::DATA_FILE_RETENTION,
             transaction_deadline: std::time::Duration::from_secs(60),
+            publish_attempts: 8,
+            retry_delay: std::time::Duration::from_millis(100),
         }
     }
 }
@@ -151,20 +189,20 @@ struct StateSlot {
     reserved: std::sync::atomic::AtomicBool,
 }
 struct StateLease<'a> {
-    slot: &'a StateSlot,
+    slot: &'a Arc<StateSlot>,
     inner: Option<Inner>,
 }
 impl StateSlot {
-    async fn take(&self) -> StateLease<'_> {
+    async fn take(self: &Arc<Self>) -> StateLease<'_> {
         self.take_as(false).await
     }
 
     /// The state for the transaction holding the reservation.
-    async fn take_reserved(&self) -> StateLease<'_> {
+    async fn take_reserved(self: &Arc<Self>) -> StateLease<'_> {
         self.take_as(true).await
     }
 
-    async fn take_as(&self, holder: bool) -> StateLease<'_> {
+    async fn take_as(self: &Arc<Self>, holder: bool) -> StateLease<'_> {
         use std::sync::atomic::Ordering;
         loop {
             let notified = self.available.notified();
@@ -186,7 +224,7 @@ impl StateSlot {
     }
 
     /// Wait for the reservation and hold it until the returned guard drops.
-    async fn reserve(&self) -> Reservation<'_> {
+    async fn reserve(self: &Arc<Self>) -> Reservation<'_> {
         use std::sync::atomic::Ordering;
         let lease = self.take().await;
         self.reserved.store(true, Ordering::Release);
@@ -241,10 +279,128 @@ impl std::ops::DerefMut for StateLease<'_> {
 }
 impl Drop for StateLease<'_> {
     fn drop(&mut self) {
+        // A commit that did not finish, including one whose caller was cancelled,
+        // leaves the log stopped; a background task brings it back.
+        if let Some(inner) = self.inner.as_mut()
+            && inner.needs_recovery()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            inner.recovering = true;
+            runtime.spawn(recover_in_background(Arc::downgrade(self.slot)));
+        }
         *self.slot.inner.lock() = self.inner.take();
         // Every waiter re-checks: one may wait on the reservation, not the state.
         self.slot.available.notify_waiters();
     }
+}
+
+/// Bring a stopped log back: an unresolved commit by reopening the log and
+/// resuming from what committed, a fenced one by reloading the committed state
+/// for its reads. Retries with a doubling wait until it succeeds or the catalog
+/// is dropped.
+async fn recover_in_background(slot: std::sync::Weak<StateSlot>) {
+    let mut attempt: u32 = 0;
+    loop {
+        let Some(strong) = slot.upgrade() else {
+            return;
+        };
+        let (delay, done) = {
+            // Past a transaction's reservation: only the reservation's holder
+            // commits while it is held, so a stopped log is its holder's, and the
+            // holder may be waiting for this very recovery to learn its outcome.
+            let mut lease = strong.take().await;
+            let delay = lease.config.retry_delay;
+            match lease.recover().await {
+                Ok(()) => {
+                    lease.recovering = false;
+                    (delay, true)
+                }
+                Err(error) => {
+                    let wait = delay.saturating_mul(2_u32.saturating_pow(attempt.min(6)));
+                    tracing::warn!(
+                        "{}",
+                        recovery_retry_message(&lease.dataset, &error.to_string(), wait)
+                    );
+                    (wait, false)
+                }
+            }
+        };
+        drop(strong);
+        if done {
+            return;
+        }
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// The `transactions/` folder beside the catalog a log at `prefix` belongs to:
+/// the registry's log is `<root>/catalog`, a dataset's `<root>/datasets/<folder>`.
+fn transactions_beside(prefix: &Path, registry: bool) -> Path {
+    let mut parts: Vec<_> = prefix.parts().collect();
+    parts.pop();
+    if !registry {
+        parts.pop();
+    }
+    Path::from_iter(parts).join("transactions")
+}
+
+/// How a log's owner is named in what it reports.
+fn subject(dataset: &str) -> String {
+    if dataset.is_empty() {
+        "The Cayenne object-native metastore".to_string()
+    } else {
+        format!("Dataset '{dataset}' (cayenne)")
+    }
+}
+
+/// Logged when a commit's outcome is still unknown after its retries.
+pub(crate) fn unresolved_commit_message(dataset: &str, cause: &str) -> String {
+    format!(
+        "{} could not confirm whether its last change was saved, so it accepts no change, and acknowledges none to its source, until it has read its state back; it retries in the background and resumes on its own once the state location is reachable. Cause: {cause}",
+        subject(dataset)
+    )
+}
+
+/// What the writer whose commit's outcome is unknown is told: not that the
+/// change failed, but that it may have been saved.
+pub(crate) fn unknown_outcome_message(dataset: &str, cause: &str) -> String {
+    let (target, owner) = if dataset.is_empty() {
+        (
+            "the Cayenne object-native metastore".to_string(),
+            "metastore",
+        )
+    } else {
+        (format!("dataset '{dataset}' (cayenne)"), "dataset")
+    };
+    format!(
+        "The outcome of this change to {target} is unknown: Spice could not confirm whether it was saved, so check whether its rows are visible before retrying it. The {owner} accepts no change until it has read its state back, which it retries in the background. Cause: {cause}"
+    )
+}
+
+/// Logged each time reading the state back fails.
+fn recovery_retry_message(dataset: &str, cause: &str, wait: std::time::Duration) -> String {
+    format!(
+        "{} could not read its state back after an unconfirmed change, so it still accepts no change; it retries in {} ms. Check that the state location is reachable. Cause: {cause}",
+        subject(dataset),
+        wait.as_millis()
+    )
+}
+
+/// Logged when the state refused a change: a bug that stops the log.
+pub(crate) fn refused_change_message(dataset: &str, cause: &str) -> String {
+    format!(
+        "{} stopped accepting changes until Spice restarts, because its state refused a change, which is a bug; queries return an error until then. Restart Spice to reload the dataset from its saved state, and report the issue at https://github.com/spiceai/spiceai/issues. Cause: {cause}",
+        subject(dataset)
+    )
+}
+
+/// Logged when another instance took the log over.
+pub(crate) fn fenced_message(dataset: &str) -> String {
+    format!(
+        "{} stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again.",
+        subject(dataset)
+    )
 }
 impl Domain {
     /// This log's part of a transaction across datasets: commit its buffered
@@ -363,12 +519,10 @@ impl Domain {
 
     async fn read(&self) -> CatalogResult<StateLease<'_>> {
         let inner = self.inner.take().await;
-        if inner.poisoned {
-            return Err(invalid(
-                "catalog publication outcome is uncertain; reopen before reading commit evidence",
-            ));
+        match inner.stop {
+            None | Some(Stop::Fenced { reloaded: true }) => Ok(inner),
+            Some(stop) => Err(inner.stopped(stop)),
         }
-        Ok(inner)
     }
 
     /// Create an empty log at a new prefix.
@@ -379,15 +533,18 @@ impl Domain {
         prefix: Path,
         config: NativeCatalogConfig,
         immediate: bool,
+        anchor: Option<Arc<str>>,
+        dataset: &str,
     ) -> CatalogResult<Self> {
         HeadLog::create(Arc::clone(&store), prefix.clone(), config.log)
             .await
             .map_err(invalid)?;
-        Self::open_with_config(store, prefix, config, immediate).await
+        Self::open_with_config(store, prefix, config, immediate, anchor, dataset).await
     }
     /// Replay committed records, then fence the previous writer with the next
     /// lease. An `immediate` log commits every change when it is made, even
-    /// inside a deferred scope.
+    /// inside a deferred scope. Data paths under `anchor` are recorded relative
+    /// to it ([`state_reader::stored_path`]).
     /// # Errors
     /// Returns an error on invalid history, takeover conflict, or storage failure.
     async fn open_with_config(
@@ -395,11 +552,55 @@ impl Domain {
         prefix: Path,
         config: NativeCatalogConfig,
         immediate: bool,
+        anchor: Option<Arc<str>>,
+        dataset: &str,
     ) -> CatalogResult<Self> {
+        let (inner, opened) = Inner::open(
+            store,
+            prefix,
+            config,
+            immediate,
+            anchor,
+            Arc::from(dataset),
+            None,
+        )
+        .await?;
+        Ok(Self {
+            opened,
+            folder: String::new(),
+            inner: Arc::new(StateSlot {
+                available: Notify::new(),
+                reserved: std::sync::atomic::AtomicBool::new(false),
+                inner: Mutex::new(Some(inner)),
+            }),
+        })
+    }
+}
+impl Inner {
+    /// Replay the log at `prefix` and take it over with the next lease. With
+    /// `held`, the lease this process wrote under, a log that has a newer one
+    /// belongs to another instance: it is not taken over, and the error is
+    /// [`FENCED_ON_REOPEN`].
+    async fn open(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        config: NativeCatalogConfig,
+        immediate: bool,
+        anchor: Option<Arc<str>>,
+        dataset: Arc<str>,
+        held: Option<u64>,
+    ) -> CatalogResult<(Self, OpenSummary)> {
         let (reader, opened) = Reader::open(Arc::clone(&store), prefix.clone())
             .await
             .map_err(invalid)?;
         let mut replayed = replay_state(opened)?;
+        if let Some(held) = held
+            && reader.state().head.lease > held
+        {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: FENCED_ON_REOPEN.to_string(),
+            });
+        }
         let generation = reader
             .state()
             .head
@@ -437,27 +638,153 @@ impl Domain {
             replayed: since_floor.len(),
             lease: generation,
         };
-        Ok(Self {
-            opened,
-            folder: String::new(),
-            inner: StateSlot {
-                available: Notify::new(),
-                reserved: std::sync::atomic::AtomicBool::new(false),
-                inner: Mutex::new(Some(Inner {
-                    reader: DatasetStateReader::from_state(state, store, prefix),
-                    writer,
-                    poisoned: false,
-                    config,
-                    floor_state,
-                    since_floor,
-                    staged_checkpoint: 0,
-                    pending: Vec::new(),
-                    immediate,
-                })),
+        Ok((
+            Self {
+                reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
+                writer,
+                stop: None,
+                recovering: false,
+                dataset,
+                config,
+                floor_state,
+                since_floor,
+                staged_checkpoint: 0,
+                pending: Vec::new(),
+                immediate,
             },
-        })
+            opened,
+        ))
+    }
+
+    /// Whether a background task has to bring this log back.
+    fn needs_recovery(&self) -> bool {
+        !self.recovering
+            && matches!(
+                self.stop,
+                Some(Stop::Unresolved | Stop::Fenced { reloaded: false })
+            )
+    }
+
+    /// Bring this log back from [`Stop::Unresolved`] by reopening it, or reload
+    /// the committed state of a fenced one.
+    async fn recover(&mut self) -> CatalogResult<()> {
+        match self.stop {
+            Some(Stop::Unresolved) => {
+                let held = self.writer.state().head.lease;
+                let reopened = Self::open(
+                    Arc::clone(&self.reader.store),
+                    self.reader.prefix.clone(),
+                    self.config,
+                    self.immediate,
+                    self.reader.anchor.clone(),
+                    Arc::clone(&self.dataset),
+                    Some(held),
+                )
+                .await;
+                match reopened {
+                    Ok((reopened, _)) => {
+                        // Changes buffered but never committed were never
+                        // acknowledged; the reopened state is what committed.
+                        *self = reopened;
+                        self.resolve_decided_transactions().await?;
+                        tracing::info!(
+                            "{} read its state back after an unconfirmed change and accepts changes again.",
+                            subject(&self.dataset)
+                        );
+                        Ok(())
+                    }
+                    Err(CatalogError::InvalidOperationNoSource { message })
+                        if message == FENCED_ON_REOPEN =>
+                    {
+                        self.stop = Some(Stop::Fenced { reloaded: false });
+                        tracing::info!("{}", fenced_message(&self.dataset));
+                        self.reload_committed().await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Some(Stop::Fenced { reloaded: false }) => self.reload_committed().await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Apply the recorded outcome of every transaction across datasets the
+    /// reopened log holds prepared, as opening the catalog does: a `Resolve`
+    /// that did not land (its commit's outcome was unknown) would otherwise keep
+    /// the transaction's tables reserved until a restart. A transaction with no
+    /// recorded outcome is left to its coordinator.
+    async fn resolve_decided_transactions(&mut self) -> CatalogResult<()> {
+        let prepared: Vec<(String, Vec<String>)> = self
+            .reader
+            .state
+            .prepared
+            .iter()
+            .map(|(txn, prepared)| (txn.clone(), prepared.footprint.iter().cloned().collect()))
+            .collect();
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        let transactions = transactions_beside(&self.reader.prefix, self.dataset.is_empty());
+        for (txn, footprint) in prepared {
+            let Some(commit) =
+                catalog::read_decision(&self.reader.store, &transactions, &txn).await?
+            else {
+                continue;
+            };
+            self.commit_now(Action::new(Kind::Resolve(proto::Resolve {
+                txn: txn.clone(),
+                footprint,
+                commit,
+            })))
+            .await?;
+            tracing::info!(
+                "{} applied transaction {txn} across datasets ({}) after reading its state back.",
+                subject(&self.dataset),
+                if commit { "committed" } else { "aborted" }
+            );
+        }
+        Ok(())
+    }
+
+    /// Replace the state with the log's committed state, without taking the log
+    /// over: a fenced log's reads then show only what committed.
+    async fn reload_committed(&mut self) -> CatalogResult<()> {
+        let (_, opened) = Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
+            .await
+            .map_err(invalid)?;
+        let replayed = replay_state(opened)?;
+        self.reader.state = replayed.state;
+        self.floor_state = replayed.floor_state;
+        self.since_floor = replayed.since_floor;
+        self.pending.clear();
+        self.stop = Some(Stop::Fenced { reloaded: true });
+        Ok(())
+    }
+
+    /// The error a caller gets from a log stopped for `stop`.
+    fn stopped(&self, stop: Stop) -> CatalogError {
+        let message = match stop {
+            Stop::Unresolved => format!(
+                "{} is reading its state back after a change whose outcome is unknown, so it accepts no change until that finishes; retry shortly.",
+                subject(&self.dataset)
+            ),
+            Stop::Fenced { .. } => fenced_message(&self.dataset),
+            Stop::Refused => refused_change_message(&self.dataset, "see the earlier error"),
+        };
+        CatalogError::InvalidOperationNoSource { message }
+    }
+
+    /// `Err` when this log accepts no change.
+    fn ensure_accepting(&self) -> CatalogResult<()> {
+        match self.stop {
+            None => Ok(()),
+            Some(stop) => Err(self.stopped(stop)),
+        }
     }
 }
+
+/// The refusal [`Inner::open`] returns when another instance holds a newer lease.
+const FENCED_ON_REOPEN: &str = "another instance holds the log's newer lease";
 struct Replayed {
     state: DatasetState,
     floor_state: DatasetState,
@@ -518,7 +845,11 @@ impl Inner {
                 if let Err(error) = self.floor_state.apply_in_place(record) {
                     // These records already applied to the live state from the
                     // same floor, so the floor state no longer describes the log.
-                    self.poisoned = true;
+                    self.stop = Some(Stop::Refused);
+                    tracing::error!(
+                        "{}",
+                        refused_change_message(&self.dataset, &error.to_string())
+                    );
                     return Err(invalid(error));
                 }
             }
@@ -530,6 +861,22 @@ impl Inner {
             .map_err(invalid)?;
         self.staged_checkpoint = at;
         Ok(())
+    }
+
+    /// Whether a change to `table_id` is applied here but not yet committed.
+    fn has_uncommitted(&self, table_id: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|buffer| buffer.tables.contains(table_id) || buffer.tables.contains(""))
+    }
+
+    /// Whether an unresolved transaction across datasets reserves `table_id`.
+    fn reserved(&self, table_id: &str) -> bool {
+        self.reader
+            .state
+            .prepared
+            .values()
+            .any(|prepared| prepared.footprint.contains(table_id))
     }
 
     fn table(&self, id: &str) -> CatalogResult<&cayenne_metastore_actions::TableState> {
@@ -570,23 +917,18 @@ impl Inner {
     }
 
     async fn commit(&mut self, actions: Vec<Action>) -> CatalogResult<()> {
-        if self.poisoned {
-            return Err(invalid(
-                "catalog requires reopening after an uncertain or fenced commit",
-            ));
-        }
+        self.ensure_accepting()?;
         let mut actions = actions;
         self.stamp(&mut actions);
         let record = Record { actions };
         // Applied without a copy of the state. A refused record is a guard this
         // catalog's own checks should have caught, and leaves the state partly
-        // changed, so the catalog stops until it is reopened from the log.
+        // changed, so the log stops until the process restarts.
         if let Err(error) = self.reader.state.apply_in_place(&record) {
-            self.poisoned = true;
-            tracing::error!(
-                "Cayenne object-native metastore stopped accepting changes, so its datasets stop updating until spiced restarts: a change was refused: {error}"
-            );
-            return Err(invalid(error));
+            self.stop = Some(Stop::Refused);
+            let message = refused_change_message(&self.dataset, &error.to_string());
+            tracing::error!("{message}");
+            return Err(CatalogError::InvalidOperationNoSource { message });
         }
         self.buffer(record).await
     }
@@ -697,22 +1039,14 @@ impl Inner {
     /// Commit every buffered change as one record. Nothing that depends on a
     /// buffered change may be acknowledged before this returns `Ok`.
     async fn flush(&mut self) -> CatalogResult<()> {
-        if self.poisoned {
-            return Err(invalid(
-                "catalog requires reopening after an uncertain or fenced commit",
-            ));
-        }
+        self.ensure_accepting()?;
         let buffers = std::mem::take(&mut self.pending);
         self.publish_buffers(buffers).await
     }
 
     /// Commit `buffers`, oldest first, as one record.
     async fn publish_buffers(&mut self, buffers: Vec<Pending>) -> CatalogResult<()> {
-        if self.poisoned {
-            return Err(invalid(
-                "catalog requires reopening after an uncertain or fenced commit",
-            ));
-        }
+        self.ensure_accepting()?;
         if buffers.is_empty() {
             return Ok(());
         }
@@ -723,18 +1057,26 @@ impl Inner {
                 .collect(),
         };
         // Buffered changes are already applied on this node. If this record does
-        // not commit, they must never be acknowledged: the catalog refuses all
-        // further work until it is reopened from what did commit.
-        self.poisoned = true;
-        let attempt = self
+        // not commit, they must never be acknowledged: the log refuses all
+        // further work until it is reopened from what did commit. Set before the
+        // first await, so a cancelled caller leaves the log to be resolved too.
+        self.stop = Some(Stop::Unresolved);
+        let attempt = match self
             .writer
             .prepare_group(vec![record.encode_to_vec().into()])
             .await
-            .map_err(invalid)?;
+        {
+            Ok(attempt) => attempt,
+            Err(error) => return Err(self.unresolved(&error.to_string())),
+        };
         // Refuse subsequent mutations unless this exact attempt is accepted.
-        match self.publish(&attempt).await? {
+        let outcome = match self.publish(&attempt).await {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(self.unresolved(&error.to_string())),
+        };
+        match outcome {
             Outcome::Accepted { commit } => {
-                self.poisoned = false;
+                self.stop = None;
                 self.since_floor.push((commit, vec![record]));
                 // The commit is acknowledged whatever happens to the checkpoint: a
                 // failed one leaves the batch index to grow until a later one lands.
@@ -745,14 +1087,36 @@ impl Inner {
                 }
                 Ok(())
             }
-            outcome => {
-                tracing::error!(
-                    "Cayenne object-native metastore stopped accepting changes, so its datasets stop updating until spiced restarts: the commit was {outcome:?}"
-                );
-                Err(invalid(format!(
-                    "catalog publication was not accepted: {outcome:?}; reopen before retrying"
-                )))
+            Outcome::Unresolved => Err(self.unresolved("the outcome was unresolved")),
+            // Another instance owns the log: normal when one takes over from
+            // another, so it is reported, not raised as an error. Its reads keep
+            // working once the committed state is reloaded.
+            Outcome::Fenced { .. } | Outcome::Rejected => {
+                tracing::info!("{}", fenced_message(&self.dataset));
+                self.stop = Some(Stop::Fenced { reloaded: false });
+                if let Err(error) = self.reload_committed().await {
+                    tracing::debug!(
+                        "{} could not reload its committed state yet, so its queries wait for a background retry: {error}",
+                        subject(&self.dataset)
+                    );
+                }
+                Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "{} The change was not saved (the commit was {outcome:?}).",
+                        fenced_message(&self.dataset)
+                    ),
+                })
             }
+        }
+    }
+
+    /// Stop the log for a commit whose outcome is unknown, and the error its
+    /// caller gets. The lease's drop starts the background reopen.
+    fn unresolved(&mut self, cause: &str) -> CatalogError {
+        self.stop = Some(Stop::Unresolved);
+        tracing::warn!("{}", unresolved_commit_message(&self.dataset, cause));
+        CatalogError::InvalidOperationNoSource {
+            message: unknown_outcome_message(&self.dataset, cause),
         }
     }
 
@@ -760,11 +1124,7 @@ impl Inner {
     /// after every buffered change. A record whose guard fails is refused and
     /// leaves the state as it was.
     async fn commit_now(&mut self, action: Action) -> CatalogResult<()> {
-        if self.poisoned {
-            return Err(invalid(
-                "catalog requires reopening after an uncertain or fenced commit",
-            ));
-        }
+        self.ensure_accepting()?;
         self.flush().await?;
         let record = Record {
             actions: vec![action],
@@ -784,6 +1144,22 @@ impl Inner {
     ) -> CatalogResult<Vec<Action>> {
         let mut batch = Vec::new();
         for publication in publications {
+            if !publication.files.is_empty() {
+                if publication.files.iter().any(|file| {
+                    file.table_id != publication.table_id
+                        || file.snapshot_id != publication.snapshot_id
+                }) {
+                    return Err(invalid(
+                        "a published file does not belong to the published snapshot",
+                    ));
+                }
+                batch.push(actions::add_files(
+                    publication.table_id,
+                    publication.snapshot_id,
+                    publication.files,
+                    true,
+                ));
+            }
             batch.extend(self.conflict_batch(
                 publication.delete_files.to_vec(),
                 publication.table_id,
@@ -834,17 +1210,19 @@ impl Inner {
         &mut self,
         attempt: &object_store_occ::headlog::PreparedAttempt,
     ) -> CatalogResult<Outcome> {
-        const ATTEMPTS: u32 = 8;
+        let attempts = self.config.publish_attempts;
+        let base = self.config.retry_delay;
         let mut outcome = self.writer.commit(attempt).await;
-        for retry in 1..=ATTEMPTS {
+        for retry in 1..=attempts {
             let error = match outcome {
                 Ok(Outcome::Unresolved) => "the outcome was unresolved".to_string(),
                 Ok(final_outcome) => return Ok(final_outcome),
                 Err(error) => error.to_string(),
             };
-            let delay = std::time::Duration::from_millis(100 * 2_u64.pow(retry.min(6)));
+            let delay = base.saturating_mul(2_u32.pow(retry.min(6)));
             tracing::warn!(
-                "Cayenne object-native metastore could not confirm a commit ({error}), so it is checking whether the commit landed and retrying it in {} ms (attempt {retry} of {ATTEMPTS})",
+                "{} could not confirm a commit ({error}), so it is checking whether the commit landed and retrying it in {} ms (attempt {retry} of {attempts})",
+                subject(&self.dataset),
                 delay.as_millis()
             );
             tokio::time::sleep(delay).await;
@@ -1017,6 +1395,59 @@ impl MetadataCatalog for Domain {
             .reader
             .get_all_snapshot_files(table_id)
             .await
+    }
+    fn keeps_retirement_record(&self) -> bool {
+        true
+    }
+    async fn retired_files(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+        let inner = self.inner.take().await;
+        // Only committed state may license a delete: a buffered change is applied
+        // here but may never commit, and a stopped log's last commit may not
+        // have landed, or a fenced one belongs to another writer.
+        if inner.stop.is_some() || inner.has_uncommitted(table_id) || inner.reserved(table_id) {
+            return Ok(None);
+        }
+        Ok(Some(
+            inner.table(table_id)?.retired.iter().cloned().collect(),
+        ))
+    }
+    async fn committed_file_keys(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<std::collections::BTreeSet<String>>> {
+        let inner = self.inner.take().await;
+        if inner.stop.is_some() || inner.has_uncommitted(table_id) || inner.reserved(table_id) {
+            return Ok(None);
+        }
+        let table = inner.table(table_id)?;
+        let mut keys = table.live_keys();
+        keys.extend(table.retired.iter().cloned());
+        Ok(Some(keys))
+    }
+    async fn forget_retired_files(&self, table_id: &str, keys: &[String]) -> CatalogResult<bool> {
+        if keys.is_empty() {
+            return Ok(true);
+        }
+        let mut inner = self.inner.take().await;
+        // A reserved table refuses every change until its transaction resolves,
+        // and a refused record stops the whole log; the next sweep forgets them.
+        if inner.reserved(table_id) {
+            return Ok(false);
+        }
+        let retired = &inner.table(table_id)?.retired;
+        let keys: Vec<String> = keys
+            .iter()
+            .filter(|key| retired.contains(*key))
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return Ok(true);
+        }
+        // The forget drops the manifest rows and statistics of its keys too.
+        inner
+            .commit(vec![actions::forget_retired(table_id, &keys)])
+            .await?;
+        Ok(true)
     }
     async fn get_snapshot_files(
         &self,
@@ -1198,15 +1629,17 @@ impl MetadataCatalog for Domain {
         let mut inner = self.inner.take().await;
         let (_, mut batch) =
             inner.delete_batch_after_removal(&delete_files, &replaced_delete_file_ids)?;
-        batch.insert(
-            0,
-            actions::remove_delete_files(
-                table_id,
-                proto::Select::Listed,
-                &replaced_delete_file_ids,
-                None,
-            ),
-        );
+        if !replaced_delete_file_ids.is_empty() {
+            batch.insert(
+                0,
+                actions::remove_delete_files(
+                    table_id,
+                    proto::Select::Listed,
+                    &replaced_delete_file_ids,
+                    None,
+                ),
+            );
+        }
         batch.extend(rewrite_inline(
             table_id,
             &updated_data,
@@ -1474,11 +1907,13 @@ impl MetadataCatalog for Domain {
         {
             return Ok(false);
         }
+        // The inputs' files leave the live set and are retired, but keep their
+        // manifest rows: a scan that captured them as live before the in-memory
+        // swap still reads them from those rows. The retirement sweep forgets
+        // the rows together with the files, once no scan holds them.
         inner
             .commit(vec![
                 actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
-                actions::remove_files(table_id, proto::Select::Listed, old_snapshot_ids),
-                actions::remove_file_stats(table_id, proto::Select::Listed, old_snapshot_ids),
                 actions::set_group(table_id, new_snapshot_id, new_sequence_number),
             ])
             .await?;
@@ -1615,6 +2050,30 @@ impl MetadataCatalog for Domain {
                 std::slice::from_ref(file),
                 true,
             )])
+            .await
+    }
+    async fn upsert_snapshot_files(&self, files: &[SnapshotFile]) -> CatalogResult<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut groups: Vec<(&str, &str, Vec<SnapshotFile>)> = Vec::new();
+        for file in files {
+            match groups.iter_mut().find(|(table, snapshot, _)| {
+                *table == file.table_id && *snapshot == file.snapshot_id
+            }) {
+                Some((_, _, rows)) => rows.push(file.clone()),
+                None => groups.push((&file.table_id, &file.snapshot_id, vec![file.clone()])),
+            }
+        }
+        self.inner
+            .take()
+            .await
+            .commit(
+                groups
+                    .iter()
+                    .map(|(table, snapshot, rows)| actions::add_files(table, snapshot, rows, true))
+                    .collect(),
+            )
             .await
     }
     async fn replace_snapshot_files(
@@ -2248,7 +2707,7 @@ impl Domain {
                 },
             )));
         }
-        if actions.is_empty() && !inner.poisoned {
+        if actions.is_empty() && inner.stop.is_none() {
             return Ok(());
         }
         inner.commit(actions).await
@@ -2263,7 +2722,7 @@ impl Domain {
         // before it. Inside a deferred scope it joins the record the scope's
         // `commit_pending` commits; otherwise it commits now.
         let mut inner = self.inner.take().await;
-        if !inner.poisoned
+        if inner.stop.is_none()
             && inner
                 .reader
                 .state
@@ -2292,6 +2751,13 @@ impl Domain {
         id: String,
         snapshot: String,
     ) -> CatalogResult<String> {
+        if !crate::metastore_layout::is_object_native_data_path(&options.base_path) {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: crate::metastore_layout::object_native_data_path_refusal(
+                    &options.table_name,
+                ),
+            });
+        }
         options.schema = arrow_tools::map_entries::conforming_schema(options.schema);
         crate::cayenne_catalog::validate_create_table_options(&options)?;
         let mut inner = self.inner.take().await;
@@ -2304,7 +2770,7 @@ impl Domain {
         {
             return inner.reopen_table(&options).await;
         }
-        if !options.base_path.starts_with("s3://") && !options.vortex_config.memory_mode {
+        if !crate::is_object_store_path(&options.base_path) && !options.vortex_config.memory_mode {
             let table_root = std::path::PathBuf::from(&options.base_path).join(&id);
             tokio::fs::create_dir_all(table_root.join(&snapshot)).await?;
             tokio::task::spawn_blocking(move || {
@@ -2321,12 +2787,14 @@ impl Domain {
         };
         let vortex_config_json =
             Some(serde_json::to_string(&options.vortex_config).map_err(invalid)?);
+        let (path, path_is_relative) =
+            state_reader::stored_path(inner.reader.anchor.as_deref(), &options.base_path);
         inner
             .commit(vec![Action::new(Kind::CreateTable(proto::CreateTable {
                 table_id: id.clone(),
                 name: options.table_name,
-                path: options.base_path,
-                path_is_relative: false,
+                path,
+                path_is_relative,
                 schema,
                 primary_key_json,
                 on_conflict_json: options.on_conflict.as_ref().map(ToString::to_string),
@@ -2376,7 +2844,20 @@ impl Inner {
         let mut first_id = None;
         let mut batch = Vec::new();
         let mut seen = std::collections::BTreeMap::new();
-        for file in files {
+        // Compared and recorded as the state keeps them.
+        let files: Vec<DeleteFile> = files
+            .iter()
+            .map(|file| {
+                let (path, path_is_relative) =
+                    state_reader::stored_path(self.reader.anchor.as_deref(), &file.path);
+                DeleteFile {
+                    path,
+                    path_is_relative,
+                    ..file.clone()
+                }
+            })
+            .collect();
+        for file in &files {
             let table = self.table(&file.table_id)?;
             let existing = table
                 .delete_files
@@ -2608,5 +3089,35 @@ impl Inner {
             self.commit(batch).await?;
         }
         Ok(stored.table_id)
+    }
+}
+
+#[cfg(test)]
+mod commit_outcome_message_tests {
+    use super::{
+        fenced_message, refused_change_message, unknown_outcome_message, unresolved_commit_message,
+    };
+
+    #[test]
+    fn each_stop_names_the_dataset_what_happens_and_the_fix() {
+        assert_eq!(
+            unresolved_commit_message("orders", "connection reset"),
+            "Dataset 'orders' (cayenne) could not confirm whether its last change was saved, so it accepts no change, and acknowledges none to its source, until it has read its state back; it retries in the background and resumes on its own once the state location is reachable. Cause: connection reset"
+        );
+        assert_eq!(
+            refused_change_message("orders", "guard failed"),
+            "Dataset 'orders' (cayenne) stopped accepting changes until Spice restarts, because its state refused a change, which is a bug; queries return an error until then. Restart Spice to reload the dataset from its saved state, and report the issue at https://github.com/spiceai/spiceai/issues. Cause: guard failed"
+        );
+        assert_eq!(
+            fenced_message("orders"),
+            "Dataset 'orders' (cayenne) stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again."
+        );
+        assert!(
+            fenced_message("").starts_with("The Cayenne object-native metastore stopped writing")
+        );
+        assert_eq!(
+            unknown_outcome_message("orders", "connection reset"),
+            "The outcome of this change to dataset 'orders' (cayenne) is unknown: Spice could not confirm whether it was saved, so check whether its rows are visible before retrying it. The dataset accepts no change until it has read its state back, which it retries in the background. Cause: connection reset"
+        );
     }
 }

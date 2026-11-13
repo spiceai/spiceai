@@ -166,7 +166,7 @@ impl Replay {
                 ])),
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: format!("/tmp/unused/{TABLE}"),
+                base_path: format!("s3://bucket/v1/datasets/{TABLE}/data"),
                 partition_column: None,
                 vortex_config: VortexConfig::default(),
             })
