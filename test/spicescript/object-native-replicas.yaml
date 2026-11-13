@@ -1,0 +1,136 @@
+name: object-native-replicas
+description: >
+  Two instances run the same Spicepod against one state location and one
+  Postgres source. The first to start writes the dataset; the second serves its
+  rows from the location as a replica, and adding it adds no replication slot.
+  The replica follows the writer's changes. When the writer is killed, the
+  replica takes over once its lease lapses and resumes the same slot from the
+  last commit, with no change missing or applied twice; the killed instance,
+  started again, follows the new writer. Every answer is checked against the
+  source.
+
+sources:
+  # One database for both instances: they share its replication slot.
+  src: { kind: postgres, shared: true }
+  # Its shared bucket holds the state location both instances use.
+  lake: { kind: rustfs }
+
+variants:
+  a: {}
+  b: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: object-native-replicas
+  runtime:
+    params: { cayenne_vnext: enabled }
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: o_id
+        on_conflict: { o_id: upsert }
+        params:
+          # Commit the in-memory CDC tier on every tick, so the replica sees
+          # each change soon after the writer applies it.
+          cayenne_cdc_mem_tier_min_flush_bytes: '0'
+
+defaults:
+  # The instances work together, so they run side by side; each answers from
+  # the one shared source.
+  run-variants: side-by-side
+  compare-variants: false
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE orders (o_id bigint PRIMARY KEY, o_status char(1), o_total numeric(15, 2));
+        INSERT INTO orders SELECT i, 'O', i * 1.25 FROM generate_series(1, 1000) AS i;
+    only: a
+
+  # A starts first and writes the dataset.
+  - start: {}
+    only: a
+  - query: SELECT count(*) AS n, sum(o_total) AS total FROM orders
+    eventually: 60s
+    only: a
+
+  # B serves A's rows from the location, consuming nothing: the source still
+  # has exactly one slot.
+  - start: {}
+    only: b
+  - query: SELECT count(*) AS n, sum(o_total) AS total FROM orders
+    eventually: 60s
+    only: b
+  - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [['1']] }
+    only: a
+
+  # Changes A applies reach B.
+  - source-exec:
+      src: |
+        INSERT INTO orders SELECT i, 'O', i * 1.25 FROM generate_series(1001, 1500) AS i;
+        UPDATE orders SET o_status = 'F', o_total = o_total + 1 WHERE o_id % 7 = 0;
+        DELETE FROM orders WHERE o_id % 11 = 0;
+    only: a
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 60s
+    only: a
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 60s
+    only: b
+
+  # A dies. Changes made meanwhile wait in the slot; B takes over once A's
+  # lease lapses and applies them from the last commit.
+  - kill-spiced: {}
+    only: a
+  - source-exec:
+      src: |
+        INSERT INTO orders SELECT i, 'P', i * 1.25 FROM generate_series(1501, 2000) AS i;
+        UPDATE orders SET o_total = o_total * 2 WHERE o_id % 5 = 0;
+        DELETE FROM orders WHERE o_id % 13 = 0;
+    only: b
+  - assert-log: { contains: "is now written by this instance" }
+    eventually: 120s
+    only: b
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 120s
+    only: b
+  # Every row once: a change applied twice or skipped would change these.
+  - query: SELECT count(*) AS n, count(DISTINCT o_id) AS ids, sum(o_total) AS total FROM orders
+    only: b
+  - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [['1']] }
+    only: b
+
+  # A, started again, follows B.
+  - start: {}
+    only: a
+  - source-exec:
+      src: "UPDATE orders SET o_status = 'X' WHERE o_id % 17 = 0"
+    only: b
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 60s
+    only: b
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 60s
+    only: a
+  - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [['1']] }
+    only: a
