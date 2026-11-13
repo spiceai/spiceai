@@ -296,9 +296,11 @@ async fn dropping_the_stream_cancels_the_query_and_frees_the_pool_connection() {
         "the driver never started executing, so nothing was cancelled"
     );
 
+    // Timed from before the drop: a cancel serialized behind the running
+    // `execute` blocks inside the drop itself, until the query ends on its own.
+    let waited = Instant::now();
     drop(stream);
 
-    let waited = Instant::now();
     let second = tokio::time::timeout(Duration::from_secs(30), pool.connect())
         .await
         .expect("the pool connection did not come back after the query was abandoned")
