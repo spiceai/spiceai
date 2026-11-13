@@ -133,10 +133,11 @@ async fn probe_team_choice() {
     let rounds: usize = std::env::var("PROBE_ROUNDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
+        .unwrap_or(150);
     let documents = [
         "My invoice shows the same charge twice.",
         "I was billed twice for the same order on my invoice. Please refund the duplicate charge.",
+        "I was billed twice for the same order on my invoice.",
     ];
     for model_name in ["openai", "anthropic", "xai", "google"] {
         if TEST_ARGS.skip_model(model_name) {
