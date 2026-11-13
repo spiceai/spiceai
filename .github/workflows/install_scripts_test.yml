@@ -10,6 +10,7 @@ on:
     paths:
       - 'install/**'
       - 'test/scripts/install-scripts-test.sh'
+      - 'test/scripts/install-ps1-test.ps1'
       - 'test/scripts/install-download-test.py'
       - '.github/workflows/install_scripts_test.yml'
   push:
@@ -18,6 +19,7 @@ on:
     paths:
       - 'install/**'
       - 'test/scripts/install-scripts-test.sh'
+      - 'test/scripts/install-ps1-test.ps1'
       - 'test/scripts/install-download-test.py'
       - '.github/workflows/install_scripts_test.yml'
   workflow_dispatch:
@@ -655,20 +657,22 @@ jobs:
           }
           Write-Host "✓ No syntax errors in Install.ps1"
 
-      - name: Test PSScriptAnalyzer (if available)
+      - name: Test Install.ps1 download verification
         shell: pwsh
-        continue-on-error: true
+        run: ./test/scripts/install-ps1-test.ps1
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
         run: |
-          # Install and run PSScriptAnalyzer
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
-          $results = Invoke-ScriptAnalyzer -Path .\install\Install.ps1 -Severity Error
+          Install-PSResource -Name PSScriptAnalyzer -TrustRepository -Scope CurrentUser -Quiet -ErrorAction Stop
+          $results = @(Invoke-ScriptAnalyzer -Path .\install\Install.ps1 -Severity Error,Warning)
 
           if ($results.Count -gt 0) {
-            Write-Warning "PSScriptAnalyzer found issues:"
-            $results | Format-Table -AutoSize
-          } else {
-            Write-Host "✓ No critical issues found by PSScriptAnalyzer"
+            $results | Format-Table -AutoSize RuleName,Severity,Line,Message | Out-String -Width 200
+            Write-Error "PSScriptAnalyzer found $($results.Count) errors or warnings in Install.ps1."
+            exit 1
           }
+          Write-Host "No errors or warnings from PSScriptAnalyzer"
 
   # Validate scripts with shellcheck
   shellcheck:
@@ -684,13 +688,14 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
+      # No exclusions: a deliberate pattern carries its own `# shellcheck` directive.
       - name: Run shellcheck on install.sh
         run: |
-          shellcheck -e SC2034,SC2086,SC2155,SC2223,SC1090 install/install.sh
+          shellcheck install/install.sh
 
       - name: Run shellcheck on install-spiced.sh
         run: |
-          shellcheck -e SC2034,SC2086,SC2155,SC2223,SC1090 install/install-spiced.sh
+          shellcheck install/install-spiced.sh
 
       - name: Run shellcheck on test script
         run: |

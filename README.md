@@ -455,6 +455,8 @@ On **Windows** using PowerShell:
 iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1"))
 ```
 
+The installers check the sha256 of each download against the release before installing it, and stop if it does not match. When the [GitHub CLI](https://cli.github.com/) is installed and logged in, they also check the download's build attestation. To install an old release that recorded no checksum, set `SPICE_INSTALL_ALLOW_UNVERIFIED=1`; that never installs a download whose check fails.
+
 > **Note:** The Spice runtime (`spiced`) does not run natively on Windows. Run it under [WSL](https://learn.microsoft.com/en-us/windows/wsl/) with the Linux CLI, or in Docker from the directory that holds your `spicepod.yaml`:
 >
 > ```powershell

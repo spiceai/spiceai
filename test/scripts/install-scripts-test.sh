@@ -143,14 +143,8 @@ test_shellcheck_passes() {
         return 0  # Pass if shellcheck not available
     fi
     
-    # Run shellcheck with common exclusions for install scripts
-    # SC2034: unused variables (often used for configuration)
-    # SC2086: word splitting (often intentional)
-    # SC2155: declare and assign separately
-    # SC2223: default assignment globbing (acceptable pattern)
-    # SC1090: non-constant source (dynamic shell profile loading)
-    shellcheck -e SC2034,SC2086,SC2155,SC2223,SC1090 "$INSTALL_SCRIPT" 2>/dev/null && \
-    shellcheck -e SC2034,SC2086,SC2155,SC2223,SC1090 "$INSTALL_SPICED_SCRIPT" 2>/dev/null
+    # No exclusions: a deliberate pattern carries its own `# shellcheck` directive in the script.
+    shellcheck "$INSTALL_SCRIPT" && shellcheck "$INSTALL_SPICED_SCRIPT"
 }
 
 # =============================================================================
@@ -785,25 +779,118 @@ test_spiced_variant_cuda_documented() {
 # Sudo Decision Tests
 # =============================================================================
 
-# Runs install.sh end to end, piped into bash as the README one-liner does, with no
-# network and no TTY: `curl` serves a local archive holding a stub `spice`, and `sudo`
-# records its arguments to $home.sudo and refuses, as sudo does without a terminal.
-# Extra arguments are VAR=value pairs passed to the installer's environment.
-run_install_offline() {
-    local home="$1"
-    shift
+sha256_of() {
+    if command -v sha256sum &> /dev/null; then
+        sha256sum "$1" | awk '{ print $1 }'
+    else
+        shasum -a 256 "$1" | awk '{ print $1 }'
+    fi
+}
+
+# The OS and architecture names the installers put in an asset name.
+host_os() {
+    uname | tr '[:upper:]' '[:lower:]'
+}
+
+host_arch() {
+    case "$(uname -m)" in
+        arm64) echo "aarch64" ;;
+        amd64) echo "x86_64" ;;
+        *) uname -m ;;
+    esac
+}
+
+# A GitHub API release, pretty-printed as the API serves it, whose `asset` has `digest` (a
+# JSON value). An asset whose name ends with the same name comes first, to catch a parser
+# that matches the wrong asset.
+release_json() {
+    local asset="$1"
+    local digest="$2"
+    cat <<JSON
+{
+  "tag_name": "v0.0.0",
+  "name": "Spice v0.0.0 (one, two)",
+  "assets": [
+    {
+      "name": "cuda_${asset}",
+      "uploader": {
+        "login": "github-actions[bot]"
+      },
+      "digest": "sha256:$(printf '%064d' 7)",
+      "browser_download_url": "https://github.com/spiceai/spiceai/releases/download/v0.0.0/cuda_${asset}"
+    },
+    {
+      "name": "${asset}",
+      "label": "",
+      "uploader": {
+        "login": "github-actions[bot]"
+      },
+      "size": 1,
+      "digest": ${digest},
+      "browser_download_url": "https://github.com/spiceai/spiceai/releases/download/v0.0.0/${asset}"
+    }
+  ],
+  "body": "Notes"
+}
+JSON
+}
+
+# Runs an installer end to end, piped into bash as the README one-liner does, with no network
+# and no TTY. Stubs stand in for the network, sudo and the GitHub CLI:
+#   curl  serves the release: a local archive holding a stub binary, and SHA256SUMS and the
+#         API release when they exist; anything missing fails as `curl --fail` does.
+#   sudo  records its arguments to $home.sudo and refuses, as sudo does without a terminal.
+#   gh    records its arguments to $home.gh.
+# What the release records for the archive comes from these variables:
+#   OFFLINE_SUMS    match (default), mismatch, unlisted (lists another asset), or none
+#   OFFLINE_DIGEST  match (default), mismatch, null, or fail (the API request fails)
+#   OFFLINE_GH      loggedout (default), pass, or fail (the attestation check)
+# Usage: run_installer_offline <script> <binary> <asset> <home> [VAR=value...], where the
+# VAR=value pairs go into the installer's environment. The log is $home.log.
+run_installer_offline() {
+    local script="$1"
+    local binary="$2"
+    local asset="$3"
+    local home="$4"
+    shift 4
     local stubs="$home.stubs"
+    local digest other
     mkdir -p "$stubs/pkg"
-    printf '#!/bin/sh\necho "CLI version: v0.0.0"\n' > "$stubs/pkg/spice"
-    chmod +x "$stubs/pkg/spice"
-    tar czf "$stubs/spice.tar.gz" -C "$stubs/pkg" spice
+    printf '#!/bin/sh\necho "CLI version: v0.0.0"\n' > "$stubs/pkg/$binary"
+    chmod +x "$stubs/pkg/$binary"
+    tar czf "$stubs/archive.tar.gz" -C "$stubs/pkg" "$binary"
+    digest=$(sha256_of "$stubs/archive.tar.gz")
+    other=$(printf '%064d' 0)
+    rm -f "$stubs/SHA256SUMS" "$stubs/release.json"
+    case "${OFFLINE_SUMS:-match}" in
+        match) printf '%s  %s\n' "$digest" "$asset" > "$stubs/SHA256SUMS" ;;
+        mismatch) printf '%s  %s\n' "$other" "$asset" > "$stubs/SHA256SUMS" ;;
+        unlisted) printf '%s  %s\n' "$digest" "other_asset.tar.gz" > "$stubs/SHA256SUMS" ;;
+    esac
+    case "${OFFLINE_DIGEST:-match}" in
+        match) release_json "$asset" "\"sha256:$digest\"" > "$stubs/release.json" ;;
+        mismatch) release_json "$asset" "\"sha256:$other\"" > "$stubs/release.json" ;;
+        null) release_json "$asset" null > "$stubs/release.json" ;;
+    esac
     cat > "$stubs/curl" <<STUB
 #!/bin/sh
+url=""
+out=""
 while [ \$# -gt 0 ]; do
-    if [ "\$1" = "-o" ]; then cp "$stubs/spice.tar.gz" "\$2"; exit 0; fi
+    case "\$1" in
+        -o) out="\$2"; shift ;;
+        -H) shift ;;
+        http*) url="\$1" ;;
+    esac
     shift
 done
-exit 1
+case "\$url" in
+    */SHA256SUMS) src="$stubs/SHA256SUMS" ;;
+    https://api.github.com/*) src="$stubs/release.json" ;;
+    *) src="$stubs/archive.tar.gz" ;;
+esac
+[ -f "\$src" ] || exit 22
+if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
 STUB
     cat > "$stubs/sudo" <<STUB
 #!/bin/sh
@@ -811,10 +898,35 @@ echo "\$*" >> "$home.sudo"
 echo "sudo: a terminal is required to read the password" >&2
 exit 1
 STUB
-    chmod +x "$stubs/curl" "$stubs/sudo"
+    cat > "$stubs/gh" <<STUB
+#!/bin/sh
+echo "\$*" >> "$home.gh"
+case "\$1 \$2" in
+    "auth status") [ "${OFFLINE_GH:-loggedout}" != loggedout ] ;;
+    "attestation verify") [ "${OFFLINE_GH:-loggedout}" = pass ] || { echo "verification failed" >&2; exit 1; } ;;
+    *) exit 1 ;;
+esac
+STUB
+    chmod +x "$stubs/curl" "$stubs/sudo" "$stubs/gh"
     : > "$home.sudo"
+    : > "$home.gh"
     env -i HOME="$home" PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin" SHELL=/bin/bash "$@" \
-        /bin/bash -c "cat '$INSTALL_SCRIPT' | /bin/bash -s -- 0.0.0" > "$home.log" 2>&1 < /dev/null
+        /bin/bash -c "cat '$script' | /bin/bash -s -- 0.0.0" > "$home.log" 2>&1 < /dev/null
+}
+
+# install.sh, offline. Extra arguments are VAR=value pairs for its environment.
+run_install_offline() {
+    local home="$1"
+    shift
+    run_installer_offline "$INSTALL_SCRIPT" spice "spice_$(host_os)_$(host_arch).tar.gz" "$home" "$@"
+}
+
+# install-spiced.sh, offline, installing into $home/bin.
+run_install_spiced_offline() {
+    local home="$1"
+    shift
+    run_installer_offline "$INSTALL_SPICED_SCRIPT" spiced "spiced_$(host_os)_$(host_arch).tar.gz" "$home" \
+        SPICED_INSTALL_DIR="$home/bin" "$@"
 }
 
 # regression test for #14445: a first install, with no ~/.spice yet, must not ask for sudo
@@ -858,6 +970,177 @@ test_install_nightly_sh_missing_parent_needs_no_sudo() {
     locked=$(nightly_use_sudo_for "$home/locked/new/bin")
     chmod 755 "$home/locked"
     [[ "$writable" == "false" && "$locked" == "true" ]]
+}
+
+# =============================================================================
+# Download Verification Tests
+# =============================================================================
+
+# The download verification block of an installer, from its header to the function after it.
+verification_block() {
+    sed -n '/^# Download verification. This block/,/^getLatestRelease() {/p' "$1" | sed '$d'
+}
+
+test_verification_block_is_identical_in_both_installers() {
+    local cli spiced
+    cli=$(verification_block "$INSTALL_SCRIPT")
+    spiced=$(verification_block "$INSTALL_SPICED_SCRIPT")
+    [[ -n "$cli" && "$cli" == "$spiced" ]] || { diff <(echo "$cli") <(echo "$spiced"); return 1; }
+}
+
+# Fails the test, printing the log, unless the log contains a line.
+log_has() {
+    grep -qF -- "$2" "$1.log" || { echo "missing from $1.log: $2"; cat "$1.log"; return 1; }
+}
+
+log_lacks() {
+    ! grep -qF -- "$2" "$1.log" || { echo "unexpected in $1.log: $2"; cat "$1.log"; return 1; }
+}
+
+installed_cli() {
+    [[ -x "$1/.spice/bin/spice" ]]
+}
+
+test_install_sh_verifies_against_sha256sums() {
+    local home="$TEST_TMP_DIR/sums-match"
+    mkdir -p "$home"
+    run_install_offline "$home" || { cat "$home.log"; return 1; }
+    installed_cli "$home" &&
+        log_has "$home" "Verified the sha256 of spice_$(host_os)_$(host_arch).tar.gz against the SHA256SUMS of release v0.0.0." &&
+        log_has "$home" "Skipped the build attestation check" &&
+        log_lacks "$home" "attestation verify"
+}
+
+test_install_sh_rejects_a_checksum_mismatch_before_extracting() {
+    local home="$TEST_TMP_DIR/sums-mismatch"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=mismatch run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" &&
+        log_has "$home" "Checksum mismatch for spice_" &&
+        log_has "$home" "Nothing was installed." &&
+        log_lacks "$home" "Extracting archive"
+}
+
+test_install_sh_rejects_an_asset_missing_from_sha256sums() {
+    local home="$TEST_TMP_DIR/sums-unlisted"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=unlisted run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" && log_has "$home" "the SHA256SUMS of release v0.0.0 does not list it"
+}
+
+test_install_sh_falls_back_to_the_github_digest() {
+    local home="$TEST_TMP_DIR/digest-match"
+    mkdir -p "$home"
+    OFFLINE_SUMS=none OFFLINE_GH=pass run_install_offline "$home" || { cat "$home.log"; return 1; }
+    # A release without SHA256SUMS has no attestations, so gh is not asked about one.
+    installed_cli "$home" &&
+        log_has "$home" "against the sha256 GitHub recorded for spice_$(host_os)_$(host_arch).tar.gz in release v0.0.0." &&
+        ! grep -q "attestation" "$home.gh"
+}
+
+test_install_sh_rejects_a_github_digest_mismatch() {
+    local home="$TEST_TMP_DIR/digest-mismatch"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=none OFFLINE_DIGEST=mismatch run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" && log_has "$home" "Checksum mismatch for spice_"
+}
+
+test_install_sh_fails_closed_without_a_checksum() {
+    local home="$TEST_TMP_DIR/digest-null"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=none OFFLINE_DIGEST=null run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" &&
+        log_has "$home" "GitHub recorded no sha256 for spice_" &&
+        log_has "$home" "SPICE_INSTALL_ALLOW_UNVERIFIED=1 bash -s 0.0.0" &&
+        log_lacks "$home" "Extracting archive"
+}
+
+test_install_sh_fails_closed_when_the_api_request_fails() {
+    local home="$TEST_TMP_DIR/digest-api-fails"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=none OFFLINE_DIGEST=fail run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" && log_has "$home" "the GitHub API request for its asset sha256 failed"
+}
+
+test_install_sh_opt_out_installs_an_unverifiable_download() {
+    local home="$TEST_TMP_DIR/opt-out"
+    mkdir -p "$home"
+    OFFLINE_SUMS=none OFFLINE_DIGEST=null run_install_offline "$home" SPICE_INSTALL_ALLOW_UNVERIFIED=1 ||
+        { cat "$home.log"; return 1; }
+    installed_cli "$home" && log_has "$home" "unverified, because SPICE_INSTALL_ALLOW_UNVERIFIED=1 is set"
+}
+
+test_install_sh_opt_out_never_installs_a_mismatch() {
+    local home="$TEST_TMP_DIR/opt-out-mismatch"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=mismatch run_install_offline "$home" SPICE_INSTALL_ALLOW_UNVERIFIED=1; then
+        cat "$home.log"
+        return 1
+    fi
+    ! installed_cli "$home" && log_has "$home" "Checksum mismatch for spice_"
+}
+
+test_install_sh_checks_the_attestation_when_gh_is_logged_in() {
+    local home="$TEST_TMP_DIR/attestation-pass"
+    local signer='^https://github\.com/spiceai/spiceai/\.github/workflows/build_release\.yml@refs/heads/release/'
+    mkdir -p "$home"
+    OFFLINE_GH=pass run_install_offline "$home" || { cat "$home.log"; return 1; }
+    installed_cli "$home" &&
+        log_has "$home" "Verified the build attestation of spice_" &&
+        grep -qF -- "--repo spiceai/spiceai --cert-identity-regex $signer --deny-self-hosted-runners" "$home.gh"
+}
+
+test_install_sh_rejects_a_failed_attestation() {
+    local home="$TEST_TMP_DIR/attestation-fail"
+    mkdir -p "$home"
+    if OFFLINE_GH=fail run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" &&
+        log_has "$home" "The build attestation of spice_" &&
+        log_has "$home" "verification failed" &&
+        log_lacks "$home" "Extracting archive"
+}
+
+test_install_spiced_sh_verifies_against_sha256sums() {
+    local home="$TEST_TMP_DIR/spiced-sums-match"
+    mkdir -p "$home"
+    run_install_spiced_offline "$home" || { cat "$home.log"; return 1; }
+    [[ -x "$home/bin/spiced" ]] &&
+        log_has "$home" "Verified the sha256 of spiced_$(host_os)_$(host_arch).tar.gz against the SHA256SUMS of release v0.0.0."
+}
+
+test_install_spiced_sh_rejects_a_checksum_mismatch() {
+    local home="$TEST_TMP_DIR/spiced-sums-mismatch"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=mismatch run_install_spiced_offline "$home"; then cat "$home.log"; return 1; fi
+    [[ ! -e "$home/bin/spiced" ]] && log_has "$home" "Checksum mismatch for spiced_"
+}
+
+test_install_spiced_sh_falls_back_to_the_github_digest() {
+    local home="$TEST_TMP_DIR/spiced-digest-match"
+    mkdir -p "$home"
+    OFFLINE_SUMS=none run_install_spiced_offline "$home" || { cat "$home.log"; return 1; }
+    [[ -x "$home/bin/spiced" ]] && log_has "$home" "against the sha256 GitHub recorded for spiced_"
+}
+
+# Runs sha256Of from install.sh with only the given tools on PATH.
+sha256_with_only() {
+    local bin="$TEST_TMP_DIR/sha-tools-$1"
+    shift
+    mkdir -p "$bin"
+    ln -sf "$(command -v awk)" "$bin/awk"
+    for tool in "$@"; do
+        printf '#!/bin/sh\necho "SHA2-256(stdin)= 0123abcd"\n' > "$bin/$tool"
+        chmod +x "$bin/$tool"
+    done
+    PATH="$bin" /bin/bash -c "$(verification_block "$INSTALL_SCRIPT")"$'\n''sha256Of /dev/null'
+}
+
+test_sha256_falls_back_to_openssl() {
+    [[ "$(sha256_with_only openssl openssl)" == "0123abcd" ]]
+}
+
+test_sha256_fails_without_a_tool() {
+    ! sha256_with_only none
 }
 
 # =============================================================================
@@ -1071,6 +1354,27 @@ run_all_tests() {
     else
         skip_test "Sudo decision tests" "running as root"
     fi
+    echo ""
+
+    # Download verification
+    echo "--- Download Verification ---"
+    run_test "Verification block is identical in both installers" test_verification_block_is_identical_in_both_installers
+    run_test "install.sh: verifies against SHA256SUMS" test_install_sh_verifies_against_sha256sums
+    run_test "install.sh: rejects a checksum mismatch before extracting" test_install_sh_rejects_a_checksum_mismatch_before_extracting
+    run_test "install.sh: rejects an asset missing from SHA256SUMS" test_install_sh_rejects_an_asset_missing_from_sha256sums
+    run_test "install.sh: falls back to the GitHub asset digest" test_install_sh_falls_back_to_the_github_digest
+    run_test "install.sh: rejects a GitHub digest mismatch" test_install_sh_rejects_a_github_digest_mismatch
+    run_test "install.sh: fails closed without a checksum" test_install_sh_fails_closed_without_a_checksum
+    run_test "install.sh: fails closed when the API request fails" test_install_sh_fails_closed_when_the_api_request_fails
+    run_test "install.sh: SPICE_INSTALL_ALLOW_UNVERIFIED installs an unverifiable download" test_install_sh_opt_out_installs_an_unverifiable_download
+    run_test "install.sh: SPICE_INSTALL_ALLOW_UNVERIFIED never installs a mismatch" test_install_sh_opt_out_never_installs_a_mismatch
+    run_test "install.sh: checks the attestation when gh is logged in" test_install_sh_checks_the_attestation_when_gh_is_logged_in
+    run_test "install.sh: rejects a failed attestation" test_install_sh_rejects_a_failed_attestation
+    run_test "install-spiced.sh: verifies against SHA256SUMS" test_install_spiced_sh_verifies_against_sha256sums
+    run_test "install-spiced.sh: rejects a checksum mismatch" test_install_spiced_sh_rejects_a_checksum_mismatch
+    run_test "install-spiced.sh: falls back to the GitHub asset digest" test_install_spiced_sh_falls_back_to_the_github_digest
+    run_test "sha256 falls back to openssl" test_sha256_falls_back_to_openssl
+    run_test "sha256 fails without a hash tool" test_sha256_fails_without_a_tool
     echo ""
 
     # Error Handling
