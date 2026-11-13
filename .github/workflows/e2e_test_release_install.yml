@@ -28,6 +28,34 @@ env:
   PREVIEW_UPGRADE_VERSION: v2.0.0-rc.2
 
 jobs:
+  # install.spiceai.org serves the install scripts of one release, pinned in
+  # the install.spiceai.org Worker's repository and moved there by a reviewed
+  # pull request after each release. This fails until it serves the latest release: each
+  # path's X-Spice-Install-Release and X-Spice-Install-Commit name that release
+  # and the commit its tag points at, its ETag, Content-Digest and Repr-Digest
+  # are the sha256 of the body, the body is install/<script> at that commit,
+  # and, for a release that publishes SHA256SUMS, it is the attached asset that
+  # SHA256SUMS lists. .github/scripts/verify_install_site.py has the details.
+  install-site:
+    if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
+    environment: secret-free
+    name: install.spiceai.org serves the latest release
+    runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: verify install.spiceai.org against the latest release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/verify_install_site.py
+
   test-install:
     environment: secret-free
     name: install on ${{ matrix.name }}
@@ -57,12 +85,18 @@ jobs:
       - name: checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Runs only the bytes it verified, from this runner's own fetch. An earlier
+      # release than the latest passes here, so the installation is still tested
+      # while the pin catches up; the install-site job is the one that requires
+      # the latest release.
       - name: install Spice (https://install.spiceai.org)
         if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          curl https://install.spiceai.org | /bin/bash
+          python3 .github/scripts/verify_install_site.py --allow-earlier-release --out-dir "$RUNNER_TEMP/install-site"
+          # On stdin, as `curl https://install.spiceai.org | /bin/bash` runs it.
+          /bin/bash < "$RUNNER_TEMP/install-site/install.sh"
 
       - name: install Spice (from branch)
         if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
@@ -276,15 +310,18 @@ jobs:
         uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
         with:
           distribution: Ubuntu-24.04
-          additional-packages: curl
+          additional-packages: curl python3
 
+      # As in test-install: verified inside WSL, where it runs.
       - name: install Spice (https://install.spiceai.org)
         if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
         shell: wsl-bash {0}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          curl https://install.spiceai.org | /bin/bash
+          python3 .github/scripts/verify_install_site.py --allow-earlier-release --out-dir "$HOME/install-site"
+          # On stdin, as `curl https://install.spiceai.org | /bin/bash` runs it.
+          /bin/bash < "$HOME/install-site/install.sh"
 
       - name: install Spice (from branch)
         if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
