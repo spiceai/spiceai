@@ -170,7 +170,7 @@
   "time-columns-retention": 11,
   "tlp": 384,
   "tls": 3,
-  "tool-results": 1,
+  "tool-results": 11,
   "tpch-coverage": 89,
   "tpch-oracles": 26,
   "unparse-aggregate-scopes": 12,
