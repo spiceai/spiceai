@@ -1,4 +1,5 @@
 {
+  "cluster-async-federated-subquery": 10,
   "cluster-limit-offset": 26,
   "cluster-literals": 39,
   "cluster-nan-literal": 42,

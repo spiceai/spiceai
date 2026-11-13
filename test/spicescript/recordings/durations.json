@@ -23,6 +23,7 @@
   "clickhouse-sql-semantics": 5,
   "clickhouse-types-acceleration": 5,
   "cluster-aggregate-over-limit": 48,
+  "cluster-async-federated": 26,
   "cluster-cdc-duplicates": 19,
   "cluster-chaos": 206,
   "cluster-executors": 71,
