@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q82"
 ---
-+------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------------+
-| i_item_id        | i_item_desc                                                                                                                                                       | i_current_price |
-+------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------------+
-| AAAAAAAAABHOBAAA | Average, pretty times might not help certain payments. Important, informal years will act required layers; forests could stay in a rocks. Gre                     | 85.67           |
-| AAAAAAAAAIIBDAAA | F                                                                                                                                                                 | 81.33           |
-| AAAAAAAABMGDAAAA | Persiste                                                                                                                                                          | 72.60           |
-| AAAAAAAABOJOCAAA | Royal, grey cases taste sometime                                                                                                                                  | 74.07           |
-| AAAAAAAABOODCAAA | Actual police pursue stairs. Others may believe now economic profits. Senior, continuous maps cannot drop later good, futur                                       | 97.57           |
-| AAAAAAAADCHFCAAA | Young, important teachers should not please purely average, leading questions. Darling husbands may not relate on a authorities. Hence excell                     | 69.26           |
-| AAAAAAAADNADAAAA | Very capable services compromise in a firms. Never prime firms scrape hardly. Troops may double however. Good, red houses s                                       | 91.62           |
-| AAAAAAAADONOCAAA | Today weekly years hold; cells honour most enough open requirements. Molecular friends cover presidential, immediate clothes. Si                                  | 94.71           |
-| AAAAAAAAEEMCAAAA | Thick, positive readers return in the explanations; police sell about perfect groups. Difficult, integrated motives would not allow here at a pubs. Ready marks b | 87.93           |
-| AAAAAAAAELEIBAAA | Marginal, radical years understand very running windows; considerable eyes get by the procedures. Interested, competitive rights cost everywhere. A               | 76.94           |
-+------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------------+
++------------------+-----------------------------------------------------------------------------------------------------------------------------------+-----------------+
+| i_item_id        | i_item_desc                                                                                                                       | i_current_price |
++------------------+-----------------------------------------------------------------------------------------------------------------------------------+-----------------+
+| AAAAAAAAABHOBAAA | Far industrial exhibitions want true, strong members. Dead lives leave then just pri                                              | 85.67           |
+| AAAAAAAAAIIBDAAA | Only classical areas must not love firmly national various notes. Concerned, legal expectations shall deteriorate special farme   | 81.33           |
+| AAAAAAAABMGDAAAA | Only technical visitors shall talk also bonds.                                                                                    | 72.60           |
+| AAAAAAAABOJOCAAA | Premises take so already different rates. Interests could score as military, international sa                                     | 74.07           |
+| AAAAAAAABOODCAAA | Occasional beds embark now                                                                                                        | 97.57           |
+| AAAAAAAADCHFCAAA | Conditions shall go decisions.                                                                                                    | 69.26           |
+| AAAAAAAADNADAAAA | Fast black days fight for a publishers; most other thoughts could suit circumstances; elections learn. Hot, black figures invite  | 91.62           |
+| AAAAAAAADONOCAAA | Ugly procedur                                                                                                                     | 94.71           |
+| AAAAAAAAEEMCAAAA | Extra, annual kinds produce other lights. Successful pp. should not tell home in a husbands. Centres ho                           | 87.93           |
+| AAAAAAAAELEIBAAA | Lacking days try democratic, similar decisions. Very possible possibilities identify once more great sons; great poets will make  | 76.94           |
++------------------+-----------------------------------------------------------------------------------------------------------------------------------+-----------------+
