@@ -91,6 +91,15 @@ pub async fn get_available_models_hint(
                 return None;
             }
         },
+        ModelSource::Darkbloom => {
+            match llms::darkbloom::DarkbloomModelLister::from_params(params) {
+                Ok(lister) => Box::new(lister),
+                Err(e) => {
+                    tracing::debug!("Cannot create Darkbloom model lister: {e}");
+                    return None;
+                }
+            }
+        }
         ModelSource::SpiceAI => match llms::spiceai::SpiceAiModelLister::from_params(params) {
             Ok(lister) => Box::new(lister),
             Err(e) => {

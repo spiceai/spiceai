@@ -318,6 +318,7 @@ The `duckdb` and `turso` accelerators were removed in v2.5, and a dataset or vie
 | `xai`         | Models hosted on xAI                         | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 | `google`      | Google Vertex AI (Gemini)                    |                   | -            | Vertex AI HTTP endpoint         |
 | `databricks`  | Models deployed to Databricks Mosaic AI      |                   | -            | OpenAI-compatible HTTP endpoint |
+| `darkbloom`   | Models served by the Darkbloom inference network |               | -            | OpenAI-compatible HTTP endpoint |
 
 ## Supported Embeddings Providers
 

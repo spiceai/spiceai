@@ -11,6 +11,7 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 | Anthropic               | ➖            |                 |
 | Amazon Bedrock          | ➖            |                 |
 | Azure OpenAI            | ➖            |                 |
+| Darkbloom               | ➖            |                 |
 | Databricks              | ➖            |                 |
 | File                    | ✅            | @Jeadie         |
 | Google (Gemini)         | ➖            |                 |

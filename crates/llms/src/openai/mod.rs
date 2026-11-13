@@ -31,6 +31,9 @@ pub mod embed;
 pub mod list_models;
 pub mod responses;
 mod responses_adapter;
+mod stream_permit;
+
+use stream_permit::StreamPermit;
 
 pub use list_models::OpenAiModelLister;
 
@@ -129,6 +132,8 @@ pub struct Openai<C: Config + Clone> {
     model: String,
 
     rate_controller: Arc<RateController>,
+    /// When a streamed request gives its `rate_controller` permit back.
+    stream_permit: StreamPermit,
     chat_backend: ChatBackend,
 }
 
@@ -188,6 +193,7 @@ pub fn new_azure_client_with_chat_backend(
         client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: default_rate_controller(),
+        stream_permit: StreamPermit::OnResponse,
         chat_backend,
     }
 }
@@ -272,6 +278,7 @@ pub fn new_azure_client_with_token_provider(
         client: crate::provider::client_without_retry(AzureTokenConfig { azure, token }),
         model,
         rate_controller: default_rate_controller(),
+        stream_permit: StreamPermit::OnResponse,
         chat_backend,
     }
 }
@@ -328,6 +335,7 @@ pub fn new_openai_client_with_chat_backend(
         client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
+        stream_permit: StreamPermit::OnResponse,
         chat_backend,
     }
 }
@@ -365,6 +373,7 @@ pub fn new_openai_client_with_token_provider(
         client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
+        stream_permit: StreamPermit::OnResponse,
         chat_backend,
     })
 }
@@ -378,11 +387,24 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
         client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: default_rate_controller(),
+        stream_permit: StreamPermit::OnResponse,
         chat_backend: ChatBackend::ChatCompletions,
     }
 }
 
 impl<C: Config + Clone> Openai<C> {
+    /// Takes a permit from `rate_controller` for each request, in place of the controller the
+    /// client was built with, and holds a streamed request's permit until the model has finished
+    /// generating the response, so that `rate_controller` bounds the responses being generated at
+    /// once rather than the requests waiting for one. The controller a model is given from its
+    /// `max_concurrency` is meant to bound exactly that.
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Arc<RateController>) -> Self {
+        self.rate_controller = rate_controller;
+        self.stream_permit = StreamPermit::OnGenerated;
+        self
+    }
+
     /// Returns true if the `OpenAI` compatible model supports [structured outputs](https://platform.openai.com/docs/guides/structured-outputs/).
     /// This is only supported for GPT-4o models from `OpenAI` (i.e not any other compatible servers).
     fn supports_structured_output(&self) -> bool {

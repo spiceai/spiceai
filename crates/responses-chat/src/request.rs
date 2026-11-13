@@ -134,7 +134,7 @@ impl ToolNames {
             return Err(invalid_request(
                 "tools",
                 format!(
-                    "Model '{model}' serves the Responses API by translating requests into chat completions, which offer each tool as a function, and two of the request's tools would both be the function '{function}'. Rename one of them, or use a model whose provider serves the Responses API natively (`from: openai`, `from: azure`, or `from: xai`). See: {DOCS}"
+                    "Model '{model}' serves the Responses API by translating requests into chat completions, which offer each tool as a function, and two of the request's tools would both be the function '{function}'. Rename one of them, or use a model whose provider serves the Responses API natively (`from: openai`, `from: azure`, `from: xai`, or `from: darkbloom`). See: {DOCS}"
                 ),
             ));
         }
@@ -171,7 +171,7 @@ fn unsupported(model: &str, param: &str, what: &str, remedy: &str) -> OpenAIErro
     invalid_request(
         param,
         format!(
-            "Model '{model}' serves the Responses API by translating requests into chat completions, which cannot carry {what}. {remedy}, or use a model whose provider serves the Responses API natively (`from: openai`, `from: azure`, or `from: xai`). See: {DOCS}"
+            "Model '{model}' serves the Responses API by translating requests into chat completions, which cannot carry {what}. {remedy}, or use a model whose provider serves the Responses API natively (`from: openai`, `from: azure`, `from: xai`, or `from: darkbloom`). See: {DOCS}"
         ),
     )
 }

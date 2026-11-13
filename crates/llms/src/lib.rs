@@ -20,6 +20,7 @@ pub mod azure;
 pub mod bedrock;
 pub mod chat;
 pub mod config;
+pub mod darkbloom;
 pub mod databricks;
 pub mod embeddings;
 pub mod evaluate;

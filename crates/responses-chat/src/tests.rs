@@ -150,7 +150,7 @@ fn refusal(param: &str, what: &str, remedy: &str) -> (Option<String>, Option<Str
         Some("invalid_request_error".to_string()),
         Some(param.to_string()),
         format!(
-            "Model 'gpt' serves the Responses API by translating requests into chat completions, which cannot carry {what}. {remedy}, or use a model whose provider serves the Responses API natively (`from: openai`, `from: azure`, or `from: xai`). See: {DOCS}"
+            "Model 'gpt' serves the Responses API by translating requests into chat completions, which cannot carry {what}. {remedy}, or use a model whose provider serves the Responses API natively (`from: openai`, `from: azure`, `from: xai`, or `from: darkbloom`). See: {DOCS}"
         ),
     )
 }
@@ -475,7 +475,7 @@ fn two_tools_offered_as_one_function_are_refused() {
             Some("invalid_request_error".to_string()),
             Some("tools".to_string()),
             format!(
-                "Model 'gpt' serves the Responses API by translating requests into chat completions, which offer each tool as a function, and two of the request's tools would both be the function 'ns__run'. Rename one of them, or use a model whose provider serves the Responses API natively (`from: openai`, `from: azure`, or `from: xai`). See: {DOCS}"
+                "Model 'gpt' serves the Responses API by translating requests into chat completions, which offer each tool as a function, and two of the request's tools would both be the function 'ns__run'. Rename one of them, or use a model whose provider serves the Responses API natively (`from: openai`, `from: azure`, `from: xai`, or `from: darkbloom`). See: {DOCS}"
             )
         )
     );

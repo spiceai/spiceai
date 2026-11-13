@@ -17,6 +17,7 @@ limitations under the License.
 use crate::Runtime;
 use crate::model::ToolUsingResponses;
 use crate::model::params::azure::AzureModelParams;
+use crate::model::params::darkbloom::DarkbloomModelParams;
 use crate::model::params::openai::OpenAiModelParams;
 use crate::model::params::xai::XaiModelParams;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
@@ -27,6 +28,7 @@ use llms::chat::Error as LlmError;
 use llms::openai::DEFAULT_LLM_MODEL;
 use llms::responses::Responses;
 use runtime_parameters_typed::TypedParams;
+use runtime_rate_control::RateController;
 use runtime_secrets::Secrets;
 use runtime_tools::options::SpiceToolsOptions;
 use secrecy::{ExposeSecret, SecretString};
@@ -52,13 +54,17 @@ macro_rules! extract_secret {
 }
 
 /// Attempt to derive a runnable Responses model from a given component from the Spicepod definition.
+///
+/// `provider_rate_controller` is as for [`super::chat::try_to_chat_model`]: a model load passes
+/// the controller it gave the model's chat client, so both share the model's rate limits.
 #[expect(clippy::implicit_hasher)]
 pub async fn try_to_responses_model(
     component: &Model,
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
+    provider_rate_controller: Option<&Arc<RateController>>,
 ) -> Result<Arc<dyn Responses>, LlmError> {
-    let model = construct_model(component, params, &rt.secrets()).await?;
+    let model = construct_model(component, params, &rt.secrets(), provider_rate_controller).await?;
 
     let openai_responses_tools: Option<Vec<OpenAIResponsesTools>> =
         extract_secret!(params, "openai_responses_tools").and_then(|v| {
@@ -144,6 +150,7 @@ async fn construct_model(
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString>,
     secrets: &Arc<RwLock<Secrets>>,
+    provider_rate_controller: Option<&Arc<RateController>>,
 ) -> Result<Arc<dyn Responses>, LlmError> {
     let model_id = component.get_model_id();
     let source = component.get_source().ok_or(LlmError::UnknownModelSource {
@@ -165,6 +172,13 @@ async fn construct_model(
             let p =
                 typed_params::<XaiModelParams>(component, params, source.clone(), secrets).await?;
             xai(model_id.as_deref(), &p)
+        }
+        ModelSource::Darkbloom => {
+            let p =
+                typed_params::<DarkbloomModelParams>(component, params, source.clone(), secrets)
+                    .await?;
+            super::chat::darkbloom_client(component, model_id, params, &p, provider_rate_controller)
+                .map(|client| Arc::new(client) as Arc<dyn Responses>)
         }
         _ => Err(LlmError::ResponsesNotSupported {
             from: source.clone(),
@@ -334,6 +348,81 @@ mod tests {
         );
     }
 
+    /// A model load gives a Darkbloom model's chat and Responses clients one provider rate
+    /// controller, so the two APIs share the model's `max_concurrency`: while that controller's
+    /// only permit is held, neither sends a request, and once it is released both do.
+    ///
+    /// The endpoint is a closed local port, so a request that is sent fails at once with a
+    /// connection error, and only one waiting for a permit outlasts the timeout.
+    #[tokio::test]
+    async fn darkbloom_chat_and_responses_take_permits_from_one_controller() {
+        use async_openai::types::chat::CreateChatCompletionRequest;
+        use async_openai::types::responses::CreateResponseArgs;
+        use std::time::Duration;
+
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let model = Model::new("darkbloom:gpt-oss-20b", "darkbloom_model");
+        let params: HashMap<String, SecretString> = [
+            ("darkbloom_api_key", "eigeninference-test"),
+            ("darkbloom_endpoint", "http://127.0.0.1:1/v1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), SecretString::from(v)))
+        .collect();
+        let controller = RateController::builder()
+            .with_max_concurrent_requests(1)
+            .build();
+
+        let chat = crate::model::try_to_chat_model(
+            &model,
+            &params,
+            Arc::clone(&runtime),
+            Some(&controller),
+        )
+        .await
+        .expect("the chat client builds")
+        .chat;
+        let responses = try_to_responses_model(&model, &params, runtime, Some(&controller))
+            .await
+            .expect("the Responses client builds");
+
+        let chat_request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "darkbloom_model",
+            "messages": [{"role": "user", "content": "ping"}]
+        }))
+        .expect("a chat completion request");
+        let responses_request = CreateResponseArgs::default()
+            .model("darkbloom_model")
+            .input("ping")
+            .build()
+            .expect("a Responses API request");
+        // Long enough that a request waiting for a permit is plainly waiting; a request that
+        // is sent fails within `sent` instead.
+        let wait = Duration::from_millis(300);
+        let sent = Duration::from_secs(10);
+
+        let held = controller
+            .acquire()
+            .await
+            .expect("the controller's only permit");
+        tokio::time::timeout(wait, chat.chat_request(chat_request.clone()))
+            .await
+            .expect_err("a chat request must wait for the permit the test holds");
+        tokio::time::timeout(wait, responses.responses_request(responses_request.clone()))
+            .await
+            .expect_err("a Responses API request must wait for the permit the test holds");
+
+        drop(held);
+        tokio::time::timeout(sent, chat.chat_request(chat_request))
+            .await
+            .expect("with the permit free, the chat request is sent")
+            .expect_err("nothing listens on the endpoint");
+        tokio::time::timeout(sent, responses.responses_request(responses_request))
+            .await
+            .expect("with the permit free, the Responses API request is sent")
+            .expect_err("nothing listens on the endpoint");
+    }
+
     #[tokio::test]
     async fn unsupported_provider_reports_responses_not_supported() {
         let runtime = Runtime::builder().build().await;
@@ -341,7 +430,7 @@ mod tests {
         let params: HashMap<String, SecretString> = HashMap::new();
 
         assert!(matches!(
-            try_to_responses_model(&model, &params, Arc::new(runtime)).await,
+            try_to_responses_model(&model, &params, Arc::new(runtime), None).await,
             Err(LlmError::ResponsesNotSupported { .. })
         ));
     }

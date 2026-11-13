@@ -24,7 +24,7 @@ use snafu::ResultExt;
 use tracing_futures::Instrument;
 
 use crate::{
-    openai::Openai,
+    openai::{Openai, stream_permit::responses_event_ends_generation},
     responses::{Error::HealthCheckError, FailedToLoadModelSnafu, Responses, Result},
 };
 
@@ -67,9 +67,9 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
 
         let stream = self.client.responses().create_stream(inner_req).await?;
 
-        drop(permit); // drop the permit after acquiring the stream, instead of after receiving the response
-
-        Ok(Box::pin(stream))
+        Ok(self
+            .stream_permit
+            .hold(permit, stream, responses_event_ends_generation))
     }
 
     async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {

@@ -1093,9 +1093,10 @@ mod tests {
             crate::udtfs::LIST_UDFS_UDTF_NAME,
             Arc::new(crate::udtfs::ListUDFTableFunc::new(Arc::clone(&df.ctx))),
         );
-        let loaded = crate::model::try_to_chat_model(&model, &resolved_params, Arc::clone(&rt))
-            .await
-            .expect("the model should load");
+        let loaded =
+            crate::model::try_to_chat_model(&model, &resolved_params, Arc::clone(&rt), None)
+                .await
+                .expect("the model should load");
         let llms: Arc<RwLock<LLMChatCompletionsModelStore>> = Arc::new(RwLock::new(HashMap::from(
             [("nsql_model".to_string(), loaded.chat)],
         )));

@@ -1,0 +1,274 @@
+name: darkbloom-model
+description: >
+  A Darkbloom model (`from: darkbloom:<model_id>`) calls Darkbloom's
+  OpenAI-compatible API with its `darkbloom_api_key` as a bearer token: chat
+  completions go to Darkbloom's `/v1/chat/completions` and the Responses API to
+  its own `/v1/responses`, each with the answer and token usage Darkbloom
+  returned, and `/v1/models` reports the context window and output cap
+  Darkbloom's model listing gives. A stream that fails after its first chunk ends with
+  Darkbloom's own error message, not a parse error, and without `[DONE]`. A
+  model Darkbloom does not serve fails to load, and the log lists the models
+  Darkbloom does serve. A streamed request to a model with `max_concurrency: 1`
+  that calls a Spice tool gets its answer, over chat completions and the
+  Responses API alike: the round that called the tool gives back the model's
+  only permit when the model finishes it, though its stream is still open
+  when Spice sends the next round. A model with no API key or no model id
+  fails to load with a message naming the fix. The API key never reaches the
+  log. Mock servers stand in for Darkbloom: `api` serves the model, `flaky`
+  fails its stream after the first chunk, `missing` does not serve the model,
+  and `tooled` answers each request with a tool call, then with its answer.
+
+sources:
+  api: { kind: mock-http }
+  flaky: { kind: mock-http }
+  missing: { kind: mock-http }
+  tooled: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: darkbloom-model
+  models:
+    - from: darkbloom:gpt-oss-20b
+      name: chat
+      params:
+        darkbloom_endpoint: ${sources.api.url}/v1
+        darkbloom_api_key: eigeninference-spicescript
+    - from: darkbloom:gpt-oss-20b
+      name: flaky
+      params:
+        darkbloom_endpoint: ${sources.flaky.url}/v1
+        darkbloom_api_key: eigeninference-spicescript
+    - from: darkbloom:no-such-model
+      name: missing_model
+      params:
+        darkbloom_endpoint: ${sources.missing.url}/v1
+        darkbloom_api_key: eigeninference-spicescript
+    # One permit, and a Spice tool to call. A streamed request that calls the tool sends its
+    # second round while the first round's stream is still open, so the first round must give
+    # the permit back when the model finishes it, or the second round waits on it for good.
+    - from: darkbloom:gpt-oss-20b
+      name: tool_loop
+      params:
+        darkbloom_endpoint: ${sources.tooled.url}/v1
+        darkbloom_api_key: eigeninference-spicescript
+        max_concurrency: 1
+        tools: list_datasets
+    # Configuration mistakes: neither reaches a network.
+    - from: darkbloom:gpt-oss-20b
+      name: no_key
+      params:
+        darkbloom_endpoint: ${sources.api.url}/v1
+    - from: darkbloom
+      name: no_model
+      params:
+        darkbloom_endpoint: ${sources.api.url}/v1
+        darkbloom_api_key: eigeninference-spicescript
+
+steps:
+  - source-exec:
+      # Answers only a request that carries the key as a bearer token: one without it gets the
+      # mock's 404 and the model would not load.
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers-match: { authorization: Bearer eigeninference-spicescript }
+          headers: { content-type: application/json }
+          body: '{"id": "chatcmpl-1", "object": "chat.completion", "created": 1778000000, "model": "gpt-oss-20b", "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong", "reasoning_content": "The user said ping."}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21, "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 11}}, "se_signature": "MEUCIQ", "response_hash": "9f86d081", "metadata": {"provider_chip": "M4 Max"}}'
+        - |
+          path: /v1/responses
+          method: POST
+          headers-match: { authorization: Bearer eigeninference-spicescript }
+          headers: { content-type: application/json }
+          body: '{"id": "resp_1", "object": "response", "created_at": 1778000000, "model": "gpt-oss-20b", "status": "completed", "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "annotations": [], "text": "pong"}]}], "usage": {"input_tokens": 9, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 12, "output_tokens_details": {"reasoning_tokens": 11}, "total_tokens": 21}}'
+        # The model object as Darkbloom's OpenAPI document describes it.
+        - |
+          path: /v1/models
+          method: GET
+          headers-match: { authorization: Bearer eigeninference-spicescript }
+          headers: { content-type: application/json }
+          body: '{"object": "list", "data": [{"id": "gpt-oss-20b", "object": "model", "created": 0, "owned_by": "darkbloom", "context_length": 131072, "max_output_length": 32768, "metadata": {"model_type": "chat", "quantization": "mxfp4", "provider_count": 3, "attested_providers": 3, "trust_level": "hardware", "routable_providers": 3, "warm_providers": 2, "can_accept": true}}]}'
+  - source-exec:
+      # The mock answers with the newest matching route first, so the one-shot health-check
+      # answer is added after the stream it gives way to.
+      flaky:
+        # Every request after the health check: the first chunk, then Darkbloom's terminal
+        # error event, with no `[DONE]`.
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers: { content-type: text/event-stream }
+          body: "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1778000000,\"model\":\"gpt-oss-20b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"po\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"provider disconnected mid-stream\",\"type\":\"server_error\",\"code\":\"provider_error\"}}\n\n"
+        # The model's Responses API check when it loads.
+        - |
+          path: /v1/responses
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"id": "resp_0", "object": "response", "created_at": 1778000000, "model": "gpt-oss-20b", "status": "completed", "output": [], "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 0, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 1}}'
+        # The model's health check when it loads.
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id": "chatcmpl-0", "object": "chat.completion", "created": 1778000000, "model": "gpt-oss-20b", "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}'
+  - source-exec:
+      missing:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          status: 404
+          headers: { content-type: application/json }
+          body: '{"error": {"message": "model no-such-model is not available", "type": "invalid_request_error", "code": "model_not_found", "param": "model"}}'
+        - |
+          path: /v1/models
+          method: GET
+          headers: { content-type: application/json }
+          body: '{"object": "list", "data": [{"id": "gpt-oss-20b", "object": "model", "created": 0, "owned_by": "darkbloom"}, {"id": "EigenLabs/Qwen3.8-27B-4bit-mtp", "object": "model", "created": 0, "owned_by": "darkbloom"}]}'
+
+  - source-exec:
+      # Each streamed request to `tool_loop` takes two rounds: the first calls the Spice tool
+      # `list_datasets`, the second answers with its result. The mock answers with the newest
+      # matching route first, so the answers are added last-needed first.
+      tooled:
+        # The second round of a chat completion.
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers: { content-type: text/event-stream }
+          body: "data: {\"id\":\"chatcmpl-t\",\"object\":\"chat.completion.chunk\",\"created\":1778000000,\"model\":\"gpt-oss-20b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"No datasets are loaded.\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-t\",\"object\":\"chat.completion.chunk\",\"created\":1778000000,\"model\":\"gpt-oss-20b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+        # The first round: a call to the Spice tool, then the finish.
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: text/event-stream }
+          body: "data: {\"id\":\"chatcmpl-t\",\"object\":\"chat.completion.chunk\",\"created\":1778000000,\"model\":\"gpt-oss-20b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"list_datasets\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-t\",\"object\":\"chat.completion.chunk\",\"created\":1778000000,\"model\":\"gpt-oss-20b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+        # The model's health check when it loads.
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id": "chatcmpl-0", "object": "chat.completion", "created": 1778000000, "model": "gpt-oss-20b", "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}'
+        # The second round of a Responses API response.
+        - |
+          path: /v1/responses
+          method: POST
+          headers: { content-type: text/event-stream }
+          body: "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_t2\",\"object\":\"response\",\"created_at\":1778000000,\"model\":\"gpt-oss-20b\",\"status\":\"in_progress\",\"output\":[],\"usage\":{\"input_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":12}}}\n\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"No datasets are loaded.\"}\n\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"No datasets are loaded.\"}]}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"resp_t2\",\"object\":\"response\",\"created_at\":1778000000,\"model\":\"gpt-oss-20b\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"No datasets are loaded.\"}]}],\"usage\":{\"input_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":12}}}\n\n"
+        # The first round: a call to the Spice tool, then response.completed.
+        - |
+          path: /v1/responses
+          method: POST
+          times: 1
+          headers: { content-type: text/event-stream }
+          body: "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_t1\",\"object\":\"response\",\"created_at\":1778000000,\"model\":\"gpt-oss-20b\",\"status\":\"in_progress\",\"output\":[],\"usage\":{\"input_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":12}}}\n\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"list_datasets\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"list_datasets\",\"arguments\":\"{}\",\"status\":\"completed\"}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_t1\",\"object\":\"response\",\"created_at\":1778000000,\"model\":\"gpt-oss-20b\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"list_datasets\",\"arguments\":\"{}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":12}}}\n\n"
+        # The model's Responses API check when it loads.
+        - |
+          path: /v1/responses
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id": "resp_0", "object": "response", "created_at": 1778000000, "model": "gpt-oss-20b", "status": "completed", "output": [], "usage": {"input_tokens": 9, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 3, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 12}}'
+
+  - start: { ready: false }
+
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "chat", "messages": [{"role": "user", "content": "ping"}]}'
+    expect:
+      status: 200
+      json:
+        - { pointer: /model, equals: chat }
+        - { pointer: /choices/0/message/content, equals: pong }
+        - { pointer: /usage/prompt_tokens, equals: 9 }
+        - { pointer: /usage/completion_tokens, equals: 12 }
+        - { pointer: /usage/completion_tokens_details/reasoning_tokens, equals: 11 }
+    eventually: 60s
+
+  # The Responses API, from Darkbloom's own `/v1/responses`: the model's check when it loaded
+  # was the first request there, and this one is the second.
+  - source-query: { api: count /v1/responses }
+    expect: { rows: [['1']] }
+  - http:
+      method: POST
+      path: /v1/responses
+      headers: { content-type: application/json }
+      body: '{"model": "chat", "input": "ping"}'
+    expect:
+      status: 200
+      json:
+        - { pointer: /output/*/content/*/text, equals: pong }
+        - { pointer: /usage/output_tokens_details/reasoning_tokens, equals: 11 }
+  - source-query: { api: count /v1/responses }
+    expect: { rows: [['2']] }
+  - source-query: { api: count /v1/chat/completions }
+    expect: { rows: [['2']] }
+
+  # The limits Darkbloom's model listing reports. The listing is read in the background, so
+  # the first answer may not carry them yet.
+  - http:
+      method: GET
+      path: /v1/models
+    expect:
+      status: 200
+      json:
+        - { pointer: /data/0/id, equals: chat }
+        - { pointer: /data/0/context_window, equals: 131072 }
+        - { pointer: /data/0/max_output_tokens, equals: 32768 }
+    eventually: 30s
+
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "flaky", "stream": true, "messages": [{"role": "user", "content": "ping"}]}'
+    expect:
+      status: 200
+      body-matches:
+        - '"content":"po"'
+        - 'event: error'
+        - '"error":\{"message":"server_error: provider disconnected mid-stream \(code: provider_error\)"\}'
+      body-lacks: ['failed to deserialize', '\[DONE\]']
+    eventually: 60s
+
+  # A streamed request to a model with one permit that calls a Spice tool: Spice runs the tool
+  # when the first round finishes and sends the second round while the first round's stream is
+  # still open. The answer arrives, so the second round did not wait on the first.
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "tool_loop", "stream": true, "messages": [{"role": "user", "content": "Which datasets are loaded?"}]}'
+    expect:
+      status: 200
+      body-matches: ['"content":"No datasets are loaded\."', '\[DONE\]']
+      body-lacks: ['event: error']
+    eventually: 60s
+  - source-query: { tooled: count /v1/chat/completions }
+    expect: { rows: [['3']] }
+  - http:
+      method: POST
+      path: /v1/responses
+      headers: { content-type: application/json }
+      body: '{"model": "tool_loop", "stream": true, "input": "Which datasets are loaded?"}'
+    expect:
+      status: 200
+      body-matches: ['"delta":"No datasets are loaded\."', 'response\.completed']
+      body-lacks: ['event: error', '"type":"error"']
+  - source-query: { tooled: count /v1/responses }
+    expect: { rows: [['3']] }
+
+  - assert-log:
+      count:
+        "WARN .*Failed to load LLM: missing_model\\. .*The specified model identifier 'no-such-model' is not valid for the source 'darkbloom'\\. Verify the model exists, and try again\\.": '>=1'
+        "Available Darkbloom models include: gpt-oss-20b, EigenLabs/Qwen3\\.8-27B-4bit-mtp": '>=1'
+        "WARN .*Failed to load LLM: no_key\\. .*Darkbloom model 'no_key' requires an API key\\. Set `darkbloom_api_key`, for example to `\\$\\{secrets:DARKBLOOM_API_KEY\\}`, with a key from https://console\\.darkbloom\\.dev\\. See: https://spiceai\\.org/docs/components/models/darkbloom": '>=1'
+        # A configuration mistake: reported once, not retried.
+        "WARN .*Failed to load LLM: no_model\\. .*A model identifier must be provided for source 'darkbloom' via `from: darkbloom:<model_id>`": 1
+      lacks: ['eigeninference-spicescript']
+    eventually: 60s

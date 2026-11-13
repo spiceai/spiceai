@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use tracing_futures::Instrument;
 
+use super::stream_permit::{chat_chunk_ends_generation, responses_event_ends_generation};
 use super::{ChatBackend, Openai, responses_adapter};
 
 #[async_trait]
@@ -66,15 +67,19 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
-        let stream = self.client.chat().create_stream(inner_req).await?;
+        let stream = self
+            .client
+            .chat()
+            .create_stream(inner_req)
+            .await?
+            .map_ok(move |mut s| {
+                s.model.clone_from(&outer_model);
+                s
+            });
 
-        drop(permit); // drop the permit after acquiring the stream, instead of after receiving the response
-        // semaphore permits aren't `Copy`, so we can't move it into the closure in `.map_ok`
-
-        Ok(Box::pin(stream.map_ok(move |mut s| {
-            s.model.clone_from(&outer_model);
-            s
-        })))
+        Ok(self
+            .stream_permit
+            .hold(permit, stream, chat_chunk_ends_generation))
     }
 
     // Custom healthcheck for OpenAI because Azure dosn't support `max_completion_tokens`.
@@ -158,8 +163,9 @@ impl<C: Config + Send + Sync + Clone> Openai<C> {
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
         let stream = self.client.responses().create_stream(inner_req).await?;
-
-        drop(permit);
+        let stream = self
+            .stream_permit
+            .hold(permit, stream, responses_event_ends_generation);
 
         Ok(responses_adapter::chat_completion_stream_from_response_stream(stream, outer_model))
     }
