@@ -108,7 +108,7 @@ own section below — a count here would be one more thing to keep true by hand.
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
 | [arrow-rs](#arrow-rs) | `510ef234e1444f2c4aaf748d0c905787738afa7a` | `spiceai-59.3.2` |
-| [async-openai](#async-openai) | `c1bf4a090c50e18f27663b008dac4c108e49b994` | `spiceai` |
+| [async-openai](#async-openai) | `e92cdef14c1e1c027f4e18cdbd5a957148462889` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `829b57522e601ea169b04e2d4a375c3abe3ed58c` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
@@ -601,6 +601,7 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `reasoning_content` on `ChatCompletionResponseMessage` | Reasoning models' output is dropped from responses | build | every provider in `crates/llms` constructs the field |
+| `reasoning_content` on `ChatCompletionStreamResponseDelta`, skipped when `None` (fork PR #47) | A streamed reply carries no reasoning, so a streaming client receives nothing while a reasoning model thinks; without the skip, every chunk carries `"reasoning_content": null` | build + silent (a `null` on every chunk) | build: every delta literal names the field, and `crates/llms/src/accumulate.rs::update_chat_choice` destructures the delta without `..`; behavior: `crates/llms-llamacpp/tests/model.rs::a_streamed_reply_carries_the_non_streamed_reasoning`, `crates/llms/src/accumulate.rs::tests::a_folded_stream_keeps_its_reasoning_apart_from_its_answer`; no `null`: `crates/llms/src/accumulate.rs::tests::a_chunk_without_reasoning_serializes_no_reasoning_field`; the tool loop: `crates/runtime/src/model/tool_use.rs::tests::a_choice_without_a_finish_is_forwarded_only_when_it_carries_content_or_reasoning` |
 | Azure Entra token auth in `config.rs` | Azure OpenAI with Entra credentials cannot authenticate | build | compile-guarded |
 | `post`/`post_stream` and the GET operation made public | Non-OpenAI providers built on the same client lose their entry point | build | compile-guarded |
 | Don't serialize nulls; hide `usage` when null (fork PR #32) | Requests carry explicit `null`s that some OpenAI-compatible servers reject | silent (request failure) | `crates/runtime/src/model/wrapper/mod.rs::a_streamed_request_carries_no_null_stream_option`, with `…::unset_stream_options_serialize_to_an_empty_object` pinning the same property at the type |

@@ -690,9 +690,19 @@ impl<'a> AppendMutationWriter<'a> {
                     )
                 };
                 let target_size_bytes = self.context.target_file_size_bytes();
-                self.table
-                    .clear_staging_snapshot_dir(&staging_snapshot_id)
-                    .await?;
+                // On an object store a table in the object-native location writes
+                // each file once, at its final key in the snapshot it commits to.
+                // A new protected snapshot then commits once, at finalize, in one
+                // record with the deletes that hide the rows it replaces
+                // (`CayenneCdcWrite::finish`); nothing below commits it.
+                if !self
+                    .table
+                    .begin_final_key_write(&staging_snapshot_id, &target_snapshot_id)
+                {
+                    self.table
+                        .clear_new_staging_snapshot_dir(&staging_snapshot_id)
+                        .await?;
+                }
 
                 // Hold `write_lock` only through Stage A (staging the WAL and
                 // registering the in-flight append), then release it at the
@@ -744,16 +754,29 @@ impl<'a> AppendMutationWriter<'a> {
                 // gone; the only remaining synchronous resort is the hard error
                 // path below when staging genuinely cannot complete.
                 let prepared_on_conflict = if stage_on_conflict {
+                    // At final keys the deletes, the snapshot's sequence and its
+                    // inline tombstone wait for the one record that also names the
+                    // snapshot's files, so a commit by anything else on the table
+                    // (the previous burst's, a merge's) cannot make them durable
+                    // without those files. The tombstone commits active in that
+                    // record, and inline-view rebuilds skip it until the publish
+                    // (see `CayenneCdcWrite::finish_in_one_record`).
+                    let one_record = prepared_append.writes_new_protected_snapshot_at_final_keys();
                     match self
                         .table
                         .prepare_on_conflict_deletions_for_staged_snapshot(
                             on_conflict_deletions,
                             target_snapshot_id,
-                            false,
+                            one_record,
                         )
                         .await
                     {
-                        Ok(prepared_on_conflict) => Some(prepared_on_conflict),
+                        Ok(mut prepared_on_conflict) => {
+                            // The record makes the snapshot live, and the publish
+                            // adds it to the protected snapshots in memory.
+                            prepared_on_conflict.publish_as_protected_snapshot |= one_record;
+                            Some(prepared_on_conflict)
+                        }
                         Err(err) => {
                             if let Err(cleanup_err) = prepared_append.rollback().await {
                                 tracing::warn!(
@@ -1386,7 +1409,7 @@ impl<'a> AppendMutationWriter<'a> {
     }
 
     async fn cleanup_layered_append_dirs(&self, snapshot_ids: &[String]) {
-        if self.table.table_path().starts_with("s3://") {
+        if self.table.data_in_store() {
             return;
         }
         for snapshot_id in snapshot_ids {
@@ -1818,13 +1841,13 @@ impl<'a> AppendMutationWriter<'a> {
                 });
             }
 
-            // Taken before the inline write, which makes its rows visible as
-            // soon as it returns. The resident-inline-row proxy covers this
-            // window today, but it is cleared by a checkpoint that does not
-            // drain the delta queue, so the count still needs its own claim.
+            // Taken before the inline write's publish, which makes its rows
+            // visible. The resident-inline-row proxy covers that window today,
+            // but it is cleared by a checkpoint that does not drain the delta
+            // queue, so the count still needs its own claim.
             let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
 
-            if self
+            if let Some(publish) = self
                 .table
                 .try_inline_batches_with_inlined_deletions(
                     buffer.batches(),
@@ -1835,12 +1858,6 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?
             {
-                // The inline rows are visible now, so the claim survives from
-                // here. `try_inline_batches_with_inlined_deletions` awaits the
-                // maintained-aggregate apply after its own visibility flip, so
-                // a cancellation inside it still loses the claim — see #13721.
-                let published_live_rows_delta = reserved_live_rows_delta.published();
-
                 // Inline tier0 (metastore BLOB) write — the synchronous CDC hot
                 // loop. Always skip NDV here (lazy): these rows contribute their
                 // distinct-count for free when the inline memtable later spills to
@@ -1864,22 +1881,6 @@ impl<'a> AppendMutationWriter<'a> {
                 let live_rows_delta = i64::try_from(buffer.total_rows())
                     .unwrap_or(i64::MAX)
                     .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
-                // `write_cdc_pipelined` reaches this inline commit without consulting
-                // `InlineMutationPolicy`, so unlike the staged path it can land here on
-                // a table that has retention delete filters — and an inlined outcome
-                // returns `CayenneCdcWrite::completed`, whose `finish` schedules
-                // nothing. This is the only place on that route that can arm the
-                // retention the header comment above promises the scheduler picks up.
-                self.table.schedule_post_write_maintenance(
-                    Some(Arc::new(stats_acc)),
-                    false,
-                    self.table.has_retention_delete_filters(),
-                    live_rows_delta,
-                    published_live_rows_delta,
-                );
-
-                self.table
-                    .schedule_inline_checkpoint_if_memtable_pressure_exceeded();
 
                 // METRIC 4 (burst shape): rows + Arrow bytes of this inlined CDC
                 // batch. Both are exact here — the whole delta fit in the buffer.
@@ -1888,6 +1889,40 @@ impl<'a> AppendMutationWriter<'a> {
                     buffer.total_rows() as u64,
                     buffer.total_bytes() as u64,
                 );
+
+                // The publish makes the rows visible once the write's catalog
+                // change has committed: now, or after the enclosing same-record
+                // scope commits its record. What it schedules reads the
+                // published state, so it follows the publish.
+                let table = self.table.clone_for_write_operations();
+                let retention_requested = table.has_retention_delete_filters();
+                self.table
+                    .publish_when_committed(async move {
+                        publish.run().await;
+                        // The inline rows are visible now, so the claim
+                        // survives from here. `run` awaits the
+                        // maintained-aggregate apply after its own visibility
+                        // flip, so a cancellation inside it still loses the
+                        // claim — see #13721.
+                        let published_live_rows_delta = reserved_live_rows_delta.published();
+                        // `write_cdc_pipelined` reaches this inline commit
+                        // without consulting `InlineMutationPolicy`, so unlike
+                        // the staged path it can land here on a table that has
+                        // retention delete filters — and an inlined outcome
+                        // returns `CayenneCdcWrite::completed`, whose `finish`
+                        // schedules nothing. This is the only place on that
+                        // route that can arm the retention the header comment
+                        // above promises the scheduler picks up.
+                        table.schedule_post_write_maintenance(
+                            Some(Arc::new(stats_acc)),
+                            false,
+                            retention_requested,
+                            live_rows_delta,
+                            published_live_rows_delta,
+                        );
+                        table.schedule_inline_checkpoint_if_memtable_pressure_exceeded();
+                    })
+                    .await;
 
                 return Ok(InlineMutationOutcome::Inlined {
                     rows: u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
@@ -1949,17 +1984,22 @@ impl<'a> AppendMutationWriter<'a> {
         estimated_bytes: Option<u64>,
     ) -> Result<StagedPlainAppend> {
         let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
-        self.table
-            .clear_staging_snapshot_dir(&staging_snapshot_id)
-            .await?;
+        if !self
+            .table
+            .begin_final_key_write(&staging_snapshot_id, &self.table.get_current_snapshot_id())
+        {
+            self.table
+                .clear_new_staging_snapshot_dir(&staging_snapshot_id)
+                .await?;
 
-        // We are about to (or have started to) write Vortex files into the
-        // staging directory. Mark it "dirty" so recovery/root cleanup
-        // (on this or a future writer, or on recovery after a crash) will
-        // actually perform the cleanup instead of taking the fast path.
-        self.table
-            .staging_may_have_files()
-            .store(true, Ordering::Release);
+            // We are about to (or have started to) write Vortex files into the
+            // staging directory. Mark it "dirty" so recovery/root cleanup
+            // (on this or a future writer, or on recovery after a crash) will
+            // actually perform the cleanup instead of taking the fast path.
+            self.table
+                .staging_may_have_files()
+                .store(true, Ordering::Release);
+        }
 
         let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = match self
@@ -2073,9 +2113,11 @@ impl<'a> AppendMutationWriter<'a> {
         Arc<ColumnStatsAccumulator>,
         PreparedStagedAppend,
     )> {
-        self.table
-            .staging_may_have_files()
-            .store(true, Ordering::Release);
+        if !self.table.is_final_key_write(&target.staging_snapshot_id) {
+            self.table
+                .staging_may_have_files()
+                .store(true, Ordering::Release);
+        }
 
         // IVM staged capture (Edit B): when the table has a retraction-capable
         // maintained aggregate, buffer the insert batches and re-stream them into

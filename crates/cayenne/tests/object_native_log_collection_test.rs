@@ -87,7 +87,7 @@ async fn sustained(retention: Duration) -> (Vec<usize>, Arc<dyn ObjectStore>, St
             ])),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/unused/orders".to_string(),
+            base_path: "s3://bucket/v1/datasets/orders/data".to_string(),
             partition_column: None,
             vortex_config: VortexConfig::default(),
         })

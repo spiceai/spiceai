@@ -26,8 +26,14 @@ use evaluate_chat::ChatEvaluator;
 use llms::{openai::decisions::OpenAiDecisions, typesafe::TypeSafe};
 use rstest::rstest;
 
-use super::{DOTENV, TEST_ARGS, get_or_create_model, on_shared_runtime};
+use super::{DOTENV, TEST_ARGS, create::create_bedrock, get_or_create_model, on_shared_runtime};
 use crate::init_tracing;
+
+/// The Bedrock model the decisions test runs against, instead of the `bedrock` fixture's
+/// `us.amazon.nova-lite-v1:0`. Given the schema in its prompt, Nova Lite often replies with
+/// the schema itself before its answer, or with probabilities that do not sum to 1, so the
+/// suite would fail on the model rather than on the Bedrock client it is here to check.
+const BEDROCK_DECISION_MODEL: &str = "us.amazon.nova-2-lite-v1:0";
 
 /// Fixture name `MODEL_ALLOWLIST` and `MODEL_SKIPLIST` select the `OpenAI` decision model by.
 const OPENAI_DECISIONS: &str = "openai_decisions";
@@ -55,7 +61,8 @@ fn required_env(name: &str, variable: &str) -> String {
 }
 
 /// The hosted chat models. The local models are left out: a small model does not follow a
-/// structured-output instruction reliably enough to hold to an exact answer.
+/// structured-output instruction reliably enough to hold to an exact answer, and Bedrock
+/// runs [`BEDROCK_DECISION_MODEL`] for the same reason.
 #[rstest]
 #[tokio::test]
 async fn chat_model_answers_decisions(
@@ -69,7 +76,13 @@ async fn chat_model_answers_decisions(
 
     let chat = on_shared_runtime({
         let model_name = model_name.to_string();
-        async move { get_or_create_model(&model_name).await }
+        async move {
+            if model_name == "bedrock" {
+                create_bedrock(BEDROCK_DECISION_MODEL).await
+            } else {
+                get_or_create_model(&model_name).await
+            }
+        }
     })
     .await
     .unwrap_or_else(|e| panic!("failed to get or create model {model_name}: {e}"));
