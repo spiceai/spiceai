@@ -5,8 +5,10 @@ name: spicescript long scripts
 # source's own clock for many minutes (a DynamoDB Streams shard iterator
 # expires after about five), too long for every pull request and merge-queue
 # run. Nightly, after build_nightly, against the newest nightly spiced; on
-# demand, against the Linux build of any E2E Test CI run, such as a pull
-# request's, with the scripts of the commit that run built.
+# demand, against the Linux build of an E2E Test CI push or merge_group run of
+# trunk or a release branch, with the scripts of the commit that run built. A
+# pull request's run is refused: its author built that spiced and wrote those
+# scripts, and this job has id-token: write on the self-hosted runners.
 
 on:
   schedule:
@@ -35,14 +37,32 @@ jobs:
     # containers and building spicescript when no earlier run built it.
     timeout-minutes: 90
     steps:
+      # Before anything of the run is downloaded or checked out; see the action for the rules.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.run_id != ''
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/check-trusted-run
+
+      - name: Check the run is a trusted build
+        id: trusted
+        if: inputs.run_id != ''
+        uses: ./.github/actions/check-trusted-run
+        with:
+          run-id: ${{ inputs.run_id }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Find the build
         id: build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ inputs.run_id }}
+          TRUSTED_WORKFLOW: ${{ steps.trusted.outputs.workflow }}
         run: |
           set -euo pipefail
           if [ -n "$RUN_ID" ]; then
+            # Only an E2E Test CI run holds build_linux_x86_64.
+            [ "$TRUSTED_WORKFLOW" = "E2E Test CI" ] || { echo "::error::Run $RUN_ID is a $TRUSTED_WORKFLOW run, not E2E Test CI"; exit 1; }
             run="$RUN_ID"
             artifact=build_linux_x86_64
           else
@@ -76,14 +96,15 @@ jobs:
       - name: Download spiced
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_RUN: ${{ steps.build.outputs.run }}
+          BUILD_ARTIFACT: ${{ steps.build.outputs.artifact }}
         run: |
           set -euo pipefail
-          gh run download "${{ steps.build.outputs.run }}" -R "$GITHUB_REPOSITORY" \
-            -n "${{ steps.build.outputs.artifact }}" -D "$RUNNER_TEMP/build"
+          gh run download "$BUILD_RUN" -R "$GITHUB_REPOSITORY" -n "$BUILD_ARTIFACT" -D "$RUNNER_TEMP/build"
           cd "$RUNNER_TEMP/build"
           # The nightly artifact is a tarball; an E2E run's holds the binary.
           if [ -f spiced_linux_x86_64.tar.gz ]; then
-            tar xzf spiced_linux_x86_64.tar.gz
+            tar xzf spiced_linux_x86_64.tar.gz -C "$RUNNER_TEMP/build"
           fi
           chmod +x spiced
           ./spiced --version
