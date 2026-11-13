@@ -39,6 +39,11 @@ spicepod:
 defaults:
   cluster-partition-by: { '*': id }
   expect: { oracle: src }
+  # Rows are instants before each variant's own `now()`, and a date keeps a
+  # row of 50 hours ago inside 3 days only from 02:00 to midnight UTC, so
+  # variants that start on either side of either time hold different rows by
+  # design; each is checked against its own source instead.
+  compare-variants: false
 
 steps:
   # Each row is an instant some seconds before now (negative: after now),
