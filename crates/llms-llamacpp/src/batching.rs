@@ -20,13 +20,21 @@ limitations under the License.
 //! arrives while others run reads its prompt into a free sequence between steps, and decodes in
 //! the next step.
 //!
-//! A request is admitted with room for its whole possible reply, its prompt plus `max_tokens`
-//! or the rest of the context, so a running request never runs out of cache. A request that does
-//! not fit beside the running ones waits, and the requests behind it wait in order. A model that
-//! is otherwise idle admits any request whose prompt fits the context, as one request at a time
-//! does. A model whose cache keeps a stream of the whole context per sequence, as DeepSeek-V4's
-//! does, gives each request that room in its own sequence, so its requests do not wait on each
-//! other's.
+//! A request is admitted when its prompt fits beside the running requests' cells with room left
+//! for [`ADMISSION_HEADROOM`] more tokens, or for as many as it may still write when that is
+//! fewer, whatever it may go on to write; one that does not fit waits, and the requests behind
+//! it wait in order. A model that is otherwise idle admits any request whose prompt fits the
+//! context, as one request at a time does. When the running requests' next step no longer fits
+//! together, even with every idle prompt in host memory, a request is preempted: its tokens
+//! leave the shared cache for host memory as an idle prompt's do, and it resumes, before any
+//! request that waits to start, once its tokens fit again with the same room, as vLLM preempts a
+//! request. The one preempted is the request admitted last, unless a request whose client is not
+//! reading holds cells it cannot use. Such a request also leaves for a preempted request whose
+//! client reads again, which would otherwise wait on a client that is not reading. One request
+//! alone always fits, as its draft is cut to the context.
+//! A model whose cache keeps a stream of the whole context per sequence, as DeepSeek-V4's does,
+//! gives each request that room in its own sequence, so its requests neither wait for nor preempt
+//! each other.
 //!
 //! llama.cpp decodes such sequences in one pass of the model only when their ids are
 //! consecutive, so a request takes the free sequence that keeps the running ones in the fewest
@@ -54,11 +62,22 @@ use tokio::sync::mpsc;
 
 use super::{
     CachedPrompt, DECODE_STOPPED, Decoder, Event, HOST_CACHE_BYTES, Job, Output, PROMPT_BATCH,
-    Picker, PromptCache, Target, read_prompt, send_unless_stopping, shared_prefix,
+    Picker, PromptCache, Target, read_prompt, read_tokens, send_unless_stopping, shared_prefix,
 };
 
 /// How long the decode thread waits when every running request waits on its client.
 const PAUSED_POLL: Duration = Duration::from_millis(1);
+
+/// The room, in tokens beyond its own, that a request starts or resumes with beside the running
+/// requests on a cache every sequence shares, so it does not start only to be preempted a few
+/// steps later, as vLLM keeps a watermark of the cache free when it admits a request.
+const ADMISSION_HEADROOM: usize = 256;
+
+/// The room a request that may still write `remaining` tokens starts or resumes with: the
+/// headroom, or `remaining` when that is less, and never less than one step of `n_draft` drafts.
+fn admission_room(remaining: usize, n_draft: usize) -> usize {
+    ADMISSION_HEADROOM.min(remaining).max(n_draft + 1)
+}
 
 /// How a model's cache holds the sequences of the requests it serves at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,8 +338,10 @@ struct Running<'v> {
     prompt_tokens: usize,
     /// The token sampled last and already sent, which the next step decodes at `history.len()`.
     id: Token,
-    /// The cells it was admitted with: its prompt and its whole possible reply.
-    reserved: usize,
+    /// The caller's cache namespace, which the tokens of a preempted request are saved under.
+    namespace: runtime_request_context::CacheNamespace,
+    /// When it was admitted, so the request admitted last is the one preempted for room.
+    admitted: u64,
     events: mpsc::Sender<Event>,
     stopping: Arc<AtomicBool>,
 }
@@ -373,11 +394,13 @@ fn run<'m, S: Shared<'m>>(
         .collect();
     let mut host = HostCache::new(slots.first().map_or("", |slot| slot.cache.model.as_str()));
     let mut waiting: VecDeque<Job> = VecDeque::new();
+    // requests preempted for room, in the order they were admitted
+    let mut preempted: VecDeque<Running<'m>> = VecDeque::new();
     let mut open = true;
     let mut tick: u64 = 0;
     loop {
         let idle = slots.iter().all(|slot| slot.running.is_none());
-        if idle && waiting.is_empty() {
+        if idle && waiting.is_empty() && preempted.is_empty() {
             if !open {
                 return;
             }
@@ -403,7 +426,7 @@ fn run<'m, S: Shared<'m>>(
             shared,
             split,
             (&mut slots, &mut host, max_running, layout),
-            &mut waiting,
+            (&mut preempted, &mut waiting),
             eog,
             &mut tick,
         );
@@ -412,6 +435,7 @@ fn run<'m, S: Shared<'m>>(
             shared,
             split,
             (&mut slots, &mut host, layout),
+            &mut preempted,
             &mut tick,
         ) {
             std::thread::sleep(PAUSED_POLL);
@@ -419,18 +443,74 @@ fn run<'m, S: Shared<'m>>(
     }
 }
 
-/// Starts as many waiting requests, in order, as there are free sequences and room for, while
-/// fewer than `max_running` run.
+/// Resumes the preempted requests, then starts the waiting ones, each in order, as there are
+/// free sequences and room for, while fewer than `max_running` run. A waiting request does not
+/// start while a preempted one whose client reads waits for room.
 fn admit<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
     split: bool,
     (slots, host, max_running, layout): (&mut [Slot<'m>], &mut HostCache, usize, CacheLayout),
-    waiting: &mut VecDeque<Job>,
+    (preempted, waiting): (&mut VecDeque<Running<'m>>, &mut VecDeque<Job>),
     eog: &[Token],
     tick: &mut u64,
 ) {
     let n_ctx = usize::try_from(shared.context().n_ctx()).unwrap_or(usize::MAX);
+    let headroom = event_headroom(shared.n_draft());
+    let mut next = 0;
+    while let Some(request) = preempted.get(next) {
+        if request.stopping.load(Ordering::Relaxed) || request.events.is_closed() {
+            if let Some(request) = preempted.remove(next) {
+                send_unless_stopping(
+                    &request.events,
+                    &request.stopping,
+                    Event::Failed(DECODE_STOPPED.to_string()),
+                );
+            }
+            continue;
+        }
+        // One whose client is not reading would hold the room it took without stepping; it
+        // waits, without holding up the requests behind it, until its client reads.
+        if request.events.capacity() < headroom {
+            next += 1;
+            continue;
+        }
+        let need = (
+            request.history.len(),
+            admission_room(request.out.remaining(), shared.n_draft()),
+        );
+        let mut displaced = Vec::new();
+        let ready = displace_stalled(
+            shared,
+            (slots, host, max_running, layout),
+            (need, n_ctx, headroom),
+            &mut displaced,
+            *tick,
+        );
+        if !ready {
+            requeue(preempted, displaced, &mut next);
+            return;
+        }
+        let Some(request) = preempted.remove(next) else {
+            requeue(preempted, displaced, &mut next);
+            return;
+        };
+        requeue(preempted, displaced, &mut next);
+        let Some(free) = choose_slot(slots, &request.history, &request.namespace, layout) else {
+            requeue(preempted, vec![request], &mut next);
+            return;
+        };
+        make_way(shared, (slots, host), free, *tick);
+        prepare(
+            shared,
+            &mut slots[free],
+            host,
+            (&request.history, &request.namespace),
+            *tick,
+        );
+        let argmax = split && greedy_alone(slots);
+        resume(shared, argmax, &mut slots[free], request);
+    }
     while let Some(job) = waiting.front() {
         // A client that has gone, as one that stopped reading before a later choice's turn,
         // is not decoded for.
@@ -445,41 +525,17 @@ fn admit<'m, S: Shared<'m>>(
             .vocab()
             .tokenize(&job.prompt, false, true)
             .unwrap_or_default();
-        let Some(free) = choose_slot(slots, &tokens, job, layout) else {
+        let room = admission_room(job.limit.unwrap_or(usize::MAX), shared.n_draft());
+        if !fits(slots, tokens.len(), room, n_ctx, layout) {
+            return;
+        }
+        let Some(free) = choose_slot(slots, &tokens, &job.namespace, layout) else {
             return;
         };
-        let prompt_len = tokens.len();
-        let reply = job
-            .limit
-            .unwrap_or(n_ctx)
-            .min(n_ctx.saturating_sub(prompt_len));
-        let reserve = prompt_len + reply + shared.n_draft() + 1;
-        // On a unified cache the running requests' reservations and this one's must fit
-        // together, so none runs out of room mid-reply; a stream per sequence holds each
-        // request's alone. With nothing running, the request is served as it would be alone.
-        let running = slots.iter().any(|slot| slot.running.is_some());
-        if running && layout == CacheLayout::Unified {
-            let reserved: usize = slots
-                .iter()
-                .filter_map(|slot| slot.running.as_ref())
-                .map(|running| running.reserved)
-                .sum();
-            if reserved + reserve > n_ctx
-                || running_cells(slots) + prompt_len + shared.n_draft() + 1 > n_ctx
-            {
-                return;
-            }
-        }
         let Some(job) = waiting.pop_front() else {
             return;
         };
-        // Only the running requests' prompts and the one this request continues stay in the
-        // shared cache.
-        for (index, slot) in slots.iter_mut().enumerate() {
-            if index != free && slot.running.is_none() {
-                spill(shared, slot, host, *tick);
-            }
-        }
+        make_way(shared, (slots, host), free, *tick);
         prepare(
             shared,
             &mut slots[free],
@@ -488,16 +544,98 @@ fn admit<'m, S: Shared<'m>>(
             *tick,
         );
         let argmax = split && greedy_alone(slots);
-        start(
-            model,
-            shared,
-            argmax,
-            &mut slots[free],
-            job,
-            eog,
-            reserve,
-            tick,
-        );
+        start(model, shared, argmax, &mut slots[free], job, eog, tick);
+    }
+}
+
+/// Whether a request holding `tokens` cells fits beside the running ones with `room` cells more
+/// (see [`admission_room`]). On a cache every sequence shares, the running requests' cells and
+/// its own must fit the context together; a stream per sequence holds each request's alone. With
+/// nothing running, a request is served as it would be alone.
+fn fits(slots: &[Slot<'_>], tokens: usize, room: usize, n_ctx: usize, layout: CacheLayout) -> bool {
+    let running = slots.iter().any(|slot| slot.running.is_some());
+    !running || layout == CacheLayout::PerSequence || running_cells(slots) + tokens + room <= n_ctx
+}
+
+/// Whether a preempted request holding `tokens` cells can resume with `room` more, preempting
+/// for it, into `displaced`, the running requests whose clients are not reading, the one admitted
+/// last first: such a request holds cells it does not step with, and would otherwise hold off a
+/// request whose client reads, even as the only one running. None is preempted unless all of
+/// them leaving would let the request resume: under `max_running`, in a free sequence, with room.
+fn displace_stalled<'m, S: Shared<'m>>(
+    shared: &mut S,
+    (slots, host, max_running, layout): (&mut [Slot<'m>], &mut HostCache, usize, CacheLayout),
+    ((tokens, room), n_ctx, headroom): ((usize, usize), usize, usize),
+    displaced: &mut Vec<Running<'m>>,
+    tick: u64,
+) -> bool {
+    let can_resume = |slots: &[Slot<'m>]| {
+        let running = slots.iter().filter(|slot| slot.running.is_some()).count();
+        running < max_running.min(slots.len()) && fits(slots, tokens, room, n_ctx, layout)
+    };
+    if can_resume(slots) {
+        return true;
+    }
+    // (index, admitted, cells) of each running request whose client is not reading
+    let mut stalled: Vec<(usize, u64, usize)> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            let running = slot.running.as_ref()?;
+            (running.events.capacity() < headroom).then_some((
+                index,
+                running.admitted,
+                running.history.len(),
+            ))
+        })
+        .collect();
+    let running = slots.iter().filter(|slot| slot.running.is_some()).count();
+    let left = running - stalled.len();
+    let cells_left =
+        running_cells(slots) - stalled.iter().map(|&(_, _, cells)| cells).sum::<usize>();
+    let room_left =
+        left == 0 || layout == CacheLayout::PerSequence || cells_left + tokens + room <= n_ctx;
+    if stalled.is_empty() || left >= max_running.min(slots.len()) || !room_left {
+        return false;
+    }
+    stalled.sort_by_key(|&(_, admitted, _)| std::cmp::Reverse(admitted));
+    for (index, _, _) in stalled {
+        displaced.extend(preempt(shared, &mut slots[index], host, tick));
+        if can_resume(slots) {
+            return true;
+        }
+    }
+    can_resume(slots)
+}
+
+/// Puts preempted requests back among `preempted`, in the order they were admitted, and moves
+/// `next` past any that land before it, so it still names the request it named.
+fn requeue<'m>(
+    preempted: &mut VecDeque<Running<'m>>,
+    requests: Vec<Running<'m>>,
+    next: &mut usize,
+) {
+    for request in requests {
+        let at = preempted.partition_point(|other| other.admitted < request.admitted);
+        if at < *next {
+            *next += 1;
+        }
+        preempted.insert(at, request);
+    }
+}
+
+/// Moves every idle prompt but `free`'s to host memory, so only the running requests' tokens
+/// and those the next request continues stay in the shared cache.
+fn make_way<'m, S: Shared<'m>>(
+    shared: &mut S,
+    (slots, host): (&mut [Slot<'m>], &mut HostCache),
+    free: usize,
+    tick: u64,
+) {
+    for (index, slot) in slots.iter_mut().enumerate() {
+        if index != free && slot.running.is_none() {
+            spill(shared, slot, host, tick);
+        }
     }
 }
 
@@ -519,7 +657,7 @@ fn prepare<'m, S: Shared<'m>>(
     let kept = slot.cache.shares(tokens, namespace);
     if let Some(saved) = host.take_best(tokens, namespace, kept) {
         spill(shared, slot, host, tick);
-        let continued = shared_prefix(&saved.prompt.tokens, tokens);
+        let continued = shared_prefix(&saved.prompt.tokens, saved.prompt.prompt, tokens);
         if continued >= saved.prompt.len() {
             restore(shared, slot, &saved.state, saved.prompt);
         } else {
@@ -538,14 +676,14 @@ fn prepare<'m, S: Shared<'m>>(
 fn choose_slot(
     slots: &[Slot<'_>],
     tokens: &[Token],
-    job: &Job,
+    namespace: &runtime_request_context::CacheNamespace,
     layout: CacheLayout,
 ) -> Option<usize> {
     let running: Vec<bool> = slots.iter().map(|slot| slot.running.is_some()).collect();
     pick_slot(&running, layout, |index| {
         let slot = &slots[index];
         (
-            slot.cache.shares(tokens, &job.namespace),
+            slot.cache.shares(tokens, namespace),
             slot.cache.tokens.is_empty(),
             slot.last_used,
         )
@@ -851,7 +989,10 @@ impl HostCache {
             .iter()
             .enumerate()
             .filter(|(_, saved)| saved.prompt.namespace.as_ref() == Some(namespace))
-            .map(|(index, saved)| (index, shared_prefix(&saved.prompt.tokens, tokens)))
+            .map(|(index, saved)| {
+                let shared = shared_prefix(&saved.prompt.tokens, saved.prompt.prompt, tokens);
+                (index, shared)
+            })
             .filter(|&(_, shared)| shared > than)
             .max_by_key(|&(index, shared)| (shared, self.saved[index].last_used))?;
         let saved = self.saved.swap_remove(index);
@@ -908,10 +1049,6 @@ fn greedy_alone(slots: &[Slot<'_>]) -> bool {
 /// the request then decodes with the others from the next step, unless that token ended it.
 /// With `argmax`, every running request picks greedily alone on a split model, and the prompt
 /// is read with the argmax output on when this request does too.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the request's slot, its job and the scheduler's state it reads and updates"
-)]
 fn start<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
@@ -919,7 +1056,6 @@ fn start<'m, S: Shared<'m>>(
     slot: &mut Slot<'m>,
     job: Job,
     eog: &[Token],
-    reserved: usize,
     tick: &mut u64,
 ) {
     let namespace = job.namespace.clone();
@@ -973,13 +1109,15 @@ fn start<'m, S: Shared<'m>>(
         return;
     }
     let id = picker.sample(shared.context(), batch.n_tokens() - 1, out.in_content());
+    *tick += 1;
     let running = Running {
         out,
         picker,
         prompt_tokens: history.len(),
         history,
         id,
-        reserved,
+        namespace,
+        admitted: *tick,
         events,
         stopping,
     };
@@ -1028,6 +1166,7 @@ fn end<'m, S: Shared<'m>>(
             seq: slot.seq,
         },
         history,
+        prompt_tokens,
     );
     *tick += 1;
     slot.last_used = *tick;
@@ -1056,12 +1195,14 @@ fn fail<'m, S: Shared<'m>>(
 }
 
 /// One step: drafts for every running request whose client has room, verifies all their
-/// drafts in one batch, and sends what each accepted. Returns false when no request could step.
+/// drafts in one batch, and sends what each accepted. A request preempted for the step's room
+/// joins `preempted`. Returns false when no request could step.
 fn step<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
     split: bool,
     (slots, host, layout): (&mut [Slot<'m>], &mut HostCache, CacheLayout),
+    preempted: &mut VecDeque<Running<'m>>,
     tick: &mut u64,
 ) -> bool {
     let n_ctx = usize::try_from(shared.context().n_ctx()).unwrap_or(usize::MAX);
@@ -1091,7 +1232,7 @@ fn step<'m, S: Shared<'m>>(
             slot.cache.forget();
         }
     }
-    let stepping: Vec<usize> = slots
+    let mut stepping: Vec<usize> = slots
         .iter()
         .enumerate()
         .filter(|(_, slot)| {
@@ -1101,22 +1242,38 @@ fn step<'m, S: Shared<'m>>(
         })
         .map(|(index, _)| index)
         .collect();
-    if stepping.is_empty() {
-        return slots.iter().all(|slot| slot.running.is_none());
-    }
     // A request's step writes its last token and a draft cut to the context, as below, which
-    // idle prompts make room for by moving to host memory. The running requests' reservations
-    // fit together, so it fits. A stream per sequence holds each request's step in its own.
-    if layout == CacheLayout::Unified {
-        let need: usize = stepping
-            .iter()
-            .filter_map(|&index| slots[index].running.as_ref())
-            .map(|running| {
-                let past = running.history.len();
-                1 + shared.n_draft().min(n_ctx.saturating_sub(past + 1))
-            })
-            .sum();
-        make_room(shared, (slots, host), need, n_ctx, *tick);
+    // idle prompts make room for by moving to host memory. When the running requests' steps do
+    // not fit together even so, requests are preempted (see [`victim`]) until they do; one
+    // request alone always fits. A stream per sequence holds each request's step in its own.
+    if layout == CacheLayout::Unified && !stepping.is_empty() {
+        loop {
+            let need: usize = stepping
+                .iter()
+                .filter_map(|&index| slots[index].running.as_ref())
+                .map(|running| {
+                    let past = running.history.len();
+                    1 + shared.n_draft().min(n_ctx.saturating_sub(past + 1))
+                })
+                .sum();
+            if make_room(shared, (slots, host), need, n_ctx, *tick) {
+                break;
+            }
+            let Some(victim) = victim(slots, headroom) else {
+                break;
+            };
+            if let Some(running) = preempt(shared, &mut slots[victim], host, *tick) {
+                let at = preempted.partition_point(|other| other.admitted < running.admitted);
+                preempted.insert(at, running);
+            }
+            stepping.retain(|&index| index != victim);
+        }
+    }
+    // With no request stepping, the caller pauses: a request preempted for room may wait on a
+    // client that is not reading even when no request runs, and with no request at all the
+    // caller blocks for the next one after the pause.
+    if stepping.is_empty() {
+        return false;
     }
     let drafts = {
         let requests: Vec<DraftRequest<'_>> = stepping
@@ -1286,6 +1443,109 @@ fn fail_all<'m, S: Shared<'m>>(
     }
 }
 
+/// The running request to preempt for room, when another runs beside it: of the requests whose
+/// client is not reading, which hold their cells without stepping, the one admitted last; else
+/// the one admitted last of all.
+fn victim(slots: &[Slot<'_>], headroom: usize) -> Option<usize> {
+    let running: Vec<(usize, bool, u64)> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            let running = slot.running.as_ref()?;
+            Some((
+                index,
+                running.events.capacity() < headroom,
+                running.admitted,
+            ))
+        })
+        .collect();
+    if running.len() < 2 {
+        return None;
+    }
+    running
+        .into_iter()
+        .max_by_key(|&(_, stalled, admitted)| (stalled, admitted))
+        .map(|(index, _, _)| index)
+}
+
+/// Preempts `slot`'s request for room: its tokens leave the shared cache as an idle prompt's
+/// do, saved to host memory when restoring them would cost less than reading them again, and the
+/// request waits to resume.
+fn preempt<'m, S: Shared<'m>>(
+    shared: &mut S,
+    slot: &mut Slot<'m>,
+    host: &mut HostCache,
+    tick: u64,
+) -> Option<Running<'m>> {
+    let running = slot.running.take()?;
+    slot.cache.keep(
+        &mut InSeq {
+            shared: &mut *shared,
+            seq: slot.seq,
+        },
+        running.history.clone(),
+        running.prompt_tokens,
+    );
+    spill(shared, slot, host, tick);
+    // a cache that could not keep the tokens has nothing to save, and the sequence still holds
+    // them
+    InSeq {
+        shared: &mut *shared,
+        seq: slot.seq,
+    }
+    .clear();
+    tracing::debug!(
+        "Model '{}' preempted a request of {} tokens for room; it resumes when they fit again.",
+        slot.cache.model,
+        running.history.len()
+    );
+    Some(running)
+}
+
+/// Resumes a preempted request in `slot`'s sequence, which [`prepare`] readied, to decode with
+/// the others from the next step. Its next token was sampled and sent before it was preempted,
+/// so when its tokens came back from host memory whole, it continues from them as they were;
+/// otherwise it reads again what the cache lacks, and the read's logits go unused. With
+/// `argmax`, as in [`start`].
+fn resume<'m, S: Shared<'m>>(
+    shared: &mut S,
+    argmax: bool,
+    slot: &mut Slot<'m>,
+    running: Running<'m>,
+) {
+    if !slot.cache.resume(&running.history, &running.namespace) {
+        shared
+            .context_mut()
+            .set_argmax_output(argmax && running.picker.picks_greedily());
+        let mut target = InSeq {
+            shared: &mut *shared,
+            seq: slot.seq,
+        };
+        let read = read_tokens(
+            &mut target,
+            &mut slot.cache,
+            (&running.history, &running.namespace),
+            &running.out.stopping,
+        );
+        if let Err(message) = read {
+            target.clear();
+            slot.cache.forget();
+            send_unless_stopping(&running.events, &running.stopping, Event::Failed(message));
+            return;
+        }
+    }
+    if let Err(message) = shared.begin(slot.seq, &running.history) {
+        fail(shared, slot, &running.events, &running.stopping, message);
+        return;
+    }
+    tracing::debug!(
+        "Model '{}' resumed a preempted request of {} tokens.",
+        slot.cache.model,
+        running.history.len()
+    );
+    slot.running = Some(running);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CacheLayout, CachedPrompt, HostCache, Saved, SeqState, pick_slot};
@@ -1295,6 +1555,7 @@ mod tests {
         Saved {
             prompt: CachedPrompt {
                 tokens: vec![llama_cpp::Token(1)],
+                prompt: 1,
                 namespace: None,
                 checkpoints: Vec::new(),
                 head_stash: None,

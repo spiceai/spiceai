@@ -1590,6 +1590,8 @@ struct PromptCache {
     /// The tokens in the KV cache, in order: the last prompt, then the reply tokens decoded
     /// after it. Empty while a request runs, so one that fails leaves nothing to reuse.
     tokens: Vec<Token>,
+    /// How many of `tokens` are the last prompt; the rest are its reply's.
+    prompt: usize,
     /// The cache namespace of the caller whose request left `tokens` and the checkpoints.
     namespace: Option<CacheNamespace>,
     /// For a cache that cannot be cut back to any position, as a recurrent state or a
@@ -1611,6 +1613,7 @@ impl PromptCache {
         Self {
             model: name.to_string(),
             tokens: Vec::new(),
+            prompt: 0,
             namespace: None,
             checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
             head_stash: None,
@@ -1759,6 +1762,7 @@ impl PromptCache {
         }
         Some(CachedPrompt {
             tokens: std::mem::take(&mut self.tokens),
+            prompt: std::mem::take(&mut self.prompt),
             namespace: self.namespace.take(),
             checkpoints: self
                 .checkpoints
@@ -1777,6 +1781,7 @@ impl PromptCache {
         }
         Some(CachedPrompt {
             tokens: self.tokens.clone(),
+            prompt: self.prompt,
             namespace: self.namespace.clone(),
             checkpoints: self
                 .checkpoints
@@ -1791,6 +1796,7 @@ impl PromptCache {
     /// sequence.
     fn put(&mut self, prompt: CachedPrompt) {
         self.tokens = prompt.tokens;
+        self.prompt = prompt.prompt;
         self.namespace = prompt.namespace;
         if let Some(checkpoints) = &mut self.checkpoints {
             checkpoints.0 = prompt.checkpoints;
@@ -1800,14 +1806,17 @@ impl PromptCache {
 
     /// How many of `tokens` the cache would give a request from the caller in `namespace`
     /// before reading the rest: the prefix they share, or nothing when that is less than half
-    /// of what the cache holds. Taking a cache it shares only a little with, such as a chat
-    /// template's opening tokens with another conversation, would throw away more than the
-    /// request reuses, so llama-server chooses a slot by prompt similarity too.
+    /// of the last prompt the cache holds. Taking a cache it shares only a little with, such as
+    /// a chat template's opening tokens with another conversation, would throw away more than
+    /// the request reuses, so llama-server chooses a slot by prompt similarity too. The share is
+    /// measured against the prompt, not its reply: the next turn of a conversation shares the
+    /// prompt, while the template renders the reply again, and a reply longer than its prompt
+    /// would otherwise leave the next turn nothing.
     fn shares(&self, tokens: &[Token], namespace: &CacheNamespace) -> usize {
         if self.namespace.as_ref() != Some(namespace) {
             return 0;
         }
-        shared_prefix(&self.tokens, tokens)
+        shared_prefix(&self.tokens, self.prompt, tokens)
     }
 
     /// Forgets everything the cache held, for a sequence whose cells were emptied: by a request
@@ -1820,11 +1829,24 @@ impl PromptCache {
         }
     }
 
-    /// Records `tokens` as what the caches hold for the next request, after truncating them to
-    /// `tokens`, which drops any drafts verified after them. A cache that cannot roll back that
-    /// far leaves nothing to reuse.
-    fn keep<'m>(&mut self, target: &mut impl Target<'m>, tokens: Vec<Token>) {
+    /// Gives a request that continues all of `tokens` without reading any of them, as a preempted
+    /// request resumes with its next token already sampled, the cache as it stands: true when it
+    /// holds exactly `tokens` from the caller in `namespace`.
+    fn resume(&mut self, tokens: &[Token], namespace: &CacheNamespace) -> bool {
+        if self.namespace.as_ref() == Some(namespace) && self.tokens == tokens {
+            self.tokens.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records `tokens`, a prompt of `prompt` tokens and then its reply's, as what the caches
+    /// hold for the next request, after truncating them to `tokens`, which drops any drafts
+    /// verified after them. A cache that cannot roll back that far leaves nothing to reuse.
+    fn keep<'m>(&mut self, target: &mut impl Target<'m>, tokens: Vec<Token>, prompt: usize) {
         if truncate_to(target, tokens.len()) {
+            self.prompt = prompt.min(tokens.len());
             self.tokens = tokens;
         }
     }
@@ -1834,6 +1856,8 @@ impl PromptCache {
 /// are saved to host memory ([`PromptCache::take`]).
 struct CachedPrompt {
     tokens: Vec<Token>,
+    /// How many of `tokens` are the prompt; the rest are its reply's.
+    prompt: usize,
     namespace: Option<CacheNamespace>,
     checkpoints: Vec<Checkpoint>,
     head_stash: Option<(usize, Vec<u8>)>,
@@ -1859,6 +1883,7 @@ impl CachedPrompt {
     fn up_to(&self, n: usize) -> CachedPrompt {
         CachedPrompt {
             tokens: self.tokens.clone(),
+            prompt: self.prompt,
             namespace: self.namespace.clone(),
             checkpoints: self
                 .checkpoints
@@ -1871,15 +1896,16 @@ impl CachedPrompt {
     }
 }
 
-/// How many of `tokens` a cache holding `cached` gives a request: the prefix they share, or
-/// nothing when that is less than half of `cached` (see [`PromptCache::shares`]).
-fn shared_prefix(cached: &[Token], tokens: &[Token]) -> usize {
+/// How many of `tokens` a cache holding `cached`, a prompt of `prompt` tokens and then its
+/// reply's, gives a request: the prefix they share, or nothing when that is less than half of
+/// the prompt (see [`PromptCache::shares`]).
+fn shared_prefix(cached: &[Token], prompt: usize, tokens: &[Token]) -> usize {
     let shared = cached
         .iter()
         .zip(tokens)
         .take_while(|(a, b)| a == b)
         .count();
-    if 2 * shared >= cached.len() {
+    if 2 * shared >= prompt.min(cached.len()) {
         shared
     } else {
         0
@@ -1999,17 +2025,29 @@ fn read_prompt<'m>(
         .vocab()
         .tokenize(prompt, false, true)
         .map_err(|e| e.to_string())?;
-    let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
     if tokens.is_empty() {
         return Err("the rendered prompt is empty".to_string());
     }
+    let (batch, start) = read_tokens(target, cache, (&tokens, namespace), stopping)?;
+    Ok((tokens, batch, start))
+}
+
+/// Decodes the part of `tokens` the cache does not already hold, returning the batch whose last
+/// logits predict the token after them, and how many of the tokens the cache held.
+fn read_tokens<'m>(
+    target: &mut impl Target<'m>,
+    cache: &mut PromptCache,
+    (tokens, namespace): (&[Token], &CacheNamespace),
+    stopping: &AtomicBool,
+) -> std::result::Result<(Batch, usize), String> {
+    let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
     if tokens.len() >= n_ctx {
         return Err(format!(
             "the prompt is {} tokens, and the model's context holds {n_ctx}. Shorten the conversation, or raise `context_length`.",
             tokens.len()
         ));
     }
-    let start = cache.reuse(target, &tokens, namespace);
+    let start = cache.reuse(target, tokens, namespace);
     let mut batch = Batch::new(PROMPT_BATCH);
     // The prompt is read in two spans split at the checkpoint, so the state saved there
     // follows exactly the tokens before it; without one, the first span is empty.
@@ -2019,7 +2057,7 @@ fn read_prompt<'m>(
     // Each span is timed to its computation's end, so the reading's cost and the save's stay
     // apart; sampling, and the save itself, wait for that computation anyway.
     let started = Instant::now();
-    decode_span(target, &mut batch, &tokens, start..split, stopping)?;
+    decode_span(target, &mut batch, tokens, start..split, stopping)?;
     target.context_mut().synchronize();
     let mut read = started.elapsed();
     if let Some(at) = checkpoint {
@@ -2028,11 +2066,11 @@ fn read_prompt<'m>(
         cache.head_stash = target.head_state().map(|state| (at, state));
     }
     let resumed = Instant::now();
-    decode_span(target, &mut batch, &tokens, split..tokens.len(), stopping)?;
+    decode_span(target, &mut batch, tokens, split..tokens.len(), stopping)?;
     target.context_mut().synchronize();
     read += resumed.elapsed();
     cache.read(tokens.len() - start, read);
-    Ok((tokens, batch, start))
+    Ok((batch, start))
 }
 
 /// Decodes `tokens[span]` at their positions, in batches of at most `PROMPT_BATCH`, asking for

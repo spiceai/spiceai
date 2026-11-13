@@ -240,6 +240,69 @@ async fn a_recurrent_state_resumes_from_its_checkpoint() {
     .await;
 }
 
+/// The prompt of a first turn whose reply is longer than the prompt itself.
+const LONG_REPLY_PROMPT: &str =
+    "Count from 1 to 80 in digits, separated by commas, and nothing else.";
+
+/// A turn after a reply longer than its prompt, as a first turn's often is: the cache holds the
+/// prompt and the reply, and the next prompt shares the prompt, not the reply, which the
+/// template renders again. The turn reuses the prompt, `held_back` tokens short of its end, and
+/// replies as a freshly loaded model does.
+async fn reuses_the_prompt_after_a_longer_reply(gguf: &Path, name: &'static str, held_back: usize) {
+    let model = load(gguf, name).await;
+    let mut messages = vec![json!({ "role": "user", "content": LONG_REPLY_PROMPT })];
+    let first = model
+        .chat_request(request(json!({
+            "model": name,
+            "messages": messages,
+            "temperature": 0,
+            "reasoning_effort": "none",
+            "max_tokens": 200,
+        })))
+        .await
+        .expect("a reply");
+    let usage = first.usage.expect("usage");
+    let (prompt, reply_tokens) = (
+        usize::try_from(usage.prompt_tokens).expect("a prompt length fits"),
+        usize::try_from(usage.completion_tokens).expect("a reply length fits"),
+    );
+    assert!(
+        reply_tokens > prompt,
+        "the reply is longer than its prompt: {reply_tokens} and {prompt} tokens"
+    );
+    let reply = first.choices[0].message.content.clone().expect("content");
+    messages.push(json!({ "role": "assistant", "content": reply }));
+    messages.push(json!({ "role": "user", "content": "Now say only the word done." }));
+    let (held, _) = ask(&model, name, &messages).await;
+    let reused = model.reused_prompt_tokens();
+    drop(model);
+    assert_eq!(
+        reused,
+        prompt - held_back,
+        "the next turn reuses the {prompt}-token prompt it shares"
+    );
+    let fresh = load(gguf, name).await;
+    let (cold, _) = ask(&fresh, name, &messages).await;
+    assert_eq!(held, cold, "the next turn's reply against a fresh model's");
+}
+
+/// Qwen3-0.6B's attention cache, after a reply longer than its prompt.
+#[tokio::test]
+async fn an_attention_cache_reuses_the_prompt_after_a_longer_reply() {
+    let gguf = crate::qwen3_gguf().await;
+    reuses_the_prompt_after_a_longer_reply(&gguf, "qwen3-0.6b-long-reply", EMPTY_THINK_TOKENS)
+        .await;
+}
+
+/// Qwen3.5-0.8B's recurrent state, after a reply longer than its prompt: the turn restores the
+/// checkpoint saved before the prompt's generation prompt.
+#[tokio::test]
+async fn a_recurrent_state_reuses_the_prompt_after_a_longer_reply() {
+    let gguf = crate::mtp::qwen35_gguf().await;
+    reuses_the_prompt_after_a_longer_reply(&gguf, "qwen3.5-long-reply", CHECKPOINT_BEFORE_END)
+        .await;
+}
+
 /// Gemma 3 270M attends over a 512-position sliding window in five of every six layers, and
 /// llama.cpp keeps that cache at full size, so a truncation leaves every window whole: each
 /// turn reuses everything it shares with the cache, as an attention cache does.
