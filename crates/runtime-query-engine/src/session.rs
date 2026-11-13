@@ -143,6 +143,12 @@ impl QueryEngine for QuerySession {
             .sql(&request.sql)
             .await
             .map_err(|source| Error::QueryExecution { source })?;
+        let df = match request.fetch {
+            Some(rows) if crate::query_engine::fetch_applies_to(df.logical_plan()) => df
+                .limit(0, Some(rows))
+                .map_err(|source| Error::QueryExecution { source })?,
+            _ => df,
+        };
         df.execute_stream()
             .await
             .map_err(|source| Error::QueryExecution { source })

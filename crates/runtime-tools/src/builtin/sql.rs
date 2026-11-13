@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::builtin::function_tool::current_principal_allows_write;
@@ -94,16 +95,26 @@ impl SpiceModelTool for SqlTool {
             // to be writable (`access: read_write`).
             let read_only = !current_principal_allows_write().await;
 
-            let mut query_request = QueryRequest::new(&query).read_only(read_only);
+            // The query asks for one row more than the result shows, to know whether there are
+            // more: sources and operators stop there, and the query finishes instead of being
+            // cancelled when the result is cut short.
+            let budget = current_budget();
+            let mut query_request = QueryRequest::new(&query)
+                .read_only(read_only)
+                .fetch(budget.max_rows().saturating_add(1));
 
             if let Some(ref allowlist) = self.allowed_tables {
                 query_request = query_request.allow_tables(allowlist.clone());
             }
 
-            let stream = self.df.execute_query(query_request).await?;
-            Ok(encode_stream(stream, current_budget())
-                .await?
-                .into_value()?)
+            let mut stream = self.df.execute_query(query_request).await?;
+            let rows = encode_stream(&mut stream, budget).await?;
+            // At most a row past the result is left, or a statement's own few rows, so reading
+            // them to the end is cheap and records the query as finished.
+            while let Some(batch) = stream.next().await {
+                batch?;
+            }
+            Ok(rows.into_value()?)
         }
         .instrument(span.clone())
         .await;

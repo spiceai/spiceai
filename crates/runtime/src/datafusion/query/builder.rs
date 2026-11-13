@@ -56,6 +56,7 @@ pub struct QueryBuilder {
     emit_tracker: bool,
     serialized_plan_cache_key: Option<Arc<str>>,
     planning_session: Option<Box<SessionState>>,
+    fetch: Option<usize>,
 }
 
 impl QueryBuilder {
@@ -73,6 +74,7 @@ impl QueryBuilder {
             emit_tracker: true,
             serialized_plan_cache_key: None,
             planning_session: None,
+            fetch: None,
         }
     }
 
@@ -95,6 +97,7 @@ impl QueryBuilder {
             emit_tracker: true,
             serialized_plan_cache_key: None,
             planning_session: None,
+            fetch: None,
         }
     }
 
@@ -120,6 +123,7 @@ impl QueryBuilder {
             emit_tracker: true,
             serialized_plan_cache_key: None,
             planning_session: None,
+            fetch: None,
         }
     }
 
@@ -179,6 +183,18 @@ impl QueryBuilder {
     #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Returns at most `rows` rows: the query runs as if it ended in `LIMIT rows`, so sources
+    /// and operators stop early and the query finishes once it has them. A statement that writes
+    /// or describes (DML, DDL, `COPY`, `EXPLAIN`, `SET`) is not limited. The limit is part of the
+    /// planned query, so the results cache keeps a limited answer apart from the full one.
+    ///
+    /// Used by the built-in `sql` tool, which shows a model only the first rows of a result.
+    #[must_use]
+    pub fn fetch(mut self, rows: usize) -> Self {
+        self.fetch = Some(rows);
         self
     }
 
@@ -262,6 +278,7 @@ impl QueryBuilder {
             runtime_binding: self.runtime_binding,
             serialized_plan_cache_key: self.serialized_plan_cache_key,
             planning_session: self.planning_session,
+            fetch: self.fetch,
         }
     }
 }

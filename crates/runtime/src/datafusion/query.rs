@@ -47,7 +47,7 @@ use datafusion::{
     common::TableReference,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext, memory_pool::MemoryLimit},
-    logical_expr::LogicalPlan,
+    logical_expr::{LogicalPlan, LogicalPlanBuilder},
     physical_plan::{
         ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
@@ -114,6 +114,7 @@ use opentelemetry::KeyValue;
 use runtime_auth::AuthRequestContext;
 use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::query_engine::fetch_applies_to;
 use runtime_request_context::{AsyncMarker, CacheControl, Protocol, RequestContext};
 use tokio::runtime::Handle;
 use util::session_state::builder_from_existing;
@@ -305,6 +306,8 @@ pub struct Query {
     results_cache_mode: ResultsCacheMode,
     /// Where this query executes and whether it is gated by query admission.
     runtime_binding: QueryRuntimeBinding,
+    /// The most rows the query returns, as a `LIMIT` on its plan. Set via [`QueryBuilder::fetch`].
+    fetch: Option<usize>,
 }
 
 macro_rules! handle_error {
@@ -1016,7 +1019,7 @@ impl Query {
                         )
                         .await?
                     };
-                    (plan, tracker, None)
+                    (limit_query_rows(plan, self.fetch)?, tracker, None)
                 } else {
                     // Use the existing get_plan_or_cached which handles all cache
                     // control, stale-while-revalidate, and query tracking. The
@@ -1035,6 +1038,7 @@ impl Query {
                                 pre_parsed_plan,
                                 None,
                                 self.serialized_plan_cache_key.as_deref(),
+                                self.fetch,
                             )
                             .await?
                         }
@@ -1047,6 +1051,7 @@ impl Query {
                                 parameters,
                                 tracker,
                                 pre_parsed_plan,
+                                self.fetch,
                             )
                             .await?
                         }
@@ -1549,6 +1554,7 @@ impl Query {
                             &query_id_str,
                             &timeout_state,
                         )?;
+                        let plan = Box::new(limit_query_rows(*plan, ctx.fetch)?);
                         let tables_referenced = plan.as_table_refs();
                         if let Some(disallowed_table) = tables_referenced
                             .iter()
@@ -1583,6 +1589,7 @@ impl Query {
                                     pre_parsed_plan,
                                     already_looked_up,
                                     ctx.serialized_plan_cache_key.as_deref(),
+                                    ctx.fetch,
                                 )
                                 .await?
                             }
@@ -1595,6 +1602,7 @@ impl Query {
                                     parameters,
                                     tracker,
                                     pre_parsed_plan,
+                                    ctx.fetch,
                                 )
                                 .await?
                             }
@@ -2119,6 +2127,7 @@ impl Query {
             read_only: false,
             results_cache_mode: ResultsCacheMode::default(),
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
+            fetch: None,
         }
     }
 
@@ -3550,6 +3559,24 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
         }
         _ => None,
     }
+}
+
+/// `plan` cut to its first `fetch` rows when it is a query, or `plan` itself when `fetch` is
+/// `None` or the plan is a statement (see [`fetch_applies_to`]) or one of the extension nodes
+/// that carry DDL and DML.
+fn limit_query_rows(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan> {
+    let Some(fetch) = fetch else {
+        return Ok(plan);
+    };
+    let writes = matches!(&plan, LogicalPlan::Extension(extension)
+        if ::cache::WRITE_CAPABLE_EXTENSION_NAMES.contains(&extension.node.name()));
+    if writes || !fetch_applies_to(&plan) {
+        return Ok(plan);
+    }
+    LogicalPlanBuilder::from(plan)
+        .limit(0, Some(fetch))
+        .and_then(LogicalPlanBuilder::build)
+        .map_err(|source| Error::UnableToExecuteQuery { source })
 }
 
 /// Returns `true` if the plan is a DML extension node.

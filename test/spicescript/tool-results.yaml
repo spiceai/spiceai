@@ -21,12 +21,18 @@ spicepod:
       api-key:
         enabled: true
         keys: [tool-key]
+    caching:
+      sql_results:
+        item_ttl: 10m
   datasets:
     - from: 'file://${sources.lake.path}/numbers/'
       name: numbers
       params: { file_format: parquet }
     - from: 'file://${sources.lake.path}/docs/'
       name: docs
+      params: { file_format: parquet }
+    - from: 'file://${sources.lake.path}/events/'
+      name: events
       params: { file_format: parquet }
 
 defaults:
@@ -52,6 +58,15 @@ steps:
         columns:
           - { name: id, sequence: 1 }
           - { name: doc, text: [1500, 1600] }
+  - generate:
+      lake:
+        table: events
+        rows: 100000
+        seed: 13
+        primary-key: id
+        format: parquet
+        columns:
+          - { name: id, sequence: 1 }
   - start: {}
 
   # A result over the row limit: the first 100 rows, marked truncated, and told not to total them.
@@ -65,6 +80,35 @@ steps:
         - { pointer: /rows/99/0, equals: 100 }
         - { pointer: /truncated, equals: true }
         - { pointer: /message, matches: '^Showing the first 100 rows; the result has more\. Do not compute totals, counts, or averages from these rows\.' }
+
+  # Stopping at the row limit is the query's own LIMIT, not a cancellation, even when the result
+  # spans many batches: the query is recorded without an error, and the same SQL asked without a
+  # limit still answers every row, though the results cache keeps answers for ten minutes.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT id FROM events ORDER BY id"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /rows, length: 100 }
+        - { pointer: /rows/99/0, equals: 100 }
+        - { pointer: /truncated, equals: true }
+  - query: SELECT count(*) AS n, count(error_message) AS errors FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT id FROM events ORDER BY id'
+    expect: { rows: [['1', '0']] }
+    eventually: 30s
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: 'SELECT id FROM events ORDER BY id' }
+    expect:
+      status: 200
+      json:
+        - { pointer: '', length: 100000 }
+        - { pointer: /99999/id, equals: 100000 }
+
+  # A statement is not limited: EXPLAIN stays at the root of its plan and answers.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "EXPLAIN SELECT id FROM numbers"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /columns, equals: [plan_type, plan] }
+        - { pointer: /rows, length: '>=1' }
+        - { pointer: /truncated, exists: false }
 
   # Exactly 100 rows is the whole result: nothing says otherwise.
   - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT id FROM numbers WHERE id <= 100 ORDER BY id"}' }

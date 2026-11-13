@@ -506,14 +506,16 @@ impl RowEncoder {
     }
 }
 
-/// Encodes the rows of `stream` within `budget`. Stops reading, which stops the query, as soon as
-/// the budget is spent: one row past the budget is read to know whether the result has more.
+/// Encodes the rows of `stream` within `budget`. Stops reading as soon as the budget is spent:
+/// one row past the budget is read to know whether the result has more. The rest of `stream` is
+/// left unread for the caller, which reads it to its end when the query was asked for a bounded
+/// number of rows, so the query finishes instead of being cancelled.
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails or a column's type has no JSON encoding.
 pub async fn encode_stream(
-    mut stream: SendableRecordBatchStream,
+    stream: &mut SendableRecordBatchStream,
     budget: ResultBudget,
 ) -> Result<ToolRows, Box<dyn StdError + Send + Sync>> {
     let mut encoder = RowEncoder::new(&stream.schema(), budget);
@@ -1461,13 +1463,13 @@ mod tests {
     async fn encoding_stops_reading_once_the_budget_is_spent() {
         let first = ids(10);
         let schema = first.schema();
-        let endless = Box::pin(RecordBatchStreamAdapter::new(
+        let mut endless: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             futures::stream::iter([Ok(first)]).chain(futures::stream::pending()),
         ));
         let rows = tokio::time::timeout(
             Duration::from_secs(10),
-            encode_stream(endless, ResultBudget::with_limits(5, MAX_RESULT_BYTES)),
+            encode_stream(&mut endless, ResultBudget::with_limits(5, MAX_RESULT_BYTES)),
         )
         .await
         .expect("the budget stops reading the stream")

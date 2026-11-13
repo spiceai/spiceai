@@ -492,6 +492,7 @@ impl Query {
         pre_parsed_plan: Option<Box<LogicalPlan>>,
         already_looked_up: Option<RawCacheKey>,
         serialized_plan_cache_key: Option<&str>,
+        fetch: Option<usize>,
     ) -> super::Result<PlanOrCached> {
         let cache_control = request_context.cache_control();
         let cache_namespace = request_context.cache_namespace();
@@ -509,30 +510,36 @@ impl Query {
             _ => sql_cache_key,
         };
 
-        // Try to get cached results from SQL or client key.
+        // Try to get cached results from SQL or client key. Both name the query without a
+        // `fetch` limit, so a limited query is looked up only under its plan, below.
         let CacheResponse {
             tracker,
             raw_key: sql_or_client_raw_key,
             ..
-        } = match Self::try_get_cached_result(
-            df,
-            &request_context,
-            tracker,
-            &sql_or_user_cache_key,
-            sql,
-            already_looked_up,
-            parameters.as_ref(),
-        )
-        .await?
-        {
-            CacheResponse {
-                result: CacheResult::Hit(result),
+        } = if fetch.is_some() {
+            CacheResponse::from(CacheResult::MissOrSkipped, CacheStatus::CacheMiss)
+                .with_query_tracker(tracker)
+        } else {
+            match Self::try_get_cached_result(
+                df,
+                &request_context,
                 tracker,
-                ..
-            } => {
-                return Ok(PlanOrCached::Cached { result, tracker });
+                &sql_or_user_cache_key,
+                sql,
+                already_looked_up,
+                parameters.as_ref(),
+            )
+            .await?
+            {
+                CacheResponse {
+                    result: CacheResult::Hit(result),
+                    tracker,
+                    ..
+                } => {
+                    return Ok(PlanOrCached::Cached { result, tracker });
+                }
+                response => response,
             }
-            response => response,
         };
 
         let sql_raw_cache_key =
@@ -558,6 +565,19 @@ impl Query {
                 }
             }
         };
+        let plan = match super::limit_query_rows(*plan, fetch) {
+            Ok(plan) => Box::new(plan),
+            Err(e) => {
+                if let Some(t) = tracker {
+                    t.finish_with_error(
+                        &request_context,
+                        e.to_string(),
+                        ErrorCode::QueryPlanningError,
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         // Try to get cached results from plan.
         let CacheResponse {
@@ -569,7 +589,9 @@ impl Query {
             df,
             &request_context,
             tracker,
-            &CacheKey::for_plan(&plan, serialized_plan_cache_key),
+            // A serialized plan's digest names the plan without a `fetch` limit, so a limited
+            // plan is keyed by the plan itself.
+            &CacheKey::for_plan(&plan, serialized_plan_cache_key.filter(|_| fetch.is_none())),
             sql,
             already_looked_up,
             // A `LogicalPlan` key carries the parameter values already bound
@@ -601,15 +623,19 @@ impl Query {
             return Err(error);
         }
 
-        let request_raw_cache_key = match request_context.cache_control() {
+        let keyed_by_plan = matches!(
+            request_context.cache_control(),
             CacheControl::Cache(CacheKeyType::Default)
-            | CacheControl::MaxStale(CacheKeyType::Default, _)
-            | CacheControl::MinFresh(CacheKeyType::Default, _)
-            | CacheControl::OnlyIfCached(CacheKeyType::Default)
-            | CacheControl::Revalidate(CacheKeyType::Default) => plan_raw_cache_key,
-            _ => sql_or_client_raw_key,
-        }
-        .unwrap_or(sql_raw_cache_key);
+                | CacheControl::MaxStale(CacheKeyType::Default, _)
+                | CacheControl::MinFresh(CacheKeyType::Default, _)
+                | CacheControl::OnlyIfCached(CacheKeyType::Default)
+                | CacheControl::Revalidate(CacheKeyType::Default)
+        );
+        let request_raw_cache_key = if keyed_by_plan {
+            plan_raw_cache_key
+        } else {
+            sql_or_client_raw_key
+        };
 
         // A `no-cache` request reports `BYPASS` whichever of its two lookups
         // matched its key type; the other reports a wrong-key-type miss.
@@ -617,7 +643,14 @@ impl Query {
             CacheControl::Revalidate(_) => CacheStatus::CacheBypass,
             _ => status,
         };
-        let cache_status = Self::should_cache_results(df, &plan, status);
+        // A limited answer is stored only under its plan's key, which carries the limit. Under the
+        // SQL text or a client key it would answer the same query asked without the limit.
+        let cache_status = if fetch.is_some() && !(keyed_by_plan && plan_raw_cache_key.is_some()) {
+            CacheStatus::CacheDisabled
+        } else {
+            Self::should_cache_results(df, &plan, status)
+        };
+        let request_raw_cache_key = request_raw_cache_key.unwrap_or(sql_raw_cache_key);
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(
@@ -628,6 +661,7 @@ impl Query {
     }
 
     /// Plans a query without consulting or populating the SQL results cache.
+    #[expect(clippy::too_many_arguments)]
     pub(super) async fn get_plan_without_results_cache(
         df: &Arc<DataFusion>,
         session: &SessionState,
@@ -636,6 +670,7 @@ impl Query {
         parameters: Option<ParamValues>,
         tracker: Option<QueryTracker>,
         pre_parsed_plan: Option<Box<LogicalPlan>>,
+        fetch: Option<usize>,
     ) -> super::Result<PlanOrCached> {
         let cache_namespace = request_context.cache_namespace();
         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
@@ -659,6 +694,19 @@ impl Query {
                     return Err(error);
                 }
                 Err(error) => return Err(error),
+            }
+        };
+        let plan = match super::limit_query_rows(*plan, fetch) {
+            Ok(plan) => Box::new(plan),
+            Err(error) => {
+                if let Some(tracker) = tracker {
+                    tracker.finish_with_error(
+                        request_context,
+                        error.to_string(),
+                        ErrorCode::QueryPlanningError,
+                    );
+                }
+                return Err(error);
             }
         };
 
@@ -871,7 +919,9 @@ impl Query {
         else {
             return CacheProbe::Skipped;
         };
-        if self.results_cache_mode != ResultsCacheMode::Default {
+        // A limited query is looked up under its plan with the limit, once planned: the keys
+        // probed here name the query without it.
+        if self.results_cache_mode != ResultsCacheMode::Default || self.fetch.is_some() {
             return CacheProbe::Skipped;
         }
         let Some(cache_provider) = self.df.results_cache_provider() else {
@@ -2357,6 +2407,140 @@ mod tests {
         create_test_request_context(CacheControl::Cache(cache_key_type), None)
             .scope(run_i64_query(df, sql, ResultsCacheMode::Default))
             .await
+    }
+
+    /// Registers an in-memory table `name` whose `id` column holds `1..=rows`.
+    fn register_ids_table(df: &Arc<DataFusion>, name: &'static str, rows: i64) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(1..=rows))],
+        )
+        .expect("valid batch");
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
+            .expect("valid mem table");
+        df.ctx
+            .register_table(TableReference::bare(name), Arc::new(table))
+            .expect("should register table");
+    }
+
+    /// Runs `sql`, limited to `fetch` rows when it is `Some`, as a request that keys the results
+    /// cache the way `key_type` configures it, and returns the cache status and every `id` read.
+    async fn run_ids_query(
+        df: &Arc<DataFusion>,
+        sql: &str,
+        fetch: Option<usize>,
+        key_type: spicepod::component::caching::CacheKeyType,
+    ) -> (CacheStatus, Vec<i64>) {
+        let cache_key_type = if matches!(key_type, spicepod::component::caching::CacheKeyType::Sql)
+        {
+            CacheKeyType::Raw
+        } else {
+            CacheKeyType::Default
+        };
+        let mut builder = QueryBuilder::new(sql, Arc::clone(df));
+        if let Some(rows) = fetch {
+            builder = builder.fetch(rows);
+        }
+        let query = builder.build();
+        create_test_request_context(CacheControl::Cache(cache_key_type), None)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                let cache_status = result.cache_status;
+                let batches = result
+                    .collect_batches()
+                    .await
+                    .expect("query should return records");
+                let ids = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("query should return an Int64 column")
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                (cache_status, ids)
+            })
+            .await
+    }
+
+    /// A `fetch` limit is part of the query: its answer is the first rows in the query's order, and
+    /// the results cache never answers the same SQL without the limit from it, nor the limited
+    /// query from the full answer, under either cache key type. Keyed by plan, the limited answer
+    /// is cached under its own plan; keyed by SQL text, which names the query without the limit,
+    /// it is not cached at all.
+    #[tokio::test]
+    async fn a_fetch_limited_answer_is_cached_apart_from_the_full_answer() {
+        const SQL: &str = "SELECT id FROM fetch_ids ORDER BY id DESC";
+        let first_101: Vec<i64> = (150..=250).rev().collect();
+        let all: Vec<i64> = (1..=250).rev().collect();
+        for key_type in [
+            spicepod::component::caching::CacheKeyType::Plan,
+            spicepod::component::caching::CacheKeyType::Sql,
+        ] {
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: key_type,
+                ..Default::default()
+            }))
+            .await;
+            register_ids_table(&df, "fetch_ids", 250);
+            let keyed_by_plan =
+                matches!(key_type, spicepod::component::caching::CacheKeyType::Plan);
+
+            // The rows first: a status says where an answer came from, the rows whether it is right.
+            let limited_cold = run_ids_query(&df, SQL, Some(101), key_type).await;
+            let full_after_limited = run_ids_query(&df, SQL, None, key_type).await;
+            let full_warm = run_ids_query(&df, SQL, None, key_type).await;
+            let limited_after_full = run_ids_query(&df, SQL, Some(101), key_type).await;
+            assert_eq!(
+                limited_cold.1, first_101,
+                "{key_type:?}: the limited query, cold"
+            );
+            assert_eq!(
+                full_after_limited.1, all,
+                "{key_type:?}: the full query after the limited one"
+            );
+            assert_eq!(full_warm.1, all, "{key_type:?}: the full query, warm");
+            assert_eq!(
+                limited_after_full.1, first_101,
+                "{key_type:?}: the limited query after the full one"
+            );
+
+            // Keyed by plan, the limited answer is cached under its own plan; keyed by SQL text, it
+            // is not cached at all.
+            let limited_status = |warm| match (keyed_by_plan, warm) {
+                (true, false) => CacheStatus::CacheMiss,
+                (true, true) => CacheStatus::CacheHit,
+                (false, _) => CacheStatus::CacheDisabled,
+            };
+            assert_eq!(
+                limited_cold.0,
+                limited_status(false),
+                "{key_type:?}: the limited query, cold"
+            );
+            assert_eq!(
+                full_after_limited.0,
+                CacheStatus::CacheMiss,
+                "{key_type:?}: the full query"
+            );
+            assert_eq!(
+                full_warm.0,
+                CacheStatus::CacheHit,
+                "{key_type:?}: the full query, warm"
+            );
+            assert_eq!(
+                limited_after_full.0,
+                limited_status(true),
+                "{key_type:?}: the limited query, warm"
+            );
+        }
     }
 
     /// Plans with volatile functions (`random()`, `uuid()`) or time functions

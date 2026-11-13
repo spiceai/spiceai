@@ -19,38 +19,6 @@ expression: tools_list
     "parameters": null
   },
   {
-    "description": "Load memories previously saved by the language model.",
-    "name": "load_memory",
-    "parameters": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "last": {
-          "description": "Retrieve memories created in the 'last' interval as a human-readable duration string, e.g. \"1h\", \"2m30s\".",
-          "type": "string"
-        },
-        "limit": {
-          "default": 100,
-          "description": "Maximum number of memories to return.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "offset": {
-          "default": 0,
-          "description": "Number of memories to skip for pagination.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "last"
-      ],
-      "title": "LoadMemoryParams",
-      "type": "object"
-    }
-  },
-  {
     "description": "Return the current UTC date and time as an ISO 8601 timestamp. Call this whenever the model needs the actual current time to compute relative durations, evaluate freshness, or stamp generated content; do not guess or rely on training-data dates. Takes no arguments. Returns a string like '2026-05-06T13:45:00Z'.",
     "name": "mcp_from_spiced__get_current_datetime",
     "parameters": {
@@ -84,39 +52,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Load memories previously saved by the language model.",
-    "name": "mcp_from_spiced__load_memory",
-    "parameters": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "last": {
-          "description": "Retrieve memories created in the 'last' interval as a human-readable duration string, e.g. \"1h\", \"2m30s\".",
-          "type": "string"
-        },
-        "limit": {
-          "default": 100,
-          "description": "Maximum number of memories to return.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "offset": {
-          "default": 0,
-          "description": "Number of memories to skip for pagination.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "last"
-      ],
-      "title": "LoadMemoryParams",
-      "type": "object"
-    }
-  },
-  {
-    "description": "Get a random sample of rows from a Spice.ai dataset",
+    "description": "Return `limit` random rows from `dataset`. Use this to inspect representative example data when realistic row content is needed but no particular ordering or distinctness is required. Returns `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows.",
     "name": "mcp_from_spiced__random_sample",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -141,7 +77,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Sample distinct column values from a Spice.ai dataset",
+    "description": "Return up to `limit` rows from `dataset` chosen to surface distinct values per column. Use this to quickly understand the value distribution and cardinality of columns without running a full SQL query. Specify `cols` to restrict to particular columns; otherwise all columns are sampled. Returns `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows.",
     "name": "mcp_from_spiced__sample_distinct_columns",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -231,7 +167,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.",
+    "description": "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result as `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows and a few thousand tokens. A result cut short has `truncated: true` and a `message`: never compute totals, counts, or averages from a truncated result; aggregate in SQL instead. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.",
     "name": "mcp_from_spiced__sql",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -245,27 +181,6 @@ expression: tools_list
         "query"
       ],
       "title": "SqlToolParams",
-      "type": "object"
-    }
-  },
-  {
-    "description": "Record any details from 'user' messages that are worth remembering for future conversations.",
-    "name": "mcp_from_spiced__store_memory",
-    "parameters": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "thoughts": {
-          "description": "A list of details to persist",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "thoughts"
-      ],
-      "title": "StoreMemoryParams",
       "type": "object"
     }
   },
@@ -306,7 +221,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Get top N samples from a Spice.ai dataset based on a specified ordering",
+    "description": "Return the first `limit` rows from `dataset` after applying `order_by`. Use this to inspect the largest, smallest, newest, or oldest rows by a single column. `order_by` must be a single column reference, optionally followed by `ASC` or `DESC` (e.g. `created_at DESC`); reserved-keyword column names are accepted. Returns `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows.",
     "name": "mcp_from_spiced__top_n_sample",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -336,7 +251,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Get a random sample of rows from a Spice.ai dataset",
+    "description": "Return `limit` random rows from `dataset`. Use this to inspect representative example data when realistic row content is needed but no particular ordering or distinctness is required. Returns `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows.",
     "name": "random_sample",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -361,7 +276,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Sample distinct column values from a Spice.ai dataset",
+    "description": "Return up to `limit` rows from `dataset` chosen to surface distinct values per column. Use this to quickly understand the value distribution and cardinality of columns without running a full SQL query. Specify `cols` to restrict to particular columns; otherwise all columns are sampled. Returns `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows.",
     "name": "sample_distinct_columns",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -451,7 +366,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.",
+    "description": "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result as `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows and a few thousand tokens. A result cut short has `truncated: true` and a `message`: never compute totals, counts, or averages from a truncated result; aggregate in SQL instead. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.",
     "name": "sql",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -465,27 +380,6 @@ expression: tools_list
         "query"
       ],
       "title": "SqlToolParams",
-      "type": "object"
-    }
-  },
-  {
-    "description": "Record any details from 'user' messages that are worth remembering for future conversations.",
-    "name": "store_memory",
-    "parameters": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "thoughts": {
-          "description": "A list of details to persist",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "thoughts"
-      ],
-      "title": "StoreMemoryParams",
       "type": "object"
     }
   },
@@ -526,7 +420,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Get top N samples from a Spice.ai dataset based on a specified ordering",
+    "description": "Return the first `limit` rows from `dataset` after applying `order_by`. Use this to inspect the largest, smallest, newest, or oldest rows by a single column. `order_by` must be a single column reference, optionally followed by `ASC` or `DESC` (e.g. `created_at DESC`); reserved-keyword column names are accepted. Returns `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows.",
     "name": "top_n_sample",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
