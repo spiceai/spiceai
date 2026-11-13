@@ -38,6 +38,8 @@ const RUNTIME_REPO: &str = "spiceai";
 pub struct GitHubClient {
     client: Client,
     token: Option<String>,
+    /// The API root, `https://api.github.com` outside tests.
+    api_base: String,
     pub owner: String,
     pub repo: String,
 }
@@ -72,9 +74,18 @@ impl GitHubClient {
         Self {
             client,
             token,
+            api_base: GITHUB_API_BASE.to_string(),
             owner: owner.to_string(),
             repo: repo.to_string(),
         }
+    }
+
+    /// The same client, sending its API requests to `api_base` instead of GitHub.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_api_base(mut self, api_base: &str) -> Self {
+        self.api_base = api_base.trim_end_matches('/').to_string();
+        self
     }
 
     /// Whether requests carry a GitHub token.
@@ -254,9 +265,16 @@ impl GitHubClient {
     #[must_use]
     pub fn releases_url(&self) -> String {
         format!(
-            "{GITHUB_API_BASE}/repos/{}/{}/releases",
-            self.owner, self.repo
+            "{}/repos/{}/{}/releases",
+            self.api_base, self.owner, self.repo
         )
+    }
+
+    /// The API URL of the release with tag `tag`. The tag is one path segment, escaped, because
+    /// it comes from the command line.
+    #[must_use]
+    pub fn release_by_tag_url(&self, tag: &str) -> String {
+        format!("{}/tags/{}", self.releases_url(), urlencoding::encode(tag))
     }
 
     /// Get the latest release API URL.

@@ -70,16 +70,16 @@ pub async fn get_latest_release(client: &GitHubClient) -> Result<RepoRelease, Gi
 }
 
 /// Get a specific release by version tag.
+///
+/// Looks the tag up directly. Listing `/releases` and searching it would see only the first
+/// page, the newest 30 releases, so an older version would read as missing.
 pub async fn get_release(client: &GitHubClient, version: &str) -> Result<RepoRelease, GitHubError> {
-    let url = client.releases_url();
-    let releases: Vec<RepoRelease> = client.get(&url).await?;
-
-    releases
-        .into_iter()
-        .find(|r| r.tag_name == version)
-        .ok_or(GitHubError::ReleaseNotFound {
+    match client.get(&client.release_by_tag_url(version)).await {
+        Err(GitHubError::Api { status: 404, .. }) => Err(GitHubError::ReleaseNotFound {
             version: version.to_string(),
-        })
+        }),
+        result => result,
+    }
 }
 
 /// Download a release asset and extract it to a directory.
@@ -553,6 +553,83 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const ASSET_NAME: &str = "spiced_linux_x86_64.tar.gz";
+
+    /// The JSON GitHub returns for a published release with no assets.
+    fn release_json(tag: &str) -> serde_json::Value {
+        serde_json::json!({
+            "url": "", "html_url": "", "assets_url": "", "tag_name": tag, "name": tag,
+            "draft": false, "prerelease": false, "created_at": "2026-03-12T08:23:30Z",
+            "published_at": "2026-03-12T08:23:30Z", "assets": [],
+        })
+    }
+
+    fn runtime_client(server: &MockServer) -> GitHubClient {
+        GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri())
+    }
+
+    /// `GET /releases` returns 30 releases by default. A tag older than the newest 30 is not on
+    /// that page, which is how `spice install v1.11.4` failed once v2.4.2 was published.
+    #[tokio::test]
+    async fn get_release_finds_a_release_older_than_the_first_page_of_the_list() {
+        let server = MockServer::start().await;
+        let newest: Vec<serde_json::Value> = (0..30)
+            .map(|patch| release_json(&format!("v2.4.{patch}")))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(newest))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v1.11.4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_json("v1.11.4")))
+            .mount(&server)
+            .await;
+
+        let release = get_release(&runtime_client(&server), "v1.11.4")
+            .await
+            .expect("an existing release is found by its tag");
+        assert_eq!(release.tag_name, "v1.11.4");
+    }
+
+    #[tokio::test]
+    async fn get_release_reports_a_missing_tag_as_release_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v9.9.9"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(r#"{"message":"Not Found"}"#))
+            .mount(&server)
+            .await;
+
+        let error = get_release(&runtime_client(&server), "v9.9.9")
+            .await
+            .expect_err("a missing tag is an error");
+        assert!(
+            matches!(&error, GitHubError::ReleaseNotFound { version } if version == "v9.9.9"),
+            "expected ReleaseNotFound, got {error}"
+        );
+    }
+
+    /// The version comes from the command line, so it stays one path segment.
+    #[tokio::test]
+    async fn get_release_escapes_the_tag_as_one_path_segment() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher(
+                "/repos/spiceai/spiceai/releases/tags/v1%2F..%2F..%2Fother%3Fx%3D1",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(release_json("v1/../../other?x=1")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let release = get_release(&runtime_client(&server), "v1/../../other?x=1")
+            .await
+            .expect("the escaped tag is requested");
+        assert_eq!(release.tag_name, "v1/../../other?x=1");
+    }
 
     /// Build a gzipped tar holding a single entry, as a release asset would.
     fn tar_gz_containing(entry_name: &str, contents: &[u8]) -> Vec<u8> {
