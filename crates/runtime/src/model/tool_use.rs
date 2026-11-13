@@ -1307,8 +1307,7 @@ mod tests {
         ChatCompletionAllowedTools, ChatCompletionAllowedToolsChoice,
         ChatCompletionMessageToolCall, ChatCompletionNamedToolChoiceCustom,
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, CustomName,
-        FunctionCall,
+        ChatCompletionRequestUserMessageArgs, CustomName, FunctionCall,
     };
     use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
     use runtime_request_context::Protocol;
