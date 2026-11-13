@@ -435,6 +435,19 @@ pub fn default_slot_name(dataset_name: &str) -> String {
     slot_name_for(dataset_name, util::instance_id::instance_id())
 }
 
+/// The default slot name for `dataset_name` whose acceleration instances share
+/// through `shared_location`, when they do: one slot for every instance on the
+/// location, consumed by whichever writes the dataset, so adding a replica adds
+/// no slot and a takeover resumes the slot its predecessor consumed. Without a
+/// shared location, [`default_slot_name`]: a slot for this instance.
+#[must_use]
+pub fn default_slot_name_on(dataset_name: &str, shared_location: Option<&str>) -> String {
+    match shared_location {
+        Some(location) => slot_name_for(dataset_name, &format!("location:{location}")),
+        None => default_slot_name(dataset_name),
+    }
+}
+
 /// Build the slot name for `dataset_name` scoped to `instance_id` (the value
 /// that distinguishes one spiced instance from another sharing the same source
 /// database). Factored out as a pure function — the instance identity is passed
@@ -1190,6 +1203,26 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         // 63-byte cap survives long slot names.
         let long = "p".repeat(120);
         assert!(publication_name_for_slot(&long).len() <= PG_IDENTIFIER_MAX_BYTES);
+    }
+
+    #[test]
+    fn instances_sharing_a_location_share_one_default_slot() {
+        let location = "s3://bucket/spice";
+        // Every instance on the location, and every restart, names the same slot.
+        let first = default_slot_name_on("orders", Some(location));
+        assert_eq!(first, default_slot_name_on("orders", Some(location)));
+        assert_eq!(first, slot_name_for("orders", "location:s3://bucket/spice"));
+        assert_ne!(
+            first,
+            default_slot_name("orders"),
+            "a shared slot is not this instance's own"
+        );
+        // Another location, or another dataset, is another slot.
+        assert_ne!(first, default_slot_name_on("orders", Some("s3://other/spice")));
+        assert_ne!(first, default_slot_name_on("lineitem", Some(location)));
+        // Without a shared location: this instance's slot, as before.
+        assert_eq!(default_slot_name_on("orders", None), default_slot_name("orders"));
+        assert!(first.len() <= PG_IDENTIFIER_MAX_BYTES, "{first}");
     }
 
     #[test]

@@ -403,10 +403,14 @@ impl DataWriteGate {
                 self.state.generation.fetch_add(1, Ordering::AcqRel);
             }
             self.state.allowed.store(true, Ordering::Release);
-            self.state.changes.send_if_modified(|allowed| !std::mem::replace(allowed, true));
+            self.state
+                .changes
+                .send_if_modified(|allowed| !std::mem::replace(allowed, true));
         } else {
             self.state.allowed.store(false, Ordering::Release);
-            self.state.changes.send_if_modified(|allowed| std::mem::replace(allowed, false));
+            self.state
+                .changes
+                .send_if_modified(|allowed| std::mem::replace(allowed, false));
         }
     }
 }
