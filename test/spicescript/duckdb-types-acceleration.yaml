@@ -236,7 +236,7 @@ steps:
   # nanoseconds in Spice, which cannot reach 9999.
   - assert-files: { contains: '(^|/)\.spice/data/far/.*\.vortex$' }
     only: cayenne
-  - assert-files: { contains: '(^|/)\.spice/data/cayenne/v1/datasets/far-[^/]+/data/.*\.vortex$' }
+  - assert-files: { contains: '(^|/)\.spice/data/cayenne/v1/datasets/far-[^/]+/data/.*\.vortex$', lacks-dirs: ['(^|/)\.spice/data/far/'] }
     only: cayenne-object-native
     cluster: false
   - assert-files: { contains: '(^|/)\.spice/data/far/.*\.vortex$' }
