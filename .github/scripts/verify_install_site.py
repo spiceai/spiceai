@@ -241,7 +241,14 @@ def read_sums(text):
         m = SHA256_LINE.match(line)
         if not m:
             raise VerifyError(f"Unreadable line in {SUMS_ASSET}: '{line}'")
-        sums[m.group(2)] = m.group(1)
+        sha, name = m.groups()
+        # `sha256sum --check` checks every line, so a second line for a name
+        # must not replace the first, which may be the one that fails.
+        if name in sums:
+            raise VerifyError(f"{SUMS_ASSET} lists {name} more than once.")
+        if os.path.basename(name) != name:
+            raise VerifyError(f"{SUMS_ASSET} lists '{name}', which is not a file name.")
+        sums[name] = sha
     return sums
 
 

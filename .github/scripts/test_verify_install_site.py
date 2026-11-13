@@ -353,6 +353,24 @@ class VerifyInstallSiteTest(unittest.TestCase):
             ],
         )
 
+    def test_sha256sums_that_lists_a_script_twice(self):
+        # sha256sum --check fails on the first line; the second must not hide it.
+        self.world.add_release(SIGNED, SIGNED_COMMIT, signed=True)
+        self.world.serve(SIGNED)
+        path = f"/dl/{SIGNED}/SHA256SUMS"
+        good = self.world.downloads[path].decode()
+        line = next(entry for entry in good.splitlines() if entry.endswith("  install.sh"))
+        self.world.downloads[path] = (f"{'0' * 64}  install.sh\n" + good).encode()
+        with tempfile.TemporaryDirectory() as out_dir:
+            code, out = self.main("--out-dir", out_dir)
+            self.assertEqual(code, 1, out)
+            self.assertEqual(os.listdir(out_dir), [])
+        self.assertIn(line, good)
+        self.assertEqual(
+            self.verify().problems,
+            ["SHA256SUMS of v2.5.0 is unreadable: SHA256SUMS lists install.sh more than once."],
+        )
+
     def test_release_from_v2_5_0_on_without_sha256sums(self):
         self.world.add_release(SIGNED, SIGNED_COMMIT, signed=False)
         self.world.serve(SIGNED)
