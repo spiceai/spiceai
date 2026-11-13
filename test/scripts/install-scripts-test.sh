@@ -858,6 +858,7 @@ JSON
 #                   unreachable (the API lists SHA256SUMS, but downloading it fails)
 #   OFFLINE_DIGEST  match (default), mismatch, null, or fail (the API request fails)
 #   OFFLINE_GH      loggedout (default), pass, or fail (the attestation check)
+#   OFFLINE_HASH    ok (default), or none (sha256sum, shasum and openssl print nothing and fail)
 # Usage: run_installer_offline <script> <binary> <asset> <home> [VAR=value...], where the
 # VAR=value pairs go into the installer's environment. The log is $home.log.
 run_installer_offline() {
@@ -924,6 +925,12 @@ case "\$1 \$2" in
 esac
 STUB
     chmod +x "$stubs/curl" "$stubs/sudo" "$stubs/gh"
+    if [ "${OFFLINE_HASH:-ok}" = none ]; then
+        for tool in sha256sum shasum openssl; do
+            printf '#!/bin/sh\nexit 1\n' > "$stubs/$tool"
+            chmod +x "$stubs/$tool"
+        done
+    fi
     : > "$home.sudo"
     : > "$home.gh"
     env -i HOME="$home" PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin" SHELL=/bin/bash "$@" \
@@ -1101,6 +1108,48 @@ test_verify_fetch_retries_a_transient_error_with_wget() {
 
 test_verify_fetch_does_not_retry_a_404_with_wget() {
     check_verify_fetch wget /missing fail 1
+}
+
+# With no working hash tool, the opt-out can install an asset nothing can check, but never one
+# from a release that publishes SHA256SUMS, and never one SHA256SUMS does not list.
+test_install_sh_opt_out_without_a_hash_tool_does_not_install_an_unlisted_asset() {
+    local home="$TEST_TMP_DIR/nohash-unlisted"
+    mkdir -p "$home"
+    if OFFLINE_HASH=none OFFLINE_SUMS=unlisted run_install_offline "$home" SPICE_INSTALL_ALLOW_UNVERIFIED=1; then
+        cat "$home.log"
+        return 1
+    fi
+    ! installed_cli "$home" && log_has "$home" "does not list it"
+}
+
+test_install_sh_opt_out_without_a_hash_tool_does_not_skip_sha256sums() {
+    local home="$TEST_TMP_DIR/nohash-signed"
+    mkdir -p "$home"
+    if OFFLINE_HASH=none run_install_offline "$home" SPICE_INSTALL_ALLOW_UNVERIFIED=1; then
+        cat "$home.log"
+        return 1
+    fi
+    ! installed_cli "$home" &&
+        log_has "$home" "release v0.0.0 publishes SHA256SUMS, but none of sha256sum, shasum or openssl is installed"
+}
+
+test_install_sh_opt_out_without_a_hash_tool_installs_an_unsigned_release() {
+    local home="$TEST_TMP_DIR/nohash-unsigned"
+    mkdir -p "$home"
+    OFFLINE_HASH=none OFFLINE_SUMS=none run_install_offline "$home" SPICE_INSTALL_ALLOW_UNVERIFIED=1 ||
+        { cat "$home.log"; return 1; }
+    installed_cli "$home" &&
+        log_has "$home" "unverified, because SPICE_INSTALL_ALLOW_UNVERIFIED=1 is set: none of sha256sum, shasum or openssl is installed"
+}
+
+# GNU sha256sum prefixes its output with a backslash when the file name has one.
+test_install_sh_verifies_with_a_backslash_in_tmpdir() {
+    local home="$TEST_TMP_DIR/backslash"
+    local tmp="$home/tmp\\dir"
+    mkdir -p "$home" "$tmp"
+    run_install_offline "$home" TMPDIR="$tmp" || { cat "$home.log"; return 1; }
+    installed_cli "$home" &&
+        log_has "$home" "Verified the sha256 of spice_$(host_os)_$(host_arch).tar.gz against the SHA256SUMS of release v0.0.0."
 }
 
 # Fails the test, printing the log, unless the log contains a line.
@@ -1529,6 +1578,10 @@ run_all_tests() {
     run_test "install-spiced.sh: falls back to the GitHub asset digest" test_install_spiced_sh_falls_back_to_the_github_digest
     run_test "sha256 falls back to openssl" test_sha256_falls_back_to_openssl
     run_test "sha256 fails without a hash tool" test_sha256_fails_without_a_tool
+    run_test "install.sh: opt-out without a hash tool does not install an unlisted asset" test_install_sh_opt_out_without_a_hash_tool_does_not_install_an_unlisted_asset
+    run_test "install.sh: opt-out without a hash tool does not skip SHA256SUMS" test_install_sh_opt_out_without_a_hash_tool_does_not_skip_sha256sums
+    run_test "install.sh: opt-out without a hash tool installs an unsigned release" test_install_sh_opt_out_without_a_hash_tool_installs_an_unsigned_release
+    run_test "install.sh: verifies with a backslash in TMPDIR" test_install_sh_verifies_with_a_backslash_in_tmpdir
     echo ""
 
     # Error Handling

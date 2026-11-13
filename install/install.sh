@@ -160,13 +160,15 @@ verifyFetch() {
 }
 
 # Prints the sha256 of a file with sha256sum, shasum or openssl, whichever is installed.
+# The file goes in on stdin: given a path with a backslash in it, sha256sum and shasum prefix
+# their output with one, and the parsed sha256 would never match.
 sha256Of() {
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{ print $1 }'
+        sha256sum < "$1" | awk '{ print $1 }'
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | awk '{ print $1 }'
+        shasum -a 256 < "$1" | awk '{ print $1 }'
     elif command -v openssl >/dev/null 2>&1; then
-        openssl dgst -sha256 "$1" | awk '{ print $NF }'
+        openssl dgst -sha256 < "$1" | awk '{ print $NF }'
     else
         return 1
     fi
@@ -193,9 +195,9 @@ verifyDownload() {
     local reason=""
     local attested=false
 
-    if ! actual=$(sha256Of "$file") || [ -z "$actual" ]; then
-        reason="none of sha256sum, shasum or openssl is installed"
-    elif verifyFetch "$download_url" "$scratch/SHA256SUMS" 2>/dev/null; then
+    # What the release records comes first, so that an asset its SHA256SUMS does not list, or a
+    # release with SHA256SUMS, is refused even when no hash tool works.
+    if verifyFetch "$download_url" "$scratch/SHA256SUMS" 2>/dev/null; then
         attested=true
         source="SHA256SUMS of release $tag"
         expected=$(awk -v f="$asset" '$2 == f || $2 == "*" f { print $1; exit }' "$scratch/SHA256SUMS")
@@ -225,6 +227,16 @@ verifyDownload() {
         fi
     else
         reason="the SHA256SUMS of release $tag could not be downloaded, and the GitHub API request for its asset sha256 failed (set GITHUB_TOKEN if the API rate limit was exceeded)"
+    fi
+
+    if [ -z "$reason" ] && { ! actual=$(sha256Of "$file") || [ -z "$actual" ]; }; then
+        # A release with SHA256SUMS can always be checked, so the opt-out does not cover it.
+        if [ "$attested" == "true" ]; then
+            echo "Cannot verify $asset: release $tag publishes SHA256SUMS, but none of sha256sum, shasum or openssl is installed."
+            echo "Install one of them and run the installer again. Nothing was installed."
+            exit 1
+        fi
+        reason="none of sha256sum, shasum or openssl is installed"
     fi
 
     if [ -n "$reason" ]; then
