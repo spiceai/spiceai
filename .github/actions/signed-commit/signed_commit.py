@@ -45,9 +45,11 @@ rebase of the run's own changes. A file the branch also changed since REV is a
 conflict (exit 3), unless the branch already has this run's content.
 
 The API takes every file's content inline in one request, so a large change is
-split into commits of at most `--max-commit-bytes` of encoded content. Those are
-built on a temporary branch and the target branch is moved to the last one only
-when all of them exist, so the branch never shows part of the change.
+split into commits of at most `--max-commit-bytes` of encoded content. A split
+change, and every commit to a new branch, is built on a temporary branch of the
+run's own; the target branch is created or fast-forwarded to the last commit only
+when all of them exist. The branch never shows part of a change, and a failed
+commit never leaves, or has to delete, a target branch another run may share.
 
 When the change cannot be published, `--patch-dir DIR` keeps it: DIR receives
 `changes.patch`, a `git format-patch` of one commit on the parent, and the step
@@ -467,28 +469,24 @@ def _create_branch(api, branch: str, sha: str) -> None:
 
 
 def _commit_chunks(api, git, req, parent, tip, chunks, headline, body, attempt, log) -> str:
-    if len(chunks) == 1:
-        if tip is not None:
-            return api.create_commit(req.branch, parent, headline, body, chunks[0], git.blob_bytes)
-        _create_branch(api, req.branch, parent)
-        try:
-            return api.create_commit(req.branch, parent, headline, body, chunks[0], git.blob_bytes)
-        except ApiError:
-            # Leave no branch behind that holds nothing but its base.
-            try:
-                if api.branch_tip(req.branch) == parent:
-                    api.delete_branch(req.branch)
-            except ApiError as err:
-                log(f"::warning::Could not delete {req.branch}, created for a commit that failed: {err}")
-            raise
-    # Build every part on a temporary branch, then move the branch in one step.
+    if tip is not None and len(chunks) == 1:
+        # expectedHeadOid makes this one atomic step: the branch moves to the new commit,
+        # or the request fails and the branch is untouched.
+        return api.create_commit(req.branch, parent, headline, body, chunks[0], git.blob_bytes)
+    # A new branch, or a change in several parts: build on a temporary branch of this
+    # run's own, then create or fast-forward the target only once every commit exists.
+    # A failure leaves the target as it was, so there is never a target branch to clean
+    # up, and no cleanup can delete a commit another run published to it meanwhile.
     temp = f"{TEMP_BRANCH_PREFIX}/{req.run_id or os.getpid()}-{attempt}-{random.randrange(1 << 32):08x}"
     _create_branch(api, temp, parent)
     try:
         sha = parent
         for i, chunk in enumerate(chunks, 1):
-            part = f"Part {i} of {len(chunks)} of one change, split to fit the API's request size."
-            sha = api.create_commit(temp, sha, headline, f"{body}\n\n{part}".strip(), chunk, git.blob_bytes)
+            message = body
+            if len(chunks) > 1:
+                part = f"Part {i} of {len(chunks)} of one change, split to fit the API's request size."
+                message = f"{body}\n\n{part}".strip()
+            sha = api.create_commit(temp, sha, headline, message, chunk, git.blob_bytes)
         if tip is None:
             _create_branch(api, req.branch, sha)
         else:

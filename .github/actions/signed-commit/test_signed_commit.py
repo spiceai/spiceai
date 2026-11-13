@@ -62,6 +62,7 @@ class FakeGitHub:
         self.fail_create_branch = False
         self.fail_commit_on_call = None
         self.before_commit = None
+        self.before_delete = None
 
     def _ref(self, branch):
         out = subprocess.run(
@@ -95,6 +96,9 @@ class FakeGitHub:
 
     def delete_branch(self, branch):
         self.calls.append(("delete_branch", branch))
+        if self.before_delete:
+            hook, self.before_delete = self.before_delete, None
+            hook()
         git(self.server, "update-ref", "-d", f"refs/heads/{branch}")
 
     def create_commit(self, branch, expected_head, headline, body, changes, read_blob):
@@ -237,6 +241,25 @@ class SignedCommitTest(unittest.TestCase):
         with self.assertRaises(sc.ApiError):
             self.publish()
         self.assertEqual(self.api.branches(), ["trunk"])
+
+    def test_cleanup_after_a_failed_commit_never_deletes_another_runs_commit(self):
+        # Another run commits to the same new branch just as this run cleans up after a
+        # failed commit. Its commit must survive: the target branch is never deleted.
+        self.write("snapshots/q1.snap", "q1 from this run\n")
+        self.api.fail_commit_on_call = 1
+        other = []
+        self.api.before_delete = lambda: other.append(
+            self.server_branch_commit("snap/1", {"snapshots/q5.snap": "q5 from another run\n"}))
+        try:
+            self.publish()
+        except sc.ApiError:
+            pass
+        self.assertEqual(len(other), 1)
+        self.assertIn("snap/1", self.api.branches(), "the other run's branch was deleted")
+        tip = git(self.server, "rev-parse", "snap/1")
+        self.assertEqual(
+            subprocess.run(["git", "merge-base", "--is-ancestor", other[0], tip], cwd=self.server).returncode, 0,
+            "the other run's commit is no longer on the branch")
 
     # ------------------------------------------------------------------ existing branch
 
