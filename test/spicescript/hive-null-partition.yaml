@@ -1,0 +1,51 @@
+name: hive-null-partition
+description: >
+  A Hive-partitioned file dataset reads the rows under the
+  `__HIVE_DEFAULT_PARTITION__` directory with NULL in the partition column,
+  which is nullable, federated and in a Cayenne and a DuckDB file acceleration
+  (apache/datafusion#26310). The expected rows follow Hive's definition of the
+  marker.
+
+sources:
+  lake: { kind: files }
+
+variants:
+  federated: {}
+  cayenne: { datasets: { h: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  duckdb: { datasets: { h: { acceleration: { enabled: true, engine: duckdb, mode: file } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: hive-null-partition
+  datasets:
+    - from: 'file://${sources.lake.path}/h/'
+      name: h
+      params: { file_format: parquet, hive_partitioning_enabled: true }
+
+steps:
+  - generate:
+      lake:
+        table: h/year=2024
+        rows: 3
+        seed: 1
+        columns: [{ name: id, sequence: 1 }]
+  - generate:
+      lake:
+        table: h/year=__HIVE_DEFAULT_PARTITION__
+        rows: 2
+        seed: 2
+        columns: [{ name: id, sequence: 100 }]
+  - start: {}
+  - query: SELECT count(*) AS n FROM h
+    expect: { rows: [['5']] }
+  - query: SELECT count(*) AS n FROM h WHERE year IS NULL
+    expect: { rows: [['2']] }
+  - query: SELECT count(*) AS n FROM h WHERE year = '__HIVE_DEFAULT_PARTITION__'
+    expect: { rows: [['0']] }
+  - query: SELECT id, year FROM h ORDER BY id LIMIT 5
+    expect: { rows: [['1', '2024'], ['2', '2024'], ['3', '2024'], ['100', null], ['101', null]] }
+  - query: SELECT count(year) AS c, min(year) AS lo, max(year) AS hi FROM h
+    expect: { rows: [['3', '2024', '2024']] }
+  - query: SELECT is_nullable FROM information_schema.columns WHERE table_name = 'h' AND column_name = 'year'
+    expect: { rows: [['YES']] }

@@ -1,0 +1,72 @@
+name: hive-null-partition-upgrade
+description: >
+  A file acceleration of a Hive-partitioned dataset written by the 2.4 release,
+  which reads the `__HIVE_DEFAULT_PARTITION__` directory as that literal string
+  in a NOT NULL partition column, is served by the binary under test, and a
+  refresh on the new binary replaces those rows with NULL in a nullable column
+  (apache/datafusion#26310).
+
+from: 2.4.x
+
+sources:
+  lake: { kind: files }
+
+variants:
+  cayenne:
+    datasets:
+      h:
+        acceleration:
+          enabled: true
+          engine: cayenne
+          mode: file
+          refresh_mode: full
+          refresh_check_interval: 1h
+          params: { cayenne_file_path: '${instance.dir}/h', cayenne_metadata_dir: '${instance.dir}/meta' }
+  duckdb:
+    datasets:
+      h:
+        acceleration:
+          enabled: true
+          engine: duckdb
+          mode: file
+          refresh_mode: full
+          refresh_check_interval: 1h
+          params: { duckdb_file: '${instance.dir}/h.db' }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: hive-null-partition-upgrade
+  datasets:
+    - from: 'file://${sources.lake.path}/h/'
+      name: h
+      params: { file_format: parquet, hive_partitioning_enabled: true }
+
+steps:
+  - generate:
+      lake:
+        table: h/year=2024
+        rows: 3
+        seed: 1
+        columns: [{ name: id, sequence: 1 }]
+  - generate:
+      lake:
+        table: h/year=__HIVE_DEFAULT_PARTITION__
+        rows: 2
+        seed: 2
+        columns: [{ name: id, sequence: 100 }]
+  - start: {}
+  # On the release: recorded, not checked; the release reads the marker as a string.
+  - query: SELECT id, year FROM h ORDER BY id LIMIT 5
+    expect: {}
+  - upgrade: {}
+  - query: SELECT count(*) AS n FROM h
+    expect: { rows: [['5']] }
+  - refresh: h
+  - query: SELECT count(*) AS n FROM h WHERE year IS NULL
+    expect: { rows: [['2']] }
+    eventually: 60s
+  - query: SELECT id, year FROM h ORDER BY id LIMIT 5
+    expect: { rows: [['1', '2024'], ['2', '2024'], ['3', '2024'], ['100', null], ['101', null]] }
+  - query: SELECT is_nullable FROM information_schema.columns WHERE table_name = 'h' AND column_name = 'year'
+    expect: { rows: [['YES']] }
