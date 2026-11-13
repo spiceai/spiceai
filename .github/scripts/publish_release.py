@@ -5,10 +5,10 @@ Used by publish_release.yml:
   find-build  Prints the id of the latest successful release build of a
               version, dispatched on a branch at its head or at another
               commit of the branch, and the commit it built.
-  publish     Attaches the files listed in SHA256SUMS to the tag's draft
-              release (created when there is none), checks every asset against
-              its sha256, and publishes the release at the built commit, which
-              creates the tag there.
+  publish     Attaches the files listed in SHA256SUMS, and SHA256SUMS itself,
+              to the tag's draft release (created when there is none), checks
+              every asset against its sha256, and publishes the release at the
+              built commit, which creates the tag there.
 
 The tag is created only by publishing.
 A published release is never changed. An asset that already exists is accepted
@@ -40,6 +40,9 @@ STABLE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(-enterprise)?$")
 SHA256_LINE = re.compile(r"^([0-9a-f]{64}) [ *](\S+)$")
 
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+# The manifest's own asset name. Installers and users check downloads against it.
+SUMS_ASSET = "SHA256SUMS"
 
 
 class PublishError(Exception):
@@ -174,6 +177,27 @@ def require_tag_free_or_at(api, repo, tag, sha):
             f"Tag {tag} already points at {existing}, not at {sha}, the commit this run releases. "
             f"A release tag is never moved."
         )
+
+
+def release_files(directory, sums_path):
+    """{asset name: (path, sha256)} for every file sums_path lists, and for the manifest itself.
+
+    Every listed file must be in directory with the sha256 the manifest records.
+    """
+    sums = read_sums(sums_path)
+    if SUMS_ASSET in sums:
+        raise PublishError(f"{sums_path} lists {SUMS_ASSET}, its own asset name")
+    files = {}
+    for name, sha in sums.items():
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            raise PublishError(f"{name} is listed in {sums_path} but was not downloaded")
+        actual = sha256_file(path)
+        if actual != sha:
+            raise PublishError(f"{name} has sha256 {actual}, but the build recorded {sha}")
+        files[name] = (path, sha)
+    files[SUMS_ASSET] = (sums_path, sha256_file(sums_path))
+    return files
 
 
 def read_sums(path):
@@ -398,16 +422,7 @@ def main(argv=None):
             write_output("commit", commit)
             return 0
 
-        sums = read_sums(args.sums)
-        files = {}
-        for name, sha in sums.items():
-            path = os.path.join(args.dir, name)
-            if not os.path.isfile(path):
-                raise PublishError(f"{name} is listed in {args.sums} but was not downloaded")
-            actual = sha256_file(path)
-            if actual != sha:
-                raise PublishError(f"{name} has sha256 {actual}, but the build recorded {sha}")
-            files[name] = (path, sha)
+        files = release_files(args.dir, args.sums)
         notes = None
         if args.notes_file and os.path.isfile(args.notes_file):
             with open(args.notes_file, encoding="utf-8") as f:
