@@ -18,11 +18,6 @@ limitations under the License.
 //! metastore is not opened as if nothing happened. Opening one used to serve
 //! the rows of whatever files were left, or none, with nothing logged.
 
-#![expect(
-    clippy::expect_used,
-    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
-)]
-
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -47,28 +42,25 @@ use runtime_acceleration::{
 
 const ROWS: i64 = 1000;
 
-/// The Cayenne metastores every check runs against: the SQLite metastore, and
-/// the object-native one `runtime.params.cayenne_vnext: enabled` selects.
+/// The Cayenne metastore every check runs against: the SQLite metastore, whose
+/// table reopens over its local data directory and checks the files it records
+/// there. With `runtime.params.cayenne_vnext: enabled` a dataset's data files are
+/// in `runtime.state.location` and are named, not listed, so a missing or truncated
+/// file fails the query that reads it instead of the open; `cayenne`'s
+/// `object_native_data_test` covers that (`a_missing_data_file_is_an_error_not_fewer_rows`,
+/// `a_truncated_data_file_is_an_error_not_fewer_rows`,
+/// `writes_scan_their_committed_files_and_reopen_from_the_store`).
 #[derive(Clone, Copy, Debug)]
 enum Metastore {
     Sqlite,
-    ObjectNative,
 }
 
-const METASTORES: [Metastore; 2] = [Metastore::Sqlite, Metastore::ObjectNative];
+const METASTORES: [Metastore; 1] = [Metastore::Sqlite];
 
 /// The app the acceleration belongs to, with the flag set for `metastore`.
 fn app(metastore: Metastore) -> app::App {
-    let builder = app::AppBuilder::new("test");
     match metastore {
-        Metastore::Sqlite => builder.build(),
-        Metastore::ObjectNative => builder
-            .with_runtime_params(
-                [("cayenne_vnext".to_string(), "enabled".to_string())]
-                    .into_iter()
-                    .collect(),
-            )
-            .build(),
+        Metastore::Sqlite => app::AppBuilder::new("test").build(),
     }
 }
 
@@ -152,11 +144,9 @@ async fn store(dir: &Path, metastore: Metastore) {
     .await
     .expect("load");
     assert_eq!(count(&ctx).await, ROWS);
-    // The flag selected the metastore under test: the object-native catalog keeps
-    // its head log in `{metadata_dir}/object_native`, and SQLite creates none.
-    assert_eq!(
-        dir.join("metadata").join("object_native").is_dir(),
-        matches!(metastore, Metastore::ObjectNative),
+    // The SQLite metastore is the one under test: it creates no object-native catalog.
+    assert!(
+        !dir.join("metadata").join("object_native").is_dir(),
         "{metastore:?}: wrong metastore under {}",
         dir.display()
     );

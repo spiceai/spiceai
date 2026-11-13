@@ -90,6 +90,7 @@ fn create_test_schema() -> Arc<Schema> {
 fn connection_string_for_backend(backend: BackendType, db_path: &std::path::Path) -> String {
     match backend {
         BackendType::Sqlite => format!("sqlite://{}", db_path.to_string_lossy()),
+        BackendType::ObjectNative => panic!("a shared metastore here is a SQLite catalog file"),
     }
 }
 

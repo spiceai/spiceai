@@ -3,10 +3,16 @@ description: >
   Append refresh into Cayenne on a short interval, which holds new rows in
   memory by default before they reach files: rows appended just before
   spiced is killed are there after it restarts, exactly once, with the
-  default in-memory durability and with `cayenne_cdc_durability: file`.
+  default in-memory durability and with `cayenne_cdc_durability: file`. With
+  object-native data, the appended rows are in the state location, and an
+  instance that loses its directory serves them while the source is down, then
+  appends again once it is back.
 
 sources:
   src: { kind: postgres }
+  # The state locations of the object-native-s3 variants.
+  lake: { kind: rustfs }
+  slow-lake: { kind: rustfs, latency: 20ms }
 
 variants:
   memory-durability: {}
@@ -18,6 +24,36 @@ variants:
   object-native-file-durability:
     spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
     datasets: { events: { acceleration: { params: { cayenne_cdc_durability: file } } } }
+  # Object-native data (#16131): data files in the state location, which an
+  # instance that loses its directory serves again without the source.
+  object-native-local: object-native-local
+  # `object-native-s3` (variants.yaml), with appends staged in files and
+  # compacted every 2 s once 4 files are waiting. Inline storage is off: by
+  # default a small append is held in the metastore until 64 of them (or 10,000
+  # rows, or 8 MiB) are waiting, which this script never reaches, so no append
+  # would reach a data file and there would be nothing to compact.
+  object-native-s3:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+    datasets:
+      events:
+        acceleration:
+          params:
+            cayenne_cdc_durability: file
+            cayenne_compaction_background_interval_ms: '2000'
+            cayenne_compaction_trigger_files: '4'
+            cayenne_inline_max_rows: '0'
+  object-native-s3-latency: object-native-s3-latency
 
 spicepod:
   version: v1
@@ -74,3 +110,104 @@ steps:
   - query: SELECT * FROM events
     eventually: 30s
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
+
+  # Object-native data (#16131): the dataset's folder is in the state location,
+  # and nothing is at a local `s3:` path. Appended rows sit in the memory tier
+  # and its seals, which are in the dataset's log there, until a checkpoint
+  # writes data files; the wipe below shows they are served from the location.
+  - assert-files: { contains: '^state/cayenne/v1/datasets/events-[^/]+/data/' }
+    only: object-native-local
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/events-, contains: /head, min: 1 }
+    only: object-native-s3
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/events-, contains: /head, min: 1 }
+    only: object-native-s3-latency
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: &object-native-data [object-native-local, object-native-s3, object-native-s3-latency]
+
+  # Killed, and its directory lost: the rows come back from the location
+  # alone, since the source is down and cannot supply them again.
+  - query: SELECT * FROM events
+    id: before-wipe
+    only: *object-native-data
+  - kill-spiced: {}
+    only: *object-native-data
+  - wipe-instance-dir: { keep: [state] }
+    only: *object-native-data
+  - assert-files: { lacks: '^\.spice/' }
+    only: *object-native-data
+  - stop-source: src
+  - start: { ready: false }
+    only: *object-native-data
+  - query: SELECT * FROM events
+    expect: { same-as: before-wipe }
+    eventually: 60s
+    only: *object-native-data
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: *object-native-data
+  - start-source: src
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1701, 1800) i" }
+    only: *object-native-data
+  - query: SELECT * FROM events
+    eventually: 60s
+    only: *object-native-data
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
+    only: *object-native-data
+
+  # With the data in an S3 state location: killed four times while appends are
+  # staged, each time the staging WAL is found and replayed, so every row is
+  # there exactly once; compaction commits on the object store and never falls
+  # back to rewriting the whole snapshot. Run last, on one variant, so its
+  # extra rows are in no comparison between variants.
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1801, 1850) i" }
+    only: object-native-s3
+  - kill-spiced: {}
+    only: object-native-s3
+  - start: {}
+    only: object-native-s3
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, max(id) AS m FROM events
+    eventually: 30s
+    only: object-native-s3
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1851, 1900) i" }
+    only: object-native-s3
+  - kill-spiced: {}
+    only: object-native-s3
+  - start: {}
+    only: object-native-s3
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, max(id) AS m FROM events
+    eventually: 30s
+    only: object-native-s3
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1901, 1950) i" }
+    only: object-native-s3
+  - kill-spiced: {}
+    only: object-native-s3
+  - start: {}
+    only: object-native-s3
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, max(id) AS m FROM events
+    eventually: 30s
+    only: object-native-s3
+  - source-exec: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(1951, 2000) i" }
+    only: object-native-s3
+  - kill-spiced: {}
+    only: object-native-s3
+  - start: {}
+    only: object-native-s3
+  - query: SELECT * FROM events
+    eventually: 30s
+    only: object-native-s3
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, max(id) AS m FROM events
+    only: object-native-s3
+  - wait-metric:
+      name: cayenne_compaction_outcome_total
+      labels: { table: events, outcome: committed }
+      above: 0
+      drive: { src: "INSERT INTO events SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i FROM generate_series(10000 + ${round} * 10, 10009 + ${round} * 10) i", every: 2s, rounds: 30 }
+    only: object-native-s3
+  - assert-log: { lacks: ['falling back to full snapshot rewrite'] }
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/events-, contains: .vortex, min: 1 }
+    only: object-native-s3
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$', '\.arrow$'] }
+    only: object-native-s3
+  - query: SELECT * FROM events
+    eventually: 30s
+    only: object-native-s3

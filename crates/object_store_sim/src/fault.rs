@@ -2,13 +2,31 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Deterministic request delivery and response faults for protocol experiments.
+//!
+//! A rule matches one [`Op`] and a path predicate. The path is the object a
+//! request writes or reads: the destination of a copy or rename, the upload's
+//! path for every multipart step, each path of a delete stream, and the prefix
+//! (empty when none) of a listing. What each [`Fault`] does per operation:
+//!
+//! | Operation | `Fail` | `DropResponse` | `Hold` |
+//! |---|---|---|---|
+//! | `Create`/`Cas`/`Put` | error, not applied | applied, error | captured until `deliver`/`respond` |
+//! | `MultipartComplete` | error, object absent, upload still open | applied (object present), error | captured until `deliver`/`respond` |
+//! | `MultipartBegin`/`Part`/`Abort` | error, not applied | applied, error | as `Fail` |
+//! | `Delete` (per path) | error for that path, object kept | deleted, error for that path | as `Fail` |
+//! | `Copy`/`Rename` | error, not applied | applied, error | as `Fail` |
+//! | `Get`/`GetConditional`/`Head`/`List` | error, not sent | as `Fail` | as `Fail` |
+//!
+//! A read has no side effect, so a lost response is indistinguishable from a
+//! failed request; listings report the error as their first item.
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, path::Path,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, UploadPart,
+    path::Path,
 };
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
@@ -18,6 +36,7 @@ use super::Op;
 type Predicate = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 /// Async work executed immediately before a held request reaches storage.
 pub type BeforeHook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+type SharedUpload = Arc<AsyncMutex<Box<dyn MultipartUpload>>>;
 
 /// One-shot fault selected by operation and path predicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,10 +53,19 @@ struct Rule {
     repeat: bool,
 }
 
+/// A captured request that `deliver` can apply, possibly more than once.
+#[derive(Clone)]
+enum Request {
+    Put {
+        payload: PutPayload,
+        options: PutOptions,
+    },
+    Complete(SharedUpload),
+}
+
 struct Held {
     path: Path,
-    payload: PutPayload,
-    options: PutOptions,
+    request: Request,
     response: Option<oneshot::Sender<object_store::Result<PutResult>>>,
     first: Option<Result<PutResult, String>>,
     hook: Option<BeforeHook>,
@@ -62,68 +90,15 @@ struct State {
     blocked: Vec<(Path, PutPayload, PutOptions)>,
 }
 
-/// Faults remain independent of caller futures: dropping a caller does not cancel
-/// a captured request, which may still land after a restart or takeover.
-pub struct FaultStore {
-    inner: Arc<dyn ObjectStore>,
-    state: Arc<Mutex<State>>,
-    applied: Arc<AsyncMutex<()>>,
+/// State shared by the store and the multipart uploads it hands out.
+#[derive(Default)]
+struct Shared {
+    state: Mutex<State>,
+    applied: AsyncMutex<()>,
     captured: Notify,
 }
 
-fn injected(reason: impl Into<String>) -> object_store::Error {
-    object_store::Error::Generic {
-        store: "FaultStore",
-        source: std::io::Error::other(reason.into()).into(),
-    }
-}
-
-impl FaultStore {
-    #[must_use]
-    pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
-        Self {
-            inner,
-            state: Arc::new(Mutex::new(State::default())),
-            applied: Arc::new(AsyncMutex::new(())),
-            captured: Notify::new(),
-        }
-    }
-
-    /// Arm one matching request. Rules are consumed in insertion order.
-    pub fn arm(
-        &self,
-        op: Op,
-        predicate: impl Fn(&Path) -> bool + Send + Sync + 'static,
-        fault: Fault,
-    ) {
-        self.state.lock().rules.push(Rule {
-            op,
-            predicate: Arc::new(predicate),
-            fault,
-            repeat: false,
-        });
-    }
-
-    /// Keep failing matching requests until rules are cleared.
-    pub fn fail_while(&self, op: Op, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
-        self.state.lock().rules.push(Rule {
-            op,
-            predicate: Arc::new(predicate),
-            fault: Fault::Fail,
-            repeat: true,
-        });
-    }
-
-    pub fn clear_rules(&self) {
-        self.state.lock().rules.clear();
-    }
-
-    /// Exact requests refused before I/O, for explicitly scheduled copy actions.
-    #[must_use]
-    pub fn blocked(&self) -> Vec<(Path, PutPayload, PutOptions)> {
-        self.state.lock().blocked.clone()
-    }
-
+impl Shared {
     fn fault(&self, op: Op, path: &Path) -> Option<Fault> {
         let mut state = self.state.lock();
         let index = state
@@ -137,20 +112,151 @@ impl FaultStore {
         Some(fault)
     }
 
+    fn record<T>(
+        &self,
+        path: &Path,
+        op: Op,
+        mode: &str,
+        payload: Option<PutPayload>,
+        answer: &object_store::Result<T>,
+    ) {
+        self.state.lock().log.push(Applied {
+            path: path.clone(),
+            op,
+            mode: mode.into(),
+            payload,
+            result: answer.as_ref().map(|_| ()).map_err(ToString::to_string),
+        });
+    }
+
+    /// Capture `request` and wait for `respond` or `drop_response`.
+    async fn hold(&self, path: &Path, request: Request) -> object_store::Result<PutResult> {
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut state = self.state.lock();
+            let id = state.next;
+            state.next += 1;
+            state.held.insert(
+                id,
+                Held {
+                    path: path.clone(),
+                    request,
+                    response: Some(sender),
+                    first: None,
+                    hook: None,
+                },
+            );
+        }
+        self.captured.notify_waiters();
+        receiver
+            .await
+            .map_err(|_| injected("response channel closed"))?
+    }
+
+    async fn complete(
+        &self,
+        path: &Path,
+        upload: &SharedUpload,
+    ) -> object_store::Result<PutResult> {
+        let _guard = self.applied.lock().await;
+        let answer = upload.lock().await.complete().await;
+        self.record(
+            path,
+            Op::MultipartComplete,
+            "multipart complete",
+            None,
+            &answer,
+        );
+        answer
+    }
+}
+
+/// Faults remain independent of caller futures: dropping a caller does not cancel
+/// a captured request, which may still land after a restart or takeover.
+pub struct FaultStore {
+    inner: Arc<dyn ObjectStore>,
+    shared: Arc<Shared>,
+}
+
+fn injected(reason: impl Into<String>) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "FaultStore",
+        source: std::io::Error::other(reason.into()).into(),
+    }
+}
+
+/// The error a `Fail` (or a fault that acts as one) returns for `op`.
+fn refused(op: Op) -> object_store::Error {
+    injected(format!("{op:?} failed before I/O"))
+}
+
+fn lost() -> object_store::Error {
+    injected("response lost after I/O")
+}
+
+/// Whether `fault` stops a request that cannot be held before it reaches storage.
+fn stops(fault: Option<Fault>) -> bool {
+    matches!(fault, Some(Fault::Fail | Fault::Hold))
+}
+
+impl FaultStore {
+    #[must_use]
+    pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            shared: Arc::new(Shared::default()),
+        }
+    }
+
+    /// Arm one matching request. Rules are consumed in insertion order.
+    pub fn arm(
+        &self,
+        op: Op,
+        predicate: impl Fn(&Path) -> bool + Send + Sync + 'static,
+        fault: Fault,
+    ) {
+        self.shared.state.lock().rules.push(Rule {
+            op,
+            predicate: Arc::new(predicate),
+            fault,
+            repeat: false,
+        });
+    }
+
+    /// Keep failing matching requests until rules are cleared.
+    pub fn fail_while(&self, op: Op, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        self.shared.state.lock().rules.push(Rule {
+            op,
+            predicate: Arc::new(predicate),
+            fault: Fault::Fail,
+            repeat: true,
+        });
+    }
+
+    pub fn clear_rules(&self) {
+        self.shared.state.lock().rules.clear();
+    }
+
+    /// Exact single-request puts refused before I/O, for explicitly scheduled copy actions.
+    #[must_use]
+    pub fn blocked(&self) -> Vec<(Path, PutPayload, PutOptions)> {
+        self.shared.state.lock().blocked.clone()
+    }
+
     #[must_use]
     pub fn log(&self) -> Vec<Applied> {
-        self.state.lock().log.clone()
+        self.shared.state.lock().log.clone()
     }
 
     #[must_use]
     pub fn held_ids(&self) -> Vec<u64> {
-        self.state.lock().held.keys().copied().collect()
+        self.shared.state.lock().held.keys().copied().collect()
     }
 
     /// Wait for a newly captured request without polling the executor.
     pub async fn wait_held(&self, after: Option<u64>) -> u64 {
         loop {
-            let notified = self.captured.notified();
+            let notified = self.shared.captured.notified();
             if let Some(id) = self
                 .held_ids()
                 .into_iter()
@@ -166,7 +272,8 @@ impl FaultStore {
     /// # Errors
     /// Unknown request id.
     pub fn before(&self, id: u64, hook: BeforeHook) -> object_store::Result<()> {
-        self.state
+        self.shared
+            .state
             .lock()
             .held
             .get_mut(&id)
@@ -181,42 +288,36 @@ impl FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        let _guard = self.applied.lock().await;
+        let _guard = self.shared.applied.lock().await;
         let op = put_op(&options.mode);
         let mode = format!("{:?}", options.mode);
         let result = self.inner.put_opts(path, payload.clone(), options).await;
-        self.state.lock().log.push(Applied {
-            path: path.clone(),
-            op,
-            mode,
-            payload: Some(payload),
-            result: result.as_ref().map(|_| ()).map_err(ToString::to_string),
-        });
+        self.shared.record(path, op, &mode, Some(payload), &result);
         result
     }
 
-    /// Apply the exact original bytes and condition, even if already delivered.
+    /// Apply the exact original request, even if already delivered: the same
+    /// bytes and condition for a put, another `complete` for a multipart
+    /// completion (the inner store decides what a repeated completion does).
     /// # Errors
-    /// Unknown id or underlying conditional-put failure.
+    /// Unknown id or underlying storage failure.
     pub async fn deliver(&self, id: u64) -> object_store::Result<PutResult> {
-        let (path, payload, options, hook) = {
-            let state = self.state.lock();
+        let (path, request, hook) = {
+            let state = self.shared.state.lock();
             let h = state
                 .held
                 .get(&id)
                 .ok_or_else(|| injected("unknown request"))?;
-            (
-                h.path.clone(),
-                h.payload.clone(),
-                h.options.clone(),
-                h.hook.clone(),
-            )
+            (h.path.clone(), h.request.clone(), h.hook.clone())
         };
         if let Some(hook) = hook {
             hook().await;
         }
-        let result = self.put_inner(&path, payload, options).await;
-        if let Some(held) = self.state.lock().held.get_mut(&id)
+        let result = match request {
+            Request::Put { payload, options } => self.put_inner(&path, payload, options).await,
+            Request::Complete(upload) => self.shared.complete(&path, &upload).await,
+        };
+        if let Some(held) = self.shared.state.lock().held.get_mut(&id)
             && held.first.is_none()
         {
             held.first = Some(result.as_ref().cloned().map_err(ToString::to_string));
@@ -228,7 +329,7 @@ impl FaultStore {
     /// # Errors
     /// Unknown id, undelivered request, or already released response.
     pub fn respond(&self, id: u64) -> object_store::Result<()> {
-        let mut state = self.state.lock();
+        let mut state = self.shared.state.lock();
         let held = state
             .held
             .get_mut(&id)
@@ -250,6 +351,7 @@ impl FaultStore {
     /// Unknown id or already released response.
     pub fn drop_response(&self, id: u64) -> object_store::Result<()> {
         let sender = self
+            .shared
             .state
             .lock()
             .held
@@ -258,6 +360,34 @@ impl FaultStore {
             .ok_or_else(|| injected("no pending response"))?;
         let _ = sender.send(Err(injected("response lost")));
         Ok(())
+    }
+
+    /// A listing that is refused, or forwarded and logged as one request.
+    fn listing(
+        &self,
+        prefix: Option<&Path>,
+        mode: String,
+        list: impl FnOnce(&dyn ObjectStore) -> BoxStream<'static, object_store::Result<ObjectMeta>>
+        + Send
+        + 'static,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        let inner = Arc::clone(&self.inner);
+        let shared = Arc::clone(&self.shared);
+        let prefix = prefix.cloned().unwrap_or_default();
+        futures::stream::once(async move {
+            if shared.fault(Op::List, &prefix).is_some() {
+                return futures::stream::iter([Err(refused(Op::List))]).boxed();
+            }
+            let _guard = shared.applied.lock().await;
+            let answer = list(inner.as_ref()).try_collect::<Vec<_>>().await;
+            shared.record(&prefix, Op::List, &mode, None, &answer);
+            match answer {
+                Ok(objects) => futures::stream::iter(objects.into_iter().map(Ok)).boxed(),
+                Err(error) => futures::stream::iter([Err(error)]).boxed(),
+            }
+        })
+        .flatten()
+        .boxed()
     }
 }
 
@@ -289,41 +419,24 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        match self.fault(put_op(&options.mode), path) {
+        match self.shared.fault(put_op(&options.mode), path) {
             Some(Fault::Fail) => {
-                self.state
+                self.shared
+                    .state
                     .lock()
                     .blocked
                     .push((path.clone(), payload, options));
                 Err(injected("put failed before I/O"))
             }
             Some(Fault::Hold) => {
-                let (sender, receiver) = oneshot::channel();
-                {
-                    let mut state = self.state.lock();
-                    let id = state.next;
-                    state.next += 1;
-                    state.held.insert(
-                        id,
-                        Held {
-                            path: path.clone(),
-                            payload,
-                            options,
-                            response: Some(sender),
-                            first: None,
-                            hook: None,
-                        },
-                    );
-                }
-                self.captured.notify_waiters();
-                receiver
+                self.shared
+                    .hold(path, Request::Put { payload, options })
                     .await
-                    .map_err(|_| injected("response channel closed"))?
             }
             fault => {
                 let result = self.put_inner(path, payload, options).await;
                 if fault == Some(Fault::DropResponse) {
-                    Err(injected("response lost after I/O"))
+                    Err(lost())
                 } else {
                     result
                 }
@@ -338,19 +451,13 @@ impl ObjectStore for FaultStore {
         } else {
             Op::Get
         };
-        if self.fault(op, path).is_some() {
+        if self.shared.fault(op, path).is_some() {
             return Err(injected("get failed before I/O"));
         }
-        let _guard = self.applied.lock().await;
+        let _guard = self.shared.applied.lock().await;
         let mode = format!("{options:?}");
         let result = self.inner.get_opts(path, options).await;
-        self.state.lock().log.push(Applied {
-            path: path.clone(),
-            op,
-            mode,
-            payload: None,
-            result: result.as_ref().map(|_| ()).map_err(ToString::to_string),
-        });
+        self.shared.record(path, op, &mode, None, &result);
         result
     }
     async fn put_multipart_opts(
@@ -358,14 +465,27 @@ impl ObjectStore for FaultStore {
         path: &Path,
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let _guard = self.applied.lock().await;
-        let answer = self.inner.put_multipart_opts(path, options).await;
-        record(&self.state, path, Op::Put, "multipart begin", None, &answer);
-        Ok(Box::new(LoggedUpload {
-            inner: answer?,
+        let fault = self.shared.fault(Op::MultipartBegin, path);
+        if stops(fault) {
+            return Err(refused(Op::MultipartBegin));
+        }
+        let answer = {
+            let _guard = self.shared.applied.lock().await;
+            let answer = self.inner.put_multipart_opts(path, options).await;
+            self.shared
+                .record(path, Op::MultipartBegin, "multipart begin", None, &answer);
+            answer
+        };
+        let upload = answer?;
+        if fault == Some(Fault::DropResponse) {
+            // The caller never learns of the upload, so it is left open, as an
+            // orphaned upload is on a real store.
+            return Err(lost());
+        }
+        Ok(Box::new(FaultUpload {
+            inner: Arc::new(AsyncMutex::new(upload)),
             path: path.clone(),
-            state: Arc::clone(&self.state),
-            applied: Arc::clone(&self.applied),
+            shared: Arc::clone(&self.shared),
         }))
     }
     fn delete_stream(
@@ -373,62 +493,58 @@ impl ObjectStore for FaultStore {
         paths: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
         let inner = Arc::clone(&self.inner);
-        let state = Arc::clone(&self.state);
-        let applied = Arc::clone(&self.applied);
+        let shared = Arc::clone(&self.shared);
         paths
             .then(move |path| {
                 let inner = Arc::clone(&inner);
-                let state = Arc::clone(&state);
-                let applied = Arc::clone(&applied);
+                let shared = Arc::clone(&shared);
                 async move {
                     let path = path?;
-                    let _guard = applied.lock().await;
+                    let fault = shared.fault(Op::Delete, &path);
+                    if stops(fault) {
+                        return Err(refused(Op::Delete));
+                    }
+                    let _guard = shared.applied.lock().await;
                     let answer = inner
                         .delete_stream(futures::stream::iter([Ok(path.clone())]).boxed())
                         .next()
                         .await
                         .unwrap_or_else(|| Err(injected("delete returned no result")));
-                    record(&state, &path, Op::Delete, "delete", None, &answer);
+                    shared.record(&path, Op::Delete, "delete", None, &answer);
+                    if answer.is_ok() && fault == Some(Fault::DropResponse) {
+                        return Err(lost());
+                    }
                     answer
                 }
             })
             .boxed()
     }
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let inner = Arc::clone(&self.inner);
-        let state = Arc::clone(&self.state);
-        let applied = Arc::clone(&self.applied);
-        let prefix = prefix.cloned();
-        futures::stream::once(async move {
-            let _guard = applied.lock().await;
-            let answer = inner.list(prefix.as_ref()).try_collect::<Vec<_>>().await;
-            record(
-                &state,
-                &prefix.unwrap_or_default(),
-                Op::List,
-                "list",
-                None,
-                &answer,
-            );
-            match answer {
-                Ok(objects) => futures::stream::iter(objects.into_iter().map(Ok)).boxed(),
-                Err(error) => futures::stream::iter([Err(error)]).boxed(),
-            }
+        let owned = prefix.cloned();
+        self.listing(prefix, "list".into(), move |inner| {
+            inner.list(owned.as_ref())
         })
-        .flatten()
-        .boxed()
+    }
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        let owned = prefix.cloned();
+        let after = offset.clone();
+        self.listing(prefix, format!("list after {offset}"), move |inner| {
+            inner.list_with_offset(owned.as_ref(), &after)
+        })
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        let _guard = self.applied.lock().await;
+        let at = prefix.cloned().unwrap_or_default();
+        if self.shared.fault(Op::List, &at).is_some() {
+            return Err(refused(Op::List));
+        }
+        let _guard = self.shared.applied.lock().await;
         let answer = self.inner.list_with_delimiter(prefix).await;
-        record(
-            &self.state,
-            &prefix.cloned().unwrap_or_default(),
-            Op::List,
-            "delimiter",
-            None,
-            &answer,
-        );
+        self.shared
+            .record(&at, Op::List, "delimiter", None, &answer);
         answer
     }
     async fn copy_opts(
@@ -437,89 +553,121 @@ impl ObjectStore for FaultStore {
         to: &Path,
         options: CopyOptions,
     ) -> object_store::Result<()> {
-        let _guard = self.applied.lock().await;
+        let fault = self.shared.fault(Op::Copy, to);
+        if stops(fault) {
+            return Err(refused(Op::Copy));
+        }
+        let _guard = self.shared.applied.lock().await;
         let mode = format!("copy from {from}: {options:?}");
         let answer = self.inner.copy_opts(from, to, options).await;
-        record(&self.state, to, Op::Copy, &mode, None, &answer);
+        self.shared.record(to, Op::Copy, &mode, None, &answer);
+        if answer.is_ok() && fault == Some(Fault::DropResponse) {
+            return Err(lost());
+        }
+        answer
+    }
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        let fault = self.shared.fault(Op::Rename, to);
+        if stops(fault) {
+            return Err(refused(Op::Rename));
+        }
+        let _guard = self.shared.applied.lock().await;
+        let mode = format!("rename from {from}: {options:?}");
+        let answer = self.inner.rename_opts(from, to, options).await;
+        self.shared.record(to, Op::Rename, &mode, None, &answer);
+        if answer.is_ok() && fault == Some(Fault::DropResponse) {
+            return Err(lost());
+        }
         answer
     }
 }
 
-fn record<T>(
-    state: &Mutex<State>,
-    path: &Path,
-    op: Op,
-    mode: &str,
-    payload: Option<PutPayload>,
-    answer: &object_store::Result<T>,
-) {
-    state.lock().log.push(Applied {
-        path: path.clone(),
-        op,
-        mode: mode.into(),
-        payload,
-        result: answer.as_ref().map(|_| ()).map_err(ToString::to_string),
-    });
-}
-
-struct LoggedUpload {
-    inner: Box<dyn MultipartUpload>,
+/// A multipart upload whose part, complete and abort requests are faultable.
+/// A held completion keeps the upload, so a part or abort issued while it is
+/// being delivered fails rather than racing it.
+struct FaultUpload {
+    inner: SharedUpload,
     path: Path,
-    state: Arc<Mutex<State>>,
-    applied: Arc<AsyncMutex<()>>,
+    shared: Arc<Shared>,
 }
-impl fmt::Debug for LoggedUpload {
+impl fmt::Debug for FaultUpload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LoggedUpload")
+        f.debug_struct("FaultUpload")
             .field("path", &self.path)
             .finish_non_exhaustive()
     }
 }
 #[async_trait]
-impl MultipartUpload for LoggedUpload {
+impl MultipartUpload for FaultUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        let future = self.inner.put_part(data.clone());
-        let state = Arc::clone(&self.state);
-        let applied = Arc::clone(&self.applied);
+        let fault = self.shared.fault(Op::MultipartPart, &self.path);
+        if stops(fault) {
+            return Box::pin(futures::future::ready(Err(refused(Op::MultipartPart))));
+        }
+        let Ok(mut upload) = self.inner.try_lock() else {
+            return Box::pin(futures::future::ready(Err(injected(
+                "multipart upload busy with a held completion",
+            ))));
+        };
+        let future = upload.put_part(data.clone());
+        drop(upload);
+        let shared = Arc::clone(&self.shared);
         let path = self.path.clone();
         Box::pin(async move {
-            let _guard = applied.lock().await;
+            let _guard = shared.applied.lock().await;
             let answer = future.await;
-            record(
-                &state,
+            shared.record(
                 &path,
-                Op::Put,
+                Op::MultipartPart,
                 "multipart part",
                 Some(data),
                 &answer,
             );
+            if answer.is_ok() && fault == Some(Fault::DropResponse) {
+                return Err(lost());
+            }
             answer
         })
     }
     async fn complete(&mut self) -> object_store::Result<PutResult> {
-        let _guard = self.applied.lock().await;
-        let answer = self.inner.complete().await;
-        record(
-            &self.state,
-            &self.path,
-            Op::Put,
-            "multipart complete",
-            None,
-            &answer,
-        );
-        answer
+        match self.shared.fault(Op::MultipartComplete, &self.path) {
+            Some(Fault::Fail) => Err(refused(Op::MultipartComplete)),
+            Some(Fault::Hold) => {
+                self.shared
+                    .hold(&self.path, Request::Complete(Arc::clone(&self.inner)))
+                    .await
+            }
+            fault => {
+                let answer = self.shared.complete(&self.path, &self.inner).await;
+                if answer.is_ok() && fault == Some(Fault::DropResponse) {
+                    return Err(lost());
+                }
+                answer
+            }
+        }
     }
     async fn abort(&mut self) -> object_store::Result<()> {
-        let _guard = self.applied.lock().await;
-        let answer = self.inner.abort().await;
-        record(
-            &self.state,
+        let fault = self.shared.fault(Op::MultipartAbort, &self.path);
+        if stops(fault) {
+            return Err(refused(Op::MultipartAbort));
+        }
+        let _guard = self.shared.applied.lock().await;
+        let answer = self.inner.lock().await.abort().await;
+        self.shared.record(
             &self.path,
-            Op::Put,
+            Op::MultipartAbort,
             "multipart abort",
             None,
             &answer,
         );
+        if answer.is_ok() && fault == Some(Fault::DropResponse) {
+            return Err(lost());
+        }
         answer
     }
 }

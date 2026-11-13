@@ -474,6 +474,37 @@ pub enum RebuildCause {
 }
 
 impl RebuildCause {
+    /// Whether the recorded position still holds after this rebuild: it was
+    /// read, it belongs to this source's current history, and the slot can still
+    /// stream from it. Only the two contents causes qualify: the position is
+    /// sound, and the rebuild happens because the acceleration does not hold
+    /// what the position says it does.
+    ///
+    /// Every change at or below a sound position was committed at the source
+    /// before the rebuild re-reads it, so the re-read already reflects it.
+    /// Replaying those changes on top of the re-read cannot add anything, but
+    /// it does pass back through older states of the table: a `TRUNCATE`, a
+    /// refill and a second `TRUNCATE` replayed after the re-read shows the
+    /// refill's rows to every query until the second `TRUNCATE` applies, after
+    /// the dataset is already ready. So the position is seated as the replay
+    /// floor, as on a resume, and only changes after it are replayed.
+    ///
+    /// The other causes have no such position: none was recorded, it cannot be
+    /// read or names another source or a rewound history, or the slot can no
+    /// longer stream from it.
+    #[must_use]
+    pub fn keeps_recorded_position(self) -> bool {
+        match self {
+            Self::EmptyWithUsablePosition | Self::UnprovenContentsWithUsablePosition => true,
+            Self::NoRecord
+            | Self::ForeignSource
+            | Self::Unreadable
+            | Self::RewoundSource
+            | Self::AcknowledgedPast
+            | Self::RetentionLost => false,
+        }
+    }
+
     /// Stable identifier for log queries. Never reworded — renaming one breaks
     /// every saved search that selects on it.
     ///

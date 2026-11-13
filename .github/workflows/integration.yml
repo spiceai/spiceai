@@ -983,12 +983,15 @@ jobs:
       - test-part-2
       - test-part-3
       - test-github
+      - test-runtime-partition
     permissions:
       contents: write
       pull-requests: write
       # Approves the snapshot PR's held pull_request runs.
       actions: write
-    runs-on: spiceai-dev-runners
+    # GitHub-hosted (a fresh VM per job): the self-hosted pool just ran the
+    # branch's tests, and this is the job that holds the write token.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1004,14 +1007,12 @@ jobs:
           merge-multiple: true
           path: integration-snapshots
 
+      # Regular `*.snap` files only, nothing under .github/ or .git/ and nothing
+      # outside the checkout: the archives come from jobs that ran test code,
+      # and this job holds the write token.
       - name: Extract snapshots
         if: steps.download_snapshots.outcome == 'success'
-        run: |
-          shopt -s nullglob
-          for archive in integration-snapshots/*.tar.gz; do
-            tar -xzf "$archive" -C .
-          done
-        shell: bash
+        run: python3 .github/scripts/extract_snapshot_archives.py integration-snapshots .
 
       - name: Configure Git
         if: steps.download_snapshots.outcome == 'success'
@@ -1485,10 +1486,11 @@ jobs:
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
+    # Read-only: this job runs the branch's test binary, so its snapshot
+    # changes leave as an artifact for `upload-integration-snapshots`, which
+    # holds the write token and runs no test code.
     permissions:
-      actions: write  # approves the held runs of its snapshot PR
-      contents: write  # push-snap-changes pushes a snapshot branch
-      pull-requests: write  # and opens, auto-merges or closes its PR
+      contents: read
       id-token: write  # RustFS credentials
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1542,15 +1544,24 @@ jobs:
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime-table-partition::partition_table_provider)'
 
-      - name: Configure Git
+      - name: Upload integration snapshots artifact
+        id: create_snapshot_archive
         if: github.event.inputs.update_snapshots == 'always'
         run: |
-          git config --global user.name 'Spice Snapshot Update Bot'
-          git config --global user.email 'spiceaibot@spice.ai'
+          git diff --name-only -- '*.snap' > snapshot-files
+          git ls-files -o --exclude-standard -- '*.snap' >> snapshot-files
+          if [ -s snapshot-files ]; then
+            tr '\n' '\0' < snapshot-files > snapshot-files-0
+            tar --null -czf integration-snapshots-part-runtime-partition.tar.gz --files-from snapshot-files-0
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No snapshot files found"
+          fi
+          rm -f snapshot-files snapshot-files-0
 
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
-        timeout-minutes: 10
-        uses: ./.github/actions/push-snap-changes
+      - name: Store integration snapshots artifact
+        if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          name: integration-snapshots-part-runtime-partition
+          path: integration-snapshots-part-runtime-partition.tar.gz
