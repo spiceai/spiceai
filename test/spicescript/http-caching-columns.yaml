@@ -103,9 +103,12 @@ steps:
 
   # `refresh_mode: caching` is not supported with `runtime.params.cayenne_vnext`
   # enabled yet, so the dataset fails to load with a message naming the fix
-  # rather than moving to the object-native metastore (#16308).
+  # rather than moving to the object-native metastore (#16308). A cluster keeps
+  # SQLite under the flag, so this runs on a single node only.
   - restart:
       ready: false
       patch: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+    cluster: false
   - assert-status: { dataset: d, status: Error, message-contains: "Failed to load dataset 'd' (cayenne): With `runtime.params.cayenne_vnext` enabled, its data must be in `runtime.state.location`. Remove `cayenne_file_path`, `cayenne_s3_zone_ids`, and `cayenne_datalake_location`, use a supported refresh mode (full, append, or changes)" }
     eventually: 30s
+    cluster: false
