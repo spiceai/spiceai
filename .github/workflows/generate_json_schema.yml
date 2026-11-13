@@ -78,27 +78,22 @@ jobs:
       - name: Create PR
         if: github.event_name == 'workflow_dispatch' && inputs.create_pr && inputs.run_build
         run: |
-          git config --global user.name 'Spice Schema Bot'
-          git config --global user.email 'schema-bot@spice.ai'
-          git checkout -b schema/${GITHUB_RUN_ID}
+          set -euo pipefail
           git diff .schema/spicepod.schema.json
-          if [[ $(git diff --exit-code .schema/spicepod.schema.json) ]]; then
-            git add .schema/spicepod.schema.json
-            git commit -m "Update spicepod.schema.json"
-            # Disable any credential helper configured on the (self-hosted) runner
-            # so git authenticates with the URL-embedded token only. Otherwise a
-            # helper (osxkeychain / git-credential-manager) can intercept the push
-            # and block on an interactive credential prompt, hanging the job.
-            git -c credential.helper='' -c credential.interactive=false \
-              push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:schema/${GITHUB_RUN_ID}
-            # enforce-pull-with-spice, a required check, fails a PR without both a kind/ and
-            # an area/ label; generate-openapi.yml gives openapi.json the same two.
-            gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID} --label kind/documentation --label area/config
-            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-            bash .github/scripts/approve_bot_pr_runs.sh "schema/${GITHUB_RUN_ID}" "$(git rev-parse HEAD)"
-          else
+          # Committed through GitHub's API rather than pushed, so GitHub signs the commit
+          # (see .github/actions/signed-commit/signed_commit.py).
+          sha="$(python3 .github/actions/signed-commit/signed_commit.py \
+            --branch "schema/${GITHUB_RUN_ID}" --message "Update spicepod.schema.json" \
+            -- .schema/spicepod.schema.json)"
+          if [[ -z "${sha}" ]]; then
             echo "No changes detected"
+            exit 0
           fi
+          # enforce-pull-with-spice, a required check, fails a PR without both a kind/ and
+          # an area/ label; generate-openapi.yml gives openapi.json the same two.
+          gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID} --label kind/documentation --label area/config
+          # Release the pull_request runs GitHub holds on a GITHUB_TOKEN commit (see the script).
+          bash .github/scripts/approve_bot_pr_runs.sh "schema/${GITHUB_RUN_ID}" "${sha}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Never fall back to an interactive prompt; fail fast if auth is rejected.

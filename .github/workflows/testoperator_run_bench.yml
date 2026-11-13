@@ -767,8 +767,6 @@ jobs:
       - name: Upload benchmark snapshots to branch
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
         run: |
-          git fetch --unshallow || true
-
           # if the spiced commit is set, use that as the branch ID
           if [ -n "${{ github.event.inputs.spiced_commit || '' }}" ]; then
             BRANCH_ID=${{ github.event.inputs.spiced_commit }}
@@ -779,83 +777,58 @@ jobs:
           BASE_BRANCH="testoperator-snapshot-update/${BRANCH_ID}"
           BRANCH_NAME="${BASE_BRANCH}"
 
-          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
-          git config --global user.email 'spiceaibot@spice.ai'
-          git checkout -b ${BRANCH_NAME}
-          git add '*.snap'
-          if git diff --cached --quiet; then
+          if [ -z "$(git status --porcelain --untracked-files=all -- '*.snap')" ]; then
             echo "No changes to commit"
           else
-            git commit -m "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}"
-            SNAPSHOT_COMMIT="$(git rev-parse HEAD)"
-
-            # Every run dispatched for one spiced commit pushes to the same
-            # branch, so the push can lose in two ways that say nothing about
-            # the benchmark:
-            # - another run pushed first ("fetch first", or any rejection after
-            #   which the branch tip has moved): move this run's snapshot
-            #   commit onto the new tip and push again;
-            # - the branch's PR is already in the merge queue (GH006: queued
-            #   branches cannot be updated): carry on in the next branch,
-            #   <base>-2, <base>-3, ..., which gets its own PR.
-            # Any other rejection fails the step.
-            remote_tip() { git ls-remote --heads origin "refs/heads/$1" | cut -f1; }
+            # Every run dispatched for one spiced commit commits to the same
+            # branch. Once that branch's PR is in the merge queue the branch
+            # cannot be updated, so these snapshots go to the next branch,
+            # <base>-2, <base>-3, ..., which gets its own PR.
+            in_merge_queue() {
+              local number
+              number="$(gh pr list --head "$1" --state open --json number --jq '.[0].number // empty')"
+              [ -n "${number}" ] || return 1
+              [ "$(gh api graphql \
+                -f query='query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { isInMergeQueue } } }' \
+                -f owner="${GITHUB_REPOSITORY%/*}" -f name="${GITHUB_REPOSITORY#*/}" -F number="${number}" \
+                --jq '.data.repository.pullRequest.isInMergeQueue')" = true ]
+            }
             suffix=1
-            pushed=false
-            for attempt in 1 2 3 4 5 6 7 8; do
-              git checkout -B "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"
-              tip_before="$(remote_tip "${BRANCH_NAME}")"
-              if [ -n "${tip_before}" ]; then
-                # Move only the snapshot commit. Runs for one spiced commit can
-                # check out different trunk heads, and `git pull --rebase` would
-                # also replay every trunk commit between them onto the branch
-                # as new commits, putting unrelated source changes in the PR.
-                git fetch origin "refs/heads/${BRANCH_NAME}"
-                if ! git rebase --onto FETCH_HEAD "${SNAPSHOT_COMMIT}^"; then
-                  git rebase --abort || true
-                  echo "::error::This run's snapshots conflict with snapshots another run already pushed to ${BRANCH_NAME}; resolve the .snap conflict on that branch by hand."
-                  exit 1
-                fi
-              fi
-              # Non-interactive: a credential helper on the runner can otherwise intercept
-              # this push and block on a prompt forever. See
-              # scripts/check_ci_git_push_noninteractive.py.
-              if push_log="$(git -c credential.helper='' -c credential.interactive=false \
-                push origin "${BRANCH_NAME}" 2>&1)"; then
-                echo "${push_log}"
-                pushed=true
-                break
-              fi
-              echo "${push_log}"
-              # GH006 is any protected-branch rejection; only the merge-queue lock
-              # moves the snapshots to the next branch.
-              if grep -q 'GH006' <<<"${push_log}" && grep -q 'queued for merging' <<<"${push_log}"; then
-                suffix=$((suffix + 1))
-                echo "::notice::${BRANCH_NAME} is locked by the merge queue; pushing these snapshots to ${BASE_BRANCH}-${suffix} instead."
-                BRANCH_NAME="${BASE_BRANCH}-${suffix}"
-              elif grep -qE 'fetch first|non-fast-forward' <<<"${push_log}" \
-                || [ "$(remote_tip "${BRANCH_NAME}")" != "${tip_before}" ]; then
-                echo "::notice::Another run pushed to ${BRANCH_NAME} first (attempt ${attempt}); rebasing onto it and pushing again."
-                # Jittered, so runs that collided do not retry in lockstep.
-                if [ "${attempt}" -lt 8 ]; then sleep $((RANDOM % 5 + 1)); fi
-              else
-                # A new branch from a release-branch commit is refused on every
-                # attempt (GitHub times out checking it for workflow changes);
-                # keep the snapshots as an artifact and say so.
-                printf '%s\n' "${push_log}" >"${RUNNER_TEMP}/snapshot-push.log"
-                if bash .github/scripts/save_unpushable_snapshots.sh \
-                  "${RUNNER_TEMP}/snapshot-push.log" "${BRANCH_NAME}" "${{ github.ref_name }}"; then
-                  exit 1
-                fi
-                echo "::error::Pushing the benchmark snapshots to ${BRANCH_NAME} was rejected for a reason other than a concurrent push or a queued branch; see the git output above."
+            while in_merge_queue "${BRANCH_NAME}"; do
+              suffix=$((suffix + 1))
+              if [ "${suffix}" -gt 8 ]; then
+                echo "::error::${BASE_BRANCH} and its next 7 branches are all in the merge queue; the benchmark snapshots were not committed."
                 exit 1
               fi
+              echo "::notice::${BRANCH_NAME} is in the merge queue; committing these snapshots to ${BASE_BRANCH}-${suffix} instead."
+              BRANCH_NAME="${BASE_BRANCH}-${suffix}"
             done
-            if [ "${pushed}" != true ]; then
-              echo "::error::The benchmark snapshots were not pushed after 8 attempts; the last branch tried was ${BRANCH_NAME}."
+
+            # Only this run's snapshot changes go onto the branch: runs for one
+            # spiced commit can check out different trunk heads, and the branch
+            # must not pick up the trunk commits between them. Committed through
+            # GitHub's API rather than pushed, so GitHub signs the commit (see
+            # .github/actions/signed-commit/signed_commit.py); a concurrent commit
+            # from another run is rebuilt on the branch's new tip. When GitHub
+            # refuses the commit (a new branch from a release-branch commit is
+            # refused on every run), the snapshots are kept as the
+            # unpushed-snapshots artifact and the step summary says how to land them.
+            status=0
+            SNAPSHOT_COMMIT="$(python3 .github/actions/signed-commit/signed_commit.py \
+              --branch "${BRANCH_NAME}" \
+              --message "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" \
+              --changed-since HEAD \
+              --patch-dir "${RUNNER_TEMP}/unpushed-snapshots" --patch-artifact unpushed-snapshots \
+              -- '*.snap')" || status=$?
+            if [ "${status}" -eq 3 ]; then
+              echo "::error::This run's snapshots conflict with snapshots another run already committed to ${BRANCH_NAME}; resolve the .snap conflict on that branch by hand."
+              exit 1
+            elif [ "${status}" -ne 0 ]; then
               exit 1
             fi
+          fi
 
+          if [ -n "${SNAPSHOT_COMMIT:-}" ]; then
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then
               echo "PR already exists -> ${PR_URL}"
@@ -878,8 +851,8 @@ jobs:
                 gh pr merge --squash --auto ${BRANCH_NAME}
               fi
             fi
-            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN commit (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -888,8 +861,8 @@ jobs:
           GCM_INTERACTIVE: 'never'
 
       - name: Upload snapshots GitHub refused to push
-        # save_unpushable_snapshots.sh leaves the snapshot commit here when
-        # GitHub will not let GITHUB_TOKEN create the snapshot branch.
+        # signed_commit.py leaves the snapshots here as a patch when GitHub
+        # refuses the commit, e.g. a new branch from a release-branch commit.
         if: ${{ failure() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

@@ -1009,12 +1009,6 @@ jobs:
           done
         shell: bash
 
-      - name: Configure Git
-        if: steps.download_snapshots.outcome == 'success'
-        run: |
-          git config --global user.name 'Spice Snapshot Update Bot'
-          git config --global user.email 'spiceaibot@spice.ai'
-
       - name: Push snapshots to branch
         if: steps.download_snapshots.outcome == 'success'
         timeout-minutes: 10
@@ -1537,12 +1531,6 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime-table-partition::partition_table_provider)'
-
-      - name: Configure Git
-        if: github.event.inputs.update_snapshots == 'always'
-        run: |
-          git config --global user.name 'Spice Snapshot Update Bot'
-          git config --global user.email 'spiceaibot@spice.ai'
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'

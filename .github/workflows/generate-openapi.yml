@@ -70,7 +70,6 @@ jobs:
         run: |
           set -euo pipefail
           spec=.schema/openapi.json
-          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}"
 
           # `gh pr list` returns 30 PRs by default, and trunk often has more open.
           prs=$(gh pr list --base trunk --state open --limit 1000 \
@@ -98,30 +97,16 @@ jobs:
             exit 0
           fi
 
-          git config --global user.name 'Spice Schema Bot'
-          git config --global user.email 'schema-bot@spice.ai'
-
-          if [ -n "$number" ]; then
-            # Commit on top of the open PR's branch so the push fast-forwards it. Resetting
-            # the index to the branch tip keeps the commit to the spec alone.
-            git -c credential.helper='' -c credential.interactive=false \
-              fetch --depth=1 "$remote" "refs/heads/${branch}"
-            git reset --soft FETCH_HEAD
-            git reset --quiet FETCH_HEAD -- .
-          else
-            branch="openapi/${GITHUB_RUN_ID}"
-          fi
-
-          git add "$spec"
-          if git diff --cached --quiet; then
+          # An open PR's branch gets one more commit, built on its tip with only the spec
+          # changed; otherwise a new branch starts at this commit. Committed through
+          # GitHub's API rather than pushed, so GitHub signs the commit (see
+          # .github/actions/signed-commit/signed_commit.py).
+          [ -n "$number" ] || branch="openapi/${GITHUB_RUN_ID}"
+          sha="$(python3 .github/actions/signed-commit/signed_commit.py \
+            --branch "$branch" --message "Update openapi.json" -- "$spec")"
+          if [ -z "$sha" ]; then
             echo "::notice::#${number} already has the current ${spec}; it is waiting for review."
           else
-            git commit --quiet -m "Update openapi.json"
-            # Non-interactive: a credential helper on the runner can otherwise intercept
-            # this push and block on a prompt forever. See
-            # scripts/check_ci_git_push_noninteractive.py.
-            git -c credential.helper='' -c credential.interactive=false \
-              push "$remote" "HEAD:refs/heads/${branch}"
             if [ -n "$number" ]; then
               echo "Updated #${number} with the current ${spec}."
             else
@@ -133,8 +118,8 @@ jobs:
                 --base trunk \
                 --head "$branch"
             fi
-            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-            bash .github/scripts/approve_bot_pr_runs.sh "$branch" "$(git rev-parse HEAD)"
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN commit (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "$branch" "$sha"
           fi
 
           if [ -n "$number" ] && [ "$age_hours" -ge "$STALE_AFTER_HOURS" ]; then
