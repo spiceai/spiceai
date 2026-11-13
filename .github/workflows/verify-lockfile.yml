@@ -26,7 +26,9 @@ jobs:
   verify:
     # Uses only the job's own `github.token`, no environment secret.
     environment: secret-free
-    runs-on: ubuntu-latest
+    # `gh` comes from the dev-runner image (spicehq/ai-platform
+    # infra/docker/arc-runner).
+    runs-on: spiceai-dev-runners
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
@@ -34,5 +36,15 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - run: gh extension install github/gh-actions-lock --pin v0.4.1
+      - name: Install gh-actions-lock into this job's temp directory
+        # A runner can be reused, and `gh extension install` leaves an installed
+        # extension as it is. Installing under RUNNER_TEMP, which the runner
+        # empties for each job, makes this job run the pinned release, not a copy
+        # an earlier job left behind.
+        run: |
+          set -euo pipefail
+          echo "XDG_DATA_HOME=${RUNNER_TEMP}/gh-data" >> "$GITHUB_ENV"
+          echo "GH_CONFIG_DIR=${RUNNER_TEMP}/gh-config" >> "$GITHUB_ENV"
+          XDG_DATA_HOME="${RUNNER_TEMP}/gh-data" GH_CONFIG_DIR="${RUNNER_TEMP}/gh-config" \
+            gh extension install github/gh-actions-lock --pin v0.4.1
       - run: gh actions-lock --verify
