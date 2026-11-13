@@ -119,7 +119,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `19ecca8e06a3e764f7cf4a550f3abba7a137f3c7` | `spiceai-55-release-2.4` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `e4f41c50fadb936c5cb6ba94c3fad896f8a1b2e8` | `spiceai-55-release-2.4` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `bc28b14282501d7c3bb9ee8ae7a941f86d707910` | `spiceai-55-release-2.4` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
@@ -444,8 +444,8 @@ federated-scan rows below (`sql/executor.rs`, `sql/mod.rs`, `schema_cast/mod.rs`
 tests. Between `ef2e590` and `54d9010` (spiceai/datafusion-table-providers#91 and #92,
 squash-merged), `datafusion-table-providers` adds only the `SqlTable` opt-in row below and
 its test, and moves its own federation pin.
-Between `f0af9b6` and `e4f41c5` (spiceai/datafusion-table-providers#122, a cherry-pick of
-spiceai/datafusion-table-providers#121 onto `spiceai-55-release-2.4`), it moves its ADBC
+Between `f0af9b6` and `bc28b14` (spiceai/datafusion-table-providers#122, a cherry-pick of
+spiceai/datafusion-table-providers#121 onto `spiceai-55-release-2.4`, merged), it moves its ADBC
 requirement and its own ADBC patch lines to 0.25 (`7caad4cc`, spiceai/arrow-adbc#9), and
 cancels an ADBC statement through `get_cancel_handle().try_cancel()`, which 0.25 issues without
 the statement lock (`core/src/sql/db_connection_pool/dbconnection/adbcconn.rs`). No row below
