@@ -1,0 +1,105 @@
+# Regression test for #15919: a reload of a `mode: file_create` Cayenne dataset
+# after a watched Spicepod change must refresh it, not leave it empty.
+name: cayenne-file-create-reload
+description: >
+  A `mode: file_create` Cayenne acceleration is rebuilt from its source
+  whenever it loads: after a watched Spicepod changes the dataset, and after a
+  restart, it answers with the source's current rows, not with what the
+  deleted acceleration held and not with nothing. A query running while the
+  watched change reloads the dataset answers with every row of the old copy or
+  of the new one, or fails; never with part of either. With object-native data
+  (#16133), each reload writes a new folder in the state location and marks the
+  previous one dropped; the previous folder is kept for the data-file retention
+  (an hour), so a query that started on it can finish. Its deletion after the
+  retention is covered by `data_file_lifecycle_test`, which shortens it.
+
+sources:
+  src: { kind: postgres }
+  # The state location of object-native-s3.
+  lake: { kind: rustfs }
+
+# The spicepod as written, the same with the prototype object-native Cayenne
+# metastore (`runtime.params.cayenne_vnext`) in place of SQLite, and with
+# object-native data in an S3-compatible state location.
+variants:
+  as-written: federated
+  object-native: object-native
+  object-native-s3: object-native-s3
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-file-create-reload
+  datasets:
+    # No refresh schedule: only a load reads the source's new rows. Every row
+    # goes to a data file, so the folders hold data, not only rows in the log.
+    - from: postgres:public.fc
+      name: file_create_reload
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file_create
+        refresh_mode: full
+        params: { cayenne_inline_max_rows: '0' }
+
+defaults:
+  expect: { oracle: src }
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE fc (id int PRIMARY KEY, v text);
+        INSERT INTO fc SELECT i, 'v' || i FROM generate_series(1, 8) i;
+  - start: {}
+  - query: SELECT id, v FROM file_create_reload
+    oracle-sql: SELECT id, v FROM fc
+
+  # The source grows; with no schedule the acceleration keeps its 8 rows.
+  - source-exec: { src: "INSERT INTO fc SELECT i, 'v' || i FROM generate_series(9, 16) i" }
+  - query: SELECT count(*) AS n FROM file_create_reload
+    expect: { rows: [['8']] }
+
+  # Changing the dataset reloads it, which recreates the acceleration. Queries
+  # keep running across the reload: each answers with the old copy's 8 rows or
+  # the new copy's 16, or fails.
+  - background:
+      id: reader
+      query: SELECT count(*) IN (8, 16) AS whole FROM file_create_reload
+      every: 100ms
+      expect: { whole: 'true' }
+  - edit-spicepod:
+      datasets:
+        file_create_reload: { params: { pg_sslmode: prefer } }
+  - query: SELECT id, v FROM file_create_reload
+    oracle-sql: SELECT id, v FROM fc
+    eventually: 60s
+  - stop-background: { id: reader, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection'] }
+  - explain: SELECT id, v FROM file_create_reload
+    contains: CayenneAccelerationExec
+
+  # The previous copy's folder is marked dropped and kept for the retention:
+  # two folders (two log heads), one of them dropped.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, min: 1 }
+    eventually: 60s
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 2 }
+    only: object-native-s3
+
+  # So does a restart, which replaces the copy again: three folders, the two
+  # earlier ones dropped and kept for the retention.
+  - source-exec: { src: "INSERT INTO fc SELECT i, 'v' || i FROM generate_series(17, 24) i" }
+  - restart: {}
+  - query: SELECT id, v FROM file_create_reload
+    oracle-sql: SELECT id, v FROM fc
+    eventually: 60s
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /dropped, min: 2 }
+    eventually: 60s
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: /head, min: 3 }
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/file_create_reload-, contains: .vortex, min: 1 }
+    only: object-native-s3
+  - assert-log: { lacks: ['were not removed from the object store', 'Deleted the acceleration data directory'] }
+    only: object-native-s3

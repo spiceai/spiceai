@@ -1,13 +1,17 @@
 name: unparse-aggregate-scopes
 description: >
   Aggregate projection scopes preserve correlated subquery references,
-  grouping sets and qualified duplicate grouping-column names.
+  grouping sets and qualified duplicate grouping-column names. A grouping-set
+  aggregate federated to MySQL beneath a window that stays local answers as
+  PostgreSQL does.
 
 sources:
   src: { kind: postgres }
+  my: { kind: mysql }
 
 variants:
   federated: {}
+  mysql: { datasets: { m: { from: 'mysql:m', params: '${sources.my.params}' } } }
 
 spicepod:
   version: v1
@@ -15,6 +19,7 @@ spicepod:
   name: unparse-aggregate-scopes
   datasets:
     - { from: 'postgres:public.e', name: e, params: '${sources.src.params}' }
+    - { from: 'postgres:public.m', name: m, params: '${sources.src.params}' }
 
 defaults:
   expect: { oracle: src }
@@ -23,6 +28,12 @@ defaults:
 steps:
   - source-exec:
       src: CREATE TABLE e (id int, v int); INSERT INTO e VALUES (1,10), (2,20), (3,10), (4,NULL), (5,10), (1,10);
+  # Every ratio of sums below is exact, so engines that divide decimals to
+  # different scales still agree on the value.
+  - source-exec:
+      src: CREATE TABLE m (c varchar(8), k varchar(8), p decimal(7,2), s decimal(7,2)); INSERT INTO m VALUES ('a','x',1.00,2.00), ('a','y',2.00,8.00), ('b','x',1.00,5.00), ('b','y',3.00,5.00);
+  - source-exec:
+      my: CREATE TABLE m (c varchar(8), k varchar(8), p decimal(7,2), s decimal(7,2)); INSERT INTO m VALUES ('a','x',1.00,2.00), ('a','y',2.00,8.00), ('b','x',1.00,5.00), ('b','y',3.00,5.00);
   - start: {}
   - query: SELECT (SELECT e.v) AS v FROM e GROUP BY e.v
   - query: SELECT (SELECT e.v + 1) AS v FROM e GROUP BY e.v
@@ -44,3 +55,8 @@ steps:
   - query: SELECT outer_t.id AS id, (SELECT (SELECT outer_t.id AS k) FROM (SELECT max(e.id) AS m FROM e WHERE e.id < 0) a) AS k FROM e AS outer_t ORDER BY id
   - query: SELECT outer_t.id AS id, (SELECT (SELECT outer_t.id) FROM (SELECT max(e.id) AS id FROM e WHERE e.id >= 0) a) AS k FROM e AS outer_t ORDER BY id
   - query: SELECT outer_t.id AS id, (SELECT (SELECT outer_t.id) FROM (SELECT max(e.id) AS id FROM e WHERE e.id < 0) a) AS k FROM e AS outer_t ORDER BY id
+  # Regression for #16081: a grouping-set aggregate federated beneath a window that
+  # stays local must not ask the source for the internal grouping id. MySQL keeps
+  # these windows local. TPC-DS Q36 and Q86.
+  - query: SELECT sum(p) / sum(s) AS margin, c, k, grouping(c) + grouping(k) AS lvl, rank() OVER (PARTITION BY grouping(c) + grouping(k), CASE WHEN grouping(k) = 0 THEN c END ORDER BY sum(p) / sum(s)) AS rnk FROM m GROUP BY ROLLUP(c, k)
+  - query: SELECT sum(p) AS total, c, k, grouping(c) + grouping(k) AS lvl, rank() OVER (PARTITION BY grouping(c) + grouping(k), CASE WHEN grouping(k) = 0 THEN c END ORDER BY sum(p) DESC) AS rnk FROM m GROUP BY ROLLUP(c, k)

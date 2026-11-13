@@ -15,6 +15,8 @@ on:
       - 'crates/chat-api/**'
       - 'crates/embed-api/**'
       - 'crates/rerank-api/**'
+      - 'crates/evaluate-api/**'
+      - 'crates/evaluate-chat/**'
       - 'crates/llms-llamacpp/**'
       - 'crates/llama-cpp/**'
   merge_group:
@@ -85,7 +87,9 @@ jobs:
                 name: 'hosted',
                 needs_env: true,
                 runner,
-                model_allowlist: 'anthropic,openai,azure,xai,bedrock'
+                // `openai_decisions` is left out: `OpenAiDecisions` takes only an API key, and CI
+                // authenticates OpenAI with workload identity federation.
+                model_allowlist: 'anthropic,openai,azure,xai,bedrock,typesafe'
               }
             ];
 
@@ -129,7 +133,7 @@ jobs:
     # 2026-09-29..10-13). The `test` legs follow it there through
     # `setup-matrix`. The standard pool on every other event.
     runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
-    environment: ci-build
+    environment: ci
     # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
     # every sample had a warm sccache. Sized against the other macOS workspace
     # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
@@ -295,6 +299,7 @@ jobs:
         env:
           MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           SPICE_BEDROCK_REGION: us-east-1
           SPICE_BEDROCK_ACCESS_KEY: ${{ steps.bedrock-role.outputs.aws-access-key-id }}
           SPICE_BEDROCK_SECRET_KEY: ${{ steps.bedrock-role.outputs.aws-secret-access-key }}
@@ -318,7 +323,7 @@ jobs:
           # Each provider's credential is required only when the run tests that provider.
           runs() { [[ ",${MODEL_ALLOWLIST}," == *",$1,"* ]]; }
           for check in openai:OPENAI_IDENTITY_PROVIDER_ID anthropic:ANTHROPIC_FEDERATION_RULE_ID \
-            azure:AZURE_OPENAI_CLIENT_ID xai:SPICE_XAI_API_KEY; do
+            azure:AZURE_OPENAI_CLIENT_ID xai:SPICE_XAI_API_KEY typesafe:TYPESAFE_API_KEY; do
             model="${check%%:*}"
             variable="${check#*:}"
             if runs "$model" && [ -z "${!variable:-}" ]; then
@@ -392,4 +397,4 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- model:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: hf_resolution:: unsupported::
+          cargo test -p llms-llamacpp --features metal --test integration -- model:: batching:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: sequences:: hf_resolution:: unsupported::

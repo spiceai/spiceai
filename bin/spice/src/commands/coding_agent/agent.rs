@@ -566,8 +566,6 @@ pub(crate) struct Backend<'a> {
     /// Every model the runtime serves, including [`Self::model`], so an agent
     /// with a model picker can switch between them.
     pub models: &'a [String],
-    /// Whether every one of [`Self::models`] answers the Messages API natively.
-    pub native_messages: bool,
     /// Whether the user named the model with the agent's own option, in which
     /// case no model option is added: the agent would refuse it twice.
     pub model_given: bool,
@@ -768,13 +766,6 @@ fn claude_code(backend: &Backend<'_>, scratch: &Path) -> Result<Launch> {
         // Claude Code otherwise asks for up to 32k tokens, which a provider with a lower cap
         // refuses.
         env.push(("CLAUDE_CODE_MAX_OUTPUT_TOKENS", os(output.to_string())));
-    }
-    if !backend.native_messages {
-        // Tool search defers tools with `defer_loading`, which a Messages
-        // request translated into a chat completion cannot carry: the runtime
-        // rejects the request, and Claude Code retries before it falls back to
-        // loading every tool. Starting with every tool loaded skips the failures.
-        env.push(("ENABLE_TOOL_SEARCH", os("false")));
     }
 
     let path = scratch.join(CLAUDE_CODE_SETTINGS);
@@ -1159,7 +1150,6 @@ mod tests {
             api_key,
             model: "qwen",
             models,
-            native_messages: false,
             model_given: false,
             limits: &NO_LIMITS,
         }
@@ -1205,7 +1195,6 @@ mod tests {
                     "1".to_string()
                 ),
                 ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0".to_string()),
-                ("ENABLE_TOOL_SEARCH", "false".to_string()),
             ]
         );
         // A vendor key or provider switch in the user's shell must not survive.
@@ -1238,7 +1227,7 @@ mod tests {
                 r#""CLAUDE_CODE_USE_ANTHROPIC_AWS":"","CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD":"","#,
                 r#""CLAUDE_CODE_USE_BEDROCK":"","CLAUDE_CODE_USE_FOUNDRY":"","#,
                 r#""CLAUDE_CODE_USE_GATEWAY":"","CLAUDE_CODE_USE_MANTLE":"","#,
-                r#""CLAUDE_CODE_USE_VERTEX":"","ENABLE_TOOL_SEARCH":"false"}}"#,
+                r#""CLAUDE_CODE_USE_VERTEX":""}}"#,
             )
         );
     }
@@ -1415,21 +1404,6 @@ mod tests {
         )
         .expect("write");
         assert_eq!(find(), None, "a listing that is this runtime's");
-    }
-
-    #[test]
-    fn claude_code_keeps_tool_search_when_every_model_is_native_anthropic() {
-        let models = models();
-        let mut native = backend(&models, None);
-        native.native_messages = true;
-        let launch = launch(Agent::ClaudeCode, &native, Path::new("/scratch"));
-        assert!(
-            !env_of(&launch)
-                .iter()
-                .any(|(key, _)| *key == "ENABLE_TOOL_SEARCH"),
-            "{:?}",
-            env_of(&launch)
-        );
     }
 
     #[test]

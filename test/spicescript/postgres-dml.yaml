@@ -12,6 +12,7 @@ variants:
   federated: {}
   cayenne: { datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } } }
   cayenne-memory: { datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: full } } } }
+  cayenne-object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } }, datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } } }
 
 spicepod:
   version: v1

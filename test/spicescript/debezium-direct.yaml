@@ -4,8 +4,8 @@ description: >
   Spice (`from: cdc:`, `POST /v1/datasets/{name}/cdc`, no Kafka): the initial
   snapshot, inserts, updates (including the key's row moving between values)
   and deletes are applied once each, and the acceleration answers as
-  PostgreSQL does, in Cayenne and in Arrow, and in Cayenne after spiced
-  restarts.
+  PostgreSQL does, in Cayenne in file and memory mode, and in file mode
+  after spiced restarts.
 
 sources:
   src: { kind: postgres }
@@ -24,7 +24,9 @@ sources:
 
 variants:
   cayenne: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } } }
-  arrow: { datasets: { '*': { acceleration: { engine: arrow, mode: memory, on_conflict: { id: upsert } } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+  cayenne-memory: { datasets: { '*': { acceleration: { engine: cayenne, mode: memory } } } }
 
 spicepod:
   version: v1
@@ -97,12 +99,12 @@ steps:
   # a durable acceleration survives this: a push source cannot be re-read, so
   # an in-memory one restarts empty and holds only what arrives afterwards.
   - restart: {}
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - source-exec:
       src: |
         UPDATE t SET v = 'after restart' WHERE id <= 20;
         DELETE FROM t WHERE id > 590;
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - query: SELECT * FROM t
     eventually: 60s
-    only: cayenne
+    only: [cayenne, cayenne-object-native]

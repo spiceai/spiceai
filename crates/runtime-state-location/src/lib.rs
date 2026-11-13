@@ -184,17 +184,24 @@ pub enum StateFeature {
     RateControl,
     ResultsCacheWarmup,
     Snapshots,
+    /// The Cayenne object-native metastore's head logs.
+    CayenneMetastore,
+    /// The data files of Cayenne datasets kept in the state location, beside
+    /// their metastore logs.
+    CayenneData,
     /// The startup check of a `runtime.state` location, which keeps
     /// `format.json` and its probe object in the location's `_spice/` folder.
     StartupCheck,
 }
 
 impl StateFeature {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Scheduler,
         Self::RateControl,
         Self::ResultsCacheWarmup,
         Self::Snapshots,
+        Self::CayenneMetastore,
+        Self::CayenneData,
         Self::StartupCheck,
     ];
 
@@ -207,8 +214,28 @@ impl StateFeature {
             Self::RateControl => Some("rate_control"),
             Self::ResultsCacheWarmup => Some("results_cache_warmup"),
             Self::Snapshots => Some("snapshots"),
+            Self::CayenneMetastore => Some("cayenne_metastore"),
+            Self::CayenneData => Some("cayenne_data"),
             Self::StartupCheck => None,
         }
+    }
+
+    /// Whether `state_store_conflicts_total` and `state_store_cleanup_deleted_total`
+    /// apply to the feature, so they are published at zero for it. Cayenne data
+    /// files are written once under unique keys, so no write conflicts, and
+    /// their cleanup is counted per table in `cayenne_maintenance_reclaimed_*`.
+    #[must_use]
+    pub fn has_conflict_and_cleanup_counters(self) -> bool {
+        !matches!(self, Self::CayenneData | Self::StartupCheck)
+    }
+
+    /// Whether the feature's conflict and cleanup counters are published at zero only
+    /// once its store is opened, rather than at startup. The Cayenne metastore is in
+    /// the location only when a dataset opens the object-native metastore there; until
+    /// then the counters do not apply to it and it has no series.
+    #[must_use]
+    pub fn publishes_counters_when_used(self) -> bool {
+        matches!(self, Self::CayenneMetastore)
     }
 
     /// The folder the feature writes under in a `runtime.state` location.
@@ -218,6 +245,7 @@ impl StateFeature {
             Self::RateControl => "rate-control",
             Self::ResultsCacheWarmup => "results-cache",
             Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
+            Self::CayenneMetastore | Self::CayenneData => "cayenne",
             Self::StartupCheck => "_spice",
         }
     }
@@ -228,6 +256,8 @@ impl StateFeature {
             Self::RateControl => "rate-control state",
             Self::ResultsCacheWarmup => "SQL results cache warmup state",
             Self::Snapshots => "snapshot",
+            Self::CayenneMetastore => "Cayenne metastore",
+            Self::CayenneData => "Cayenne data",
             Self::StartupCheck => "shared state location check",
         }
     }
@@ -240,6 +270,8 @@ impl StateFeature {
             Self::RateControl => "source rate control",
             Self::ResultsCacheWarmup => "SQL results cache warmup",
             Self::Snapshots => "acceleration snapshots",
+            Self::CayenneMetastore => "the Cayenne metastore",
+            Self::CayenneData => "Cayenne data files",
             Self::StartupCheck => "the startup check",
         }
     }
@@ -251,7 +283,12 @@ impl StateFeature {
         match (self, source) {
             (Self::Snapshots, _) | (_, StateSource::RuntimeState) => &SNAPSHOT_S3_PARAMETERS,
             (
-                Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::StartupCheck,
+                Self::Scheduler
+                | Self::RateControl
+                | Self::ResultsCacheWarmup
+                | Self::CayenneMetastore
+                | Self::CayenneData
+                | Self::StartupCheck,
                 _,
             ) => &S3_PARAMETERS,
         }
@@ -282,7 +319,9 @@ impl StateFeature {
 /// `abfss://` that is the container root, whatever path the URL has.
 ///
 /// Every request through the store is recorded in the state-store
-/// [`metrics`] under `feature`'s label, when it has one.
+/// [`metrics`] under `feature`'s label, when it has one. Two features sharing
+/// one store build it with [`build_unmetered_object_store`] and meter it once
+/// for each.
 ///
 /// `s3://`, `abfs://`, `abfss://`, `gs://` and `file://` locations build the
 /// same store for every feature. A snapshot location with another scheme is
@@ -303,7 +342,13 @@ pub async fn build_object_store(
     Ok((metrics::metered(store, feature), prefix))
 }
 
-async fn build_unmetered_object_store(
+/// [`build_object_store`] without the metrics: the caller meters the store with
+/// [`metrics::metered`], once for each feature whose requests go through it.
+///
+/// # Errors
+///
+/// As [`build_object_store`].
+pub async fn build_unmetered_object_store(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
     state: &StateLocation,
@@ -337,17 +382,41 @@ async fn build_unmetered_object_store(
                 location: local_path.display().to_string(),
             })?;
 
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            object_store_occ::LocalConditionalPut::new(&local_path).map_err(|source| {
-                Error::LocalFileSystemInit {
-                    usage,
-                    location: local_path.display().to_string(),
-                    source: Box::new(source),
-                }
-            })?,
+        // The Cayenne metastore acknowledges a source once its commit is
+        // published, so its puts, and those of the data files the commit names,
+        // must be on disk when they return. Its store is keyed by absolute
+        // paths, as an S3 store is keyed from its bucket's root, so the
+        // `file://` URL of a dataset's data folder in the location names its
+        // objects the way an `s3://` URL does.
+        let cayenne = matches!(
+            feature,
+            StateFeature::CayenneMetastore | StateFeature::CayenneData
         );
+        let local = if cayenne {
+            object_store_occ::LocalConditionalPut::new_durable_keyed_by_absolute_path(&local_path)
+        } else {
+            object_store_occ::LocalConditionalPut::new(&local_path)
+        };
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(local.map_err(|source| Error::LocalFileSystemInit {
+                usage,
+                location: local_path.display().to_string(),
+                source: Box::new(source),
+            })?);
 
-        return Ok((store, feature_prefix("")));
+        let prefix = if cayenne {
+            // The directory's own key, decoded from the URL: `my dir`, not `my%20dir`.
+            let key = object_store::path::Path::from_absolute_path(&local_path).map_err(|_| {
+                Error::InvalidFileLocation {
+                    usage,
+                    location: state_location.to_string(),
+                }
+            })?;
+            feature_prefix(key.as_ref())
+        } else {
+            feature_prefix("")
+        };
+        return Ok((store, prefix));
     }
 
     let base_prefix = if matches!(url.scheme(), "abfs" | "abfss")
@@ -651,6 +720,39 @@ mod tests {
         );
     }
 
+    /// Cayenne's store for a `file://` location is keyed by absolute paths, as
+    /// an S3 store is keyed from its bucket's root: its prefix is the location's
+    /// path and the `cayenne` folder, and an object under it is the file the
+    /// `file://` URL of the same path names, with the URL's percent-encoding
+    /// decoded.
+    #[tokio::test]
+    async fn runtime_state_file_location_keys_cayenne_by_absolute_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp_dir.path().join("nested state");
+        let state_location = format!("file://{}/", state_dir.display()).replace(' ', "%20");
+        for feature in [StateFeature::CayenneMetastore, StateFeature::CayenneData] {
+            let (store, prefix) = build_object_store(
+                secrets(),
+                Handle::current(),
+                &runtime_state(&state_location, &[]),
+                feature,
+            )
+            .await
+            .expect("file state store should build");
+            let expected = format!("{}/cayenne", state_dir.display());
+            assert_eq!(format!("/{prefix}"), expected, "{feature:?}");
+            object_store::ObjectStoreExt::put(
+                store.as_ref(),
+                &object_store::path::Path::from(format!("{prefix}/v1/{feature:?}")),
+                bytes::Bytes::from_static(b"x").into(),
+            )
+            .await
+            .expect("put");
+            let written = state_dir.join("cayenne/v1").join(format!("{feature:?}"));
+            assert_eq!(std::fs::read(&written).expect("read"), b"x");
+        }
+    }
+
     const S3_KEY_PARAMS: &[(&str, &str)] = &[
         ("s3_endpoint", "http://localhost:9000"),
         ("s3_key", "AKID"),
@@ -764,6 +866,33 @@ mod tests {
             UpdateResult::Conflict { current } => assert_eq!(current, remote_update),
             other => panic!("expected Conflict, got {other:?}"),
         }
+    }
+
+    /// The Cayenne metastore acknowledges a source only once its commit is
+    /// durable, so on a local directory every put must be synced: a store that
+    /// returns before the bytes reach the disk loses acknowledged commits on
+    /// power loss.
+    #[tokio::test]
+    async fn a_file_location_keeps_the_cayenne_metastore_on_synced_puts() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state_location = format!("file://{}", temp_dir.path().display());
+        let (store, prefix) = build_object_store(
+            secrets(),
+            Handle::current(),
+            &runtime_state(&state_location, &[]),
+            StateFeature::CayenneMetastore,
+        )
+        .await
+        .expect("file state store should build");
+        // Keyed by absolute paths: see `runtime_state_file_location_keys_cayenne_by_absolute_path`.
+        assert_eq!(
+            format!("/{prefix}"),
+            format!("{}/cayenne", temp_dir.path().display())
+        );
+        assert!(
+            store.to_string().ends_with(", durable)"),
+            "the Cayenne metastore's local store does not sync its puts: {store}"
+        );
     }
 
     #[tokio::test]

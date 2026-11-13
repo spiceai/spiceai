@@ -959,6 +959,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::CreateDirectory { .. } => "create_directory",
         spice::error::Error::RuntimeExecution { .. } => "runtime_execution",
         spice::error::Error::RuntimeVersion { .. } => "runtime_version",
+        spice::error::Error::NightlyInstall { .. } => "nightly_install",
         spice::error::Error::Environment { .. } => "environment",
         spice::error::Error::InvalidArgument { .. } | spice::error::Error::InvalidUsage { .. } => {
             "invalid_argument"

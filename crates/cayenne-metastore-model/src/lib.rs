@@ -8,6 +8,7 @@ mod action_compatibility;
 mod commits;
 mod concurrent;
 mod core;
+mod data_files;
 mod dataset_lifecycle;
 mod floors;
 mod intent_partitioned;
@@ -1065,6 +1066,38 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "I8 visible replay equality",
+        },
+        Run {
+            name: "transactions-txn-no-fence-check-0-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-fence-check",
+            bound: 0,
+            seed: None,
+            failure: "a prepared participant keeps its transaction's records",
+        },
+        Run {
+            name: "transactions-txn-no-prepared-check-1-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-prepared-check",
+            bound: 1,
+            seed: None,
+            failure: "a prepared participant keeps its transaction's records",
+        },
+        Run {
+            name: "transactions-txn-no-intent-check-1-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-intent-check",
+            bound: 1,
+            seed: None,
+            failure: "the coordinator reports the transaction's decision",
+        },
+        Run {
+            name: "transactions-txn-no-coordinator-wait-0-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-coordinator-wait",
+            bound: 0,
+            seed: None,
+            failure: "a prepared participant keeps its transaction's records",
         },
         Run {
             name: "transactions-txn-no-roots-0-exhaust",
@@ -2307,7 +2340,245 @@ fn additional_runs() -> Vec<Run> {
             failure: "",
         });
     }
+    // Data files uploaded before the commit that names them.
+    for (name, mode, bound, failure) in [
+        ("data-files", "data-files", 2, ""),
+        ("data-files-3", "data-files", 3, ""),
+        (
+            "data-files-no-upload-before-commit",
+            "data-files-no-upload-before-commit",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-no-committed-read",
+            "data-files-no-committed-read",
+            2,
+            "reader sees only committed files",
+        ),
+        (
+            "data-files-no-resolve-by-head",
+            "data-files-no-resolve-by-head",
+            2,
+            "unknown outcome resolves all-or-nothing",
+        ),
+        ("data-files-intent", "data-files-intent", 2, ""),
+        (
+            "data-files-intent-sweep-ignores-intent",
+            "data-files-intent-sweep-ignores-intent",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-intent-adopt-by-listing",
+            "data-files-intent-adopt-by-listing",
+            2,
+            "aborted or abandoned upload never visible to a reader",
+        ),
+        // Per-file retirement of committed data files and reader protection.
+        ("data-files-retire", "data-files-intent-retire", 2, ""),
+        ("data-files-retire-3", "data-files-intent-retire", 3, ""),
+        // The clock, the retention T and a reader on another instance.
+        (
+            "data-files-retire-remote",
+            "data-files-intent-retire-remote",
+            2,
+            "",
+        ),
+        (
+            "data-files-retire-remote-3",
+            "data-files-intent-retire-remote",
+            3,
+            "",
+        ),
+        (
+            "data-files-retire-whole-snapshot",
+            "data-files-intent-retire-whole-snapshot",
+            2,
+            "local scan within T finds every file",
+        ),
+        (
+            "data-files-retire-3-retires-carried",
+            "data-files-intent-retire-retires-carried",
+            3,
+            "carried or shared file never deleted while live",
+        ),
+        (
+            "data-files-retire-local-ignores-retention",
+            "data-files-intent-retire-local-ignores-retention",
+            2,
+            "local scan within T finds every file",
+        ),
+        (
+            "data-files-retire-remote-ignores-retention",
+            "data-files-intent-retire-remote-ignores-retention",
+            2,
+            "remote reader within T - S finds every file",
+        ),
+        (
+            "data-files-retire-forget-early",
+            "data-files-intent-retire-forget-early",
+            2,
+            "forgotten file leaves nothing behind",
+        ),
+        (
+            "data-files-retire-ignores-restore-hold",
+            "data-files-intent-retire-ignores-restore-hold",
+            2,
+            "restore point copies every file",
+        ),
+        (
+            "data-files-retire-sweep-uncommitted",
+            "data-files-intent-retire-sweep-uncommitted",
+            2,
+            "committed files exist",
+        ),
+        (
+            "data-files-retire-prepared",
+            "data-files-intent-retire-prepared",
+            2,
+            "",
+        ),
+        (
+            "data-files-retire-prepared-lean-3",
+            "data-files-intent-retire-prepared-lean",
+            3,
+            "",
+        ),
+        (
+            "data-files-retire-prepared-orphan-ignores-reservation",
+            "data-files-intent-retire-prepared-orphan-ignores-reservation",
+            2,
+            "committed files exist",
+        ),
+        // Not a control: the retirement sweep's reservation check is not
+        // needed for these properties (see the README).
+        (
+            "data-files-retire-prepared-lean-3-retire-ignores-reservation",
+            "data-files-intent-retire-prepared-lean-retire-ignores-reservation",
+            3,
+            "",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "data-files",
+            mode,
+            bound,
+            seed: None,
+            failure,
+        });
+    }
     runs
+}
+
+/// Appends one JSON line to the file named by `TRACE_JSON`, if set: the
+/// action sequences that trace replay maps onto real storage code.
+fn trace_json(line: &str) {
+    use std::io::Write as _;
+    let Ok(path) = std::env::var("TRACE_JSON") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn json_string(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_actions<A: std::fmt::Debug>(actions: &[A]) -> String {
+    let items: Vec<String> = actions
+        .iter()
+        .map(|action| json_string(&format!("{action:?}")))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Seeded random walks over `model` (`WALK=<seed>:<count>:<max_steps>`), each
+/// written as a JSON line with the properties that failed along it, if any.
+fn walk<M>(model: &M, run: &Run, spec: &str) -> bool
+where
+    M: Model,
+    M::State: Clone + std::fmt::Debug,
+    M::Action: Clone + PartialEq + std::fmt::Debug,
+{
+    let mut parts = spec.split(':').map(|part| part.parse::<u64>().unwrap_or(0));
+    let seed = parts.next().unwrap_or(1).max(1);
+    let count = parts.next().unwrap_or(100);
+    let max_steps = parts.next().unwrap_or(50);
+    let mut rng = seed;
+    let mut next = move |bound: usize| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        usize::try_from(rng % (bound as u64).max(1)).unwrap_or(0)
+    };
+    let properties = model.properties();
+    let initials = model.init_states();
+    let mut good = true;
+    for walk_index in 0..count {
+        let initial_index = next(initials.len());
+        let mut state = initials[initial_index].clone();
+        let mut actions = Vec::new();
+        let mut failed: Vec<&str> = Vec::new();
+        for _ in 0..max_steps {
+            let mut enabled = vec![];
+            model.actions(&state, &mut enabled);
+            if enabled.is_empty() {
+                break;
+            }
+            let action = enabled[next(enabled.len())].clone();
+            let Some(after) = model.next_state(&state, action.clone()) else {
+                break;
+            };
+            state = after;
+            actions.push(action);
+            for p in &properties {
+                if p.expectation == Expectation::Always
+                    && !(p.condition)(model, &state)
+                    && !failed.contains(&p.name)
+                {
+                    failed.push(p.name);
+                }
+            }
+        }
+        good &= failed.is_empty() || !run.failure.is_empty();
+        let failed: Vec<String> = failed.iter().map(|name| json_string(name)).collect();
+        trace_json(&format!(
+            "{{\"kind\":\"walk\",\"run\":{},\"family\":{},\"mode\":{},\"seed\":{seed},\"walk\":{walk_index},\"initial_index\":{initial_index},\"failed\":[{}],\"actions\":{}}}",
+            json_string(run.name),
+            json_string(run.family),
+            json_string(run.mode),
+            failed.join(","),
+            json_actions(&actions)
+        ));
+    }
+    println!(
+        "WALKS {} seed={seed} count={count} max_steps={max_steps} good={good}",
+        run.name
+    );
+    good
 }
 
 fn replay<M: Model>(model: &M, initial: &M::State, actions: &[M::Action]) -> Option<M::State>
@@ -2419,6 +2690,9 @@ where
     M::State: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash + PartialEq,
     M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
 {
+    if let Ok(spec) = std::env::var("WALK") {
+        return walk(&model, &run, &spec);
+    }
     println!("START {}", run.name);
     let _simulating = Simulating::start(run.seed.is_some());
     let start = Instant::now();
@@ -2426,12 +2700,22 @@ where
     // broker closure as evidence that the search exhausted its graph.
     let (finished, watch) = std::sync::mpsc::channel::<()>();
     let name = run.name;
+    // Retirement composes local scans and restore points with the retention clock.
+    // Keep the complete graph's bounds while allowing its extra interleavings.
+    let timeout = if run.family == "data-files" && run.mode.contains("retire") {
+        std::time::Duration::from_mins(30)
+    } else {
+        std::time::Duration::from_mins(9)
+    };
     let watchdog = std::thread::spawn(move || {
         if matches!(
-            watch.recv_timeout(std::time::Duration::from_mins(9)),
+            watch.recv_timeout(timeout),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ) {
-            eprintln!("INCOMPLETE {name}: checker exceeded 540 seconds");
+            eprintln!(
+                "INCOMPLETE {name}: checker exceeded {} seconds",
+                timeout.as_secs()
+            );
             std::process::exit(1);
         }
     });
@@ -2580,8 +2864,10 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         && run.failure.is_empty()
         && (run.mode.contains("remote-gc") || run.mode.contains("checkpoint"))
         && *expectation == Expectation::Sometimes;
-    let standby_required = matches!(run.family, "standby" | "object-names" | "reads")
-        && run.failure.is_empty()
+    let standby_required = matches!(
+        run.family,
+        "standby" | "object-names" | "reads" | "data-files"
+    ) && run.failure.is_empty()
         && *expectation == Expectation::Sometimes;
     let promotion_required = run.family == "cold-promotion"
         && run.failure.is_empty()
@@ -2597,6 +2883,13 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
     let added_required = run.failure.is_empty()
         && run.seed.is_none()
         && match (run.family, name) {
+            (
+                "transactions",
+                "the coordinator removes the records"
+                | "another process removes the records after a takeover"
+                | "a decision object recreated after removal"
+                | "the coordinator aborts at its deadline and reports it",
+            ) => run.mode == "resolution-txn" && run.bound >= 1,
             (
                 "remote-maintenance",
                 "writer retries original stamps then commits" | "maintenance retries guards",
@@ -2764,6 +3057,16 @@ where
                 "MINIMIZED enabled={valid} steps={} {action:?}",
                 action.len()
             );
+            trace_json(&format!(
+                "{{\"kind\":\"witness\",\"run\":{},\"family\":{},\"mode\":{},\"property\":{},\"status\":{},\"valid\":{valid},\"initial_index\":{},\"actions\":{}}}",
+                json_string(run.name),
+                json_string(run.family),
+                json_string(run.mode),
+                json_string(p.name),
+                json_string(status),
+                initial_index.map_or_else(|| "null".to_string(), |i| i.to_string()),
+                json_actions(&action)
+            ));
             if (run.family.ends_with("-progress")
                 || run.family == "read-programs"
                 || run.family == "read-delivery"
@@ -2779,6 +3082,7 @@ where
                 || run.family == "standby"
                 || run.family == "object-names"
                 || run.family == "reads"
+                || run.family == "data-files"
                 || run.family == "intent-roll-forward"
                 || run.family == "replicas"
                 || run.mode.contains("restart")
@@ -2836,6 +3140,7 @@ pub fn run(name: &str) -> Result<(), String> {
         "standby" => check(standby::Protocol::new(r.mode), r),
         "object-names" => check(object_names::Protocol::new(r.mode, r.bound), r),
         "reads" => check(reads::Protocol::new(r.mode, r.bound), r),
+        "data-files" => check(data_files::Protocol::new(r.mode, r.bound), r),
         "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
         "retention" => check(retention::Protocol::new(r.mode), r),
         "replicas" => check(replicas::Protocol::new(r.mode), r),
@@ -2878,6 +3183,72 @@ pub fn run(name: &str) -> Result<(), String> {
     } else {
         Err(format!("Unexpected outcome for {name}"))
     }
+}
+
+/// The head the window run named `run` leaves after `actions`: each listed batch's
+/// end (commit numbers count from 1) and each inline record's symbolic size.
+/// `None` for an unknown run, a run of another family, or an action the run does
+/// not enable at that point.
+#[must_use]
+pub fn window_head_after(run: &str, actions: &[String]) -> Option<(Vec<usize>, Vec<usize>)> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "window")?;
+    window::head_after(run.mode, run.bound, actions)
+}
+
+pub use transactions::Step as TransactionStep;
+
+/// What each action of a `transactions` trace from `run` does in the model:
+/// the record that lands or the delivery refused, the decision and every
+/// participant's log after it. `None` for an unknown run, a run of another
+/// family, or an action the run does not enable at that point.
+#[must_use]
+pub fn transaction_steps(run: &str, actions: &[String]) -> Option<Vec<TransactionStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "transactions")?;
+    transactions::steps(run.mode, run.bound, actions)
+}
+
+pub use data_files::{
+    CommitKind as DataFileCommitKind, File as DataFile, Key as DataFileKey, Op as DataFileOp,
+    Prepared as DataFilePrepared, Retired as DataFileRetired, Step as DataFileStep,
+};
+
+/// What each action of a `data-files` trace from `run` does in the model, for a
+/// replay through real storage. `None` for an unknown run, a run of another
+/// family, or an action the run does not enable at that point.
+///
+/// Each action maps to one real operation (see [`DataFileOp`]):
+/// `StartUpload(w)` sends writer `w`'s PUT of a fresh data file to its final
+/// key under the dataset prefix, and `FinishUpload(i)` lands the `i`-th PUT in
+/// flight (acknowledged to the writer only if it still knows the upload).
+/// `Commit(w)` sends the conditional head publication, on the head version the
+/// writer read and its lease generation, naming every file whose upload has
+/// returned; `Deliver(i)` has the store evaluate the `i`-th commit request in
+/// flight, and `Drop(i)` loses it. `Timeout(w)` loses the response, leaving an
+/// unknown outcome; `Retry(w)` resends the identical request; `Resolve(w)`
+/// reads the head and resolves the outcome (committed when the head names the
+/// files, aborted once the head moved past the request's base). `Takeover(w)`
+/// is the head commit that raises the lease generation; `Crash(w)` restarts the
+/// writer process. `Read` reads the head's committed file set; `Fetch` GETs the
+/// next file of it. `Sweep(i)` deletes the `i`-th stored file, which no
+/// committed head names and whose generation is fenced. The `retire` runs add
+/// records that remove files by name and retire them (`Compact`,
+/// `CompactCarry`, `Remove`, `Prepare` with `CommitTx`/`AbortTx`), the
+/// holder's sweep (`Plan`, `DeleteLand`, `DeleteFail`, `Forget`), a logical
+/// clock (`Tick`), local scan pins (`Unpin`), restore points and a reader on
+/// another instance (`RemoteConfirm`, `RemoteStart`, `RemoteFetch`). Each step
+/// also carries the head (version, lease, files), the store's files, and in
+/// the `retire` runs the retired set and the clock after the action, the state
+/// a replay checks after every operation.
+#[must_use]
+pub fn data_file_steps(run: &str, actions: &[String]) -> Option<Vec<DataFileStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "data-files")?;
+    data_files::steps(run.mode, run.bound, actions)
 }
 
 /// Problems with the model citations in design documents: a cited run that does

@@ -40,6 +40,7 @@ pub struct TableSpec {
     #[serde(default)]
     pub format: FileFormat,
     /// For a `files` source: how many part files to split the rows across.
+    /// `0` writes none, leaving an empty directory after `mode: replace`.
     #[serde(default = "one")]
     pub files: u32,
     /// `replace` (default) recreates the table or its files; `append` adds the

@@ -176,13 +176,13 @@ endif
 # silently never built it — selection looked complete while three lanes never
 # ran. See `crates/cayenne/tests/correctness/README.md`.
 #
-# Scoped to `cayenne` deliberately. `runtime/duckdb,runtime/sqlite` would also
-# unlock runtime's accelerator-parity binary, but the feature flows through the
+# Scoped to `cayenne` deliberately. `runtime/sqlite` would also unlock runtime's
+# accelerator-parity binary, but the feature flows through the
 # whole `--all` build: every runtime test binary the gate builds relinks with
 # them, and those link at hundreds of megabytes each. That is a
 # large, permanent cost on every sign-off and merge-queue run to gain two
 # micro-shape comparisons — the thinnest of the five lanes. It belongs in the
-# integration workflow, which already builds with `duckdb,sqlite`.
+# integration workflow, which already builds with `adbc,sqlite`.
 #
 # The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
 # build script fetches over the network, so folding it into the gate would make
@@ -321,19 +321,20 @@ nextest-packages:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite --no-capture
+	# The `adbc::` tests need the SQLite ADBC driver; run them with `dbc install sqlite` and `-E 'test(/^adbc::/)'`, as integration_adbc.yml does.
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(/^adbc::/)'
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite --no-capture -E 'not test(spiceai_integration_test)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
 
 .PHONY: test-integration-models
 test-integration-models:
-	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture
+	@cargo test -p runtime --test integration_models --features models -- --nocapture
 
 .PHONY: test-integration-models-without-openai
 test-integration-models-without-openai:
-	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture --skip openai_test
+	@cargo test -p runtime --test integration_models --features models -- --nocapture --skip openai_test
 
 .PHONY: test-bench
 test-bench:
@@ -345,7 +346,7 @@ test-bench:
 ## workspace-wide linting (unless PACKAGES is set, then uses package defaults —
 ## workspace features like `models` are not valid on every crate).
 ## Example: make lint-rust PACKAGES="runtime data_components"
-## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
+## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="adbc,postgres"
 PACKAGES ?=
 FEATURES ?=
 # Use strip non-empty checks (not bare ifdef): PACKAGES/FEATURES are always
@@ -436,6 +437,9 @@ lint-rust:
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
 	$(PYTHON) scripts/test_check_module_reachability.py
 	$(PYTHON) scripts/check_module_reachability.py
+	## Cayenne data-path guard (fast, no compile): data files go through each dataset's ObjectStore, so no new std::fs/tokio::fs call may enter crates/cayenne/src/provider
+	$(PYTHON) scripts/test_check_cayenne_data_path_fs.py
+	$(PYTHON) scripts/check_cayenne_data_path_fs.py
 	## Fork-pin guard (fast, no compile): a moved fork pin must come with a re-audit of that fork's patches. See docs/dev/fork_patches.md
 	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
 	$(PYTHON) scripts/test_check_fork_patches.py
@@ -457,7 +461,6 @@ lint-rust-fix:
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
 	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
-	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
 	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
 	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
@@ -526,7 +529,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # and it is not `default` minus `models`: it is an independent list maintained by hand right here,
 # so a feature added to `default` does not reach `make install-data-only` until it is added below
 # too, and no check reports the omission. The two currently differ in both directions, which is why
-# reading this list as "default, less the model bits" is wrong: -data is also an ADBC-less build
+# reading this list as "default, less the model bits" is wrong: -data is also a build
 # without any of the three feature-gated secret stores `default` turns on (aws-secrets-manager,
 # azure-keyvault and keyring-secret-store) — the env and Kubernetes stores are not feature-gated
 # at all, so a -data build still reads secrets from both of those — and it carries the PostgreSQL
@@ -535,7 +538,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # `default = [...]` array in bin/spiced/Cargo.toml.
 #
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
+SPICED_DATA_FEATURES := adbc,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build

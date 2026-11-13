@@ -76,7 +76,6 @@ use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
-use runtime_async::is_shutdown_cancellation;
 use runtime_metrics::{self as metrics, components::register_component_metric};
 use runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key;
 use snafu::prelude::*;
@@ -956,14 +955,9 @@ impl Runtime {
             } else {
                 bootstrap_status.complete().await
             };
-            // A restore completed at initialization already updated the cached
-            // timestamps there; only one completed here still needs it.
             let restored = pending && bootstrap_status.is_bootstrapped();
             if restored && ds.is_snapshot_source() && self.refuses_projected_publisher(&ds).await {
                 return;
-            }
-            if restored {
-                update_cached_dataset_timestamps(ds.as_ref()).await;
             }
             // Rows restored from an acceleration snapshot are not the rows an append
             // cursor saved here before describes.
@@ -3197,12 +3191,7 @@ impl Runtime {
                             source: Box::new(error),
                         },
                     }) {
-                    Ok(bootstrap_status) => {
-                        if bootstrap_status.is_bootstrapped() {
-                            update_cached_dataset_timestamps(ds.as_ref()).await;
-                        }
-                        (ds.name.clone(), Ok(bootstrap_status))
-                    }
+                    Ok(bootstrap_status) => (ds.name.clone(), Ok(bootstrap_status)),
                     Err(err) => {
                         let ds_name = &ds.name;
                         status.update_dataset(
@@ -3900,50 +3889,6 @@ async fn unknown_data_connector(source: &str) -> Error {
     .build()
 }
 
-/// Updates the `fetched_at` column for all records in a cached dataset that was bootstrapped.
-/// This is necessary for caching mode to ensure all bootstrapped records have a valid timestamp.
-async fn update_cached_dataset_timestamps(dataset: &Dataset) {
-    let is_caching_mode = dataset
-        .acceleration
-        .as_ref()
-        .and_then(|acc| acc.refresh_mode)
-        .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
-
-    if !is_caching_mode {
-        return;
-    }
-
-    let is_reset_expiry_on_load_enabled = dataset
-        .acceleration
-        .as_ref()
-        .is_some_and(|acc| acc.snapshots_reset_expiry_on_load_enabled);
-
-    if !is_reset_expiry_on_load_enabled {
-        return;
-    }
-
-    match crate::dataaccelerator::spice_sys::update_caching_engine_fetched_at(dataset).await {
-        Ok(()) => {
-            tracing::info!(
-                "Updated _fetched_at for all records in cached dataset {}",
-                dataset.name
-            );
-        }
-        Err(e) if is_shutdown_cancellation(&e) => {
-            tracing::debug!(
-                "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
-                dataset.name
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to update _fetched_at for cached dataset {}: {e}",
-                dataset.name
-            );
-        }
-    }
-}
-
 /// The message logged when an accelerated dataset with data on disk waits for its
 /// source before serving, because of `reason` (see
 /// `Runtime::waits_for_source_reason`).
@@ -4260,8 +4205,8 @@ mod tests {
     #[test]
     fn the_last_arrival_warning_says_which_rows_are_missed_and_how_to_load_them() {
         assert_eq!(
-            last_arrival_without_overlap_warning("acc", Engine::DuckDB),
-            "Dataset 'acc' (`engine: duckdb`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+            last_arrival_without_overlap_warning("acc", Engine::Sqlite),
+            "Dataset 'acc' (`engine: sqlite`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
     }
 
@@ -4281,12 +4226,11 @@ mod tests {
         let (keyed, time_keyed) = (Some(&key), Some(&with_time));
         let (append, full) = (RefreshMode::Append, RefreshMode::Full);
         for (engine, key, mode, expected, what) in [
-            (Engine::DuckDB, keyed, append, true, "keyed"),
             (Engine::Sqlite, keyed, append, true, "keyed"),
-            (Engine::DuckDB, None, append, false, "unkeyed"),
-            (Engine::DuckDB, keyed, full, false, "full"),
+            (Engine::Sqlite, None, append, false, "unkeyed"),
+            (Engine::Sqlite, keyed, full, false, "full"),
             (Engine::Cayenne, keyed, append, false, "keeps newest"),
-            (Engine::DuckDB, time_keyed, append, false, "key holds time"),
+            (Engine::Sqlite, time_keyed, append, false, "key holds time"),
         ] {
             assert_eq!(
                 reads_by_time_despite_commits(&acceleration(engine, key), ts, mode),
@@ -4904,7 +4848,7 @@ mod tests {
         }
 
         let not_cayenne = Acceleration {
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             ..acceleration_with_params(WriteMode::WriteThrough, &none)
         };
         assert_eq!(

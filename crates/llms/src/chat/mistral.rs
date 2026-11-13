@@ -116,6 +116,8 @@ impl MistralLlama {
             reasoning,
             // mistral.rs reads its ring from `RING_CONFIG`, which the caller wrote.
             distributed: _,
+            // mistral.rs schedules its own requests.
+            concurrent_requests: _,
         } = options;
         for weight in model_weights {
             if !weight.exists() {
@@ -1137,6 +1139,9 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
         index: *index as u32,
         delta: ChatCompletionStreamResponseDelta {
             content: delta.content.clone(),
+            // A fragment of nothing carries nothing, so a streamed `reasoning_content` is never
+            // empty.
+            reasoning_content: delta.reasoning_content.clone().filter(|r| !r.is_empty()),
             function_call: None,
             tool_calls: delta.tool_calls.as_ref().map(|t| {
                 t.iter()

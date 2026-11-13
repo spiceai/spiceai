@@ -119,6 +119,7 @@ async fn download(version: &str, asset: &str, file: &str, override_var: &str) ->
         let archive = dir.join(asset);
         let url = format!("https://github.com/duckdb/duckdb/releases/download/v{version}/{asset}");
         let status = tokio::process::Command::new("curl")
+            .args(crate::release::CURL_RELEASE_RETRY)
             .args(["-fsSL", "-o"])
             .arg(&archive)
             .arg(&url)

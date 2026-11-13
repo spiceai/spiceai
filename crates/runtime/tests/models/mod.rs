@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 mod ai_udf;
 mod anthropic;
 mod bedrock;
+mod decisions;
 mod embedding;
 mod embedding_filter_limit;
 mod fts_caching_restart;

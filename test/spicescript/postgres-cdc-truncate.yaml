@@ -9,6 +9,7 @@ sources:
 variants:
   file: {}
   memory: { datasets: { '*': { acceleration: { mode: memory } } } }
+  object-native: object-native
 spicepod:
   version: v1
   kind: Spicepod
@@ -59,3 +60,57 @@ steps:
   - query: SELECT * FROM a
     expect-empty: true
   - query: SELECT * FROM b
+  # Refilled and truncated in quick succession, then restarted. A durable
+  # acceleration left empty is rebuilt from the source on restart, and the slot
+  # can resend commits it had already applied; replayed onto the rebuilt table
+  # they would show the refill's rows before the second truncate reapplies.
+  - source-exec: { src: "INSERT INTO a VALUES (5, 'new5'), (2000, 'new2000')" }
+  - query: SELECT * FROM a
+    eventually: 30s
+  - source-exec: { src: "BEGIN; TRUNCATE a; INSERT INTO a SELECT i, 'again' || i FROM generate_series(1, 10) i; COMMIT; TRUNCATE a, b; INSERT INTO b VALUES (1, 'b-after')" }
+  - query: SELECT * FROM a
+    expect-empty: true
+    eventually: 30s
+  - restart: {}
+  - query: SELECT * FROM a
+    expect-empty: true
+  - query: SELECT * FROM b
+  # Restarts with the source busy with writes to a table no dataset reads: a
+  # dataset is ready only once its rows can be read, never on a keepalive
+  # that overtakes its snapshot (in memory mode every restart loads one).
+  - source-exec: { src: "INSERT INTO a SELECT i, 'refill' || i FROM generate_series(1, 1000) i; CREATE TABLE unrelated (id serial PRIMARY KEY)" }
+  - query: SELECT * FROM a
+    eventually: 30s
+  - background:
+      id: unrelated-writes
+      source-exec: { src: "INSERT INTO unrelated DEFAULT VALUES" }
+      every: 50ms
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - restart: {}
+  - query: SELECT * FROM a
+  - query: SELECT * FROM b
+  - stop-background: { id: unrelated-writes }
+  # Restarts with the source idle: a dataset whose stream has caught up is
+  # ready in seconds, without waiting for unrelated writes on the server to
+  # move its WAL (#15038).
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
+  - restart: { ready-timeout: 10s }
