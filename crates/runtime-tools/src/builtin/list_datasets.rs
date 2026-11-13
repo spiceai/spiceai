@@ -356,17 +356,24 @@ pub fn catalog_prompt(page: &DatasetPage) -> String {
     if page.total == 0 {
         return "No datasets are available to query.".to_string();
     }
-    let too_many = || {
-        format!(
-            "{} datasets are available. Call list_datasets with search to find the ones relevant to the question.",
-            page.total
-        )
-    };
     if page.has_more {
-        return too_many();
+        return too_many_datasets(page.total);
     }
+    catalog_listing(&page.datasets).unwrap_or_else(|| too_many_datasets(page.total))
+}
+
+/// What the system prompt says when the `total` datasets do not fit in it.
+fn too_many_datasets(total: usize) -> String {
+    format!(
+        "{total} datasets are available. Call list_datasets with search to find the ones relevant to the question."
+    )
+}
+
+/// `datasets` by name, as the system prompt lists them; `None` when the list takes more than
+/// [`MAX_CATALOG_PROMPT_BYTES`].
+fn catalog_listing(datasets: &[ListDatasetElement]) -> Option<String> {
     let mut text = String::from("Datasets (use these names in sql, search, and table_schema):");
-    for dataset in &page.datasets {
+    for dataset in datasets {
         text.push_str("\n- ");
         text.push_str(&dataset.table);
         if let Some(description) = dataset
@@ -381,19 +388,38 @@ pub fn catalog_prompt(page: &DatasetPage) -> String {
             text.push_str(" [searchable]");
         }
         if text.len() > MAX_CATALOG_PROMPT_BYTES {
-            return too_many();
+            return None;
         }
     }
-    text
+    Some(text)
 }
 
 /// The system-prompt text naming the datasets `tool`, a `list_datasets` tool, lists: see
-/// [`catalog_prompt`]. `None` when the tool fails.
+/// [`catalog_prompt`]. It reads the tool's pages of [`MAX_LIST_LIMIT`] datasets until it has every
+/// dataset or they no longer fit in [`MAX_CATALOG_PROMPT_BYTES`], so the page size is not a
+/// second limit on the list. A catalog whose number of datasets changes between pages gets the
+/// search hint instead of a list, because its pages could skip or repeat a dataset. `None` when
+/// the tool fails.
 pub async fn catalog_prompt_from_tool(tool: &dyn SpiceModelTool) -> Option<String> {
-    let arguments = format!(r#"{{"limit":{MAX_LIST_LIMIT}}}"#);
+    let mut page = list_datasets_page(tool, 0).await?;
+    while page.has_more && catalog_listing(&page.datasets).is_some() {
+        let next = list_datasets_page(tool, page.datasets.len()).await?;
+        if next.total != page.total || next.datasets.is_empty() {
+            return Some(too_many_datasets(next.total));
+        }
+        page.datasets.extend(next.datasets);
+        page.has_more = next.has_more;
+    }
+    Some(catalog_prompt(&page))
+}
+
+/// The page of [`MAX_LIST_LIMIT`] datasets `tool`, a `list_datasets` tool, lists from `offset`.
+/// `None` when the tool fails.
+async fn list_datasets_page(tool: &dyn SpiceModelTool, offset: usize) -> Option<DatasetPage> {
+    let arguments = format!(r#"{{"limit":{MAX_LIST_LIMIT},"offset":{offset}}}"#);
     match tool.call(&arguments).await {
         Ok(value) => match serde_json::from_value::<DatasetPage>(value) {
-            Ok(page) => Some(catalog_prompt(&page)),
+            Ok(page) => Some(page),
             Err(error) => {
                 tracing::debug!("Could not read the datasets list_datasets returned: {error}");
                 None
@@ -603,6 +629,101 @@ mod tests {
         assert_eq!(
             catalog_prompt(&page),
             "100 datasets are available. Call list_datasets with search to find the ones relevant to the question."
+        );
+    }
+
+    /// A `list_datasets` tool over `count` datasets named `spice.public.t0000`, … that counts its
+    /// calls. From call number `grow_after` on, it lists one more dataset, as a catalog that gains
+    /// a table while it is being listed would.
+    struct PagedTool {
+        count: usize,
+        grow_after: Option<usize>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PagedTool {
+        fn new(count: usize) -> Self {
+            Self {
+                count,
+                grow_after: None,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SpiceModelTool for PagedTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("list_datasets")
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let count = match self.grow_after {
+                Some(after) if call >= after => self.count + 1,
+                _ => self.count,
+            };
+            let elements = (0..count)
+                .map(|i| element(&format!("spice.public.t{i:04}"), None, false))
+                .collect();
+            let params = ListDatasetsParams::parse(arg)?;
+            Ok(serde_json::to_value(dataset_page(
+                elements, &params, no_columns,
+            ))?)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_catalog_prompt_lists_every_dataset_past_one_page_when_they_fit() {
+        let tool = PagedTool::new(MAX_LIST_LIMIT + 1);
+        let prompt = catalog_prompt_from_tool(&tool).await.expect("a prompt");
+
+        let expected = std::iter::once(
+            "Datasets (use these names in sql, search, and table_schema):".to_string(),
+        )
+        .chain((0..=MAX_LIST_LIMIT).map(|i| format!("spice.public.t{i:04}")))
+        .join("\n- ");
+        assert!(
+            expected.len() <= MAX_CATALOG_PROMPT_BYTES,
+            "{}",
+            expected.len()
+        );
+        assert_eq!(prompt, expected);
+        assert_eq!(tool.calls(), 2, "one call per page of {MAX_LIST_LIMIT}");
+    }
+
+    #[tokio::test]
+    async fn the_catalog_prompt_stops_paging_once_the_datasets_do_not_fit() {
+        // 21 bytes a dataset, so 387 fit: the second page of 200 is the first past 8 KiB.
+        let tool = PagedTool::new(5_000);
+        assert_eq!(
+            catalog_prompt_from_tool(&tool).await.expect("a prompt"),
+            "5000 datasets are available. Call list_datasets with search to find the ones relevant to the question."
+        );
+        assert_eq!(tool.calls(), 2, "pages read before the budget ran out");
+    }
+
+    #[tokio::test]
+    async fn a_catalog_that_changes_between_pages_gets_the_search_hint() {
+        let tool = PagedTool {
+            grow_after: Some(1),
+            ..PagedTool::new(MAX_LIST_LIMIT + 1)
+        };
+        assert_eq!(
+            catalog_prompt_from_tool(&tool).await.expect("a prompt"),
+            "202 datasets are available. Call list_datasets with search to find the ones relevant to the question."
         );
     }
 }
