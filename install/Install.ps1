@@ -47,8 +47,9 @@ function Assert-Supported {
 
 # The sha256 a release records for one of its assets: the release's SHA256SUMS, or for
 # releases published before SHA256SUMS, the sha256 GitHub recorded when the asset was
-# uploaded. Sha256 is empty, with the Reason, when neither is available. Fatal is set when
-# the release has a SHA256SUMS that does not list the asset.
+# uploaded, only when the release's asset list confirms it has no SHA256SUMS. Sha256 is empty,
+# with the Reason, when neither is available. Fatal is set when the release has a SHA256SUMS
+# that does not list the asset, or that could not be downloaded.
 function Get-ExpectedSha256 {
     param([string]$Tag, [string]$AssetName, [string]$WorkDir)
 
@@ -76,7 +77,12 @@ function Get-ExpectedSha256 {
     try {
         $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$spiceOrgName/$spiceRepoName/releases/tags/$Tag" -Headers $headers -ErrorAction Stop
     } catch {
-        return @{ Sha256 = ""; Reason = "release $Tag has no SHA256SUMS, and the GitHub API request for its asset sha256 failed (set GITHUB_TOKEN if the API rate limit was exceeded)" }
+        return @{ Sha256 = ""; Reason = "the SHA256SUMS of release $Tag could not be downloaded, and the GitHub API request for its asset sha256 failed (set GITHUB_TOKEN if the API rate limit was exceeded)" }
+    }
+    # The release lists SHA256SUMS when it has one. Then the download failed for another reason,
+    # and the GitHub digest would skip the attestation check, so stop instead.
+    if ($release.assets | Where-Object { $_.name -eq "SHA256SUMS" }) {
+        return @{ Sha256 = ""; Fatal = $true; Reason = "release $Tag publishes SHA256SUMS, but downloading it failed ($sumsUrl). Try again later" }
     }
     $asset = $release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
     if ($asset -and $asset.digest -match '^sha256:([0-9a-fA-F]{64})$') {

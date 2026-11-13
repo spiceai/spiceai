@@ -36,6 +36,9 @@ $script:GhCalls = @()
 
 function Invoke-WebRequest {
     param([string]$Uri, [string]$OutFile, $Headers, [switch]$UseBasicParsing)
+    if ($Uri -like "*/SHA256SUMS" -and $script:Release.SumsUnreachable) {
+        throw "503 Service Unavailable: $Uri"
+    }
     if ($Uri -like "*/SHA256SUMS" -and $null -ne $script:Release.Sums) {
         Set-Content -Path $OutFile -Value $script:Release.Sums -NoNewline
         return
@@ -48,12 +51,15 @@ function Invoke-RestMethod {
     if ($script:Release.ApiFails) {
         throw "403 rate limit exceeded"
     }
-    return [pscustomobject]@{
-        assets = @(
-            [pscustomobject]@{ name = "cuda_$asset"; digest = "sha256:" + ("7" * 64) },
-            [pscustomobject]@{ name = $asset; digest = $script:Release.Digest }
-        )
+    # A release lists SHA256SUMS among its assets exactly when it has one.
+    $assets = @(
+        [pscustomobject]@{ name = "cuda_$asset"; digest = "sha256:" + ("7" * 64) },
+        [pscustomobject]@{ name = $asset; digest = $script:Release.Digest }
+    )
+    if ($null -ne $script:Release.Sums -or $script:Release.SumsUnreachable) {
+        $assets += [pscustomobject]@{ name = "SHA256SUMS"; digest = "sha256:" + ("8" * 64) }
     }
+    return [pscustomobject]@{ assets = $assets }
 }
 
 function gh {
@@ -118,6 +124,9 @@ if ($script:GhCalls.Count -ne 0) {
     $failures += 1
 }
 
+Test-Case "stops when a listed SHA256SUMS cannot be downloaded" @{ SumsUnreachable = $true; Digest = "sha256:$digest"; Gh = "fail" } "stopped" "publishes SHA256SUMS, but downloading it failed"
+Test-Case "opt-out does not skip a listed SHA256SUMS" @{ SumsUnreachable = $true; Digest = "sha256:$digest" } "stopped" "publishes SHA256SUMS, but downloading it failed" -AllowUnverified
+
 Remove-Item -Path $work -Recurse -Force
 $env:SPICE_INSTALL_ALLOW_UNVERIFIED = $null
 if ($failures -gt 0) {
@@ -125,3 +134,5 @@ if ($failures -gt 0) {
     exit 1
 }
 Write-Output "All Install.ps1 verification tests passed"
+# The gh stub leaves $LASTEXITCODE set, and GitHub Actions' pwsh shell exits with it.
+exit 0

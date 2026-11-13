@@ -166,7 +166,8 @@ sha256Of() {
 
 # Exits, before anything is installed, unless a downloaded release asset matches the sha256
 # its release records for it: the release's SHA256SUMS, or for releases published before
-# SHA256SUMS, the sha256 GitHub recorded when the asset was uploaded. A release with
+# SHA256SUMS, the sha256 GitHub recorded when the asset was uploaded. That fallback is taken
+# only when the release's asset list confirms it has no SHA256SUMS. A release with
 # SHA256SUMS also has build attestations, which are checked when the GitHub CLI is logged in.
 # SPICE_INSTALL_ALLOW_UNVERIFIED=1 installs an asset that cannot be checked at all; it never
 # installs one whose check fails.
@@ -196,6 +197,13 @@ verifyDownload() {
             exit 1
         fi
     elif verifyFetch "$api_url" "$scratch/release.json" 2>/dev/null; then
+        # The release lists SHA256SUMS when it has one. Then the download failed for another
+        # reason, and the GitHub digest would skip the attestation check, so stop instead.
+        if tr ',' '\n' < "$scratch/release.json" | grep -Eq '"name"[[:space:]]*:[[:space:]]*"SHA256SUMS"'; then
+            echo "Cannot verify $asset: release $tag publishes SHA256SUMS, but downloading it failed ($download_url)."
+            echo "Try again later. Nothing was installed."
+            exit 1
+        fi
         source="sha256 GitHub recorded for $asset in release $tag"
         # Pretty-printed or not, the JSON has one key per line once each comma is a line break.
         expected=$(tr ',' '\n' < "$scratch/release.json" | awk -v f="\"$asset\"" '
@@ -208,7 +216,7 @@ verifyDownload() {
             reason="release $tag has no SHA256SUMS, and GitHub recorded no sha256 for $asset"
         fi
     else
-        reason="release $tag has no SHA256SUMS, and the GitHub API request for its asset sha256 failed (set GITHUB_TOKEN if the API rate limit was exceeded)"
+        reason="the SHA256SUMS of release $tag could not be downloaded, and the GitHub API request for its asset sha256 failed (set GITHUB_TOKEN if the API rate limit was exceeded)"
     fi
 
     if [ -n "$reason" ]; then

@@ -806,11 +806,23 @@ host_arch() {
 release_json() {
     local asset="$1"
     local digest="$2"
+    local sums_listed="${3:-no}"
+    local sums_asset=""
+    if [ "$sums_listed" = "yes" ]; then
+        sums_asset='
+    {
+      "name": "SHA256SUMS",
+      "uploader": {
+        "login": "github-actions[bot]"
+      },
+      "browser_download_url": "https://github.com/spiceai/spiceai/releases/download/v0.0.0/SHA256SUMS"
+    },'
+    fi
     cat <<JSON
 {
   "tag_name": "v0.0.0",
   "name": "Spice v0.0.0 (one, two)",
-  "assets": [
+  "assets": [${sums_asset}
     {
       "name": "cuda_${asset}",
       "uploader": {
@@ -842,7 +854,8 @@ JSON
 #   sudo  records its arguments to $home.sudo and refuses, as sudo does without a terminal.
 #   gh    records its arguments to $home.gh.
 # What the release records for the archive comes from these variables:
-#   OFFLINE_SUMS    match (default), mismatch, unlisted (lists another asset), or none
+#   OFFLINE_SUMS    match (default), mismatch, unlisted (lists another asset), none, or
+#                   unreachable (the API lists SHA256SUMS, but downloading it fails)
 #   OFFLINE_DIGEST  match (default), mismatch, null, or fail (the API request fails)
 #   OFFLINE_GH      loggedout (default), pass, or fail (the attestation check)
 # Usage: run_installer_offline <script> <binary> <asset> <home> [VAR=value...], where the
@@ -867,10 +880,13 @@ run_installer_offline() {
         mismatch) printf '%s  %s\n' "$other" "$asset" > "$stubs/SHA256SUMS" ;;
         unlisted) printf '%s  %s\n' "$digest" "other_asset.tar.gz" > "$stubs/SHA256SUMS" ;;
     esac
+    # A release lists SHA256SUMS among its assets exactly when it has one.
+    local sums_listed=yes
+    [ "${OFFLINE_SUMS:-match}" = "none" ] && sums_listed=no
     case "${OFFLINE_DIGEST:-match}" in
-        match) release_json "$asset" "\"sha256:$digest\"" > "$stubs/release.json" ;;
-        mismatch) release_json "$asset" "\"sha256:$other\"" > "$stubs/release.json" ;;
-        null) release_json "$asset" null > "$stubs/release.json" ;;
+        match) release_json "$asset" "\"sha256:$digest\"" "$sums_listed" > "$stubs/release.json" ;;
+        mismatch) release_json "$asset" "\"sha256:$other\"" "$sums_listed" > "$stubs/release.json" ;;
+        null) release_json "$asset" null "$sums_listed" > "$stubs/release.json" ;;
     esac
     cat > "$stubs/curl" <<STUB
 #!/bin/sh
@@ -1098,6 +1114,34 @@ test_install_sh_rejects_a_failed_attestation() {
         log_has "$home" "The build attestation of spice_" &&
         log_has "$home" "verification failed" &&
         log_lacks "$home" "Extracting archive"
+}
+
+# A release that lists SHA256SUMS is signed, so a failed SHA256SUMS download must stop the
+# install rather than fall back to the GitHub digest, which skips the attestation check.
+test_install_sh_stops_when_a_listed_sha256sums_cannot_be_downloaded() {
+    local home="$TEST_TMP_DIR/sums-unreachable"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=unreachable OFFLINE_GH=fail run_install_offline "$home"; then cat "$home.log"; return 1; fi
+    ! installed_cli "$home" &&
+        log_has "$home" "release v0.0.0 publishes SHA256SUMS, but downloading it failed" &&
+        log_lacks "$home" "Extracting archive"
+}
+
+test_install_sh_opt_out_does_not_skip_a_listed_sha256sums() {
+    local home="$TEST_TMP_DIR/sums-unreachable-opt-out"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=unreachable run_install_offline "$home" SPICE_INSTALL_ALLOW_UNVERIFIED=1; then
+        cat "$home.log"
+        return 1
+    fi
+    ! installed_cli "$home" && log_has "$home" "publishes SHA256SUMS, but downloading it failed"
+}
+
+test_install_spiced_sh_stops_when_a_listed_sha256sums_cannot_be_downloaded() {
+    local home="$TEST_TMP_DIR/spiced-sums-unreachable"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=unreachable OFFLINE_GH=fail run_install_spiced_offline "$home"; then cat "$home.log"; return 1; fi
+    [[ ! -e "$home/bin/spiced" ]] && log_has "$home" "release v0.0.0 publishes SHA256SUMS, but downloading it failed"
 }
 
 test_install_spiced_sh_verifies_against_sha256sums() {
@@ -1359,6 +1403,9 @@ run_all_tests() {
     # Download verification
     echo "--- Download Verification ---"
     run_test "Verification block is identical in both installers" test_verification_block_is_identical_in_both_installers
+    run_test "install.sh stops when a listed SHA256SUMS cannot be downloaded" test_install_sh_stops_when_a_listed_sha256sums_cannot_be_downloaded
+    run_test "install.sh opt-out does not skip a listed SHA256SUMS" test_install_sh_opt_out_does_not_skip_a_listed_sha256sums
+    run_test "install-spiced.sh stops when a listed SHA256SUMS cannot be downloaded" test_install_spiced_sh_stops_when_a_listed_sha256sums_cannot_be_downloaded
     run_test "install.sh: verifies against SHA256SUMS" test_install_sh_verifies_against_sha256sums
     run_test "install.sh: rejects a checksum mismatch before extracting" test_install_sh_rejects_a_checksum_mismatch_before_extracting
     run_test "install.sh: rejects an asset missing from SHA256SUMS" test_install_sh_rejects_an_asset_missing_from_sha256sums
