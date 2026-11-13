@@ -1,7 +1,7 @@
 // Copyright 2024-2026 The Spice.ai OSS Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use cayenne_metastore_model::{cite_check, run, runs, serve};
+use cayenne_metastore_model::{Kind, cite_check, run, runs, serve};
 
 // Checking clones and drops a state per transition; allocation dominates the
 // system allocator's profile.
@@ -12,8 +12,28 @@ fn main() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("list") => {
+            let filter = args.get(1).map(String::as_str);
+            if let Some(f) = filter
+                && f != "replayed"
+                && !Kind::ALL.iter().any(|k| k.name() == f)
+            {
+                return Err(format!(
+                    "Unknown filter {f}; use holds, rule-required, rule-not-required, current-defect or replayed"
+                ));
+            }
             for r in runs() {
-                println!("{r:?}");
+                let shown = match filter {
+                    None => true,
+                    Some("replayed") => r.replayed(),
+                    Some(kind) => r.kind().name() == kind,
+                };
+                if shown {
+                    println!(
+                        "{:<17} {:<8} {r:?}",
+                        r.kind().name(),
+                        if r.replayed() { "replayed" } else { "-" }
+                    );
+                }
             }
         }
         Some("run") => run(args.get(1).ok_or("Usage: run <name>")?)?,
@@ -97,7 +117,7 @@ fn main() -> Result<(), String> {
         }
         _ => {
             return Err(
-                "Usage: cayenne-metastore-model list | run <name> | serve <name> [address] | quick | all | cite-check <doc>…"
+                "Usage: cayenne-metastore-model list [kind|replayed] | run <name> | serve <name> [address] | quick | all | cite-check <doc>…"
                     .into(),
             );
         }

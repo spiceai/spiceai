@@ -20,6 +20,32 @@ nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-two-w
 EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-no-shift
 ```
 
+## Run kinds
+
+Every run demonstrates one of four things; `list` prints the kind first, and
+`RESULT` lines carry `kind=`:
+
+| Kind | What the run shows | How it is declared |
+|---|---|---|
+| `holds` | The design's properties hold: exhaustively within the bound, or not violated on a simulation run's sampled paths (a sampled run has a seed and cannot establish exhaustive safety) | No expected failure |
+| `rule-required` | A safeguard or an assumption is removed and the run must find the named failure, so the design needs it | An expected failure |
+| `rule-not-required` | A safeguard is removed and every property still holds, so the design does not need it for safety in that graph | `RULE_NOT_REQUIRED` in `src/lib.rs` |
+| `current-defect` | The model follows the current code, not the design, and reproduces a known defect in it | `CURRENT_DEFECTS` in `src/lib.rs` |
+
+Separately, a run is `replayed` when the implementation's own tests replay its
+traces: the trace files under `crates/cayenne/tests/traces` and
+`crates/object_store_occ/tests/traces`, and the runs `crates/cayenne`'s mem-tier
+replay names. Those runs check the code; every other run checks the design.
+`REPLAYED_AGAINST_CODE` lists them, and a test keeps that list equal to the runs
+the replay files name. Another test requires every run that removes a safeguard
+(a `-no-` mode) and still holds to be listed as `rule-not-required`.
+
+```sh
+target/release/cayenne-metastore-model list rule-not-required
+target/release/cayenne-metastore-model list current-defect
+target/release/cayenne-metastore-model list replayed
+```
+
 `cite-check` checks the design documents' model citations: every code span
 after `Model:` (in any case) names a run (`prefix*` must match one), to the end
 of the paragraph, row or item when the marker opens it, to the closing
@@ -85,7 +111,7 @@ paths and renders each step as the Explorer does (every enabled action's label
 and text, and the drawing), failing on a panic, an empty label, malformed SVG,
 or a family that stops drawing.
 
-Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
+Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Every run whose kind is not `holds` requires `EXHAUST=1`; the README calls these controls. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
 A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
 New exhaustive safe graphs require their essential reachability witnesses; missing
@@ -198,7 +224,8 @@ as a separate maintenance process does.
 
 ## Negative controls
 
-`list` prints every individual bound, seed and expected downstream failure.
+`list` prints every individual bound, seed and expected downstream failure. Rows below
+that hold are `rule-not-required` runs; the rest are `rule-required`.
 
 | Control suffix | Removed safeguard and required downstream failure |
 |---|---|
