@@ -29,8 +29,8 @@ env:
 
 jobs:
   # install.spiceai.org serves the install scripts of one release, pinned in
-  # spicehq/ai-platform-cloudflare and moved there by a reviewed pull request
-  # after each release. This fails until it serves the latest release: each
+  # the install.spiceai.org Worker's repository and moved there by a reviewed
+  # pull request after each release. This fails until it serves the latest release: each
   # path's X-Spice-Install-Release and X-Spice-Install-Commit name that release
   # and the commit its tag points at, its ETag, Content-Digest and Repr-Digest
   # are the sha256 of the body, the body is install/<script> at that commit,

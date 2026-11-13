@@ -251,8 +251,8 @@ class VerifyInstallSiteTest(unittest.TestCase):
     def test_earlier_release_fails_unless_allowed_and_is_still_verified(self):
         self.world.serve(OLD)
         pin = (
-            f"{self.site} serves {OLD}, not {CUR}, the latest release. Pin {CUR} in spicehq/ai-platform-cloudflare "
-            f"(install/README.md, 'Updating the scripts'), then run E2E Test Release Installation."
+            f"{self.site} serves {OLD}, not {CUR}, the latest release. Pin {CUR} on install.spiceai.org "
+            f"('Updating the scripts' in the Worker's README), then run E2E Test Release Installation."
         )
         strict = self.verify()
         self.assertEqual(strict.problems, [pin])

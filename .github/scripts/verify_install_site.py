@@ -3,8 +3,8 @@
 """Verify that install.spiceai.org serves the install scripts of a spiceai/spiceai release.
 
 install.spiceai.org is a Worker that serves byte-for-byte copies of one
-release's install scripts, pinned in spicehq/ai-platform-cloudflare (install/)
-and moved there by a reviewed pull request. Every response says what it is:
+release's install scripts, pinned in the Worker's repository and moved there by
+a reviewed pull request. Every response says what it is:
 
   X-Spice-Install-Release        {repo}@{tag}
   X-Spice-Install-Commit         the commit the tag points at
@@ -366,8 +366,8 @@ def verify(http, site, repo, release="latest", allow_earlier=False):
         latest = ", the latest release" if release == "latest" else ""
         if stable_version(served_tag) < stable_version(expected_tag):
             message = (
-                f"{site} serves {served_tag}, not {expected_tag}{latest}. Pin {expected_tag} in "
-                f"spicehq/ai-platform-cloudflare (install/README.md, 'Updating the scripts'), "
+                f"{site} serves {served_tag}, not {expected_tag}{latest}. Pin {expected_tag} on "
+                f"install.spiceai.org ('Updating the scripts' in the Worker's README), "
                 f"then run E2E Test Release Installation."
             )
             if allow_earlier:
