@@ -1784,94 +1784,6 @@
   "postgres-cdc-parity": [
     {
       "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT * FROM orders",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20000",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT * FROM customers",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 500",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT * FROM orders #2",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 19794",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT * FROM customers #2",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 501",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT * FROM orders #3",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 19794",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT * FROM orders #4",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 19794",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT * FROM customers #3",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 501",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT * FROM orders #6",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 18449, actual: 14758 }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT * FROM customers #5",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 480",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT o_status, count(*), sum(o_total), min(o_placed), max(o_updated) FROM orders GROUP BY o_status ORDER BY o_status NULLS LAST",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"5967\\\"\", actual: \"\\\"4771\\\"\" }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "partitioned-object-native",
-      "key": "query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment",
-      "kind": "empty",
-      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 4",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-parity",
       "who": "object-native-local",
       "key": "query: SELECT * FROM orders #9",
       "kind": "error",
@@ -1924,6 +1836,36 @@
       "key": "query: SELECT * FROM customers #8",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3",
+      "key": "sample-objects: {\"contains\":\"/data/\",\"every\":\"10s\",\"for\":\"180s\",\"max-objects\":600,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"lake\"}",
+      "kind": "other",
+      "signature": "objects under 'state/cayenne/v1/datasets/orders-' in 'lake' trend upward: the last third peaks at <n>",
+      "pattern": "^objects under 'state/cayenne/v1/datasets/orders-' in 'lake' (trend upward|went over their bound)",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3",
+      "key": "assert-objects: {\"contains\":\".arrow\",\"max\":200,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"lake\"}",
+      "kind": "other",
+      "signature": "expected 0 to 200 objects under 'state/cayenne/v1/datasets/orders-' containing '.arrow' in 'lake', found <n>",
+      "pattern": "^expected 0 to 200 objects under 'state/cayenne/v1/datasets/orders-' containing '\\.arrow' in 'lake', found \\d+",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3",
+      "key": "assert-objects: {\"contains\":\".vortex\",\"max\":400,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"lake\"}",
+      "kind": "other",
+      "signature": "expected 0 to 400 objects under 'state/cayenne/v1/datasets/orders-' containing '.vortex' in 'lake', found <n>",
+      "pattern": "^expected 0 to 400 objects under 'state/cayenne/v1/datasets/orders-' containing '\\.vortex' in 'lake', found \\d+",
       "group": "cayenne",
       "may-pass": true
     }
