@@ -14,6 +14,8 @@ on:
       - '.github/scripts/test_get_release_version.py'
       - '.github/scripts/publish_release.py'
       - '.github/scripts/test_publish_release.py'
+      - '.github/scripts/verify_install_site.py'
+      - '.github/scripts/test_verify_install_site.py'
       - '.github/workflows/release_script_test.yml'
   push:
     branches:
@@ -25,6 +27,8 @@ on:
       - '.github/scripts/test_get_release_version.py'
       - '.github/scripts/publish_release.py'
       - '.github/scripts/test_publish_release.py'
+      - '.github/scripts/verify_install_site.py'
+      - '.github/scripts/test_verify_install_site.py'
       - '.github/workflows/release_script_test.yml'
   workflow_dispatch:
 
@@ -61,3 +65,14 @@ jobs:
 
       - name: Run publish_release.py tests
         run: python .github/scripts/test_publish_release.py -v
+
+      - name: Run verify_install_site.py tests
+        run: python .github/scripts/test_verify_install_site.py -v
+
+      # The tests stand in for the site and the GitHub API, so also run it
+      # against both. An earlier release than the latest passes, so a pin that
+      # has not caught up with a release does not fail an unrelated change.
+      - name: Run verify_install_site.py against install.spiceai.org
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python .github/scripts/verify_install_site.py --allow-earlier-release
