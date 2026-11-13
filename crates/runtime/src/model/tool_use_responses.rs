@@ -125,10 +125,7 @@ impl ToolUsingResponses {
         if !items.iter().any(|item| holds_catalog(item, &catalog)) {
             let at = items
                 .iter()
-                .position(|item| {
-                    !matches!(item, InputItem::EasyMessage(message)
-                        if matches!(message.role, Role::System | Role::Developer))
-                })
+                .position(|item| !is_instruction(item))
                 .unwrap_or(items.len());
             items.insert(
                 at,
@@ -1135,6 +1132,18 @@ fn to_input_item(input: InputParam) -> Vec<InputItem> {
     }
 }
 
+/// Whether `item` is a system or developer message, in either message shape the Responses API
+/// accepts: the instructions that lead an input.
+fn is_instruction(item: &InputItem) -> bool {
+    match item {
+        InputItem::EasyMessage(message) => matches!(message.role, Role::System | Role::Developer),
+        InputItem::Item(Item::Message(MessageItem::Input(message))) => {
+            matches!(message.role, InputRole::System | InputRole::Developer)
+        }
+        _ => false,
+    }
+}
+
 /// Whether `item` is a system message holding `catalog`, as its text or as one of its text parts,
 /// in either message shape the Responses API accepts.
 fn holds_catalog(item: &InputItem, catalog: &str) -> bool {
@@ -1310,6 +1319,32 @@ mod tests {
         );
         let again = input_with_catalog(input.clone()).await;
         assert_eq!(again, input, "an input that holds the list keeps it once");
+    }
+
+    /// Instructions sent as typed `message` items with `input_text` parts lead the input as
+    /// string ones do: the dataset list goes after them, before the conversation.
+    #[tokio::test]
+    async fn the_dataset_list_follows_structured_instructions() {
+        let input = input_with_catalog(json!([
+            {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "You answer about trips."}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Be brief."}]},
+            {"type": "message", "role": "user", "content": "How many trips?"},
+        ]))
+        .await;
+        let order: Vec<String> = input
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| {
+                let role = item["role"].as_str().unwrap_or_default();
+                if item.to_string().contains("spice.public.taxi_trips") {
+                    format!("{role}: datasets")
+                } else {
+                    role.to_string()
+                }
+            })
+            .collect();
+        assert_eq!(order, ["system", "developer", "system: datasets", "user"]);
     }
 
     /// A client that sends the dataset list back as a system message of `input_text` parts, in
