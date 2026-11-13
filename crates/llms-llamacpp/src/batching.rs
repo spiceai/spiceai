@@ -657,7 +657,7 @@ fn prepare<'m, S: Shared<'m>>(
     let kept = slot.cache.shares(tokens, namespace);
     if let Some(saved) = host.take_best(tokens, namespace, kept) {
         spill(shared, slot, host, tick);
-        let continued = shared_prefix(&saved.prompt.tokens, tokens);
+        let continued = shared_prefix(&saved.prompt.tokens, saved.prompt.prompt, tokens);
         if continued >= saved.prompt.len() {
             restore(shared, slot, &saved.state, saved.prompt);
         } else {
@@ -989,7 +989,10 @@ impl HostCache {
             .iter()
             .enumerate()
             .filter(|(_, saved)| saved.prompt.namespace.as_ref() == Some(namespace))
-            .map(|(index, saved)| (index, shared_prefix(&saved.prompt.tokens, tokens)))
+            .map(|(index, saved)| {
+                let shared = shared_prefix(&saved.prompt.tokens, saved.prompt.prompt, tokens);
+                (index, shared)
+            })
             .filter(|&(_, shared)| shared > than)
             .max_by_key(|&(index, shared)| (shared, self.saved[index].last_used))?;
         let saved = self.saved.swap_remove(index);
@@ -1163,6 +1166,7 @@ fn end<'m, S: Shared<'m>>(
             seq: slot.seq,
         },
         history,
+        prompt_tokens,
     );
     *tick += 1;
     slot.last_used = *tick;
@@ -1480,6 +1484,7 @@ fn preempt<'m, S: Shared<'m>>(
             seq: slot.seq,
         },
         running.history.clone(),
+        running.prompt_tokens,
     );
     spill(shared, slot, host, tick);
     // a cache that could not keep the tokens has nothing to save, and the sequence still holds
@@ -1550,6 +1555,7 @@ mod tests {
         Saved {
             prompt: CachedPrompt {
                 tokens: vec![llama_cpp::Token(1)],
+                prompt: 1,
                 namespace: None,
                 checkpoints: Vec::new(),
                 head_stash: None,
