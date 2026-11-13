@@ -123,65 +123,57 @@ async fn typesafe_jev_conforms() {
     assert_conforms(TYPESAFE, Arc::new(model)).await;
 }
 
-/// PROBE (never merge): asks the `choice` case's team question of a hosted chat model
-/// many times per document and prints each distribution, to measure how often it picks
-/// something other than `billing`.
+/// PROBE (never merge): asks the `choice` case of several `OpenAI` chat models many
+/// times and prints how often each picks something other than `billing`.
 #[tokio::test]
 async fn probe_team_choice() {
     LazyLock::force(&DOTENV);
     let _tracing_guard = init_tracing(None);
-    let rounds: usize = std::env::var("PROBE_ROUNDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(150);
-    let documents = [
-        "My invoice shows the same charge twice.",
-        "I was billed twice for the same order on my invoice. Please refund the duplicate charge.",
-        "I was billed twice for the same order on my invoice.",
-    ];
-    for model_name in ["openai", "anthropic", "xai", "google"] {
-        if TEST_ARGS.skip_model(model_name) {
-            continue;
-        }
-        let chat = on_shared_runtime({
-            let model_name = model_name.to_string();
-            async move { get_or_create_model(&model_name).await }
+    if TEST_ARGS.skip_model("openai") {
+        return;
+    }
+    let rounds: usize = 150;
+    let base = conformance::cases()
+        .into_iter()
+        .find(|c| c.name == "choice")
+        .expect("choice case");
+    for model_id in ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-5-mini"] {
+        let chat = match on_shared_runtime({
+            let model_id = model_id.to_string();
+            async move { super::create::create_openai(&model_id).await }
         })
         .await
-        .unwrap_or_else(|e| panic!("failed to get or create model {model_name}: {e}"));
-        let evaluator: Arc<dyn Evaluate> = Arc::new(ChatEvaluator::new(model_name, chat));
-        let base = conformance::cases()
-            .into_iter()
-            .find(|c| c.name == "choice")
-            .expect("choice case");
-        for document in documents {
-            let mut wrong = 0usize;
-            let mut errors = 0usize;
-            for round in 0..rounds {
-                let mut case = base.clone();
-                case.state = document.into();
-                let request = case.request(model_name);
-                let evaluator = Arc::clone(&evaluator);
-                let result =
-                    on_shared_runtime(async move { evaluator.evaluate(request).await }).await;
-                match result {
-                    Ok(response) => {
-                        let answer = response.answers.get("team");
-                        let line = format!("{answer:?}");
-                        if !line.contains("choice: \"billing\"") {
-                            wrong += 1;
-                        }
-                        println!("PROBE {model_name} doc={document:?} round={round} {line}");
-                    }
-                    Err(e) => {
-                        errors += 1;
-                        println!("PROBE {model_name} doc={document:?} round={round} ERROR {e}");
+        {
+            Ok(chat) => chat,
+            Err(e) => {
+                println!("PROBE-SUMMARY {model_id} CREATE-ERROR {e}");
+                continue;
+            }
+        };
+        let evaluator: Arc<dyn Evaluate> = Arc::new(ChatEvaluator::new("openai", chat));
+        let mut wrong = 0usize;
+        let mut errors = 0usize;
+        let started = std::time::Instant::now();
+        for round in 0..rounds {
+            let request = base.request("openai");
+            let evaluator = Arc::clone(&evaluator);
+            match on_shared_runtime(async move { evaluator.evaluate(request).await }).await {
+                Ok(response) => {
+                    let line = format!("{:?}", response.answers.get("team"));
+                    if !line.contains("choice: \"billing\"") {
+                        wrong += 1;
+                        println!("PROBE {model_id} round={round} {line}");
                     }
                 }
+                Err(e) => {
+                    errors += 1;
+                    println!("PROBE {model_id} round={round} ERROR {e}");
+                }
             }
-            println!(
-                "PROBE-SUMMARY {model_name} doc={document:?} rounds={rounds} not_billing={wrong} errors={errors}"
-            );
         }
+        println!(
+            "PROBE-SUMMARY {model_id} rounds={rounds} not_billing={wrong} errors={errors} secs={}",
+            started.elapsed().as_secs()
+        );
     }
 }
