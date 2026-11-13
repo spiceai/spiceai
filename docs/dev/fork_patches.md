@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 
 | Fork | Pinned revision | Branch |
 |---|---|---|
-| [arrow-adbc](#arrow-adbc) | `3e423748f1d73213429f52ec055959cc0a93772c` | `spiceai-25-patches` (TEMPORARY: spiceai/arrow-adbc#9) |
+| [arrow-adbc](#arrow-adbc) | `7caad4ccc7050b0721778a426eef38f0f151fef9` | `spiceai-25` |
 | [arrow-rs](#arrow-rs) | `510ef234e1444f2c4aaf748d0c905787738afa7a` | `spiceai-59.3.2` |
 | [async-openai](#async-openai) | `e92cdef14c1e1c027f4e18cdbd5a957148462889` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `829b57522e601ea169b04e2d4a375c3abe3ed58c` | `spiceai` |
@@ -119,7 +119,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `59a3510f01992a0fe486c5c4bf337422a7533403` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4b160ed87db59a100c30bf9c05efd41ef4d4e3ff` | `spiceai-55-adbc-25` (TEMPORARY: spiceai/datafusion-table-providers#121) |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `daa91fe928174edb95473e644059aee9958dca06` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
@@ -515,7 +515,7 @@ test-connection row after it, with their tests (`mysqlpool.rs`, `core/tests/mysq
 Between `d323656` and `9d30d58` (spiceai/datafusion-table-providers#105 and #120, squash-merged), it adds
 only the `SQLite` `UNNEST` row below and its tests (`core/src/sqlite/federation.rs`), and
 moves its own federation pin to match this workspace's.
-Between `9d30d58` and `4b160ed` (spiceai/datafusion-table-providers#121), it moves its ADBC
+Between `9d30d58` and `daa91fe` (spiceai/datafusion-table-providers#121, squash-merged), it moves its ADBC
 requirement and its own ADBC patch lines to 0.25 (`3e423748`, spiceai/arrow-adbc#9), and
 cancels an ADBC statement through `get_cancel_handle().try_cancel()`, which 0.25 issues without
 the statement lock (`core/src/sql/db_connection_pool/dbconnection/adbcconn.rs`). No row below

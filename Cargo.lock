@@ -137,7 +137,7 @@ dependencies = [
 [[package]]
 name = "adbc_core"
 version = "0.25.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=3e423748f1d73213429f52ec055959cc0a93772c#3e423748f1d73213429f52ec055959cc0a93772c"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=7caad4ccc7050b0721778a426eef38f0f151fef9#7caad4ccc7050b0721778a426eef38f0f151fef9"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -146,7 +146,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.25.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=3e423748f1d73213429f52ec055959cc0a93772c#3e423748f1d73213429f52ec055959cc0a93772c"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=7caad4ccc7050b0721778a426eef38f0f151fef9#7caad4ccc7050b0721778a426eef38f0f151fef9"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -157,13 +157,13 @@ dependencies = [
  "regex",
  "toml 1.1.2+spec-1.1.0",
  "windows-registry",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "adbc_ffi"
 version = "0.25.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=3e423748f1d73213429f52ec055959cc0a93772c#3e423748f1d73213429f52ec055959cc0a93772c"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=7caad4ccc7050b0721778a426eef38f0f151fef9#7caad4ccc7050b0721778a426eef38f0f151fef9"
 dependencies = [
  "adbc_core",
  "arrow-array",
@@ -7400,7 +7400,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=4b160ed87db59a100c30bf9c05efd41ef4d4e3ff#4b160ed87db59a100c30bf9c05efd41ef4d4e3ff"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=daa91fe928174edb95473e644059aee9958dca06#daa91fe928174edb95473e644059aee9958dca06"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
