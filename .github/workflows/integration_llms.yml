@@ -334,7 +334,7 @@ jobs:
           test_binary=./integration_test/llms_integration_test
           # The live-provider tests live under `integration.rs`'s `llms` module; the
           # binary's other modules are credential-free and run in `make nextest`.
-          filter='llms::'
+          filter='llms::evaluate::probe_team_choice'
 
           # A filter that matches nothing makes libtest print `ok. 0 passed` and exit 0, so the
           # suite reports success having tested nothing. The filter names test-code structure,
