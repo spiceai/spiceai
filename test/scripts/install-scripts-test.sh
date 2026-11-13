@@ -1011,15 +1011,24 @@ test_verification_block_is_identical_in_both_installers() {
     [[ -n "$cli" && "$cli" == "$spiced" ]] || { diff <(echo "$cli") <(echo "$spiced"); return 1; }
 }
 
-# A local HTTP server for verifyFetch. /flaky answers 504 to its first request and "ok" after it;
-# any other path is a 404. Each request's path is appended to $1.hits, and the port is in $1.port.
+# One local HTTP server for the verifyFetch tests, started on first use and shared by them, so
+# each test needs no server start of its own. A path that starts with /flaky answers 504 to its
+# first request and "ok" after it; any other path is a 404. Each request's path is appended to
+# $FLAKY_BASE.hits, and the port is in $FLAKY_BASE.port. The server exits by itself after five
+# minutes, so a run that stops early leaves nothing behind.
+FLAKY_BASE=""
+FLAKY_SERVER_PID=""
 start_flaky_server() {
-    local base="$1"
-    : > "$base.hits"
-    rm -f "$base.port"
-    python3 - "$base" <<'PY' &
+    if [[ -n "$FLAKY_SERVER_PID" ]] && kill -0 "$FLAKY_SERVER_PID" 2>/dev/null; then
+        return 0
+    fi
+    FLAKY_BASE="$TEST_TMP_DIR/flaky-server"
+    : > "$FLAKY_BASE.hits"
+    python3 - "$FLAKY_BASE" > "$FLAKY_BASE.log" 2>&1 <<'PY' &
 import http.server
+import os
 import sys
+import threading
 
 base = sys.argv[1]
 seen = {}
@@ -1030,14 +1039,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         seen[self.path] = seen.get(self.path, 0) + 1
         with open(base + ".hits", "a") as hits:
             hits.write(self.path + "\n")
-        if self.path == "/flaky" and seen[self.path] > 1:
+        flaky = self.path.startswith("/flaky")
+        if flaky and seen[self.path] > 1:
             body = b"ok"
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
             return
-        self.send_response(504 if self.path == "/flaky" else 404)
+        self.send_response(504 if flaky else 404)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -1045,17 +1055,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+threading.Timer(300, os._exit, [0]).start()
 server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
 with open(base + ".port", "w") as port:
     port.write(str(server.server_address[1]))
 server.serve_forever()
 PY
     FLAKY_SERVER_PID=$!
-    for _ in $(seq 1 50); do
-        [[ -s "$base.port" ]] && return 0
+    for _ in $(seq 1 200); do
+        [[ -s "$FLAKY_BASE.port" ]] && return 0
         sleep 0.1
     done
+    echo "the test server did not start in 20 seconds; its output:"
+    cat "$FLAKY_BASE.log"
     return 1
+}
+
+stop_flaky_server() {
+    if [[ -n "$FLAKY_SERVER_PID" ]]; then
+        kill "$FLAKY_SERVER_PID" 2>/dev/null || true
+        wait "$FLAKY_SERVER_PID" 2>/dev/null || true
+        FLAKY_SERVER_PID=""
+    fi
 }
 
 # Runs install.sh's verifyFetch with the given HTTP client (curl or wget). Prints its exit code.
@@ -1065,31 +1086,29 @@ run_verify_fetch() {
     echo "$rc"
 }
 
-# verifyFetch against the flaky server: path $2 with client $1. Passes when the exit code is
-# zero exactly when $3 is "ok", and the server saw the path $4 times.
+# verifyFetch with client $1 against the flaky server's path $2, which no other test uses. Passes
+# when the exit code is zero exactly when $3 is "ok", and the server saw the path $4 times.
 check_verify_fetch() {
-    local client="$1" path="$2" expect="$3" hits="$4"
-    local base="$TEST_TMP_DIR/flaky-$client-${path#/}" rc seen
-    start_flaky_server "$base" || { echo "the test server did not start"; return 1; }
-    rc=$(run_verify_fetch "$client" "http://127.0.0.1:$(cat "$base.port")$path" "$base.out")
-    kill "$FLAKY_SERVER_PID" 2>/dev/null
-    wait "$FLAKY_SERVER_PID" 2>/dev/null
-    seen=$(grep -c "^$path\$" "$base.hits")
+    local client="$1" url_path="$2" expect="$3" hits="$4"
+    local out="$TEST_TMP_DIR/verify-fetch${url_path//\//-}.out" rc seen
+    start_flaky_server || return 1
+    rc=$(run_verify_fetch "$client" "http://127.0.0.1:$(cat "$FLAKY_BASE.port")$url_path" "$out")
+    seen=$(grep -c "^$url_path\$" "$FLAKY_BASE.hits" || true)
     if [[ "$expect" == ok ]]; then
-        [[ "$rc" == 0 && "$(cat "$base.out")" == ok && "$seen" == "$hits" ]] && return 0
+        [[ "$rc" == 0 && "$(cat "$out")" == ok && "$seen" == "$hits" ]] && return 0
     else
         [[ "$rc" != 0 && "$seen" == "$hits" ]] && return 0
     fi
-    echo "$client $path: exit $rc, $seen request(s); expected $expect after $hits"
+    echo "$client $url_path: exit $rc, $seen request(s); expected $expect after $hits"
     return 1
 }
 
 test_verify_fetch_retries_a_transient_error_with_curl() {
-    check_verify_fetch curl /flaky ok 2
+    check_verify_fetch curl /flaky-curl ok 2
 }
 
 test_verify_fetch_does_not_retry_a_404_with_curl() {
-    check_verify_fetch curl /missing fail 1
+    check_verify_fetch curl /missing-curl fail 1
 }
 
 # GNU wget retries an HTTP error only when told which; older wget and BusyBox wget can't.
@@ -1103,11 +1122,11 @@ wget_can_retry_http_errors() {
 }
 
 test_verify_fetch_retries_a_transient_error_with_wget() {
-    check_verify_fetch wget /flaky ok 2
+    check_verify_fetch wget /flaky-wget ok 2
 }
 
 test_verify_fetch_does_not_retry_a_404_with_wget() {
-    check_verify_fetch wget /missing fail 1
+    check_verify_fetch wget /missing-wget fail 1
 }
 
 # With no working hash tool, the opt-out can install an asset nothing can check, but never one
@@ -1559,6 +1578,7 @@ run_all_tests() {
     else
         skip_test "verifyFetch retries (wget)" "this wget has no --retry-on-http-error"
     fi
+    stop_flaky_server
     run_test "install.sh stops when a listed SHA256SUMS cannot be downloaded" test_install_sh_stops_when_a_listed_sha256sums_cannot_be_downloaded
     run_test "install.sh opt-out does not skip a listed SHA256SUMS" test_install_sh_opt_out_does_not_skip_a_listed_sha256sums
     run_test "install-spiced.sh stops when a listed SHA256SUMS cannot be downloaded" test_install_spiced_sh_stops_when_a_listed_sha256sums_cannot_be_downloaded
