@@ -1402,6 +1402,7 @@ impl DataFusionBuilder {
             .config_mut()
             .set_extension(Arc::new(super::PlansGeneration(0)));
 
+        let (writer_role_changes, writer_role_changes_rx) = tokio::sync::mpsc::unbounded_channel();
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
@@ -1441,6 +1442,8 @@ impl DataFusionBuilder {
             ),
             dataset_placements: dashmap::DashMap::new(),
             accelerator_engine_registry: self.accelerator_engine_registry,
+            writer_role_changes,
+            writer_role_changes_rx: parking_lot::Mutex::new(Some(writer_role_changes_rx)),
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
             query_admission_limit: self.query_admission_limit,

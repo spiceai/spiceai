@@ -597,6 +597,9 @@ impl AcceleratorEngineRegistry {
 }
 
 /// A `DataAccelerator` knows how to read, write and create new tables.
+/// Whether this instance writes an acceleration; see [`DataAccelerator::writer_role`].
+pub type WriterRole = tokio::sync::watch::Receiver<bool>;
+
 #[async_trait]
 pub trait DataAccelerator: Send + Sync {
     fn as_any(&self) -> &dyn Any;
@@ -922,6 +925,16 @@ pub trait DataAccelerator: Send + Sync {
     ) -> Option<Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>> {
         None
     }
+
+    /// Whether this instance writes `source`'s acceleration, for an engine
+    /// whose accelerations several instances share through one location:
+    /// `true` while it does, changing when another instance takes it over or
+    /// this one does. An instance that does not write an acceleration serves
+    /// its queries but runs no refresh and consumes no change stream.
+    ///
+    /// `None` when this instance always writes the acceleration (it is the
+    /// only one that can). No default, so every engine states which it is.
+    async fn writer_role(&self, source: &dyn AccelerationSource) -> Option<WriterRole>;
 }
 
 /// Factory that re-runs the `create_accelerator_table` registry flow to

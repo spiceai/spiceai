@@ -520,6 +520,17 @@ impl ObjectNativeCatalog {
     pub fn data_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(self.data_store.as_ref().unwrap_or(&self.store))
     }
+    /// Follow whether this instance writes dataset `name`: `true` while it
+    /// does, changing when another instance takes it over or this one does.
+    /// `None` when no log holds the dataset.
+    #[must_use]
+    pub fn writer_watch(&self, name: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.routes
+            .read()
+            .datasets
+            .get(name)
+            .map(|domain| domain.data_writes.watch())
+    }
     /// The prefix of the dataset folders (`…/cayenne/v1/datasets`) in [`Self::store`].
     #[must_use]
     pub fn datasets_prefix(&self) -> &Path {

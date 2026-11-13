@@ -571,6 +571,9 @@ pub struct Builder {
     engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
+    /// Another instance writes this acceleration: this one serves its queries
+    /// from the shared location and runs no refresh.
+    replica: bool,
     user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
@@ -637,6 +640,7 @@ impl Builder {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cluster_role: None,
+            replica: false,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
@@ -672,6 +676,14 @@ impl Builder {
 
     pub fn cluster_role(&mut self, role: Option<ClusterRole>) -> &mut Self {
         self.cluster_role = role;
+        self
+    }
+
+    /// Another instance writes this acceleration (see
+    /// `DataAccelerator::writer_role`): serve its queries from what that
+    /// instance committed, and start no refresh, which would write it too.
+    pub fn replica(&mut self) -> &mut Self {
+        self.replica = true;
         self
     }
 
@@ -1360,8 +1372,14 @@ impl Builder {
             None
         };
 
-        let (refresh_handle, refresh_trigger) =
-            if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+        let (refresh_handle, refresh_trigger) = if self.replica {
+            // The instance that writes the acceleration refreshes it; this one
+            // serves what it committed, so its rows are ready to query now.
+            refresh_completion.close();
+            self.runtime_status
+                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+            (None, None)
+        } else if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
                 // Accelerated tables aren't loaded locally on the scheduler —
                 // executors do. Don't start a refresh task, and leave the
                 // dataset status as `Refreshing` (set by the caller before

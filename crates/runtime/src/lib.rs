@@ -2253,6 +2253,12 @@ impl Runtime {
         self.load_embeddings().await;
         self.load_rerankers().await;
 
+        // A dataset whose writer changes (another instance took its shared
+        // acceleration over, or this one did) reloads.
+        if let Some(changes) = self.df.take_writer_role_changes() {
+            tokio::spawn(Arc::clone(&self).reload_on_writer_changes(changes));
+        }
+
         // Spawn each remaining component load in its own task to run in parallel
         let datasets = tokio::spawn({
             let self_clone = Arc::clone(&self);

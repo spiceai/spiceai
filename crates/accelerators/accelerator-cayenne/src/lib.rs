@@ -4293,6 +4293,17 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
 
 #[async_trait]
 impl DataAccelerator for CayenneAccelerator {
+    async fn writer_role(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Option<data_accelerator_api::WriterRole> {
+        // Only an acceleration in the object-native location is shared with
+        // other instances; any other is written by this instance alone.
+        self.native_catalog
+            .get()
+            .and_then(|catalog| catalog.writer_watch(&source.name().to_string()))
+    }
+
     async fn change_sink(
         &self,
         context: runtime_acceleration::change_sink::ChangeSinkContext,

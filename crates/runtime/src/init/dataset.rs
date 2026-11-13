@@ -1946,6 +1946,28 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    /// Reload each dataset named on `changes`, whose shared acceleration
+    /// changed writer: a takeover reopens it from what the previous writer
+    /// committed and starts its refresh, a handover stops its refresh.
+    pub(crate) async fn reload_on_writer_changes(
+        self: Arc<Self>,
+        mut changes: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        while let Some(name) = changes.recv().await {
+            let Some(app) = self.read_app().await else {
+                continue;
+            };
+            let Some(dataset) = Arc::clone(&self)
+                .get_valid_datasets(&app, LogErrors(false))
+                .into_iter()
+                .find(|ds| ds.name.to_string() == name)
+            else {
+                continue;
+            };
+            Arc::clone(&self).update_dataset(dataset).await;
+        }
+    }
+
     async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) -> Option<AcceleratorBootstrap> {
         self.update_dataset_with_bootstrap(ds, BootstrapStatus::None.into())
             .await
@@ -6351,6 +6373,14 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 
     #[async_trait::async_trait]
     impl data_accelerator_api::DataAccelerator for RecordingAccelerator {
+        async fn writer_role(
+            &self,
+            _source: &dyn data_accelerator_api::AccelerationSource,
+        ) -> Option<data_accelerator_api::WriterRole> {
+            // Only this instance writes this engine's accelerations.
+            None
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
