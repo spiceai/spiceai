@@ -129,6 +129,21 @@ jobs:
           SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
+      # Over HTTP, spiced reads a Hub dataset with one anonymous request per Parquet row group, and a
+      # sweep's legs then exhaust the Hub's per-IP quota (`429 Too Many Requests`). Download each
+      # file once, with the token, and point the checked-out spicepod at the local copy.
+      - name: Download the spicepod's Hugging Face files
+        id: hf_data
+        shell: bash
+        env:
+          SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+          HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          data_dir="$RUNNER_TEMP/search-data"
+          rm -rf "$data_dir"
+          bash .github/scripts/prefetch_hf_search_data.sh "$SPICEPOD_PATH" "$data_dir"
+          echo "data_dir=$data_dir" >> "$GITHUB_OUTPUT"
+
       # Short-lived AWS credentials, kept out of the job's environment and passed to the step below.
       - name: Assume the S3 Vectors role
         id: aws-s3-vectors
@@ -158,6 +173,7 @@ jobs:
           AWS_S3_VECTORS_SESSION_TOKEN: ${{ steps.aws-s3-vectors.outputs.aws-session-token }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          DATA_DIR: ${{ steps.hf_data.outputs.data_dir }}
         run: |
           rm -rf .spice/data
           # The spicepod loads its own data and names it in `metadata.benchmark_dataset`.
@@ -171,5 +187,6 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --concurrency 10 \
             "${sql_pipeline_args[@]}" \
+            --data-dir "$DATA_DIR" \
             --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"
