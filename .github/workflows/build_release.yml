@@ -75,6 +75,10 @@ on:
           - 'release-lto'
         default: 'release'
 
+# Jobs that need more ask for it; setup-matrix reads only the event payload.
+permissions:
+  contents: read
+
 env:
   # Checked against version.txt by get_release_version.py; empty except on a release build.
   RELEASE_VERSION: ${{ inputs.release_version }}

@@ -36,6 +36,19 @@ jobs:
       branch: ${{ steps.find.outputs.branch }}
       workflow: ${{ steps.find.outputs.workflow }}
     steps:
+      # The test job runs the chosen run's spiced on the self-hosted runners with id-token: write,
+      # so run_id must name a build this repo made; see the action for the rules.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/check-trusted-run
+
+      - name: Check the run is a trusted build
+        uses: ./.github/actions/check-trusted-run
+        with:
+          run-id: ${{ inputs.run_id }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Find the build's artifacts
         id: find
         env:
@@ -43,7 +56,6 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
-          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
           names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
             -q '.artifacts[] | select(.expired | not) | .name')
           has() { grep -qx "$1" <<<"$names"; }
@@ -139,8 +151,11 @@ jobs:
           if [ -n "$SPICE_ARTIFACT" ] && [ "$SPICE_ARTIFACT" != "$SPICED_ARTIFACT" ]; then
             gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n "$SPICE_ARTIFACT" -D "$build"
           fi
+          for t in "$build"/*.tar.gz; do
+            [ -e "$t" ] || continue
+            tar xzf "$t" -C "$RUNNER_TEMP/build"
+          done
           cd "$build"
-          for t in *.tar.gz; do [ -e "$t" ] && tar xzf "$t"; done
           chmod +x spiced
           ./spiced --version
           if [ -f spice ]; then
@@ -211,7 +226,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SCRIPTS: ${{ inputs.scripts }}
         run: |
-          # shellcheck disable=SC2086 # SCRIPTS is a space-separated list
+          # SCRIPTS is a space-separated list of script paths, never options: anyone who can dispatch
+          # could otherwise pass flags such as --spiced. Split it without globbing, refuse an entry
+          # that starts with `-`, and end the options with `--` before it.
+          read -r -d '' -a script_paths <<<"$SCRIPTS" || true # every line; read returns 1 at the end
+          for entry in "${script_paths[@]}"; do
+            [[ "$entry" != -* ]] || { echo "::error::scripts entry '$entry' starts with '-'; give script paths only"; exit 1; }
+          done
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
             --partition ${{ matrix.partition }} \
             --spiced "$SPICED" \
@@ -219,7 +240,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/spicescript" \
             --results "$RUNNER_TEMP/spicescript-results.json" \
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
-            $SCRIPTS
+            -- "${script_paths[@]}"
 
       - name: Upload script results
         if: ${{ !cancelled() }}
