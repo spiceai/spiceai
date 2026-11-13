@@ -1,5 +1,5 @@
 name: 'Add snapshots to PR'
-description: 'Commits and pushes updated snapshots to an automation PR.'
+description: 'Commits updated snapshots to an automation PR as a commit GitHub signs.'
 inputs:
   token:
     description: 'GitHub token with permissions to push to the repository'
@@ -36,12 +36,6 @@ runs:
       run: |
         set -euo pipefail
 
-        git add '*.snap'
-        if git diff --cached --quiet; then
-          echo "No changes to commit"
-          exit 0
-        fi
-
         # Every run gets its own branch off the commit it just tested (never an old
         # branch's history) so there is never a divergent base to rebase or merge onto.
         BRANCH_PREFIX="snapshot-update/${GITHUB_JOB:-job}-"
@@ -53,17 +47,15 @@ runs:
         # commits) instead of always diffing against trunk.
         BASE_BRANCH="${GITHUB_REF_NAME:-trunk}"
 
-        git config --global user.name 'Spice Snapshot Update Bot'
-        git config --global user.email 'spiceaibot@spice.ai'
-        AUTHENTICATED_REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-        git remote set-url origin "${AUTHENTICATED_REMOTE_URL}"
-        git checkout -b "${BRANCH_NAME}"
-        git commit -m "${PR_TITLE}"
-        # Non-interactive: a credential helper on the runner can otherwise intercept
-        # this push and block on a prompt forever. See
-        # scripts/check_ci_git_push_noninteractive.py.
-        git -c credential.helper='' -c credential.interactive=false \
-          push origin "HEAD:${BRANCH_NAME}"
+        # Committed through GitHub's API rather than pushed, so GitHub signs the commit
+        # and a ruleset that requires signed commits accepts it. A re-run of the job finds
+        # its branch already there and brings that branch's snapshots up to date instead.
+        SNAPSHOT_COMMIT="$(python3 .github/actions/signed-commit/signed_commit.py \
+          --branch "${BRANCH_NAME}" --message "${PR_TITLE}" -- '*.snap')"
+        if [[ -z "${SNAPSHOT_COMMIT}" ]]; then
+          echo "No changes to commit"
+          exit 0
+        fi
 
         BODY="${PR_DESCRIPTION}"
         if [[ -z "${BODY}" ]]; then
@@ -74,8 +66,8 @@ runs:
         PR_URL="$(gh pr create --title "${PR_TITLE}" --body "${BODY}" --base "${BASE_BRANCH}" --head "${BRANCH_NAME}" --label kind/bug --label area/tests)"
         echo "Created snapshot update PR -> ${PR_URL}"
         gh pr merge --squash --auto "${BRANCH_NAME}" || echo "Auto-merge not available for this branch; PR created and requires manual merge."
-        # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-        bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
+        # Release the pull_request runs GitHub holds on a GITHUB_TOKEN commit (see the script).
+        bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"
 
         # Close any earlier open snapshot-update PR this job opened against the same
         # base with the same title: the one above supersedes it. Matching the base keeps
@@ -101,10 +93,7 @@ runs:
         ' "${EXISTING_PR_JSON}" | while IFS=$'\t' read -r OLD_PR_NUMBER OLD_BRANCH; do
           echo "Closing superseded snapshot update PR #${OLD_PR_NUMBER}"
           gh pr close "${OLD_PR_NUMBER}" --comment "Superseded by ${PR_URL} (fresher snapshot diff against current ${BASE_BRANCH})." || true
-          # `|| true` bounds the exit status, not the wall clock: the same credential
-          # helper can block this push too, so it needs the same guard.
-          git -c credential.helper='' -c credential.interactive=false \
-            push origin --delete "${OLD_BRANCH}" || true
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${OLD_BRANCH}" || true
         done
       env:
         GH_TOKEN: ${{ inputs.token }}

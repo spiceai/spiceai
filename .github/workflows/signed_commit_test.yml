@@ -1,0 +1,223 @@
+---
+name: Signed Commit Tests
+
+# `.github/actions/signed-commit` is how CI commits to this repository: through
+# GitHub's API, so GitHub signs each commit and a ruleset that requires signed
+# commits accepts it. The unit tests cover its rules against a local stand-in
+# for GitHub; the live job runs it with this job's GITHUB_TOKEN against a
+# throwaway branch and reads back from GitHub that every commit it made is
+# Verified and holds the expected files. Only the live job shows what GitHub
+# itself accepts and signs.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/actions/signed-commit/**'
+      - '.github/workflows/signed_commit_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/actions/signed-commit/**'
+      - '.github/workflows/signed_commit_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  unit:
+    environment: secret-free
+    name: Unit tests for signed_commit.py
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 5
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # A checkout plus local git repositories; the job reads the repository and nothing else.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: python3 .github/actions/signed-commit/test_signed_commit.py
+
+  live:
+    environment: secret-free
+    name: Signed commits on a throwaway branch
+    needs: unit
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 10
+    # A fork PR's token cannot write, and the self-hosted pool does not run fork code.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    permissions:
+      # Creates, commits to and deletes `signed-commit-test/<run>` and the action's
+      # temporary branches. Nothing else is written.
+      contents: write
+    env:
+      BRANCH: signed-commit-test/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Write the files of the first commit
+        run: |
+          mkdir -p signed-commit-test
+          printf 'a v1\n' > signed-commit-test/a.txt
+          printf 'b v1\n' > signed-commit-test/b.txt
+
+      - name: Commit to a new branch
+        id: first
+        uses: ./.github/actions/signed-commit
+        with:
+          token: ${{ github.token }}
+          branch: ${{ env.BRANCH }}
+          message: 'test: signed-commit live check, new branch'
+          paths: signed-commit-test
+
+      - name: Modify one file and delete the other
+        run: |
+          printf 'a v2\n' > signed-commit-test/a.txt
+          rm signed-commit-test/b.txt
+
+      - name: Commit to the existing branch
+        id: second
+        uses: ./.github/actions/signed-commit
+        with:
+          token: ${{ github.token }}
+          branch: ${{ env.BRANCH }}
+          message: 'test: signed-commit live check, existing branch'
+          paths: signed-commit-test
+
+      - name: Commit a change split into two commits
+        id: third
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf 'c%.0s' $(seq 1 300) > signed-commit-test/c.txt
+          printf 'd%.0s' $(seq 1 300) > signed-commit-test/d.txt
+          # Each file encodes to about 480 bytes with its overhead, so a 600-byte
+          # budget puts them in separate commits on a temporary branch.
+          sha="$(python3 .github/actions/signed-commit/signed_commit.py \
+            --branch "$BRANCH" --message 'test: signed-commit live check, split change' \
+            --max-commit-bytes 600 -- signed-commit-test)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit with nothing changed
+        id: fourth
+        uses: ./.github/actions/signed-commit
+        with:
+          token: ${{ github.token }}
+          branch: ${{ env.BRANCH }}
+          message: 'test: signed-commit live check, no change'
+          paths: signed-commit-test
+
+      - name: Check what GitHub recorded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FIRST_SHA: ${{ steps.first.outputs.sha }}
+          FIRST_COMMITTED: ${{ steps.first.outputs.committed }}
+          SECOND_SHA: ${{ steps.second.outputs.sha }}
+          THIRD_SHA: ${{ steps.third.outputs.sha }}
+          FOURTH_SHA: ${{ steps.fourth.outputs.sha }}
+          FOURTH_COMMITTED: ${{ steps.fourth.outputs.committed }}
+        run: |
+          python3 - <<'EOF'
+          import base64, json, os, subprocess, sys, urllib.error, urllib.request
+
+          api = os.environ["GITHUB_API_URL"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          branch = os.environ["BRANCH"]
+          problems = []
+
+          def get(path):
+              req = urllib.request.Request(f"{api}/repos/{repo}/{path}")
+              req.add_header("Authorization", f"Bearer {os.environ['GH_TOKEN']}")
+              req.add_header("Accept", "application/vnd.github+json")
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read())
+              except urllib.error.HTTPError as err:
+                  if err.code == 404:
+                      return None
+                  raise
+
+          base = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          compare = get(f"compare/{base}...{branch}")
+          commits = compare["commits"]
+          print(f"{len(commits)} commit(s) on {branch} after {base}:")
+          for c in commits:
+              v = c["commit"]["verification"]
+              author = (c.get("author") or {}).get("login")
+              print(f"  {c['sha']} author={author} committer={c['commit']['committer']['name']} "
+                    f"verified={v['verified']} reason={v['reason']} | {c['commit']['message'].splitlines()[0]}")
+              if not v["verified"] or v["reason"] != "valid":
+                  problems.append(f"{c['sha']} is not Verified: {v['reason']}")
+              if author != "github-actions[bot]":
+                  problems.append(f"{c['sha']} is authored by {author}, not github-actions[bot]")
+              if "Workflow run: " not in c["commit"]["message"]:
+                  problems.append(f"{c['sha']} does not name the workflow run")
+          shas = [c["sha"] for c in commits]
+          if len(shas) != 4:
+              problems.append(f"expected 4 commits (new branch, existing branch, two split parts), got {len(shas)}")
+          else:
+              expected = {"first": (os.environ["FIRST_SHA"], shas[0]), "second": (os.environ["SECOND_SHA"], shas[1]),
+                          "third": (os.environ["THIRD_SHA"], shas[3])}
+              for step, (reported, actual) in expected.items():
+                  if reported != actual:
+                      problems.append(f"the {step} commit reported {reported!r}, but GitHub has {actual}")
+              if [c["parents"][0]["sha"] for c in commits] != [base] + shas[:3]:
+                  problems.append("the commits do not form one chain on the checked-out commit")
+          if os.environ["FIRST_COMMITTED"] != "true":
+              problems.append(f"the first commit reported committed={os.environ['FIRST_COMMITTED']}")
+          if os.environ["FOURTH_COMMITTED"] != "false" or os.environ["FOURTH_SHA"]:
+              problems.append("a run with nothing changed reported a commit")
+
+          expected_files = {"a.txt": "a v2\n", "b.txt": None, "c.txt": "c" * 300, "d.txt": "d" * 300}
+          for name, want in expected_files.items():
+              got = get(f"contents/signed-commit-test/{name}?ref={branch}")
+              text = base64.b64decode(got["content"]).decode() if got else None
+              if text != want:
+                  problems.append(f"signed-commit-test/{name} on the branch is {text!r}, expected {want!r}")
+
+          leftover = get(f"git/matching-refs/heads/signed-commit-tmp/{os.environ['GITHUB_RUN_ID']}-")
+          if leftover:
+              problems.append(f"temporary branches were left behind: {[r['ref'] for r in leftover]}")
+
+          for p in problems:
+              print(f"::error::{p}")
+          sys.exit(1 if problems else 0)
+          EOF
+
+      - name: Delete the throwaway branch
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'EOF'
+          import os, urllib.error, urllib.parse, urllib.request
+          ref = urllib.parse.quote(os.environ["BRANCH"], safe="/")
+          req = urllib.request.Request(
+              f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/git/refs/heads/{ref}",
+              method="DELETE")
+          req.add_header("Authorization", f"Bearer {os.environ['GH_TOKEN']}")
+          try:
+              urllib.request.urlopen(req)
+              print(f"Deleted {os.environ['BRANCH']}")
+          except urllib.error.HTTPError as err:
+              print(f"{os.environ['BRANCH']} not deleted: {err.code}")
+          EOF

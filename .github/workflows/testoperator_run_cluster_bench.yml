@@ -619,7 +619,6 @@ jobs:
           GCM_INTERACTIVE: 'never'
         run: |
           set -euo pipefail
-          git fetch --unshallow || true
 
           # Categorize snap-file changes from the working tree. `git status -s`
           # output starts with status codes: `??` for untracked (new baselines),
@@ -649,16 +648,6 @@ jobs:
           slug="$(echo "${SPICEPOD_PATH_DISPLAY}" | sed 's#[][/]#-#g' | sed 's#--*#-#g')"
           BRANCH_NAME="testoperator-cluster-snapshot-update/${BRANCH_ID}-${slug}"
 
-          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
-          git config --global user.email 'spiceaibot@spice.ai'
-          git checkout -b "${BRANCH_NAME}"
-          git add '*.snap'
-
-          if git diff --cached --quiet; then
-            echo "No staged changes after git add; nothing to commit"
-            exit 0
-          fi
-
           # Short summary line for the commit message.
           if [ "$modified_count" -eq 0 ]; then
             commit_summary="create ${new_count} baseline$( [ "$new_count" -ne 1 ] && echo s ) for ${SPICEPOD_PATH_DISPLAY}"
@@ -668,30 +657,32 @@ jobs:
             commit_summary="${new_count} new + ${modified_count} updated snapshot$( [ "$total" -ne 1 ] && echo s ) for ${SPICEPOD_PATH_DISPLAY}"
           fi
 
-          git commit -m "fix(cluster-bench): ${commit_summary}"
-          if git ls-remote --exit-code --heads origin "${BRANCH_NAME}" >/dev/null 2>&1; then
-            # Move only the snapshot commit. Runs against one image can check
-            # out different trunk heads, and `git pull --rebase` would also
-            # replay every trunk commit between them onto the branch as new
-            # commits, putting unrelated source changes in the PR.
-            git fetch origin "refs/heads/${BRANCH_NAME}"
-            if ! git rebase --onto FETCH_HEAD HEAD^; then
-              git rebase --abort || true
-              echo "::error::This run's snapshots conflict with snapshots another run already pushed to ${BRANCH_NAME}; resolve the .snap conflict on that branch by hand."
-              exit 1
-            fi
+          # Only this run's snapshot changes go onto the branch: runs against one
+          # image can check out different trunk heads, and the branch must not pick up
+          # the trunk commits between them. Committed through GitHub's API rather than
+          # pushed, so GitHub signs the commit (see
+          # .github/actions/signed-commit/signed_commit.py); a concurrent push to the
+          # branch is rebuilt on its new tip.
+          status=0
+          SNAPSHOT_COMMIT="$(python3 .github/actions/signed-commit/signed_commit.py \
+            --branch "${BRANCH_NAME}" --message "fix(cluster-bench): ${commit_summary}" \
+            --changed-since HEAD -- '*.snap')" || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "::error::This run's snapshots conflict with snapshots another run already pushed to ${BRANCH_NAME}; resolve the .snap conflict on that branch by hand."
+            exit 1
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
           fi
-          # Non-interactive: a credential helper on the runner can otherwise intercept
-          # this push and block on a prompt forever. See
-          # scripts/check_ci_git_push_noninteractive.py.
-          git -c credential.helper='' -c credential.interactive=false \
-            push origin "${BRANCH_NAME}"
+          if [ -z "${SNAPSHOT_COMMIT}" ]; then
+            echo "${BRANCH_NAME} already has these snapshots; nothing to commit"
+            exit 0
+          fi
 
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq '.[].url')"
           if [ -n "${PR_URL}" ]; then
             echo "PR already exists -> ${PR_URL}"
-            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN commit (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"
             exit 0
           fi
 
@@ -792,4 +783,4 @@ jobs:
             --head "${BRANCH_NAME}" \
             --label kind/bug \
             --label area/ci
-          bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
+          bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"

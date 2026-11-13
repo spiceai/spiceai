@@ -406,45 +406,24 @@ jobs:
             | tr '[:upper:]' '[:lower:]')"
           BRANCH_NAME="testoperator-snapshot-update/${SLUG}"
 
-          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
-          git config --global user.email 'spiceaibot@spice.ai'
-          git checkout -b "${BRANCH_NAME}"
-
-          # Continue that branch when it already exists, so the push
-          # fast-forwards onto it. Re-parenting the index onto the remote tip
-          # keeps the commit to the snapshots alone instead of replaying every
-          # trunk commit made since the branch was opened.
-          if git ls-remote --exit-code --heads origin "${BRANCH_NAME}"; then
-            git fetch origin "${BRANCH_NAME}"
-            git reset --soft FETCH_HEAD
-            git reset --quiet FETCH_HEAD -- .
+          # An existing branch gets one more commit on its tip with only the snapshots
+          # changed, rather than replaying every trunk commit made since it was opened.
+          # Committed through GitHub's API rather than pushed, so GitHub signs the commit
+          # (see .github/actions/signed-commit/signed_commit.py). When GitHub refuses it
+          # (a new branch from a release-branch commit is refused on every run), the
+          # snapshots are kept as the unpushed-snapshots artifact and the step summary
+          # says how to land them.
+          if ! SNAPSHOT_COMMIT="$(python3 .github/actions/signed-commit/signed_commit.py \
+            --branch "${BRANCH_NAME}" \
+            --message "fix: Update schema snapshots for: ${{ github.event.inputs.spicepod_path }}" \
+            --patch-dir "${RUNNER_TEMP}/unpushed-snapshots" --patch-artifact unpushed-snapshots \
+            -- '*.snap')"; then
+            exit 1
           fi
-
-          git add '*.snap'
-          if git diff --cached --quiet; then
+          if [[ -z "${SNAPSHOT_COMMIT}" ]]; then
             echo "Schema snapshots already up to date on ${BRANCH_NAME}"
             exit 0
           fi
-
-          git commit -m "fix: Update schema snapshots for: ${{ github.event.inputs.spicepod_path }}"
-          # The checkout persists no credentials, so authenticate the push
-          # itself rather than leaving a token in the local git config for the
-          # rest of the job. Disable any credential helper configured on the
-          # (self-hosted) runner as well, so git uses the URL-embedded token only:
-          # otherwise a helper (osxkeychain / git-credential-manager) can intercept
-          # the push and block on an interactive credential prompt, hanging the job.
-          if ! push_log="$(git -c credential.helper='' -c credential.interactive=false \
-            push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}" 2>&1)"; then
-            echo "${push_log}"
-            # A new branch from a release-branch commit is refused on every run
-            # (GitHub times out checking it for workflow changes); keep the
-            # snapshots as an artifact and say so.
-            printf '%s\n' "${push_log}" >"${RUNNER_TEMP}/snapshot-push.log"
-            bash .github/scripts/save_unpushable_snapshots.sh \
-              "${RUNNER_TEMP}/snapshot-push.log" "${BRANCH_NAME}" "${{ github.ref_name }}" || true
-            exit 1
-          fi
-          echo "${push_log}"
 
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
           if [[ -n "${PR_URL}" ]]; then
@@ -461,8 +440,8 @@ jobs:
               --label kind/bug \
               --label area/tests
           fi
-          # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-          bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
+          # Release the pull_request runs GitHub holds on a GITHUB_TOKEN commit (see the script).
+          bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Never fall back to an interactive prompt; fail fast if auth is rejected.
@@ -470,8 +449,8 @@ jobs:
           GCM_INTERACTIVE: 'never'
 
       - name: Upload snapshots GitHub refused to push
-        # save_unpushable_snapshots.sh leaves the snapshot commit here when
-        # GitHub will not let GITHUB_TOKEN create the snapshot branch.
+        # signed_commit.py leaves the snapshots here as a patch when GitHub
+        # refuses the commit, e.g. a new branch from a release-branch commit.
         if: ${{ failure() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

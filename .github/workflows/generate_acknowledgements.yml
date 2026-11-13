@@ -38,26 +38,22 @@ jobs:
       - name: Create PR
         if: github.event_name == 'workflow_dispatch'
         run: |
-          git config --global user.name 'Spice Acknowledgements Bot'
-          git config --global user.email 'acknowledgements-bot@spice.ai'
-          git checkout -b acknowledgements/${GITHUB_RUN_ID}
+          set -euo pipefail
           git diff acknowledgements.md
-          if [[ $(git diff --exit-code acknowledgements.md) ]]; then
-            git add acknowledgements.md
-            git commit -m "Update acknowledgements"
-            # Non-interactive: a credential helper on the runner can otherwise intercept
-            # this push and block on a prompt forever. See
-            # scripts/check_ci_git_push_noninteractive.py.
-            git -c credential.helper='' -c credential.interactive=false \
-              push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:acknowledgements/${GITHUB_RUN_ID}
-            # enforce-pull-with-spice, a required check, fails a PR without both a kind/ and
-            # an area/ label.
-            gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID} --label kind/documentation --label area/docs
-            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-            bash .github/scripts/approve_bot_pr_runs.sh "acknowledgements/${GITHUB_RUN_ID}" "$(git rev-parse HEAD)"
-          else
+          # Committed through GitHub's API rather than pushed, so GitHub signs the commit
+          # (see .github/actions/signed-commit/signed_commit.py).
+          sha="$(python3 .github/actions/signed-commit/signed_commit.py \
+            --branch "acknowledgements/${GITHUB_RUN_ID}" --message "Update acknowledgements" \
+            -- acknowledgements.md)"
+          if [[ -z "${sha}" ]]; then
             echo "No changes detected"
+            exit 0
           fi
+          # enforce-pull-with-spice, a required check, fails a PR without both a kind/ and
+          # an area/ label.
+          gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID} --label kind/documentation --label area/docs
+          # Release the pull_request runs GitHub holds on a GITHUB_TOKEN commit (see the script).
+          bash .github/scripts/approve_bot_pr_runs.sh "acknowledgements/${GITHUB_RUN_ID}" "${sha}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Never fall back to an interactive prompt; fail fast if auth is rejected.

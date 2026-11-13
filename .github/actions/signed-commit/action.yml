@@ -1,0 +1,92 @@
+name: Signed commit
+description: >-
+  Commits working-tree files to a branch through GitHub's API, so GitHub signs the commit and shows
+  it as Verified, which a branch ruleset that requires signed commits accepts and a `git push` from
+  CI does not. Files matched by `paths` are made to look like the working tree; nothing outside them
+  changes. See signed_commit.py for the parent and conflict rules. Needs `python3` and `git`, and a
+  job token with `contents: write`.
+
+inputs:
+  token:
+    description: Token that makes the commit. Its identity is the commit's author.
+    required: true
+  branch:
+    description: Branch to commit to, without `refs/heads/`. Created when it does not exist.
+    required: true
+  message:
+    description: Commit message. The first line is the headline. The workflow run URL is appended.
+    required: true
+  paths:
+    description: Pathspecs to commit, one per line, relative to the repository root.
+    required: true
+  parent:
+    description: >-
+      Commit to build on. The branch must point at it or not exist. Empty builds on the branch's tip,
+      or on HEAD when the branch does not exist, and rebuilds on the new tip after a concurrent push.
+    required: false
+    default: ''
+  changed-since:
+    description: >-
+      Commit only the files under `paths` that differ between this revision (usually HEAD) and the
+      working tree, written onto the parent. A file the branch also changed since then is a conflict.
+    required: false
+    default: ''
+  patch-dir:
+    description: >-
+      When the change cannot be published, write it here as `changes.patch` and put the commands to
+      land it in the step summary. Upload this directory as `patch-artifact`.
+    required: false
+    default: ''
+  patch-artifact:
+    description: Artifact name the step summary tells people to download.
+    required: false
+    default: unpublished-changes
+
+outputs:
+  sha:
+    description: The commit the branch points at after this step. Empty when there was nothing to commit.
+    value: ${{ steps.commit.outputs.sha }}
+  committed:
+    description: '`true` when the branch now has the change, `false` when there was nothing to commit.'
+    value: ${{ steps.commit.outputs.committed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Commit through the GitHub API
+      id: commit
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        BRANCH: ${{ inputs.branch }}
+        MESSAGE: ${{ inputs.message }}
+        PATHS: ${{ inputs.paths }}
+        PARENT: ${{ inputs.parent }}
+        CHANGED_SINCE: ${{ inputs.changed-since }}
+        PATCH_DIR: ${{ inputs.patch-dir }}
+        PATCH_ARTIFACT: ${{ inputs.patch-artifact }}
+      run: |
+        set -euo pipefail
+        if ! command -v python3 >/dev/null; then
+          echo "::error::The signed-commit action needs python3 on the runner."
+          exit 1
+        fi
+        args=(--branch "$BRANCH" --message "$MESSAGE" --patch-artifact "$PATCH_ARTIFACT")
+        [ -n "$PARENT" ] && args+=(--parent "$PARENT")
+        [ -n "$CHANGED_SINCE" ] && args+=(--changed-since "$CHANGED_SINCE")
+        [ -n "$PATCH_DIR" ] && args+=(--patch-dir "$PATCH_DIR")
+        paths=()
+        while IFS= read -r line; do
+          [ -n "$line" ] && paths+=("$line")
+        done <<< "$PATHS"
+        if [ "${#paths[@]}" -eq 0 ]; then
+          echo "::error::The signed-commit action needs at least one path."
+          exit 2
+        fi
+        sha="$(python3 "${GITHUB_ACTION_PATH}/signed_commit.py" "${args[@]}" -- "${paths[@]}")"
+        echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+        if [ -n "$sha" ]; then
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "committed=false" >> "$GITHUB_OUTPUT"
+        fi
