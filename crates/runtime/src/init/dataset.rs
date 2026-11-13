@@ -1945,7 +1945,6 @@ impl Runtime {
         true
     }
 
-    #[cfg(test)]
     /// Reload each dataset named on `changes`, whose shared acceleration
     /// changed writer: a takeover reopens it from what the previous writer
     /// committed and starts its refresh, a handover stops its refresh.

@@ -1380,39 +1380,37 @@ impl Builder {
                 .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
             (None, None)
         } else if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-                // Accelerated tables aren't loaded locally on the scheduler —
-                // executors do. Don't start a refresh task, and leave the
-                // dataset status as `Refreshing` (set by the caller before
-                // this point). The scheduler flips the dataset to `Ready`
-                // only after executors confirm via `PartitionsLoaded` acks
-                // that every assigned partition is loaded; see
-                // `runtime_cluster::PartitionLoadTracker` and the
-                // `PartitionsLoaded` handler in `cluster::service`.
-                // Previously this branch flipped the dataset to `Ready`
-                // immediately, which made `/v1/ready` claim the cluster was
-                // queryable before any data had been loaded on executors.
-                //
-                // `refresh_trigger` is None because the receiver will be
-                // dropped (refresher.start() is not called).
-                //
-                // No refresh will ever be recorded for this table here, so
-                // close the completion signal: the schedule-creation path and
-                // every other caller resolves at once instead of waiting on a
-                // refresh that cannot arrive. Dataset readiness is a separate
-                // concern handled above.
-                refresh_completion.close();
-                (None, None)
-            } else {
-                (
-                    refresher
-                        .start(acceleration_refresh_mode)
-                        .await
-                        .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart {
-                            source,
-                        })?,
-                    refresh_trigger,
-                )
-            };
+            // Accelerated tables aren't loaded locally on the scheduler —
+            // executors do. Don't start a refresh task, and leave the
+            // dataset status as `Refreshing` (set by the caller before
+            // this point). The scheduler flips the dataset to `Ready`
+            // only after executors confirm via `PartitionsLoaded` acks
+            // that every assigned partition is loaded; see
+            // `runtime_cluster::PartitionLoadTracker` and the
+            // `PartitionsLoaded` handler in `cluster::service`.
+            // Previously this branch flipped the dataset to `Ready`
+            // immediately, which made `/v1/ready` claim the cluster was
+            // queryable before any data had been loaded on executors.
+            //
+            // `refresh_trigger` is None because the receiver will be
+            // dropped (refresher.start() is not called).
+            //
+            // No refresh will ever be recorded for this table here, so
+            // close the completion signal: the schedule-creation path and
+            // every other caller resolves at once instead of waiting on a
+            // refresh that cannot arrive. Dataset readiness is a separate
+            // concern handled above.
+            refresh_completion.close();
+            (None, None)
+        } else {
+            (
+                refresher
+                    .start(acceleration_refresh_mode)
+                    .await
+                    .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart { source })?,
+                refresh_trigger,
+            )
+        };
         let mut handlers = refresher.take_background_tasks();
         let initial_snapshot = refresher.take_initial_snapshot();
         let refresher = Arc::new(refresher);

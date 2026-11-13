@@ -92,6 +92,7 @@ pub async fn resolve_position_store(
 pub fn build_changes_stream(
     params: &Parameters,
     dataset: &DatasetSpec,
+    shared_location: Option<&str>,
     position_store: Arc<dyn PositionStore>,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
@@ -118,15 +119,16 @@ pub fn build_changes_stream(
         }
     };
 
-    let params_for_stream = match replication_params_from_connector_params(params, &dataset_name) {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("mysql replication: {e}");
-            return Box::pin(futures::stream::once(async move {
-                Err(StreamError::External(msg))
-            }));
-        }
-    };
+    let params_for_stream =
+        match replication_params_from_connector_params(params, &dataset_name, shared_location) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!("mysql replication: {e}");
+                return Box::pin(futures::stream::once(async move {
+                    Err(StreamError::External(msg))
+                }));
+            }
+        };
 
     // TIMESTAMP columns scan through the read pool in the session time zone
     // (`mysql_time_zone`, default UTC) while binlog values are always UTC.
@@ -654,6 +656,9 @@ fn replication_params_from_connector_params(
     // per-dataset opt-out (which would key both `server_id` and the shared
     // `SourceKey` on the dataset so it coalesces with nothing).
     _dataset_name: &str,
+    // The state location the dataset's acceleration is shared through, if any
+    // (`data_connector_api::shared_location::shared_state_location`).
+    shared_location: Option<&str>,
 ) -> Result<ReplicationParams, String> {
     let opts = build_mysql_opts(params)?;
     // All `refresh_mode: changes` datasets on the same connection share one
@@ -688,7 +693,19 @@ fn replication_params_from_connector_params(
             opts.user().unwrap_or_default(),
             hasher.finish()
         );
-        derive_server_id(&conn_identity, process_nonce())
+        // Instances sharing the acceleration through one location take the
+        // same id: only the one writing the dataset streams the binlog, and if
+        // a former writer is still connected when another takes over, MySQL
+        // drops the older connection rather than let both apply changes.
+        let nonce = match shared_location {
+            Some(location) => {
+                let mut hasher = DefaultHasher::new();
+                location.hash(&mut hasher);
+                u32::try_from(hasher.finish() >> 32).unwrap_or_default()
+            }
+            None => process_nonce(),
+        };
+        derive_server_id(&conn_identity, nonce)
     };
     let snapshot_mode = parse_snapshot_mode(params)?;
     let checkpoint_interval = optional_duration(
@@ -1007,7 +1024,7 @@ mod tests {
             ("db", "mydb"),
             ("sslmode", "disabled"),
         ]);
-        let repl = replication_params_from_connector_params(&params, "orders")
+        let repl = replication_params_from_connector_params(&params, "orders", None)
             .expect("valid params parse");
         assert_eq!(repl.snapshot_mode, InitialSnapshotMode::Auto);
         assert_eq!(repl.bootstrap_batch_size, DEFAULT_BOOTSTRAP_BATCH_SIZE);
@@ -1033,7 +1050,7 @@ mod tests {
         // binlog dump), regardless of dataset name.
         let on_host = |ds: &str, host: &str| {
             let p = params_with(&[("host", host), ("sslmode", "disabled")]);
-            replication_params_from_connector_params(&p, ds).expect("valid params parse")
+            replication_params_from_connector_params(&p, ds, None).expect("valid params parse")
         };
         let orders = on_host("orders", "localhost");
         let customers = on_host("customers", "localhost");
@@ -1059,7 +1076,7 @@ mod tests {
         // DISTINCT server_ids, or the two dumps would collide on the source
         // (MySQL drops a replication connection with a duplicate server_id).
         let derive = |pairs: &[(&str, &str)]| {
-            replication_params_from_connector_params(&params_with(pairs), "orders")
+            replication_params_from_connector_params(&params_with(pairs), "orders", None)
                 .expect("valid params parse")
                 .server_id
         };
@@ -1100,7 +1117,7 @@ mod tests {
             ("sslmode", "disabled"),
             ("replication_server_id", "4242"),
         ]);
-        let repl = replication_params_from_connector_params(&params, "orders")
+        let repl = replication_params_from_connector_params(&params, "orders", None)
             .expect("valid params parse");
         assert_eq!(repl.server_id, 4242);
     }
@@ -1108,7 +1125,7 @@ mod tests {
     #[test]
     fn invalid_server_id_is_rejected() {
         let params = params_with(&[("replication_server_id", "not-a-number")]);
-        let err = replication_params_from_connector_params(&params, "orders")
+        let err = replication_params_from_connector_params(&params, "orders", None)
             .expect_err("bad server id must error");
         assert!(err.contains("mysql_replication_server_id"), "got: {err}");
     }
@@ -1121,13 +1138,13 @@ mod tests {
             ("ALWAYS", InitialSnapshotMode::Always),
         ] {
             let params = params_with(&[("replication_initial_snapshot", raw)]);
-            let repl = replication_params_from_connector_params(&params, "orders")
+            let repl = replication_params_from_connector_params(&params, "orders", None)
                 .expect("valid params parse");
             assert_eq!(repl.snapshot_mode, expected, "raw: {raw}");
         }
 
         let params = params_with(&[("replication_initial_snapshot", "yes")]);
-        let err = replication_params_from_connector_params(&params, "orders")
+        let err = replication_params_from_connector_params(&params, "orders", None)
             .expect_err("typo'd mode must error");
         assert!(
             err.contains("mysql_replication_initial_snapshot")
@@ -1143,13 +1160,13 @@ mod tests {
             ("RESTART", InvalidCheckpointBehavior::Restart),
         ] {
             let params = params_with(&[("replication_invalid_checkpoint_behavior", raw)]);
-            let repl = replication_params_from_connector_params(&params, "orders")
+            let repl = replication_params_from_connector_params(&params, "orders", None)
                 .expect("valid params parse");
             assert_eq!(repl.invalid_position_behavior, expected, "raw: {raw}");
         }
 
         let params = params_with(&[("replication_invalid_checkpoint_behavior", "reboot")]);
-        let err = replication_params_from_connector_params(&params, "orders")
+        let err = replication_params_from_connector_params(&params, "orders", None)
             .expect_err("typo must error");
         assert!(
             err.contains("mysql_replication_invalid_checkpoint_behavior")
@@ -1162,13 +1179,13 @@ mod tests {
     fn ready_lag_parses_and_defaults() {
         // Explicit duration is parsed.
         let params = params_with(&[("replication_ready_lag", "500ms")]);
-        let repl = replication_params_from_connector_params(&params, "orders")
+        let repl = replication_params_from_connector_params(&params, "orders", None)
             .expect("valid params parse");
         assert_eq!(repl.ready_lag, std::time::Duration::from_millis(500));
 
         // An unparseable duration errors, naming the user-facing parameter.
         let params = params_with(&[("replication_ready_lag", "soon")]);
-        let err = replication_params_from_connector_params(&params, "orders")
+        let err = replication_params_from_connector_params(&params, "orders", None)
             .expect_err("unparseable duration must error");
         assert!(err.contains("ready_lag"), "got: {err}");
     }
@@ -1176,7 +1193,7 @@ mod tests {
     #[test]
     fn unknown_sslmode_is_rejected() {
         let params = params_with(&[("sslmode", "verify-full")]);
-        let err = replication_params_from_connector_params(&params, "orders")
+        let err = replication_params_from_connector_params(&params, "orders", None)
             .expect_err("unsupported sslmode must error");
         assert!(err.contains("mysql_sslmode"), "got: {err}");
     }
@@ -1186,7 +1203,7 @@ mod tests {
         // `0s` would persist the position on every loop iteration — reject it
         // rather than silently busy-looping the sidecar.
         let params = params_with(&[("replication_checkpoint_interval", "0s")]);
-        let err = replication_params_from_connector_params(&params, "orders")
+        let err = replication_params_from_connector_params(&params, "orders", None)
             .expect_err("zero interval must error");
         assert!(err.contains("positive duration"), "got: {err}");
         assert!(
@@ -1202,7 +1219,7 @@ mod tests {
             ("host", "ignored"),
             ("sslmode", "disabled"),
         ]);
-        let repl = replication_params_from_connector_params(&params, "orders")
+        let repl = replication_params_from_connector_params(&params, "orders", None)
             .expect("valid params parse");
         assert_eq!(repl.opts.ip_or_hostname(), "db.internal");
         assert_eq!(repl.opts.tcp_port(), 3307);

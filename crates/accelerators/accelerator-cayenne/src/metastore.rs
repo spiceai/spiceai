@@ -529,8 +529,16 @@ impl CayenneAccelerator {
                     Arc::clone(&store),
                     runtime_state_location::StateFeature::CayenneData,
                 );
-                let native =
-                    cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
+                // Instances on one location share its accelerations: a writer
+                // lease on each dataset decides which instance writes it, and
+                // the others serve it as replicas until it lapses.
+                let config = cayenne::metastore::object_native::NativeCatalogConfig {
+                    access: cayenne::metastore::object_native::Access::Leased(
+                        cayenne::metastore::object_native::LeaseSettings::default(),
+                    ),
+                    ..cayenne::metastore::object_native::NativeCatalogConfig::default()
+                };
+                let native = cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at_with_config(
                         runtime_state_location::metrics::metered(
                             store,
                             runtime_state_location::StateFeature::CayenneMetastore,
@@ -539,6 +547,7 @@ impl CayenneAccelerator {
                             .join("v1")
                             .join("catalog"),
                         &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
+                        config,
                     )
                     .await
                     .map(|native| native.with_data_store(data_store));

@@ -1756,9 +1756,7 @@ impl DataFusion {
 
     /// The names of datasets whose writer changed, to reload: taken once, by
     /// the runtime.
-    pub fn take_writer_role_changes(
-        &self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
+    pub fn take_writer_role_changes(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
         self.writer_role_changes_rx.lock().take()
     }
 

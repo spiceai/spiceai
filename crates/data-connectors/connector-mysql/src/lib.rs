@@ -606,9 +606,12 @@ impl DataConnector for MySQL {
         _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         let position_store = replication::resolve_position_store(context, dataset).await;
+        let shared_location =
+            data_connector_api::shared_location::shared_state_location(context, dataset);
         Some(replication::build_changes_stream(
             &self.params,
             dataset,
+            shared_location.as_deref(),
             position_store,
             federated_table,
             Arc::clone(&self.replication_metrics),
