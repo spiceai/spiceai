@@ -661,6 +661,12 @@ jobs:
         shell: pwsh
         run: ./test/scripts/install-ps1-test.ps1
 
+      # A stock Windows install runs the README's `iex (... DownloadString ...)` in Windows
+      # PowerShell 5.1, not PowerShell 7, so the same tests run there too.
+      - name: Test Install.ps1 download verification (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./test/scripts/install-ps1-test.ps1
+
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
