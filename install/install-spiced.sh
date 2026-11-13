@@ -219,21 +219,25 @@ verifyDownload() {
             exit 1
         fi
     elif verifyFetch "$api_url" "$scratch/release.json" 2>/dev/null; then
+        # Pretty-printed or not, the JSON has one key per line once each comma is a line break.
+        # grep and awk read that from a file, not a pipe: under pipefail (SHELLOPTS can turn it on)
+        # a reader that stops at its first match would fail the pipeline when the writer gets
+        # SIGPIPE, and a listed SHA256SUMS would read as missing.
+        tr ',' '\n' < "$scratch/release.json" > "$scratch/release.lines"
         # The release lists SHA256SUMS when it has one. Then the download failed for another
         # reason, and the GitHub digest would skip the attestation check, so stop instead.
-        if tr ',' '\n' < "$scratch/release.json" | grep -Eq '"name"[[:space:]]*:[[:space:]]*"SHA256SUMS"'; then
+        if grep -Eq '"name"[[:space:]]*:[[:space:]]*"SHA256SUMS"' "$scratch/release.lines"; then
             echo "Cannot verify $asset: release $tag publishes SHA256SUMS, but downloading it failed ($download_url)."
             echo "Try again later. Nothing was installed."
             exit 1
         fi
         source="sha256 GitHub recorded for $asset in release $tag"
-        # Pretty-printed or not, the JSON has one key per line once each comma is a line break.
-        expected=$(tr ',' '\n' < "$scratch/release.json" | awk -v f="\"$asset\"" '
+        expected=$(awk -v f="\"$asset\"" '
             /"name"[[:space:]]*:/ { found = (index($0, f) > 0); next }
             found && /"digest"[[:space:]]*:/ {
                 if (match($0, /sha256:[0-9a-fA-F]+/)) { print substr($0, RSTART + 7, RLENGTH - 7) }
                 exit
-            }')
+            }' "$scratch/release.lines")
         if [ -z "$expected" ]; then
             reason="release $tag has no SHA256SUMS, and GitHub recorded no sha256 for $asset"
         fi

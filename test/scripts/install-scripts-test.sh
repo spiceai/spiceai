@@ -842,9 +842,19 @@ release_json() {
       "browser_download_url": "https://github.com/spiceai/spiceai/releases/download/v0.0.0/${asset}"
     }
   ],
-  "body": "Notes"
+  "body": "$(release_body)"
 }
 JSON
+}
+
+# The release notes in release_json: "Notes", or OFFLINE_BODY_BYTES bytes of them. A real release's
+# JSON is tens of kilobytes, more than a pipe buffer holds.
+release_body() {
+    if [ -n "${OFFLINE_BODY_BYTES:-}" ]; then
+        head -c "$OFFLINE_BODY_BYTES" /dev/zero | tr '\0' 'n'
+    else
+        printf 'Notes'
+    fi
 }
 
 # Runs an installer end to end, piped into bash as the README one-liner does, with no network
@@ -859,6 +869,7 @@ JSON
 #   OFFLINE_DIGEST  match (default), mismatch, null, or fail (the API request fails)
 #   OFFLINE_GH      loggedout (default), pass, or fail (the attestation check)
 #   OFFLINE_HASH    ok (default), or none (sha256sum, shasum and openssl print nothing and fail)
+#   OFFLINE_BODY_BYTES  the size of the release notes in the API's release (default: a few bytes)
 # Usage: run_installer_offline <script> <binary> <asset> <home> [VAR=value...], where the
 # VAR=value pairs go into the installer's environment. The log is $home.log.
 run_installer_offline() {
@@ -1159,6 +1170,28 @@ test_install_sh_opt_out_without_a_hash_tool_installs_an_unsigned_release() {
         { cat "$home.log"; return 1; }
     installed_cli "$home" &&
         log_has "$home" "unverified, because SPICE_INSTALL_ALLOW_UNVERIFIED=1 is set: none of sha256sum, shasum or openssl is installed"
+}
+
+# With pipefail on (SHELLOPTS=pipefail in the environment turns it on in bash) and a release JSON
+# larger than a pipe buffer, a reader that stops at its first match leaves the writer to die of
+# SIGPIPE, and the whole pipeline reads as failed. The listed SHA256SUMS must still be found.
+test_install_sh_finds_a_listed_sha256sums_under_pipefail() {
+    local home="$TEST_TMP_DIR/pipefail-sums"
+    mkdir -p "$home"
+    if OFFLINE_SUMS=unreachable OFFLINE_BODY_BYTES=200000 run_install_offline "$home" SHELLOPTS=pipefail; then
+        cat "$home.log"
+        return 1
+    fi
+    ! installed_cli "$home" && log_has "$home" "publishes SHA256SUMS, but downloading it failed"
+}
+
+test_install_sh_reads_the_github_digest_under_pipefail() {
+    local home="$TEST_TMP_DIR/pipefail-digest"
+    mkdir -p "$home"
+    OFFLINE_SUMS=none OFFLINE_BODY_BYTES=200000 run_install_offline "$home" SHELLOPTS=pipefail ||
+        { cat "$home.log"; return 1; }
+    installed_cli "$home" &&
+        log_has "$home" "Verified the sha256 of spice_$(host_os)_$(host_arch).tar.gz against the sha256 GitHub recorded"
 }
 
 # GNU sha256sum prefixes its output with a backslash when the file name has one.
@@ -1602,6 +1635,8 @@ run_all_tests() {
     run_test "install.sh: opt-out without a hash tool does not skip SHA256SUMS" test_install_sh_opt_out_without_a_hash_tool_does_not_skip_sha256sums
     run_test "install.sh: opt-out without a hash tool installs an unsigned release" test_install_sh_opt_out_without_a_hash_tool_installs_an_unsigned_release
     run_test "install.sh: verifies with a backslash in TMPDIR" test_install_sh_verifies_with_a_backslash_in_tmpdir
+    run_test "install.sh: finds a listed SHA256SUMS under pipefail" test_install_sh_finds_a_listed_sha256sums_under_pipefail
+    run_test "install.sh: reads the GitHub digest under pipefail" test_install_sh_reads_the_github_digest_under_pipefail
     echo ""
 
     # Error Handling
