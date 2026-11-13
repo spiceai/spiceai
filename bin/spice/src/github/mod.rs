@@ -38,6 +38,8 @@ const RUNTIME_REPO: &str = "spiceai";
 pub struct GitHubClient {
     client: Client,
     token: Option<String>,
+    /// Root of the REST API that the release URLs are built on.
+    api_base: String,
     pub owner: String,
     pub repo: String,
 }
@@ -72,9 +74,18 @@ impl GitHubClient {
         Self {
             client,
             token,
+            api_base: GITHUB_API_BASE.to_string(),
             owner: owner.to_string(),
             repo: repo.to_string(),
         }
+    }
+
+    /// The same client, building its release URLs on `api_base` instead of the public API.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_api_base(mut self, api_base: &str) -> Self {
+        self.api_base = api_base.to_string();
+        self
     }
 
     /// Whether requests carry a GitHub token.
@@ -254,8 +265,8 @@ impl GitHubClient {
     #[must_use]
     pub fn releases_url(&self) -> String {
         format!(
-            "{GITHUB_API_BASE}/repos/{}/{}/releases",
-            self.owner, self.repo
+            "{}/repos/{}/{}/releases",
+            self.api_base, self.owner, self.repo
         )
     }
 
@@ -263,6 +274,12 @@ impl GitHubClient {
     #[must_use]
     pub fn latest_release_url(&self) -> String {
         format!("{}/latest", self.releases_url())
+    }
+
+    /// Get the API URL of the release tagged `tag`.
+    #[must_use]
+    pub fn release_by_tag_url(&self, tag: &str) -> String {
+        format!("{}/tags/{}", self.releases_url(), urlencoding::encode(tag))
     }
 }
 
