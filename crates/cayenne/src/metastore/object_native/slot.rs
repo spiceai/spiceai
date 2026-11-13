@@ -16,7 +16,7 @@ limitations under the License.
 
 //! State slots and transaction reservations.
 
-use super::{Domain, Inner};
+use super::{Domain, Inner, subject};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -32,20 +32,20 @@ pub(super) struct StateSlot {
     pub(super) reserved: std::sync::atomic::AtomicBool,
 }
 pub(super) struct StateLease<'a> {
-    slot: &'a StateSlot,
+    slot: &'a Arc<StateSlot>,
     inner: Option<Inner>,
 }
 impl StateSlot {
-    pub(super) async fn take(&self) -> StateLease<'_> {
+    pub(super) async fn take(self: &Arc<Self>) -> StateLease<'_> {
         self.take_as(false).await
     }
 
     /// The state for the transaction holding the reservation.
-    pub(super) async fn take_reserved(&self) -> StateLease<'_> {
+    pub(super) async fn take_reserved(self: &Arc<Self>) -> StateLease<'_> {
         self.take_as(true).await
     }
 
-    async fn take_as(&self, holder: bool) -> StateLease<'_> {
+    async fn take_as(self: &Arc<Self>, holder: bool) -> StateLease<'_> {
         use std::sync::atomic::Ordering;
         loop {
             let notified = self.available.notified();
@@ -67,7 +67,7 @@ impl StateSlot {
     }
 
     /// Wait for the reservation and hold it until the returned guard drops.
-    pub(super) async fn reserve(&self) -> Reservation<'_> {
+    pub(super) async fn reserve(self: &Arc<Self>) -> Reservation<'_> {
         use std::sync::atomic::Ordering;
         let lease = self.take().await;
         self.reserved.store(true, Ordering::Release);
@@ -122,8 +122,66 @@ impl std::ops::DerefMut for StateLease<'_> {
 }
 impl Drop for StateLease<'_> {
     fn drop(&mut self) {
+        // A commit that did not finish, including one whose caller was cancelled,
+        // leaves the log stopped; a background task brings it back.
+        if let Some(inner) = self.inner.as_mut()
+            && inner.needs_recovery()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            inner.recovering = true;
+            runtime.spawn(recover_in_background(Arc::downgrade(self.slot)));
+        }
         *self.slot.inner.lock() = self.inner.take();
         // Every waiter re-checks: one may wait on the reservation, not the state.
         self.slot.available.notify_waiters();
     }
+}
+
+/// Bring a stopped log back: an unresolved commit by reopening the log and
+/// resuming from what committed, a fenced one by reloading the committed state
+/// for its reads. Retries with a doubling wait until it succeeds or the catalog
+/// is dropped.
+async fn recover_in_background(slot: std::sync::Weak<StateSlot>) {
+    let mut attempt: u32 = 0;
+    loop {
+        let Some(strong) = slot.upgrade() else {
+            return;
+        };
+        let (delay, done) = {
+            // Past a transaction's reservation: only the reservation's holder
+            // commits while it is held, so a stopped log is its holder's, and the
+            // holder may be waiting for this very recovery to learn its outcome.
+            let mut lease = strong.take().await;
+            let delay = lease.config.retry_delay;
+            match lease.recover().await {
+                Ok(()) => {
+                    lease.recovering = false;
+                    (delay, true)
+                }
+                Err(error) => {
+                    let wait = delay.saturating_mul(2_u32.saturating_pow(attempt.min(6)));
+                    tracing::warn!(
+                        "{}",
+                        recovery_retry_message(&lease.dataset, &error.to_string(), wait)
+                    );
+                    (wait, false)
+                }
+            }
+        };
+        drop(strong);
+        if done {
+            return;
+        }
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Logged each time reading the state back fails.
+fn recovery_retry_message(dataset: &str, cause: &str, wait: std::time::Duration) -> String {
+    format!(
+        "{} could not read its state back after an unconfirmed change, so it still accepts no change; it retries in {} ms. Check that the state location is reachable. Cause: {cause}",
+        subject(dataset),
+        wait.as_millis()
+    )
 }

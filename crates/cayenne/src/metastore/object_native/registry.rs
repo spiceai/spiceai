@@ -21,6 +21,7 @@ use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog},
     metadata::CreateTableOptions,
 };
+use cayenne_metastore_actions::proto;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 use parking_lot::RwLock;
@@ -39,6 +40,9 @@ pub(super) const DROPPED: &str = "dropped";
 /// The name registry and every dataset's log.
 pub struct ObjectNativeCatalog {
     pub(super) store: Arc<dyn ObjectStore>,
+    /// The location's store as the data files of datasets in the location use
+    /// it: the same bucket, its requests measured apart from the logs'.
+    data_store: Option<Arc<dyn ObjectStore>>,
     pub(super) config: NativeCatalogConfig,
     /// The name registry's log, at the catalog's prefix. It also holds tables
     /// created before datasets had logs of their own, and positions whose key
@@ -49,8 +53,18 @@ pub struct ObjectNativeCatalog {
     pub(super) datasets: Path,
     pub(super) transactions: Path,
     routes: RwLock<Routes>,
-    /// Serializes creating and dropping datasets.
-    pub(super) ddl: tokio::sync::Mutex<()>,
+    /// Serializes creating and dropping datasets, and deleting a dropped
+    /// dataset's folder.
+    pub(super) ddl: Arc<tokio::sync::Mutex<()>>,
+    /// Folders of datasets dropped in this process whose deletion is pending.
+    pub(super) dropping: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// Restore-point and export holds on each table's deletions, by table id.
+    deletion_holds: parking_lot::Mutex<HashMap<String, Vec<TableDeletionHolds>>>,
+    /// The URL of the folder `datasets/` is in, when the catalog was opened at a
+    /// location URL: a dataset's data path under it is recorded relative to it
+    /// and resolved against it on every read, so a copy of the location opened
+    /// at another URL reads its own data.
+    anchor: Option<Arc<str>>,
 }
 
 /// Which log holds each table.
@@ -171,9 +185,7 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
     ) -> CatalogResult<Self> {
-        let registry =
-            Domain::create_with_config(Arc::clone(&store), prefix.clone(), config, true).await?;
-        Self::assemble(store, prefix, config, registry).await
+        Self::create_at(store, prefix, config, None).await
     }
 
     /// Open the catalog kept in a local directory, creating it on first use. The
@@ -196,7 +208,11 @@ impl ObjectNativeCatalog {
     }
 
     /// Open the catalog at `prefix` in `store`, creating it on first use.
-    /// `location` names where it is, for the startup log.
+    /// `location` names where it is, for the startup log. When `location` is the
+    /// URL of the folder `prefix` is in (`s3://bucket/state/cayenne/v1` for
+    /// `state/cayenne/v1/catalog`), a dataset's data path under it is recorded
+    /// relative to it, so a copy of the location opened at another URL serves
+    /// the same rows from its own objects.
     /// # Errors
     /// Returns an error when the store cannot be used or the history is invalid.
     pub async fn open_or_create_at(
@@ -204,19 +220,8 @@ impl ObjectNativeCatalog {
         prefix: Path,
         location: &str,
     ) -> CatalogResult<Self> {
-        let (catalog, verb) = match store.head(&prefix.clone().join("head")).await {
-            Ok(_) => (Self::open(store, prefix).await?, "Opened"),
-            Err(object_store::Error::NotFound { .. }) => {
-                (Self::create(store, prefix).await?, "Created")
-            }
-            Err(error) => return Err(invalid(error)),
-        };
-        let (datasets, tables, replayed) = catalog.summary();
-        let OpenSummary { lease, .. } = catalog.registry.opened;
-        tracing::info!(
-            "{verb} the Cayenne object-native metastore at '{location}': {datasets} datasets with {tables} tables, plus {replayed} commits after their checkpoints, writing as lease {lease}"
-        );
-        Ok(catalog)
+        Self::open_or_create_at_with_config(store, prefix, location, NativeCatalogConfig::default())
+            .await
     }
 
     /// Replay committed records, then fence the previous writers with the next lease.
@@ -234,9 +239,7 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
     ) -> CatalogResult<Self> {
-        let registry =
-            Domain::open_with_config(Arc::clone(&store), prefix.clone(), config, true).await?;
-        Self::assemble(store, prefix, config, registry).await
+        Self::open_at(store, prefix, config, None).await
     }
 
     /// Open the log of every dataset the registry names, route each table to its
@@ -246,6 +249,7 @@ impl ObjectNativeCatalog {
         prefix: Path,
         config: NativeCatalogConfig,
         registry: Domain,
+        anchor: Option<Arc<str>>,
     ) -> CatalogResult<Self> {
         let datasets = sibling(&prefix, "datasets");
         let transactions = sibling(&prefix, "transactions");
@@ -256,6 +260,7 @@ impl ObjectNativeCatalog {
         let opened = futures::future::try_join_all(entries.into_iter().map(|(name, folder)| {
             let store = Arc::clone(&store);
             let datasets = datasets.clone();
+            let anchor = anchor.clone();
             async move {
                 let folder = String::from_utf8(folder).map_err(invalid)?;
                 let prefix = datasets.join(folder.as_str());
@@ -265,7 +270,8 @@ impl ObjectNativeCatalog {
                     Err(object_store::Error::NotFound { .. }) => return Ok((name, None)),
                     Err(error) => return Err(invalid(error)),
                 }
-                let mut domain = Domain::open_with_config(store, prefix, config, false).await?;
+                let mut domain =
+                    Domain::open_with_config(store, prefix, config, false, anchor, &name).await?;
                 domain.folder = folder;
                 Ok::<_, CatalogError>((name, Some(domain)))
             }
@@ -284,13 +290,17 @@ impl ObjectNativeCatalog {
         registry.commit_actions(stale).await?;
         let catalog = Self {
             store,
+            data_store: None,
             config,
             registry,
             prefix,
             datasets,
             transactions,
             routes: RwLock::new(routes),
-            ddl: tokio::sync::Mutex::new(()),
+            ddl: Arc::new(tokio::sync::Mutex::new(())),
+            dropping: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            deletion_holds: parking_lot::Mutex::new(HashMap::new()),
+            anchor,
         };
         catalog.recover().await?;
         catalog.reclaim().await?;
@@ -389,12 +399,19 @@ impl ObjectNativeCatalog {
             self.routes.write().refresh(&domain, tables);
             return Ok(id);
         }
-        let folder = format!("{}-{}", slug(&name), uuid::Uuid::now_v7());
+        // A dataset whose data files go in the location names its folder in its
+        // table path (`<datasets>/<folder>/data`, see [`new_dataset_folder`]), so the
+        // files and the log share one folder and a drop reclaims both.
+        let folder = self
+            .folder_named_by(&name, &options.base_path)
+            .unwrap_or_else(|| new_dataset_folder(&name));
         let mut domain = Domain::create_with_config(
             Arc::clone(&self.store),
             self.datasets.clone().join(folder.as_str()),
             self.config,
             false,
+            self.anchor.clone(),
+            &name,
         )
         .await?;
         domain.folder.clone_from(&folder);
@@ -443,6 +460,12 @@ impl ObjectNativeCatalog {
         let Some(domain) = domain else {
             return self.registry.drop_table(name).await;
         };
+        let table_ids: Vec<String> = domain
+            .tables()
+            .await
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
         let dropped = domain.drop_table(name).await?;
         if own.is_some_and(|own| Arc::ptr_eq(&own, &domain)) {
             // Written before the registry forgets the name, so a log no name
@@ -467,9 +490,20 @@ impl ObjectNativeCatalog {
                     .map(|((source, partition), value)| position(&source, &partition, Some(value))),
             );
             self.registry.commit_actions(unregister).await?;
-            let mut routes = self.routes.write();
-            routes.refresh(&domain, Vec::new());
-            routes.datasets.remove(name);
+            {
+                let mut routes = self.routes.write();
+                routes.refresh(&domain, Vec::new());
+                routes.datasets.remove(name);
+            }
+            let readers: Vec<TableDeletionHolds> = {
+                let mut registered = self.deletion_holds.lock();
+                table_ids
+                    .iter()
+                    .filter_map(|id| registered.remove(id))
+                    .flatten()
+                    .collect()
+            };
+            self.reclaim_dropped_folder(name, &domain.folder, readers);
             return Ok(dropped);
         }
         let tables = domain.tables().await;
@@ -534,5 +568,226 @@ impl ObjectNativeCatalog {
     /// Returns an error when the commit is not accepted.
     pub async fn set_sidecar_value(&self, key: &str, value: Option<Vec<u8>>) -> CatalogResult<()> {
         self.for_key(key).set_sidecar_value(key, value).await
+    }
+}
+
+/// A weak handle to a table's restore-point and export deletion hold.
+#[derive(Clone, Debug)]
+pub struct TableDeletionHolds {
+    deletions: std::sync::Weak<tokio::sync::RwLock<()>>,
+}
+
+impl TableDeletionHolds {
+    pub(crate) fn new(deletions: &Arc<tokio::sync::RwLock<()>>) -> Self {
+        Self {
+            deletions: Arc::downgrade(deletions),
+        }
+    }
+    pub(super) fn held(&self) -> bool {
+        self.deletions
+            .upgrade()
+            .is_some_and(|fence| fence.try_write().is_err())
+    }
+    fn gone(&self) -> bool {
+        self.deletions.strong_count() == 0
+    }
+}
+
+/// The URL of the folder holding the registry at `prefix` and `datasets/`, when
+/// `location` is that folder's URL (`s3://bucket/state/cayenne/v1` for the
+/// registry `state/cayenne/v1/catalog`).
+fn location_anchor(location: &str, prefix: &Path) -> Option<Arc<str>> {
+    let url = url::Url::parse(location).ok()?;
+    if url.scheme() == "file" {
+        return None;
+    }
+    let folder: Vec<_> = prefix.parts().collect();
+    let folder = Path::from_iter(folder[..folder.len().checked_sub(1)?].iter().cloned());
+    (url.path().trim_matches('/') == folder.as_ref())
+        .then(|| Arc::from(location.trim_end_matches('/')))
+}
+
+/// A new folder for dataset `name`: its slug and a fresh `UUIDv7`. A caller that
+/// puts the dataset's data files in the location mints the folder first, so the
+/// table path it creates the dataset with (`<datasets>/<folder>/data`) names it.
+#[must_use]
+pub fn new_dataset_folder(name: &str) -> String {
+    format!("{}-{}", slug(name), uuid::Uuid::now_v7())
+}
+
+impl ObjectNativeCatalog {
+    async fn create_at(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        config: NativeCatalogConfig,
+        anchor: Option<Arc<str>>,
+    ) -> CatalogResult<Self> {
+        let registry = Domain::create_with_config(
+            Arc::clone(&store),
+            prefix.clone(),
+            config,
+            true,
+            anchor.clone(),
+            "",
+        )
+        .await?;
+        Self::assemble(store, prefix, config, registry, anchor).await
+    }
+    /// [`Self::open_or_create_at`] with explicit head-log tuning.
+    /// # Errors
+    /// Returns an error when the store cannot be used or the history is invalid.
+    pub async fn open_or_create_at_with_config(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        location: &str,
+        config: NativeCatalogConfig,
+    ) -> CatalogResult<Self> {
+        let anchor = location_anchor(location, &prefix);
+        let (catalog, verb) = match store.head(&prefix.clone().join("head")).await {
+            Ok(_) => (
+                Self::open_at(store, prefix, config, anchor).await?,
+                "Opened",
+            ),
+            Err(object_store::Error::NotFound { .. }) => (
+                Self::create_at(store, prefix, config, anchor).await?,
+                "Created",
+            ),
+            Err(error) => return Err(invalid(error)),
+        };
+        let (datasets, tables, replayed) = catalog.summary();
+        let OpenSummary { lease, .. } = catalog.registry.opened;
+        tracing::info!(
+            "{verb} the Cayenne object-native metastore at '{location}': {datasets} datasets with {tables} tables, plus {replayed} commits after their checkpoints, writing as lease {lease}"
+        );
+        Ok(catalog)
+    }
+    async fn open_at(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        config: NativeCatalogConfig,
+        anchor: Option<Arc<str>>,
+    ) -> CatalogResult<Self> {
+        let registry = Domain::open_with_config(
+            Arc::clone(&store),
+            prefix.clone(),
+            config,
+            true,
+            anchor.clone(),
+            "",
+        )
+        .await?;
+        Self::assemble(store, prefix, config, registry, anchor).await
+    }
+    /// The store the catalog's logs are in.
+    #[must_use]
+    pub fn store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.store)
+    }
+    /// Data files of datasets in the location go through `store`: the same
+    /// location as [`Self::store`], measured as data rather than as the logs.
+    #[must_use]
+    pub fn with_data_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        self.data_store = Some(store);
+        self
+    }
+    /// The store a dataset whose data files are in the location keeps them in,
+    /// under [`Self::datasets_prefix`]: the one [`Self::with_data_store`] set,
+    /// or else [`Self::store`].
+    #[must_use]
+    pub fn data_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(self.data_store.as_ref().unwrap_or(&self.store))
+    }
+    /// The prefix of the dataset folders (`…/cayenne/v1/datasets`) in [`Self::store`].
+    #[must_use]
+    pub fn datasets_prefix(&self) -> &Path {
+        &self.datasets
+    }
+    /// The folder `base_path` names for a new dataset `name`, when it is a data path
+    /// `…/<datasets>/<folder>/data` in this catalog's location whose folder is one
+    /// [`new_dataset_folder`] makes for `name`.
+    pub(super) fn folder_named_by(&self, name: &str, base_path: &str) -> Option<String> {
+        let url = url::Url::parse(base_path).ok()?;
+        let path = url.path().trim_matches('/');
+        let rest = path
+            .strip_prefix(self.datasets.as_ref())?
+            .strip_prefix('/')?;
+        let folder = rest.strip_suffix("/data")?;
+        let uuid = folder.strip_prefix(&format!("{}-", slug(name)))?;
+        (!folder.contains('/') && uuid::Uuid::parse_str(uuid).is_ok()).then(|| folder.to_string())
+    }
+    /// Commit, on `dataset`'s log, a change its state refuses: the path a bug in
+    /// this catalog's own checks would take. For tests of what a refused change
+    /// does to the dataset.
+    /// # Errors
+    /// Returns the refusal.
+    #[doc(hidden)]
+    pub async fn commit_change_the_state_refuses(&self, dataset: &str) -> CatalogResult<()> {
+        let domain = self.for_name(dataset);
+        let table_id = domain
+            .tables()
+            .await
+            .into_iter()
+            .find(|(_, name, _)| name == dataset)
+            .map(|(id, _, _)| id)
+            .ok_or_else(|| CatalogError::TableNotFound {
+                table_name: dataset.to_string(),
+            })?;
+        domain
+            .commit_actions(vec![crate::metastore::actions::remove_groups(
+                &table_id,
+                proto::Select::Listed,
+                &["not-a-registered-snapshot".to_string()],
+                true,
+            )])
+            .await
+    }
+    /// Register the restore-point and export holds that delay folder deletion.
+    pub fn register_deletion_holds(&self, table_id: &str, readers: TableDeletionHolds) {
+        let mut registered = self.deletion_holds.lock();
+        registered.retain(|_, tables| {
+            tables.retain(|table| !table.gone());
+            !tables.is_empty()
+        });
+        registered
+            .entry(table_id.to_string())
+            .or_default()
+            .push(readers);
+    }
+    /// Whether `path`, a table's data path, is a dataset folder's data in this
+    /// catalog's location: its files go with the dataset's folder when the dataset
+    /// is dropped. `path` is either the absolute URL a read of the table returns
+    /// (the state records it relative to the location and resolves it against the
+    /// URL the catalog was opened at) or the relative form itself,
+    /// `datasets/<folder>/data`.
+    #[must_use]
+    pub fn holds_data_at(&self, path: &str) -> bool {
+        let in_datasets = match url::Url::parse(path) {
+            Ok(url) => {
+                // Opened at a location URL: the data must be under that URL, not
+                // under the same key prefix of another bucket.
+                if let Some(anchor) = self.anchor.as_deref()
+                    && !path
+                        .strip_prefix(anchor)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                {
+                    return false;
+                }
+                url.path()
+                    .trim_matches('/')
+                    .strip_prefix(self.datasets.as_ref())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .map(str::to_string)
+            }
+            Err(_) => path
+                .trim_matches('/')
+                .strip_prefix("datasets/")
+                .map(str::to_string),
+        };
+        in_datasets
+            .as_deref()
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(folder, rest)| {
+                !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))
+            })
     }
 }

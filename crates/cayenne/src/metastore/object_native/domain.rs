@@ -17,9 +17,14 @@ limitations under the License.
 //! Domain lifecycle, replay, and state operations.
 
 use super::{
-    super::{actions, state_reader::DatasetStateReader},
-    Domain, Inner, NativeCatalogConfig, OpenSummary, ValueChange, invalid,
+    super::{
+        actions,
+        state_reader::{self, DatasetStateReader},
+    },
+    Domain, Inner, NativeCatalogConfig, OpenSummary, Stop, ValueChange, fenced_message, invalid,
+    refused_change_message,
     slot::{StateLease, StateSlot},
+    subject,
 };
 use crate::{
     catalog::{CatalogError, CatalogResult},
@@ -156,12 +161,10 @@ impl Domain {
 
     pub(super) async fn read(&self) -> CatalogResult<StateLease<'_>> {
         let inner = self.inner.take().await;
-        if inner.poisoned {
-            return Err(invalid(
-                "catalog publication outcome is uncertain; reopen before reading commit evidence",
-            ));
+        match inner.stop {
+            None | Some(Stop::Fenced { reloaded: true }) => Ok(inner),
+            Some(stop) => Err(inner.stopped(stop)),
         }
-        Ok(inner)
     }
 
     /// Create an empty log at a new prefix.
@@ -172,15 +175,18 @@ impl Domain {
         prefix: Path,
         config: NativeCatalogConfig,
         immediate: bool,
+        anchor: Option<Arc<str>>,
+        dataset: &str,
     ) -> CatalogResult<Self> {
         HeadLog::create(Arc::clone(&store), prefix.clone(), config.log)
             .await
             .map_err(invalid)?;
-        Self::open_with_config(store, prefix, config, immediate).await
+        Self::open_with_config(store, prefix, config, immediate, anchor, dataset).await
     }
     /// Replay committed records, then fence the previous writer with the next
     /// lease. An `immediate` log commits every change when it is made, even
-    /// inside a deferred scope.
+    /// inside a deferred scope. Data paths under `anchor` are recorded relative
+    /// to it ([`state_reader::stored_path`]).
     /// # Errors
     /// Returns an error on invalid history, takeover conflict, or storage failure.
     pub(super) async fn open_with_config(
@@ -188,66 +194,27 @@ impl Domain {
         prefix: Path,
         config: NativeCatalogConfig,
         immediate: bool,
+        anchor: Option<Arc<str>>,
+        dataset: &str,
     ) -> CatalogResult<Self> {
-        let (reader, opened) = Reader::open(Arc::clone(&store), prefix.clone())
-            .await
-            .map_err(invalid)?;
-        let mut replayed = replay_state(opened)?;
-        let generation = reader
-            .state()
-            .head
-            .lease
-            .checked_add(1)
-            .ok_or_else(|| invalid("catalog lease exhausted"))?;
-        let mut writer =
-            Writer::take_over(Arc::clone(&store), prefix.clone(), config.log, generation)
-                .await
-                .map_err(invalid)?;
-        writer.set_attempt_horizon(config.attempt_horizon);
-        // Takeover fences the old writer. If it committed during replay,
-        // rebuild from that fenced head before acknowledging the open.
-        if writer.state().head.commit != reader.state().head.commit
-            || writer.state().head.incarnation != reader.state().head.incarnation
-        {
-            let (fenced, opened) = Reader::open(Arc::clone(&store), prefix.clone())
-                .await
-                .map_err(invalid)?;
-            if fenced.state().head != writer.state().head
-                || fenced.state().version != writer.state().version
-            {
-                return Err(invalid(
-                    "catalog changed during takeover; reopen the catalog",
-                ));
-            }
-            replayed = replay_state(opened)?;
-        }
-        let Replayed {
-            state,
-            floor_state,
-            since_floor,
-        } = replayed;
-        let opened = OpenSummary {
-            replayed: since_floor.len(),
-            lease: generation,
-        };
+        let (inner, opened) = Inner::open(
+            store,
+            prefix,
+            config,
+            immediate,
+            anchor,
+            Arc::from(dataset),
+            None,
+        )
+        .await?;
         Ok(Self {
             opened,
             folder: String::new(),
-            inner: StateSlot {
+            inner: Arc::new(StateSlot {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
-                inner: Mutex::new(Some(Inner {
-                    reader: DatasetStateReader::from_state(state, store, prefix),
-                    writer,
-                    poisoned: false,
-                    config,
-                    floor_state,
-                    since_floor,
-                    staged_checkpoint: 0,
-                    pending: Vec::new(),
-                    immediate,
-                })),
-            },
+                inner: Mutex::new(Some(inner)),
+            }),
         })
     }
 }
@@ -311,7 +278,11 @@ impl Inner {
                 if let Err(error) = self.floor_state.apply_in_place(record) {
                     // These records already applied to the live state from the
                     // same floor, so the floor state no longer describes the log.
-                    self.poisoned = true;
+                    self.stop = Some(Stop::Refused);
+                    tracing::error!(
+                        "{}",
+                        refused_change_message(&self.dataset, &error.to_string())
+                    );
                     return Err(invalid(error));
                 }
             }
@@ -363,29 +334,24 @@ impl Inner {
     }
 
     pub(super) async fn commit(&mut self, actions: Vec<Action>) -> CatalogResult<()> {
-        if self.poisoned {
-            return Err(invalid(
-                "catalog requires reopening after an uncertain or fenced commit",
-            ));
-        }
+        self.ensure_accepting()?;
         let mut actions = actions;
         self.stamp(&mut actions);
         let record = Record { actions };
         // Applied without a copy of the state. A refused record is a guard this
         // catalog's own checks should have caught, and leaves the state partly
-        // changed, so the catalog stops until it is reopened from the log.
+        // changed, so the log stops until the process restarts.
         if let Err(error) = self.reader.state.apply_in_place(&record) {
-            self.poisoned = true;
-            tracing::error!(
-                "Cayenne object-native metastore stopped accepting changes, so its datasets stop updating until spiced restarts: a change was refused: {error}"
-            );
-            return Err(invalid(error));
+            self.stop = Some(Stop::Refused);
+            let message = refused_change_message(&self.dataset, &error.to_string());
+            tracing::error!("{message}");
+            return Err(CatalogError::InvalidOperationNoSource { message });
         }
         self.buffer(record).await
     }
 
     /// Set the commit time on the actions that keep one.
-    fn stamp(&self, actions: &mut [Action]) {
+    pub(super) fn stamp(&self, actions: &mut [Action]) {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         for action in actions {
             match action.kind.as_mut() {
@@ -505,7 +471,7 @@ impl Domain {
                 },
             )));
         }
-        if actions.is_empty() && !inner.poisoned {
+        if actions.is_empty() && inner.stop.is_none() {
             return Ok(());
         }
         inner.commit(actions).await
@@ -520,7 +486,7 @@ impl Domain {
         // before it. Inside a deferred scope it joins the record the scope's
         // `commit_pending` commits; otherwise it commits now.
         let mut inner = self.inner.take().await;
-        if !inner.poisoned
+        if inner.stop.is_none()
             && inner
                 .reader
                 .state
@@ -549,6 +515,13 @@ impl Domain {
         id: String,
         snapshot: String,
     ) -> CatalogResult<String> {
+        if !crate::metastore_layout::is_object_native_data_path(&options.base_path) {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: crate::metastore_layout::object_native_data_path_refusal(
+                    &options.table_name,
+                ),
+            });
+        }
         options.schema = arrow_tools::map_entries::conforming_schema(options.schema);
         crate::cayenne_catalog::validate_create_table_options(&options)?;
         let mut inner = self.inner.take().await;
@@ -561,7 +534,7 @@ impl Domain {
         {
             return inner.reopen_table(&options).await;
         }
-        if !options.base_path.starts_with("s3://") && !options.vortex_config.memory_mode {
+        if !crate::is_object_store_path(&options.base_path) && !options.vortex_config.memory_mode {
             let table_root = std::path::PathBuf::from(&options.base_path).join(&id);
             tokio::fs::create_dir_all(table_root.join(&snapshot)).await?;
             tokio::task::spawn_blocking(move || {
@@ -578,12 +551,14 @@ impl Domain {
         };
         let vortex_config_json =
             Some(serde_json::to_string(&options.vortex_config).map_err(invalid)?);
+        let (path, path_is_relative) =
+            state_reader::stored_path(inner.reader.anchor.as_deref(), &options.base_path);
         inner
             .commit(vec![Action::new(Kind::CreateTable(proto::CreateTable {
                 table_id: id.clone(),
                 name: options.table_name,
-                path: options.base_path,
-                path_is_relative: false,
+                path,
+                path_is_relative,
                 schema,
                 primary_key_json,
                 on_conflict_json: options.on_conflict.as_ref().map(ToString::to_string),
@@ -776,3 +751,218 @@ impl Inner {
         Ok(stored.table_id)
     }
 }
+
+/// The `transactions/` folder beside the catalog a log at `prefix` belongs to:
+/// the registry's log is `<root>/catalog`, a dataset's `<root>/datasets/<folder>`.
+fn transactions_beside(prefix: &Path, registry: bool) -> Path {
+    let mut parts: Vec<_> = prefix.parts().collect();
+    parts.pop();
+    if !registry {
+        parts.pop();
+    }
+    Path::from_iter(parts).join("transactions")
+}
+
+impl Inner {
+    /// Replay the log at `prefix` and take it over with the next lease. With
+    /// `held`, the lease this process wrote under, a log that has a newer one
+    /// belongs to another instance: it is not taken over, and the error is
+    /// [`FENCED_ON_REOPEN`].
+    async fn open(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        config: NativeCatalogConfig,
+        immediate: bool,
+        anchor: Option<Arc<str>>,
+        dataset: Arc<str>,
+        held: Option<u64>,
+    ) -> CatalogResult<(Self, OpenSummary)> {
+        let (reader, opened) = Reader::open(Arc::clone(&store), prefix.clone())
+            .await
+            .map_err(invalid)?;
+        let mut replayed = replay_state(opened)?;
+        if let Some(held) = held
+            && reader.state().head.lease > held
+        {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: FENCED_ON_REOPEN.to_string(),
+            });
+        }
+        let generation = reader
+            .state()
+            .head
+            .lease
+            .checked_add(1)
+            .ok_or_else(|| invalid("catalog lease exhausted"))?;
+        let mut writer =
+            Writer::take_over(Arc::clone(&store), prefix.clone(), config.log, generation)
+                .await
+                .map_err(invalid)?;
+        writer.set_attempt_horizon(config.attempt_horizon);
+        // Takeover fences the old writer. If it committed during replay,
+        // rebuild from that fenced head before acknowledging the open.
+        if writer.state().head.commit != reader.state().head.commit
+            || writer.state().head.incarnation != reader.state().head.incarnation
+        {
+            let (fenced, opened) = Reader::open(Arc::clone(&store), prefix.clone())
+                .await
+                .map_err(invalid)?;
+            if fenced.state().head != writer.state().head
+                || fenced.state().version != writer.state().version
+            {
+                return Err(invalid(
+                    "catalog changed during takeover; reopen the catalog",
+                ));
+            }
+            replayed = replay_state(opened)?;
+        }
+        let Replayed {
+            state,
+            floor_state,
+            since_floor,
+        } = replayed;
+        let opened = OpenSummary {
+            replayed: since_floor.len(),
+            lease: generation,
+        };
+        Ok((
+            Self {
+                reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
+                writer,
+                stop: None,
+                recovering: false,
+                dataset,
+                config,
+                floor_state,
+                since_floor,
+                staged_checkpoint: 0,
+                pending: Vec::new(),
+                immediate,
+            },
+            opened,
+        ))
+    }
+    /// Whether a background task has to bring this log back.
+    pub(super) fn needs_recovery(&self) -> bool {
+        !self.recovering
+            && matches!(
+                self.stop,
+                Some(Stop::Unresolved | Stop::Fenced { reloaded: false })
+            )
+    }
+    /// Bring this log back from [`Stop::Unresolved`] by reopening it, or reload
+    /// the committed state of a fenced one.
+    pub(super) async fn recover(&mut self) -> CatalogResult<()> {
+        match self.stop {
+            Some(Stop::Unresolved) => {
+                let held = self.writer.state().head.lease;
+                let reopened = Self::open(
+                    Arc::clone(&self.reader.store),
+                    self.reader.prefix.clone(),
+                    self.config,
+                    self.immediate,
+                    self.reader.anchor.clone(),
+                    Arc::clone(&self.dataset),
+                    Some(held),
+                )
+                .await;
+                match reopened {
+                    Ok((reopened, _)) => {
+                        // Changes buffered but never committed were never
+                        // acknowledged; the reopened state is what committed.
+                        *self = reopened;
+                        self.resolve_decided_transactions().await?;
+                        tracing::info!(
+                            "{} read its state back after an unconfirmed change and accepts changes again.",
+                            subject(&self.dataset)
+                        );
+                        Ok(())
+                    }
+                    Err(CatalogError::InvalidOperationNoSource { message })
+                        if message == FENCED_ON_REOPEN =>
+                    {
+                        self.stop = Some(Stop::Fenced { reloaded: false });
+                        tracing::info!("{}", fenced_message(&self.dataset));
+                        self.reload_committed().await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Some(Stop::Fenced { reloaded: false }) => self.reload_committed().await,
+            _ => Ok(()),
+        }
+    }
+    /// Apply the recorded outcome of every transaction across datasets the
+    /// reopened log holds prepared, as opening the catalog does: a `Resolve`
+    /// that did not land (its commit's outcome was unknown) would otherwise keep
+    /// the transaction's tables reserved until a restart. A transaction with no
+    /// recorded outcome is left to its coordinator.
+    async fn resolve_decided_transactions(&mut self) -> CatalogResult<()> {
+        let prepared: Vec<(String, Vec<String>)> = self
+            .reader
+            .state
+            .prepared
+            .iter()
+            .map(|(txn, prepared)| (txn.clone(), prepared.footprint.iter().cloned().collect()))
+            .collect();
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        let transactions = transactions_beside(&self.reader.prefix, self.dataset.is_empty());
+        for (txn, footprint) in prepared {
+            let Some(commit) =
+                super::transactions::read_decision(&self.reader.store, &transactions, &txn).await?
+            else {
+                continue;
+            };
+            self.commit_now(Action::new(Kind::Resolve(proto::Resolve {
+                txn: txn.clone(),
+                footprint,
+                commit,
+            })))
+            .await?;
+            tracing::info!(
+                "{} applied transaction {txn} across datasets ({}) after reading its state back.",
+                subject(&self.dataset),
+                if commit { "committed" } else { "aborted" }
+            );
+        }
+        Ok(())
+    }
+    /// Replace the state with the log's committed state, without taking the log
+    /// over: a fenced log's reads then show only what committed.
+    pub(super) async fn reload_committed(&mut self) -> CatalogResult<()> {
+        let (_, opened) = Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
+            .await
+            .map_err(invalid)?;
+        let replayed = replay_state(opened)?;
+        self.reader.state = replayed.state;
+        self.floor_state = replayed.floor_state;
+        self.since_floor = replayed.since_floor;
+        self.pending.clear();
+        self.stop = Some(Stop::Fenced { reloaded: true });
+        Ok(())
+    }
+    /// The error a caller gets from a log stopped for `stop`.
+    fn stopped(&self, stop: Stop) -> CatalogError {
+        let message = match stop {
+            Stop::Unresolved => format!(
+                "{} is reading its state back after a change whose outcome is unknown, so it accepts no change until that finishes; retry shortly.",
+                subject(&self.dataset)
+            ),
+            Stop::Fenced { .. } => fenced_message(&self.dataset),
+            Stop::Refused => refused_change_message(&self.dataset, "see the earlier error"),
+        };
+        CatalogError::InvalidOperationNoSource { message }
+    }
+    /// `Err` when this log accepts no change.
+    pub(super) fn ensure_accepting(&self) -> CatalogResult<()> {
+        match self.stop {
+            None => Ok(()),
+            Some(stop) => Err(self.stopped(stop)),
+        }
+    }
+}
+
+/// The refusal [`Inner::open`] returns when another instance holds a newer lease.
+const FENCED_ON_REOPEN: &str = "another instance holds the log's newer lease";

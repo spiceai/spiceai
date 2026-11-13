@@ -18,15 +18,21 @@ limitations under the License.
 
 use super::{
     Domain, invalid,
-    registry::{DROPPED, ObjectNativeCatalog, REGISTRY, created_at, delete_under},
+    registry::{
+        DROPPED, ObjectNativeCatalog, REGISTRY, TableDeletionHolds, created_at, delete_under,
+    },
     replay_state,
     slot::HeldReservation,
 };
 use crate::catalog::CatalogResult;
 use cayenne_metastore_actions::proto;
+use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, path::Path};
 use prost::Message;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 #[cfg(test)]
 mod replay_tests;
@@ -86,7 +92,7 @@ async fn read_intent(
 }
 
 /// The recorded outcome of `txn`: `Some(true)` to commit.
-async fn read_decision(
+pub(super) async fn read_decision(
     store: &Arc<dyn ObjectStore>,
     transactions: &Path,
     txn: &str,
@@ -695,5 +701,147 @@ impl ObjectNativeCatalog {
             );
         }
         Ok(())
+    }
+}
+
+/// Delete a dropped dataset's folder at `prefix`: its data through
+/// `data_store`, its log through `store`, in batched requests, and its `dropped`
+/// marker last. Returns the data files and bytes deleted.
+async fn delete_dropped_folder(
+    store: &Arc<dyn ObjectStore>,
+    data_store: &Arc<dyn ObjectStore>,
+    prefix: &Path,
+) -> CatalogResult<(u64, u64)> {
+    let marker = prefix.clone().join(DROPPED);
+    let data = prefix.clone().join("data");
+    let listed: Vec<object_store::ObjectMeta> = store
+        .list(Some(prefix))
+        .try_collect()
+        .await
+        .map_err(invalid)?;
+    let (data_objects, log_objects): (Vec<_>, Vec<_>) = listed
+        .into_iter()
+        .filter(|meta| meta.location != marker)
+        .partition(|meta| meta.location.prefix_matches(&data));
+    let sizes: HashMap<Path, u64> = data_objects
+        .iter()
+        .map(|meta| (meta.location.clone(), meta.size))
+        .collect();
+    let data_deleted = crate::dataset_storage::delete_in_batches(
+        data_store,
+        data_objects.into_iter().map(|meta| meta.location).collect(),
+    )
+    .await;
+    let log_deleted = crate::dataset_storage::delete_in_batches(
+        store,
+        log_objects.into_iter().map(|meta| meta.location).collect(),
+    )
+    .await;
+    for outcome in [&data_deleted, &log_deleted] {
+        if let Some(error) = &outcome.first_error {
+            return Err(invalid(error));
+        }
+        if outcome.failed > 0 {
+            return Err(invalid(format!(
+                "{} object(s) were neither deleted nor reported absent",
+                outcome.failed
+            )));
+        }
+    }
+    let files = u64::try_from(data_deleted.deleted.len()).unwrap_or(u64::MAX);
+    let bytes = data_deleted
+        .deleted
+        .iter()
+        .map(|path| sizes.get(path).copied().unwrap_or(0))
+        .sum();
+    match store.delete(&marker).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok((files, bytes)),
+        Err(error) => Err(invalid(error)),
+    }
+}
+
+impl ObjectNativeCatalog {
+    /// Delete a dropped dataset's folder after `dropped_grace` and once no
+    /// restore point or export holds its deletions. The marker goes last so a
+    /// later open can resume deletion after a process stops.
+    pub(super) fn reclaim_dropped_folder(
+        &self,
+        name: &str,
+        folder: &str,
+        readers: Vec<TableDeletionHolds>,
+    ) {
+        let store = Arc::clone(&self.store);
+        let data_store = self.data_store();
+        let prefix = self.datasets.clone().join(folder);
+        let grace = self.config.dropped_grace;
+        let name = name.to_string();
+        let folder = folder.to_string();
+        let ddl = Arc::clone(&self.ddl);
+        let dropping = Arc::clone(&self.dropping);
+        dropping.lock().insert(folder.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            let grace = grace.min(std::time::Duration::from_secs(1));
+            while readers.iter().any(TableDeletionHolds::held) {
+                tokio::time::sleep(grace.max(std::time::Duration::from_millis(100))).await;
+            }
+            // Under the DDL lock, so no create can take the folder while it goes.
+            let _ddl = ddl.lock().await;
+            if !dropping.lock().remove(&folder) {
+                return;
+            }
+            match delete_dropped_folder(&store, &data_store, &prefix).await {
+                Ok((files, bytes)) => {
+                    crate::provider::maintenance_metrics::track_reclaimed(
+                        &name,
+                        crate::provider::maintenance_metrics::MaintenanceOp::RetiredDirSweep,
+                        files,
+                        bytes,
+                        0,
+                    );
+                    tracing::debug!(
+                        "Deleted the {files} object(s) of dataset '{name}''s dropped acceleration in '{prefix}'"
+                    );
+                }
+                Err(error) => {
+                    crate::provider::maintenance_metrics::track_maintenance(
+                        &name,
+                        crate::provider::maintenance_metrics::MaintenanceOp::RetiredDirSweep,
+                        crate::provider::maintenance_metrics::MaintenanceOutcome::Failed,
+                    );
+                    tracing::warn!(
+                        "Failed to delete the files of dataset '{name}''s dropped acceleration under '{prefix}', so they keep using storage until Spice deletes them at a start at least an hour after the drop; no data is lost. Cause: {error}"
+                    );
+                }
+            }
+        });
+    }
+    /// Whether a transaction across datasets is prepared, and not yet resolved,
+    /// with `table_id` in its footprint: its commit would add the files its
+    /// `Prepare` names, so nothing may reclaim them meanwhile.
+    pub async fn has_prepared_transaction(&self, table_id: &str) -> bool {
+        self.for_table(table_id)
+            .unresolved()
+            .await
+            .iter()
+            .any(|(_, footprint)| footprint.iter().any(|table| table == table_id))
+    }
+    /// The time the store stamped on the head of the log that holds `table_id`
+    /// when it was last written: the store's clock as of the table's latest
+    /// commit or takeover, which the orphan sweep measures object ages against.
+    /// # Errors
+    /// Returns an error when the head cannot be read.
+    pub async fn head_store_time(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<chrono::DateTime<chrono::Utc>> {
+        let domain = self.for_table(table_id);
+        let prefix = self.log_of(&domain.folder);
+        Ok(self
+            .store
+            .head(&prefix.join("head"))
+            .await
+            .map_err(invalid)?
+            .last_modified)
     }
 }

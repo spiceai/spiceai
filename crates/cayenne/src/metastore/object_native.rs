@@ -22,6 +22,7 @@ use cayenne_metastore_actions::{Action, DatasetState, Kind, Record, proto};
 use domain::replay_state;
 use object_store_occ::headlog::{HeadLogConfig, Writer};
 use slot::StateSlot;
+use std::sync::Arc;
 
 mod catalog;
 mod domain;
@@ -30,12 +31,12 @@ mod publish;
 mod registry;
 mod slot;
 mod transactions;
-pub use registry::{ObjectNativeCatalog, dataset_log_at};
+pub use registry::{ObjectNativeCatalog, TableDeletionHolds, dataset_log_at, new_dataset_folder};
 
 /// One head log: a serial writer and its last acknowledged state. The catalog
 /// keeps one for its name registry and one per dataset. No database is used.
 struct Domain {
-    inner: StateSlot,
+    inner: Arc<StateSlot>,
     opened: OpenSummary,
     /// The dataset folder this log is in; empty for the name registry.
     folder: String,
@@ -50,7 +51,13 @@ struct OpenSummary {
 struct Inner {
     reader: DatasetStateReader,
     writer: Writer,
-    poisoned: bool,
+    /// Why this log accepts no change, when it does not.
+    stop: Option<Stop>,
+    /// A background task is resolving [`Stop::Unresolved`] or reloading after
+    /// [`Stop::Fenced`].
+    recovering: bool,
+    /// The dataset this log holds, for what it reports; empty for the registry.
+    dataset: Arc<str>,
     config: NativeCatalogConfig,
     /// The state with every record up to the last checkpoint this catalog
     /// attempted (or opened from) applied, and the records committed after it,
@@ -93,10 +100,20 @@ pub struct NativeCatalogConfig {
     /// dropped dataset's log are kept before a catalog that opens may remove
     /// them: anything newer may belong to a process still writing it.
     pub reclaim_after: std::time::Duration,
+    /// How long after a dataset is dropped the instance that dropped it waits
+    /// before it deletes the dataset's folder, once no restore point or export
+    /// holds its tables' deletions. Running scans do not extend this retention.
+    pub dropped_grace: std::time::Duration,
     /// How long the coordinator of a transaction across datasets tries to
     /// commit it before it aborts it instead, so its client gets an answer and
     /// its datasets accept other changes again.
     pub transaction_deadline: std::time::Duration,
+    /// How many times a commit whose outcome is not known is resolved and
+    /// retried before the log reopens in the background instead.
+    pub publish_attempts: u32,
+    /// The first wait between those retries, and between background reopen
+    /// attempts; each later wait doubles, up to 64 times this.
+    pub retry_delay: std::time::Duration,
 }
 
 impl Default for NativeCatalogConfig {
@@ -107,7 +124,10 @@ impl Default for NativeCatalogConfig {
             checkpoint_after_batches: 1,
             attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
             reclaim_after: std::time::Duration::from_hours(1),
+            dropped_grace: crate::metastore_layout::DATA_FILE_RETENTION,
             transaction_deadline: std::time::Duration::from_secs(60),
+            publish_attempts: 8,
+            retry_delay: std::time::Duration::from_millis(100),
         }
     }
 }
@@ -136,4 +156,99 @@ fn validate_uuid(name: &str, value: &str) -> CatalogResult<()> {
     uuid::Uuid::parse_str(value)
         .map_err(|_| invalid(format!("{name} is not a valid UUID: {value}")))?;
     Ok(())
+}
+
+/// Why a log accepts no change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// A commit's outcome is not known after its retries. Its changes are
+    /// applied here but may not be in the log, so neither changes nor reads are
+    /// served until a background task reopens the log and resumes from what
+    /// committed.
+    Unresolved,
+    /// Another instance took the log over. Writes stop; reads serve the
+    /// committed state once it is reloaded (`reloaded`).
+    Fenced { reloaded: bool },
+    /// The state refused a change this catalog made, which is a bug: the state
+    /// no longer matches the log, so the log stops until the process restarts.
+    Refused,
+}
+
+/// How a log's owner is named in what it reports.
+fn subject(dataset: &str) -> String {
+    if dataset.is_empty() {
+        "The Cayenne object-native metastore".to_string()
+    } else {
+        format!("Dataset '{dataset}' (cayenne)")
+    }
+}
+
+/// Logged when a commit's outcome is still unknown after its retries.
+pub(crate) fn unresolved_commit_message(dataset: &str, cause: &str) -> String {
+    format!(
+        "{} could not confirm whether its last change was saved, so it accepts no change, and acknowledges none to its source, until it has read its state back; it retries in the background and resumes on its own once the state location is reachable. Cause: {cause}",
+        subject(dataset)
+    )
+}
+
+/// What the writer whose commit's outcome is unknown is told: not that the
+/// change failed, but that it may have been saved.
+pub(crate) fn unknown_outcome_message(dataset: &str, cause: &str) -> String {
+    let (target, owner) = if dataset.is_empty() {
+        (
+            "the Cayenne object-native metastore".to_string(),
+            "metastore",
+        )
+    } else {
+        (format!("dataset '{dataset}' (cayenne)"), "dataset")
+    };
+    format!(
+        "The outcome of this change to {target} is unknown: Spice could not confirm whether it was saved, so check whether its rows are visible before retrying it. The {owner} accepts no change until it has read its state back, which it retries in the background. Cause: {cause}"
+    )
+}
+
+/// Logged when the state refused a change: a bug that stops the log.
+pub(crate) fn refused_change_message(dataset: &str, cause: &str) -> String {
+    format!(
+        "{} stopped accepting changes until Spice restarts, because its state refused a change, which is a bug; queries return an error until then. Restart Spice to reload the dataset from its saved state, and report the issue at https://github.com/spiceai/spiceai/issues. Cause: {cause}",
+        subject(dataset)
+    )
+}
+
+/// Logged when another instance took the log over.
+pub(crate) fn fenced_message(dataset: &str) -> String {
+    format!(
+        "{} stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again.",
+        subject(dataset)
+    )
+}
+
+#[cfg(test)]
+mod commit_outcome_message_tests {
+    use super::{
+        fenced_message, refused_change_message, unknown_outcome_message, unresolved_commit_message,
+    };
+
+    #[test]
+    fn each_stop_names_the_dataset_what_happens_and_the_fix() {
+        assert_eq!(
+            unresolved_commit_message("orders", "connection reset"),
+            "Dataset 'orders' (cayenne) could not confirm whether its last change was saved, so it accepts no change, and acknowledges none to its source, until it has read its state back; it retries in the background and resumes on its own once the state location is reachable. Cause: connection reset"
+        );
+        assert_eq!(
+            refused_change_message("orders", "guard failed"),
+            "Dataset 'orders' (cayenne) stopped accepting changes until Spice restarts, because its state refused a change, which is a bug; queries return an error until then. Restart Spice to reload the dataset from its saved state, and report the issue at https://github.com/spiceai/spiceai/issues. Cause: guard failed"
+        );
+        assert_eq!(
+            fenced_message("orders"),
+            "Dataset 'orders' (cayenne) stopped writing, because another Spice instance now writes its state; this instance keeps answering queries from the state saved so far. Restart this instance to make it the writer again."
+        );
+        assert!(
+            fenced_message("").starts_with("The Cayenne object-native metastore stopped writing")
+        );
+        assert_eq!(
+            unknown_outcome_message("orders", "connection reset"),
+            "The outcome of this change to dataset 'orders' (cayenne) is unknown: Spice could not confirm whether it was saved, so check whether its rows are visible before retrying it. The dataset accepts no change until it has read its state back, which it retries in the background. Cause: connection reset"
+        );
+    }
 }

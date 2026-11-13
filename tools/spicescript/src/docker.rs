@@ -47,11 +47,20 @@ pub struct ContainerSpec {
     pub ports: Vec<u16>,
     pub healthcheck: Option<HealthConfig>,
     /// A Docker network to join (created if missing), so containers of one
-    /// source can reach each other by name.
+    /// source can reach each other by name; or `container:<name>`, to share
+    /// that container's network namespace, which takes no network from
+    /// Docker's address pools (the container then publishes no ports; the
+    /// other one publishes them).
     pub network: Option<String>,
     /// Another name peers on `network` reach the container by. A container
     /// name can outgrow the 63 characters a host name label may hold.
     pub alias: Option<String>,
+}
+
+/// A network mode that names no network of the run's own: Docker's shared
+/// ones, or another container's namespace.
+fn is_shared_network(network: &str) -> bool {
+    matches!(network, "host" | "bridge" | "none") || network.starts_with("container:")
 }
 
 pub struct Container {
@@ -132,7 +141,7 @@ impl Container {
             .await
             .context("Docker did not answer; start Docker (or OrbStack) and retry")?;
         pull_if_missing(&docker, &spec.image).await?;
-        if let Some(network) = &spec.network
+        if let Some(network) = spec.network.as_ref().filter(|n| !is_shared_network(n))
             && docker
                 .inspect_network::<String>(network, None)
                 .await
@@ -231,7 +240,7 @@ impl Container {
                     .chain(spec.alias.clone())
                     .collect();
                 if !aliases.is_empty()
-                    && let Some(network) = spec.network.as_deref().filter(|n| *n != "host")
+                    && let Some(network) = spec.network.as_deref().filter(|n| !is_shared_network(n))
                 {
                     config.networking_config = Some(NetworkingConfig {
                         endpoints_config: HashMap::from([(
@@ -470,11 +479,7 @@ impl Container {
     /// Removes the network the container joined, once no container is on it.
     pub async fn remove_network(&self) -> Result<()> {
         // Docker's own networks are shared by everything on the host.
-        if let Some(network) = self
-            .network
-            .as_ref()
-            .filter(|n| !matches!(n.as_str(), "host" | "bridge" | "none"))
-        {
+        if let Some(network) = self.network.as_ref().filter(|n| !is_shared_network(n)) {
             self.docker
                 .remove_network(network)
                 .await

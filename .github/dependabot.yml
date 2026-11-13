@@ -44,9 +44,26 @@ updates:
           - '*'
 
   - package-ecosystem: 'docker' # See documentation for possible values
-    directory: '/' # Location of package manifests
+    # Every FROM is pinned as `image:tag@sha256:<digest>`, so these updates bring
+    # the rebuilt digest of the same tag (base-image security fixes) as well as
+    # newer tags. Dependabot only reads a literal FROM, not `FROM ${ARG}`.
+    directories:
+      - '/'
+      - '/crates/data_components/tests/hadoop_data'
+      - '/test/tpc-bench/*'
+      - '/tools/spidapter'
+      - '/tools/testoperator'
     schedule:
       interval: 'weekly'
+    ignore:
+      # The rust image tag follows the channel in rust-toolchain.toml, which a
+      # toolchain upgrade moves deliberately.
+      - dependency-name: 'rust'
+        update-types: ['version-update:semver-major', 'version-update:semver-minor']
+      # Dockerfile-cuda-release ships a spiced built against the CUDA 12 toolkit,
+      # which links the CUDA 12 runtime libraries a CUDA 13 image does not carry.
+      - dependency-name: 'nvidia/cuda'
+        update-types: ['version-update:semver-major']
     labels:
       - 'docker'
       - 'kind/dependencies'

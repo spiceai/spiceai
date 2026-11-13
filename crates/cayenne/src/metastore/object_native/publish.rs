@@ -16,9 +16,13 @@ limitations under the License.
 
 //! Buffered changes and publication.
 
-use super::{super::actions, Inner, Pending, invalid};
+use super::{
+    super::{actions, state_reader},
+    Inner, Pending, Stop, fenced_message, invalid, subject, unknown_outcome_message,
+    unresolved_commit_message,
+};
 use crate::{
-    catalog::{CatalogResult, SnapshotSequenceCommit},
+    catalog::{CatalogError, CatalogResult, SnapshotSequenceCommit},
     metadata::{DeleteFile, InlinedData},
 };
 use cayenne_metastore_actions::{Action, Kind, Record, proto};
@@ -109,22 +113,14 @@ impl Inner {
     /// Commit every buffered change as one record. Nothing that depends on a
     /// buffered change may be acknowledged before this returns `Ok`.
     pub(super) async fn flush(&mut self) -> CatalogResult<()> {
-        if self.poisoned {
-            return Err(invalid(
-                "catalog requires reopening after an uncertain or fenced commit",
-            ));
-        }
+        self.ensure_accepting()?;
         let buffers = std::mem::take(&mut self.pending);
         self.publish_buffers(buffers).await
     }
 
     /// Commit `buffers`, oldest first, as one record.
     async fn publish_buffers(&mut self, buffers: Vec<Pending>) -> CatalogResult<()> {
-        if self.poisoned {
-            return Err(invalid(
-                "catalog requires reopening after an uncertain or fenced commit",
-            ));
-        }
+        self.ensure_accepting()?;
         if buffers.is_empty() {
             return Ok(());
         }
@@ -135,18 +131,26 @@ impl Inner {
                 .collect(),
         };
         // Buffered changes are already applied on this node. If this record does
-        // not commit, they must never be acknowledged: the catalog refuses all
-        // further work until it is reopened from what did commit.
-        self.poisoned = true;
-        let attempt = self
+        // not commit, they must never be acknowledged: the log refuses all
+        // further work until it is reopened from what did commit. Set before the
+        // first await, so a cancelled caller leaves the log to be resolved too.
+        self.stop = Some(Stop::Unresolved);
+        let attempt = match self
             .writer
             .prepare_group(vec![record.encode_to_vec().into()])
             .await
-            .map_err(invalid)?;
+        {
+            Ok(attempt) => attempt,
+            Err(error) => return Err(self.unresolved(&error.to_string())),
+        };
         // Refuse subsequent mutations unless this exact attempt is accepted.
-        match self.publish(&attempt).await? {
+        let outcome = match self.publish(&attempt).await {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(self.unresolved(&error.to_string())),
+        };
+        match outcome {
             Outcome::Accepted { commit } => {
-                self.poisoned = false;
+                self.stop = None;
                 self.since_floor.push((commit, vec![record]));
                 // The commit is acknowledged whatever happens to the checkpoint: a
                 // failed one leaves the batch index to grow until a later one lands.
@@ -157,13 +161,25 @@ impl Inner {
                 }
                 Ok(())
             }
-            outcome => {
-                tracing::error!(
-                    "Cayenne object-native metastore stopped accepting changes, so its datasets stop updating until spiced restarts: the commit was {outcome:?}"
-                );
-                Err(invalid(format!(
-                    "catalog publication was not accepted: {outcome:?}; reopen before retrying"
-                )))
+            Outcome::Unresolved => Err(self.unresolved("the outcome was unresolved")),
+            // Another instance owns the log: normal when one takes over from
+            // another, so it is reported, not raised as an error. Its reads keep
+            // working once the committed state is reloaded.
+            Outcome::Fenced { .. } | Outcome::Rejected => {
+                tracing::info!("{}", fenced_message(&self.dataset));
+                self.stop = Some(Stop::Fenced { reloaded: false });
+                if let Err(error) = self.reload_committed().await {
+                    tracing::debug!(
+                        "{} could not reload its committed state yet, so its queries wait for a background retry: {error}",
+                        subject(&self.dataset)
+                    );
+                }
+                Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "{} The change was not saved (the commit was {outcome:?}).",
+                        fenced_message(&self.dataset)
+                    ),
+                })
             }
         }
     }
@@ -172,11 +188,7 @@ impl Inner {
     /// after every buffered change. A record whose guard fails is refused and
     /// leaves the state as it was.
     pub(super) async fn commit_now(&mut self, action: Action) -> CatalogResult<()> {
-        if self.poisoned {
-            return Err(invalid(
-                "catalog requires reopening after an uncertain or fenced commit",
-            ));
-        }
+        self.ensure_accepting()?;
         self.flush().await?;
         let record = Record {
             actions: vec![action],
@@ -196,6 +208,22 @@ impl Inner {
     ) -> CatalogResult<Vec<Action>> {
         let mut batch = Vec::new();
         for publication in publications {
+            if !publication.files.is_empty() {
+                if publication.files.iter().any(|file| {
+                    file.table_id != publication.table_id
+                        || file.snapshot_id != publication.snapshot_id
+                }) {
+                    return Err(invalid(
+                        "a published file does not belong to the published snapshot",
+                    ));
+                }
+                batch.push(actions::add_files(
+                    publication.table_id,
+                    publication.snapshot_id,
+                    publication.files,
+                    true,
+                ));
+            }
             batch.extend(self.conflict_batch(
                 publication.delete_files.to_vec(),
                 publication.table_id,
@@ -246,17 +274,19 @@ impl Inner {
         &mut self,
         attempt: &object_store_occ::headlog::PreparedAttempt,
     ) -> CatalogResult<Outcome> {
-        const ATTEMPTS: u32 = 8;
+        let attempts = self.config.publish_attempts;
+        let base = self.config.retry_delay;
         let mut outcome = self.writer.commit(attempt).await;
-        for retry in 1..=ATTEMPTS {
+        for retry in 1..=attempts {
             let error = match outcome {
                 Ok(Outcome::Unresolved) => "the outcome was unresolved".to_string(),
                 Ok(final_outcome) => return Ok(final_outcome),
                 Err(error) => error.to_string(),
             };
-            let delay = std::time::Duration::from_millis(100 * 2_u64.pow(retry.min(6)));
+            let delay = base.saturating_mul(2_u32.pow(retry.min(6)));
             tracing::warn!(
-                "Cayenne object-native metastore could not confirm a commit ({error}), so it is checking whether the commit landed and retrying it in {} ms (attempt {retry} of {ATTEMPTS})",
+                "{} could not confirm a commit ({error}), so it is checking whether the commit landed and retrying it in {} ms (attempt {retry} of {attempts})",
+                subject(&self.dataset),
                 delay.as_millis()
             );
             tokio::time::sleep(delay).await;
@@ -313,7 +343,20 @@ impl Inner {
         let mut first_id = None;
         let mut batch = Vec::new();
         let mut seen = std::collections::BTreeMap::new();
-        for file in files {
+        // Compared and recorded as the state keeps them.
+        let files: Vec<DeleteFile> = files
+            .iter()
+            .map(|file| {
+                let (path, path_is_relative) =
+                    state_reader::stored_path(self.reader.anchor.as_deref(), &file.path);
+                DeleteFile {
+                    path,
+                    path_is_relative,
+                    ..file.clone()
+                }
+            })
+            .collect();
+        for file in &files {
             let table = self.table(&file.table_id)?;
             let existing = table
                 .delete_files
@@ -390,5 +433,28 @@ impl Inner {
             ));
         }
         Ok(batch)
+    }
+    /// Whether a change to `table_id` is applied here but not yet committed.
+    pub(super) fn has_uncommitted(&self, table_id: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|buffer| buffer.tables.contains(table_id) || buffer.tables.contains(""))
+    }
+    /// Whether an unresolved transaction across datasets reserves `table_id`.
+    pub(super) fn reserved(&self, table_id: &str) -> bool {
+        self.reader
+            .state
+            .prepared
+            .values()
+            .any(|prepared| prepared.footprint.contains(table_id))
+    }
+    /// Stop the log for a commit whose outcome is unknown, and the error its
+    /// caller gets. The lease's drop starts the background reopen.
+    fn unresolved(&mut self, cause: &str) -> CatalogError {
+        self.stop = Some(Stop::Unresolved);
+        tracing::warn!("{}", unresolved_commit_message(&self.dataset, cause));
+        CatalogError::InvalidOperationNoSource {
+            message: unknown_outcome_message(&self.dataset, cause),
+        }
     }
 }

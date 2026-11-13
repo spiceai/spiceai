@@ -345,15 +345,17 @@ impl MetadataCatalog for Domain {
         let mut inner = self.inner.take().await;
         let (_, mut batch) =
             inner.delete_batch_after_removal(&delete_files, &replaced_delete_file_ids)?;
-        batch.insert(
-            0,
-            actions::remove_delete_files(
-                table_id,
-                proto::Select::Listed,
-                &replaced_delete_file_ids,
-                None,
-            ),
-        );
+        if !replaced_delete_file_ids.is_empty() {
+            batch.insert(
+                0,
+                actions::remove_delete_files(
+                    table_id,
+                    proto::Select::Listed,
+                    &replaced_delete_file_ids,
+                    None,
+                ),
+            );
+        }
         batch.extend(rewrite_inline(
             table_id,
             &updated_data,
@@ -621,11 +623,13 @@ impl MetadataCatalog for Domain {
         {
             return Ok(false);
         }
+        // The inputs' files leave the live set and are retired, but keep their
+        // manifest rows: a scan that captured them as live before the in-memory
+        // swap still reads them from those rows. The retirement sweep forgets
+        // the rows together with the files, once no scan holds them.
         inner
             .commit(vec![
                 actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
-                actions::remove_files(table_id, proto::Select::Listed, old_snapshot_ids),
-                actions::remove_file_stats(table_id, proto::Select::Listed, old_snapshot_ids),
                 actions::set_group(table_id, new_snapshot_id, new_sequence_number),
             ])
             .await?;
@@ -1268,5 +1272,82 @@ impl MetadataCatalog for Domain {
         Err(CatalogError::NotImplemented {
             function: "object-native: import_dataset_slice".to_string(),
         })
+    }
+    fn keeps_retirement_record(&self) -> bool {
+        true
+    }
+    async fn retired_files(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+        let inner = self.inner.take().await;
+        // Only committed state may license a delete: a buffered change is applied
+        // here but may never commit, and a stopped log's last commit may not
+        // have landed, or a fenced one belongs to another writer.
+        if inner.stop.is_some() || inner.has_uncommitted(table_id) || inner.reserved(table_id) {
+            return Ok(None);
+        }
+        Ok(Some(
+            inner.table(table_id)?.retired.iter().cloned().collect(),
+        ))
+    }
+    async fn committed_file_keys(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<std::collections::BTreeSet<String>>> {
+        let inner = self.inner.take().await;
+        if inner.stop.is_some() || inner.has_uncommitted(table_id) || inner.reserved(table_id) {
+            return Ok(None);
+        }
+        let table = inner.table(table_id)?;
+        let mut keys = table.live_keys();
+        keys.extend(table.retired.iter().cloned());
+        Ok(Some(keys))
+    }
+    async fn forget_retired_files(&self, table_id: &str, keys: &[String]) -> CatalogResult<bool> {
+        if keys.is_empty() {
+            return Ok(true);
+        }
+        let mut inner = self.inner.take().await;
+        // A reserved table refuses every change until its transaction resolves,
+        // and a refused record stops the whole log; the next sweep forgets them.
+        if inner.reserved(table_id) {
+            return Ok(false);
+        }
+        let retired = &inner.table(table_id)?.retired;
+        let keys: Vec<String> = keys
+            .iter()
+            .filter(|key| retired.contains(*key))
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return Ok(true);
+        }
+        // The forget drops the manifest rows and statistics of its keys too.
+        inner
+            .commit(vec![actions::forget_retired(table_id, &keys)])
+            .await?;
+        Ok(true)
+    }
+    async fn upsert_snapshot_files(&self, files: &[SnapshotFile]) -> CatalogResult<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut groups: Vec<(&str, &str, Vec<SnapshotFile>)> = Vec::new();
+        for file in files {
+            match groups.iter_mut().find(|(table, snapshot, _)| {
+                *table == file.table_id && *snapshot == file.snapshot_id
+            }) {
+                Some((_, _, rows)) => rows.push(file.clone()),
+                None => groups.push((&file.table_id, &file.snapshot_id, vec![file.clone()])),
+            }
+        }
+        self.inner
+            .take()
+            .await
+            .commit(
+                groups
+                    .iter()
+                    .map(|(table, snapshot, rows)| actions::add_files(table, snapshot, rows, true))
+                    .collect(),
+            )
+            .await
     }
 }

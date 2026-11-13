@@ -437,6 +437,9 @@ lint-rust:
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
 	$(PYTHON) scripts/test_check_module_reachability.py
 	$(PYTHON) scripts/check_module_reachability.py
+	## Cayenne data-path guard (fast, no compile): data files go through each dataset's ObjectStore, so no new std::fs/tokio::fs call may enter crates/cayenne/src/provider
+	$(PYTHON) scripts/test_check_cayenne_data_path_fs.py
+	$(PYTHON) scripts/check_cayenne_data_path_fs.py
 	## Fork-pin guard (fast, no compile): a moved fork pin must come with a re-audit of that fork's patches. See docs/dev/fork_patches.md
 	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
 	$(PYTHON) scripts/test_check_fork_patches.py

@@ -31,6 +31,7 @@ limitations under the License.
 //!   - `row_key: Binary` - Primary key bytes (via Arrow's `RowConverter`)
 //!   - `deleted_at: Int64` - Deletion timestamp (microseconds)
 
+use object_store::ObjectStoreExt as _;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,7 @@ use chrono::Utc;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use crate::dataset_storage::DatasetStorage;
 use crate::metadata::{DeleteFile, DeletionType, TableMetadata};
 use crate::provider::utils::bytes_key;
 use crate::provider::{Error, Result};
@@ -58,7 +60,7 @@ struct KeyDeletionReadState {
 }
 
 /// A key-based deletion-vector whose catalog row exists but whose `.arrow` file is
-/// missing on disk. Reported (instead of erroring) by [`detect_deletion_type_and_read`]
+/// missing on disk. Reported (instead of erroring) by [`read_deletion_vectors`]
 /// so the async loader can discriminate a self-healable orphan (the file-first
 /// orphaned-DV sweep unlinked the file but a crash interrupted the row removal)
 /// from genuine data loss, by comparing `sequence_number` against the
@@ -159,6 +161,10 @@ pub struct DeletionVectorWriteSpec {
     /// The sequence the file's deletes carry in the catalog, when it differs
     /// from the writer's table metadata (see [`Self::with_sequence_number`]).
     sequence_number: Option<i64>,
+    /// Each key's own delete sequence, index-aligned with a key-based spec's keys,
+    /// for a file that holds several sequences (see
+    /// [`Self::new_key_based_with_sequences`]).
+    row_sequences: Option<Vec<i64>>,
 }
 
 impl DeletionVectorWriteSpec {
@@ -181,6 +187,7 @@ impl DeletionVectorWriteSpec {
                 pre_sorted: false,
             },
             sequence_number: None,
+            row_sequences: None,
         }
     }
 
@@ -196,6 +203,7 @@ impl DeletionVectorWriteSpec {
                 pre_sorted: true,
             },
             sequence_number: None,
+            row_sequences: None,
         }
     }
 
@@ -205,6 +213,23 @@ impl DeletionVectorWriteSpec {
         Self {
             identifiers: DeletionIdentifier::KeyBased(row_keys),
             sequence_number: None,
+            row_sequences: None,
+        }
+    }
+
+    /// Create a key-based specification whose keys carry delete sequences of their
+    /// own, so the deletes of many sequences go into one file. The file is recorded
+    /// at the highest of them, and a reader takes each key's own sequence from the
+    /// file rather than the recorded one. A key listed more than once keeps its
+    /// highest sequence.
+    #[must_use]
+    pub fn new_key_based_with_sequences(keys: Vec<(Box<[u8]>, i64)>) -> Self {
+        let max_sequence = keys.iter().map(|(_, sequence)| *sequence).max();
+        let (row_keys, row_sequences): (Vec<Box<[u8]>>, Vec<i64>) = keys.into_iter().unzip();
+        Self {
+            identifiers: DeletionIdentifier::KeyBased(row_keys),
+            sequence_number: max_sequence,
+            row_sequences: Some(row_sequences),
         }
     }
 
@@ -253,10 +278,35 @@ type WrittenDeletionFile = (
     Option<i64>,
 );
 
+/// A store and an object path in it.
+type StoreLocation = (Arc<dyn object_store::ObjectStore>, object_store::path::Path);
+
+/// The dataset store and object path of a deletion-vector file addressed by
+/// `path`; `None` for a table with no store of its own (its data path is a local
+/// directory), whose vectors are read and written as files.
+///
+/// # Errors
+///
+/// A URL outside `storage` is an error: no store of this dataset holds it.
+fn deletion_vector_location(
+    storage: Option<&DatasetStorage>,
+    path: &str,
+) -> std::result::Result<Option<StoreLocation>, object_store::Error> {
+    match storage {
+        Some(storage) => Ok(storage
+            .resolve(path)?
+            .map(|location| (Arc::clone(storage.store()), location))),
+        None => Ok(None),
+    }
+}
+
 /// Writes deletion-vector files for a specific Cayenne table snapshot.
 #[derive(Debug)]
 pub struct DeletionVectorWriter<'a> {
     table: &'a TableMetadata,
+    /// The table's storage when its data path is an object-store URL; the
+    /// vectors are then written through its store.
+    storage: Option<Arc<DatasetStorage>>,
     #[cfg(test)]
     test_hook: Option<Arc<TestWriterHook>>,
 }
@@ -278,13 +328,15 @@ impl Drop for PendingWriteCompletion {
 
 struct UncommittedDeleteFilesGuard {
     paths: Vec<PathBuf>,
+    storage: Option<Arc<DatasetStorage>>,
     pending: Arc<PendingBatchWrites>,
     armed: bool,
 }
 
 impl UncommittedDeleteFilesGuard {
-    fn new(paths: Vec<PathBuf>) -> Self {
+    fn new(paths: Vec<PathBuf>, storage: Option<Arc<DatasetStorage>>) -> Self {
         Self {
+            storage,
             pending: Arc::new(PendingBatchWrites {
                 remaining: AtomicUsize::new(paths.len()),
                 completed: tokio::sync::Notify::new(),
@@ -309,6 +361,7 @@ impl Drop for UncommittedDeleteFilesGuard {
             return;
         }
         let paths = std::mem::take(&mut self.paths);
+        let storage = self.storage.take();
         let pending = Arc::clone(&self.pending);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
@@ -318,14 +371,24 @@ impl Drop for UncommittedDeleteFilesGuard {
                         notified.await;
                     }
                 }
-                cleanup_uncommitted_delete_paths(&paths).await;
+                cleanup_uncommitted_delete_paths(&paths, storage.as_deref()).await;
             });
         } else {
             std::thread::spawn(move || {
                 while pending.remaining.load(Ordering::Acquire) != 0 {
                     std::thread::yield_now();
                 }
+                if let Some(record) = storage.as_deref().and_then(DatasetStorage::writer_record) {
+                    record.release_deletion_files(
+                        paths.iter().filter_map(|path| deletion_file_name(path)),
+                    );
+                }
                 for path in paths {
+                    // Object-store files are removed through the store, never as
+                    // a local path; without a runtime they are left for the sweep.
+                    if crate::is_object_store_path(&path.to_string_lossy()) {
+                        continue;
+                    }
                     match std::fs::remove_file(path) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -341,11 +404,13 @@ impl Drop for UncommittedDeleteFilesGuard {
 }
 
 impl<'a> DeletionVectorWriter<'a> {
-    /// Create a new writer bound to the provided table metadata.
+    /// Create a new writer bound to the provided table metadata, writing through
+    /// `storage` when the table's data path is an object-store URL.
     #[must_use]
-    pub fn new(table: &'a TableMetadata) -> Self {
+    pub fn new(table: &'a TableMetadata, storage: Option<&Arc<DatasetStorage>>) -> Self {
         Self {
             table,
+            storage: storage.map(Arc::clone),
             #[cfg(test)]
             test_hook: None,
         }
@@ -355,6 +420,7 @@ impl<'a> DeletionVectorWriter<'a> {
     fn new_with_test_hook(table: &'a TableMetadata, test_hook: Arc<TestWriterHook>) -> Self {
         Self {
             table,
+            storage: None,
             test_hook: Some(test_hook),
         }
     }
@@ -406,14 +472,19 @@ impl<'a> DeletionVectorWriter<'a> {
         //
         // The sync is one-time per snapshot (first deletion vector
         // written to it). Subsequent deletions reuse the directory.
-        let sync_snapshot_parent = match tokio::fs::create_dir(&deletion_dir).await {
-            Ok(()) => true,
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                tokio::fs::create_dir_all(&deletion_dir).await?;
-                true
+        let object_store_table = self.storage.is_some();
+        let sync_snapshot_parent = if object_store_table {
+            false
+        } else {
+            match tokio::fs::create_dir(&deletion_dir).await {
+                Ok(()) => true,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::fs::create_dir_all(&deletion_dir).await?;
+                    true
+                }
+                Err(source) => return Err(Error::IoError { source }),
             }
-            Err(source) => return Err(Error::IoError { source }),
         };
         if sync_snapshot_parent {
             let table = self.table.path.clone();
@@ -443,64 +514,96 @@ impl<'a> DeletionVectorWriter<'a> {
         let batch_paths = (0..specs.len())
             .map(|_| Self::deletion_file_path(&deletion_dir))
             .collect::<Vec<_>>();
-        let mut cleanup_guard = UncommittedDeleteFilesGuard::new(batch_paths.clone());
+        // A dataset in the object-native location holds the files in its writer
+        // record before any is uploaded, so the orphan sweep never takes one
+        // whose write or commit is still in flight.
+        if let Some(record) = self
+            .storage
+            .as_deref()
+            .and_then(DatasetStorage::writer_record)
+        {
+            record.hold_deletion_files(
+                batch_paths
+                    .iter()
+                    .filter_map(|path| deletion_file_name(path)),
+            );
+        }
+        let mut cleanup_guard =
+            UncommittedDeleteFilesGuard::new(batch_paths.clone(), self.storage.clone());
         let write_futures = specs
             .into_iter()
             .zip(batch_paths.iter().cloned())
             .map(|(spec, file_path)| {
                 let mut completion = Some(cleanup_guard.completion());
                 let sequence_number = spec.sequence_number;
+                let row_sequences = spec.row_sequences;
                 let table_name = self.table.table_name.clone();
+                let storage = self.storage.clone();
                 #[cfg(test)]
                 let test_hook = self.test_hook.as_ref().map(Arc::clone);
                 async move {
-                    let (batch, schema, count, identifiers, source_data_file_path) =
-                        match spec.identifiers {
-                            DeletionIdentifier::PositionBased {
-                                file_path: source_file,
-                                mut row_ids,
-                                pre_sorted,
-                            } => {
-                                if pre_sorted {
-                                    debug_assert!(
-                                        row_ids.windows(2).all(|w| w[0] < w[1]),
-                                        "pre_sorted=true but row_ids is not strictly increasing",
-                                    );
-                                } else {
-                                    row_ids.sort_unstable();
-                                    row_ids.dedup();
+                    let (batch, schema, count, identifiers, source_data_file_path) = match spec
+                        .identifiers
+                    {
+                        DeletionIdentifier::PositionBased {
+                            file_path: source_file,
+                            mut row_ids,
+                            pre_sorted,
+                        } => {
+                            if pre_sorted {
+                                debug_assert!(
+                                    row_ids.windows(2).all(|w| w[0] < w[1]),
+                                    "pre_sorted=true but row_ids is not strictly increasing",
+                                );
+                            } else {
+                                row_ids.sort_unstable();
+                                row_ids.dedup();
+                            }
+                            let count = row_ids.len();
+                            let schema = position_based_deletion_schema();
+                            let batch = build_position_based_batch(&schema, &row_ids)?;
+                            (
+                                batch,
+                                schema,
+                                count,
+                                DeletionIdentifier::PositionBased {
+                                    file_path: source_file.clone(),
+                                    row_ids,
+                                    pre_sorted,
+                                },
+                                Some(source_file),
+                            )
+                        }
+                        DeletionIdentifier::KeyBased(row_keys) => {
+                            let (row_keys, schema, batch) = match row_sequences {
+                                None => {
+                                    // Sort and deduplicate keys
+                                    let mut row_keys = row_keys;
+                                    row_keys.sort();
+                                    row_keys.dedup();
+                                    let schema = key_based_deletion_schema();
+                                    let batch = build_key_based_batch(&schema, &row_keys)?;
+                                    (row_keys, schema, batch)
                                 }
-                                let count = row_ids.len();
-                                let schema = position_based_deletion_schema();
-                                let batch = build_position_based_batch(&schema, &row_ids)?;
-                                (
-                                    batch,
-                                    schema,
-                                    count,
-                                    DeletionIdentifier::PositionBased {
-                                        file_path: source_file.clone(),
-                                        row_ids,
-                                        pre_sorted,
-                                    },
-                                    Some(source_file),
-                                )
-                            }
-                            DeletionIdentifier::KeyBased(mut row_keys) => {
-                                // Sort and deduplicate keys
-                                row_keys.sort();
-                                row_keys.dedup();
-                                let count = row_keys.len();
-                                let schema = key_based_deletion_schema();
-                                let batch = build_key_based_batch(&schema, &row_keys)?;
-                                (
-                                    batch,
-                                    schema,
-                                    count,
-                                    DeletionIdentifier::KeyBased(row_keys),
-                                    None,
-                                )
-                            }
-                        };
+                                Some(row_sequences) => {
+                                    let keyed =
+                                        sorted_keys_with_max_sequence(row_keys, row_sequences)?;
+                                    let schema = sequenced_key_based_deletion_schema();
+                                    let batch = build_sequenced_key_based_batch(&schema, &keyed)?;
+                                    let row_keys = keyed.into_iter().map(|(key, _)| key).collect();
+                                    (row_keys, schema, batch)
+                                }
+                            };
+                            let count = row_keys.len();
+                            (
+                                batch,
+                                schema,
+                                count,
+                                DeletionIdentifier::KeyBased(row_keys),
+                                None,
+                            )
+                        }
+                    };
 
                     // From this point the completion token is transferred into the
                     // detached blocking writer. Any earlier `?` drops it here and
@@ -510,6 +613,7 @@ impl<'a> DeletionVectorWriter<'a> {
                     #[cfg(test)]
                     let file_size_bytes = write_deletion_file(
                         &file_path,
+                        storage.as_deref(),
                         Arc::clone(&schema),
                         batch,
                         &table_name,
@@ -520,6 +624,7 @@ impl<'a> DeletionVectorWriter<'a> {
                     #[cfg(not(test))]
                     let file_size_bytes = write_deletion_file(
                         &file_path,
+                        storage.as_deref(),
                         Arc::clone(&schema),
                         batch,
                         &table_name,
@@ -555,7 +660,7 @@ impl<'a> DeletionVectorWriter<'a> {
                     // from the failed logical batch before returning; otherwise a
                     // later failure or task cancellation at a caller could leak
                     // unreferenced deletion vectors indefinitely.
-                    cleanup_uncommitted_delete_paths(&batch_paths).await;
+                    cleanup_uncommitted_delete_paths(&batch_paths, self.storage.as_deref()).await;
                     cleanup_guard.disarm();
                     return Err(error);
                 }
@@ -566,7 +671,7 @@ impl<'a> DeletionVectorWriter<'a> {
         // flushes ALL of its pending entries, so syncing once after every file
         // exists provides the same dirent durability at 1/N the barrier count.
         // Must complete before the catalog records any of the paths.
-        {
+        if !object_store_table {
             let table = self.table.path.clone();
             let deletion_dir_for_sync = deletion_dir.clone();
             tokio::task::spawn_blocking(move || {
@@ -614,11 +719,18 @@ impl<'a> DeletionVectorWriter<'a> {
         Ok(results)
     }
 
+    /// Where new deletion vectors go: `<table path>/<table id>/deletions/` for a
+    /// table whose data is in the object-native location, which keeps its files
+    /// flat with no folder per snapshot, and the current snapshot's
+    /// `deletions/` folder otherwise.
     fn table_snapshot_deletion_dir(&self) -> PathBuf {
         let base = Path::new(&self.table.path);
-        let snapshot_path = base.join(&self.table.current_snapshot_id);
-
-        snapshot_path.join(DELETION_DIR_NAME)
+        let parent = if crate::metastore_layout::is_object_native_data_path(&self.table.path) {
+            base.join(&self.table.table_id)
+        } else {
+            base.join(&self.table.current_snapshot_id)
+        };
+        parent.join(DELETION_DIR_NAME)
     }
 
     fn deletion_file_path(deletion_dir: &Path) -> PathBuf {
@@ -631,61 +743,57 @@ impl<'a> DeletionVectorWriter<'a> {
 // Reader
 // ============================================================================
 
-/// Read deletion vectors from files, detecting whether each file is position-based or key-based
-/// from its schema, and return separate collections for each type.
-///
-/// For position-based deletions, returns a map of source data file path to the `RoaringBitmap`
-/// of file-local row positions. This enables correct deletion filtering regardless of file
-/// scan order.
-///
-/// # Blocking I/O Warning
-///
-/// This function performs **blocking file system I/O** operations and must be called
-/// from within `tokio::task::spawn_blocking`.
-///
-/// # Returns
-///
-/// A tuple of `(per_file_row_ids, key_based_row_keys_with_sequence, reinserted_row_keys)`.
-/// - `per_file_row_ids`: Map of source data file path -> `RoaringBitmap` of deleted row positions
-/// - `key_based_row_keys_with_sequence`: Map of PK bytes -> max delete sequence number
-/// - `reinserted_row_keys`: Map of PK bytes -> max reinsert sequence number derived from delete-file metadata
-///
-/// # Errors
-///
-/// Returns an error if any deletion vector file cannot be read or parsed.
-#[expect(clippy::type_complexity)]
-pub fn detect_deletion_type_and_read(
-    delete_files: Vec<DeleteFile>,
-) -> datafusion_common::Result<(
+/// What a deletion-vector read returns: deleted positions per data file, deleted
+/// keys with their delete sequence, re-inserted keys with theirs, and the key
+/// vectors whose file is missing.
+pub type DeletionVectorReadResult = (
     HashMap<String, RoaringBitmap>,
     HashMap<Box<[u8]>, i64>,
     HashMap<Box<[u8]>, i64>,
     Vec<MissingKeyDeletionVector>,
-)> {
-    let mut per_file_row_ids: HashMap<String, RoaringBitmap> = HashMap::new();
+);
+
+trait ReadSeek: std::io::Read + std::io::Seek + Send {}
+impl<T: std::io::Read + std::io::Seek + Send> ReadSeek for T {}
+
+/// Most deletion-vector objects [`read_deletion_vectors`] fetches at once from an
+/// object store. A GET's cost there is its round trip, not its bytes, so opening a
+/// table with tens of thousands of vectors takes about `count / this` round trips
+/// rather than `count`. It also bounds memory: at most twice this many fetched
+/// objects wait to be decoded at any time.
+const DELETION_VECTOR_READ_CONCURRENCY_REMOTE: usize = 64;
+
+/// [`DELETION_VECTOR_READ_CONCURRENCY_REMOTE`] for a dataset store on local disk,
+/// where a read costs a page-cache copy rather than a round trip.
+const DELETION_VECTOR_READ_CONCURRENCY_LOCAL: usize = 8;
+
+/// The deletion-vector state read so far, merged file by file.
+#[derive(Default)]
+struct DeletionVectorReadState {
+    per_file_row_ids: HashMap<String, RoaringBitmap>,
     // Key-based DV rows whose `.arrow` file is missing — reported, not errored, so
     // the async loader can self-heal provable orphans (see `MissingKeyDeletionVector`).
-    let mut missing_key_dvs: Vec<MissingKeyDeletionVector> = Vec::new();
+    missing_key_dvs: Vec<MissingKeyDeletionVector>,
     // Metadata-only publish: keep delete and reinsert sequence state in one map
     // while reading key-based vectors. This avoids cloning every key in the hot
     // read loop just to update a second map; the legacy return shape is derived
     // once after all files are scanned.
-    let mut key_row_state: HashMap<Box<[u8]>, KeyDeletionReadState> = HashMap::new();
-    let file_count = delete_files.len();
+    key_row_state: HashMap<Box<[u8]>, KeyDeletionReadState>,
+}
 
-    tracing::debug!(
-        "detect_deletion_type_and_read: processing {} delete files",
-        file_count
-    );
-
-    for delete_file in delete_files {
+impl DeletionVectorReadState {
+    /// Merge one vector, given its catalog row and the result of opening its file.
+    fn add(
+        &mut self,
+        delete_file: &DeleteFile,
+        opened: std::io::Result<Box<dyn ReadSeek>>,
+    ) -> datafusion_common::Result<()> {
         let path = std::path::Path::new(&delete_file.path);
-        tracing::debug!("detect_deletion_type_and_read: reading file {:?}", path);
-
-        let file = match std::fs::File::open(path) {
+        let file = match opened {
             Ok(file) => file,
             // A missing KEY-based DV file is tolerated and reported: the file-first
-            // orphaned-DV sweep unlinks the file before removing its catalog row, so
+            // orphaned-DV sweep of a dataset outside the object-native location
+            // unlinks the file before removing its catalog row, so
             // a crash in that window leaves a discoverable dangling row. The async
             // loader decides self-heal vs error against the floor. Position-based DVs
             // (source_data_file_path = Some) are tied to a live data file, so a
@@ -694,12 +802,12 @@ pub fn detect_deletion_type_and_read(
                 if e.kind() == std::io::ErrorKind::NotFound
                     && delete_file.source_data_file_path.is_none() =>
             {
-                missing_key_dvs.push(MissingKeyDeletionVector {
+                self.missing_key_dvs.push(MissingKeyDeletionVector {
                     delete_file_id: delete_file.delete_file_id.clone(),
                     path: delete_file.path.clone(),
                     sequence_number: delete_file.sequence_number,
                 });
-                continue;
+                return Ok(());
             }
             Err(e) => {
                 return Err(datafusion_common::DataFusionError::Execution(format!(
@@ -721,6 +829,13 @@ pub fn detect_deletion_type_and_read(
         let schema = reader.schema();
         let first_field = schema.field(0);
         let is_key_based = matches!(first_field.data_type(), DataType::Binary);
+        // A key vector that holds several delete sequences carries each row's own
+        // (see `KEY_DELETE_SEQUENCE_COLUMN`); otherwise every row has the file's.
+        let row_sequence_column = if is_key_based {
+            schema.index_of(KEY_DELETE_SEQUENCE_COLUMN).ok()
+        } else {
+            None
+        };
 
         // Get the sequence number for this delete file (for sequence-based ordering)
         let file_sequence = delete_file.sequence_number;
@@ -747,15 +862,45 @@ pub fn detect_deletion_type_and_read(
                             "Expected BinaryArray for row_key column".to_string(),
                         )
                     })?;
+                let row_sequences = match row_sequence_column {
+                    Some(index) => Some(
+                        batch
+                            .column(index)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or_else(|| {
+                                datafusion_common::DataFusionError::Execution(format!(
+                                    "Deletion vector file {} has a non-Int64 {KEY_DELETE_SEQUENCE_COLUMN} column",
+                                    path.display()
+                                ))
+                            })?,
+                    ),
+                    None => None,
+                };
 
                 for i in 0..row_key_array.len() {
                     if !row_key_array.is_null(i) {
+                        let row_sequence = match row_sequences {
+                            Some(sequences) if sequences.is_valid(i) => sequences.value(i),
+                            Some(_) => {
+                                return Err(datafusion_common::DataFusionError::Execution(
+                                    format!(
+                                        "Deletion vector file {} has a key with no {KEY_DELETE_SEQUENCE_COLUMN}",
+                                        path.display()
+                                    ),
+                                ));
+                            }
+                            None => file_sequence,
+                        };
                         let key = bytes_key(row_key_array.value(i));
-                        let entry = key_row_state.entry(key).or_insert(KeyDeletionReadState {
-                            delete_sequence: file_sequence,
-                            reinsert_sequence: file_reinsert,
-                        });
-                        entry.delete_sequence = entry.delete_sequence.max(file_sequence);
+                        let entry = self
+                            .key_row_state
+                            .entry(key)
+                            .or_insert(KeyDeletionReadState {
+                                delete_sequence: row_sequence,
+                                reinsert_sequence: file_reinsert,
+                            });
+                        entry.delete_sequence = entry.delete_sequence.max(row_sequence);
                         if let Some(reinsert) = file_reinsert {
                             entry.reinsert_sequence = Some(
                                 entry
@@ -787,7 +932,7 @@ pub fn detect_deletion_type_and_read(
                     })?;
 
                 // Bulk insert row IDs - schema guarantees no nulls (nullable: false)
-                let bitmap = per_file_row_ids.entry(source_file).or_default();
+                let bitmap = self.per_file_row_ids.entry(source_file).or_default();
                 let values = row_id_array.values();
                 for &row_id in values {
                     let row_id_u32 = u32::try_from(row_id).map_err(|_| {
@@ -802,32 +947,216 @@ pub fn detect_deletion_type_and_read(
                 }
             }
         }
+        Ok(())
     }
 
-    let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::with_capacity(key_row_state.len());
-    let mut reinserted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
-    for (key, state) in key_row_state {
-        if let Some(reinsert_sequence) = state.reinsert_sequence {
-            reinserted_row_keys.insert(key.clone(), reinsert_sequence);
+    fn finish(self, file_count: usize) -> DeletionVectorReadResult {
+        let mut deleted_row_keys: HashMap<Box<[u8]>, i64> =
+            HashMap::with_capacity(self.key_row_state.len());
+        let mut reinserted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
+        for (key, state) in self.key_row_state {
+            if let Some(reinsert_sequence) = state.reinsert_sequence {
+                reinserted_row_keys.insert(key.clone(), reinsert_sequence);
+            }
+            deleted_row_keys.insert(key, state.delete_sequence);
         }
-        deleted_row_keys.insert(key, state.delete_sequence);
+
+        let total_position_based: u64 =
+            self.per_file_row_ids.values().map(RoaringBitmap::len).sum();
+        tracing::debug!(
+            "Loaded {} position-based deletions across {} files + {} key-based deleted rows from {} deletion vector files",
+            total_position_based,
+            self.per_file_row_ids.len(),
+            deleted_row_keys.len(),
+            file_count
+        );
+
+        (
+            self.per_file_row_ids,
+            deleted_row_keys,
+            reinserted_row_keys,
+            self.missing_key_dvs,
+        )
     }
+}
 
-    let total_position_based: u64 = per_file_row_ids.values().map(RoaringBitmap::len).sum();
-    tracing::debug!(
-        "Loaded {} position-based deletions across {} files + {} key-based deleted rows from {} deletion vector files",
-        total_position_based,
-        per_file_row_ids.len(),
-        deleted_row_keys.len(),
-        file_count
-    );
+/// Opens a local deletion-vector file. Blocking.
+fn open_local_deletion_vector(path: &str) -> std::io::Result<Box<dyn ReadSeek>> {
+    std::fs::File::open(path).map(|f| Box::new(f) as Box<dyn ReadSeek>)
+}
 
-    Ok((
-        per_file_row_ids,
-        deleted_row_keys,
-        reinserted_row_keys,
-        missing_key_dvs,
-    ))
+/// Read the deletion-vector files of a table whose vectors are local files (it has no
+/// dataset store), one at a time, detecting whether each file is position-based or
+/// key-based from its schema. [`read_deletion_vectors`] is the form the table calls.
+///
+/// For position-based deletions, returns a map of source data file path to the `RoaringBitmap`
+/// of file-local row positions. This enables correct deletion filtering regardless of file
+/// scan order.
+///
+/// # Blocking I/O Warning
+///
+/// This function performs **blocking file system I/O** and must be called from within
+/// `tokio::task::spawn_blocking`.
+///
+/// # Returns
+///
+/// A tuple of `(per_file_row_ids, key_based_row_keys_with_sequence, reinserted_row_keys, missing)`.
+/// - `per_file_row_ids`: Map of source data file path -> `RoaringBitmap` of deleted row positions
+/// - `key_based_row_keys_with_sequence`: Map of PK bytes -> max delete sequence number
+/// - `reinserted_row_keys`: Map of PK bytes -> max reinsert sequence number derived from delete-file metadata
+/// - `missing`: key vectors whose file is missing
+///
+/// # Errors
+///
+/// Returns an error if any deletion vector file cannot be read or parsed.
+fn detect_deletion_type_and_read(
+    delete_files: Vec<DeleteFile>,
+) -> datafusion_common::Result<DeletionVectorReadResult> {
+    let file_count = delete_files.len();
+    let mut state = DeletionVectorReadState::default();
+    for delete_file in delete_files {
+        let opened = open_local_deletion_vector(&delete_file.path);
+        state.add(&delete_file, opened)?;
+    }
+    Ok(state.finish(file_count))
+}
+
+/// A deletion-vector object fetched from its dataset store, or a vector that lives
+/// outside the store and is opened as a local file by the decoding thread.
+enum FetchedDeletionVector {
+    Bytes(std::io::Result<bytes::Bytes>),
+    Local,
+    /// A vector the committed state of a dataset in the object-native location
+    /// names but its store does not hold.
+    Lost(crate::dataset_storage::DataFileError),
+}
+
+async fn fetch_deletion_vector(storage: &DatasetStorage, path: &str) -> FetchedDeletionVector {
+    match deletion_vector_location(Some(storage), path) {
+        Ok(Some((store, location))) => {
+            FetchedDeletionVector::Bytes(match store.get(&location).await {
+                Ok(result) => result.bytes().await.map_err(std::io::Error::other),
+                // A dataset in the object-native location records a deletion
+                // vector's removal before it deletes the object, so one its
+                // committed state still names is never an interrupted sweep: it is
+                // lost, and reading on without it would bring back rows the
+                // dataset deleted.
+                Err(object_store::Error::NotFound { .. }) if storage.in_location() => {
+                    return FetchedDeletionVector::Lost(
+                        storage.missing(crate::dataset_storage::DataFileKind::Deletion, &location),
+                    );
+                }
+                Err(object_store::Error::NotFound { .. }) => {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                }
+                Err(error) => Err(std::io::Error::other(error)),
+            })
+        }
+        Ok(None) => FetchedDeletionVector::Local,
+        Err(error) => FetchedDeletionVector::Bytes(Err(std::io::Error::other(error))),
+    }
+}
+
+/// Aborts a spawned task when dropped, so a cancelled read stops fetching.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Read a table's deletion vectors without blocking an async thread: the files of a
+/// table with no dataset store one by one on a blocking thread
+/// ([`detect_deletion_type_and_read`]), and the objects of a table whose vectors are
+/// in its store concurrently.
+///
+/// A task on the async runtime fetches the objects, at most
+/// [`DELETION_VECTOR_READ_CONCURRENCY_REMOTE`] at once (or
+/// [`DELETION_VECTOR_READ_CONCURRENCY_LOCAL`] for a store on local disk), and hands
+/// them in catalog order over a bounded channel to one blocking thread that decodes
+/// and merges them, so neither the fetches nor the decoding hold an async thread.
+/// The result is the same as reading the files one by one: the merge takes the
+/// maximum sequence per key, whatever the order. Every vector the catalog names is
+/// either merged, reported missing (a key vector, as the sequential read does), or
+/// the read fails; a read that stops early is an error, never fewer deletes.
+///
+/// # Errors
+///
+/// Returns an error if any deletion vector cannot be fetched, read or parsed.
+pub async fn read_deletion_vectors(
+    delete_files: Vec<DeleteFile>,
+    storage: Option<Arc<DatasetStorage>>,
+) -> datafusion_common::Result<DeletionVectorReadResult> {
+    let join_error = |error: tokio::task::JoinError| {
+        datafusion_common::DataFusionError::Execution(format!(
+            "Deletion vector reader task failed: {error}"
+        ))
+    };
+    let Some(storage) = storage else {
+        return tokio::task::spawn_blocking(move || detect_deletion_type_and_read(delete_files))
+            .await
+            .map_err(join_error)?;
+    };
+    let file_count = delete_files.len();
+    if file_count == 0 {
+        return Ok(DeletionVectorReadState::default().finish(0));
+    }
+    let concurrency = if storage.is_local() {
+        DELETION_VECTOR_READ_CONCURRENCY_LOCAL
+    } else {
+        DELETION_VECTOR_READ_CONCURRENCY_REMOTE
+    };
+
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<(DeleteFile, FetchedDeletionVector)>(concurrency);
+    let fetcher = tokio::spawn(async move {
+        use futures::StreamExt as _;
+        let mut fetched = futures::stream::iter(delete_files)
+            .map(|delete_file| {
+                let storage = Arc::clone(&storage);
+                async move {
+                    let fetched = fetch_deletion_vector(&storage, &delete_file.path).await;
+                    (delete_file, fetched)
+                }
+            })
+            .buffered(concurrency);
+        while let Some(item) = fetched.next().await {
+            if sender.send(item).await.is_err() {
+                // The decoder stopped (an error); nothing reads the rest.
+                break;
+            }
+        }
+    });
+    let _fetcher = AbortOnDrop(fetcher.abort_handle());
+
+    tokio::task::spawn_blocking(move || {
+        let mut state = DeletionVectorReadState::default();
+        let mut merged_files = 0_usize;
+        while let Some((delete_file, fetched)) = receiver.blocking_recv() {
+            merged_files += 1;
+            let opened = match fetched {
+                FetchedDeletionVector::Bytes(bytes) => {
+                    bytes.map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn ReadSeek>)
+                }
+                FetchedDeletionVector::Local => open_local_deletion_vector(&delete_file.path),
+                FetchedDeletionVector::Lost(error) => {
+                    return Err(datafusion_common::DataFusionError::External(Box::new(
+                        error,
+                    )));
+                }
+            };
+            state.add(&delete_file, opened)?;
+        }
+        if merged_files != file_count {
+            return Err(datafusion_common::DataFusionError::Execution(format!(
+                "Deletion vector reader stopped after {merged_files} of {file_count} files"
+            )));
+        }
+        Ok(state.finish(file_count))
+    })
+    .await
+    .map_err(join_error)?
 }
 
 // ============================================================================
@@ -870,8 +1199,53 @@ fn build_key_based_batch(schema: &SchemaRef, row_keys: &[Box<[u8]>]) -> Result<R
     )?)
 }
 
+/// `row_keys` paired with `row_sequences`, sorted by key, each key once at its
+/// highest sequence.
+fn sorted_keys_with_max_sequence(
+    row_keys: Vec<Box<[u8]>>,
+    row_sequences: Vec<i64>,
+) -> Result<Vec<(Box<[u8]>, i64)>> {
+    if row_keys.len() != row_sequences.len() {
+        return Err(Error::Internal {
+            table: String::new(),
+            message: format!(
+                "A key deletion vector has {} keys but {} delete sequences",
+                row_keys.len(),
+                row_sequences.len()
+            ),
+        });
+    }
+    let mut keyed: Vec<(Box<[u8]>, i64)> = row_keys.into_iter().zip(row_sequences).collect();
+    // Highest sequence first within a key, so `dedup_by` keeps it.
+    keyed.sort_unstable_by(|(a_key, a_seq), (b_key, b_seq)| {
+        a_key.cmp(b_key).then_with(|| b_seq.cmp(a_seq))
+    });
+    keyed.dedup_by(|later, earlier| later.0 == earlier.0);
+    Ok(keyed)
+}
+
+/// Build a key deletion batch whose rows carry their own delete sequence.
+fn build_sequenced_key_based_batch(
+    schema: &SchemaRef,
+    keyed: &[(Box<[u8]>, i64)],
+) -> Result<RecordBatch> {
+    let deleted_at = Utc::now().timestamp_micros();
+    let row_key_array = BinaryArray::from_iter_values(keyed.iter().map(|(key, _)| key.as_ref()));
+    let deleted_at_array = Int64Array::from(vec![deleted_at; keyed.len()]);
+    let sequence_array = Int64Array::from_iter_values(keyed.iter().map(|(_, sequence)| *sequence));
+    Ok(RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(row_key_array) as Arc<dyn Array>,
+            Arc::new(deleted_at_array),
+            Arc::new(sequence_array),
+        ],
+    )?)
+}
+
 async fn write_deletion_file(
     file_path: &Path,
+    storage: Option<&DatasetStorage>,
     schema: SchemaRef,
     batch: RecordBatch,
     table_name: &str,
@@ -880,6 +1254,28 @@ async fn write_deletion_file(
 ) -> Result<u64> {
     let output_path = file_path.to_path_buf();
     let table_name = table_name.to_string();
+
+    let location =
+        deletion_vector_location(storage, &output_path.to_string_lossy()).map_err(|source| {
+            Error::IoError {
+                source: std::io::Error::other(source),
+            }
+        })?;
+    if let Some((store, location)) = location {
+        let _completion = completion;
+        let mut writer = FileWriter::try_new(Vec::new(), &schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let bytes = writer.into_inner()?;
+        let len = bytes.len() as u64;
+        store
+            .put(&location, bytes.into())
+            .await
+            .map_err(|source| Error::IoError {
+                source: std::io::Error::other(source),
+            })?;
+        return Ok(len);
+    }
 
     tokio::task::spawn_blocking(move || -> Result<u64> {
         let _completion = completion;
@@ -942,10 +1338,46 @@ async fn write_deletion_file(
     })?
 }
 
+/// The file name of the deletion-vector file at `path` (a local path or a URL).
+fn deletion_file_name(path: &Path) -> Option<&str> {
+    path.file_name().and_then(std::ffi::OsStr::to_str)
+}
+
+/// Stops holding the deletion-vector files at `paths` in the dataset's writer
+/// record: their writer deleted them, or no commit names them any more.
+pub(crate) fn release_deletion_files<'a>(
+    storage: Option<&DatasetStorage>,
+    paths: impl IntoIterator<Item = &'a Path>,
+) {
+    if let Some(record) = storage.and_then(DatasetStorage::writer_record) {
+        record.release_deletion_files(paths.into_iter().filter_map(deletion_file_name));
+    }
+}
+
 /// Best-effort removal of physical deletion-vector files that were written but
 /// never committed to the catalog.
-pub(crate) async fn cleanup_uncommitted_delete_paths(paths: &[PathBuf]) {
+pub(crate) async fn cleanup_uncommitted_delete_paths(
+    paths: &[PathBuf],
+    storage: Option<&DatasetStorage>,
+) {
+    release_deletion_files(storage, paths.iter().map(PathBuf::as_path));
     for path in paths {
+        match deletion_vector_location(storage, &path.to_string_lossy()) {
+            Ok(Some((store, location))) => {
+                match store.delete(&location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "Failed to remove an uncommitted deletion-vector object");
+                    }
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "Failed to remove an uncommitted deletion-vector object");
+                continue;
+            }
+        }
         if let Err(error) = tokio::fs::remove_file(path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -971,7 +1403,14 @@ pub(crate) async fn cleanup_uncommitted_delete_paths(paths: &[PathBuf]) {
 pub(crate) fn remove_dropped_deletion_vector_files(
     files: Vec<DeleteFile>,
     file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
+    storage: Option<Arc<DatasetStorage>>,
 ) {
+    // No commit names these files any more: the orphan sweep takes any of them
+    // left in the store.
+    release_deletion_files(
+        storage.as_deref(),
+        files.iter().map(|file| Path::new(file.path.as_str())),
+    );
     let paths: Vec<PathBuf> = files
         .into_iter()
         .filter(|file| !file.path_is_relative)
@@ -983,6 +1422,21 @@ pub(crate) fn remove_dropped_deletion_vector_files(
     crate::provider::compaction::spawn_compaction(async move {
         let _deleting = file_deletion_fence.write().await;
         for path in paths {
+            match deletion_vector_location(storage.as_deref(), &path.to_string_lossy()) {
+                Ok(Some((store, location))) => {
+                    if let Err(error) = store.delete(&location).await
+                        && !matches!(error, object_store::Error::NotFound { .. })
+                    {
+                        tracing::debug!(path = %path.display(), %error, "Failed to remove a deletion-vector object no catalog row references");
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(path = %path.display(), %error, "Failed to remove a deletion-vector object no catalog row references");
+                    continue;
+                }
+            }
             if let Err(error) = tokio::fs::remove_file(&path).await
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -1053,6 +1507,21 @@ static KEY_BASED_DELETION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+/// The column a key vector holding several delete sequences adds: each key's own
+/// delete sequence, which then takes the place of the file's catalog sequence for
+/// that key. One checkpoint's tombstones span many source transactions, so this is
+/// what lets it write them as one file rather than one per sequence.
+pub(crate) const KEY_DELETE_SEQUENCE_COLUMN: &str = "delete_sequence";
+
+/// Schema for key-based deletion vectors that carry a delete sequence per key.
+static SEQUENCED_KEY_BASED_DELETION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("row_key", DataType::Binary, false),
+        Field::new("deleted_at", DataType::Int64, false),
+        Field::new(KEY_DELETE_SEQUENCE_COLUMN, DataType::Int64, false),
+    ]))
+});
+
 /// Returns the schema for position-based deletion vectors.
 fn position_based_deletion_schema() -> SchemaRef {
     Arc::clone(&POSITION_BASED_DELETION_SCHEMA)
@@ -1061,6 +1530,11 @@ fn position_based_deletion_schema() -> SchemaRef {
 /// Returns the schema for key-based deletion vectors.
 fn key_based_deletion_schema() -> SchemaRef {
     Arc::clone(&KEY_BASED_DELETION_SCHEMA)
+}
+
+/// Returns the schema for key-based deletion vectors with a sequence per key.
+fn sequenced_key_based_deletion_schema() -> SchemaRef {
+    Arc::clone(&SEQUENCED_KEY_BASED_DELETION_SCHEMA)
 }
 
 // ============================================================================
@@ -1093,7 +1567,7 @@ mod tests {
     async fn writes_deletion_vector_and_returns_metadata() {
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
-        let writer = DeletionVectorWriter::new(&table_metadata);
+        let writer = DeletionVectorWriter::new(&table_metadata, None);
 
         let specs = vec![DeletionVectorWriteSpec::new_position_based(
             "test_file.vortex".to_string(),
@@ -1143,7 +1617,7 @@ mod tests {
     async fn skips_empty_specs() {
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
-        let writer = DeletionVectorWriter::new(&table_metadata);
+        let writer = DeletionVectorWriter::new(&table_metadata, None);
 
         let results = writer
             .write(vec![
@@ -1160,7 +1634,7 @@ mod tests {
     async fn rejects_position_ids_above_bitmap_range() {
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
-        let writer = DeletionVectorWriter::new(&table_metadata);
+        let writer = DeletionVectorWriter::new(&table_metadata, None);
         let results = writer
             .write(vec![DeletionVectorWriteSpec::new_position_based(
                 "large.vortex".to_string(),
@@ -1202,7 +1676,7 @@ mod tests {
         specs.push(DeletionVectorWriteSpec::new_key_based(vec![
             key(3 * groups),
         ]));
-        let results = DeletionVectorWriter::new(&table_metadata)
+        let results = DeletionVectorWriter::new(&table_metadata, None)
             .write(specs)
             .await
             .expect("write deletion vectors");
@@ -1228,6 +1702,49 @@ mod tests {
             .collect();
         expected_keys.insert(key(3 * groups), 7);
         assert_eq!(keys, expected_keys);
+    }
+
+    /// A key vector written for several delete sequences is one file recorded at
+    /// the highest, and reads back each key at its own sequence; a key listed at
+    /// two sequences keeps the higher.
+    #[tokio::test]
+    async fn one_key_vector_carries_each_key_at_its_own_sequence() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let table_metadata = build_table_metadata(&temp_dir);
+        let key = |name: &str| -> Box<[u8]> { name.as_bytes().into() };
+        let results = DeletionVectorWriter::new(&table_metadata, None)
+            .write(vec![DeletionVectorWriteSpec::new_key_based_with_sequences(
+                vec![
+                    (key("c"), 12),
+                    (key("a"), 10),
+                    (key("b"), 11),
+                    (key("a"), 14),
+                    (key("d"), 9),
+                ],
+            )])
+            .await
+            .expect("write the sequenced key vector");
+        assert_eq!(results.len(), 1, "one file for every sequence");
+        assert_eq!(results[0].delete_file.sequence_number, 14);
+        assert_eq!(results[0].delete_file.delete_count, 4);
+
+        let (positions, keys, reinserted, missing) = detect_deletion_type_and_read(
+            results
+                .into_iter()
+                .map(|result| result.delete_file)
+                .collect(),
+        )
+        .expect("read the sequenced key vector back");
+        assert!(positions.is_empty() && reinserted.is_empty() && missing.is_empty());
+        let expected: HashMap<Box<[u8]>, i64> = [
+            (key("a"), 14),
+            (key("b"), 11),
+            (key("c"), 12),
+            (key("d"), 9),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
     }
 
     #[tokio::test]

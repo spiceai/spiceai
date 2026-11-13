@@ -95,6 +95,10 @@ impl MetadataCatalog for ObjectNativeCatalog {
 
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
         let _ddl = self.ddl.lock().await;
+        if let Some(folder) = self.folder_named_by(&options.table_name, &options.base_path) {
+            // A create that names a folder whose deletion is pending keeps it.
+            self.dropping.lock().remove(&folder);
+        }
         self.create_dataset(options).await
     }
 
@@ -733,5 +737,38 @@ impl MetadataCatalog for ObjectNativeCatalog {
         self.for_table(table_id)
             .clear_inlined_deletes(table_id)
             .await
+    }
+    fn keeps_retirement_record(&self) -> bool {
+        true
+    }
+    async fn retired_files(&self, table_id: &str) -> CatalogResult<Option<Vec<String>>> {
+        self.for_table(table_id).retired_files(table_id).await
+    }
+    async fn committed_file_keys(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<std::collections::BTreeSet<String>>> {
+        self.for_table(table_id).committed_file_keys(table_id).await
+    }
+    async fn forget_retired_files(&self, table_id: &str, keys: &[String]) -> CatalogResult<bool> {
+        self.for_table(table_id)
+            .forget_retired_files(table_id, keys)
+            .await
+    }
+    async fn upsert_snapshot_files(&self, files: &[SnapshotFile]) -> CatalogResult<()> {
+        let Some(first) = files.first() else {
+            return Ok(());
+        };
+        // One table's files go to one log: route by the first and check the rest.
+        let domain = self.for_table(&first.table_id);
+        if files.iter().all(|file| file.table_id == first.table_id) {
+            return domain.upsert_snapshot_files(files).await;
+        }
+        for file in files {
+            self.for_table(&file.table_id)
+                .upsert_snapshot_file(file)
+                .await?;
+        }
+        Ok(())
     }
 }

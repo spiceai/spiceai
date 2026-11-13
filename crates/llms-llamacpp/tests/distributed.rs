@@ -63,6 +63,7 @@ fn topology(node_rank: usize, world: usize) -> DistributedConfig {
         node_rank,
         nodes: vec!["127.0.0.1".to_string(); world],
         allow_insecure_connections: true,
+        head_url: None,
     }
 }
 
@@ -103,7 +104,11 @@ async fn rank_two_of_three() {
     if std::env::var_os(RANK_TWO).is_none() {
         return;
     }
-    let cfg = topology(2, 3);
+    // clients reach the head at another address than the one the nodes use
+    let cfg = DistributedConfig {
+        head_url: Some("http://192.0.2.10:8090".to_string()),
+        ..topology(2, 3)
+    };
     let weights = [PathBuf::from(FILE)];
     let engine = llms::chat::engine::engine_for(&weights).expect("a .gguf goes to llama.cpp");
     // no head ever reaches this rank, and its load still finishes
@@ -130,7 +135,7 @@ async fn rank_two_of_three() {
     };
     assert_eq!(
         refusal.message,
-        "Model 'qwen3-0.6b' is served by the first machine in 'nodes' (127.0.0.1); this machine holds part of it."
+        "Model 'qwen3-0.6b' is served by the head at http://192.0.2.10:8090; this machine holds part of it, so send requests there."
     );
     assert_eq!(refusal.r#type.as_deref(), Some("invalid_request_error"));
 
