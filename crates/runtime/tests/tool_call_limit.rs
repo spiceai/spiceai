@@ -73,17 +73,13 @@ enum Api {
 }
 
 impl Api {
-    /// A tool result `text` as `self` sends it to the model: as it is, on every API.
-    fn sent(self, text: &str) -> String {
-        text.to_string()
-    }
-
     /// A tool error `text` as `self` sends it to the model: the Messages API's `is_error` result
-    /// reaches a chat model as a message that says it is an error.
+    /// reaches a chat model as a message that says it is an error. A tool result that is not an
+    /// error reaches the model as it is, on every API.
     fn sent_error(self, text: &str) -> String {
         match self {
             Self::Messages => format!("Error: {text}"),
-            Self::ChatCompletions | Self::Responses => self.sent(text),
+            Self::ChatCompletions | Self::Responses => text.to_string(),
         }
     }
 }
@@ -420,7 +416,7 @@ async fn tool_calls_past_the_limit_in_one_response_do_not_run(
     let expected: Vec<(String, String)> = (0..CALLS)
         .map(|i| {
             let result = if i < LIMIT {
-                api.sent(QUERY_RESULT)
+                QUERY_RESULT.to_string()
             } else {
                 api.sent_error(&not_run(CALLS))
             };
@@ -440,7 +436,7 @@ async fn every_tool_call_runs_at_the_limit(
     let results = tool_results_for(api, stream, LIMIT).await?;
 
     let expected: Vec<(String, String)> = (0..LIMIT)
-        .map(|i| (call_id(i), api.sent(QUERY_RESULT)))
+        .map(|i| (call_id(i), QUERY_RESULT.to_string()))
         .collect();
     assert_eq!(results, expected, "{api:?}, stream: {stream}");
     Ok(())

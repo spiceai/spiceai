@@ -164,6 +164,20 @@ steps:
       json:
         - { pointer: /rows/0, equals: ['NaN', null, '12345678901234567890.0123456789', 12.5] }
 
+  # Nested values keep the same rules: a struct is an object whose fields are encoded like
+  # columns, a list over 16 items ends with a marker, and a map is a list of [key, value] pairs.
+  - http: { method: POST, path: /v1/tools/sql, headers: { content-type: application/json }, body: '{"query": "SELECT named_struct(''n'', 1, ''nan'', CAST(''NaN'' AS DOUBLE), ''wide'', CAST(''12345678901234567890.0123456789'' AS DECIMAL(38, 10))) AS s, make_array(1, 2, 3) AS short_list, range(1, 21) AS long_list, map([''k1'', ''k2''], [10, 20]) AS m"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /columns, equals: [s, short_list, long_list, m] }
+        - { pointer: /rows/0/0, equals: { n: 1, nan: 'NaN', wide: '12345678901234567890.0123456789' } }
+        - { pointer: /rows/0/1, equals: [1, 2, 3] }
+        - { pointer: /rows/0/2, equals: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, '…[+4 items]'] }
+        - { pointer: /rows/0/3, equals: [['k1', 10], ['k2', 20]] }
+        - { pointer: /message, equals: 'Some long values were shortened: text to its first 1,024 characters and lists to their first 16 items. Read the rest with substr(column, 1025, 1024) or array_slice(column, 17, 32).' }
+        - { pointer: /truncated, exists: false }
+
   # The sampler tools return the same shape, within the same row limit.
   - http: { method: POST, path: /v1/tools/random_sample, headers: { content-type: application/json }, body: '{"dataset": "numbers", "limit": 1000}' }
     expect:
