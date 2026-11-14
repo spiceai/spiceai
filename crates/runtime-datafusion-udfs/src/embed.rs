@@ -246,15 +246,17 @@ impl ScalarUDFImpl for Embed {
             return exec_err!("{EMBED_UDF_NAME} cannot read model_store");
         };
 
-        let Some(model) = model_store.get(model_name) else {
+        let Some(model) = model_store.get(model_name).cloned() else {
             return exec_err!("{EMBED_UDF_NAME} cannot mount {model_arg}");
         };
+        // Released before embedding, so a model load or reload does not wait on the provider.
+        drop(model_store);
 
         match text_arg {
             // An array representing multiple rows
             ColumnarValue::Array(arr) => {
                 let ColumnarValue::Array(embeddings) =
-                    Self::embed_multiple(&**model, string_array_iter!(arr))?
+                    Self::embed_multiple(&*model, string_array_iter!(arr))?
                 else {
                     unreachable!(
                         "{EMBED_UDF_NAME}: embed_multiple must return ColumnarValue::Array by contract"
@@ -271,28 +273,28 @@ impl ScalarUDFImpl for Embed {
             // A single text value
             ColumnarValue::Scalar(
                 ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)),
-            ) => Self::embed_single(&**model, text),
+            ) => Self::embed_single(&*model, text),
             // Various combinations of single row/multiple input
             ColumnarValue::Scalar(ScalarValue::LargeList(arr)) => {
                 if arr.is_empty() {
                     return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
                 }
                 let inner_array = arr.value(0);
-                Self::embed_multiple(&**model, string_array_iter!(&inner_array))
+                Self::embed_multiple(&*model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::List(arr)) => {
                 if arr.is_empty() {
                     return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
                 }
                 let inner_array = arr.value(0);
-                Self::embed_multiple(&**model, string_array_iter!(&inner_array))
+                Self::embed_multiple(&*model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::FixedSizeList(arr)) => {
                 if arr.is_empty() {
                     return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
                 }
                 let inner_array = arr.value(0);
-                Self::embed_multiple(&**model, string_array_iter!(&inner_array))
+                Self::embed_multiple(&*model, string_array_iter!(&inner_array))
             }
             unsupported_text_arg @ ColumnarValue::Scalar(_) => {
                 exec_err!("Unsupported text argument: {unsupported_text_arg}")

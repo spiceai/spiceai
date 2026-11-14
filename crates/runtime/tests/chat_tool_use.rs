@@ -20,6 +20,9 @@ limitations under the License.
 //! The mock's model writes [`PREAMBLE`] and calls the `sql` tool, then answers with [`ANSWER`]
 //! once it has the tool result.
 
+// The runtime's async call graph nests deeply enough that computing the layout of a test's
+// top-level future exceeds rustc's default 128-deep query limit.
+#![recursion_limit = "256"]
 #![expect(
     clippy::expect_used,
     reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"

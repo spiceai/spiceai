@@ -681,10 +681,11 @@ struct Reconciled {
 ///
 /// [`Runtime::apply_app`] reconciles catalogs, datasets, views, models and
 /// functions into a running process, so those are taken from the deployment.
-/// Every other section configures something that was built while the process
-/// started — the servers, the CPU budget, the embedding models, the secret
-/// stores — and nothing re-reads it, so the deployed value is persisted for the
-/// next start while the value in effect is kept and named in
+/// Every other section is kept as the process started — the servers, the CPU
+/// budget and the secret stores, which nothing re-reads, and the embedding
+/// models and rerankers, which a deployment does not reload — so the deployed
+/// value is persisted for the next start while the value in effect is kept and
+/// named in
 /// [`Reconciled::restart_required`]. Keeping it is what makes the app this
 /// process reports the app it is actually serving, which is in turn what lets
 /// the next deployment be diffed against something true.

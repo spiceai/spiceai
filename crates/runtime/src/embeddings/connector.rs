@@ -27,6 +27,7 @@ use crate::federated::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
+use crate::status::{ComponentStatus, RuntimeStatus};
 use async_trait::async_trait;
 use data_components::cdc::{
     AccelerationContents, ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data,
@@ -56,6 +57,7 @@ pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     secrets: Arc<RwLock<Secrets>>,
+    status: Arc<RuntimeStatus>,
 }
 
 impl std::fmt::Debug for EmbeddingConnector {
@@ -72,12 +74,41 @@ impl EmbeddingConnector {
         inner_connector: Arc<dyn DataConnector>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         secrets: Arc<RwLock<Secrets>>,
+        status: Arc<RuntimeStatus>,
     ) -> Self {
         Self {
             inner_connector,
             embedding_models,
             secrets,
+            status,
         }
+    }
+
+    /// Explains why an embedding model that `dataset` uses is not loaded, when the Spicepod
+    /// configures that model.
+    async fn configured_model_not_loaded(&self, dataset: &DatasetSpec) -> Option<String> {
+        let loaded = self.embedding_models.read().await;
+        dataset
+            .embeddings
+            .iter()
+            .map(|e| &e.model)
+            .chain(
+                dataset
+                    .columns
+                    .iter()
+                    .flat_map(|c| c.embeddings.iter().map(|e| &e.model)),
+            )
+            .filter(|model| !loaded.contains_key(*model))
+            .find(|model| {
+                self.status
+                    .get_embedding_status(model)
+                    .is_some_and(|s| !matches!(s, ComponentStatus::Disabled))
+            })
+            .map(|model| {
+                self.status
+                    .unavailable_embedding_reason(model)
+                    .unwrap_or_else(|| format!("Embedding model '{model}' is not loaded yet."))
+            })
     }
 
     /// Wrap an existing [`TableProvider`] with a [`EmbeddingTable`] provider. If no embeddings
@@ -96,6 +127,17 @@ impl EmbeddingConnector {
                     "The dataset is configured with an embedding model, but the runtime is not built with model support.\n{ENABLE_MODEL_SUPPORT_MESSAGE}"
                 ),
                 connector_component: dataset.into(),
+            });
+        }
+
+        // A retriable error: the model may still be loading or retrying. A model whose load
+        // ended on a configuration error loads again only with the Spicepod change that fixes
+        // it, which reloads this dataset too.
+        if let Some(reason) = self.configured_model_not_loaded(dataset).await {
+            return Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dataset.source().to_string(),
+                connector_component: dataset.into(),
+                source: reason.into(),
             });
         }
 
@@ -706,6 +748,7 @@ mod tests {
             Arc::clone(source) as Arc<dyn DataConnector>,
             Arc::new(RwLock::new(EmbeddingModelStore::default())),
             Arc::new(RwLock::new(Secrets::default())),
+            RuntimeStatus::new(),
         )
     }
 
@@ -790,5 +833,61 @@ mod tests {
 
         source.assert_handed_only(&table);
         assert_yields_only_the_marker(&mut stream).await;
+    }
+
+    /// A dataset whose embedding model the Spicepod configures but has not loaded fails with an
+    /// error that its load retries, and that names the model's cause, so the dataset loads once
+    /// the model does. A model the Spicepod does not configure fails the dataset for good.
+    #[cfg(feature = "models")]
+    #[tokio::test]
+    async fn a_dataset_retries_while_its_configured_embedding_model_is_not_loaded() {
+        let spicepod_dataset: spicepod::component::dataset::Dataset =
+            serde_json::from_value(serde_json::json!({
+                "from": "test",
+                "name": "test",
+                "columns": [{"name": "content", "embeddings": [{"from": "e"}]}],
+            }))
+            .expect("a valid dataset");
+        let app = app::AppBuilder::new("test")
+            .with_dataset(spicepod_dataset.clone())
+            .build();
+        let dataset =
+            crate::component::dataset::builder::DatasetBuilder::try_from(spicepod_dataset)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(crate::Runtime::builder().build().await))
+                .build()
+                .expect("valid dataset");
+        let context =
+            crate::dataconnector::parameters::RuntimeConnectorContext::for_dataset(&dataset);
+        let status = RuntimeStatus::new();
+        let connector = EmbeddingConnector::new(
+            Arc::new(StreamingSource::default()) as Arc<dyn DataConnector>,
+            Arc::new(RwLock::new(EmbeddingModelStore::default())),
+            Arc::new(RwLock::new(Secrets::default())),
+            Arc::clone(&status),
+        );
+        let wrap_error = async || {
+            connector
+                .wrap_table(&context, memtable(), &dataset)
+                .await
+                .expect_err("the model is not loaded")
+        };
+
+        assert!(!wrap_error().await.is_retriable());
+
+        status.update_embedding(
+            "e",
+            ComponentStatus::error_with_message("You exceeded your current quota."),
+        );
+        let err = wrap_error().await;
+        assert!(err.is_retriable(), "{err}");
+        assert!(
+            err.to_string().contains("You exceeded your current quota."),
+            "the error must name the model's cause: {err}"
+        );
+
+        status.update_embedding("e", ComponentStatus::Disabled);
+        assert!(!wrap_error().await.is_retriable());
     }
 }
