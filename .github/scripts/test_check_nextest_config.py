@@ -25,6 +25,29 @@ test-group = 'cayenne-property-tests'
 retries = 0
 """
 
+# The ceilings for three Cayenne tests that sat inside the contention band of the
+# global 360s: one unit test of the `cayenne` library named exactly, and two
+# integration-test modules.
+SMALL_TIER_TEST = (
+    "provider::table::tests::small_tier_merge_runs_while_large_tier_merge_is_in_flight"
+)
+FILE_MODE_TEST = (
+    "lookup_index_widening_test::file_mode_widened_keys_return_the_rows_of_an_unindexed_table"
+)
+SLOW_SIGN_OFF_TESTS = f"""
+[[profile.default.overrides]]
+filter = '(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))'
+slow-timeout = {{ period = "120s", terminate-after = 6 }}
+
+[[profile.default.overrides]]
+filter = '(binary_id(=cayenne::integration) & test(/^lookup_index_widening_test::/))'
+slow-timeout = {{ period = "120s", terminate-after = 7 }}
+
+[[profile.default.overrides]]
+filter = '(binary_id(=cayenne::integration) & test(/^bulk_load_index_coverage_test::/))'
+slow-timeout = {{ period = "120s", terminate-after = 5 }}
+"""
+
 # The fix: the same overrides, plus an explicit ceiling for the slow binaries.
 # `mutation_model_test` is split out at a lower ceiling, mirroring the real
 # config: its baseline is a third of the others', so 960s already clears the
@@ -44,7 +67,7 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 filter = '(binary_id(=cayenne::integration) & test(/^result_correctness_vs_duckdb_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_vs_sqlite_test::/)) | (binary_id(=runtime::integration) & test(/^result_correctness::/))'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }
-"""
+""" + SLOW_SIGN_OFF_TESTS
 
 # The ceiling sized against the 3.7x contention factor measured for #12336: high
 # enough to clear every baseline at that factor, and still reached once the pool
@@ -194,6 +217,82 @@ class BinaryFilterTest(unittest.TestCase):
             },
         )
 
+    def test_matches_one_test_of_a_library_or_an_integration_binary(self):
+        self.assertEqual(
+            check_nextest_config.selectors_matched(
+                f"(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))"
+                " | (binary_id(=cayenne::integration) & test(=a_test::one))"
+            ),
+            {f"cayenne#{SMALL_TIER_TEST}", "cayenne::integration#a_test::one"},
+        )
+
+    def test_a_test_selector_matches_only_that_test(self):
+        expr = f"(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))"
+        self.assertTrue(check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}", expr))
+        self.assertFalse(
+            check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}_sibling", expr)
+        )
+        # The same test path in another binary is a different test.
+        self.assertFalse(
+            check_nextest_config.selected(f"cayenne::integration#{SMALL_TIER_TEST}", expr)
+        )
+        # And it does not stand in for the library's other tests.
+        self.assertFalse(check_nextest_config.selected("cayenne", expr))
+
+    def test_a_test_key_is_selected_by_its_module_or_its_binary(self):
+        """nextest applies a module or whole-binary override to every test in it."""
+        key = "cayenne::integration#lookup_index_widening_test::file_mode"
+        self.assertTrue(
+            check_nextest_config.selected(
+                key, "(binary_id(=cayenne::integration) & test(/^lookup_index_widening_test::/))"
+            )
+        )
+        # A module whose name is a prefix of the test's module is a different module.
+        self.assertFalse(
+            check_nextest_config.selected(
+                key, "(binary_id(=cayenne::integration) & test(/^lookup_index_widening::/))"
+            )
+        )
+        # A module of a different binary with the same name does not match.
+        self.assertFalse(
+            check_nextest_config.selected(
+                key, "(binary_id(=runtime::integration) & test(/^lookup_index_widening_test::/))"
+            )
+        )
+        self.assertTrue(check_nextest_config.selected(key, "binary(=integration)"))
+        self.assertTrue(check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}", "binary(=cayenne)"))
+        self.assertFalse(check_nextest_config.selected(f"cayenne#{SMALL_TIER_TEST}", "binary(=runtime)"))
+
+    def test_refuses_operators_that_could_exclude_the_named_tests(self):
+        """A negated or intersected term does not select its tests; refuse to read it so."""
+        exact = f"(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))"
+        module = "(binary_id(=cayenne::integration) & test(/^a_test::/))"
+        for expr in (
+            f"not {exact}",
+            f"!{exact}",
+            f"{exact} & none()",
+            f"{exact} and test(/x/)",
+            f"all() - {module}",
+            f"not {module}",
+            "not binary(=retention_oom)",
+        ):
+            with self.subTest(expr=expr):
+                with self.assertRaisesRegex(ValueError, "unsupported"):
+                    check_nextest_config.selectors_matched(expr)
+
+    def test_a_union_of_terms_is_still_read(self):
+        """The negative case: unions, in every spelling nextest accepts, resolve."""
+        exact = f"(binary_id(=cayenne) & test(={SMALL_TIER_TEST}))"
+        module = "(binary_id(=cayenne::integration) & test(/^a_test::/))"
+        for expr in (f"{exact} | {module}", f"{exact} or {module}", f"{exact} + {module}"):
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    check_nextest_config.selectors_matched(expr),
+                    {f"cayenne#{SMALL_TIER_TEST}", "cayenne::integration::a_test"},
+                )
+        # A filter on test names alone still resolves to no test set at all.
+        self.assertEqual(check_nextest_config.selectors_matched("not test(/^github::/)"), set())
+
     def test_a_module_selector_does_not_match_the_whole_binary(self):
         """Selecting one module must not stand in for the binary, or its siblings."""
         matched = check_nextest_config.selectors_matched(
@@ -201,6 +300,33 @@ class BinaryFilterTest(unittest.TestCase):
         )
         self.assertNotIn("integration", matched)
         self.assertNotIn("cayenne::integration::b_test", matched)
+
+
+class ContainedInTest(unittest.TestCase):
+    def test_an_exact_test_is_in_its_module_and_its_binary(self):
+        exact = f"cayenne::integration#{FILE_MODE_TEST}"
+        contained = check_nextest_config.contained_in
+        self.assertTrue(contained(exact, "cayenne::integration::lookup_index_widening_test"))
+        self.assertTrue(contained(exact, "integration"))
+        self.assertTrue(contained(f"cayenne#{SMALL_TIER_TEST}", "cayenne"))
+
+    def test_a_module_is_in_its_binary(self):
+        contained = check_nextest_config.contained_in
+        self.assertTrue(contained("cayenne::integration::lookup_index_widening_test", "integration"))
+
+    def test_unrelated_and_identical_sets_are_not_contained(self):
+        contained = check_nextest_config.contained_in
+        module = "cayenne::integration::lookup_index_widening_test"
+        # A same-prefix module, another binary, and the set itself.
+        self.assertFalse(
+            contained(
+                "cayenne::integration#lookup_index_widening_test_extra::t",
+                module,
+            )
+        )
+        self.assertFalse(contained(f"runtime::integration#{FILE_MODE_TEST}", module))
+        self.assertFalse(contained(module, module))
+        self.assertFalse(contained(module, f"cayenne#{SMALL_TIER_TEST}"))
 
 
 class ResolveTest(unittest.TestCase):
@@ -364,6 +490,66 @@ class CheckConfigTest(unittest.TestCase):
         self.assertGreater(1200, widest * check_nextest_config.CONTENTION_FACTOR)
         self.assertTrue(any("partition_chunking_test is killed after 1200s" in p for p in problems))
 
+    def test_rejects_the_global_ceiling_for_the_slow_sign_off_tests(self):
+        """Without their overrides, all three are killed at 360s again."""
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(
+                write(tmp, FIXED_CONFIG.replace(SLOW_SIGN_OFF_TESTS, ""))
+            )
+        self.assertEqual(len(problems), 3, problems)
+        for needle in (
+            f"cayenne#{SMALL_TIER_TEST} is killed after 360s",
+            "lookup_index_widening_test is killed after 360s",
+            "bulk_load_index_coverage_test is killed after 360s",
+        ):
+            self.assertTrue(any(needle in p for p in problems), (needle, problems))
+
+    def test_rejects_a_test_ceiling_one_period_short(self):
+        """The exact-test ceiling is held to its own baseline: 600s < 122.5 x 5.75."""
+        line = f"test(={SMALL_TIER_TEST}))'\nslow-timeout = {{ period = \"120s\", terminate-after = %d }}"
+        undersized = FIXED_CONFIG.replace(line % 6, line % 5)
+        self.assertNotEqual(undersized, FIXED_CONFIG)
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, undersized))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(f"cayenne#{SMALL_TIER_TEST} is killed after 600s", problems[0])
+
+    def test_rejects_a_narrower_override_that_lowers_a_measured_test(self):
+        """An exact test placed ahead of its measured module's override is held to it.
+
+        nextest gives `file_mode_widened_keys…` the first override it matches, so
+        a 120s exact-test override ahead of the module's 840s one kills the
+        module's slowest test at 120s, while the module key still resolves to
+        840s. The same holds for a module of a measured binary.
+        """
+        narrower = (
+            "\n[[profile.default.overrides]]\n"
+            f"filter = '(binary_id(=cayenne::integration) & test(={FILE_MODE_TEST}))'\n"
+            'slow-timeout = { period = "120s", terminate-after = 1 }\n'
+        )
+        head, _, tail = FIXED_CONFIG.partition("[[profile.default.overrides]]")
+        config = head + narrower.lstrip("\n") + "\n[[profile.default.overrides]]" + tail
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(
+            f"cayenne::integration#{FILE_MODE_TEST} is killed after 120s", problems[0]
+        )
+        self.assertIn("the slowest test measured in the test set holding it", problems[0])
+        self.assertIn("needs 140.9s", problems[0])
+
+    def test_accepts_a_narrower_override_that_clears_its_set(self):
+        """The negative case: a narrower override sized for the set passes."""
+        narrower = (
+            "\n[[profile.default.overrides]]\n"
+            f"filter = '(binary_id(=cayenne::integration) & test(={FILE_MODE_TEST}))'\n"
+            'slow-timeout = { period = "120s", terminate-after = 7 }\n'
+        )
+        head, _, tail = FIXED_CONFIG.partition("[[profile.default.overrides]]")
+        config = head + narrower.lstrip("\n") + "\n[[profile.default.overrides]]" + tail
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check_nextest_config.check_config(write(tmp, config)), [])
+
     def test_rejects_raising_the_global_ceiling_instead(self):
         """The tempting one-line 'fix' hides slowness across the whole workspace."""
         config = FIXED_CONFIG.replace(
@@ -421,6 +607,72 @@ class CheckConfigTest(unittest.TestCase):
         never_terminates = [p for p in problems if "never terminates" in p]
         self.assertEqual(len(never_terminates), len(check_nextest_config.ZERO_RETRY_BINARIES))
         self.assertTrue(all("Set terminate-after" in p for p in never_terminates))
+
+    def _with_override_first(self, override: str) -> str:
+        head, _, tail = FIXED_CONFIG.partition("[[profile.default.overrides]]")
+        return head + override.lstrip("\n") + "\n[[profile.default.overrides]]" + tail
+
+    def test_rejects_an_exact_test_override_that_retries_a_zero_retry_test(self):
+        """An exact test ahead of its zero-retry module's override is held to retries = 0.
+
+        nextest gives the test the first override that sets `retries`, so a
+        `retries = 1` exact-test override placed first retries that test while
+        the module key still resolves to the module's `retries = 0`.
+        """
+        config = self._with_override_first(
+            "[[profile.default.overrides]]\n"
+            "filter = '(binary_id(=cayenne::integration) & "
+            "test(=mutation_property_test::prop_concurrent_mixed_position_sqlite))'\n"
+            "retries = 1\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(
+            "cayenne::integration#mutation_property_test::prop_concurrent_mixed_position_sqlite "
+            "no longer has retries = 0",
+            problems[0],
+        )
+
+    def test_rejects_an_exact_test_override_that_drops_a_zero_retry_ceiling(self):
+        """An exact test ahead of its zero-retry module's override keeps a real ceiling."""
+        config = self._with_override_first(
+            "[[profile.default.overrides]]\n"
+            "filter = '(binary_id(=cayenne::integration) & "
+            "test(=mutation_property_test::prop_concurrent_mixed_position_sqlite))'\n"
+            'slow-timeout = "120s"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(
+            "cayenne::integration#mutation_property_test::prop_concurrent_mixed_position_sqlite "
+            "has retries = 0 and a slow-timeout that never terminates",
+            problems[0],
+        )
+
+    def test_accepts_an_exact_test_override_that_keeps_the_zero_retry_rules(self):
+        """The negative case: an exact override with no retries and a real ceiling passes."""
+        config = self._with_override_first(
+            "[[profile.default.overrides]]\n"
+            "filter = '(binary_id(=cayenne::integration) & "
+            "test(=mutation_property_test::prop_concurrent_mixed_position_sqlite))'\n"
+            "retries = 0\n"
+            'slow-timeout = { period = "120s", terminate-after = 12 }\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check_nextest_config.check_config(write(tmp, config)), [])
+
+    def test_an_exact_test_outside_the_zero_retry_modules_may_retry(self):
+        """The sibling that must not match: retries on a test of another module are allowed."""
+        config = self._with_override_first(
+            "[[profile.default.overrides]]\n"
+            "filter = '(binary_id(=cayenne::integration) & "
+            "test(=some_other_module::a_test))'\n"
+            "retries = 2\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check_nextest_config.check_config(write(tmp, config)), [])
 
     def test_reports_a_slow_timeout_missing_its_period(self):
         """A `terminate-after` with no `period` is a config problem, not a crash."""
