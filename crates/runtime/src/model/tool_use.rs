@@ -677,11 +677,13 @@ fn next_round_tool_choice(
     }
 }
 
-/// `req` without its `tool_choice` when it offers no tools: a request with `tool_choice: none`
-/// that gets no runtime tools would otherwise carry a tool choice and no tools.
+/// `req` without its `tool_choice` and `parallel_tool_calls` when it offers no tools: a request
+/// with `tool_choice: none` that gets no runtime tools would otherwise carry tool settings and no
+/// tools, which a provider may reject (issue #14821).
 fn without_orphan_tool_choice(mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
     if req.tools.as_ref().is_none_or(Vec::is_empty) {
         req.tool_choice = None;
+        req.parallel_tool_calls = None;
     }
     req
 }
@@ -2859,5 +2861,38 @@ mod tests {
         let requests = provider.requests.lock();
         assert_eq!(requests[0].tools, None);
         assert_eq!(requests[0].tool_choice, None);
+    }
+
+    /// `parallel_tool_calls` is a tool setting too, so a `tool_choice: none` that turns the
+    /// runtime tools off also drops the client's `parallel_tool_calls`, streamed or not.
+    #[tokio::test]
+    async fn test_a_none_tool_choice_sends_no_parallel_tool_calls_without_tools() {
+        let provider = ScriptedChat::new(vec![Reply::Answer("D"), Reply::Answer("F")]);
+        let model = with_defaults(sql_model(&provider), &[("tool_choice", json!("none"))]);
+        let with_parallel_tool_calls = |text| {
+            let mut req = request(vec![user(text)]);
+            req.parallel_tool_calls = Some(false);
+            req
+        };
+
+        model
+            .chat_request(with_parallel_tool_calls("A"))
+            .await
+            .expect("turn 1");
+        let chunks: Vec<_> = model
+            .chat_stream(with_parallel_tool_calls("E"))
+            .await
+            .expect("turn 2")
+            .collect()
+            .await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+
+        let requests = provider.requests.lock();
+        assert_eq!(requests.len(), 2);
+        for sent in requests.iter() {
+            assert_eq!(sent.tools, None);
+            assert_eq!(sent.tool_choice, None);
+            assert_eq!(sent.parallel_tool_calls, None);
+        }
     }
 }
