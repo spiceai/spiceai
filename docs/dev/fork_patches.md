@@ -116,7 +116,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `19ecca8e06a3e764f7cf4a550f3abba7a137f3c7` | `spiceai-55-release-2.4` |
+| [datafusion](#datafusion) | `204345e93b5d0dbd7ac46328ce55637725a6b189` (TEMPORARY: spiceai/datafusion#299) | `spiceai-55-release-2.4` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `bc28b14282501d7c3bb9ee8ae7a941f86d707910` | `spiceai-55-release-2.4` |
@@ -217,7 +217,7 @@ fetch through a single-input repartition. On top of #260's merge commit, `spicea
 #287 (merged to `spiceai-55` separately), which stores a compacted copy of each nested `COUNT(DISTINCT …)` value,
 #275 (cherry-picked in #289), which limits the nesting depth of a SQL data type, and #288 (backported in #293), which
 keeps a struct column in a Parquet scan's projection and row filter when `get_field` keys into a map inside it, and
-makes `get_field` apply the parent's nulls to the field it extracts. The pin is #293's merge commit. None changes a
+makes `get_field` apply the parent's nulls to the field it extracts. On top of #293's merge commit, spiceai/datafusion#299 merges upstream `55.3.0` (apache/datafusion@7941823), with the conflict resolutions reviewed for `spiceai-55` in spiceai/datafusion#298: #251's empty-file rule and apache/datafusion#26310's NULL-partition rule are both kept in `PartitionedFile::with_statistics`, and the metadata-column code in `catalog-listing` keeps upstream's nullable partition columns. That merge drops no Spice patch: for every file the fork changes, its diff against the release is line for line the same before and after it, except those resolutions and `Cargo.lock`. The pin is #299's merge commit. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
