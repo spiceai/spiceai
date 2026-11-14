@@ -24,7 +24,7 @@ use rmcp::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
         Implementation, ListResourceTemplatesRequestMethod, ListResourceTemplatesResult,
         ListResourcesRequestMethod, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-        ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+        ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
     },
     service::RequestContext,
 };
@@ -800,8 +800,8 @@ impl RuntimeServer {
 }
 
 impl ServerHandler for RuntimeServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "Spice.ai Open Source",
                 env!("CARGO_PKG_VERSION"),
@@ -3199,8 +3199,8 @@ mod tests {
     struct SchemaLessServer;
 
     impl ServerHandler for SchemaLessServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
                 .with_protocol_version(ProtocolVersion::V_2026_07_28)
         }
 
