@@ -78,6 +78,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
+use super::pk_index::PkBloom;
 use crate::row_converter::{RowConverter, SortField};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use arrow::array::{Array, ArrayRef, AsArray, UInt32Array, UInt64Array};
@@ -474,6 +475,11 @@ struct ShapeIndex {
     /// Block `i`'s head is `heads[head_offsets[i]..head_offsets[i + 1]]`.
     head_offsets: Vec<usize>,
     distinct_keys: usize,
+    /// Bloom filter over every entry's row-encoded key. A probe for a key it
+    /// rules out answers empty without decoding a block, which is what most
+    /// probes are: a lookup probes every protected snapshot and finds its key in
+    /// at most one.
+    membership: PkBloom,
 }
 
 impl ShapeIndex {
@@ -493,6 +499,7 @@ impl ShapeIndex {
             .fold(usize_of(self.postings.nbytes()), usize::saturating_add)
             .saturating_add(self.heads.capacity())
             .saturating_add(self.head_offsets.capacity() * std::mem::size_of::<usize>())
+            .saturating_add(self.membership.size_bytes())
     }
 
     /// The entries of every block that can hold `key`.
@@ -541,6 +548,9 @@ impl ShapeIndex {
             return ShapeProbe::Unanswerable;
         };
         let key = rows.row(0);
+        if !self.membership.maybe_contains(key.as_ref()) {
+            return ShapeProbe::Postings(Vec::new());
+        }
         let range = self.candidate_range(key.as_ref());
         if range.is_empty() {
             return ShapeProbe::Postings(Vec::new());
@@ -2573,10 +2583,10 @@ impl ShapeBuild {
         let mut fields: Vec<Field> = columns.iter().map(KeyColumn::indexed_field).collect();
         fields.push(postings_field());
         let mut ctx = session.create_execution_ctx();
-        let mut heads = BlockHeads::new();
+        let len = postings.len();
+        let mut heads = BlockHeads::new(len);
         let mut compressed: Vec<Vec<vortex::array::ArrayRef>> =
             fields.iter().map(|_| Vec::new()).collect();
-        let len = postings.len();
         let mut start = 0usize;
         while start < len {
             let rows = chunk_rows.min(len - start);
@@ -2632,7 +2642,7 @@ impl ShapeBuild {
         let postings = arrays
             .pop()
             .ok_or_else(|| format!("{label}: no postings array"))?;
-        let (heads, head_offsets, distinct_keys) = heads.finish();
+        let (heads, head_offsets, distinct_keys, membership) = heads.finish();
         Ok(ShapeIndex {
             label,
             converter,
@@ -2643,6 +2653,7 @@ impl ShapeBuild {
             heads,
             head_offsets,
             distinct_keys,
+            membership,
         })
     }
 }
@@ -2653,6 +2664,11 @@ impl ShapeBuild {
 /// Encodes one block at a time, so the whole index is never row-encoded at
 /// once. Fails if any entry encodes below its predecessor: the sort and the
 /// encoding disagree for this key's types, and a lookup would miss rows.
+/// Largest membership filter one shape index allocates (~10 bits per key up to
+/// ~6.7 M keys); past it the filter saturates toward "maybe" and probes fall back
+/// to decoding blocks, as without it.
+const MEMBERSHIP_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 struct BlockHeads {
     heads: Vec<u8>,
     /// Block `i`'s head is `heads[offsets[i]..offsets[i + 1]]`.
@@ -2661,15 +2677,19 @@ struct BlockHeads {
     /// The last key seen, which continues the order check and the distinct count
     /// from one chunk into the next.
     previous: Option<Vec<u8>>,
+    /// Every entry's row-encoded key, for [`ShapeIndex::membership`].
+    membership: PkBloom,
 }
 
 impl BlockHeads {
-    fn new() -> Self {
+    /// Sized for `entries` keys at the key set's ~1 % false-positive target.
+    fn new(entries: usize) -> Self {
         Self {
             heads: Vec::new(),
             offsets: vec![0],
             distinct_keys: 0,
             previous: None,
+            membership: PkBloom::with_expected_keys(entries, MEMBERSHIP_MAX_BYTES),
         }
     }
 
@@ -2691,6 +2711,7 @@ impl BlockHeads {
             self.offsets.push(self.heads.len());
             for row in 0..rows.num_rows() {
                 let current = rows.row(row);
+                self.membership.insert(current.as_ref());
                 let prior_row = row.checked_sub(1).map(|prior| rows.row(prior));
                 let prior = match &prior_row {
                     Some(prior_row) => Some(prior_row.as_ref()),
@@ -2712,9 +2733,9 @@ impl BlockHeads {
         Ok(())
     }
 
-    fn finish(mut self) -> (Vec<u8>, Vec<usize>, usize) {
+    fn finish(mut self) -> (Vec<u8>, Vec<usize>, usize, PkBloom) {
         self.heads.shrink_to_fit();
-        (self.heads, self.offsets, self.distinct_keys)
+        (self.heads, self.offsets, self.distinct_keys, self.membership)
     }
 }
 

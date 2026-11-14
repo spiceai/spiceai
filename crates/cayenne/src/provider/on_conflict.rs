@@ -27,7 +27,7 @@ use super::pk_index::{
     PkExistenceRef,
 };
 use super::pk_validation::null_primary_key_message;
-use super::table::DeletionRequestSource;
+use super::table::{DeletionRequestSource, VerifiedKeyDelete};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
@@ -634,18 +634,44 @@ impl DeletionSink for InlineAwareDeletionSink {
         // rows as a protected snapshot, and the sink freezes the protected set it
         // will scan. See [`DeletionSinkSource`].
         let built_at_execution;
+        // Set when the delete's rows were located by key and verified in this hold
+        // (`verified_key_delete`): the file sink then tombstones exactly those keys
+        // without a scan, and the verified count stands in for its own.
+        let mut verified = None;
         let file_sink = match &self.file_sink {
-            DeletionSinkSource::Prebuilt(sink) => sink.as_ref(),
+            DeletionSinkSource::Prebuilt(sink) => Some(sink.as_ref()),
             DeletionSinkSource::BuildAtExecution(source) => {
                 // A no-op in `mode: memory`, which has no Vortex tier to checkpoint
                 // into — there the tier is reconciled below by
                 // `apply_mem_tier_delete`.
                 self.table.checkpoint_mem_tier_for_delete().await?;
-                built_at_execution = self
-                    .table
-                    .build_deletion_vector_sink(&self.filters, None, *source)
-                    .await?;
-                &built_at_execution
+                verified = self.table.verified_key_delete(&self.filters).await?;
+                let (filters, source) = match &verified {
+                    // No live row matched: nothing to tombstone in the file tiers.
+                    Some(VerifiedKeyDelete {
+                        key_filter: None, ..
+                    }) => (None, *source),
+                    // Key-only filter over verified keys: the count is already
+                    // known, so the sink's no-scan key path applies.
+                    Some(VerifiedKeyDelete {
+                        key_filter: Some(key_filter),
+                        ..
+                    }) => (
+                        Some(std::slice::from_ref(key_filter)),
+                        DeletionRequestSource::Cdc,
+                    ),
+                    None => (Some(self.filters.as_slice()), *source),
+                };
+                match filters {
+                    Some(filters) => {
+                        built_at_execution = self
+                            .table
+                            .build_deletion_vector_sink(filters, None, source)
+                            .await?;
+                        Some(&built_at_execution)
+                    }
+                    None => None,
+                }
             }
         };
 
@@ -653,10 +679,18 @@ impl DeletionSink for InlineAwareDeletionSink {
             .table
             .prepare_inlined_rows_matching_filters(&self.filters)
             .await?;
-        let mut prepared_file_delete = file_sink.prepare_delete().await?;
-        let file_deleted = prepared_file_delete
-            .as_ref()
-            .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
+        let mut prepared_file_delete = match file_sink {
+            Some(sink) => sink.prepare_delete().await?,
+            None => None,
+        };
+        let file_deleted = match &verified {
+            // The verified count covers every live matching row, the inlined ones
+            // included; those are removed and counted by the inline rewrite above.
+            Some(verified) => verified.matched_rows.saturating_sub(inlined_deleted),
+            None => prepared_file_delete
+                .as_ref()
+                .map_or(0, super::delete::PreparedDeletionPublish::deleted_count),
+        };
 
         if !inline_rewrite.is_empty() || prepared_file_delete.is_some() {
             let delete_files = prepared_file_delete

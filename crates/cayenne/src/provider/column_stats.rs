@@ -546,6 +546,17 @@ impl ColumnStatsAccumulator {
                     ScalarValue::TimestampNanosecond(Some(value), tz.clone())
                 })
             }
+            // Nested values have no ordering a scan can prune on, and the scalar
+            // fallback would compare them one `ScalarValue` at a time on every write
+            // (an HTTP dataset's `response_headers` map is written with each row).
+            DataType::Map(..)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::FixedSizeList(..)
+            | DataType::Struct(_)
+            | DataType::Union(..) => Some((None, None)),
             _ => None,
         }
     }

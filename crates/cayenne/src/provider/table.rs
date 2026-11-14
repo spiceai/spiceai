@@ -3079,7 +3079,7 @@ const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
 /// cross-snapshot manifest references already exist and are honored by physical-file
 /// GC (see [`Self::manifest_file_relative_path`]). That is the change that would
 /// make this path fast rather than merely bounded; it is out of scope here.
-const PROTECTED_MERGE_INPUT_BYTES_PER_POOL_BYTE: u64 = 4;
+const PROTECTED_MERGE_INPUT_BYTES_PER_POOL_BYTE: u64 = 1;
 
 /// Per-pass merge-input budget for a pool of `pool_limit` (extracted for unit
 /// testing).
@@ -36375,6 +36375,134 @@ fn active_transaction(
     } else {
         txn.mark_unregistered_read();
         None
+    }
+}
+
+/// A filter-based delete whose matching rows were located by key and verified
+/// against the whole predicate. See [`CayenneTableProvider::verified_key_delete`].
+pub(crate) struct VerifiedKeyDelete {
+    /// Primary-key equalities for exactly the keys whose live row matched, or
+    /// `None` when no live row did. Key-only, so the deletion-vector sink takes
+    /// its no-scan key path.
+    pub(crate) key_filter: Option<Expr>,
+    /// Live rows the original predicate matched, across every tier a scan reads.
+    pub(crate) matched_rows: u64,
+}
+
+/// Most disjuncts a verified key delete resolves as individual point reads. Each
+/// costs about one indexed lookup, so even the largest batch is far cheaper than the
+/// scan-based path it replaces; the cap only bounds a pathological predicate.
+const MAX_VERIFIED_KEY_DELETE_DISJUNCTS: usize = 8_192;
+
+/// Point reads a verified key delete runs at once.
+const VERIFIED_KEY_DELETE_CONCURRENCY: usize = 8;
+
+impl CayenneTableProvider {
+    /// Resolve a delete whose predicate is an OR of conjunctions that each pin
+    /// every primary-key column by one point read per conjunction, instead of
+    /// scanning every row of every tier.
+    ///
+    /// Each conjunction is read through this table's own scan, which serves a
+    /// pinned key from the secondary index and applies deletions, so it returns
+    /// exactly the live rows that satisfy the whole conjunction — including any
+    /// conjunct on a non-key column. The keys of those rows are returned as a
+    /// key-only filter: with the primary key unique among live rows, tombstoning a
+    /// matched key removes exactly the row that matched. `matched_rows` is the
+    /// exact count.
+    ///
+    /// `None` leaves the delete to the scan-based path: no secondary index covers
+    /// the key, a conjunction does not pin every key column, the predicate has too
+    /// many disjuncts, or rows are resident in memory mode (counted separately).
+    pub(crate) async fn verified_key_delete(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Option<VerifiedKeyDelete>> {
+        let [filter] = filters else {
+            return Ok(None);
+        };
+        let Some(index_state) = self.lookup_index.as_ref() else {
+            return Ok(None);
+        };
+        let pk_columns = &self.table_metadata.primary_key;
+        if pk_columns.is_empty()
+            || self.pk_deletion_strategy.is_position_based()
+            || (self.is_memory_resident_mode() && !self.mem_tier.is_empty())
+        {
+            return Ok(None);
+        }
+        let disjuncts = datafusion_expr::utils::split_binary(filter, Operator::Or);
+        if disjuncts.len() > MAX_VERIFIED_KEY_DELETE_DISJUNCTS {
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                disjuncts = disjuncts.len(),
+                "Key-verified delete declined: too many disjuncts; using the scan-based delete"
+            );
+            return Ok(None);
+        }
+
+        let mut key_conjunctions = Vec::with_capacity(disjuncts.len());
+        for disjunct in &disjuncts {
+            let conjuncts = datafusion_expr::utils::split_conjunction(disjunct);
+            let scalar_for = |column: &str| {
+                conjuncts
+                    .iter()
+                    .find_map(|conjunct| bare_column_scalar_for(conjunct, column))
+            };
+            if index_state.matched_shape(&scalar_for).is_none() {
+                tracing::debug!(
+                    table = %self.table_metadata.table_name,
+                    "Key-verified delete declined: a disjunct does not pin an indexed key; using the scan-based delete"
+                );
+                return Ok(None);
+            }
+            let mut key_terms = Vec::with_capacity(pk_columns.len());
+            for pk_column in pk_columns {
+                let Some(term) = conjuncts
+                    .iter()
+                    .find(|conjunct| bare_column_scalar_for(conjunct, pk_column).is_some())
+                else {
+                    return Ok(None);
+                };
+                key_terms.push((*term).clone());
+            }
+            let Some(key_conjunction) = datafusion_expr::utils::conjunction(key_terms) else {
+                return Ok(None);
+            };
+            key_conjunctions.push(key_conjunction);
+        }
+
+        let ctx = self.create_session_context();
+        let table: Arc<dyn TableProvider> = Arc::new(self.clone_for_write());
+        let key_columns: Vec<Expr> = pk_columns
+            .iter()
+            .map(|name| Expr::Column(datafusion_common::Column::new_unqualified(name)))
+            .collect();
+        let frames = disjuncts
+            .iter()
+            .map(|disjunct| {
+                ctx.read_table(Arc::clone(&table))?
+                    .filter((*disjunct).clone())?
+                    .select(key_columns.clone())
+            })
+            .collect::<datafusion_common::Result<Vec<_>>>()?;
+        let counts: Vec<usize> = stream::iter(frames)
+            .map(datafusion::dataframe::DataFrame::count)
+            .buffered(VERIFIED_KEY_DELETE_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        let mut matched_rows: u64 = 0;
+        let mut matched_keys = Vec::new();
+        for (key_conjunction, count) in key_conjunctions.into_iter().zip(counts) {
+            if count > 0 {
+                matched_rows = matched_rows.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                matched_keys.push(key_conjunction);
+            }
+        }
+        Ok(Some(VerifiedKeyDelete {
+            key_filter: datafusion_expr::utils::disjunction(matched_keys),
+            matched_rows,
+        }))
     }
 }
 

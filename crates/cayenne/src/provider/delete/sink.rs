@@ -939,7 +939,14 @@ impl CayenneDeletionSink {
             }
         }
 
-        let physical_filters = self.build_physical_filters(&coerced_filters)?;
+        // Read only what the delete needs: the primary key and the columns the
+        // filters reference, with the filters pushed into the scan so it can prune.
+        // The filters are still applied to every returned batch, so a pruned or
+        // inexactly filtered scan removes exactly the rows it would unfiltered;
+        // what it no longer does is decode every column of every row (a caching
+        // table's `content` payload dominates) for each replaced key.
+        let (projection, projected_sink) = self.delete_scan_projection(&coerced_filters)?;
+        let physical_filters = projected_sink.build_physical_filters(&coerced_filters)?;
 
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
@@ -949,7 +956,10 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
                 for source in tables {
-                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -966,7 +976,8 @@ impl CayenneDeletionSink {
                         // One bloom-prefiltered probe per row: no second scan, and nothing
                         // held that the raw scan did not already hold.
                         pending_pk_values.extend(
-                            self.extract_int64_pk_values(&batch)?
+                            projected_sink
+                                .extract_int64_pk_values(&batch)?
                                 .into_iter()
                                 .filter(|pk| self.is_live_int64_pk(*pk, source)),
                         );
@@ -1021,7 +1032,10 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
                 for source in tables {
-                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
+                    let scan_plan = source
+                        .table
+                        .scan(&ctx.state(), Some(&projection), &coerced_filters, None)
+                        .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -1034,7 +1048,8 @@ impl CayenneDeletionSink {
                         // See the Int64 branch: this snapshot's threshold is what tells
                         // a superseded version from the row that replaced it.
                         pending_row_keys.extend(
-                            self.extract_row_keys(&batch, row_converter)?
+                            projected_sink
+                                .extract_row_keys(&batch, row_converter)?
                                 .into_iter()
                                 .filter(|key| self.is_live_row_key(key, source)),
                         );
@@ -1193,6 +1208,39 @@ impl CayenneDeletionSink {
         }
 
         Ok(coerced_filters)
+    }
+
+    /// The scan projection for a filtered delete (primary-key columns plus every
+    /// column the filters reference, in schema order) and a copy of this sink whose
+    /// schema and primary-key indices address the projected batches.
+    fn delete_scan_projection(&self, filters: &[Expr]) -> super::super::Result<(Vec<usize>, Self)> {
+        let mut projection: Vec<usize> = self.pk_column_indices.clone();
+        for filter in filters {
+            for column in filter.column_refs() {
+                projection.push(self.schema.index_of(column.name())?);
+            }
+        }
+        projection.sort_unstable();
+        projection.dedup();
+        let pk_column_indices = self
+            .pk_column_indices
+            .iter()
+            .map(|idx| {
+                projection
+                    .binary_search(idx)
+                    .map_err(|_| Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Primary-key column missing from the delete scan projection"
+                            .to_string(),
+                    })
+            })
+            .collect::<super::super::Result<Vec<_>>>()?;
+        let projected_sink = Self {
+            schema: Arc::new(self.schema.project(&projection)?),
+            pk_column_indices,
+            ..self.clone()
+        };
+        Ok((projection, projected_sink))
     }
 
     fn build_physical_filters(
