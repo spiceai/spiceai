@@ -584,7 +584,7 @@ dependencies = [
  "strum_macros 0.27.2",
  "thiserror 2.0.18",
  "uuid 1.23.2",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -855,7 +855,7 @@ dependencies = [
  "arrow-select",
  "flatbuffers",
  "lz4_flex 0.14.0",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -4391,8 +4391,8 @@ dependencies = [
  "flate2",
  "liblzma",
  "memchr",
- "zstd 0.13.5",
- "zstd-safe 7.4.1",
+ "zstd 0.13.3",
+ "zstd-safe 7.2.4",
 ]
 
 [[package]]
@@ -6042,9 +6042,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.8"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
+checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
 dependencies = [
  "cmov",
 ]
@@ -6525,7 +6525,7 @@ dependencies = [
  "uuid 1.23.2",
  "wiremock",
  "zip 9.1.2",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -6614,7 +6614,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid 1.23.2",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -6738,7 +6738,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -10282,7 +10282,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-util",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -10585,7 +10585,7 @@ dependencies = [
  "url",
  "uuid 1.23.2",
  "zeroize",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -13217,7 +13217,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "uuid 1.23.2",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -14651,7 +14651,7 @@ dependencies = [
  "snafu",
  "snap",
  "tokio",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -14873,7 +14873,7 @@ dependencies = [
  "snap",
  "tokio",
  "twox-hash",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -21369,7 +21369,7 @@ dependencies = [
  "tantivy-bitpacker",
  "tantivy-common",
  "tantivy-fst",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -24440,7 +24440,7 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-session",
- "zstd 0.13.5",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -26198,11 +26198,11 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.13.5"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50adf04cf3ec914b0b9905c9dde90c80fe74bfd701e331fc80a39c512c525278"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
 dependencies = [
- "zstd-safe 7.4.1",
+ "zstd-safe 7.2.4",
 ]
 
 [[package]]
@@ -26216,9 +26216,9 @@ dependencies = [
 
 [[package]]
 name = "zstd-safe"
-version = "7.4.1"
+version = "7.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498d94ad68720c89b4fbe41b9090850651e68cb2dd9210ce7ffbff3a94653819"
+checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
 dependencies = [
  "zstd-sys",
 ]
