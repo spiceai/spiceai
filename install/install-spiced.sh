@@ -3,16 +3,14 @@
 set -e
 
 # colors
-blue="\033[0;94m"
-white="\033[0;97m"
 yellow="\033[0;33m"
 reset="\033[0m"
 
 # Spice Runtime location
-: ${SPICED_INSTALL_DIR:="/usr/local/bin"}
+: "${SPICED_INSTALL_DIR:="/usr/local/bin"}"
 
 # sudo is required to copy binary to SPICE_INSTALL_DIR for linux
-: ${USE_SUDO:="false"}
+: "${USE_SUDO:="false"}"
 
 # Http request CLI
 SPICE_HTTP_REQUEST_CLI=curl
@@ -21,16 +19,19 @@ SPICE_HTTP_REQUEST_CLI=curl
 GITHUB_ORG=spiceai
 GITHUB_REPO=spiceai
 
+# Where this installer is served, for the commands its messages suggest
+SPICE_INSTALLER_URL=https://install.spiceai.org/install-spiced.sh
+
 # Spice Runtime filename
 SPICED_FILENAME=spiced
 
 # Variant options: "" (default, includes models), "cuda", "metal"
 # The default distribution now includes models, so no separate variant suffix needed
-: ${VARIANT:=""}
+: "${VARIANT:=""}"
 
 # CUDA version: "80", "86", "87", "89", "90"
 # Only used when VARIANT is "cuda"
-: ${CUDA_VERSION:=""}
+: "${CUDA_VERSION:=""}"
 
 # Retry configuration
 MAX_RETRIES=3
@@ -135,7 +136,163 @@ checkHttpRequestCLI() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# Download verification. This block is identical in install.sh and
+# install-spiced.sh; test/scripts/install-scripts-test.sh fails when they differ.
+# -----------------------------------------------------------------------------
 
+# Release attestations are signed by build_release.yml running on a release branch.
+SPICE_ATTESTATION_SIGNER='^https://github\.com/spiceai/spiceai/\.github/workflows/build_release\.yml@refs/heads/release/'
+
+# Saves a URL to a file, sending GITHUB_TOKEN when it is set. Fails on an HTTP error. A request
+# that times out or gets a 408, 429 or 5xx is tried up to 3 more times, a second apart, so a
+# brief GitHub error doesn't stop the install. A 404, such as the SHA256SUMS of a release
+# without one, is not retried.
+verifyFetch() {
+    local url="$1"
+    local out="$2"
+    local auth=()
+    local retry=()
+
+    if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+        fi
+        curl --fail -sSL --retry 3 --retry-delay 1 "${auth[@]}" "$url" -o "$out"
+    else
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            auth=(--header="Authorization: Bearer $GITHUB_TOKEN")
+        fi
+        # GNU wget retries an HTTP error only when told which. BusyBox wget can't, and makes one try.
+        case "$(wget --help 2>&1)" in
+            *--retry-on-http-error*) retry=(--tries=4 --waitretry=1 "--retry-on-http-error=408,429,500,502,503,504") ;;
+        esac
+        wget -q "${retry[@]}" "${auth[@]}" -O "$out" "$url"
+    fi
+}
+
+# Prints the sha256 of a file with sha256sum, shasum or openssl, whichever is installed.
+# The file goes in on stdin: given a path with a backslash in it, sha256sum and shasum prefix
+# their output with one, and the parsed sha256 would never match.
+sha256Of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum < "$1" | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 < "$1" | awk '{ print $1 }'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 < "$1" | awk '{ print $NF }'
+    else
+        return 1
+    fi
+}
+
+# Exits, before anything is installed, unless a downloaded release asset matches the sha256
+# its release records for it: the release's SHA256SUMS, or for releases published before
+# SHA256SUMS, the sha256 GitHub recorded when the asset was uploaded. That fallback is taken
+# only when the release's asset list confirms it has no SHA256SUMS. A release with
+# SHA256SUMS also has build attestations, which are checked when the GitHub CLI is logged in.
+# SPICE_INSTALL_ALLOW_UNVERIFIED=1 installs an asset that cannot be checked at all; it never
+# installs one whose check fails.
+#   $1 downloaded file, $2 asset name, $3 release tag, $4 empty scratch directory
+verifyDownload() {
+    local file="$1"
+    local asset="$2"
+    local tag="$3"
+    local scratch="$4"
+    local download_url="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download/${tag}/SHA256SUMS"
+    local api_url="https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases/tags/${tag}"
+    local expected=""
+    local actual=""
+    local source=""
+    local reason=""
+    local attested=false
+
+    # What the release records comes first, so that an asset its SHA256SUMS does not list, or a
+    # release with SHA256SUMS, is refused even when no hash tool works.
+    if verifyFetch "$download_url" "$scratch/SHA256SUMS" 2>/dev/null; then
+        attested=true
+        source="SHA256SUMS of release $tag"
+        expected=$(awk -v f="$asset" '$2 == f || $2 == "*" f { print $1; exit }' "$scratch/SHA256SUMS")
+        if [ -z "$expected" ]; then
+            echo "Cannot install $asset: the SHA256SUMS of release $tag does not list it."
+            echo "Nothing was installed."
+            exit 1
+        fi
+    elif verifyFetch "$api_url" "$scratch/release.json" 2>/dev/null; then
+        # Pretty-printed or not, the JSON has one key per line once each comma is a line break.
+        # grep and awk read that from a file, not a pipe: under pipefail (SHELLOPTS can turn it on)
+        # a reader that stops at its first match would fail the pipeline when the writer gets
+        # SIGPIPE, and a listed SHA256SUMS would read as missing.
+        tr ',' '\n' < "$scratch/release.json" > "$scratch/release.lines"
+        # The release lists SHA256SUMS when it has one. Then the download failed for another
+        # reason, and the GitHub digest would skip the attestation check, so stop instead.
+        if grep -Eq '"name"[[:space:]]*:[[:space:]]*"SHA256SUMS"' "$scratch/release.lines"; then
+            echo "Cannot verify $asset: release $tag publishes SHA256SUMS, but downloading it failed ($download_url)."
+            echo "Try again later. Nothing was installed."
+            exit 1
+        fi
+        source="sha256 GitHub recorded for $asset in release $tag"
+        expected=$(awk -v f="\"$asset\"" '
+            /"name"[[:space:]]*:/ { found = (index($0, f) > 0); next }
+            found && /"digest"[[:space:]]*:/ {
+                if (match($0, /sha256:[0-9a-fA-F]+/)) { print substr($0, RSTART + 7, RLENGTH - 7) }
+                exit
+            }' "$scratch/release.lines")
+        if [ -z "$expected" ]; then
+            reason="release $tag has no SHA256SUMS, and GitHub recorded no sha256 for $asset"
+        fi
+    else
+        reason="the SHA256SUMS of release $tag could not be downloaded, and the GitHub API request for its asset sha256 failed (set GITHUB_TOKEN if the API rate limit was exceeded)"
+    fi
+
+    if [ -z "$reason" ] && { ! actual=$(sha256Of "$file") || [ -z "$actual" ]; }; then
+        # A release with SHA256SUMS can always be checked, so the opt-out does not cover it.
+        if [ "$attested" == "true" ]; then
+            echo "Cannot verify $asset: release $tag publishes SHA256SUMS, but none of sha256sum, shasum or openssl is installed."
+            echo "Install one of them and run the installer again. Nothing was installed."
+            exit 1
+        fi
+        reason="none of sha256sum, shasum or openssl is installed"
+    fi
+
+    if [ -n "$reason" ]; then
+        if [ "${SPICE_INSTALL_ALLOW_UNVERIFIED:-}" == "1" ]; then
+            echo -e "${yellow}Warning:${reset} installing $asset unverified, because SPICE_INSTALL_ALLOW_UNVERIFIED=1 is set: $reason."
+            return 0
+        fi
+        echo "Cannot verify $asset: $reason."
+        echo "To install it without verification, run the installer with SPICE_INSTALL_ALLOW_UNVERIFIED=1, e.g.:"
+        echo "  curl -fsSL $SPICE_INSTALLER_URL | SPICE_INSTALL_ALLOW_UNVERIFIED=1 bash -s ${tag#v}"
+        echo "Nothing was installed."
+        exit 1
+    fi
+
+    expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+    if [ "$actual" != "$expected" ]; then
+        echo "Checksum mismatch for $asset:"
+        echo "  expected sha256 $expected ($source)"
+        echo "  downloaded      $actual"
+        echo "The download is corrupt or was altered. Nothing was installed."
+        exit 1
+    fi
+    echo "Verified the sha256 of $asset against the $source."
+
+    if [ "$attested" == "true" ]; then
+        if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+            if ! gh attestation verify "$file" --repo "${GITHUB_ORG}/${GITHUB_REPO}" \
+                --cert-identity-regex "$SPICE_ATTESTATION_SIGNER" --deny-self-hosted-runners \
+                > "$scratch/attestation.log" 2>&1; then
+                echo "The build attestation of $asset did not verify:"
+                cat "$scratch/attestation.log"
+                echo "Nothing was installed."
+                exit 1
+            fi
+            echo "Verified the build attestation of $asset."
+        else
+            echo "Skipped the build attestation check of $asset: the GitHub CLI (gh) is not installed or not logged in."
+        fi
+    fi
+}
 
 getLatestRelease() {
     local spiceReleaseUrl="https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest"
@@ -260,6 +417,9 @@ downloadFile() {
     fi
     
     echo "Download completed successfully"
+
+    mkdir -p "$SPICE_TMP_ROOT/verify"
+    verifyDownload "$ARTIFACT_TMP_FILE" "$SPICED_ARTIFACT" "$LATEST_RELEASE_TAG" "$SPICE_TMP_ROOT/verify"
 }
 
 installFile() {
