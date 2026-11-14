@@ -338,6 +338,45 @@ class PinActionsToShaTest(unittest.TestCase):
         ).replace(entry(f"actions/cache@{CACHE}", "v5.0.3", CACHE), entry(f"actions/cache@{CACHE}", "v5", CACHE))
         self.assertEqual(self.read(LOCK), expected)
 
+    def test_an_entry_a_remote_manifest_names_by_tag_keeps_its_key(self) -> None:
+        # actions/github-script's own action.yml names actions/cache@v5.0.3, and
+        # the runner looks that edge up as written: renaming it would break the
+        # composite. A workflow naming it too gets a commit-keyed copy.
+        def lockfile(script_uses: str, cache_entries: str, root: str = "") -> str:
+            text = LOCK_TAGS.replace(
+                entry("actions/github-script@v9.0.0", "v9.0.0", GITHUB_SCRIPT, (f"actions/cache@{CACHE}",)),
+                entry("actions/github-script@v9.0.0", "v9.0.0", GITHUB_SCRIPT, (script_uses,)),
+            ).replace(entry(f"actions/cache@{CACHE}", "v5.0.3", CACHE), cache_entries)
+            return text.replace("        - 'actions/checkout@v7.0.1'\n", f"{root}        - 'actions/checkout@v7.0.1'\n", 1)
+
+        tag_entry = entry("actions/cache@v5.0.3", "v5.0.3", CACHE)
+        checkout_pinned = entry(f"actions/checkout@{CHECKOUT}", "v7.0.1", CHECKOUT)
+        script_pinned = entry(f"actions/github-script@{GITHUB_SCRIPT}", "v9.0.0", GITHUB_SCRIPT, ("actions/cache@v5.0.3",))
+        pinned = LOCK_PINNED.replace(
+            entry(f"actions/github-script@{GITHUB_SCRIPT}", "v9.0.0", GITHUB_SCRIPT, (f"actions/cache@{CACHE}",)),
+            script_pinned,
+        )
+
+        with self.subTest("named only by the manifest"):
+            repo(self.root, WORKFLOW_TAGS, ACTION_TAGS, lockfile("actions/cache@v5.0.3", tag_entry))
+            self.assertEqual(run(self.root)[0], 0)
+            expected = pinned.replace(entry(f"actions/cache@{CACHE}", "v5.0.3", CACHE), "")
+            self.assertEqual(self.read(LOCK), expected.replace(checkout_pinned, tag_entry + checkout_pinned))
+            self.assertEqual(run(self.root, "--check")[:2], (0, f"Every remote `uses:` is pinned to a full-length commit SHA, and {LOCK} is keyed by it.\n"))
+
+        self.tearDown()
+        self.setUp()
+        with self.subTest("named by the manifest and by a workflow"):
+            workflow = WORKFLOW_TAGS.replace("      - name: Analyze\n", "      - uses: actions/cache@v5.0.3\n      - name: Analyze\n")
+            repo(self.root, workflow, ACTION_TAGS, lockfile("actions/cache@v5.0.3", tag_entry, "        - 'actions/cache@v5.0.3'\n"))
+            self.assertEqual(run(self.root)[0], 0)
+            self.assertIn(f"      - uses: actions/cache@{CACHE} # v5.0.3\n", self.read(WORKFLOW))
+            expected = pinned.replace(
+                "    '.github/workflows/ci.yml':\n", f"    '.github/workflows/ci.yml':\n        - 'actions/cache@{CACHE}'\n"
+            ).replace(checkout_pinned, tag_entry + checkout_pinned)
+            self.assertEqual(self.read(LOCK), expected)
+            self.assertEqual(run(self.root, "--check")[0], 0)
+
     def test_entries_that_disagree_on_more_than_their_ref_write_nothing(self) -> None:
         lockfile = LOCK_TAGS.replace(
             entry("actions/checkout@v7.0.1", "v7.0.1", CHECKOUT),

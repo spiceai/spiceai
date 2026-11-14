@@ -29,6 +29,8 @@ Run this script after `gh actions-lock`. It replaces each tag in a `uses:` with
 the commit the lockfile locks for it, moves the tag to the comment, and re-keys
 the entry by the commit. The entry keeps the tag as its `ref:`, the form
 `gh actions-lock` itself writes for an action a composite action pins by SHA.
+An entry that a locked action's own manifest names by tag keeps that tag key as
+well, because the runner looks that edge up as the manifest writes it.
 
     gh actions-lock                          # update .github/workflows/actions.lock
     python3 scripts/pin_actions_to_sha.py    # put the SHAs back, in both places
@@ -160,11 +162,19 @@ class Lockfile:
             pins += [(f"dependencies: {key} uses", m["pin"]) for line in body if (m := LOCK_USES_ITEM.match(line))]
         return pins
 
-    def rekey_by_commit(self) -> None:
-        """Key every tag-keyed entry by the commit it locks, and point every reference at the new key.
+    def transitive_pins(self) -> set[str]:
+        """Each pin a locked action's own manifest names: the `uses:` edges of the entries."""
+        return {m["pin"] for body in self.dependencies.values() for line in body if (m := LOCK_USES_ITEM.match(line))}
 
-        The entry keeps the tag as its `ref:`. Two entries that land on one key lock one commit, so they
-        can differ only in the tag they record; the one already keyed by the commit is kept.
+    def rekey_by_commit(self) -> None:
+        """Key every pin this repository's own files name by the commit it locks.
+
+        A workflow's roots are named by this repository's workflows and actions, which this script pins
+        by SHA, so each tag-keyed root entry moves to its commit key and keeps the tag as its `ref:`. An
+        entry's `uses:` edges mirror a remote action's manifest, which the runner reads as written, so
+        they are never rewritten, and an entry such a manifest names by tag keeps that key. An entry
+        named both ways is kept under both keys. Two entries that land on one key lock one commit, so
+        they can differ only in the tag they record; the one already keyed by the commit is kept.
         """
         renames = {}
         for key in self.dependencies:
@@ -174,35 +184,34 @@ class Lockfile:
                 if sha is None:
                     raise LockfileError(f"{LOCKFILE}: entry {key} records no commit")
                 renames[key] = f"{repo}@{sha}"
+        transitive = self.transitive_pins()
+        roots = {pin for path in self.workflows for pin in self.workflow_pins(path)}
 
-        def renamed(body: list[str], pattern: re.Pattern[str], indent: str) -> list[str]:
-            """`body` with each run of list items renamed, de-duplicated and sorted as the tool writes them."""
-            out: list[str] = []
-            run: set[str] = set()
-            for line in [*body, ""]:
-                if match := pattern.match(line):
-                    run.add(renames.get(match["pin"], match["pin"]))
-                    continue
-                out += [f"{indent}- '{pin}'" for pin in sorted(run)]
-                run = set()
-                if line:
-                    out.append(line)
-            return out
+        def renamed(body: list[str]) -> list[str]:
+            """A workflow's roots renamed, de-duplicated and sorted as the tool writes them."""
+            pins = sorted({renames.get(m["pin"], m["pin"]) for line in body if (m := LOCK_LIST_ITEM.match(line))})
+            return [f"        - '{pin}'" for pin in pins]
 
-        self.workflows = {path: renamed(body, LOCK_LIST_ITEM, " " * 8) for path, body in self.workflows.items()}
+        self.workflows = {path: renamed(body) for path, body in self.workflows.items()}
         dependencies: dict[str, list[str]] = {}
         for key in sorted(self.dependencies, key=lambda k: k in renames):
-            body = renamed(self.dependencies[key], LOCK_USES_ITEM, " " * 12)
-            new_key = renames.get(key, key)
-            if new_key in dependencies:
-                kept = [line for line in dependencies[new_key] if not line.startswith("        ref:")]
-                if kept != [line for line in body if not line.startswith("        ref:")]:
-                    raise LockfileError(
-                        f"{LOCKFILE}: entries {key} and {new_key} lock one commit but record different "
-                        "dependencies; run `gh actions-lock --relock` to rebuild them"
-                    )
-                continue
-            dependencies[new_key] = body
+            body = self.dependencies[key]
+            if key not in renames:
+                keys = [key]
+            elif key not in transitive:
+                keys = [renames[key]]
+            else:
+                keys = [key, renames[key]] if key in roots else [key]
+            for new_key in keys:
+                if new_key in dependencies:
+                    kept = [line for line in dependencies[new_key] if not line.startswith("        ref:")]
+                    if kept != [line for line in body if not line.startswith("        ref:")]:
+                        raise LockfileError(
+                            f"{LOCKFILE}: entries {key} and {new_key} lock one commit but record different "
+                            "dependencies; run `gh actions-lock --relock` to rebuild them"
+                        )
+                    continue
+                dependencies[new_key] = body
         self.dependencies = dependencies
 
     def render(self) -> str:
@@ -345,8 +354,9 @@ def problems(root: Path, lock: Lockfile, files: list[ActionFile]) -> list[str]:
                 found.append(f"{where} has no {LOCKFILE} pin {uses.key} under {relative}")
             elif not in_workflows and uses.key not in lock.dependencies:
                 found.append(f"{where} has no {LOCKFILE} entry {uses.key}")
+    transitive = lock.transitive_pins()
     for key in lock.dependencies:
-        if not is_full_sha(key.rsplit("@", 1)[1]):
+        if not is_full_sha(key.rsplit("@", 1)[1]) and key not in transitive:
             found.append(f"{LOCKFILE}: dependencies: {key} is keyed by a tag, not the commit it locks")
     for where, pin in lock.referenced_pins():
         if pin not in lock.dependencies:
