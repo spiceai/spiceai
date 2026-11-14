@@ -1202,6 +1202,41 @@ two halves. The table at the end gives the reason for each rule.
   timer. The orphan sweep skips them.
 - Attempt evidence is kept for the evidence horizon, T_O.
 
+**Log objects below the floor: implemented in the prototype.** When a
+checkpoint's floor is published, the batches it covers, the payloads their
+records spilled and the previous checkpoint leave the head. The head log's
+`Collector` (`crates/object_store_occ/src/headlog/collect.rs`) deletes them
+once no log reader can still need them, by a rule that needs no durable
+removal list:
+
+- It notes each floor it has not seen with the head's commit, and stamps it
+  with the `LastModified` of a later head with a higher commit: that head was
+  written on a base holding the floor, so after the floor was published. (The
+  head that first shows the floor can carry an earlier time: a store may set
+  `LastModified` when an upload starts, and the local store stamps the staged
+  file before its rename.) It deletes below the floor once a later head's
+  `LastModified` is a retention past the stamp.
+  A reader that read an older head read it before the floor was published, so
+  it has had at least the retention to fetch what that head lists.
+- A restarted collector knows no stamps; it stamps the current floor afresh.
+  That stamp is later than the lost ones, so a restart delays deletion by at
+  most a retention and never hastens it.
+- It deletes by name: batches starting at or below the floor (a floor is a
+  batch end), spilled payloads at or below it (named `records/<commit>-<attempt>`),
+  and checkpoints below it. The current checkpoint carries the attempt evidence,
+  so resolving an uncertain commit never needs a deleted object.
+- Only cold opens and polls read these objects, so the retention is shorter
+  than T (`DEFAULT_RETENTION`, ten minutes). A cold open that finds a listed
+  object gone while the floor has moved starts over from the newer head; it
+  returns that head's state, never a mix. The catalog runs one collection per
+  log at a time beside its commits, after each checkpoint.
+- Model: `window-storage` (deletion, a reader of an older head, a collector
+  restart) and the `window-storage-gc-early` control, which deletes without
+  waiting and fails I7. Its traces replay against the collector.
+
+Objects a record's actions reference (data files, `objects/blobs/…`) are not
+log objects: they follow the rules above and [#15818](https://github.com/spiceai/spiceai/issues/15818).
+
 **What a query is guaranteed.** **Readers never write.** A query starts from a
 state confirmed current within S, **counted from when the confirming GET was
 sent**. Every object that state references was live at the confirmation, so GC
