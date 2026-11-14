@@ -37,6 +37,7 @@ dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
+datafusion-datasource-csv.workspace = true
 datafusion-federation = { workspace = true }
 # `federation` is always on: `crate::federation` needs the `impl SQLExecutor for
 # SqlTable` it gates, and the unparser guards in `src/federation.rs` must run in a
