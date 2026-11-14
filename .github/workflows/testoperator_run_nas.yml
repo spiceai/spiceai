@@ -23,6 +23,9 @@ on:
         type: boolean
         default: false
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-nas-bench:
     name: Run network-attached storage benchmark tests

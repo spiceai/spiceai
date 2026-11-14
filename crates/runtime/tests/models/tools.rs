@@ -50,14 +50,17 @@ mod mcp {
     /// The `store_memory` tool's error for a read-only API key.
     const READ_ONLY_STORE_MEMORY_REJECTION: &str = "Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth";
 
-    /// Test that spiced can run a stdio MCP server.
+    /// Test that spiced can run a stdio MCP server, and exposes its tool under the server's name.
+    ///
+    /// The image is pinned by digest because the snapshot records the tool's whole schema, and
+    /// `mcp/fetch:latest` rewords its descriptions between releases.
     #[tokio::test]
     async fn test_mcp_stdio() -> Result<(), anyhow::Error> {
         let tool_yaml = r"
 name: mcp_fetch
 from: mcp:docker
 params:
-  mcp_args: run -i --rm mcp/fetch
+  mcp_args: run -i --rm mcp/fetch@sha256:1a7a0996a565a0b8ca5c41b42830d4e5f334d33f851596bbd9debb2beedb22d3
 ";
         let http_base_url = start_spiced_with_tools(vec![
             yaml::from_str(tool_yaml).expect("Tool spicepod component is not in expected format"),
@@ -69,8 +72,8 @@ params:
 
         let mcp_fetch = tools_list
             .into_iter()
-            .find(|t| t.get("name") == Some(&Value::String("mcp_fetch/fetch".to_string())))
-            .expect("'mcp_fetch' tool not found");
+            .find(|t| t.get("name") == Some(&Value::String("mcp_fetch__fetch".to_string())))
+            .expect("'mcp_fetch__fetch' tool not found");
 
         assert_snapshot!("mcp_fetch_list", mcp_fetch);
 
