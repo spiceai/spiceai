@@ -303,6 +303,11 @@ pub enum Error {
         path: Option<String>,
     },
 
+    /// `acceleration.partition_by` on a file-mode dataset with
+    /// `runtime.params.cayenne_vnext` enabled.
+    #[snafu(display("{}", partition_by_under_vnext_refusal(dataset)))]
+    PartitionByUnderVnextRefused { dataset: Arc<str> },
+
     #[snafu(display(
         "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
     ))]
@@ -1507,6 +1512,16 @@ fn object_store_data_path_refusal(dataset: &str, path: Option<&str>) -> String {
     )
 }
 
+/// The text of [`Error::PartitionByUnderVnextRefused`]: with `runtime.params.cayenne_vnext`
+/// enabled, a file-mode dataset cannot set `partition_by` yet.
+fn partition_by_under_vnext_refusal(dataset: &str) -> String {
+    format!(
+        "Failed to load dataset '{dataset}' (cayenne): `acceleration.partition_by` is not supported yet with `runtime.params.cayenne_vnext` enabled. \
+        Remove `partition_by` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 /// The `SQLite` database a Cayenne metastore lives in, inside its metadata
 /// directory. Every metastore connection string in this file ends in this name.
 const METASTORE_DB_FILE: &str = "cayenne.db";
@@ -1930,6 +1945,28 @@ impl CayenneAccelerator {
             .fail(),
             None => Ok(()),
         }
+    }
+
+    /// Refuses a file-mode dataset that sets `partition_by` while
+    /// `runtime.params.cayenne_vnext` is enabled outside a cluster. The object-native
+    /// metastore does not hold partitioned tables, and such a table, kept on SQLite
+    /// with its data files read and written through the local object store, misses
+    /// rows its change stream applied (#16308). A cluster scheduler or executor keeps
+    /// every dataset on SQLite under the flag and is not refused.
+    fn ensure_partition_by_supported(&self, source: &dyn AccelerationSource) -> Result<()> {
+        let partitioned = source
+            .acceleration()
+            .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
+        if !partitioned || !source.is_file_accelerated() || self.cluster_role.is_some() {
+            return Ok(());
+        }
+        ensure!(
+            !Self::vnext_enabled(source)?,
+            PartitionByUnderVnextRefusedSnafu {
+                dataset: Arc::from(source.name().to_string()),
+            }
+        );
+        Ok(())
     }
 
     fn resolve_auto_s3_data_path(
@@ -3176,9 +3213,9 @@ impl CayenneAccelerator {
     /// object-native metastore is left as it is. With the flag on, a new dataset goes
     /// to the object-native metastore and one already on SQLite is an error naming
     /// the dataset and the fix, except under `mode: file_create`, which recreates it
-    /// from its source in the object-native metastore. A partitioned dataset, and
-    /// every dataset of a cluster scheduler or executor, stays on SQLite under the
-    /// flag.
+    /// from its source in the object-native metastore. Every dataset of a cluster
+    /// scheduler or executor stays on SQLite under the flag; outside a cluster a
+    /// partitioned dataset is refused under it.
     async fn metastore_type_for(
         &self,
         source: &dyn AccelerationSource,
@@ -3189,6 +3226,7 @@ impl CayenneAccelerator {
             return Ok("sqlite");
         }
         let requested = Self::vnext_enabled(source)?;
+        self.ensure_partition_by_supported(source)?;
         // A cluster scheduler or executor keeps SQLite under the flag. The
         // executors of a cluster share `runtime.state.location`, while the
         // object-native metastore allows one writer per dataset log, so each
@@ -3202,7 +3240,7 @@ impl CayenneAccelerator {
         let partitioned = source
             .acceleration()
             .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
-        if vnext && !partitioned {
+        if vnext {
             let location_supported = url::Url::parse(
                 &effective_state_location(&source.app())?.location,
             )
@@ -3238,13 +3276,8 @@ impl CayenneAccelerator {
                 .catalog_holds(metadata_dir, "sqlite", source, &table_name)
                 .await?;
         if in_sqlite {
-            // A partitioned dataset stays on SQLite under the flag (below), so
-            // finding it there is where it belongs, not an acceleration to move.
-            if partitioned && vnext {
-                self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support `partition_by` yet.");
-            }
             ensure!(
-                !vnext || recreated || partitioned,
+                !vnext || recreated,
                 InvalidConfigurationSnafu {
                     detail: Arc::from(format!(
                         "Dataset '{table_name}' is accelerated in the SQLite Cayenne metastore, but `runtime.params.{CAYENNE_VNEXT_PARAM}` is enabled, and an existing acceleration is not moved to the object-native metastore. Set `runtime.params.{CAYENNE_VNEXT_PARAM}: disabled` to keep serving it, or start it once with `acceleration.mode: file_create` to reload it from its source into the object-native metastore."
@@ -3273,21 +3306,18 @@ impl CayenneAccelerator {
                 }
             );
         }
-        if partitioned {
-            // The object-native metastore does not hold partitioned tables yet.
-            // One already in it is refused rather than moved to a new, empty
-            // SQLite table that would strand its rows.
-            ensure!(
-                !in_native,
-                InvalidConfigurationSnafu {
-                    detail: Arc::from(format!(
-                        "Dataset '{table_name}' is in the object-native Cayenne metastore, which does not support `partition_by` yet. Remove `partition_by` to keep serving it, or delete its acceleration so it rebuilds on SQLite."
-                    )),
-                }
-            );
-            self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support `partition_by` yet.");
-            return Ok("sqlite");
-        }
+        // The object-native metastore does not hold partitioned tables yet. One that
+        // gained `partition_by` while in it (outside a cluster it is refused above
+        // with the flag on) is refused rather than moved to a new, empty SQLite table
+        // that would strand its rows.
+        ensure!(
+            !partitioned,
+            InvalidConfigurationSnafu {
+                detail: Arc::from(format!(
+                    "Dataset '{table_name}' is in the object-native Cayenne metastore, which does not support `partition_by` yet. Remove `partition_by` to keep serving it, or delete its acceleration so it rebuilds on SQLite."
+                )),
+            }
+        );
         // `mode: file_create` with the flag disabled drops the object-native copy
         // and recreates the table, which then lands in SQLite.
         Ok("object_native")
@@ -4971,6 +5001,7 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         Self::ensure_data_path_supported(source)?;
+        self.ensure_partition_by_supported(source)?;
         if let Some(acceleration) = source.acceleration() {
             // Validate S3 Express One Zone configuration - only one method allowed
             let has_s3_zone_ids = acceleration.params.contains_key("cayenne_s3_zone_ids");
@@ -7669,6 +7700,77 @@ mod tests {
                 .expect("a local data path loads with the flag off"),
             "/var/spice/data/orders/"
         );
+    }
+
+    /// With `runtime.params.cayenne_vnext` enabled outside a cluster, a file-mode
+    /// dataset that sets `partition_by` fails to load before anything is opened, with
+    /// a message naming the dataset and the fix. A cluster executor keeps it on
+    /// SQLite, and with the flag off, in memory mode, or without `partition_by` the
+    /// check lets it through.
+    #[tokio::test]
+    async fn partition_by_is_refused_under_the_flag() {
+        let partitioned = |flag: &str, mode: Mode| {
+            let mut source = data_path_source(flag, &[]);
+            source.set_acceleration(Acceleration {
+                engine: Engine::Cayenne,
+                mode,
+                partition_by: vec![spicepod::partitioning::PartitionedBy {
+                    name: "bucket".to_string(),
+                    expression: "bucket(4, id)".to_string(),
+                }],
+                ..Default::default()
+            });
+            source
+        };
+        let expected = "Failed to load dataset 'orders' (cayenne): `acceleration.partition_by` is not supported yet with `runtime.params.cayenne_vnext` enabled. Remove `partition_by` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
+
+        let source = partitioned("enabled", Mode::File);
+        let accelerator = CayenneAccelerator::new();
+        let error = accelerator
+            .validate_init(&source)
+            .await
+            .expect_err("partition_by is refused under the flag");
+        assert_eq!(error.to_string(), expected);
+        let error = accelerator
+            .metastore_type_for(&source, "/nonexistent/metadata")
+            .await
+            .expect_err("the metastore choice refuses it too");
+        assert_eq!(error.to_string(), expected);
+
+        let executor =
+            CayenneAccelerator::from_runtime_config(&data_accelerator_api::CayenneRuntimeConfig {
+                footer_cache_mb: None,
+                cluster_role: Some(runtime_component::ClusterRole::Executor),
+            });
+        executor
+            .ensure_partition_by_supported(&source)
+            .expect("a cluster executor is not refused");
+        assert_eq!(
+            executor
+                .metastore_type_for(&source, "/nonexistent/metadata")
+                .await
+                .expect("a cluster executor keeps a partitioned dataset"),
+            "sqlite"
+        );
+
+        for (source, why) in [
+            (
+                partitioned("disabled", Mode::File),
+                "a partitioned dataset loads with the flag off",
+            ),
+            (
+                partitioned("enabled", Mode::Memory),
+                "memory mode keeps no data files, so the flag does not apply",
+            ),
+            (
+                data_path_source("enabled", &[]),
+                "an unpartitioned dataset loads under the flag",
+            ),
+        ] {
+            accelerator
+                .ensure_partition_by_supported(&source)
+                .expect(why);
+        }
     }
 
     /// Under `runtime.params.cayenne_vnext`, a standard S3 data path is accepted so

@@ -83,6 +83,9 @@ on:
         type: boolean
         default: true
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-append:
     environment: ci

@@ -32,8 +32,15 @@ env:
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   test-management-api:
+    permissions:
+      contents: write  # push-snap-changes: git push of the snapshot-update branch, gh pr merge --auto
+      pull-requests: write  # push-snap-changes: gh pr create/close/list
+      actions: write  # approve_bot_pr_runs.sh: approve the pull_request runs held on its GITHUB_TOKEN push
     environment: ci
     name: Test Management API Integration
     runs-on: 'spiceai-macos'
