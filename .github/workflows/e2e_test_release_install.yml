@@ -22,7 +22,9 @@ on:
       - '.github/workflows/e2e_test_release_install.yml'
 
 env:
-  PREVIOUS_STABLE_VERSION: v1.11.4
+  # The newest v1.11 release. Released CLIs up to v2.4.2 look a version up only among the 30
+  # newest releases, so `spice install` of an older one fails with "Release not found".
+  PREVIOUS_STABLE_VERSION: v1.11.6
   PREVIEW_UPGRADE_VERSION: v2.0.0-rc.2
 
 jobs:
