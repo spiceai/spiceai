@@ -173,7 +173,7 @@ jobs:
   test-models:
     name: Test Models & AI
     needs: build
-    runs-on: spiceai-macos
+    runs-on: spiceai-macos-large
     # Holds the OpenAI and Anthropic workload identity federation IDs (`OPENAI_*` and
     # `ANTHROPIC_*` secrets).
     environment: ci
@@ -588,7 +588,7 @@ jobs:
     name: Test Bedrock Models
     needs: [build]
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
-    runs-on: spiceai-macos
+    runs-on: spiceai-macos-large
     # Holds the ARN of the IAM role the tests call Bedrock as (`AWS_BEDROCK_ROLE_ARN`).
     environment: ci
     permissions:
