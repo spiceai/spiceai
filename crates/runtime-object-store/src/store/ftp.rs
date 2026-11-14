@@ -21,7 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use bytes::Bytes;
-use futures::AsyncReadExt;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
@@ -31,8 +31,9 @@ use object_store::{
     GetOptions, GetResult, GetResultPayload, ObjectMeta, ObjectStore, PutOptions, PutResult,
     path::Path,
 };
-use suppaftp::AsyncFtpStream;
+use suppaftp::tokio::AsyncFtpStream;
 use suppaftp::types::FileType;
+use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
 
 use super::common::{
@@ -157,8 +158,13 @@ impl bb8::ManageConnection for FTPConnectionManager {
     fn has_broken(&self, conn: &mut Self::Connection) -> bool {
         // Use the underlying TCP stream as a simple, non-blocking health heuristic.
         // If we cannot obtain the peer address, treat the connection as broken so
-        // that the pool can proactively discard it.
-        conn.get_ref().peer_addr().is_err()
+        // that the pool can proactively discard it. The control socket sits behind
+        // an async lock that is uncontended here (the pool holds the only
+        // reference); if it cannot be taken without waiting, discard the
+        // connection rather than block.
+        conn.get_ref()
+            .now_or_never()
+            .is_none_or(|socket| socket.peer_addr().is_err())
     }
 }
 
@@ -424,12 +430,24 @@ impl FTPObjectStore {
     }
 }
 
-/// Read data from an FTP stream asynchronously
+/// Read `read_size` bytes starting at `start` from `location` on a single-use connection.
+///
+/// `read_to_eof` is set when the range ends at the file size. Such a download is read
+/// to end of file and finished: the server's completion reply is read, and a reply
+/// other than success fails the read, because the bytes received may be truncated.
+/// A range that ends before the file does is aborted with `ABOR` once `read_size` bytes
+/// have arrived; those bytes already hold the whole range, so a failed abort is only
+/// logged. So is a download that turns out longer than `read_size` (the file grew after
+/// its size was read): it is cut at `read_size`, the size the object reports.
+/// Both replies are awaited for at most `reply_timeout`, so an unresponsive server
+/// cannot hold the read.
 async fn read_ftp_data(
     mut client: AsyncFtpStream,
     location: String,
     start: usize,
     read_size: usize,
+    read_to_eof: bool,
+    reply_timeout: Duration,
 ) -> object_store::Result<Vec<u8>> {
     client
         .transfer_type(FileType::Binary)
@@ -442,16 +460,17 @@ async fn read_ftp_data(
         .map_err(|e| generic_error(STORE_NAME, e))?;
 
     let mut stream = client
-        .retr_as_stream(location)
+        .retr_as_stream(&location)
         .await
         .map_err(|e| generic_error(STORE_NAME, e))?;
 
     let mut result = Vec::with_capacity(read_size);
     let mut buf = vec![0; 4096];
     let mut total = 0;
+    let mut reached_eof = false;
 
     loop {
-        if total >= read_size {
+        if total > read_size || (total == read_size && !read_to_eof) {
             break;
         }
 
@@ -461,12 +480,42 @@ async fn read_ftp_data(
             .map_err(|e| generic_error(STORE_NAME, e))?;
 
         if n == 0 {
+            reached_eof = true;
             break;
         }
 
-        let bytes_to_take = (read_size - total).min(n);
+        let bytes_to_take = read_size.saturating_sub(total).min(n);
         result.extend_from_slice(&buf[..bytes_to_take]);
         total += n;
+    }
+
+    if reached_eof {
+        match tokio::time::timeout(reply_timeout, stream.finish()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(generic_error(STORE_NAME, e)),
+            Err(_) => {
+                return Err(generic_error(
+                    STORE_NAME,
+                    format!(
+                        "reading '{location}': the server did not confirm the download within {reply_timeout:?}"
+                    ),
+                ));
+            }
+        }
+    } else {
+        match tokio::time::timeout(reply_timeout, client.abort(stream)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    "FTP: aborting the rest of the download of '{location}' failed: {e}"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "FTP: the server did not acknowledge aborting the download of '{location}' within {reply_timeout:?}"
+                );
+            }
+        }
     }
 
     Ok(result)
@@ -545,6 +594,8 @@ impl ObjectStore for FTPObjectStore {
             location_string,
             start as usize,
             data_to_read as usize,
+            end == size,
+            self.inner.config.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
         )
         .await?;
 
@@ -688,5 +739,183 @@ mod tests {
         let entry = DirEntry::directory("subdir".to_string());
         assert!(entry.is_dir);
         assert_eq!(entry.size, 0);
+    }
+
+    /// One scripted FTP session on loopback, to drive `read_ftp_data` over real sockets.
+    ///
+    /// `RETR` sends `payload` from the `REST` offset, closes the data connection, then
+    /// replies `completion` on the control connection. The handle yields every command
+    /// the client sent, once the client disconnects.
+    async fn scripted_ftp_session(
+        payload: Vec<u8>,
+        completion: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let control = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the control listener");
+        let port = control
+            .local_addr()
+            .expect("control listener address")
+            .port()
+            .to_string();
+        let server = tokio::spawn(async move {
+            let (socket, _) = control
+                .accept()
+                .await
+                .expect("accept the control connection");
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut commands = Vec::new();
+            let mut offset = 0_usize;
+            let mut data_listener: Option<TcpListener> = None;
+            write
+                .write_all(b"220 ready\r\n")
+                .await
+                .expect("send the greeting");
+            while let Ok(Some(line)) = lines.next_line().await {
+                let verb = line
+                    .split(' ')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                commands.push(verb.clone());
+                let reply = match verb.as_str() {
+                    "USER" => "331 password required".to_string(),
+                    "PASS" => "230 logged in".to_string(),
+                    "TYPE" => "200 type set".to_string(),
+                    "REST" => {
+                        offset = line[5..].trim().parse().expect("REST offset");
+                        "350 restarting".to_string()
+                    }
+                    "PASV" => {
+                        let listener = TcpListener::bind("127.0.0.1:0")
+                            .await
+                            .expect("bind the data listener");
+                        let port = listener.local_addr().expect("data listener address").port();
+                        data_listener = Some(listener);
+                        format!(
+                            "227 Entering Passive Mode (127,0,0,1,{},{})",
+                            port >> 8,
+                            port & 0xff
+                        )
+                    }
+                    "RETR" => {
+                        write.write_all(b"150 sending\r\n").await.expect("send 150");
+                        let listener = data_listener.take().expect("PASV before RETR");
+                        let (mut data, _) =
+                            listener.accept().await.expect("accept the data connection");
+                        data.write_all(&payload[offset.min(payload.len())..])
+                            .await
+                            .expect("send the file");
+                        let _ = data.shutdown().await;
+                        drop(data);
+                        completion.to_string()
+                    }
+                    "ABOR" => "226 abort done".to_string(),
+                    "QUIT" => "221 bye".to_string(),
+                    _ => "502 not implemented".to_string(),
+                };
+                write
+                    .write_all(format!("{reply}\r\n").as_bytes())
+                    .await
+                    .expect("send the reply");
+            }
+            commands
+        });
+        (port, server)
+    }
+
+    /// Read `read_size` bytes at `start` from a scripted session serving `payload`.
+    async fn read_from_scripted_server(
+        payload: Vec<u8>,
+        completion: &'static str,
+        start: usize,
+        read_size: usize,
+        read_to_eof: bool,
+    ) -> (object_store::Result<Vec<u8>>, Vec<String>) {
+        let (port, server) = scripted_ftp_session(payload, completion).await;
+        let client = connect_and_login(
+            "127.0.0.1",
+            &port,
+            "user",
+            "pass",
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("log in to the scripted server");
+        let result = read_ftp_data(
+            client,
+            "file.parquet".to_string(),
+            start,
+            read_size,
+            read_to_eof,
+            Duration::from_secs(5),
+        )
+        .await;
+        let commands = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the scripted session ends when the client disconnects")
+            .expect("the scripted session does not panic");
+        (result, commands)
+    }
+
+    fn file_bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| u8::try_from(i % 251).expect("below 256"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn full_file_read_checks_the_completion_reply_instead_of_aborting() {
+        let file = file_bytes(10_000);
+        let (result, commands) =
+            read_from_scripted_server(file.clone(), "226 transfer complete", 0, 10_000, true).await;
+        assert_eq!(result.expect("the full read succeeds"), file);
+        // No `REST` from offset 0, and no `ABOR`: the completion reply is read instead.
+        assert_eq!(commands, ["USER", "PASS", "TYPE", "PASV", "RETR"]);
+    }
+
+    #[tokio::test]
+    async fn full_file_read_fails_when_the_server_reports_a_failed_transfer() {
+        let (result, commands) = read_from_scripted_server(
+            file_bytes(10_000),
+            "451 local error in processing",
+            0,
+            10_000,
+            true,
+        )
+        .await;
+        let error = result.expect_err("a failed transfer must not return its bytes");
+        assert!(
+            error.to_string().contains("451"),
+            "the error names the server's reply: {error}"
+        );
+        // No `REST` from offset 0, and no `ABOR`: the completion reply is read instead.
+        assert_eq!(commands, ["USER", "PASS", "TYPE", "PASV", "RETR"]);
+    }
+
+    #[tokio::test]
+    async fn empty_file_read_reaches_eof_without_aborting() {
+        let (result, commands) =
+            read_from_scripted_server(Vec::new(), "226 transfer complete", 0, 0, true).await;
+        assert_eq!(result.expect("the empty read succeeds"), Vec::<u8>::new());
+        // No `REST` from offset 0, and no `ABOR`: the completion reply is read instead.
+        assert_eq!(commands, ["USER", "PASS", "TYPE", "PASV", "RETR"]);
+    }
+
+    #[tokio::test]
+    async fn range_ending_before_eof_returns_its_bytes_and_aborts() {
+        let file = file_bytes(10_000);
+        let (result, commands) =
+            read_from_scripted_server(file.clone(), "226 transfer complete", 100, 1_000, false)
+                .await;
+        assert_eq!(result.expect("the ranged read succeeds"), file[100..1_100]);
+        assert_eq!(
+            commands,
+            ["USER", "PASS", "TYPE", "PASV", "REST", "RETR", "ABOR"]
+        );
     }
 }
