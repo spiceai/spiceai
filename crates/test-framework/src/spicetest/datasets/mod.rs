@@ -25,7 +25,7 @@ use crate::{
         DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
         ThroughputMetrics, system_time_to_unix_epoch_ms,
     },
-    queries::{Query, QueryOverrides, QuerySet},
+    queries::{ParameterRows, Query, QueryOverrides, QuerySet},
     telemetry::streaming::QueryMetricEvent,
 };
 use anyhow::Result;
@@ -274,6 +274,19 @@ impl SpiceTest<NotStarted> {
     pub fn start(mut self) -> Result<SpiceTest<Running>> {
         if self.state.query_set.is_empty() {
             return Err(anyhow::anyhow!("Query set is empty"));
+        }
+
+        if let Some(template) = self
+            .state
+            .query_set
+            .iter()
+            .find(|query| matches!(query.parameter_rows, ParameterRows::Unexpanded(_)))
+        {
+            return Err(anyhow::anyhow!(
+                "Scenario query '{}' uses `parameters_from`, which this test does not support. \
+                `testoperator run bench` supports it.",
+                template.name
+            ));
         }
 
         if self.state.parallel_count == 0 {

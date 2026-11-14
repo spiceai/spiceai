@@ -138,6 +138,53 @@ queries:
 
 For more examples, see `test/spicepods/http/queries.yaml`.
 
+##### Run one query template for many parameter values (`parameters_from`)
+
+A scenario query can set `parameters_from`: SQL that returns one row for each query to run. Then
+`sql` is a template. Each row becomes one query, with the row's columns, in order, bound to `$1`,
+`$2`, ... (text, integers, or floats; a NULL is an error). The SQL runs against `spiced` after it is
+ready.
+
+All the queries of a template have the same `name`. Thus, bench reports one latency distribution
+(median, P90, P95, P99, and the number of runs as `iterations`) for each `name`. Bench runs each
+query one time to warm up, and then 5 times. The queries of a template do not record explain-plan
+snapshots, and a template cannot have `expected_results`. Only `run bench` supports
+`parameters_from`.
+
+```yaml
+queries:
+  - name: phrase_top10
+    sql: SELECT _id, _score FROM text_search(corpus, $1, 10)
+    parameters_from: SELECT text FROM test_queries WHERE query_type = 'phrase' ORDER BY _id
+```
+
+With the default Flight SQL client, each query is a prepared statement with the row as its
+parameters. Thus, the latency includes the prepare and parameter requests. With `--http-clients` or
+`--distributed`, the values are written into the SQL as literals.
+
+A placeholder in a table function argument, such as `text_search(corpus, $1, 10)`, needs a
+`spiced` that has [#15048](https://github.com/spiceai/spiceai/pull/15048). Older versions fail to
+prepare the query.
+
+Full-text search latency benchmarks use this format. The spicepods are in
+`test/spicepods/scenario/sf1/search/`, and the scenario files are in `test/scenario/search/`:
+
+| Spicepods | Scenario file | Queries |
+|---|---|---|
+| `search/msmarco/` | `search/msmarco_text_search.yaml` | The 6,980 MS MARCO dev queries that have judgments, over 8.8M passages. One `name`. |
+| `search/search_benchmark_game/` | `search/search_benchmark_game_text_search.yaml` | The 962 queries of [search-benchmark-game](https://github.com/quickwit-oss/search-benchmark-game), over 5M English Wikipedia articles from the [`spiceai/search-benchmark-game`](https://huggingface.co/datasets/spiceai/search-benchmark-game) dataset. One `name` for each query type (`union_top10`, `intersection_top10`, `phrase_top10`, ...). |
+
+```sh
+testoperator run bench \
+  -p "test/spicepods/scenario/sf1/search/search_benchmark_game/full_text_search-cayenne[file].yaml" \
+  --query-set scenario \
+  --scenario-query-file test/scenario/search/search_benchmark_game_text_search.yaml \
+  --ready-wait 3600
+```
+
+To run them in GitHub Actions:
+`testoperator dispatch tools/testoperator/dispatch/scenario/sf1/search --workflow bench`.
+
 ### Running Throughput Tests
 
 A throughput test replicates a benchmark test, but runs with multiple concurrent query executors. A throughput test uses the same command options as a benchmark test, with the additional options:

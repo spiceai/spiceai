@@ -1,0 +1,9 @@
+# Full-text search latency on MS MARCO passages (8.8M), for the spicepods in
+# test/spicepods/scenario/sf1/search/msmarco/. One query runs for each of the 6,980 judged MS MARCO
+# dev queries. All of them share one name, so bench reports one latency distribution.
+name: msmarco_text_search
+
+queries:
+  - name: msmarco_dev_top10
+    sql: SELECT _id, _score FROM text_search(corpus, $1, 10)
+    parameters_from: SELECT text FROM test_queries ORDER BY _id

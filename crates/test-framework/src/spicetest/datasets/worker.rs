@@ -35,7 +35,7 @@ use crate::telemetry::streaming::QueryMetricEvent;
 
 use crate::{
     metrics::QueryStatus,
-    queries::{Query, validation, validation::QueryValidationResult},
+    queries::{ParameterRows, Query, validation, validation::QueryValidationResult},
     snapshot::{ResultsSnapshotPredicate, SnapshotMode, record_explain_plan, round_float_columns},
 };
 
@@ -409,8 +409,11 @@ impl SpiceTestQueryWorker {
 
                         // Record the explain plan before the warmup run so the plan is visible
                         // in logs even if the warmup query itself hangs.
+                        // A `parameters_from` row shares its name with every other row of the
+                        // template, so one snapshot per name cannot hold all their plans.
                         if self.explain_plan_snapshot
                             && self.id == 0
+                            && !matches!(query.parameter_rows, ParameterRows::Row(_))
                             && let Some(client) = self.executor.as_spice_client()
                         {
                             println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
@@ -523,9 +526,16 @@ impl SpiceTestQueryWorker {
                             current_query_count += 1;
                         }
                         let end = SystemTime::now();
-                        query_iteration_durations
-                            .insert(Arc::clone(&query.name), (query_start, end));
-                        query_statuses.insert(Arc::clone(&query.name), query_status);
+                        // Queries from one `parameters_from` template share a name: span all of
+                        // them, and keep the first failure.
+                        let window = query_iteration_durations
+                            .entry(Arc::clone(&query.name))
+                            .or_insert((query_start, end));
+                        window.0 = window.0.min(query_start);
+                        window.1 = end;
+                        let merged_status =
+                            merge_query_status(query_statuses.remove(&query.name), query_status);
+                        query_statuses.insert(Arc::clone(&query.name), merged_status);
                     }
                 }
             }
@@ -1084,6 +1094,14 @@ impl SpiceTestQueryWorker {
     }
 }
 
+/// The status of a name that more than one query shares: the earlier failure, if any.
+fn merge_query_status(previous: Option<QueryStatus>, current: QueryStatus) -> QueryStatus {
+    match previous {
+        Some(failed @ QueryStatus::Failed(_)) => failed,
+        _ => current,
+    }
+}
+
 /// Fold one run of a query into the status the benchmark reports for it.
 ///
 /// Every run funnels through here — the warmup and each timed iteration alike — so
@@ -1328,6 +1346,15 @@ mod tests {
 
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn merged_query_status_keeps_the_first_failure() {
+        let failed = || QueryStatus::Failed(Some("row 3 failed".into()));
+        // `QueryStatus` is not `Debug`, so compare with `==`.
+        assert!(merge_query_status(None, QueryStatus::Passed) == QueryStatus::Passed);
+        assert!(merge_query_status(Some(QueryStatus::Passed), failed()) == failed());
+        assert!(merge_query_status(Some(failed()), QueryStatus::Passed) == failed());
+    }
 
     /// `LIMIT 600000` would request `2 * 600000` keyed rows; the first fetch
     /// must stay at or below [`MAX_KEYED_REFERENCE_ROWS`].
@@ -1933,12 +1960,14 @@ mod tests {
                 sql: Arc::from("SELECT * FROM table WHERE id = ?"),
                 overridden: false,
                 parameters: Some(vec![ParameterValue::String("1".into())]),
+                parameter_rows: crate::queries::ParameterRows::None,
             },
             Query {
                 name: Arc::from("query1"),
                 sql: Arc::from("SELECT * FROM table WHERE id = ?"),
                 overridden: false,
                 parameters: Some(vec![ParameterValue::String("2".into())]),
+                parameter_rows: crate::queries::ParameterRows::None,
             },
         ];
 
@@ -1961,24 +1990,28 @@ mod tests {
                 sql: Arc::from("SELECT * FROM table1"),
                 overridden: false,
                 parameters: None,
+                parameter_rows: crate::queries::ParameterRows::None,
             },
             Query {
                 name: Arc::from("query2"),
                 sql: Arc::from("SELECT * FROM table2"),
                 overridden: false,
                 parameters: None,
+                parameter_rows: crate::queries::ParameterRows::None,
             },
             Query {
                 name: Arc::from("query1"),
                 sql: Arc::from("SELECT * FROM table1 WHERE id = ?"),
                 overridden: false,
                 parameters: Some(vec![ParameterValue::String("1".into())]),
+                parameter_rows: crate::queries::ParameterRows::None,
             },
             Query {
                 name: Arc::from("query2"),
                 sql: Arc::from("SELECT * FROM table2 WHERE id = ?"),
                 overridden: false,
                 parameters: Some(vec![ParameterValue::String("2".into())]),
+                parameter_rows: crate::queries::ParameterRows::None,
             },
         ];
 
@@ -2012,12 +2045,14 @@ mod tests {
                 sql: Arc::from("SELECT * FROM table1"),
                 overridden: false,
                 parameters: None,
+                parameter_rows: crate::queries::ParameterRows::None,
             },
             Query {
                 name: Arc::from("query2"),
                 sql: Arc::from("SELECT * FROM table2"),
                 overridden: false,
                 parameters: None,
+                parameter_rows: crate::queries::ParameterRows::None,
             },
         ];
 
