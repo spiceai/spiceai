@@ -146,14 +146,22 @@ pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
     }
 });
 
+/// Evaluates to `Result<Option<_>>`: `Ok(None)` when `$key` is absent, and an
+/// error when it is present but cannot be read as `$kind` (for example
+/// `k => 'abc'` or `k => NULL`), so a bad value never silently becomes the
+/// default.
 macro_rules! extract_scalar_base {
-    ($map:expr, $key:literal, $datatype:expr, $pattern:pat => $value:expr) => {
-        $map.get($key)
-            .and_then(|sv| sv.cast_to(&$datatype).ok())
-            .and_then(|sv| match sv {
-                $pattern => Some($value),
-                _ => None,
-            })
+    ($map:expr, $key:literal, $kind:literal, $datatype:expr, $pattern:pat => $value:expr) => {
+        match $map.get($key) {
+            None => Ok(None),
+            Some(sv) => match sv.cast_to(&$datatype) {
+                Ok($pattern) => Ok(Some($value)),
+                _ => Err(DataFusionError::Plan(format!(
+                    "{RRF_UDF_NAME}: '{}' must be {}, got: {sv}",
+                    $key, $kind
+                ))),
+            },
+        }
     };
 }
 
@@ -162,6 +170,7 @@ macro_rules! extract_f64 {
           extract_scalar_base!(
               $map,
               $key,
+              "a number",
               DataType::Float64,
               ScalarValue::Float64(Some(val), ..) => val
           )
@@ -173,6 +182,7 @@ macro_rules! extract_string {
           extract_scalar_base!(
               $map,
               $key,
+              "a string",
               DataType::Utf8,
               ScalarValue::Utf8(Some(val), ..) => val
           )
@@ -240,6 +250,16 @@ impl ReciprocalRankFusionSubqueryArgs {
         expr: &Expr,
     ) -> Result<(Expr, ReciprocalRankFusionSubqueryArgs)> {
         if let Expr::ScalarFunction(ScalarFunction { args, func }) = expr {
+            // A non-literal `rank_weight` is not extracted below, and the
+            // nested search call ignores it, so it would be silently dropped.
+            if let Some(Expr::Alias(alias)) = args.iter().find(|arg| {
+                matches!(arg, Expr::Alias(alias) if alias.metadata.as_ref().and_then(|m| m.inner().get("spice.parameter_name")).is_some_and(|name| name == "rank_weight"))
+            }) {
+                return Err(DataFusionError::Plan(format!(
+                    "{RRF_UDF_NAME}: 'rank_weight' must be a number literal, got: {}",
+                    alias.expr
+                )));
+            }
             let mut args = args.clone();
             // Only `rank_weight` belongs to `rrf`. Other named arguments, such as
             // `limit`, stay on the nested search call.
@@ -262,7 +282,7 @@ impl ReciprocalRankFusionSubqueryArgs {
                     func: Arc::clone(func),
                 }),
                 ReciprocalRankFusionSubqueryArgs {
-                    rank_weight: extract_f64!(rrf_args, "rank_weight"),
+                    rank_weight: extract_f64!(rrf_args, "rank_weight")?,
                 },
             ))
         } else {
@@ -376,15 +396,15 @@ impl ReciprocalRankFusionArgs {
         Ok(Self {
             search_udtf_exprs: search_udtfs,
             rrf_subquery_arguments: subquery_args,
-            k: extract_f64!(rrf_args, "k").unwrap_or(DEFAULT_RRF_K),
-            join_key: extract_string!(rrf_args, "join_key").map(ident),
-            time_column: extract_string!(rrf_args, "time_column").map(ident),
-            recency_decay: extract_string!(rrf_args, "recency_decay")
+            k: extract_f64!(rrf_args, "k")?.unwrap_or(DEFAULT_RRF_K),
+            join_key: extract_string!(rrf_args, "join_key")?.map(ident),
+            time_column: extract_string!(rrf_args, "time_column")?.map(ident),
+            recency_decay: extract_string!(rrf_args, "recency_decay")?
                 .map(|rd| RecencyDecay::from_str(&rd))
                 .transpose()?,
-            decay_constant: extract_f64!(rrf_args, "decay_constant"),
-            decay_scale_secs: extract_f64!(rrf_args, "decay_scale_secs"),
-            decay_window_secs: extract_f64!(rrf_args, "decay_window_secs"),
+            decay_constant: extract_f64!(rrf_args, "decay_constant")?,
+            decay_scale_secs: extract_f64!(rrf_args, "decay_scale_secs")?,
+            decay_window_secs: extract_f64!(rrf_args, "decay_window_secs")?,
             // Validate `limit` explicitly so bad values fail fast instead of
             // silently becoming `None` (cast failure) or `usize::MAX`
             // (try_from saturation). Reuses the same helpers the nested search
@@ -565,6 +585,9 @@ impl ReciprocalRankFusionArgs {
         let mut limit = None;
         let mut include_score = None;
 
+        // An argument of the wrong kind is an error, not skipped: skipping
+        // it would silently run the search without the caller's limit or
+        // option.
         for arg in positional.iter().skip(2) {
             match arg {
                 Expr::Column(Column { name, .. }) => {
@@ -579,35 +602,63 @@ impl ReciprocalRankFusionArgs {
                 Expr::Literal(ScalarValue::Boolean(Some(b)), _) => {
                     include_score = Some(*b);
                 }
-                _ => {}
+                other => {
+                    return Err(DataFusionError::Plan(format!(
+                        "Search UDTF optional arguments must be a column, an integer limit or a boolean include_score, got: {other}"
+                    )));
+                }
             }
         }
 
         // Merge in named args for any field not already set positionally.
         if column.is_none() {
-            if let Some(Expr::Column(Column { name, .. })) = named.get("column") {
-                column = Some(name.clone());
-            } else if let Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) = named.get("column") {
-                column = Some(s.clone());
+            match named.get("column") {
+                None => {}
+                Some(Expr::Column(Column { name, .. })) => column = Some(name.clone()),
+                Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => column = Some(s.clone()),
+                Some(other) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "Search UDTF named 'column' argument must be a column reference or string, got: {other}"
+                    )));
+                }
             }
         }
         if limit.is_none() {
-            if let Some(Expr::Literal(ScalarValue::UInt64(Some(l)), _)) = named.get("limit") {
-                limit = Some(Self::parse_limit_u64(*l)?);
-            } else if let Some(Expr::Literal(ScalarValue::Int64(Some(l)), _)) = named.get("limit") {
-                limit = Some(Self::parse_limit_i64(*l)?);
+            match named.get("limit") {
+                None => {}
+                Some(Expr::Literal(ScalarValue::UInt64(Some(l)), _)) => {
+                    limit = Some(Self::parse_limit_u64(*l)?);
+                }
+                Some(Expr::Literal(ScalarValue::Int64(Some(l)), _)) => {
+                    limit = Some(Self::parse_limit_i64(*l)?);
+                }
+                Some(other) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "Search UDTF named 'limit' argument must be an integer literal, got: {other}"
+                    )));
+                }
             }
         }
-        if include_score.is_none()
-            && let Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) =
-                named.get("include_score")
-        {
-            include_score = Some(*b);
+        if include_score.is_none() {
+            match named.get("include_score") {
+                None => {}
+                Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) => include_score = Some(*b),
+                Some(other) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "Search UDTF named 'include_score' argument must be a boolean literal, got: {other}"
+                    )));
+                }
+            }
         }
 
         let distance_metric = match named.get("distance_metric") {
+            None => None,
             Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => Some(s.clone()),
-            _ => None,
+            Some(other) => {
+                return Err(DataFusionError::Plan(format!(
+                    "Search UDTF named 'distance_metric' argument must be a string literal, got: {other}"
+                )));
+            }
         };
 
         Ok((table, query, column, limit, include_score, distance_metric))
@@ -1713,6 +1764,119 @@ mod tests {
             !error.to_string().contains("specified multiple times"),
             "named args must not collide with positional search sources, got: {error}"
         );
+    }
+
+    #[test]
+    fn from_udtf_exprs_rejects_unreadable_named_args() {
+        // `k => 'abc'` or `recency_decay => 5`-style values used to become the
+        // default silently.
+        let cases = [
+            (
+                named_arg("k", ScalarValue::Utf8(Some("abc".to_string()))),
+                "'k' must be a number",
+            ),
+            (
+                named_arg("k", ScalarValue::Float64(None)),
+                "'k' must be a number",
+            ),
+            (
+                named_arg("decay_constant", ScalarValue::Boolean(None)),
+                "'decay_constant' must be a number",
+            ),
+        ];
+        for (arg, expected) in cases {
+            let error = ReciprocalRankFusionArgs::from_udtf_exprs(&[
+                vector_search_expr("foo", "query1"),
+                text_search_expr("foo", "query2"),
+                arg,
+            ])
+            .expect_err("unreadable named argument must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_udtf_exprs_rejects_non_literal_rank_weight() {
+        let meta = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            "rank_weight".to_string(),
+        )]));
+        let weighted = match vector_search_expr("foo", "query1") {
+            Expr::ScalarFunction(mut sf) => {
+                sf.args
+                    .push(col_expr("w").alias_with_metadata("rank_weight", Some(meta)));
+                Expr::ScalarFunction(sf)
+            }
+            other => other,
+        };
+        let error = ReciprocalRankFusionArgs::from_udtf_exprs(&[
+            weighted,
+            text_search_expr("foo", "query2"),
+        ])
+        .expect_err("non-literal rank_weight must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("'rank_weight' must be a number literal"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_search_args_rejects_unreadable_optional_args() {
+        let named = |name: &str| {
+            let meta = FieldMetadata::new(BTreeMap::from([(
+                "spice.parameter_name".to_string(),
+                name.to_string(),
+            )]));
+            col_expr("k").alias_with_metadata(name, Some(meta))
+        };
+        let cases = [
+            (
+                Expr::Literal(ScalarValue::Float64(Some(1.5)), None),
+                "optional arguments must be",
+            ),
+            (
+                named("limit"),
+                "named 'limit' argument must be an integer literal",
+            ),
+            (
+                named("include_score"),
+                "named 'include_score' argument must be a boolean literal",
+            ),
+            (
+                named("distance_metric"),
+                "named 'distance_metric' argument must be a string literal",
+            ),
+        ];
+        for (arg, expected) in cases {
+            let args = vec![col_expr("docs"), lit_str("q"), arg];
+            let error = ReciprocalRankFusionArgs::parse_search_args(&args)
+                .expect_err("unreadable optional argument must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_search_args_accepts_literal_optional_args() {
+        let args = vec![
+            col_expr("docs"),
+            lit_str("q"),
+            col_expr("body"),
+            Expr::Literal(ScalarValue::Int64(Some(5)), None),
+            named_arg("include_score", ScalarValue::Boolean(Some(false))),
+        ];
+        let parsed =
+            ReciprocalRankFusionArgs::parse_search_args(&args).expect("literal args parse");
+        assert_eq!(parsed.2.as_deref(), Some("body"));
+        assert_eq!(parsed.3, Some(5));
+        assert_eq!(parsed.4, Some(false));
     }
 
     #[test]

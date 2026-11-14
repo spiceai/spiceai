@@ -312,13 +312,17 @@ impl VectorSearchTableFunc {
         let (positional, named) = split_named_args(args);
 
         // Extract distance_metric from named args (vector_search-specific).
-        let distance_metric = named
-            .get("distance_metric")
-            .and_then(|e| match e {
-                Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(DistanceMetric::parse(s)),
-                _ => None,
-            })
-            .transpose()?;
+        // A non-string value is an error, so the search never silently runs
+        // with the default metric instead of the requested one.
+        let distance_metric = match named.get("distance_metric") {
+            None => None,
+            Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => Some(DistanceMetric::parse(s)?),
+            Some(other) => {
+                return Err(DataFusionError::Plan(format!(
+                    "Named 'distance_metric' argument must be a string literal, got {other}."
+                )));
+            }
+        };
 
         let mut pos = positional.into_iter();
 
@@ -1546,6 +1550,30 @@ mod tests {
         let parsed =
             VectorSearchTableFunc::parse_args(&exprs).expect("Named distance_metric should parse");
         assert_eq!(parsed.distance_metric, Some(super::DistanceMetric::Dot));
+    }
+
+    #[test]
+    fn parse_args_named_non_literal_arguments_are_rejected() {
+        // `limit => k` or `distance_metric => m` where the value did not
+        // plan to a literal must fail, not silently fall back to a default.
+        for name in ["limit", "include_score", "distance_metric"] {
+            let meta = FieldMetadata::new(BTreeMap::from([(
+                "spice.parameter_name".to_string(),
+                name.to_string(),
+            )]));
+            let exprs = vec![
+                Expr::Column(datafusion::common::Column::new_unqualified("docs")),
+                lit_utf8("hello"),
+                Expr::Column(datafusion::common::Column::new_unqualified("k"))
+                    .alias_with_metadata(name, Some(meta)),
+            ];
+            let err = VectorSearchTableFunc::parse_args(&exprs)
+                .expect_err("Non-literal named argument should be rejected");
+            assert!(
+                matches!(&err, DataFusionError::Plan(message) if message.contains(&format!("Named '{name}' argument must be"))),
+                "unexpected error for {name}: {err:?}"
+            );
+        }
     }
 
     #[test]

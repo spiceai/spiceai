@@ -375,24 +375,42 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
             }
         };
         // Merge in named args for any optional field not set positionally.
+        // A named arg of the wrong kind is an error: ignoring it would
+        // silently run the search without the caller's limit or option.
         let (mut column, mut limit, mut include_score) = (column, limit, include_score);
         if column.is_none() {
-            if let Some(Expr::Column(Column { name, .. })) = named.get("column") {
-                column = Some(name.clone());
-            } else if let Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) = named.get("column") {
-                column = Some(s.clone());
+            match named.get("column") {
+                None => {}
+                Some(Expr::Column(Column { name, .. })) => column = Some(name.clone()),
+                Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => column = Some(s.clone()),
+                Some(other) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "text_search: named 'column' argument must be a column reference or string, got {other}."
+                    )));
+                }
             }
         }
-        if limit.is_none()
-            && let Some(Expr::Literal(scalar, _)) = named.get("limit")
-        {
-            limit = Some(parse_limit_scalar(scalar)?);
+        if limit.is_none() {
+            match named.get("limit") {
+                None => {}
+                Some(Expr::Literal(scalar, _)) => limit = Some(parse_limit_scalar(scalar)?),
+                Some(other) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "text_search: named 'limit' argument must be an integer literal, got {other}."
+                    )));
+                }
+            }
         }
-        if include_score.is_none()
-            && let Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) =
-                named.get("include_score")
-        {
-            include_score = Some(*b);
+        if include_score.is_none() {
+            match named.get("include_score") {
+                None => {}
+                Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) => include_score = Some(*b),
+                Some(other) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "text_search: named 'include_score' argument must be a boolean literal, got {other}."
+                    )));
+                }
+            }
         }
         // Apply the `include_score` default once named-arg merge is done, so a
         // user-provided `include_score => false` can still flip the default.
@@ -861,5 +879,61 @@ mod tests {
         let parsed = TextSearchTableFunc::<NoopExplorer>::parse_args(&exprs)
             .expect("Named include_score should parse");
         assert_eq!(parsed.include_score, Some(false));
+    }
+
+    /// A named arg whose value is a non-literal expression, as the planner
+    /// produces for `limit => k` when `k` is not a literal.
+    fn named_column_arg(name: &str, column: &str) -> Expr {
+        let meta = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            name.to_string(),
+        )]));
+        Expr::Column(Column::new_unqualified(column)).alias_with_metadata(name, Some(meta))
+    }
+
+    #[test]
+    fn parse_args_named_non_literal_limit_is_an_error() {
+        // `text_search(docs, 'hello', limit => k)` must not silently run
+        // without a limit.
+        let exprs = vec![
+            Expr::Column(Column::new_unqualified("docs")),
+            Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
+            named_column_arg("limit", "k"),
+        ];
+        let err = TextSearchTableFunc::<NoopExplorer>::parse_args(&exprs)
+            .expect_err("Non-literal named limit should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("named 'limit' argument must be an integer literal"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_args_named_non_literal_include_score_is_an_error() {
+        let exprs = vec![
+            Expr::Column(Column::new_unqualified("docs")),
+            Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
+            named_column_arg("include_score", "s"),
+        ];
+        let err = TextSearchTableFunc::<NoopExplorer>::parse_args(&exprs)
+            .expect_err("Non-literal named include_score should be rejected");
+        assert!(
+            err.to_string()
+                .contains("named 'include_score' argument must be a boolean literal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_args_named_literal_limit_still_parses() {
+        let exprs = vec![
+            Expr::Column(Column::new_unqualified("docs")),
+            Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
+            named_arg("limit", ScalarValue::Int64(Some(5))),
+        ];
+        let parsed = TextSearchTableFunc::<NoopExplorer>::parse_args(&exprs)
+            .expect("Named literal limit should parse");
+        assert_eq!(parsed.limit, Some(5));
     }
 }
