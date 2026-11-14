@@ -325,6 +325,18 @@ pub struct MemTierDurableCommit {
     pub inline_data: Vec<InlinedData>,
     /// Clear the superseded inline corpus AND its deletion markers.
     pub clear_inlined: bool,
+    /// Keys re-inserted at `sequence_number` that a delete-only vector from an
+    /// earlier commit may still hide, recorded as per-key insert records.
+    pub insert_records: Vec<Vec<u8>>,
+    /// The table's statistics including this commit's rows.
+    pub table_statistics: Option<TableStatistics>,
+    /// Drop the per-file statistics of every snapshot except this one.
+    pub keep_file_statistics_of: Option<String>,
+    /// Manifest rows of the data files this commit's rows landed in, upserted
+    /// with it: a table whose data is in the object-native location scans only
+    /// its manifest, so its files and the clear of the rows they hold commit
+    /// together.
+    pub manifest_files: Vec<SnapshotFile>,
 }
 
 /// One table's durable append publication. A slice is one atomic transaction.

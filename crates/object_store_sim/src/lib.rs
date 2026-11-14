@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Object store wrappers for tests: injected latency, and (in [`fault`])
-//! injected delivery faults. Results measured through [`LatencyStore`] are
-//! simulated latency, never an object store's own numbers.
+//! Object store wrappers for tests: injected latency, (in [`fault`]) injected
+//! delivery faults, and (in [`crash`]) a process crash at a chosen write.
+//! Results measured through [`LatencyStore`] are simulated latency, never an
+//! object store's own numbers.
 
+pub mod crash;
 pub mod fault;
 pub mod latency;
 
