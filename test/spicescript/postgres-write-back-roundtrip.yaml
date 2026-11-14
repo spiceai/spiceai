@@ -11,6 +11,8 @@ variants:
   write-back: {}
   write-through:
     datasets: { accounts: { acceleration: { write_mode: write_through } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
@@ -60,7 +62,7 @@ steps:
     expect: { rows: [["7575.00"]] }
 
   - spice-exec: "BEGIN; INSERT INTO accounts VALUES (101, 'spice', 100.00, TIMESTAMPTZ '2025-02-01 00:00:00+00'), (102, 'spice', 200.00, NULL); COMMIT;"
-    only: write-back
+    only: [write-back, object-native]
   - spice-exec: "INSERT INTO accounts VALUES (101, 'spice', 100.00, TIMESTAMPTZ '2025-02-01 00:00:00+00'), (102, 'spice', 200.00, NULL)"
     only: write-through
   - query: SELECT * FROM accounts
@@ -81,7 +83,7 @@ steps:
 
   - restart: {}
   - spice-exec: "BEGIN; UPDATE accounts SET balance = 250.00 WHERE id = 101; COMMIT;"
-    only: write-back
+    only: [write-back, object-native]
   - spice-exec: UPDATE accounts SET balance = 250.00 WHERE id = 101
     only: write-through
   - query: SELECT * FROM accounts
@@ -92,7 +94,7 @@ steps:
 
   # An acknowledged write must survive a kill that lands before it is delivered.
   - spice-exec: "BEGIN; UPDATE accounts SET balance = 201.00 WHERE id = 102; COMMIT;"
-    only: write-back
+    only: [write-back, object-native]
   - spice-exec: UPDATE accounts SET balance = 201.00 WHERE id = 102
     only: write-through
   - kill-spiced: {}
@@ -106,11 +108,11 @@ steps:
   # An update computed from the row's own value. Write-through cannot send
   # this to Postgres today (known-failing/write-back/postgres-write-through-expressions.yaml).
   - spice-exec: "BEGIN; UPDATE accounts SET balance = balance + 10 WHERE id % 7 = 0; COMMIT;"
-    only: write-back
+    only: [write-back, object-native]
   - query: SELECT * FROM accounts
     eventually: 30s
-    only: write-back
+    only: [write-back, object-native]
   - query: SELECT count(*), sum(balance) FROM accounts
     eventually: 30s
     expect: { rows: [["95", "7610.00"]] }
-    only: write-back
+    only: [write-back, object-native]

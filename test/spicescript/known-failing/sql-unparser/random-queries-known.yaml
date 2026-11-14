@@ -7,7 +7,7 @@ description: >
   ORDER BY … LIMIT on a unique key, joins, UNION ALL) under outer queries that
   read some, none or all of their columns answer through Spice as PostgreSQL
   answers them over the same rows: federated to PostgreSQL and MySQL, and
-  accelerated into each engine.
+  accelerated into Cayenne in file and memory mode.
 
 sources:
   backend: { kind: '${matrix.backend}' }
@@ -19,7 +19,9 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
-  arrow: arrow
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
+  cayenne-memory: cayenne-memory
 
 spicepod:
   version: v1

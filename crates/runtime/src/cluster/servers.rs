@@ -29,7 +29,7 @@ use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use runtime_tls::flight_incoming::tls_incoming;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -53,6 +53,20 @@ async fn bind_cluster_listener(bind_address: SocketAddr) -> Result<TcpListener, 
             Error::UnableToBindClusterListener { source }
         }
     })
+}
+
+/// The address a registered executor's Flight server binds: the port it registered at
+/// `node_bind_ip`, the address `--node-bind-address` names and registration bound;
+/// `fallback` when it has registered no port that fits a port number.
+fn registered_bind_address(
+    node_bind_ip: IpAddr,
+    registered_port: Option<u32>,
+    fallback: SocketAddr,
+) -> SocketAddr {
+    match registered_port.and_then(|port| u16::try_from(port).ok()) {
+        Some(port) => SocketAddr::new(node_bind_ip, port),
+        None => fallback,
+    }
 }
 
 /// Requires cluster mTLS unless the node explicitly allows insecure connections.
@@ -304,22 +318,20 @@ pub async fn start_executor_flight_server(
             .max_encoding_message_size(usize::MAX),
     );
 
-    // Use the executor's bound address if it was dynamically assigned during registration.
-    #[expect(clippy::cast_possible_truncation)]
-    let bind_address = match rt.df.executor.read().ok().and_then(|maybe_executor| {
-        maybe_executor
-            .as_ref()
-            .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
-    }) {
-        Some((host, port)) => match tokio::net::lookup_host((&*host, port)).await {
-            Ok(mut addrs) => addrs.next().unwrap_or(bind_address),
-            Err(e) => {
-                tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
-                bind_address
-            }
-        },
-        None => bind_address,
-    };
+    // Serve where the executor registered: its port, which differs from the configured
+    // one when registration fell back to a dynamic port, at the node bind address.
+    // The registered host is the advertise address, where peers reach this executor:
+    // behind NAT or a published container port it is not an address of this machine,
+    // and binding it fails with "Cannot assign requested address".
+    let bind_address = registered_bind_address(
+        rt.df.cluster_config.node_bind_address().ip(),
+        rt.df
+            .executor
+            .read()
+            .ok()
+            .and_then(|maybe_executor| maybe_executor.as_ref().map(|e| e.metadata.port)),
+        bind_address,
+    );
 
     let serve_result = if let Some(server_config) = cluster_server_config {
         let listener = bind_cluster_listener(bind_address).await?;
@@ -358,4 +370,28 @@ pub async fn start_executor_flight_server(
     tracing::debug!("Spice Runtime executor Flight stopped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registered_bind_address;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn binds_the_node_bind_address_at_the_registered_port() {
+        let every = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let flight: SocketAddr = "127.0.0.1:50051".parse().expect("address");
+        // The advertise host never enters it: a peer-facing address need not be local.
+        assert_eq!(
+            registered_bind_address(every, Some(29160), flight),
+            SocketAddr::new(every, 29160)
+        );
+        // A dynamic port that registration fell back to.
+        assert_eq!(
+            registered_bind_address(every, Some(41234), flight),
+            SocketAddr::new(every, 41234)
+        );
+        assert_eq!(registered_bind_address(every, None, flight), flight);
+        assert_eq!(registered_bind_address(every, Some(70_000), flight), flight);
+    }
 }

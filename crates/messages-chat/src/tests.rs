@@ -33,6 +33,7 @@ use crate::ChatMessages;
 use crate::request::chat_request;
 use crate::response::{message, messages_error};
 use crate::stream::{Translator, message_stream};
+use messages_api::types::ThinkingDisplay;
 
 fn typed(body: &Value) -> messages_api::types::CreateMessageRequest {
     serde_json::from_value(body.clone()).expect("a valid Messages API request")
@@ -123,6 +124,7 @@ fn what_only_changes_how_a_request_is_served_is_accepted() {
         json!({"context_management": {"edits": []}}),
         json!({"fallbacks": "default"}),
         json!({"diagnostics": {"previous_message_id": null}}),
+        json!({"safeguards": [{"type": "dangerous_tool_use", "classifier_context": {"v": 1, "permission_mode": "auto"}}]}),
         json!({"thinking": {"type": "adaptive", "display": "omitted"}}),
         json!({"output_config": {"effort": "high"}}),
     ] {
@@ -229,7 +231,7 @@ fn what_a_chat_completion_cannot_carry_is_refused_by_name() {
 }
 
 /// A tool's `cache_control` and `eager_input_streaming` only change how a request is served, so
-/// the tool is translated without them; any other field of a tool, such as `defer_loading`, is
+/// the tool is translated without them; any other field of a tool, such as `input_examples`, is
 /// refused by name, since dropping it would offer the model a tool the client meant otherwise.
 #[test]
 fn a_tools_serving_fields_are_accepted_and_its_other_fields_refused_by_name() {
@@ -245,7 +247,6 @@ fn a_tools_serving_fields_are_accepted_and_its_other_fields_refused_by_name() {
         json!([{"type": "function", "function": {"name": "read_file", "description": "Reads a file.", "parameters": {"type": "object"}, "strict": true}}])
     );
     for (field, value) in [
-        ("defer_loading", json!(true)),
         ("input_examples", json!([{"path": "a.rs"}])),
         ("allowed_callers", json!(["code_execution_20250825"])),
     ] {
@@ -258,6 +259,194 @@ fn a_tools_serving_fields_are_accepted_and_its_other_fields_refused_by_name() {
                 400,
                 &ErrorType::InvalidRequest,
                 format!("Model 'gpt' serves the Messages API by translating requests into chat completions, which cannot carry `{field}` on the tool 'read_file'. Remove `{field}`, or use a model with `from: anthropic`. See: https://spiceai.org/docs/components/models").as_str()
+            )
+        );
+    }
+}
+
+/// A tool as a Messages API request defines it, deferred or not, with a one-key schema so the
+/// rendered definition does not depend on how `serde_json` orders keys.
+fn tool(name: &str, deferred: Option<bool>) -> Value {
+    let mut tool = json!({"name": name, "description": format!("{name} does it."), "input_schema": {"type": "object"}});
+    if let Some(deferred) = deferred {
+        tool["defer_loading"] = json!(deferred);
+    }
+    tool
+}
+
+/// A chat completion tool, as the translation offers one.
+fn chat_tool(name: &str) -> Value {
+    json!({"type": "function", "function": {"name": name, "description": format!("{name} does it."), "parameters": {"type": "object"}}})
+}
+
+/// The line a `tool_reference` to `name` reads as.
+fn function_line(name: &str) -> String {
+    format!(
+        r#"<function>{{"description":"{name} does it.","name":"{name}","parameters":{{"type":"object"}}}}</function>"#
+    )
+}
+
+/// Claude Code's tool search, as it sends it: tools it has not loaded are left out but for a
+/// deferred placeholder, and a loaded tool is listed with `defer_loading` still set, in name
+/// order, once a `ToolSearch` result has referenced it. A deferred tool is offered only once
+/// referenced, after the tools that were never deferred, and the reference reads as its
+/// definition.
+#[test]
+fn a_deferred_tool_is_offered_once_a_tool_reference_loads_it() {
+    let first = json!({
+        "model": "gpt", "max_tokens": 10,
+        "tools": [tool("Bash", None), tool("DeferredToolPlaceholder", Some(true)), tool("ToolSearch", None), tool("Write", Some(false))],
+        "messages": [{"role": "user", "content": "Fetch the page."}],
+    });
+    let chat = translated(&first).expect("a translated request");
+    assert_eq!(
+        chat["tools"],
+        json!([
+            chat_tool("Bash"),
+            chat_tool("ToolSearch"),
+            chat_tool("Write")
+        ])
+    );
+
+    let second = json!({
+        "model": "gpt", "max_tokens": 10,
+        "tools": [
+            tool("Bash", None), tool("DeferredToolPlaceholder", Some(true)), tool("NotebookEdit", Some(true)),
+            tool("ToolSearch", None), tool("WebFetch", Some(true)), tool("Write", None),
+        ],
+        "messages": [
+            {"role": "user", "content": "Fetch the page."},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "ToolSearch", "input": {"query": "select:WebFetch", "max_results": 5}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "tool_reference", "tool_name": "WebFetch"}], "cache_control": {"type": "ephemeral"}}]},
+        ],
+    });
+    let chat = translated(&second).expect("a translated request");
+    assert_eq!(
+        chat["tools"],
+        json!([
+            chat_tool("Bash"),
+            chat_tool("ToolSearch"),
+            chat_tool("Write"),
+            chat_tool("WebFetch")
+        ])
+    );
+    assert_eq!(
+        chat["messages"][2],
+        json!({"role": "tool", "tool_call_id": "toolu_1", "content": format!("<functions>\n{}\n</functions>", function_line("WebFetch"))})
+    );
+}
+
+/// Tools load in the order the conversation first references them, and a run of references
+/// reads as one `<functions>` block beside the result's text.
+#[test]
+fn tools_load_in_the_order_they_are_first_referenced() {
+    let result = |id: &str, content: Value| json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": content}]});
+    let call = |id: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "ToolSearch", "input": {}}]});
+    let body = json!({
+        "model": "gpt", "max_tokens": 10,
+        "tools": [tool("Alpha", Some(true)), tool("Beta", Some(true)), tool("Gamma", Some(true)), tool("ToolSearch", None)],
+        "messages": [
+            {"role": "user", "content": "Go."},
+            call("toolu_1"),
+            result("toolu_1", json!([
+                {"type": "text", "text": "Found two."},
+                {"type": "tool_reference", "tool_name": "Gamma"},
+                {"type": "tool_reference", "tool_name": "Alpha", "cache_control": {"type": "ephemeral"}},
+            ])),
+            call("toolu_2"),
+            result("toolu_2", json!([{"type": "tool_reference", "tool_name": "Alpha"}])),
+        ],
+    });
+    let chat = translated(&body).expect("a translated request");
+    assert_eq!(
+        chat["tools"],
+        json!([
+            chat_tool("ToolSearch"),
+            chat_tool("Gamma"),
+            chat_tool("Alpha")
+        ])
+    );
+    assert_eq!(
+        chat["messages"][2]["content"],
+        json!(format!(
+            "Found two.\n<functions>\n{}\n{}\n</functions>",
+            function_line("Gamma"),
+            function_line("Alpha")
+        ))
+    );
+    assert_eq!(
+        chat["messages"][4]["content"],
+        json!(format!(
+            "<functions>\n{}\n</functions>",
+            function_line("Alpha")
+        ))
+    );
+}
+
+/// A request whose every tool is deferred and none yet loaded offers the model no tools.
+#[test]
+fn a_request_whose_tools_are_all_unloaded_offers_none() {
+    let body = json!({
+        "model": "gpt", "max_tokens": 10,
+        "tools": [tool("DeferredToolPlaceholder", Some(true))],
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    assert_eq!(
+        translated(&body).expect("a translated request"),
+        json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 10})
+    );
+}
+
+#[test]
+fn a_tool_reference_that_cannot_be_loaded_is_refused() {
+    let body = |tools: Value, reference: Value| {
+        json!({
+            "model": "gpt", "max_tokens": 10, "tools": tools,
+            "messages": [
+                {"role": "user", "content": "Go."},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "ToolSearch", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [reference]}]},
+            ],
+        })
+    };
+    let refusal = |body: &Value| {
+        let error = translated(body).expect_err("a refused request");
+        assert_eq!(
+            (error.status, &error.error_type),
+            (400, &ErrorType::InvalidRequest)
+        );
+        error.message
+    };
+    assert_eq!(
+        refusal(&body(
+            json!([tool("ToolSearch", None)]),
+            json!({"type": "tool_reference", "tool_name": "WebFetch"})
+        )),
+        "A `tool_reference` in the request to model 'gpt' names the tool 'WebFetch', which is not in `tools`. Add 'WebFetch' to `tools`, with `defer_loading: true` to offer it only once it is referenced. See: https://spiceai.org/docs/components/models"
+    );
+    assert_eq!(
+        refusal(&body(
+            json!([tool("WebFetch", Some(true))]),
+            json!({"type": "tool_reference"})
+        )),
+        "A `tool_reference` block needs a `tool_name`: the name of a tool in `tools`."
+    );
+    assert_eq!(
+        refusal(&body(
+            json!([tool("WebFetch", Some(true))]),
+            json!({"type": "tool_reference", "tool_name": "WebFetch", "citations": []})
+        )),
+        "Model 'gpt' serves the Messages API by translating requests into chat completions, which cannot carry `citations` on a tool_reference block. Remove `citations`, or use a model with `from: anthropic`. See: https://spiceai.org/docs/components/models"
+    );
+    for (value, shown) in [(json!("yes"), "\"yes\""), (Value::Null, "null")] {
+        let mut deferred = tool("WebFetch", None);
+        deferred["defer_loading"] = value;
+        assert_eq!(
+            refusal(
+                &json!({"model": "gpt", "max_tokens": 10, "tools": [deferred], "messages": [{"role": "user", "content": "hi"}]})
+            ),
+            format!(
+                "`defer_loading` on the tool 'WebFetch' is {shown}, and must be `true` or `false`."
             )
         );
     }
@@ -305,7 +494,7 @@ fn a_completion_becomes_a_message() {
         "tool_calls",
     );
     assert_eq!(
-        serde_json::to_value(message(answer.clone(), true).expect("a message"))
+        serde_json::to_value(message(answer.clone(), ThinkingDisplay::Shown).expect("a message"))
             .expect("serializable"),
         json!({
             "id": "msg_abc",
@@ -323,7 +512,7 @@ fn a_completion_becomes_a_message() {
             "usage": {"input_tokens": 20, "output_tokens": 30, "cache_read_input_tokens": 100},
         })
     );
-    let without_thinking = message(answer, false).expect("a message");
+    let without_thinking = message(answer, ThinkingDisplay::Off).expect("a message");
     assert_eq!(
         without_thinking.content.first(),
         Some(&messages_api::types::ContentBlock::Text {
@@ -336,7 +525,8 @@ fn a_completion_becomes_a_message() {
 fn finish_reasons_become_stop_reasons() {
     let stop = |finish: &str, message: Value| {
         serde_json::to_value(
-            crate::response::message(completion(&message, finish), false).expect("a message"),
+            crate::response::message(completion(&message, finish), ThinkingDisplay::Off)
+                .expect("a message"),
         )
         .expect("serializable")["stop_reason"]
             .clone()
@@ -370,7 +560,7 @@ fn tool_arguments_that_are_not_an_object_are_an_api_error() {
         "tool_calls",
     );
     assert_eq!(
-        message(answer, false).expect_err("truncated arguments"),
+        message(answer, ThinkingDisplay::Off).expect_err("truncated arguments"),
         MessagesError::api(
             "Model 'gpt' called the tool 'read_file' with arguments that are not a JSON object, which the Messages API cannot return: {\"path\": "
         )
@@ -410,11 +600,102 @@ fn tool_call(index: u32, id: Option<&str>, name: Option<&str>, arguments: &str) 
 async fn events(
     chunks: Vec<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
 ) -> Vec<Value> {
+    events_showing_thinking(chunks, ThinkingDisplay::Off).await
+}
+
+async fn events_showing_thinking(
+    chunks: Vec<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
+    thinking: ThinkingDisplay,
+) -> Vec<Value> {
     let chunks: ChatCompletionResponseStream = Box::pin(futures::stream::iter(chunks));
-    message_stream(chunks, "gpt".to_string())
+    message_stream(chunks, "gpt".to_string(), thinking)
         .map(|event| event.unwrap_or_else(|error| error.to_envelope()))
         .collect()
         .await
+}
+
+/// The content blocks a client builds from `events`: each block as it started, with its deltas
+/// applied in order.
+fn streamed_blocks(events: &[Value]) -> Vec<Value> {
+    let mut blocks: Vec<Value> = Vec::new();
+    for event in events {
+        match event["type"].as_str() {
+            Some("content_block_start") => blocks.push(event["content_block"].clone()),
+            Some("content_block_delta") => {
+                let index = usize::try_from(event["index"].as_u64().expect("an index"))
+                    .expect("a small index");
+                let block = &mut blocks[index];
+                let delta = &event["delta"];
+                for (field, key) in [("thinking", "thinking"), ("text", "text")] {
+                    if let Some(more) = delta[key].as_str() {
+                        let so_far = block[field].as_str().unwrap_or_default().to_string();
+                        block[field] = json!(so_far + more);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// A reasoning model's reasoning streams as a `thinking` block ahead of the answer, with its text
+/// when the request's `thinking` shows it and empty when it omits it (Claude Code asks for
+/// `{"type": "adaptive", "display": "omitted"}`), and the blocks a client builds from the stream
+/// are the unstreamed message's for the same reply.
+#[tokio::test]
+async fn reasoning_streams_as_the_unstreamed_thinking_block() {
+    let chunks = || {
+        vec![
+            Ok(chunk(
+                &json!({"index": 0, "delta": {"role": "assistant", "reasoning_content": "The user "}, "finish_reason": null}),
+            )),
+            Ok(chunk(
+                &json!({"index": 0, "delta": {"reasoning_content": "wants the file."}, "finish_reason": null}),
+            )),
+            Ok(chunk(
+                &json!({"index": 0, "delta": {"content": "Reading "}, "finish_reason": null}),
+            )),
+            Ok(chunk(
+                &json!({"index": 0, "delta": {"content": "it."}, "finish_reason": null}),
+            )),
+            Ok(chunk(
+                &json!({"index": 0, "delta": {}, "finish_reason": "stop"}),
+            )),
+            Ok(usage_chunk()),
+        ]
+    };
+    let answer = completion(
+        &json!({"role": "assistant", "content": "Reading it.", "reasoning_content": "The user wants the file."}),
+        "stop",
+    );
+    for thinking in [
+        ThinkingDisplay::Shown,
+        ThinkingDisplay::Omitted,
+        ThinkingDisplay::Off,
+    ] {
+        let streamed = events_showing_thinking(chunks(), thinking).await;
+        let unstreamed =
+            serde_json::to_value(message(answer.clone(), thinking).expect("a message"))
+                .expect("serializable");
+        assert_eq!(
+            Value::Array(streamed_blocks(&streamed)),
+            unstreamed["content"],
+            "{thinking:?}"
+        );
+    }
+    let omitted = events_showing_thinking(chunks(), ThinkingDisplay::Omitted).await;
+    assert_eq!(
+        streamed_blocks(&omitted)[0],
+        json!({"type": "thinking", "thinking": "", "signature": ""}),
+        "an omitted thinking block carries no text"
+    );
+    let streamed = events_showing_thinking(chunks(), ThinkingDisplay::Shown).await;
+    assert_eq!(
+        streamed[2],
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "The user "}}),
+        "the thinking streams as it arrives"
+    );
 }
 
 #[tokio::test]
@@ -538,7 +819,7 @@ async fn interleaved_tool_calls_stream_the_message_the_unstreamed_answer_carries
 /// arrive: a call that starts once the one before it is whole ends that one's block.
 #[test]
 fn a_tool_call_that_starts_after_a_whole_one_streams_as_it_arrives() {
-    let mut translator = Translator::new("gpt".to_string());
+    let mut translator = Translator::new("gpt".to_string(), ThinkingDisplay::Off);
     let values = |events: Result<Vec<StreamEvent>, MessagesError>| -> Vec<Value> {
         events
             .expect("events")
@@ -1015,7 +1296,9 @@ async fn tool_calls_that_finish_with_stop_are_a_tool_use_stop() {
         "stop",
     );
     assert_eq!(
-        message(answer, false).expect("a message").stop_reason,
+        message(answer, ThinkingDisplay::Off)
+            .expect("a message")
+            .stop_reason,
         Some(messages_api::types::StopReason::ToolUse)
     );
     let streamed = events(vec![
@@ -1071,7 +1354,7 @@ fn a_tool_call_cut_off_by_max_tokens_is_left_out() {
         ]}),
         "length",
     );
-    let cut = message(answer, false).expect("a message");
+    let cut = message(answer, ThinkingDisplay::Off).expect("a message");
     assert_eq!(
         serde_json::to_value(&cut).expect("serializable")["content"],
         json!([{"type": "text", "text": "Writing it."}])

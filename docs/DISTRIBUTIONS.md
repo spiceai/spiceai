@@ -41,7 +41,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 **Included Features:**
 
 - All standard data connectors (PostgreSQL, MySQL, DuckDB, SQLite, ClickHouse, etc.)
-- Embedded data accelerators (Spice Cayenne, DuckDB, SQLite)
+- Embedded data accelerators (Spice Cayenne, SQLite)
 - AI/ML model inference (LLMs, embeddings)
 - Search capabilities (Vector and BM-25 Full-Text-Search)
 - Inline SQL user-defined scalar and table functions
@@ -226,6 +226,25 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 
 > **Note:** The Spice runtime does not run natively on Windows in any distribution. On Windows, run it under Windows Subsystem for Linux (WSL) or in Docker, and use the Windows `spice` CLI against it.
 
+## Verifying a Download
+
+Each GitHub release publishes `SHA256SUMS`, the sha256 of every other file in the release: the `spice` and `spiced` archives and the install scripts (`install.sh`, `install-spiced.sh`, `Install.ps1`). Each of those files, and `SHA256SUMS` itself, has a [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) signed by the release build, `.github/workflows/build_release.yml`, running on a `release/*` branch.
+
+To check a download, run these in the directory that holds it. Replace `v2.5.0` and the file name with the release and file you downloaded.
+
+```bash
+# Its sha256 matches the release's SHA256SUMS.
+curl -fsSLO https://github.com/spiceai/spiceai/releases/download/v2.5.0/SHA256SUMS
+grep ' spice_linux_x86_64.tar.gz$' SHA256SUMS | sha256sum --check   # macOS: shasum -a 256 --check
+
+# The release build made it. Needs the GitHub CLI, logged in.
+gh attestation verify spice_linux_x86_64.tar.gz --repo spiceai/spiceai \
+  --cert-identity-regex '^https://github\.com/spiceai/spiceai/\.github/workflows/build_release\.yml@refs/heads/release/' \
+  --deny-self-hosted-runners
+```
+
+Releases built before `SHA256SUMS` was introduced have neither file. For those, compare `sha256sum <file>` with the sha256 the release page lists next to each asset.
+
 ## Choosing a Distribution
 
 | Use Case                                | Recommended Distribution     |
@@ -277,7 +296,7 @@ You can build custom distributions with specific feature combinations:
 
 ```bash
 # Build with specific features
-SPICED_CUSTOM_FEATURES="duckdb,postgres,sqlite,models" make build-runtime
+SPICED_CUSTOM_FEATURES="adbc,postgres,sqlite,models" make build-runtime
 
 # Build with HTTP-backed function servers
 SPICED_NON_DEFAULT_FEATURES="http-functions" make install

@@ -16,6 +16,12 @@ variants:
   upsert: { datasets: { t: { acceleration: { on_conflict: { id: upsert } } } } }
   upsert-dedup: { datasets: { t: { acceleration: { on_conflict: { id: upsert_dedup } } } } }
   upsert-dedup-by-row-id: { datasets: { t: { acceleration: { on_conflict: { id: upsert_dedup_by_row_id } } } } }
+  # Each variant above that keeps an unpartitioned Cayenne file acceleration,
+  # with the prototype object-native Cayenne metastore.
+  drop-object-native: {datasets: {t: {acceleration: {on_conflict: {id: drop}}}}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
+  upsert-object-native: {datasets: {t: {acceleration: {on_conflict: {id: upsert}}}}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
+  upsert-dedup-object-native: {datasets: {t: {acceleration: {on_conflict: {id: upsert_dedup}}}}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
+  upsert-dedup-by-row-id-object-native: {datasets: {t: {acceleration: {on_conflict: {id: upsert_dedup_by_row_id}}}}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
 
 spicepod:
   version: v1

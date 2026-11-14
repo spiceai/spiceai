@@ -47,11 +47,20 @@ pub struct ContainerSpec {
     pub ports: Vec<u16>,
     pub healthcheck: Option<HealthConfig>,
     /// A Docker network to join (created if missing), so containers of one
-    /// source can reach each other by name.
+    /// source can reach each other by name; or `container:<name>`, to share
+    /// that container's network namespace, which takes no network from
+    /// Docker's address pools (the container then publishes no ports; the
+    /// other one publishes them).
     pub network: Option<String>,
     /// Another name peers on `network` reach the container by. A container
     /// name can outgrow the 63 characters a host name label may hold.
     pub alias: Option<String>,
+}
+
+/// A network mode that names no network of the run's own: Docker's shared
+/// ones, or another container's namespace.
+fn is_shared_network(network: &str) -> bool {
+    matches!(network, "host" | "bridge" | "none") || network.starts_with("container:")
 }
 
 pub struct Container {
@@ -132,7 +141,7 @@ impl Container {
             .await
             .context("Docker did not answer; start Docker (or OrbStack) and retry")?;
         pull_if_missing(&docker, &spec.image).await?;
-        if let Some(network) = &spec.network
+        if let Some(network) = spec.network.as_ref().filter(|n| !is_shared_network(n))
             && docker
                 .inspect_network::<String>(network, None)
                 .await
@@ -149,10 +158,13 @@ impl Container {
                 .with_context(|| format!("Failed to create network {network}"))?;
         }
 
+        let also = also_publish_on();
         let mut ports = HashMap::new();
         for port in &spec.ports {
             let host = match host_ports.get(port) {
                 Some(host) => *host,
+                // Published on `also` too, so it must be free there as well.
+                None if also.is_some() => free_port_on(std::net::Ipv4Addr::UNSPECIFIED.into())?,
                 None => free_port()?,
             };
             ports.insert(*port, host);
@@ -163,7 +175,7 @@ impl Container {
                 (
                     format!("{container}/tcp"),
                     Some(vec![PortBinding {
-                        host_ip: Some("127.0.0.1".into()),
+                        host_ip: Some(binding_address(also).into()),
                         host_port: Some(host.to_string()),
                     }]),
                 )
@@ -228,7 +240,7 @@ impl Container {
                     .chain(spec.alias.clone())
                     .collect();
                 if !aliases.is_empty()
-                    && let Some(network) = spec.network.as_deref().filter(|n| *n != "host")
+                    && let Some(network) = spec.network.as_deref().filter(|n| !is_shared_network(n))
                 {
                     config.networking_config = Some(NetworkingConfig {
                         endpoints_config: HashMap::from([(
@@ -467,11 +479,7 @@ impl Container {
     /// Removes the network the container joined, once no container is on it.
     pub async fn remove_network(&self) -> Result<()> {
         // Docker's own networks are shared by everything on the host.
-        if let Some(network) = self
-            .network
-            .as_ref()
-            .filter(|n| !matches!(n.as_str(), "host" | "bridge" | "none"))
-        {
+        if let Some(network) = self.network.as_ref().filter(|n| !is_shared_network(n)) {
             self.docker
                 .remove_network(network)
                 .await
@@ -879,6 +887,42 @@ fn conflict_holder(message: &str) -> Option<String> {
 /// The label naming the runner process that created a container or network,
 /// which the reaper reads to tell a live run's resources from a dead one's.
 pub const RUNNER_LABEL: &str = "spicescript.runner";
+
+tokio::task_local! {
+    /// An address the containers started within [`publishing_also_on`]
+    /// publish their ports on, besides loopback.
+    static ALSO_PUBLISH_ON: Option<std::net::IpAddr>;
+}
+
+/// Runs `work`, in which every container started publishes its ports where
+/// they are reached at `address` as well as on loopback, where one is given:
+/// for peers that reach this machine at that address, such as cluster
+/// executors in bridge containers behind a rootless daemon (see
+/// [`crate::spiced::ContainerRun`]).
+pub async fn publishing_also_on<F: std::future::Future>(
+    address: Option<std::net::IpAddr>,
+    work: F,
+) -> F::Output {
+    ALSO_PUBLISH_ON.scope(address, work).await
+}
+
+/// The address [`publishing_also_on`] gave the current task, if any.
+pub fn also_publish_on() -> Option<std::net::IpAddr> {
+    ALSO_PUBLISH_ON.try_with(|address| *address).ok().flatten()
+}
+
+/// The host address a container's port is published on: loopback, or, when
+/// it must also be reached at `also`, every interface. A rootless daemon
+/// cannot publish one port on two host addresses: it binds each at its own
+/// loopback inside its namespace, so the second fails with "address already
+/// in use". Every interface is loopback and `also`, the routable address.
+fn binding_address(also: Option<std::net::IpAddr>) -> &'static str {
+    if also.is_some() {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
+}
 
 fn runner_label() -> HashMap<&'static str, String> {
     HashMap::from([(RUNNER_LABEL, std::process::id().to_string())])
@@ -1476,5 +1520,25 @@ mod pull_tests {
             "{got:?}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod also_publish_tests {
+    use super::{also_publish_on, binding_address, publishing_also_on};
+
+    #[tokio::test]
+    async fn publishes_on_the_extra_address_only_within_its_scope() {
+        let address: std::net::IpAddr = std::net::Ipv4Addr::new(10, 244, 0, 183).into();
+        assert_eq!(also_publish_on(), None);
+        assert_eq!(binding_address(also_publish_on()), "127.0.0.1");
+        let inside =
+            publishing_also_on(Some(address), async { binding_address(also_publish_on()) }).await;
+        assert_eq!(inside, "0.0.0.0");
+        assert_eq!(
+            publishing_also_on(None, async { also_publish_on() }).await,
+            None
+        );
+        assert_eq!(also_publish_on(), None);
     }
 }

@@ -11,6 +11,8 @@ sources:
 variants:
   cayenne: {}
   cayenne-memory: { datasets: { '*': { acceleration: { mode: memory } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

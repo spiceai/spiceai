@@ -44,19 +44,8 @@ pub(crate) struct Selection {
     pub model: String,
     /// Every model that is ready, `model` included.
     pub available: Vec<String>,
-    /// Whether every model in `available` answers the Messages API natively
-    /// rather than through a translation into chat completions, which cannot
-    /// carry every Messages feature (deferred tool loading, for one).
-    pub native_messages: bool,
     /// The token limits of each model in `available` that reports any.
     pub limits: HashMap<String, Limits>,
-}
-
-/// Whether the runtime serves `model`'s Messages API natively: only a model
-/// whose provider is Anthropic does, and the runtime reports the provider as
-/// the start of `owned_by` (the model's `from`).
-fn serves_messages_natively(model: &ModelInfo) -> bool {
-    model.owned_by == "anthropic" || model.owned_by.starts_with("anthropic:")
 }
 
 /// How a model's state reads for the agent waiting on it.
@@ -189,10 +178,6 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
         .iter()
         .filter(|model| readiness(model) == Readiness::Ready)
         .collect();
-    let native_messages = !ready_models.is_empty()
-        && ready_models
-            .iter()
-            .all(|model| serves_messages_natively(model));
     let ready: Vec<String> = ready_models.iter().map(|model| model.id.clone()).collect();
     let limits: HashMap<String, Limits> = ready_models
         .iter()
@@ -220,7 +205,6 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
             Readiness::Ready => Decision::Ready(Selection {
                 model: requested.to_string(),
                 available: ready,
-                native_messages,
                 limits,
             }),
             Readiness::Loading => Decision::Wait(vec![requested.to_string()]),
@@ -263,12 +247,10 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
         [only] => Decision::Ready(Selection {
             model: only.clone(),
             available: ready.clone(),
-            native_messages,
             limits,
         }),
         _ => Decision::Choose(Choices {
             available: ready,
-            native_messages,
             limits,
         }),
     }
@@ -299,16 +281,11 @@ fn misspelled_model(
 #[derive(Debug)]
 struct Choices {
     available: Vec<String>,
-    native_messages: bool,
     limits: HashMap<String, Limits>,
 }
 
 fn choose(choices: Choices, interactive: bool, agent: Agent) -> Result<Selection> {
-    let Choices {
-        available,
-        native_messages,
-        limits,
-    } = choices;
+    let Choices { available, limits } = choices;
     if !interactive {
         let example = available.first().map_or_else(String::new, |model| {
             format!(
@@ -339,7 +316,6 @@ fn choose(choices: Choices, interactive: bool, agent: Agent) -> Result<Selection
     Ok(Selection {
         model: available[index].clone(),
         available,
-        native_messages,
         limits,
     })
 }
@@ -395,6 +371,7 @@ mod tests {
             metadata: None,
             context_window: None,
             max_output_tokens: None,
+            node_rank: None,
         }
     }
 
@@ -413,26 +390,9 @@ mod tests {
             Selection {
                 model: "qwen".to_string(),
                 available: vec!["qwen".to_string()],
-                native_messages: false,
                 limits: HashMap::new(),
             }
         );
-    }
-
-    #[test]
-    fn messages_are_native_only_when_every_ready_model_is_anthropic() {
-        let mut claude = model("claude", Some(ComponentStatus::Ready));
-        claude.owned_by = "anthropic:claude-sonnet-5".to_string();
-        assert!(ready(decide(std::slice::from_ref(&claude), None)).native_messages);
-
-        // One translated model is enough: the agent can switch to it mid-session.
-        let models = [claude, model("gpt", Some(ComponentStatus::Ready))];
-        assert!(!ready(decide(&models, Some("claude"))).native_messages);
-
-        // `owned_by` is the model's `from`; a name that merely starts alike is not Anthropic.
-        let mut lookalike = model("x", Some(ComponentStatus::Ready));
-        lookalike.owned_by = "anthropic-proxy:claude".to_string();
-        assert!(!ready(decide(&[lookalike], None)).native_messages);
     }
 
     #[test]
@@ -556,7 +516,6 @@ mod tests {
             Selection {
                 model: "qwen".to_string(),
                 available: vec!["qwen".to_string()],
-                native_messages: false,
                 limits: HashMap::new(),
             }
         );

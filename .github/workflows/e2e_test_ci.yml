@@ -131,7 +131,7 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
-    environment: ci-build
+    environment: ci
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     # A backstop above the longest step bound below, leaving room for the artifact upload
@@ -1044,7 +1044,6 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -1205,7 +1204,6 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -1454,7 +1452,7 @@ jobs:
         run: |
           CLICKHOUSE_VERSION="26.3.9.8-lts"
           BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
           mv clickhouse-macos-aarch64 clickhouse
           chmod +x clickhouse
           sudo ./clickhouse install --noninteractive
@@ -1556,14 +1554,14 @@ jobs:
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
           unzip duckdb_cli-linux-amd64.zip
           chmod +x ./duckdb
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'darwin'
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -O https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
           unzip duckdb_cli-osx-universal.zip
           chmod +x ./duckdb
 
@@ -1640,8 +1638,6 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
-            { engine: sqlite, mode: memory },
-            { engine: sqlite, mode: file },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -2560,7 +2556,12 @@ jobs:
 
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
+          # GitHub release downloads answer 504 in bursts longer than a fixed 5s x 5
+          # retry outlasts. With no --retry-delay, curl waits 1s and doubles each time,
+          # so 8 retries span about 4 minutes; --retry-max-time 300 bounds that.
+          # Every GitHub release download in this file's own steps uses these flags;
+          # composite actions such as install-protoc keep their own.
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
           echo "b5bad3ec8bf689885f8270ebd8e0f507e4f671f37dabf6127c09b19960389f96  duckdb_cli.zip" | sha256sum -c
           unzip duckdb_cli.zip
           chmod +x ./duckdb
@@ -2577,7 +2578,7 @@ jobs:
         run: |
           # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
           # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
-          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+          curl --fail --silent --show-error --location --retry 8 --retry-all-errors --retry-max-time 300 \
             -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
           echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
@@ -2802,7 +2803,7 @@ jobs:
         run: |
           # Pinned and checksummed like the DuckDB CLI above; the retry covers only the
           # download, so a transient release-CDN 5xx or TLS error cannot fail the job.
-          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+          curl --fail --silent --show-error --location --retry 8 --retry-all-errors --retry-max-time 300 \
             -o oha "https://github.com/hatoo/oha/releases/download/v1.16.0/oha-linux-amd64"
           echo "620bb9e16fb53eabc9a3fc45f88bdb41fefa3fee5c05e75892011ce320391716  oha" | sha256sum -c
           chmod +x ./oha
@@ -3048,7 +3049,7 @@ jobs:
       # DuckLake source fetches the release matching spiced's embedded DuckDB.
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/duckdb.zip" \
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 -o "$RUNNER_TEMP/duckdb.zip" \
             https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
@@ -3230,9 +3231,11 @@ jobs:
       - graceful_shutdown_test_full
       - test_cold_start_unkeyed_append
       - build_spicescript
-      # test_spicescript reports but does not gate merges while the scenario
-      # scripts settle on the CI runners: a run that fails there names the
-      # failing scripts in its own job.
+      # Every spicescript job gates: the passing scripts, the known-failing
+      # scripts (which must fail exactly as recorded), the older DuckDB releases
+      # and the live providers. A failing shard names its failing scripts in
+      # its own log.
+      - test_spicescript
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required

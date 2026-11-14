@@ -6,14 +6,30 @@ description: >
   killed during the refresh that picks them up, it comes back with whole rows
   and then catches up. Readers always see the full row count, and the table
   ends equal to the same rows in PostgreSQL. Run over databases, lakehouse
-  tables, an object store and local files.
+  tables, an object store and local files. With object-native data, the table's
+  files are in the state location, and an instance that loses its directory
+  serves the whole table again while the source is down.
 
 sources:
   src: { kind: '${matrix.src}' }
   ref: { kind: postgres }
+  # The state locations of the object-native-s3 variants.
+  lake: { kind: rustfs }
+  slow-lake: { kind: rustfs, latency: 20ms }
 
 matrix:
   src: [postgres, mysql, clickhouse, iceberg, ducklake, rustfs, files]
+
+# The spicepod as written, and the same with the prototype object-native Cayenne
+# metastore in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+  # Object-native data (#16131): data files in the state location, which an
+  # instance that loses its directory serves again without the source.
+  object-native-local: object-native-local
+  object-native-s3: object-native-s3
+  object-native-s3-latency: object-native-s3-latency
 
 spicepod:
   version: v1
@@ -88,3 +104,43 @@ steps:
   - query: SELECT * FROM facts WHERE grp = 17 ORDER BY id
 
   - stop-background: { id: whole-table, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection', 'not ready'] }
+
+  # Object-native data (#16131): the table's files are in the state
+  # location, under its log's data/ folder, and none at a local `s3:` path.
+  - assert-files: { contains: '^state/cayenne/v1/datasets/facts-[^/]+/data/' }
+    only: object-native-local
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/facts-, contains: /data/, min: 1 }
+    only: object-native-s3
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/facts-, contains: /data/, min: 1 }
+    only: object-native-s3-latency
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: &object-native-data [object-native-local, object-native-s3, object-native-s3-latency]
+
+  # An instance that loses its directory serves the whole table from the
+  # location alone: the source is down, so it cannot read the rows again.
+  - stop: {}
+    only: *object-native-data
+    when: *stoppable
+  - wipe-instance-dir: { keep: [state] }
+    only: *object-native-data
+    when: *stoppable
+  - assert-files: { lacks: '^\.spice/' }
+    only: *object-native-data
+    when: *stoppable
+  - stop-source: src
+    when: *stoppable
+  - start: { ready: false }
+    only: *object-native-data
+    when: *stoppable
+  - query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts
+    eventually: 60s
+    only: *object-native-data
+    when: *stoppable
+  - query: SELECT * FROM facts WHERE grp = 17 ORDER BY id
+    only: *object-native-data
+    when: *stoppable
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: *object-native-data
+    when: *stoppable
+  - start-source: src
+    when: *stoppable

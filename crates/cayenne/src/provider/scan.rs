@@ -64,27 +64,33 @@ use vortex_datafusion::VortexSource;
 /// segment files deleted out from under it by a concurrent compaction. This replaces
 /// the brittle time-based grace, which a query slower than the grace would outlive.
 ///
-/// Correctness rests on the listing-flip invariant: a scan captures its snapshot ids
-/// under `listing_fence.read()`, and a compaction's flip takes `listing_fence.write()`,
+/// Object-native data files instead use retention T; these references do not
+/// hold back their retirement sweep.
+///
+/// Correctness of snapshot-folder cleanup rests on the listing-flip invariant:
+/// a scan captures its snapshot ids under `listing_fence.read()`, and a compaction's flip takes `listing_fence.write()`,
 /// so after the flip no NEW scan can reference the superseded snapshot — its ref-count
 /// only decreases, and cleanup that observes count 0 can delete it safely.
 #[derive(Debug)]
 pub(crate) struct SnapshotScanRef {
-    refs: Arc<Mutex<HashMap<String, usize>>>,
+    refs: Arc<Mutex<SnapshotScanRefs>>,
     snapshot_ids: Vec<String>,
 }
 
+/// Per-snapshot scan refcounts for snapshot-folder cleanup.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotScanRefs {
+    pub(crate) snapshots: HashMap<String, usize>,
+}
+
 impl SnapshotScanRef {
-    /// Increment the in-flight-scan ref-count for each snapshot id and return a
-    /// guard that decrements them on drop.
-    pub(crate) fn new(
-        refs: Arc<Mutex<HashMap<String, usize>>>,
-        snapshot_ids: Vec<String>,
-    ) -> Arc<Self> {
+    /// Increment the in-flight-scan ref-count for each snapshot id and return
+    /// a guard that releases the references on drop.
+    pub(crate) fn new(refs: Arc<Mutex<SnapshotScanRefs>>, snapshot_ids: Vec<String>) -> Arc<Self> {
         {
             let mut map = refs.lock();
             for id in &snapshot_ids {
-                *map.entry(id.clone()).or_insert(0) += 1;
+                *map.snapshots.entry(id.clone()).or_insert(0) += 1;
             }
         }
         Arc::new(Self { refs, snapshot_ids })
@@ -95,10 +101,10 @@ impl Drop for SnapshotScanRef {
     fn drop(&mut self) {
         let mut map = self.refs.lock();
         for id in &self.snapshot_ids {
-            if let Some(count) = map.get_mut(id) {
+            if let Some(count) = map.snapshots.get_mut(id) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    map.remove(id);
+                    map.snapshots.remove(id);
                 }
             }
         }
@@ -2315,7 +2321,10 @@ mod tests {
 
         // `with_guard` marks this the outermost wrapper, so only the file-backed
         // gate can hold the accounting off.
-        let guard = SnapshotScanRef::new(Arc::new(Mutex::new(HashMap::new())), Vec::new());
+        let guard = SnapshotScanRef::new(
+            Arc::new(Mutex::new(SnapshotScanRefs::default())),
+            Vec::new(),
+        );
         let exec = CayenneAccelerationExec::with_guard(one_partition_plan(), guard);
 
         let mut stream = exec

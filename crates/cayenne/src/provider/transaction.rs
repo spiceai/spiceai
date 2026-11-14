@@ -52,7 +52,6 @@ use super::pk_index::PkDigestSet;
 use super::staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 use super::table::CayenneTableProvider;
 use super::{Error, Result};
-use crate::CayenneCatalog;
 
 /// One participant table in a transaction (read and/or written): its per-table
 /// begin token, provider, accumulated read footprint, and — once a write stages
@@ -383,14 +382,7 @@ impl CayenneTransaction {
                     .to_string(),
             });
         }
-        let Some(catalog) = shared_catalog.as_any().downcast_ref::<CayenneCatalog>() else {
-            drop(write_guards);
-            rollback_prepared(prepared).await;
-            return Err(Error::Internal {
-                table: "<transaction>".to_string(),
-                message: "transaction participant is not backed by a Cayenne catalog".to_string(),
-            });
-        };
+        let catalog = shared_catalog.as_ref();
 
         // Hold visibility + listing-fence locks (canonical order) across the fused
         // durable commit and the in-memory publish.
@@ -451,32 +443,23 @@ enum FusedFailure {
 /// Bounded retry on a busy backend; an `apply` failure is terminal (the whole
 /// multi-table commit aborts). On success every table is durable together.
 async fn commit_fused(
-    catalog: &CayenneCatalog,
+    catalog: &dyn crate::catalog::MetadataCatalog,
     prepared: &mut [PreparedTxnCommit],
 ) -> std::result::Result<(), FusedFailure> {
     use write_retry::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
-    let first_table = prepared
-        .first()
-        .map(|pc| pc.table_id().to_string())
-        .unwrap_or_default();
     for attempt in 1..=DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS {
-        let mut txn = catalog
-            .begin_transaction()
-            .await
-            .map_err(|e| FusedFailure::Uncommitted(e.into()))?;
-        let mut apply_err = None;
-        for pc in prepared.iter_mut() {
-            if let Err(e) = pc.apply_in_txn(catalog, txn.as_mut()).await {
-                apply_err = Some(e);
-                break;
-            }
-        }
-        if let Some(e) = apply_err {
-            let _ = txn.rollback().await;
-            return Err(FusedFailure::Uncommitted(Error::from(e)));
-        }
-        match super::append_commit::commit_transaction(txn, &first_table).await {
+        let publications: Vec<_> = prepared
+            .iter()
+            .filter_map(PreparedTxnCommit::catalog_publication)
+            .collect();
+        // A transaction's COMMIT is acknowledged to the caller, so its metastore
+        // change commits now rather than waiting in a buffering catalog.
+        let committed = match catalog.commit_publications(&publications).await {
+            Ok(()) => crate::catalog::commit_at_acknowledgement(catalog).await,
+            Err(e) => Err(e),
+        };
+        match committed {
             Ok(()) => {
                 // Durably committed — disarm each publish's abort cleanup so its
                 // `Drop` does not delete the now-live deletion-vector files.
@@ -509,16 +492,26 @@ async fn commit_fused(
 /// transaction stands; none, it never happened; otherwise the staged files are
 /// kept and each table refuses writes until it is reloaded.
 async fn resolve_failed_fused_commit(
-    catalog: &CayenneCatalog,
+    catalog: &dyn crate::catalog::MetadataCatalog,
     prepared: &mut [PreparedTxnCommit],
     error: Error,
 ) -> std::result::Result<(), FusedFailure> {
     let mut committed = 0;
     let mut unreadable = None;
     for pc in prepared.iter() {
-        match super::append_commit::snapshot_sequence(catalog, pc.table_id(), pc.snapshot_id())
+        // A table in the object-native location reads its state back in the
+        // background after a commit whose outcome is unknown: wait for that.
+        let read_back = if pc.data_in_object_native_location() {
+            super::append_commit::snapshot_sequence_once_readable(
+                catalog,
+                pc.table_id(),
+                pc.snapshot_id(),
+            )
             .await
-        {
+        } else {
+            super::append_commit::snapshot_sequence(catalog, pc.table_id(), pc.snapshot_id()).await
+        };
+        match read_back {
             Ok(Some(sequence)) if sequence == pc.snapshot_sequence() => committed += 1,
             Ok(_) => {}
             Err(read_error) => {
@@ -539,6 +532,9 @@ async fn resolve_failed_fused_commit(
         }
         None if committed == 0 => Err(FusedFailure::Uncommitted(error)),
         _ => {
+            let refuses_queries = prepared
+                .iter()
+                .any(PreparedTxnCommit::data_in_object_native_location);
             for pc in prepared.iter_mut() {
                 pc.retain_after_unknown_outcome();
             }
@@ -554,7 +550,12 @@ async fn resolve_failed_fused_commit(
             Err(FusedFailure::Unknown(Error::IncompleteWrite {
                 table: "<transaction>".to_string(),
                 message: format!(
-                    "a transaction's commit failed ({error}), and {read_back}. Its files are kept, and writes to its tables are refused until they are reloaded from their catalog. Restart Spice to reload them"
+                    "a transaction's commit failed ({error}), and {read_back}. Its files are kept, and {} until they are reloaded from their catalog. Restart Spice to reload them",
+                    if refuses_queries {
+                        "writes to its tables, and queries of those whose data is in the state location, are refused"
+                    } else {
+                        "writes to its tables are refused"
+                    }
                 ),
             }))
         }

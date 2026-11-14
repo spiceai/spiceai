@@ -766,12 +766,26 @@ impl Chat for LlamaCpp {
                 if state.done {
                     return None;
                 }
-                // A streamed delta has no reasoning field, so reasoning is not streamed, as on
-                // the mistral.rs engine; it is in a non-streamed response's `reasoning_content`.
                 let item = loop {
                     let (index, first) = (state.index, state.first);
                     match state.choices.front_mut()?.recv().await {
-                        Some(Event::Reasoning(_)) => {}
+                        // A fragment of nothing carries nothing, so a streamed
+                        // `reasoning_content` is never empty.
+                        Some(Event::Reasoning(reasoning)) if reasoning.is_empty() => {}
+                        Some(Event::Reasoning(reasoning)) => {
+                            state.first = false;
+                            break Ok(chunk(
+                                &id,
+                                &model,
+                                created,
+                                index,
+                                first,
+                                Some(Text::Reasoning(reasoning)),
+                                None,
+                                None,
+                                None,
+                            ));
+                        }
                         Some(Event::Content(content)) => {
                             state.first = false;
                             break Ok(chunk(
@@ -780,7 +794,7 @@ impl Chat for LlamaCpp {
                                 created,
                                 index,
                                 first,
-                                Some(content),
+                                Some(Text::Answer(content)),
                                 None,
                                 None,
                                 None,
@@ -1126,7 +1140,7 @@ fn serve(
         let events = job.events.clone();
         let stopping = Arc::clone(&job.stopping);
         let result = match &mut decoder {
-            Decoder::Plain(context) => generate(&model, context, &mut cache, job, &eog),
+            Decoder::Plain(context) => generate(&model, context, split, &mut cache, job, &eog),
             Decoder::Mtp(spec) => generate_mtp(&model, spec, split, &mut cache, job, &eog),
         };
         let event = match result {
@@ -2337,6 +2351,12 @@ impl<'v> Picker<'v> {
         self.goes_on
     }
 
+    /// Whether every token of the reply is the greedy sampler's pick alone: no penalties, no
+    /// end-of-generation ban and no grammar, which a context's argmax output does not apply.
+    fn picks_greedily(&self) -> bool {
+        self.free.is_greedy() && self.constrained.is_none()
+    }
+
     fn sample(&mut self, context: &Context<'_>, index: i32, in_content: bool) -> Token {
         let (used, other) = match &mut self.constrained {
             Some(constrained) if in_content => (constrained, Some(&mut self.free)),
@@ -2368,10 +2388,13 @@ fn draw<'v>(sampling: &Sampling) -> Vec<Sampler<'v>> {
     }
 }
 
-/// Runs one request, one token per forward pass.
+/// Runs one request, one token per forward pass. On a model `split` across nodes, a request
+/// that picks greedily alone takes its picks from the context's argmax output
+/// ([`Context::set_argmax_output`]), set before its prompt is read.
 fn generate(
     model: &Model,
     context: &mut Context<'_>,
+    split: bool,
     cache: &mut PromptCache,
     job: Job,
     eog: &[Token],
@@ -2387,6 +2410,7 @@ fn generate(
         out.pending(),
     )?;
     out.begin(picker.goes_on());
+    context.set_argmax_output(split && picker.picks_greedily());
     // `tokens` grows by every reply token decoded, so it is always what the cache holds.
     let (mut tokens, mut batch) =
         read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
@@ -2416,7 +2440,8 @@ fn generate(
 /// A model `split` across nodes verifies every drafted token even when the request has fewer
 /// left, so each verify batch keeps one shape: a shorter batch at a request's end rebuilds the
 /// verify graph twice (to the short shape and back), which over RPC re-serializes every rank's
-/// graph. Tokens past the limit are verified but never emitted.
+/// graph. Tokens past the limit are verified but never emitted. A request that picks greedily
+/// alone on a split model takes its picks from the target's argmax output, as in [`generate`].
 fn generate_mtp(
     model: &Model,
     spec: &mut Mtp<'_>,
@@ -2436,6 +2461,8 @@ fn generate_mtp(
         out.pending(),
     )?;
     out.begin(picker.goes_on());
+    spec.target_mut()
+        .set_argmax_output(split && picker.picks_greedily());
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`; its cache keeps the positions the
     // target's reuses.
@@ -3018,6 +3045,13 @@ fn completion_limit(req: &CreateChatCompletionRequest) -> Option<usize> {
         .and_then(|limit| usize::try_from(limit).ok())
 }
 
+/// The text one streamed chunk carries: a fragment of the reasoning or of the answer, never both,
+/// in `reasoning_content` or `content`.
+enum Text {
+    Reasoning(String),
+    Answer(String),
+}
+
 #[expect(
     deprecated,
     reason = "`function_call` and `system_fingerprint` are deprecated fields of a chunk"
@@ -3032,13 +3066,19 @@ fn chunk(
     created: u32,
     index: u32,
     first: bool,
-    content: Option<String>,
+    text: Option<Text>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
     finish_reason: Option<FinishReason>,
     usage: Option<CompletionUsage>,
 ) -> CreateChatCompletionStreamResponse {
+    let (reasoning_content, content) = match text {
+        Some(Text::Reasoning(reasoning)) => (Some(reasoning), None),
+        Some(Text::Answer(answer)) => (None, Some(answer)),
+        None => (None, None),
+    };
     let delta = ChatCompletionStreamResponseDelta {
         content,
+        reasoning_content,
         function_call: None,
         tool_calls,
         role: first.then_some(Role::Assistant),

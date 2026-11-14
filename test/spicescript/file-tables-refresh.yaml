@@ -16,6 +16,8 @@ matrix:
 variants:
   cayenne:
     datasets: { facts: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { facts: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
 
 spicepod:
   version: v1

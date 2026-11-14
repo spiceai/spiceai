@@ -144,6 +144,11 @@ jobs:
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         env:
           SQL_PIPELINE: ${{ github.event.inputs.sql_pipeline }}
+          # spiced downloads the spicepod's Hugging Face embedding models (model2vec, hf). Without a
+          # token those downloads share the Hub's anonymous per-IP quota with every other job on
+          # the runner pool, and a sweep of search legs gets `429 Too Many Requests` until the
+          # ready wait runs out. spiced sends `HF_TOKEN` only to the Hub.
+          HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
           S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
