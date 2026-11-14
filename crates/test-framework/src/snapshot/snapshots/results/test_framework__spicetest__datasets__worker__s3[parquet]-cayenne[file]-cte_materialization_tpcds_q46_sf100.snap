@@ -5,14 +5,14 @@ description: "Query: tpcds_q46"
 +-------------+--------------+-------------+--------------------+------------------+---------+-----------+
 | c_last_name | c_first_name | ca_city     | bought_city        | ss_ticket_number | amt     | profit    |
 +-------------+--------------+-------------+--------------------+------------------+---------+-----------+
-| Aaron       | Alicia       | Oak Hill    | Bridgeport         | 9778993          | 0.00    | -10975.43 |
-| Aaron       | Angelica     | Belmont     | Pleasant Hill      | 18792910         | 305.19  | -19595.87 |
-| Aaron       | Barbara      | White Oak   | Greenfield         | 23868407         | 77.52   | 751.02    |
-| Aaron       | Brenda       | Kingston    | Wilson             | 13126556         | 4045.84 | -10327.85 |
-| Aaron       | Charles      | Ashland     | Pleasant Hill      | 23837730         | 6421.29 | -9145.86  |
-| Aaron       | Cynthia      | Cedar Grove | Shady Grove        | 10202504         | 1248.01 | -12305.94 |
-| Aaron       | Dale         | Oak Hill    | Macon              | 18697197         | 0.00    | -7561.58  |
-| Aaron       | Dale         | Oak Hill    | Oakland            | 15544894         | 2776.14 | -12605.58 |
-| Aaron       | Dale         | Oak Hill    | Washington Heights | 11537651         | 1981.66 | -10637.57 |
-| Aaron       | Duncan       | Springfield | Clifton            | 18531090         | 7986.95 | -12714.76 |
+| Aaron       | Alicia       | Oak Hill    | Bridgeport         | 9778993          | 0.00    | -2620.16  |
+| Aaron       | Angelica     | Belmont     | Pleasant Hill      | 18792910         | 508.99  | -8752.20  |
+| Aaron       | Barbara      | White Oak   | Greenfield         | 23868407         | 0.00    | -1142.90  |
+| Aaron       | Brenda       | Kingston    | Wilson             | 13126556         | 56.34   | -14301.15 |
+| Aaron       | Charles      | Ashland     | Pleasant Hill      | 23837730         | 0.00    | -4435.57  |
+| Aaron       | Cynthia      | Cedar Grove | Shady Grove        | 10202504         | 872.59  | -6067.38  |
+| Aaron       | Dale         | Oak Hill    | Macon              | 18697197         | 5719.86 | -10892.42 |
+| Aaron       | Dale         | Oak Hill    | Oakland            | 15544894         | 2428.58 | -11001.62 |
+| Aaron       | Dale         | Oak Hill    | Washington Heights | 11537651         | 1.92    | -16596.05 |
+| Aaron       | Duncan       | Springfield | Clifton            | 18531090         | 1506.23 | -7889.97  |
 +-------------+--------------+-------------+--------------------+------------------+---------+-----------+
