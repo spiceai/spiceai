@@ -502,8 +502,10 @@ fn window_distinct_is_renderable(expr: &Expr) -> bool {
 /// the unparser writes as `MySQL`'s exact `/` rather than the integer `DIV`
 /// it needs if the quotient is an integer; [`divides_by_a_possible_zero`]
 /// refuses a `/` or `%` whose divisor could be zero, which `MySQL` answers as
-/// `NULL`; and [`distinct_is_renderable_in_mysql`] refuses a `DISTINCT`
-/// aggregate `MySQL` cannot parse.
+/// `NULL`; [`distinct_is_renderable_in_mysql`] refuses a `DISTINCT`
+/// aggregate `MySQL` cannot parse; and [`compares_a_decimal_with_a_float`]
+/// refuses a comparison of a decimal with a float, which `MySQL` makes in
+/// `DOUBLE` where `DataFusion` makes it in decimal.
 #[must_use]
 pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     integer_cast_is_renderable(expr, scope)
@@ -511,6 +513,55 @@ pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> b
         && !divides_a_decimal(expr, scope)
         && !divides_by_a_possible_zero(expr)
         && distinct_is_renderable_in_mysql(expr)
+        && !compares_a_decimal_with_a_float(expr, scope)
+}
+
+/// Whether `expr` is a comparison (`=`, `<`, `IS DISTINCT FROM`, `BETWEEN`,
+/// `IN`, …) with a decimal operand and a floating-point one.
+///
+/// `DataFusion` compares the two as decimals: it casts the float to a decimal
+/// wide enough for both, rounding at that scale. `MySQL` compares them as
+/// `DOUBLE`, and a float literal it is sent is a `DOUBLE` (`6E-2`), so
+/// `disc <= 6E-2 + 1E-2` drops the rows at `0.07` that `DataFusion` keeps.
+/// A constant float is folded to the decimal `DataFusion` compares it as before
+/// federation (`DecimalComparisonFloatConstant`), so what reaches this check is
+/// a float that is not a constant, such as a `DOUBLE` column, or a constant that
+/// does not fit the decimal. An operand whose type cannot be read does not
+/// refuse the comparison: that is every comparison's operand in such a scope,
+/// not a sign of this one.
+fn compares_a_decimal_with_a_float(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let operands: Vec<&Expr> = match expr {
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+                    | Operator::IsDistinctFrom
+                    | Operator::IsNotDistinctFrom
+            ) =>
+        {
+            vec![binary.left.as_ref(), binary.right.as_ref()]
+        }
+        Expr::Between(between) => vec![
+            between.expr.as_ref(),
+            between.low.as_ref(),
+            between.high.as_ref(),
+        ],
+        Expr::InList(in_list) => std::iter::once(in_list.expr.as_ref())
+            .chain(in_list.list.iter())
+            .collect(),
+        _ => return false,
+    };
+    let scope = scope.unwrap_or_else(|| DFSchema::empty_ref());
+    let types: Vec<DataType> = operands
+        .into_iter()
+        .filter_map(|operand| operand_type(operand, scope))
+        .collect();
+    types.iter().any(DataType::is_decimal) && types.iter().any(DataType::is_floating)
 }
 
 /// Whether `MySQL` accepts this aggregate's `DISTINCT`.

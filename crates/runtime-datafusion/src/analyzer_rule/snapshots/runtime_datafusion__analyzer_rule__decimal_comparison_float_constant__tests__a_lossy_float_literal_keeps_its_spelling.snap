@@ -1,0 +1,5 @@
+---
+source: crates/runtime-datafusion/src/analyzer_rule/decimal_comparison_float_constant.rs
+expression: mysql
+---
+SELECT * FROM `m` WHERE (`m`.`d` < 99999999999999999999999999999999999.999999999999999999999999999999)

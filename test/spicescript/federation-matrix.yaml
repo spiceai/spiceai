@@ -42,6 +42,11 @@ variants:
         params:
           $merge: '${sources.backend.adbc_params}'
           duckdb_open: null
+      q:
+        from: adbc:q
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
 
 spicepod:
   version: v1
@@ -59,6 +64,9 @@ spicepod:
       params: ${sources.backend.params}
     - from: '${matrix.backend}:edge'
       name: edge
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:q'
+      name: q
       params: ${sources.backend.params}
 
 defaults:
@@ -122,6 +130,19 @@ steps:
           - { name: c, bigint: [-9223372036854775808, -9223372036854775808] }
           - { name: k, bigint: [-1, -1] }
     mirror: ref
+  # Decimals on a 0.01 grid, so float constants such as `0.06 + 0.01` land on
+  # stored values.
+  - generate:
+      backend:
+        table: q
+        rows: 200
+        seed: 35
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: disc, decimal: { range: [0, 0.1], scale: 2 }, nulls: 0.1 }
+          - { name: f, float: [0, 0.1] }
+    mirror: ref
   - start: {}
   - corpus: corpus/pushdown.sql
   - corpus: corpus/sql-semantics.sql
@@ -162,6 +183,16 @@ steps:
     when: { backend: mysql }
   - explain: SELECT id, a / 2, a % 2, a / 30000.0 FROM w
     contains: [VirtualExecutionPlan, "(`w`.`a` DIV 2)", "(`w`.`a` % 2)", "/ 3E4)"]
+    when: { backend: mysql }
+  # A float constant compared with a decimal is sent as the decimal DataFusion
+  # compares it as, which MySQL does not read as a DOUBLE; a float column
+  # compared with a decimal stays local on MySQL, which compares them as DOUBLE.
+  - explain: SELECT id FROM q WHERE disc BETWEEN 0.06 - 0.01 AND 0.06 + 0.01
+    contains: [VirtualExecutionPlan, "BETWEEN 0.050000000000000 AND 0.070000000000000"]
+    when: { backend: mysql }
+  - explain: SELECT id FROM q WHERE disc < f
+    contains: [VirtualExecutionPlan]
+    omits: ["`q`.`disc` < `q`.`f`"]
     when: { backend: mysql }
   # A divisor that might be zero, or a decimal division, stays local on MySQL:
   # MySQL answers NULL for a zero divisor and rounds a decimal quotient.
