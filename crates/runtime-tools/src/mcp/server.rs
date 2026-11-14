@@ -3322,8 +3322,9 @@ mod tests {
         );
     }
 
-    /// rmcp caches `get_tool == None`. A later registry update is invisible
-    /// until Streamable HTTP is rebuilt (the HTTP layer watches snapshot epoch).
+    /// rmcp looks a tool's schema up per request, so a tool registered after
+    /// a miss is validated by the existing Streamable HTTP service at once,
+    /// and by a service rebuilt when the snapshot epoch moves.
     #[tokio::test]
     async fn rebuilt_service_validates_after_tool_registers_following_a_miss() {
         let tools = Arc::new(RwLock::new(HashMap::new()));
@@ -3357,7 +3358,7 @@ mod tests {
         assert_ne!(
             json.pointer("/error/code").and_then(Value::as_i64),
             Some(-32020),
-            "a miss must skip HeaderMismatch so the cached None is load-bearing: {status} {json}"
+            "an unregistered tool has no schema, so a miss must skip HeaderMismatch: {status} {json}"
         );
         let epoch_after_miss = schemas.epoch();
 
@@ -3377,10 +3378,15 @@ mod tests {
 
         let (status, json) =
             post_tools_call(&service, "deploy", Some("us-west1"), "eu-west1").await;
-        assert_ne!(
+        assert_eq!(
+            status,
+            http::StatusCode::BAD_REQUEST,
+            "the existing StreamableHttpService must validate Mcp-Param once the tool appears: {status} {json}"
+        );
+        assert_eq!(
             json.pointer("/error/code").and_then(Value::as_i64),
             Some(-32020),
-            "the same StreamableHttpService must keep the cached miss: {status} {json}"
+            "expected HeaderMismatch (-32020) from the existing service, got {json}"
         );
 
         let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -3407,10 +3413,9 @@ mod tests {
         );
     }
 
-    /// rmcp caches `get_tool` per name. After `deploy` rewrites
-    /// `x-mcp-header` from `Region` to `Zone`, the existing
-    /// `StreamableHttpService` still validates `mcp-param-region`; a
-    /// rebuilt service validates `mcp-param-zone`.
+    /// rmcp looks a tool's schema up per request. After `deploy` rewrites
+    /// `x-mcp-header` from `Region` to `Zone`, both the existing
+    /// `StreamableHttpService` and a rebuilt one validate `mcp-param-zone`.
     #[tokio::test]
     async fn rebuilt_service_validates_after_same_name_schema_identity_change() {
         let mut tools = HashMap::new();
@@ -3475,10 +3480,9 @@ mod tests {
 
         let (status, json) =
             post_tools_call_param(&service, "deploy", "zone", Some("us-west1"), "us-west1").await;
-        assert_eq!(
-            json.pointer("/error/code").and_then(Value::as_i64),
-            Some(-32020),
-            "existing StreamableHttpService must still validate mcp-param-region: {status} {json}"
+        assert!(
+            status.is_success() && json.get("error").is_none(),
+            "the existing StreamableHttpService must validate mcp-param-zone after the schema rewrite: {status} {json}"
         );
 
         let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -3784,10 +3788,10 @@ mod tests {
         );
     }
 
-    /// A proxied catalog TTL refresh used to update only the catalog
-    /// cache. Streamable HTTP kept validating `mcp-param-region` until a
-    /// gateway `tools/list`. Publishing the cache into the snapshot and
-    /// rebuilding the service validates `mcp-param-zone` without that list.
+    /// A proxied catalog TTL refresh publishes the catalog cache into the
+    /// snapshot. Streamable HTTP then validates `mcp-param-zone` without a
+    /// gateway `tools/list`, in the existing service (rmcp looks the schema
+    /// up per request) and in a rebuilt one.
     #[tokio::test]
     async fn rebuilt_service_validates_after_catalog_cache_schema_identity_change() {
         let exposed = encode_tool_name("srv", "deploy");
@@ -3855,10 +3859,9 @@ mod tests {
 
         let (status, json) =
             post_tools_call_param(&service, &exposed, "zone", Some("us-west1"), "us-west1").await;
-        assert_eq!(
-            json.pointer("/error/code").and_then(Value::as_i64),
-            Some(-32020),
-            "existing StreamableHttpService must still validate mcp-param-region: {status} {json}"
+        assert!(
+            status.is_success() && json.get("error").is_none(),
+            "the existing StreamableHttpService must validate mcp-param-zone after the catalog cache rewrite: {status} {json}"
         );
 
         let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -4709,16 +4712,20 @@ mod tests {
             "message": "Unknown tool: no_such_tool"
         });
 
+        // An unknown tool is a JSON-RPC protocol error answered in-band, in an
+        // HTTP 200: MCP's Streamable HTTP transport keeps 400 for a mismatched
+        // header, an unsupported protocol version or malformed `_meta`, and a
+        // client that gets a 400 may fall back to the legacy `initialize`.
         let (status, json) = post_tools_call_with_spice_ctx(
             &service,
             "no_such_tool",
             Some(spice_ctx_with_api_key("test-key:rw")),
         )
         .await;
-        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(status, http::StatusCode::OK, "{json}");
         assert_eq!(json.get("error"), Some(&expected), "{json}");
 
-        // A legacy session reports the same error, in an HTTP 200.
+        // A legacy session reports the same error, also in an HTTP 200.
         let session_id = initialize_legacy_mcp_session(&service).await;
         let (status, json) = post_legacy_tools_call_with_session(
             &service,
