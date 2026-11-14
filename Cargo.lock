@@ -82,30 +82,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "accelerator-postgres"
-version = "2.5.0-unstable"
-dependencies = [
- "async-trait",
- "data-accelerator-api",
- "data_components",
- "datafusion",
- "datafusion-table-providers",
- "linkme",
- "paste",
- "runtime-acceleration",
- "runtime-checkpoint-api",
- "runtime-checkpoint-postgres",
- "runtime-datafusion",
- "runtime-parameters",
- "runtime-secrets",
- "runtime-table-partition",
- "secrecy",
- "snafu",
- "tokio",
- "util",
-]
-
-[[package]]
 name = "accelerator-sqlite"
 version = "2.5.0-unstable"
 dependencies = [
@@ -17555,7 +17531,6 @@ name = "runtime"
 version = "2.5.0-unstable"
 dependencies = [
  "accelerator-cayenne",
- "accelerator-postgres",
  "accelerator-sqlite",
  "adbc_core",
  "adbc_driver_manager",
@@ -17737,7 +17712,6 @@ dependencies = [
  "runtime-async",
  "runtime-auth",
  "runtime-checkpoint-api",
- "runtime-checkpoint-postgres",
  "runtime-checkpoint-sqlite",
  "runtime-cluster",
  "runtime-component",
@@ -17927,19 +17901,6 @@ dependencies = [
  "snafu",
  "tracing",
  "util",
-]
-
-[[package]]
-name = "runtime-checkpoint-postgres"
-version = "2.5.0-unstable"
-dependencies = [
- "arrow",
- "async-trait",
- "datafusion-table-providers",
- "runtime-acceleration",
- "runtime-checkpoint-api",
- "serde_json",
- "tokio-postgres",
 ]
 
 [[package]]
@@ -20436,7 +20397,6 @@ name = "spiced"
 version = "2.5.0-unstable"
 dependencies = [
  "accelerator-cayenne",
- "accelerator-postgres",
  "accelerator-sqlite",
  "ansi_colors",
  "app",
@@ -20581,7 +20541,6 @@ name = "spicepodschema"
 version = "2.5.0-unstable"
 dependencies = [
  "accelerator-cayenne",
- "accelerator-postgres",
  "accelerator-sqlite",
  "connector-abfs",
  "connector-clickhouse",

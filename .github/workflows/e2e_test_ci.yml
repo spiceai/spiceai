@@ -228,7 +228,7 @@ jobs:
         timeout-minutes: 150
         uses: ./.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,postgres-accel'
+          features: 'tpc-extension,models'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -247,7 +247,7 @@ jobs:
         timeout-minutes: 180
         uses: ./.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,postgres-accel,metal'
+          features: 'tpc-extension,models,metal'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}

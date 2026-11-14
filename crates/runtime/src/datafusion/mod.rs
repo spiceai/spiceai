@@ -839,7 +839,7 @@ fn validate_distributed_engine(
 
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
-/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
+/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow).
 pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "sqlite")]
@@ -9268,27 +9268,12 @@ mod tests {
         }
 
         #[test]
-        fn postgresql_rejected_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-        }
-
-        #[test]
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
             validate_distributed_engine(&config, Engine::Sqlite, "ds")
                 .expect("duckdb should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Sqlite, "ds")
                 .expect("sqlite should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
-                .expect("postgresql should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")

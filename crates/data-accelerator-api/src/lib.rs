@@ -121,7 +121,6 @@ pub enum AcceleratorRuntimeConfig {
     Arrow,
     PartitionedArrow,
     Sqlite,
-    PostgreSQL,
     Cayenne(CayenneRuntimeConfig),
 }
 
@@ -133,7 +132,6 @@ impl AcceleratorRuntimeConfig {
             Self::Arrow => Engine::Arrow,
             Self::PartitionedArrow => Engine::PartitionedArrow,
             Self::Sqlite => Engine::Sqlite,
-            Self::PostgreSQL => Engine::PostgreSQL,
             Self::Cayenne(_) => Engine::Cayenne,
         }
     }
@@ -149,7 +147,6 @@ impl AcceleratorRuntimeConfig {
             Engine::Arrow => Self::Arrow,
             Engine::PartitionedArrow => Self::PartitionedArrow,
             Engine::Sqlite => Self::Sqlite,
-            Engine::PostgreSQL => Self::PostgreSQL,
             Engine::Cayenne => Self::Cayenne(CayenneRuntimeConfig::default()),
         }
     }
@@ -351,7 +348,7 @@ pub enum Error {
     InvalidConfiguration { msg: String },
 
     #[snafu(display(
-        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, sqlite, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     UnknownEngine { engine: Arc<str> },
 
@@ -435,8 +432,8 @@ impl AcceleratorEngineRegistry {
 
         // Normalize Dictionary-encoded types to their value types only for
         // accelerator engines that do not natively support Arrow Dictionary
-        // encoding (SQLite).  Other engines (Arrow, Cayenne,
-        // PostgreSQL) handle Dictionary types natively and benefit from the
+        // encoding (SQLite).  Other engines (Arrow, Cayenne) handle Dictionary
+        // types natively and benefit from the
         // compact encoding.
         let needs_dictionary_normalization = matches!(engine.to_unpartitioned(), Engine::Sqlite);
         let schema = if needs_dictionary_normalization
@@ -1641,7 +1638,6 @@ mod tests {
             Engine::Arrow,
             Engine::PartitionedArrow,
             Engine::Sqlite,
-            Engine::PostgreSQL,
             Engine::Cayenne,
         ] {
             assert_eq!(

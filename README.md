@@ -292,16 +292,14 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | ---------- | --------------------------------- | ----------------- | ---------------- |
 | `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `memory`, `file` |
 | `arrow`    | [In-Memory Arrow Records][arrow]  | Deprecated        | `memory`         |
-| `postgres` | Attached [PostgreSQL][postgres] (Spice.ai Enterprise) | Deprecated | N/A |
 | `sqlite`   | Embedded [SQLite][sqlite]         | Deprecated        | `memory`, `file` |
 
 An acceleration with no `engine` uses `cayenne`.
 
-The `duckdb` and `turso` accelerators were removed in v2.5, and a dataset or view that sets one fails to load. Every other accelerator except `cayenne` is deprecated and will be removed. Spice logs a warning naming the datasets and views still using one; set `engine: cayenne` (or remove `engine`) on each to migrate, then delete the old engine's acceleration files and snapshots. Accelerations that hold data their source does not, such as `write_mode: acceleration`, should stay on v2.4 until that data is moved. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
+The `duckdb`, `postgres` and `turso` accelerators were removed in v2.5, and a dataset or view that sets one fails to load. Every other accelerator except `cayenne` is deprecated and will be removed. Spice logs a warning naming the datasets and views still using one; set `engine: cayenne` (or remove `engine`) on each to migrate, then delete the old engine's acceleration files and snapshots. Accelerations that hold data their source does not, such as `write_mode: acceleration`, should stay on v2.4 until that data is moved. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne
-[postgres]: https://spiceai.org/docs/components/data-accelerators/postgres
 [sqlite]: https://spiceai.org/docs/components/data-accelerators/sqlite
 
 ## Supported Model Providers

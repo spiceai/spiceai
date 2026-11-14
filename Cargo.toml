@@ -77,7 +77,6 @@ members = [
     "crates/runtime-api-types",
     "crates/runtime-checkpoint-api",
     "crates/runtime-checkpoint-sqlite",
-    "crates/runtime-checkpoint-postgres",
     "crates/runtime-auth",
     "crates/runtime-metrics",
     "crates/runtime-async",

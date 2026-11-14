@@ -21,8 +21,6 @@ limitations under the License.
 // exercises an engine needs its own reference. `integration.rs`'s
 // `accelerator_crates_register_their_engines` guards the mechanism.
 use accelerator_cayenne as _;
-#[cfg(feature = "postgres-accel")]
-use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
 
