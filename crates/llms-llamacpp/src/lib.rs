@@ -251,6 +251,9 @@ pub struct LlamaCpp {
     /// How many prompt tokens the last request read from the KV cache, which the decode thread
     /// sets.
     reused_prompt_tokens: Arc<AtomicUsize>,
+    /// How many requests read their prompt's end in a step beside other requests, which the
+    /// decode thread counts.
+    prompt_ends_in_steps: Arc<AtomicUsize>,
 }
 
 /// A model's chat template: one, or named ones from a `tokenizer_config.json`, which a request
@@ -276,6 +279,8 @@ struct Loaded {
     context_window: u32,
     /// How many prompt tokens each request reads from the KV cache, as the thread sets it.
     reused_prompt_tokens: Arc<AtomicUsize>,
+    /// How many requests read their prompt's end in a step, as the thread counts them.
+    prompt_ends_in_steps: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -547,6 +552,7 @@ impl LlamaCpp {
             counter: AtomicUsize::new(0),
             context_window: loaded.context_window,
             reused_prompt_tokens: loaded.reused_prompt_tokens,
+            prompt_ends_in_steps: loaded.prompt_ends_in_steps,
         })
     }
 
@@ -556,6 +562,14 @@ impl LlamaCpp {
     #[must_use]
     pub fn reused_prompt_tokens(&self) -> usize {
         self.reused_prompt_tokens.load(Ordering::Relaxed)
+    }
+
+    /// How many requests read the end of their prompt in a step beside the running requests,
+    /// rather than in a decode of its own. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn prompt_ends_in_steps(&self) -> usize {
+        self.prompt_ends_in_steps.load(Ordering::Relaxed)
     }
 
     /// The prompt `req` renders, as a request decodes it. For tests.
@@ -1142,6 +1156,7 @@ fn serve(
         harmony: harmony::Markers::find(vocab),
         context_window,
         reused_prompt_tokens: Arc::clone(&cache.reused),
+        prompt_ends_in_steps: Arc::clone(&cache.ends_in_steps),
     };
     // Ruled out while a required tool call is outstanding.
     let eog = vocab.eog_tokens();
@@ -1152,6 +1167,7 @@ fn serve(
     while caches.len() < usize::try_from(concurrent).unwrap_or(usize::MAX) {
         let mut more = PromptCache::new(name, truncation);
         more.reused = Arc::clone(&caches[0].reused);
+        more.ends_in_steps = Arc::clone(&caches[0].ends_in_steps);
         caches.push(more);
     }
     let running = usize::try_from(concurrent).unwrap_or(1);
@@ -1604,6 +1620,9 @@ struct PromptCache {
     head_stash: Option<(usize, Vec<u8>)>,
     /// How many prompt tokens the last request read from the cache.
     reused: Arc<AtomicUsize>,
+    /// How many requests read their prompt's end in a step beside the running requests, which
+    /// every sequence's cache shares.
+    ends_in_steps: Arc<AtomicUsize>,
     /// What saving a checkpoint costs against reading prompt tokens again.
     cost: CheckpointCost,
 }
@@ -1618,6 +1637,7 @@ impl PromptCache {
             checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
             head_stash: None,
             reused: Arc::default(),
+            ends_in_steps: Arc::default(),
             cost: CheckpointCost::default(),
         }
     }
@@ -2011,16 +2031,29 @@ fn count(tokens: usize) -> f64 {
     f64::from(u32::try_from(tokens).unwrap_or(u32::MAX))
 }
 
-/// Tokenizes the prompt and decodes the part of it the cache does not already hold, returning
-/// the tokens, the batch whose last logits predict the first generated token, and how many of
-/// the tokens the cache held.
+/// A prompt [`read_prompt`] read.
+struct PromptRead {
+    tokens: Vec<Token>,
+    /// The batch of the read's last decode, whose last logits predict the token after the
+    /// decoded ones.
+    batch: Batch,
+    /// How many of the tokens the cache held.
+    cached: usize,
+    /// How many of the tokens are decoded: all of them, unless the read left their end for the
+    /// caller to decode (see [`read_tokens`]).
+    decoded: usize,
+}
+
+/// Tokenizes the prompt and decodes the part of it the cache does not already hold, but for an
+/// end of at most `defer` tokens that [`read_tokens`] may leave to the caller.
 fn read_prompt<'m>(
     model: &Model,
     target: &mut impl Target<'m>,
     cache: &mut PromptCache,
     (prompt, namespace): (&str, &CacheNamespace),
     stopping: &AtomicBool,
-) -> std::result::Result<(Vec<Token>, Batch, usize), String> {
+    defer: usize,
+) -> std::result::Result<PromptRead, String> {
     let tokens = model
         .vocab()
         .tokenize(prompt, false, true)
@@ -2028,18 +2061,30 @@ fn read_prompt<'m>(
     if tokens.is_empty() {
         return Err("the rendered prompt is empty".to_string());
     }
-    let (batch, start) = read_tokens(target, cache, (&tokens, namespace), stopping)?;
-    Ok((tokens, batch, start))
+    let (batch, cached, decoded) =
+        read_tokens(target, cache, (&tokens, namespace), stopping, defer)?;
+    Ok(PromptRead {
+        tokens,
+        batch,
+        cached,
+        decoded,
+    })
 }
 
 /// Decodes the part of `tokens` the cache does not already hold, returning the batch whose last
-/// logits predict the token after them, and how many of the tokens the cache held.
+/// logits predict the token after the decoded ones, how many of the tokens the cache held, and
+/// how many are decoded.
+///
+/// The read's last span, after any checkpoint, is left undecoded when it is at most `defer`
+/// tokens, for a caller that decodes it beside other sequences' tokens: in a decode of its own,
+/// a few tokens cost a whole pass of the model.
 fn read_tokens<'m>(
     target: &mut impl Target<'m>,
     cache: &mut PromptCache,
     (tokens, namespace): (&[Token], &CacheNamespace),
     stopping: &AtomicBool,
-) -> std::result::Result<(Batch, usize), String> {
+    defer: usize,
+) -> std::result::Result<(Batch, usize, usize), String> {
     let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
     if tokens.len() >= n_ctx {
         return Err(format!(
@@ -2065,12 +2110,16 @@ fn read_tokens<'m>(
     } else if let Some(at) = stash_at {
         cache.head_stash = target.head_state().map(|state| (at, state));
     }
+    if tokens.len() - split <= defer {
+        cache.read(split - start, read);
+        return Ok((batch, start, split));
+    }
     let resumed = Instant::now();
     decode_span(target, &mut batch, tokens, split..tokens.len(), stopping)?;
     target.context_mut().synchronize();
     read += resumed.elapsed();
     cache.read(tokens.len() - start, read);
-    Ok((batch, start))
+    Ok((batch, start, tokens.len()))
 }
 
 /// Decodes `tokens[span]` at their positions, in batches of at most `PROMPT_BATCH`, asking for
@@ -3870,6 +3919,7 @@ mod tests {
             counter: AtomicUsize::new(0),
             context_window: 0,
             reused_prompt_tokens: Arc::default(),
+            prompt_ends_in_steps: Arc::default(),
         };
         let mut req = serde_json::json!({
             "model": "gpt-oss",
