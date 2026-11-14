@@ -49,12 +49,19 @@ steps:
   - start: {}
   # On the release: the marker is read as the literal string, in a NOT NULL column.
   - query: SELECT id, year FROM h ORDER BY id LIMIT 5
+    id: release-rows
     expect: { rows: [['1', '2024'], ['2', '2024'], ['3', '2024'], ['100', '__HIVE_DEFAULT_PARTITION__'], ['101', '__HIVE_DEFAULT_PARTITION__']] }
   - query: SELECT data_type, is_nullable FROM information_schema.columns WHERE table_name = 'h' AND column_name = 'year'
     expect: { rows: [['Utf8', 'NO']] }
   # `sync_all_columns` lets the acceleration take the nullable column; without
   # it the acceleration keeps NOT NULL and the refresh below fails on the NULLs.
   - upgrade: { patch: { datasets: { h: { on_schema_change: sync_all_columns } } } }
+  # Before any refresh: the column is widened at startup, and the acceleration
+  # still serves the rows the release wrote.
+  - query: SELECT id, year FROM h ORDER BY id LIMIT 5
+    expect: { same-as: release-rows }
+  - query: SELECT data_type, is_nullable FROM information_schema.columns WHERE table_name = 'h' AND column_name = 'year'
+    expect: { rows: [['Utf8', 'YES']] }
   - refresh: h
   - query: SELECT count(*) AS n FROM h WHERE year IS NULL
     expect: { rows: [['2']] }
