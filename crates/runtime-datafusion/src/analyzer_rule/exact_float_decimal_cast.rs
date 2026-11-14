@@ -110,22 +110,9 @@ fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
     if let Expr::Cast(Cast { expr: inner, field }) | Expr::TryCast(TryCast { expr: inner, field }) =
         &expr
         && let Expr::Literal(value, metadata) = inner.as_ref()
+        && let Some(decimal) = exact_literal_decimal(value, metadata.as_ref(), field.data_type())
     {
-        let data_type = field.data_type();
-        let token_spelling = metadata
-            .as_ref()
-            .and_then(|metadata| metadata.inner().get(FLOAT_LITERAL_SPELLING_KEY));
-        let decimal = match token_spelling {
-            // The token is the exact value, so rounding it to the scale here is
-            // the decimal-to-decimal cast, which the binary cast cannot match.
-            Some(spelling) => decimal_scale(data_type)
-                .and_then(|scale| round_to_scale(spelling, scale))
-                .and_then(|spelling| exact_decimal_from_spelling(&spelling, data_type)),
-            None => exact_decimal(value, data_type),
-        };
-        if let Some(decimal) = decimal {
-            return Transformed::yes(Expr::Literal(decimal, without_spelling(metadata.as_ref())));
-        }
+        return Transformed::yes(Expr::Literal(decimal, without_spelling(metadata.as_ref())));
     }
     // The spelling only matters to the rewrite above; drop it from any literal
     // it did not apply to so it never reaches the physical plan. This includes
@@ -136,6 +123,24 @@ fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
             Transformed::yes(Expr::Literal(value, without_spelling(Some(&metadata))))
         }
         expr => Transformed::no(expr),
+    }
+}
+
+/// The decimal this rule casts the float literal `value` to at `data_type`: its
+/// retained token spelling (in `metadata`) rounded to the scale, else its
+/// shortest spelling when that fits the scale. `None` leaves the cast to Arrow.
+pub(crate) fn exact_literal_decimal(
+    value: &ScalarValue,
+    metadata: Option<&FieldMetadata>,
+    data_type: &DataType,
+) -> Option<ScalarValue> {
+    match metadata.and_then(|metadata| metadata.inner().get(FLOAT_LITERAL_SPELLING_KEY)) {
+        // The token is the exact value, so rounding it to the scale here is
+        // the decimal-to-decimal cast, which the binary cast cannot match.
+        Some(spelling) => decimal_scale(data_type)
+            .and_then(|scale| round_to_scale(spelling, scale))
+            .and_then(|spelling| exact_decimal_from_spelling(&spelling, data_type)),
+        None => exact_decimal(value, data_type),
     }
 }
 
