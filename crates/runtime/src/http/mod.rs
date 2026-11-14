@@ -206,6 +206,7 @@ where
                             identity_source,
                             config.client_auth,
                             shutdown_notify.subscribe(),
+                            runtime_tls::TLS_HANDSHAKE_TIMEOUT,
                         );
                     }
                     None => {
@@ -262,10 +263,11 @@ fn process_tls_tcp_stream(
     identity_source: IdentitySource,
     client_auth: runtime_tls::ClientAuthEnforcement,
     on_shutdown: Receiver<()>,
+    handshake_timeout: Duration,
 ) {
     set_tcp_nodelay(&stream);
     tokio::spawn(async move {
-        match acceptor.accept(stream).await {
+        match runtime_tls::accept_within(&acceptor, stream, handshake_timeout).await {
             Ok(tls_stream) => {
                 // Pre-compute the per-connection mTLS identities
                 // (`ChannelIdentity` always; `MtlsPrincipal` only in
@@ -347,6 +349,26 @@ async fn handle_connection<S>(
     }
 }
 
+/// A TLS acceptor for the repository's test certificate.
+#[cfg(test)]
+pub(crate) fn test_tls_acceptor() -> TlsAcceptor {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let cert =
+        CertificateDer::from_pem_slice(include_bytes!("../../../../test/tls/spiced_cert.pem"))
+            .expect("the fixture is a PEM certificate");
+    let key = PrivateKeyDer::from_pem_slice(include_bytes!("../../../../test/tls/spiced_key.pem"))
+        .expect("the fixture is a PEM private key");
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("the fixture certificate and key match");
+    TlsAcceptor::from(Arc::new(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,7 +376,7 @@ mod tests {
     use futures::future;
     use http::StatusCode;
     use std::time::Duration;
-    use tokio::{net::TcpListener, sync::watch, time::timeout};
+    use tokio::{io::AsyncReadExt, net::TcpListener, sync::watch, time::timeout};
 
     // Router that immediately responds with "ok"
     fn ok_router() -> Router {
@@ -512,6 +534,44 @@ mod tests {
                 .expect("to read the accepted socket options"),
             "the server must disable Nagle's algorithm on connections it accepts"
         );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_completes_the_tls_handshake_is_disconnected() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("to create listener");
+        let addr = listener.local_addr().expect("to get local addr");
+        let (shutdown_notify, shutdown_rx) = watch::channel(());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("to accept connection");
+            process_tls_tcp_stream(
+                stream,
+                test_tls_acceptor(),
+                ok_router(),
+                IdentitySource::Anonymous,
+                runtime_tls::ClientAuthEnforcement::Disabled,
+                shutdown_rx,
+                Duration::from_millis(200),
+            );
+        });
+
+        // Connects and never sends a `ClientHello`.
+        let mut silent = TcpStream::connect(addr).await.expect("to connect");
+        let mut buf = [0u8; 1];
+        let read = timeout(Duration::from_secs(5), silent.read(&mut buf))
+            .await
+            .expect("the server closes the connection once its handshake deadline passes");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "the server closes the connection without sending anything: {read:?}"
+        );
+        // The connection task holds a shutdown receiver until it ends, so a
+        // graceful shutdown does not wait for this connection.
+        timeout(Duration::from_secs(5), shutdown_notify.closed())
+            .await
+            .expect("the connection task ends");
     }
 
     fn build_test_http_client() -> reqwest::Client {
