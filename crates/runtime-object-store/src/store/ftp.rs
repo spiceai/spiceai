@@ -21,7 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use bytes::Bytes;
-use futures::AsyncReadExt;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
@@ -31,8 +31,9 @@ use object_store::{
     GetOptions, GetResult, GetResultPayload, ObjectMeta, ObjectStore, PutOptions, PutResult,
     path::Path,
 };
-use suppaftp::AsyncFtpStream;
+use suppaftp::tokio::AsyncFtpStream;
 use suppaftp::types::FileType;
+use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
 
 use super::common::{
@@ -157,8 +158,13 @@ impl bb8::ManageConnection for FTPConnectionManager {
     fn has_broken(&self, conn: &mut Self::Connection) -> bool {
         // Use the underlying TCP stream as a simple, non-blocking health heuristic.
         // If we cannot obtain the peer address, treat the connection as broken so
-        // that the pool can proactively discard it.
-        conn.get_ref().peer_addr().is_err()
+        // that the pool can proactively discard it. The control socket sits behind
+        // an async lock that is uncontended here (the pool holds the only
+        // reference); if it cannot be taken without waiting, discard the
+        // connection rather than block.
+        conn.get_ref()
+            .now_or_never()
+            .is_none_or(|socket| socket.peer_addr().is_err())
     }
 }
 
@@ -424,12 +430,20 @@ impl FTPObjectStore {
     }
 }
 
-/// Read data from an FTP stream asynchronously
+/// Read `read_size` bytes starting at `start` from `location` on a single-use connection.
+///
+/// A download that reaches end of file is finished: the server's completion reply is
+/// read, and a reply other than success fails the read, because the bytes received may
+/// be truncated. A download stopped once `read_size` bytes have arrived is aborted with
+/// `ABOR`; the bytes already hold the whole range, so a failed abort is only logged.
+/// Both replies are awaited for at most `reply_timeout`, so an unresponsive server
+/// cannot hold the read.
 async fn read_ftp_data(
     mut client: AsyncFtpStream,
     location: String,
     start: usize,
     read_size: usize,
+    reply_timeout: Duration,
 ) -> object_store::Result<Vec<u8>> {
     client
         .transfer_type(FileType::Binary)
@@ -442,13 +456,14 @@ async fn read_ftp_data(
         .map_err(|e| generic_error(STORE_NAME, e))?;
 
     let mut stream = client
-        .retr_as_stream(location)
+        .retr_as_stream(&location)
         .await
         .map_err(|e| generic_error(STORE_NAME, e))?;
 
     let mut result = Vec::with_capacity(read_size);
     let mut buf = vec![0; 4096];
     let mut total = 0;
+    let mut reached_eof = false;
 
     loop {
         if total >= read_size {
@@ -461,12 +476,40 @@ async fn read_ftp_data(
             .map_err(|e| generic_error(STORE_NAME, e))?;
 
         if n == 0 {
+            reached_eof = true;
             break;
         }
 
         let bytes_to_take = (read_size - total).min(n);
         result.extend_from_slice(&buf[..bytes_to_take]);
         total += n;
+    }
+
+    if reached_eof {
+        match tokio::time::timeout(reply_timeout, stream.finish()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(generic_error(STORE_NAME, e)),
+            Err(_) => {
+                return Err(generic_error(
+                    STORE_NAME,
+                    format!(
+                        "reading '{location}': the server did not confirm the download within {reply_timeout:?}"
+                    ),
+                ));
+            }
+        }
+    } else {
+        match tokio::time::timeout(reply_timeout, client.abort(stream)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!("FTP: aborting the rest of the download of '{location}' failed: {e}");
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "FTP: the server did not acknowledge aborting the download of '{location}' within {reply_timeout:?}"
+                );
+            }
+        }
     }
 
     Ok(result)
@@ -545,6 +588,7 @@ impl ObjectStore for FTPObjectStore {
             location_string,
             start as usize,
             data_to_read as usize,
+            self.inner.config.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
         )
         .await?;
 

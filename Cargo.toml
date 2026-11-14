@@ -455,7 +455,7 @@ snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "f5
 sqlparser = "0.62.0"
 ssh2 = { version = "0.9.5" }
 stateright = "=0.31.0"
-suppaftp = { version = "6.3.0", features = ["async"] }
+suppaftp = { version = "12.2.1", features = ["tokio"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.4"
 system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "8a90555dcb14e2bbbde8263d225f2c4e7ee547fc", features = ["client", "server"] }
@@ -713,3 +713,8 @@ vortex-datafusion = { path = "crates/vortex" }
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "4539a2fa604c9cfe72f6977fdf3cff98323b00c0" } # branch: spiceai-55 (vortex 0.86.1)
+
+# `ttf-parser` is unmaintained (RUSTSEC-2026-0192). The workspace vendors it under
+# `crates/vendor/ttf-parser` for `lopdf` and `pdf-extract`; this patch routes the
+# crates.io consumers (`pdf-inspector` and its `lopdf` 0.42) to the same vendored copy.
+ttf-parser = { path = "crates/vendor/ttf-parser" }
