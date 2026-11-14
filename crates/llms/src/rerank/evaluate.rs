@@ -16,19 +16,25 @@ limitations under the License.
 
 //! Reranker adapter over an [`Evaluate`] model (e.g. `TypeSafe` Jev).
 //!
-//! A document's score is the `noul` (P(yes), in \[0, 1\]) the model returns for "is this
-//! document relevant to the query?". [`LlmStrategy`] picks the request shape:
+//! [`LlmStrategy`] picks the request shape and what a score means:
 //!
-//! - Pointwise: one request per document, `state = {query, document}`.
+//! - Pointwise: one request per document, `state = {query, document}`, with one `noul`
+//!   question. The score is P(yes), in \[0, 1\], for "is this document relevant to the
+//!   query?", independent of the other candidates.
 //! - Listwise: one request, `state = {query, documents: {"0": d0, ...}}`, with one
-//!   question per document id.
+//!   `choice` question whose options are the document ids. The score of a document is
+//!   its probability in the answer's distribution, so the scores compare the candidates
+//!   and sum to about 1. A distribution can put most of its mass on the best one or two
+//!   documents, which leaves the others tied near 0.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use evaluate_api::{Answer, Evaluate, EvaluateRequest, EvaluateResponse, EvaluateState, Question};
+use evaluate_api::{
+    Answer, EntryType, Evaluate, EvaluateRequest, EvaluateResponse, EvaluateState, Question,
+};
 use futures::future::try_join_all;
 use serde_json::{Map, Value};
 
@@ -38,9 +44,12 @@ const POINTWISE_QUESTION_ID: &str = "relevant";
 const POINTWISE_INSTRUCTIONS: &str =
     "Is `document` relevant to `query`, i.e. does it help answer it?";
 
-fn listwise_instructions(id: &str) -> String {
-    format!("Is `documents[\"{id}\"]` relevant to `query`, i.e. does it help answer it?")
-}
+const LISTWISE_QUESTION_ID: &str = "best";
+const LISTWISE_INSTRUCTIONS: &str = "Which document in `documents` best answers `query`? Probabilities will be used as listwise reranking score. Each option is the key of one document in `documents`.";
+
+/// Most documents one listwise request can rank: one choice option per document, and
+/// both `TypeSafe` and `OpenAI` decision models accept at most 255 options.
+const MAX_LISTWISE_DOCUMENTS: usize = evaluate_api::openai::MAX_CHOICES;
 
 fn noul_question(instructions: String) -> Question {
     Question::Noul {
@@ -98,7 +107,8 @@ impl EvaluateRerank {
             questions,
             safety_identifier: None,
             reasoning_effort: None,
-            // Rerank asks only `noul` questions, so no choice needs typed options.
+            // Only a choice with a boolean option needs typed values. The listwise
+            // options are string ids.
             typed_choices: BTreeMap::new(),
         };
         self.evaluator
@@ -110,6 +120,13 @@ impl EvaluateRerank {
             })
     }
 
+    fn unparseable(&self, response: String) -> Error {
+        Error::UnparseableResponse {
+            model: self.name.clone(),
+            response,
+        }
+    }
+
     #[expect(
         clippy::cast_possible_truncation,
         reason = "a probability in [0, 1] loses only precision as f32"
@@ -117,11 +134,31 @@ impl EvaluateRerank {
     fn noul_score(&self, response: &EvaluateResponse, id: &str) -> Result<f32> {
         match response.answers.get(id) {
             Some(Answer::Noul { noul }) if (0.0..=1.0).contains(noul) => Ok(*noul as f32),
-            other => Err(Error::UnparseableResponse {
-                model: self.name.clone(),
-                response: format!("expected a noul in [0, 1] for '{id}', got {other:?}"),
-            }),
+            other => Err(self.unparseable(format!(
+                "expected a noul in [0, 1] for '{id}', got {other:?}"
+            ))),
         }
+    }
+
+    /// The probability of each option in `ids`, in the order of `ids`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a probability in [0, 1] loses only precision as f32"
+    )]
+    fn choice_scores(&self, answer: Option<&Answer>, ids: &[String]) -> Result<Vec<f32>> {
+        let Some(Answer::Choice { probabilities, .. }) = answer else {
+            return Err(self.unparseable(format!(
+                "expected a choice for '{LISTWISE_QUESTION_ID}', got {answer:?}"
+            )));
+        };
+        ids.iter()
+            .map(|id| match probabilities.get(id) {
+                Some(p) if (0.0..=1.0).contains(p) => Ok(*p as f32),
+                other => Err(self.unparseable(format!(
+                    "expected a probability in [0, 1] for document '{id}', got {other:?}"
+                ))),
+            })
+            .collect()
     }
 
     async fn score_one(&self, query: &str, document: &str) -> Result<f32> {
@@ -143,12 +180,34 @@ impl EvaluateRerank {
         try_join_all(documents.iter().map(|doc| self.score_one(query, doc))).await
     }
 
+    /// One choice question over all the documents, so the model compares them in one
+    /// judgment.
+    ///
+    /// More than [`MAX_LISTWISE_DOCUMENTS`] fails instead of being split into windows:
+    /// a probability is relative to the documents in its own request, so scores from
+    /// different windows are not comparable.
     async fn rerank_listwise(&self, query: &str, documents: &[String]) -> Result<Vec<f32>> {
-        // An evaluation needs at least one question.
+        // An evaluation needs at least one question, and a choice at least one option.
         if documents.is_empty() {
             return Ok(Vec::new());
         }
+        if documents.len() > MAX_LISTWISE_DOCUMENTS {
+            return Err(Error::TooManyDocuments {
+                model: self.name.clone(),
+                count: documents.len(),
+                max: MAX_LISTWISE_DOCUMENTS,
+            });
+        }
         let ids: Vec<String> = (0..documents.len()).map(|i| i.to_string()).collect();
+        let question = Question::Choice {
+            instructions: LISTWISE_INSTRUCTIONS.into(),
+            // The text stays in `state.documents`; each option is only its id.
+            criteria: ids.iter().map(|id| (id.clone(), EntryType::Null)).collect(),
+        };
+        // A single document is the only option, so it needs no request.
+        if let Some(answer) = question.foregone_answer() {
+            return self.choice_scores(Some(&answer), &ids);
+        }
         let state = Map::from_iter([
             ("query".to_string(), Value::from(query)),
             (
@@ -161,14 +220,9 @@ impl EvaluateRerank {
                 ),
             ),
         ]);
-        let questions = ids
-            .iter()
-            .map(|id| (id.clone(), noul_question(listwise_instructions(id))))
-            .collect();
+        let questions = BTreeMap::from([(LISTWISE_QUESTION_ID.to_string(), question)]);
         let response = self.ask(state, questions).await?;
-        ids.iter()
-            .map(|id| self.noul_score(&response, id))
-            .collect()
+        self.choice_scores(response.answers.get(LISTWISE_QUESTION_ID), &ids)
     }
 }
 
@@ -202,10 +256,10 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Answers each question with the noul `score(state, question_id)` and records
-    /// every request it receives.
+    /// Answers each question with `answer(state, question)` and records every request
+    /// it receives.
     struct MockEvaluate {
-        score: fn(&EvaluateState, &str) -> Option<f64>,
+        answer: fn(&EvaluateState, &Question) -> Option<Answer>,
         requests: Mutex<Vec<EvaluateRequest>>,
     }
 
@@ -216,9 +270,9 @@ mod tests {
     }
 
     impl MockEvaluate {
-        fn new(score: fn(&EvaluateState, &str) -> Option<f64>) -> Arc<Self> {
+        fn new(answer: fn(&EvaluateState, &Question) -> Option<Answer>) -> Arc<Self> {
             Arc::new(Self {
-                score,
+                answer,
                 requests: Mutex::new(Vec::new()),
             })
         }
@@ -236,9 +290,9 @@ mod tests {
         ) -> evaluate_api::Result<EvaluateResponse> {
             let answers = request
                 .questions
-                .keys()
-                .filter_map(|id| {
-                    (self.score)(&request.state, id).map(|noul| (id.clone(), Answer::Noul { noul }))
+                .iter()
+                .filter_map(|(id, question)| {
+                    (self.answer)(&request.state, question).map(|answer| (id.clone(), answer))
                 })
                 .collect();
             self.requests.lock().expect("lock").push(request);
@@ -261,19 +315,53 @@ mod tests {
         }
     }
 
-    /// Pointwise: the document text is the digit to score, e.g. "3" → 0.3.
-    fn pointwise_score(state: &EvaluateState, _id: &str) -> Option<f64> {
-        let doc = state_field(state, "document")?.as_str()?;
-        doc.parse::<u8>().ok().map(|n| f64::from(n) / 10.0)
+    fn option_ids(question: &Question) -> Vec<&String> {
+        match question {
+            Question::Choice { criteria, .. } => criteria.keys().collect(),
+            _ => Vec::new(),
+        }
     }
 
-    /// Listwise: the score of document id `n` is `n / 10`.
-    fn listwise_score(_state: &EvaluateState, id: &str) -> Option<f64> {
-        id.parse::<u8>().ok().map(|n| f64::from(n) / 10.0)
+    /// A choice answer over `probabilities`, choosing a highest-probability option.
+    fn choice(probabilities: BTreeMap<String, f64>) -> Answer {
+        let choice = probabilities
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(id, _)| id.clone())
+            .unwrap_or_default();
+        Answer::Choice {
+            choice,
+            probabilities,
+            confidence: 0.5,
+        }
+    }
+
+    /// Pointwise: the document text is the digit to score, e.g. "3" → 0.3.
+    fn pointwise_score(state: &EvaluateState, _question: &Question) -> Option<Answer> {
+        let doc = state_field(state, "document")?.as_str()?;
+        let n = doc.parse::<u8>().ok()?;
+        Some(Answer::Noul {
+            noul: f64::from(n) / 10.0,
+        })
+    }
+
+    /// Listwise: the probability of document id `n` is `n / 55`, a distribution over
+    /// the eleven ids 0..=10.
+    #[expect(clippy::unnecessary_wraps, reason = "matches the mock's fn signature")]
+    fn listwise_score(_state: &EvaluateState, question: &Question) -> Option<Answer> {
+        let probabilities = option_ids(question)
+            .into_iter()
+            .map(|id| (id.clone(), id.parse::<u8>().map_or(0.0, f64::from) / 55.0))
+            .collect();
+        Some(choice(probabilities))
     }
 
     fn docs(texts: &[&str]) -> Vec<String> {
         texts.iter().map(ToString::to_string).collect()
+    }
+
+    fn listwise(answer: fn(&EvaluateState, &Question) -> Option<Answer>) -> EvaluateRerank {
+        EvaluateRerank::new("jev", MockEvaluate::new(answer)).with_strategy(LlmStrategy::Listwise)
     }
 
     #[tokio::test]
@@ -291,13 +379,14 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert!(requests.iter().all(|r| r.model == "jev"
             && r.questions.len() == 1
+            && matches!(r.questions.values().next(), Some(Question::Noul { .. }))
             && state_field(&r.state, "query") == Some(&Value::from("q"))));
     }
 
     /// Eleven documents make the ids sort differently as strings ("10" < "2") than as
-    /// indexes, so this catches mapping answers back by position.
+    /// indexes, so this catches mapping probabilities back by position.
     #[tokio::test]
-    async fn listwise_sends_one_request_and_maps_answers_by_id() {
+    async fn listwise_asks_one_choice_and_scores_from_its_distribution_by_id() {
         let mock = MockEvaluate::new(listwise_score);
         let reranker = EvaluateRerank::new("jev", Arc::clone(&mock) as Arc<dyn Evaluate>)
             .with_strategy(LlmStrategy::Listwise);
@@ -307,15 +396,40 @@ mod tests {
 
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "test values are exact tenths"
+            reason = "the test compares the same f64 → f32 cast the adapter makes"
         )]
-        let expected: Vec<f32> = (0..11u8).map(|i| (f64::from(i) / 10.0) as f32).collect();
+        let expected: Vec<f32> = (0..11u8).map(|i| (f64::from(i) / 55.0) as f32).collect();
         assert_eq!(scores, expected);
         let requests = mock.requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].questions.len(), 11);
+        assert_eq!(requests[0].questions.len(), 1);
+        let question = &requests[0].questions[LISTWISE_QUESTION_ID];
+        let mut expected_ids: Vec<String> = (0..11).map(|i| i.to_string()).collect();
+        expected_ids.sort();
+        assert_eq!(
+            option_ids(question),
+            expected_ids.iter().collect::<Vec<_>>()
+        );
+        // The option is only an id; its text is in `state.documents`.
+        let Question::Choice { criteria, .. } = question else {
+            panic!("listwise asks a choice, got {question:?}");
+        };
+        assert!(criteria.values().all(|entry| *entry == EntryType::Null));
         let documents = state_field(&requests[0].state, "documents").expect("documents");
         assert_eq!(documents["10"], "doc 10");
+    }
+
+    /// A single document is a choice with one option, which needs no model.
+    #[tokio::test]
+    async fn listwise_scores_a_single_document_without_a_request() {
+        let mock = MockEvaluate::new(listwise_score);
+        let reranker = EvaluateRerank::new("jev", Arc::clone(&mock) as Arc<dyn Evaluate>)
+            .with_strategy(LlmStrategy::Listwise);
+
+        let scores = reranker.rerank("q", &docs(&["a"])).await.expect("rerank");
+
+        assert_eq!(scores, vec![1.0]);
+        assert!(mock.requests().is_empty());
     }
 
     #[tokio::test]
@@ -330,29 +444,83 @@ mod tests {
         }
     }
 
-    /// An unanswered document is a wrong result, not a 0 score.
+    /// More documents than a choice can have options fails before any request, rather
+    /// than ranking only some of them.
     #[tokio::test]
-    async fn listwise_fails_when_a_document_is_unanswered() {
-        fn skip_last(_state: &EvaluateState, id: &str) -> Option<f64> {
-            (id != "1").then_some(0.4)
-        }
-        let reranker = EvaluateRerank::new("jev", MockEvaluate::new(skip_last))
+    async fn listwise_fails_over_the_option_limit_without_a_request() {
+        let mock = MockEvaluate::new(listwise_score);
+        let reranker = EvaluateRerank::new("jev", Arc::clone(&mock) as Arc<dyn Evaluate>)
             .with_strategy(LlmStrategy::Listwise);
+        let texts: Vec<String> = (0..=MAX_LISTWISE_DOCUMENTS)
+            .map(|i| format!("doc {i}"))
+            .collect();
 
         let err = reranker
+            .rerank("q", &texts)
+            .await
+            .expect_err("too many documents for one choice");
+        assert!(
+            matches!(err, Error::TooManyDocuments { count, max, .. }
+                if count == MAX_LISTWISE_DOCUMENTS + 1 && max == MAX_LISTWISE_DOCUMENTS),
+            "{err:?}"
+        );
+        assert!(mock.requests().is_empty());
+    }
+
+    /// A document missing from the distribution is a wrong result, not a 0 score.
+    #[tokio::test]
+    async fn listwise_fails_when_a_document_has_no_probability() {
+        #[expect(clippy::unnecessary_wraps, reason = "matches the mock's fn signature")]
+        fn skip_one(_state: &EvaluateState, _question: &Question) -> Option<Answer> {
+            Some(choice(BTreeMap::from([("0".to_string(), 1.0)])))
+        }
+
+        let err = listwise(skip_one)
             .rerank("q", &docs(&["a", "b"]))
             .await
-            .expect_err("a missing answer fails the rerank");
+            .expect_err("a missing probability fails the rerank");
+        assert!(matches!(err, Error::UnparseableResponse { .. }), "{err:?}");
+    }
+
+    /// The adapter does not trust every evaluation model to range-check its probabilities.
+    #[tokio::test]
+    async fn listwise_fails_on_a_probability_outside_zero_to_one() {
+        #[expect(clippy::unnecessary_wraps, reason = "matches the mock's fn signature")]
+        fn out_of_range(_state: &EvaluateState, _question: &Question) -> Option<Answer> {
+            Some(choice(BTreeMap::from([
+                ("0".to_string(), 1.7),
+                ("1".to_string(), -0.7),
+            ])))
+        }
+
+        let err = listwise(out_of_range)
+            .rerank("q", &docs(&["a", "b"]))
+            .await
+            .expect_err("an out-of-range probability fails the rerank");
+        assert!(matches!(err, Error::UnparseableResponse { .. }), "{err:?}");
+    }
+
+    /// A listwise answer of another kind is a wrong result.
+    #[tokio::test]
+    async fn listwise_fails_when_the_answer_is_not_a_choice() {
+        #[expect(clippy::unnecessary_wraps, reason = "matches the mock's fn signature")]
+        fn noul(_state: &EvaluateState, _question: &Question) -> Option<Answer> {
+            Some(Answer::Noul { noul: 0.4 })
+        }
+
+        let err = listwise(noul)
+            .rerank("q", &docs(&["a", "b"]))
+            .await
+            .expect_err("a noul answer to a choice fails the rerank");
         assert!(matches!(err, Error::UnparseableResponse { .. }), "{err:?}");
     }
 
     /// The adapter does not trust every evaluation model to range-check its nouls.
     #[tokio::test]
     async fn a_noul_outside_zero_to_one_fails() {
-        // `MockEvaluate` takes a fn returning `Option`, so the wrap is required.
-        #[expect(clippy::unnecessary_wraps)]
-        fn out_of_range(_state: &EvaluateState, _id: &str) -> Option<f64> {
-            Some(1.7)
+        #[expect(clippy::unnecessary_wraps, reason = "matches the mock's fn signature")]
+        fn out_of_range(_state: &EvaluateState, _question: &Question) -> Option<Answer> {
+            Some(Answer::Noul { noul: 1.7 })
         }
         let reranker = EvaluateRerank::new("jev", MockEvaluate::new(out_of_range));
 

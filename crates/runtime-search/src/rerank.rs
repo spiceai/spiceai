@@ -203,7 +203,8 @@ pub struct RerankTableFuncArgs {
 pub enum RerankVia {
     /// An LLM-as-judge prompt sent as a chat completion ([`LlmRerank`]).
     Chat,
-    /// One "is this relevant" question per candidate ([`EvaluateRerank`]).
+    /// Relevance questions to an evaluation model ([`EvaluateRerank`]): one `noul` per
+    /// candidate (pointwise), or one `choice` over all candidates (listwise).
     Decisions,
 }
 
@@ -2119,8 +2120,10 @@ mod tests {
         Ok(())
     }
 
-    /// Evaluation model that answers every `noul` question from a fixed
-    /// document → score table, and counts the requests it receives.
+    /// Evaluation model that scores each document from a fixed document → score
+    /// table, and counts the requests it receives. A `noul` question gets the score;
+    /// a `choice` question over document ids gets the scores normalized to sum to 1,
+    /// which keeps the same order.
     #[derive(Debug, Default)]
     struct MockEvaluate {
         requests: std::sync::atomic::AtomicUsize,
@@ -2144,27 +2147,58 @@ mod tests {
             &self,
             request: llms::evaluate::EvaluateRequest,
         ) -> llms::evaluate::Result<llms::evaluate::EvaluateResponse> {
+            use llms::evaluate::{Answer, Question};
+
             self.requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let llms::evaluate::EvaluateState::Object(state) = &request.state else {
                 panic!("rerank sends an object state");
             };
-            // Pointwise sends `document`; listwise sends `documents` keyed by question id.
+            // Pointwise sends `document` with a noul; listwise sends `documents` keyed by
+            // the options of one choice.
             let answers = request
                 .questions
-                .keys()
-                .map(|id| {
-                    let document = state
-                        .get("document")
-                        .or_else(|| state.get("documents").and_then(|docs| docs.get(id)))
-                        .and_then(serde_json::Value::as_str)
-                        .expect("a document for each question");
-                    (
-                        id.clone(),
-                        llms::evaluate::Answer::Noul {
-                            noul: Self::score(document),
-                        },
-                    )
+                .iter()
+                .map(|(id, question)| {
+                    let answer = match question {
+                        Question::Choice { criteria, .. } => {
+                            let documents = state.get("documents").expect("listwise documents");
+                            let scores: std::collections::BTreeMap<String, f64> = criteria
+                                .keys()
+                                .map(|option| {
+                                    let document = documents[option.as_str()]
+                                        .as_str()
+                                        .expect("a document for each option");
+                                    (option.clone(), Self::score(document))
+                                })
+                                .collect();
+                            let total: f64 = scores.values().sum();
+                            let probabilities: std::collections::BTreeMap<String, f64> = scores
+                                .into_iter()
+                                .map(|(option, score)| (option, score / total))
+                                .collect();
+                            let choice = probabilities
+                                .iter()
+                                .max_by(|a, b| a.1.total_cmp(b.1))
+                                .map(|(option, _)| option.clone())
+                                .expect("at least one option");
+                            Answer::Choice {
+                                choice,
+                                probabilities,
+                                confidence: 0.5,
+                            }
+                        }
+                        _ => {
+                            let document = state
+                                .get("document")
+                                .and_then(serde_json::Value::as_str)
+                                .expect("a pointwise document");
+                            Answer::Noul {
+                                noul: Self::score(document),
+                            }
+                        }
+                    };
+                    (id.clone(), answer)
                 })
                 .collect();
             Ok(llms::evaluate::EvaluateResponse {

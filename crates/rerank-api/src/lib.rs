@@ -58,6 +58,17 @@ pub enum Error {
         actual: usize,
     },
 
+    /// A listwise request asks one choice question with an option per document, and
+    /// evaluation models limit how many options a choice may have.
+    #[snafu(display(
+        "Reranker model '{model}' can rank at most {max} documents in one listwise request, but got {count}. Use strategy => 'pointwise', or send fewer candidates (for example, a smaller limit on the search inside rerank())."
+    ))]
+    TooManyDocuments {
+        model: String,
+        count: usize,
+        max: usize,
+    },
+
     #[snafu(display("Reranker health check failed: {source}"))]
     HealthCheckFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
