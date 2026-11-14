@@ -34,10 +34,10 @@ on:
         type: string
         default: '.'
 
+# Each job that needs more declares it: build-image (packages, id-token, for the
+# spiced_docker_dev call) and dispatch-cluster-bench (actions).
 permissions:
   contents: read
-  packages: write    # workflow_call into spiced_docker_dev needs write
-  actions: write     # workflow_dispatch API needs this
 
 concurrency:
   # One cluster-bench dispatch at a time; the cluster benches themselves are
@@ -125,6 +125,9 @@ jobs:
   # ---------------------------------------------------------------------------
   dispatch-cluster-bench:
     environment: secret-free
+    permissions:
+      contents: read
+      actions: write  # POST .../actions/workflows/testoperator_run_cluster_bench.yml/dispatches
     name: Dispatch cluster benchmarks
     needs: [resolve-image, build-image]
     if: |
