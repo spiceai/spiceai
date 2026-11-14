@@ -70,16 +70,17 @@ pub async fn get_latest_release(client: &GitHubClient) -> Result<RepoRelease, Gi
 }
 
 /// Get a specific release by version tag.
+///
+/// The release is fetched by its tag rather than searched for in the release list, which
+/// GitHub pages 30 at a time: a search of the first page cannot find any older release.
 pub async fn get_release(client: &GitHubClient, version: &str) -> Result<RepoRelease, GitHubError> {
-    let url = client.releases_url();
-    let releases: Vec<RepoRelease> = client.get(&url).await?;
-
-    releases
-        .into_iter()
-        .find(|r| r.tag_name == version)
-        .ok_or(GitHubError::ReleaseNotFound {
+    let url = client.release_by_tag_url(version);
+    match client.get(&url).await {
+        Err(GitHubError::Api { status: 404, .. }) => Err(GitHubError::ReleaseNotFound {
             version: version.to_string(),
-        })
+        }),
+        result => result,
+    }
 }
 
 /// Download a release asset and extract it to a directory.
@@ -225,6 +226,50 @@ pub async fn upgrade_cli_in_place(
         });
     }
 
+    swap_into_current_exe(&extracted_binary, &current_exe)
+}
+
+/// Replace the running CLI with `binary`, returning the path it now has.
+///
+/// # Errors
+///
+/// Returns an error if the executable's path cannot be read or the file cannot be written or
+/// moved into place.
+pub fn replace_current_exe(binary: &[u8]) -> Result<std::path::PathBuf, GitHubError> {
+    let current_exe = std::env::current_exe().map_err(|e| GitHubError::Io {
+        message: format!("Failed to get current executable path: {e}"),
+    })?;
+    let exe_dir = current_exe.parent().ok_or_else(|| GitHubError::Io {
+        message: "Failed to get executable parent directory".to_string(),
+    })?;
+    // Next to the executable, so the rename stays on one filesystem.
+    let temp_dir = tempfile::tempdir_in(exe_dir).map_err(|e| GitHubError::Io {
+        message: format!("Failed to create temporary directory: {e}"),
+    })?;
+    let new_binary = temp_dir
+        .path()
+        .join(if cfg!(windows) { "spice.exe" } else { "spice" });
+    std::fs::write(&new_binary, binary).map_err(|e| GitHubError::Io {
+        message: format!("Failed to write {}: {e}", new_binary.display()),
+    })?;
+    swap_into_current_exe(&new_binary, &current_exe)?;
+    Ok(current_exe)
+}
+
+/// Make `new_binary`, a file in `current_exe`'s directory, executable, then move it to
+/// `current_exe`.
+fn swap_into_current_exe(new_binary: &Path, current_exe: &Path) -> Result<(), GitHubError> {
+    // Executable before it takes the path, so that a `spice` started right after the rename
+    // can run it, and an interrupted upgrade cannot leave the CLI without its execute bit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(new_binary, permissions).map_err(|e| GitHubError::Io {
+            message: format!("Failed to set executable permissions: {e}"),
+        })?;
+    }
+
     // We cannot overwrite a running executable directly — Linux returns ETXTBSY and
     // Windows locks the file. Use rename to atomically swap the directory entry: the
     // old inode stays alive (referenced by the running process) while the new binary
@@ -236,25 +281,15 @@ pub async fn upgrade_cli_in_place(
         // Try to remove old backup if it exists
         let _ = std::fs::remove_file(&backup_path);
         // Rename current executable to backup
-        std::fs::rename(&current_exe, &backup_path).map_err(|e| GitHubError::Io {
+        std::fs::rename(current_exe, &backup_path).map_err(|e| GitHubError::Io {
             message: format!("Failed to backup current executable: {e}"),
         })?;
     }
 
     // Atomically move the new binary into place.
-    std::fs::rename(&extracted_binary, &current_exe).map_err(|e| GitHubError::Io {
+    std::fs::rename(new_binary, current_exe).map_err(|e| GitHubError::Io {
         message: format!("Failed to replace CLI binary: {e}"),
     })?;
-
-    // Make the binary executable on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&current_exe, permissions).map_err(|e| GitHubError::Io {
-            message: format!("Failed to set executable permissions: {e}"),
-        })?;
-    }
 
     Ok(())
 }
@@ -769,5 +804,98 @@ mod tests {
         assert!(is_v2_or_later("v2.1.0"));
         assert!(is_v2_or_later("v10.0.0"));
         assert!(!is_v2_or_later("invalid"));
+    }
+
+    /// A release tagged `tag`, in the shape the releases API serves.
+    fn release_json(tag: &str) -> serde_json::Value {
+        serde_json::json!({
+            "url": "",
+            "html_url": "",
+            "assets_url": "",
+            "tag_name": tag,
+            "name": tag,
+            "draft": false,
+            "prerelease": false,
+            "created_at": "",
+            "published_at": null,
+            "assets": [],
+        })
+    }
+
+    /// A mock API serving `GET /repos/spiceai/spiceai/releases` as GitHub does without
+    /// `per_page`: only the 30 newest releases, none of them `v1.11.4`.
+    async fn api_listing_only_the_newest_releases() -> MockServer {
+        let server = MockServer::start().await;
+        let newest: Vec<_> = (0..30)
+            .map(|patch| release_json(&format!("v2.0.{patch}")))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(newest))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `spice install v1.11.4` failed with `Release not found: v1.11.4` once 30 newer releases
+    /// were published, because the lookup searched only the first page of the release list.
+    #[tokio::test]
+    async fn a_release_older_than_the_first_page_of_the_list_is_found_by_its_tag() {
+        let server = api_listing_only_the_newest_releases().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v1.11.4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_json("v1.11.4")))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri());
+
+        let release = match get_release(&client, "v1.11.4").await {
+            Ok(release) => release,
+            Err(error) => panic!("v1.11.4 is published, so it must be found: {error}"),
+        };
+
+        assert_eq!(release.tag_name, "v1.11.4");
+    }
+
+    #[tokio::test]
+    async fn a_tag_with_no_release_is_reported_as_release_not_found() {
+        let server = api_listing_only_the_newest_releases().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v9.9.9"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(r#"{"message":"Not Found"}"#))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri());
+
+        let Err(error) = get_release(&client, "v9.9.9").await else {
+            panic!("an unpublished tag must not resolve to a release");
+        };
+
+        assert!(
+            matches!(&error, GitHubError::ReleaseNotFound { version } if version == "v9.9.9"),
+            "expected ReleaseNotFound for v9.9.9, got: {error}"
+        );
+    }
+
+    /// Only a 404 means the release does not exist. A server error must still read as one,
+    /// rather than telling the user that a published release is missing.
+    #[tokio::test]
+    async fn a_server_error_is_not_reported_as_a_missing_release() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v1.11.4"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("Bad Gateway"))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri());
+
+        let Err(error) = get_release(&client, "v1.11.4").await else {
+            panic!("a 502 must not resolve to a release");
+        };
+
+        assert!(
+            matches!(error, GitHubError::Api { status: 502, .. }),
+            "expected the 502 to surface as an API error, got: {error}"
+        );
     }
 }

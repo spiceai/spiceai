@@ -163,6 +163,7 @@ pub struct CreateTable {
     pub current_snapshot_id: String,
     #[prost(int64, tag = "11")]
     pub seq: i64,
+    // Tag 12 is reserved.
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -229,6 +230,18 @@ pub struct RemoveBySnapshot {
     pub select: i32,
     #[prost(string, repeated, tag = "3")]
     pub snapshot_ids: Vec<String>,
+}
+
+/// Data files and deletion vectors of one table, by key: the path relative to
+/// the table that [`crate::TableState::file_key`] and
+/// [`crate::TableState::delete_file_key`] give. Retired by `RetireFiles`,
+/// forgotten by `ForgetRetired` once deleted.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct FileKeys {
+    #[prost(string, tag = "1")]
+    pub table_id: String,
+    #[prost(string, repeated, tag = "2")]
+    pub keys: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -540,7 +553,7 @@ pub enum Outcome {
 pub struct Action {
     #[prost(
         oneof = "action::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 41, 42"
     )]
     pub kind: Option<action::Kind>,
 }
@@ -624,6 +637,17 @@ pub mod action {
         Prepare(super::Prepare),
         #[prost(message, tag = "38")]
         Resolve(super::Resolve),
+        // Tags 39 and 40 held retirement by snapshot in prototype builds; a
+        // record with them decodes with no kind and is refused.
+        /// Files whose deletion is pending. A record that takes a file out of
+        /// the live set retires it without this action; only a checkpoint
+        /// states the retired set with it.
+        #[prost(message, tag = "41")]
+        RetireFiles(super::FileKeys),
+        /// Retired files that are deleted: they leave the retired set, with
+        /// every entry and statistics row that names them.
+        #[prost(message, tag = "42")]
+        ForgetRetired(super::FileKeys),
     }
 }
 
@@ -675,6 +699,7 @@ impl Action {
             Kind::ClearInsertRecords(a) => &a.table_id,
             Kind::AddPartition(a) => &a.table_id,
             Kind::Unconverted(a) => &a.table_id,
+            Kind::RetireFiles(a) | Kind::ForgetRetired(a) => &a.table_id,
             Kind::AdvanceSourcePosition(_) | Kind::Prepare(_) | Kind::Resolve(_) => return None,
         })
     }
@@ -724,6 +749,8 @@ impl Action {
                 Kind::Unconverted(_) => "Unconverted",
                 Kind::Prepare(_) => "Prepare",
                 Kind::Resolve(_) => "Resolve",
+                Kind::RetireFiles(_) => "RetireFiles",
+                Kind::ForgetRetired(_) => "ForgetRetired",
             },
         }
     }

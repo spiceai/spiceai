@@ -1,0 +1,94 @@
+name: file-source-removed-keeps-acceleration
+description: >
+  When every source file of a file-connector dataset is removed, a federated
+  query errors instead of returning zero rows, and a full refresh into Cayenne
+  fails and keeps the last loaded rows, each one unchanged. A file that still exists but holds no
+  rows still refreshes to zero rows. Restoring files lets the next refresh
+  load them again.
+
+sources:
+  lake: { kind: files }
+  # The generated rows, kept to check every retained row after a failed refresh.
+  ref: { kind: postgres }
+
+matrix:
+  format: [parquet, csv]
+
+variants:
+  cayenne:
+    datasets:
+      facts:
+        acceleration:
+          enabled: true
+          engine: cayenne
+          mode: file
+          refresh_mode: full
+          refresh_retry_enabled: false
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: file-source-removed-keeps-acceleration
+  datasets:
+    - from: '${sources.lake.from_prefix}facts${sources.lake.from_suffix}'
+      name: facts
+      params: { $merge: '${sources.lake.table_params}', file_format: '${matrix.format}' }
+    - from: '${sources.lake.from_prefix}facts${sources.lake.from_suffix}'
+      name: facts_src
+      params: { $merge: '${sources.lake.table_params}', file_format: '${matrix.format}' }
+
+steps:
+  - generate:
+      lake: &facts
+        table: facts
+        rows: 1000
+        seed: 7
+        files: 2
+        format: '${matrix.format}'
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: label, choice: [a, b, c] }
+    mirror: ref
+  - start: {}
+  - query: SELECT count(*) AS n FROM facts
+    expect: { rows: [['1000']] }
+  - query: SELECT count(*) AS n FROM facts_src
+    expect: { rows: [['1000']] }
+
+  # Every matching file removed: empty directory, not a zero-row file.
+  - generate:
+      lake:
+        <<: *facts
+        rows: 0
+        files: 0
+  - query: SELECT count(*) AS n FROM facts_src
+    expect-error: 'No data files are yet available for dataset facts_src'
+  - refresh: { dataset: facts, expect-error: true }
+  - query: SELECT count(*) AS n FROM facts
+    expect: { rows: [['1000']] }
+  # Every retained row, not just the count, is the one loaded before the removal.
+  - query: SELECT id, label FROM facts ORDER BY id
+    expect: { oracle: ref }
+  - assert-log: { contains: 'No data files are yet available' }
+
+  # Restored files load again.
+  - generate:
+      lake:
+        <<: *facts
+  - refresh: facts
+  - query: SELECT count(*) AS n FROM facts
+    expect: { rows: [['1000']] }
+  - query: SELECT count(*) AS n FROM facts_src
+    expect: { rows: [['1000']] }
+
+  # An existing file that holds no rows still refreshes to zero.
+  - generate:
+      lake:
+        <<: *facts
+        rows: 0
+        files: 1
+  - refresh: facts
+  - query: SELECT count(*) AS n FROM facts
+    expect: { rows: [['0']] }
+  - query: SELECT count(*) AS n FROM facts_src
+    expect: { rows: [['0']] }

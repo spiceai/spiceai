@@ -95,6 +95,11 @@ pub enum CheckpointError {
     },
 }
 
+/// The blob checkpoint table an append refresh keeps the source commit it last loaded
+/// in, one row per dataset. Named here so an accelerator that recreates a table empty
+/// can clear it along with the dataset checkpoint.
+pub const APPEND_CURSOR_TABLE: &str = "spice_sys_append_cursor";
+
 /// The **blob** checkpoint shape: a per-dataset store of one opaque `String` payload,
 /// satisfied by the accelerator and called by a data-source connector. Object-safe and
 /// `#[async_trait]` so it is used as `Arc<dyn BlobCheckpointStore>`.

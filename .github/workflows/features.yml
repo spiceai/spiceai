@@ -48,7 +48,7 @@ jobs:
     # feature matrix; the real check runs on the merge-group commit.
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 

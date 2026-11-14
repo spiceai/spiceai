@@ -60,6 +60,7 @@ pub struct LlmRuntimeStores {
     evaluate_models: Arc<RwLock<EvaluateModelStore>>,
     rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
     capabilities: Arc<RwLock<CapabilityStore>>,
+    node_ranks: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 impl Default for LlmRuntimeStores {
@@ -71,6 +72,7 @@ impl Default for LlmRuntimeStores {
             evaluate_models: Arc::new(RwLock::new(HashMap::new())),
             rate_controllers: Arc::new(RwLock::new(HashMap::new())),
             capabilities: Arc::new(RwLock::new(HashMap::new())),
+            node_ranks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -108,6 +110,13 @@ impl LlmRuntimeStores {
     #[must_use]
     pub fn capabilities(&self) -> Arc<RwLock<CapabilityStore>> {
         Arc::clone(&self.capabilities)
+    }
+
+    /// This node's rank in each loaded model split across several nodes, by model name. A
+    /// model that runs on one node has no entry.
+    #[must_use]
+    pub fn node_ranks(&self) -> Arc<RwLock<HashMap<String, usize>>> {
+        Arc::clone(&self.node_ranks)
     }
 }
 

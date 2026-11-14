@@ -25,7 +25,7 @@ limitations under the License.
 
 use async_openai::types::chat::{CreateChatCompletionResponse, CreateChatCompletionStreamResponse};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use messages_api::types::CreateMessageRequest;
+use messages_api::types::{CreateMessageRequest, ThinkingDisplay};
 use messages_chat::request::chat_request;
 use messages_chat::response::message;
 use messages_chat::stream::Translator;
@@ -126,7 +126,8 @@ fn bench(c: &mut Criterion) {
         b.iter_batched(
             || answer.clone(),
             |answer| {
-                serde_json::to_value(message(answer, false).expect("a message")).expect("JSON")
+                serde_json::to_value(message(answer, ThinkingDisplay::Off).expect("a message"))
+                    .expect("JSON")
             },
             BatchSize::SmallInput,
         );
@@ -137,7 +138,7 @@ fn bench(c: &mut Criterion) {
         b.iter_batched(
             || streamed.clone(),
             |streamed| {
-                let mut translator = Translator::new("gpt".to_string());
+                let mut translator = Translator::new("gpt".to_string(), ThinkingDisplay::Off);
                 let mut events = 0;
                 for chunk in streamed {
                     for event in translator.chunk(chunk).expect("events") {

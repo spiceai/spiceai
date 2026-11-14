@@ -259,13 +259,16 @@ pub(crate) async fn lend_gpu(cfg: &DistributedConfig, name: &str) -> Result<Shar
             "Model '{name}' could not serve this node's GPU: {e}"
         ))
     })??;
-    let head = host(&cfg.nodes[0]);
+    let head = cfg
+        .head_url
+        .clone()
+        .unwrap_or_else(|| host(&cfg.nodes[0]).to_string());
     tracing::info!(
         "Model '{name}': this node is rank {rank} of {} and holds its share of the model for the head at '{head}', which serves the model's requests; this node serves its GPU at {endpoint}.",
         cfg.world_size(),
     );
     Ok(Share {
-        refusal: served_by_head(name, head),
+        refusal: served_by_head(name, host(&cfg.nodes[0]), cfg.head_url.as_deref()),
         stopped: format!(
             "Model '{name}' no longer holds its share on this node: the server of this node's GPU at {endpoint} stopped. Restart spiced on this node."
         ),
@@ -273,11 +276,17 @@ pub(crate) async fn lend_gpu(cfg: &DistributedConfig, name: &str) -> Result<Shar
     })
 }
 
-/// What a request to a rank other than 0 is answered with.
-fn served_by_head(name: &str, head: &str) -> String {
-    format!(
-        "Model '{name}' is served by the first machine in 'nodes' ({head}); this machine holds part of it."
-    )
+/// What a request to a rank other than 0 is answered with: the head's `head_url`, where clients
+/// reach it, or else its address in `nodes`, which only the nodes may be able to reach.
+fn served_by_head(name: &str, head: &str, head_url: Option<&str>) -> String {
+    match head_url {
+        Some(url) => format!(
+            "Model '{name}' is served by the head at {url}; this machine holds part of it, so send requests there."
+        ),
+        None => format!(
+            "Model '{name}' is served by the first machine in 'nodes' ({head}); this machine holds part of it. Set `head_url` to the address clients reach the head at to name it here."
+        ),
+    }
 }
 
 /// A model on a rank other than 0: this node's GPU holds a share of it for the head, which
@@ -483,6 +492,7 @@ mod tests {
             node_rank: 0,
             nodes: vec!["127.0.0.1".to_string(), "192.0.2.1".to_string()],
             allow_insecure_connections: true,
+            head_url: None,
         };
         assert_eq!(
             head_gpu_address(&cfg).expect("127.0.0.1 is an IPv4 address"),
@@ -493,8 +503,16 @@ mod tests {
     #[test]
     fn a_request_to_another_rank_names_the_node_that_serves_the_model() {
         assert_eq!(
-            served_by_head("deepseek-v4.1-flash", "10.42.9.100"),
-            "Model 'deepseek-v4.1-flash' is served by the first machine in 'nodes' (10.42.9.100); this machine holds part of it."
+            served_by_head("deepseek-v4.1-flash", "10.42.9.100", None),
+            "Model 'deepseek-v4.1-flash' is served by the first machine in 'nodes' (10.42.9.100); this machine holds part of it. Set `head_url` to the address clients reach the head at to name it here."
+        );
+    }
+
+    #[test]
+    fn a_request_to_another_rank_names_the_head_url_when_one_is_set() {
+        assert_eq!(
+            served_by_head("glm", "10.42.9.100", Some("http://192.168.1.100:8090")),
+            "Model 'glm' is served by the head at http://192.168.1.100:8090; this machine holds part of it, so send requests there."
         );
     }
 
