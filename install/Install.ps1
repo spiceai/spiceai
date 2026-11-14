@@ -70,14 +70,36 @@ function Download-And-Install-Spice {
     }
 }
 
+# Returns $pathValue with $directory appended, or $null when $directory is already one of its
+# entries. An unset or empty value has no entries. Entries match whole, ignoring case and a
+# trailing backslash, so C:\x\bin2 does not count as C:\x\bin. Existing text is kept as it is.
+function Add-PathEntry {
+    param([string]$pathValue, [string]$directory)
+
+    $wanted = $directory.TrimEnd('\')
+    foreach ($entry in ($pathValue -split ';')) {
+        if ($entry -and ($entry.TrimEnd('\') -ieq $wanted)) {
+            return $null
+        }
+    }
+    if ([string]::IsNullOrEmpty($pathValue)) {
+        return $directory
+    }
+    if ($pathValue.EndsWith(';')) {
+        return $pathValue + $directory
+    }
+    return "$pathValue;$directory"
+}
+
 Verify-Supported
 
 Download-And-Install-Spice
 
 # Add Spice CLI to system PATH
 $envPath = [Environment]::GetEnvironmentVariable("PATH", [EnvironmentVariableTarget]::User)
-if (-not $envPath.Contains($spiceCliInstallDir)) {
-    [Environment]::SetEnvironmentVariable("PATH", $envPath + ";$spiceCliInstallDir", [EnvironmentVariableTarget]::User)
+$newEnvPath = Add-PathEntry $envPath $spiceCliInstallDir
+if ($null -ne $newEnvPath) {
+    [Environment]::SetEnvironmentVariable("PATH", $newEnvPath, [EnvironmentVariableTarget]::User)
     Write-Host "Spice CLI directory added to PATH."
 } else {
     Write-Host "Spice CLI directory is already in PATH."
