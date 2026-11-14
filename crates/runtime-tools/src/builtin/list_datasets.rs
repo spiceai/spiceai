@@ -273,12 +273,13 @@ pub struct ListDatasetsParams {
 }
 
 impl ListDatasetsParams {
+    /// The parameters of a call, all optional: an empty argument, or `null` (an MCP call
+    /// without `arguments`), lists the first page of every dataset.
     fn parse(arg: &str) -> Result<Self, serde_json::Error> {
         if arg.trim().is_empty() {
-            Ok(Self::default())
-        } else {
-            serde_json::from_str(arg)
+            return Ok(Self::default());
         }
+        Ok(serde_json::from_str::<Option<Self>>(arg)?.unwrap_or_default())
     }
 }
 
@@ -461,6 +462,29 @@ mod tests {
 
     fn no_columns(_: &str) -> Vec<(String, Option<String>)> {
         Vec::new()
+    }
+
+    /// An MCP call without `arguments` reaches the tool as `null`: the first page of every dataset.
+    #[test]
+    fn null_or_empty_arguments_are_no_arguments() {
+        for arg in ["", "  ", "null", "{}"] {
+            let params = ListDatasetsParams::parse(arg).expect("no arguments");
+            assert_eq!(
+                (params.search, params.limit, params.offset),
+                (None, None, None),
+                "{arg:?}"
+            );
+        }
+        let params = ListDatasetsParams::parse(r#"{"limit": 2}"#).expect("a limit");
+        assert_eq!(params.limit, Some(2));
+        let error =
+            ListDatasetsParams::parse(r#"{"limit": "two"}"#).expect_err("a limit must be a number");
+        assert!(
+            error
+                .to_string()
+                .starts_with(r#"invalid type: string "two", expected"#),
+            "{error}"
+        );
     }
 
     #[test]
