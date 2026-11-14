@@ -16,17 +16,23 @@ limitations under the License.
 
 //! Differential test of `PostgreSQL` federation against `PostgreSQL` itself.
 //!
-//! Each query runs six ways over the same committed rows: sent straight to
+//! Each query runs over the same committed rows: sent straight to
 //! `PostgreSQL` (the oracle, which shares no code with Spice), against the
 //! federated datasets, whose plans Spice rewrites and sends to `PostgreSQL`,
-//! and against four accelerations of the same tables, loaded with
+//! and against accelerations of the same tables, loaded with
 //! `refresh_mode: full` after the connector converts the rows: Arrow, Cayenne
 //! `mode: memory`, Cayenne `mode: file` with its defaults, which keeps a load
-//! this small as rows inlined in its metastore, and Cayenne `mode: file` with
-//! inlining turned off, which writes and reads Vortex files. The Cayenne sides read the rows
+//! this small as rows inlined in its metastore, Cayenne `mode: file` with
+//! inlining turned off, which writes and reads Vortex files, and, when their
+//! features are on, `SQLite` in memory and on disk (`sqlite`) and the
+//! `PostgreSQL` accelerator (`postgres-accel`), which writes the rows into
+//! tables of their own on the same server. The Cayenne sides read the rows
 //! back through Cayenne's own scan, with filters and projections pushed into
 //! it, so a value Cayenne stores, encodes, or prunes wrongly shows up as a row
-//! that differs from `PostgreSQL`'s. The fixture holds the values
+//! that differs from `PostgreSQL`'s. The `SQLite` and `PostgreSQL`-accelerator
+//! sides run each query in their own engine where Spice can send it there, so
+//! a value they store wrongly, or SQL Spice writes for them wrongly, shows up
+//! the same way. The fixture holds the values
 //! a translation gets wrong: NULLs in every column, `bigint` and `numeric`
 //! boundaries, `LIKE` wildcards as literal characters, non-ASCII and padded
 //! text, fractional-second timestamps, and duplicate join keys.
@@ -71,6 +77,18 @@ const ITEM_ROWS: usize = 16;
 const SEED: &[&str] = &[
     "DROP TABLE IF EXISTS diff_items",
     "DROP TABLE IF EXISTS diff_regions",
+    // The PostgreSQL accelerator's own tables and checkpoints. A dataset with a
+    // checkpoint serves the rows already in its table instead of loading again,
+    // so on a server that outlives one run (`POSTGRES_TEST_PORT`) the last
+    // run's rows, or none, would be compared instead.
+    "DROP TABLE IF EXISTS pgacc_items",
+    "DROP TABLE IF EXISTS pgacc_regions",
+    "DO $$ BEGIN \
+       IF to_regclass('spice_sys_dataset_checkpoint') IS NOT NULL THEN \
+         DELETE FROM spice_sys_dataset_checkpoint \
+         WHERE dataset_name IN ('pgacc_items', 'pgacc_regions'); \
+       END IF; \
+     END $$",
     "CREATE TABLE diff_items (\
        id integer PRIMARY KEY, grp integer, qty bigint, name text, \
        price numeric(10, 2), flag boolean, d date, ts timestamp)",
@@ -283,6 +301,7 @@ fn cases() -> Vec<Case> {
         rows("SELECT id FROM {items} WHERE flag IS NOT TRUE"),
         rows("SELECT id FROM {items} WHERE flag IS DISTINCT FROM true"),
         rows("SELECT id FROM {items} WHERE flag IS UNKNOWN"),
+        rows("SELECT id FROM {items} WHERE flag IS NOT UNKNOWN"),
         rows("SELECT id, CASE WHEN flag THEN 1 WHEN NOT flag THEN 0 END FROM {items}"),
         // Dates and timestamps.
         rows("SELECT id FROM {items} WHERE d >= DATE '2024-01-01'"),
@@ -371,6 +390,18 @@ enum Kind {
     /// [`Kind::CayenneFile`] with `inline_max_rows: 0`, so the load is written
     /// to Vortex files and every scan reads them.
     CayenneVortex,
+    /// A `SQLite` acceleration held in memory, loaded once with
+    /// `refresh_mode: full`.
+    #[cfg(feature = "sqlite")]
+    SqliteMemory,
+    /// A `SQLite` acceleration in a database file, loaded once with
+    /// `refresh_mode: full`.
+    #[cfg(feature = "sqlite")]
+    SqliteFile,
+    /// The `PostgreSQL` accelerator, writing its own copy of each table into
+    /// the oracle's server, loaded once with `refresh_mode: full`.
+    #[cfg(feature = "postgres-accel")]
+    PostgresAccel,
 }
 
 /// Where a `mode: file` acceleration of dataset `name` keeps its data.
@@ -382,12 +413,15 @@ fn data_dir(dir: &Path, name: &str) -> PathBuf {
 /// directory per dataset `name`.
 fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Dataset {
     let mut ds = Dataset::new(format!("postgres:{table}"), name.to_string());
-    ds.params = Some(Params::from_string_map(
-        get_pg_params(port)
-            .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().to_string()))
-            .collect::<HashMap<String, String>>(),
-    ));
+    let pg_params = || {
+        Params::from_string_map(
+            get_pg_params(port)
+                .into_iter()
+                .map(|(k, v)| (k, v.expose_secret().to_string()))
+                .collect::<HashMap<String, String>>(),
+        )
+    };
+    ds.params = Some(pg_params());
     let full = Acceleration {
         enabled: true,
         refresh_mode: Some(RefreshMode::Full),
@@ -425,6 +459,28 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
                 ..full
             })
         }
+        #[cfg(feature = "sqlite")]
+        Kind::SqliteMemory => Some(Acceleration {
+            engine: Some("sqlite".to_string()),
+            mode: Mode::Memory,
+            ..full
+        }),
+        #[cfg(feature = "sqlite")]
+        Kind::SqliteFile => Some(Acceleration {
+            engine: Some("sqlite".to_string()),
+            mode: Mode::File,
+            params: Some(Params::from_string_map(HashMap::from([(
+                "sqlite_file".to_string(),
+                dir.join(format!("{name}.sqlite")).display().to_string(),
+            )]))),
+            ..full
+        }),
+        #[cfg(feature = "postgres-accel")]
+        Kind::PostgresAccel => Some(Acceleration {
+            engine: Some("postgres".to_string()),
+            params: Some(pg_params()),
+            ..full
+        }),
     };
     ds
 }
@@ -498,7 +554,7 @@ struct Subject {
     kind: Kind,
 }
 
-const SUBJECTS: [Subject; 5] = [
+const SUBJECTS: &[Subject] = &[
     Subject {
         name: "federated",
         items: "fed_items",
@@ -528,6 +584,27 @@ const SUBJECTS: [Subject; 5] = [
         items: "cvortex_items",
         regions: "cvortex_regions",
         kind: Kind::CayenneVortex,
+    },
+    #[cfg(feature = "sqlite")]
+    Subject {
+        name: "sqlite memory",
+        items: "smem_items",
+        regions: "smem_regions",
+        kind: Kind::SqliteMemory,
+    },
+    #[cfg(feature = "sqlite")]
+    Subject {
+        name: "sqlite file",
+        items: "sfile_items",
+        regions: "sfile_regions",
+        kind: Kind::SqliteFile,
+    },
+    #[cfg(feature = "postgres-accel")]
+    Subject {
+        name: "postgres accelerator",
+        items: "pgacc_items",
+        regions: "pgacc_regions",
+        kind: Kind::PostgresAccel,
     },
 ];
 
@@ -565,6 +642,55 @@ fn check_cayenne_sources(plan: &[Row]) -> Result<(), String> {
     }
 }
 
+/// Checks that every source of the physical plan in `plan`, an `EXPLAIN`
+/// answer, is a scan that sends SQL to the accelerator engine named `engine`
+/// over the accelerator's own copy of a table, or is one of
+/// [`CONSTANT_SOURCES`]. The `PostgreSQL` accelerator writes into the oracle's
+/// server, so its scan names the same engine as the federated one: only the
+/// table in the SQL tells them apart. A side that read the fixture tables, or
+/// anything else, answered from somewhere other than the acceleration.
+#[cfg(any(feature = "sqlite", feature = "postgres-accel"))]
+fn check_accelerator_sources(plan: &[Row], engine: &str) -> Result<(), String> {
+    let physical = physical_plan(plan)?;
+    let lines: Vec<&str> = physical.lines().filter(|l| !l.trim().is_empty()).collect();
+    let depth = |line: &str| line.len() - line.trim_start().len();
+    let scan = format!("name={engine} ");
+    let other: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, line)| {
+            lines
+                .get(i + 1)
+                .is_none_or(|next| depth(next) <= depth(line))
+        })
+        .map(|(_, line)| line.trim())
+        .filter(|leaf| {
+            let remote = REMOTE_SCANS.iter().any(|op| leaf.starts_with(op))
+                && leaf.contains(&scan)
+                && !leaf.contains("diff_items")
+                && !leaf.contains("diff_regions");
+            !remote && !CONSTANT_SOURCES.iter().any(|op| leaf.starts_with(op))
+        })
+        .collect();
+    if other.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the plan reads {other:?}, not only the {engine} acceleration:\n{physical}"
+        ))
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn check_sqlite_sources(plan: &[Row]) -> Result<(), String> {
+    check_accelerator_sources(plan, "sqlite")
+}
+
+#[cfg(feature = "postgres-accel")]
+fn check_postgres_accelerator_sources(plan: &[Row]) -> Result<(), String> {
+    check_accelerator_sources(plan, "postgres")
+}
+
 async fn compare_case(
     rt: &Arc<Runtime>,
     client: &tokio_postgres::Client,
@@ -587,7 +713,7 @@ async fn compare_case(
     }
 
     let mut all_remote = true;
-    for subject in &SUBJECTS {
+    for subject in SUBJECTS {
         let name = subject.name;
         let sql = case
             .sql
@@ -605,14 +731,19 @@ async fn compare_case(
         }
         // The federated side must send the whole query to PostgreSQL, or it is
         // DataFusion over a wider scan and compares nothing the accelerated side
-        // does not. A Cayenne side must read only Cayenne, or its agreement says
-        // nothing about what Cayenne stored.
+        // does not. A Cayenne, SQLite or PostgreSQL-accelerator side must read
+        // only its acceleration, or its agreement says nothing about what that
+        // acceleration stored.
         let check: Option<PlanCheck> = match subject.kind {
             Kind::Federated => Some(check_nothing_local),
             Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
                 Some(check_cayenne_sources)
             }
             Kind::Accelerated => None,
+            #[cfg(feature = "sqlite")]
+            Kind::SqliteMemory | Kind::SqliteFile => Some(check_sqlite_sources),
+            #[cfg(feature = "postgres-accel")]
+            Kind::PostgresAccel => Some(check_postgres_accelerator_sources),
         };
         if let Some(check) = check {
             let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
@@ -642,7 +773,7 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
 
             register_test_connectors().await;
             let mut app = AppBuilder::new("postgres_federation_differential");
-            for subject in &SUBJECTS {
+            for subject in SUBJECTS {
                 app = app
                     .with_dataset(dataset(port, "diff_items", subject.items, subject.kind, dir.path()))
                     .with_dataset(dataset(port, "diff_regions", subject.regions, subject.kind, dir.path()));
@@ -666,7 +797,7 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
                     .map_err(|e| anyhow::anyhow!(e))?,
                 expected
             );
-            for subject in &SUBJECTS {
+            for subject in SUBJECTS {
                 assert_eq!(
                     spice_rows(&rt, &format!("SELECT count(*) FROM {}", subject.items))
                         .await
