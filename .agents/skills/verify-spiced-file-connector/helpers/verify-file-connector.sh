@@ -670,11 +670,11 @@ print(value)
 PY
 }
 
-# The `spiced` clock, in nanoseconds since the Unix epoch. Read just before a
-# refresh POST, it is the cutoff that tells the requested refresh apart from an
-# older one: the requested refresh starts at or after it, while a refresh that
-# was already running or queued (or whose task-history row is exported late)
-# started before it.
+# The `spiced` clock, in nanoseconds since the Unix epoch. `drive` reads it
+# after a step rewrites its source files and just before the refresh POST, so a
+# refresh that starts at or after it reads the rewritten files, whatever started
+# it. A refresh that started before it (still running, or whose task-history
+# row is exported late) may have read the files from before the rewrite.
 refresh_cutoff_ns() {
   local ns
   ns="$(sql_int "refresh cutoff" refresh-cutoff.body "SELECT CAST(now() AS BIGINT) AS ns")" || \
@@ -712,9 +712,9 @@ refresh_completion_marker() {
 
 # A new completion is a terminal status plus a new `acceleration_refresh`
 # task-history row that started at or after the cutoff both markers were
-# counted from. A moved `last_refresh` or `error_message` is not one: a refresh
-# that started before the POST moves them too, while the requested refresh is
-# still queued behind it.
+# counted from: that refresh read the rewritten files. A moved `last_refresh`
+# or `error_message` is not one: a refresh that started before the cutoff moves
+# them too, and it may have read the files from before the rewrite.
 refresh_is_complete() {
   python3 - "$1" "$2" <<'PY'
 import sys
