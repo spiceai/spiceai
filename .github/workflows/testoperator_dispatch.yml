@@ -53,6 +53,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'schedule' && (github.event.schedule == '0 0 * * 0' && 'weekly' || 'daily')) || ((github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly') && github.event.inputs.schedule) || github.run_id }}
   cancel-in-progress: false
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # Resolves which schedule this run dispatches (the cron that fired, or the manual `schedule`
   # input) and for which branches. trunk dispatches the configs on that schedule. A release

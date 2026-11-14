@@ -106,6 +106,9 @@ concurrency:
   cancel-in-progress: false
   queue: max
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-htap:
     environment: ci

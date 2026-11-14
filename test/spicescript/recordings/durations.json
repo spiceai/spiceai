@@ -111,6 +111,8 @@
   "mysql-types-acceleration": 10,
   "mysql-unsigned-negation": 7,
   "newest-by-time": 12,
+  "object-native-data": 22,
+  "object-native-same-bucket": 85,
   "on-zero-results": 20,
   "parquet-struct-map-key": 5,
   "partitioning": 5,

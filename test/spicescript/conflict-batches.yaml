@@ -24,10 +24,11 @@ variants:
     when: { mode: file }
     datasets: { across: &part { acceleration: { partition_by: [region] } }, wsame: *part, wdiff: *part, ap: *part }
   # Each variant above that keeps an unpartitioned Cayenne file acceleration,
-  # with the prototype object-native Cayenne metastore.
-  upsert-object-native: { datasets: { across: *upsert, wsame: *upsert, wdiff: *upsert, ap: *upsert, lp: *upsert }, spicepod: &vnext { runtime: { params: { cayenne_vnext: enabled } } } }
-  drop-object-native: { datasets: { across: *drop, wsame: *drop, wdiff: *drop, ap: *drop, lp: *drop }, spicepod: *vnext }
-  none-object-native: { spicepod: *vnext }
+  # with the prototype object-native Cayenne metastore. `cayenne_vnext` does
+  # not support `partition_by` yet (#16308), so `tp` is unpartitioned here.
+  upsert-object-native: { datasets: { across: *upsert, wsame: *upsert, wdiff: *upsert, ap: *upsert, lp: *upsert, tp: &unpartitioned { acceleration: { partition_by: null } } }, spicepod: &vnext { runtime: { params: { cayenne_vnext: enabled } } } }
+  drop-object-native: { datasets: { across: *drop, wsame: *drop, wdiff: *drop, ap: *drop, lp: *drop, tp: *unpartitioned }, spicepod: *vnext }
+  none-object-native: { datasets: { tp: *unpartitioned }, spicepod: *vnext }
 
 spicepod:
   version: v1
@@ -164,7 +165,8 @@ steps:
   - query: SELECT id, v FROM t WHERE id IN (3, 100000)
     expect: { rows: [['100000', v3]] }
 
-  # Partitioned: the update would collide in one partition, so no partition changes.
+  # Partitioned (unpartitioned in the object-native variants): the update would
+  # collide in one partition, so no partition changes.
   - spice-exec: UPDATE tp SET id = 2 WHERE id = 1
     expect-error: "Failed to update dataset 'tp': the new '(id, region)' of 1 row matches a key already stored, so nothing was changed."
   - query: SELECT CAST(id AS VARCHAR) || ':' || v AS r FROM tp

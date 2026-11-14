@@ -622,14 +622,14 @@ impl SlotAdvancer for PositionSavingAdvancer {
     }
 }
 
-/// The prefix of `dataset`'s log in the catalog at `catalog/`.
+/// The prefix of `dataset`'s log in the catalog at `v1/catalog/`.
 async fn dataset_log(
     store: &Arc<dyn object_store::ObjectStore>,
     dataset: &str,
 ) -> TestResult<object_store::path::Path> {
     Ok(cayenne::metastore::object_native::dataset_log_at(
         Arc::clone(store),
-        &object_store::path::Path::from("catalog"),
+        &object_store::path::Path::from("v1/catalog"),
         dataset,
     )
     .await?
@@ -679,19 +679,26 @@ async fn an_object_native_checkpoint_commits_its_position_with_its_data() -> Tes
     let fixture = TestFixture::new(common::BackendType::Sqlite).await?;
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let catalog = Arc::new(
-        cayenne::metastore::object_native::ObjectNativeCatalog::create(
+        cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
             Arc::clone(&store),
-            object_store::path::Path::from("catalog"),
+            object_store::path::Path::from("v1/catalog"),
+            "s3://bucket/v1",
         )
         .await?,
     );
     let ctx = SessionContext::new();
+    let mut options = memory_tier_options(&fixture, NAME, &id_value_schema());
+    options.base_path = format!("s3://bucket/v1/datasets/{NAME}/data");
     let table = Arc::new(
-        CayenneTableProvider::create_table(
+        common::table_builder_on_store(
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-            memory_tier_options(&fixture, NAME, &id_value_schema()),
             ctx.runtime_env(),
+            cayenne::metadata::ObjectStoreConfig {
+                url: url::Url::parse(&options.base_path)?,
+                store: Arc::clone(&store),
+            },
         )
+        .create(options)
         .await?,
     );
     let advancer = Arc::new(PositionSavingAdvancer {
@@ -751,19 +758,26 @@ async fn an_object_native_seal_commits_its_position_with_its_data() -> TestResul
     let fixture = TestFixture::new(common::BackendType::Sqlite).await?;
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let catalog = Arc::new(
-        cayenne::metastore::object_native::ObjectNativeCatalog::create(
+        cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
             Arc::clone(&store),
-            object_store::path::Path::from("catalog"),
+            object_store::path::Path::from("v1/catalog"),
+            "s3://bucket/v1",
         )
         .await?,
     );
     let ctx = SessionContext::new();
+    let mut options = memory_tier_options(&fixture, NAME, &id_value_schema());
+    options.base_path = format!("s3://bucket/v1/datasets/{NAME}/data");
     let table = Arc::new(
-        CayenneTableProvider::create_table(
+        common::table_builder_on_store(
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-            memory_tier_options(&fixture, NAME, &id_value_schema()),
             ctx.runtime_env(),
+            cayenne::metadata::ObjectStoreConfig {
+                url: url::Url::parse(&options.base_path)?,
+                store: Arc::clone(&store),
+            },
         )
+        .create(options)
         .await?,
     );
     let advancer = Arc::new(PositionSavingAdvancer {
