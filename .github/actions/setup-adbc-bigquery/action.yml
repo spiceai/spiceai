@@ -5,7 +5,7 @@ inputs:
   adbc_bigquery_commit:
     description: 'Git commit hash to build the driver from'
     required: false
-    default: 'fe83ac26d43bffeaf28844bcf5fef303b1bdf345'
+    default: '2ecfe26c798012e0e289e2ba25e78849a4f90851'
   go_version:
     description: >-
       Go version to build the driver with. Must satisfy the `go` directive in the
@@ -13,7 +13,7 @@ inputs:
       so Go will not download a newer toolchain to cover a shortfall. The build
       step below asserts the two agree.
     required: false
-    default: '1.26.1'
+    default: '1.27.4'
 
 runs:
   using: 'composite'
