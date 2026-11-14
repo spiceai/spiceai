@@ -5,16 +5,30 @@ all-features = true
 [advisories]
 # cargo-deny v2 schema: vulnerability, unmaintained, unsound, and notice
 # advisories all fail the check by default. Yanked crates also fail.
-# To bypass a vulnerability, unsound, or yanked finding, add its RUSTSEC ID (or,
-# for a yanked crate, its `crate@version`) to `ignore` with a comment explaining
-# why and an owner. Unmaintained advisories are never ignored: they stay in the
-# nightly advisory report until the crate is upgraded, replaced, or vendored
-# under `crates/vendor/`.
+# To bypass a specific advisory, add its RUSTSEC ID (or, for a yanked crate,
+# its `crate@version`) to `ignore` with a comment explaining why and an owner.
+# Do not add new unmaintained advisories: they stay in the nightly advisory
+# report until the crate is upgraded, replaced, or vendored under
+# `crates/vendor/`. The unmaintained entries below predate this rule.
 version = 2
 yanked = "deny"
 ignore = [
+  # Runtime serialization pulls `atomic-polyfill` through `postcard`/`heapless`; no safe upgrade is available yet. Owner: runtime.
+  "RUSTSEC-2023-0089",
+  # A transitive local-model dependency still pulls `dotenv`; no safe upgrade is available yet. Owner: llms.
+  "RUSTSEC-2021-0141",
+  # Local model search dependencies pull `fxhash`; no safe upgrade is available yet. Owner: llms.
+  "RUSTSEC-2025-0057",
+  # Progress-display dependencies pull `number_prefix`; no safe upgrade is available yet. Owner: llms.
+  "RUSTSEC-2025-0119",
+  # `paste` is widely used by proc-macro/data connector dependencies; no safe upgrade is available yet. Owner: runtime/data connectors.
+  "RUSTSEC-2024-0436",
   # Object store signing dependencies pull `rsa`; no safe upgrade is available yet. Owner: data components/runtime.
   "RUSTSEC-2023-0071",
+  # `rustls-pemfile` is unmaintained. Runtime no longer depends on it directly
+  # (uses `rustls::pki_types::pem` instead), but the spice-rs SDK (`spiceai`
+  # crate) still pulls v1.x transitively. Owner: spice-rs / runtime.
+  "RUSTSEC-2025-0134",
   # `quick-xml` quadratic duplicate-attribute check on start tags (DoS). Pulled
   # transitively in several versions (via vortex, AWS-XML, and serialization
   # dependencies); no single safe upgrade across all pins yet. Owner: data components/runtime.
