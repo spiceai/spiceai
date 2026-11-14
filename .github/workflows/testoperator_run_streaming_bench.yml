@@ -58,6 +58,9 @@ on:
         type: string
         default: '500'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-streaming-benchmark:
     environment: ci

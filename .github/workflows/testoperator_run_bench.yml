@@ -123,6 +123,9 @@ on:
         type: string
         default: ''
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-bench:
     # The Databricks service principal's federation policy trusts this environment's subject.

@@ -19,8 +19,15 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   generate_openapi:
+    permissions:
+      contents: write  # git push of the openapi/ branch
+      pull-requests: write  # gh pr list/create/close --comment, with labels
+      actions: write  # approve_bot_pr_runs.sh: approve the pull_request runs held on its GITHUB_TOKEN push
     environment: secret-free
     runs-on: self-hosted
 

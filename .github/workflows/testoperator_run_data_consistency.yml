@@ -59,6 +59,9 @@ on:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-data-consistency:
     # The service principal's federation policy trusts this environment's subject.

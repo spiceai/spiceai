@@ -10,10 +10,10 @@ description: >
 sources:
   api: { kind: mock-http }
 
+# `refresh_mode: caching` fails to load with `runtime.params.cayenne_vnext`
+# enabled, so there is no object-native variant.
 variants:
   cayenne: {}
-  # The spicepod as written, with the prototype object-native Cayenne metastore.
-  object-native: object-native
 
 spicepod:
   version: v1

@@ -50,14 +50,6 @@
       "kind": "other",
       "signature": "the source answered [[Some(\"1\")]], expected [[Some(\"2\")]]",
       "group": "caching-http"
-    },
-    {
-      "run": "http-caching-request-key",
-      "who": "object-native",
-      "key": "start: {}",
-      "kind": "error",
-      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"The accelerator engine cayenne failed to initialize: Invalid Cayenne acceleration configuration: Failed to load dataset 't' (cayenne)",
-      "group": "caching-http"
     }
   ],
   "http-headers-from-subquery": [

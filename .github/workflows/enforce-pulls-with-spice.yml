@@ -58,6 +58,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   enforce-pull-with-spice:
     environment: secret-free

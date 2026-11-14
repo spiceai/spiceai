@@ -11,6 +11,9 @@ on:
         required: false
         type: string
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   dispatch-search:
     environment: ci
