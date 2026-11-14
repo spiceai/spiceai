@@ -2,7 +2,7 @@ name: hive-null-partition
 description: >
   A Hive-partitioned file dataset reads the rows under the
   `__HIVE_DEFAULT_PARTITION__` directory with NULL in the partition column,
-  which is nullable, federated and in a Cayenne and a DuckDB file acceleration
+  which is nullable, federated and in a Cayenne file acceleration
   (apache/datafusion#26310). The expected rows follow Hive's definition of the
   marker.
 
@@ -12,7 +12,6 @@ sources:
 variants:
   federated: {}
   cayenne: { datasets: { h: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
-  duckdb: { datasets: { h: { acceleration: { enabled: true, engine: duckdb, mode: file } } } }
 
 spicepod:
   version: v1

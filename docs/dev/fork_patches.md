@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `88ca8060ea01da1b63f36baa494f9d8190028d38` | `spiceai-55-merge-55.3.0` (TEMPORARY: spiceai/datafusion#298) |
+| [datafusion](#datafusion) | `88db5b10de44c41ba8cf8331316c5d2a1fc17f8a` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `9d30d58cbdb4d9f7e511738bedd896603a5a256f` | `spiceai-55` |
@@ -241,8 +241,8 @@ rows of an `Unnest` under an empty projection, and #295 writes MySQL's concatena
 division and float literals in forms MySQL reads as DataFusion does, and writes sample standard
 deviation and variance under their standard names. On top of #295, #296 backports apache/datafusion#24989, which
 computes a grouped `bit_xor(DISTINCT …)` with its distinct accumulator. On top of #296, spiceai/datafusion#298
-merges upstream `55.3.0` (apache/datafusion@7941823cf077678fef337a29f8307e5d721d1fc8); the pin is that merge
-commit. Outside the six files it resolved by hand, every Spice patch's diff against `55.3.0` is line for line
+merges upstream `55.3.0` (apache/datafusion@7941823cf077678fef337a29f8307e5d721d1fc8); the pin is the merge
+commit of #298. Outside the six files it resolved by hand, every Spice patch's diff against `55.3.0` is line for line
 its diff against `55.2.0`. Of those six, #251 keeps its empty-file rule beside upstream's null-partition
 statistics (apache/datafusion#26310), and #277's ordered *partial* path is replaced by upstream's
 apache/datafusion#25312 (row below). These commits descend
