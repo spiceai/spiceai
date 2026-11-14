@@ -47,6 +47,7 @@ mod catalog_concurrency_test;
 mod catalog_selector_test;
 mod cdc_compaction_delete_race_test;
 mod checkpoint_write_sizing_test;
+mod cold_planning_cost_test;
 mod cold_tier_pruning_test;
 mod cold_tier_statistics_test;
 mod cold_tier_test;
