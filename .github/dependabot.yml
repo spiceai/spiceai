@@ -64,6 +64,12 @@ updates:
       # which links the CUDA 12 runtime libraries a CUDA 13 image does not carry.
       - dependency-name: 'nvidia/cuda'
         update-types: ['version-update:semver-major']
+      # The Hadoop test-data image (crates/data_components/tests/hadoop_data) runs Iceberg's
+      # Spark runtime, which Iceberg publishes per Spark minor. Iceberg 1.12.0 has runtimes up
+      # to Spark 4.1; on 4.2 every CREATE TABLE fails with IncompatibleClassChangeError. Raise
+      # this bound with the runtime in setup_spark.sh once Iceberg releases one for 4.2.
+      - dependency-name: 'spark'
+        versions: ['>= 4.2']
     labels:
       - 'docker'
       - 'kind/dependencies'

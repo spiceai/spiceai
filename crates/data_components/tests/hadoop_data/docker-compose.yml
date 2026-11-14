@@ -1,15 +1,15 @@
-# Create a MinIO cluster, so we can copy the hadoop warehouse into it for testing
+# Create an S3-compatible store, so we can copy the hadoop warehouse into it for testing.
+# MinIO no longer publishes images to Docker Hub or quay.io, so this is RustFS, the store
+# spicescript tests against, under the service name `minio` that the setup scripts address.
 services:
   minio:
-    image: minio/minio:RELEASE.2024-03-07T00-43-48Z
+    image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
     expose:
       - 9000
-      - 9001
     environment:
-      - MINIO_ROOT_USER=admin
-      - MINIO_ROOT_PASSWORD=password
-      - MINIO_DOMAIN=minio
-    command: [ "server", "/data", "--console-address", ":9001" ]
+      - RUSTFS_ACCESS_KEY=admin
+      - RUSTFS_SECRET_KEY=password
+    command: [ "/data" ]
     networks:
       - default
 
