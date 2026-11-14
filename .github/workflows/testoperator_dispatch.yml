@@ -364,8 +364,29 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
-      - name: Validate spicepods - TPCH - SF10 memory mode
+      # This workflow is trunk's, but the release job checks out the release branch, which can predate
+      # the SF10 memory-mode config (release/2.4 does). Trunk must carry it; a release branch without
+      # it skips only this config and still runs the rest of its suite.
+      - name: Check for the TPCH SF10 memory-mode config
+        id: sf10-memory
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
+        env:
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          spicepod='./test/spicepods/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml'
+          dispatch='./tools/testoperator/dispatch/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml'
+          if [ -f "$spicepod" ] && [ -f "$dispatch" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          elif [ "$BRANCH" = trunk ]; then
+            echo "::error::trunk is missing $spicepod or $dispatch, which the SF10 memory-mode steps run"
+            exit 1
+          else
+            echo "::notice::$BRANCH has no SF10 memory-mode config ($spicepod, $dispatch); skipping it"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate spicepods - TPCH - SF10 memory mode
+        if: ${{ steps.benchmarked.outputs.skip != 'true' && steps.sf10-memory.outputs.present == 'true' }}
         run: |
           "$SPICEPOD_VALIDATOR" "./test/spicepods/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml"
 
@@ -460,7 +481,7 @@ jobs:
       # not fit a large runner; SF10 is the largest scale it runs at. Only this config is dispatched
       # from tpch/sf10.
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF10 memory mode
-        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
+        if: ${{ steps.benchmarked.outputs.skip != 'true' && steps.sf10-memory.outputs.present == 'true' }}
         run: |
           testoperator dispatch "./tools/testoperator/dispatch/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml" --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
         env:
