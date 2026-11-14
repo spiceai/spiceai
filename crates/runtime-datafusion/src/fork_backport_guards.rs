@@ -747,7 +747,7 @@ fn ordered_aggregate_input() -> (
     (schema, DataSourceExec::from_data_source(input))
 }
 
-/// spiceai/datafusion#277, the ordered partial path (upstream from DataFusion
+/// spiceai/datafusion#277, the ordered partial path (upstream from `DataFusion`
 /// 55.3.0 as apache/datafusion#25312). An ordered aggregate must emit the
 /// groups left at end of input with one `EmitTo::All`. Emitting them as
 /// repeated `EmitTo::First(batch_size)` renumbers every group still held, so
