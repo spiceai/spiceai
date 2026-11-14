@@ -1,9 +1,11 @@
 # Fails when .github/workflows/actions.lock is out of sync with the
 # workflows, a locked pin no longer verifies upstream, or a `uses:` is not
-# pinned to a full-length commit SHA.
+# pinned to a full-length commit SHA with a lockfile entry keyed by that SHA.
 #
 # After adding a workflow or changing any `uses:`, regenerate the lockfile,
-# then put the SHAs back, because `gh actions-lock` rewrites SHA pins to tags:
+# then put the SHAs back. `gh actions-lock` rewrites SHA pins to tags and keys
+# the lockfile by tag, and the runner matches a `uses:` to its lockfile entry
+# by the exact ref, so a SHA `uses:` needs its entry keyed by that SHA:
 #   gh extension install github/gh-actions-lock
 #   gh actions-lock
 #   python3 scripts/pin_actions_to_sha.py
