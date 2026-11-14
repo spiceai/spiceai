@@ -420,22 +420,20 @@ fn run<'m, S: Shared<'m>>(
         }
         // a few at a time, so requests arriving faster than they are taken cannot hold off the
         // steps of the running ones
-        for _ in 0..slots.len() {
-            match jobs.try_recv() {
-                Ok(job) => waiting.push_back(job),
-                Err(std_mpsc::TryRecvError::Empty) => break,
-                Err(std_mpsc::TryRecvError::Disconnected) => {
-                    open = false;
-                    break;
-                }
-            }
-        }
+        let limit = slots.len();
+        open &= receive(jobs, &mut waiting, limit);
         admit(
             model,
             shared,
             split,
             (&mut slots, &mut host, max_running, layout),
-            (&mut preempted, &mut waiting),
+            (
+                &mut preempted,
+                &mut waiting,
+                &mut |waiting: &mut VecDeque<Job>| {
+                    open &= receive(jobs, waiting, limit);
+                },
+            ),
             eog,
             &mut tick,
         );
@@ -452,6 +450,22 @@ fn run<'m, S: Shared<'m>>(
     }
 }
 
+/// Moves requests that have arrived since into the waiting ones (see [`receive`]).
+type Arrivals<'a> = &'a mut dyn FnMut(&mut VecDeque<Job>);
+
+/// Moves up to `limit` requests that have arrived into `waiting`, without waiting for any.
+/// Returns false once no request can arrive any more.
+fn receive(jobs: &std_mpsc::Receiver<Job>, waiting: &mut VecDeque<Job>, limit: usize) -> bool {
+    for _ in 0..limit {
+        match jobs.try_recv() {
+            Ok(job) => waiting.push_back(job),
+            Err(std_mpsc::TryRecvError::Empty) => break,
+            Err(std_mpsc::TryRecvError::Disconnected) => return false,
+        }
+    }
+    true
+}
+
 /// Resumes the preempted requests, then starts the waiting ones, each in order, as there are
 /// free sequences and room for, while fewer than `max_running` run. A waiting request does not
 /// start while a preempted one whose client reads waits for room.
@@ -460,7 +474,7 @@ fn admit<'m, S: Shared<'m>>(
     shared: &mut S,
     split: bool,
     (slots, host, max_running, layout): (&mut [Slot<'m>], &mut HostCache, usize, CacheLayout),
-    (preempted, waiting): (&mut VecDeque<Running<'m>>, &mut VecDeque<Job>),
+    (preempted, waiting, arrivals): (&mut VecDeque<Running<'m>>, &mut VecDeque<Job>, Arrivals<'_>),
     eog: &[Token],
     tick: &mut u64,
 ) {
@@ -553,16 +567,23 @@ fn admit<'m, S: Shared<'m>>(
             *tick,
         );
         let argmax = split && greedy_alone(slots);
+        // Requests that arrived while this one's sequence was readied, as two conversations'
+        // next turns do when their replies end together, start in this pass too.
+        arrivals(waiting);
         // Beside requests that step next, the read's end joins their step: a prompt the cache
         // holds but for its last few tokens, as a conversation's next turn mostly is, then costs
-        // a few more tokens in a pass the model makes anyway, not a pass of its own.
-        let steps_beside = slots.iter().enumerate().any(|(index, slot)| {
-            index != free
-                && slot
-                    .running
-                    .as_ref()
-                    .is_some_and(|running| running.events.capacity() >= headroom)
-        });
+        // a few more tokens in a pass the model makes anyway, not a pass of its own. A request
+        // that can start in this pass after this one steps next too.
+        let running_now = slots.iter().filter(|slot| slot.running.is_some()).count();
+        let starts_after = !waiting.is_empty() && running_now + 1 < max_running;
+        let steps_beside = starts_after
+            || slots.iter().enumerate().any(|(index, slot)| {
+                index != free
+                    && slot
+                        .running
+                        .as_ref()
+                        .is_some_and(|running| running.events.capacity() >= headroom)
+            });
         let defer = if steps_beside {
             (shared.n_draft() + 1).max(CHECKPOINT_BEFORE_END)
         } else {

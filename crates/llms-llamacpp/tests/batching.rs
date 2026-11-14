@@ -265,6 +265,59 @@ async fn a_request_admitted_mid_reply_reads_its_prompts_end_in_the_running_ones_
     );
 }
 
+/// Requests that start in one pass with nothing running, as a request's choices do, or two
+/// conversations' next turns whose replies ended together, read their prompts' ends in the one
+/// step they share: the first does not read its own in a pass of its own before the next joins
+/// it. Greedy, each choice is the reply alone.
+#[tokio::test]
+async fn requests_starting_together_read_their_prompts_ends_in_one_step() {
+    let gguf = qwen35_gguf().await;
+    let name = "qwen3.5";
+    let prompt = PROMPTS[0];
+    let alone = {
+        let model = load(&gguf, name, 1, 4096).await;
+        reply(&model, body(name, prompt, 96)).await
+    };
+    let engine = Arc::new(
+        LlamaCpp::from(
+            std::slice::from_ref(&gguf),
+            LocalModelOptions {
+                reasoning: ReasoningDefault {
+                    model_name: name,
+                    effort: None,
+                },
+                context_length: Some(4096),
+                concurrent_requests: NonZeroU32::new(2),
+                ..LocalModelOptions::default()
+            },
+        )
+        .await
+        .expect("the model loads"),
+    );
+    let model: Arc<dyn Chat> = Arc::clone(&engine) as Arc<dyn Chat>;
+    let mut two_choices = body(name, prompt, 96);
+    two_choices["n"] = json!(2);
+    let reply = tokio::time::timeout(SERVED_WITHIN, model.chat_request(request(two_choices)))
+        .await
+        .expect("both choices reply")
+        .expect("a reply");
+    let texts: Vec<String> = reply
+        .choices
+        .iter()
+        .map(|choice| choice.message.content.clone().expect("content"))
+        .collect();
+    assert_eq!(
+        texts,
+        vec![alone.clone(), alone],
+        "two choices started together, against the reply alone"
+    );
+    assert_eq!(
+        engine.prompt_ends_in_steps(),
+        2,
+        "both choices read their prompt's end in the step they share"
+    );
+}
+
 /// Requests whose output limits together pass the shared cache still all reply, as each does
 /// alone. With a 1024-token context, each of the four requests may write 320 reply tokens, more
 /// than a third of the context; each is admitted while its prompt fits beside the running
