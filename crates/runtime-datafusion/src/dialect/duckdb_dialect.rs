@@ -25,7 +25,7 @@ use datafusion::sql::sqlparser::ast::{self, BinaryOperator, WindowFrameBound};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{
     CharacterLengthStyle, DateFieldExtractStyle, Dialect, DistinctFromStyle, DuckDBDialect,
-    IntervalStyle, ScalarFnToSqlHandler,
+    FloatLiteralStyle, IntervalStyle, ScalarFnToSqlHandler,
 };
 
 use super::duckdb::ordered_aggregate_to_sql;
@@ -115,6 +115,10 @@ impl Dialect for SpiceDuckDBDialect {
         self.inner.float64_ast_dtype()
     }
 
+    fn float_literal_style(&self) -> FloatLiteralStyle {
+        self.inner.float_literal_style()
+    }
+
     fn utf8_cast_dtype(&self) -> ast::DataType {
         self.inner.utf8_cast_dtype()
     }
@@ -193,6 +197,10 @@ impl Dialect for SpiceDuckDBDialect {
 
     fn integer_division_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
         self.inner.integer_division_to_sql(lhs, rhs)
+    }
+
+    fn string_concat_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
+        self.inner.string_concat_to_sql(lhs, rhs)
     }
 
     fn requires_explicit_comparison_coercion(&self) -> bool {

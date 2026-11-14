@@ -1,0 +1,5 @@
+---
+source: crates/runtime-datafusion/src/analyzer_rule/decimal_comparison_float_constant.rs
+expression: mysql
+---
+SELECT * FROM `m` WHERE (`m`.`disc` IN (0.050000000000000, 3.000000000000000) AND (0.070000000000000 >= `m`.`disc`))

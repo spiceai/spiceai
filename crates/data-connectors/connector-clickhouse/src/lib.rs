@@ -25,6 +25,7 @@ limitations under the License.
 
 mod block_to_arrow;
 mod conn;
+mod dialect;
 mod factory;
 mod federation;
 mod pool;

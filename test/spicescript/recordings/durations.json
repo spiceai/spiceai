@@ -54,7 +54,7 @@
   "executor-numeric-literals": 10,
   "federated-result-columns": 12,
   "federation-differential": 12,
-  "federation-matrix": 21,
+  "federation-matrix": 40,
   "feed-chaos": 232,
   "feed-generate": 38,
   "feed-write-boundaries": 10,
