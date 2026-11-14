@@ -53,3 +53,9 @@ SELECT id FROM q WHERE disc = 0.1 + 0.2 - 0.23;
 SELECT id FROM q WHERE disc IN (0.05, 0.03 + 0.04);
 SELECT id FROM q WHERE 0.06 + 0.01 <= disc;
 SELECT id FROM q WHERE disc <> 0.07;
+-- Beside a decimal of a larger scale, the float constant still rounds at the
+-- scale of its own comparison with the column: rounded at scale 20, the double
+-- `0.06 + 0.01` would stay below 0.07 and `0.1 - 0.03` above it.
+SELECT id FROM q WHERE disc BETWEEN CAST(0 AS DECIMAL(38, 20)) AND 0.06 + 0.01;
+SELECT id FROM q WHERE disc BETWEEN 0.1 - 0.03 AND CAST(1 AS DECIMAL(38, 20));
+SELECT id FROM q WHERE disc IN (CAST(0 AS DECIMAL(38, 20)), 0.06 + 0.01);
