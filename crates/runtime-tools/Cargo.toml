@@ -78,6 +78,9 @@ axum.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
 bytes.workspace = true
 http-body-util = "0.1"
+# Checks tool results against the MCP `outputSchema` the tools declare (`result_schema`),
+# with a validator that shares no code with the schema or the encoder.
+jsonschema = { version = "0.60.2", default-features = false }
 tower.workspace = true
 tracing-subscriber.workspace = true
 

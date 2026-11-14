@@ -1528,4 +1528,85 @@ mod tests {
         let schema = result_schema();
         assert_eq!(schema["required"], json!(["columns", "rows"]));
     }
+
+    /// Every shape of result the encoder makes conforms to [`result_schema`], the `outputSchema`
+    /// the `sql` and sampling tools declare, so an MCP client that validates `structuredContent`
+    /// against it accepts each one.
+    #[test]
+    fn every_result_shape_conforms_to_the_output_schema() {
+        let validator = jsonschema::validator_for(&result_schema()).expect("a valid JSON Schema");
+        let errors = |value: &Value| {
+            validator
+                .iter_errors(value)
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let too_wide = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "x".repeat(40_000),
+            DataType::Int32,
+            true,
+        )]));
+        let mut lists = arrow::array::ListBuilder::new(Int32Builder::new());
+        for i in 0..20 {
+            lists.values().append_value(i);
+        }
+        lists.append(true);
+        let shortened = batch(vec![
+            (
+                "text",
+                Arc::new(StringArray::from(vec!["t".repeat(2_000)])) as ArrayRef,
+            ),
+            ("list", Arc::new(lists.finish()) as ArrayRef),
+            (
+                "bytes",
+                Arc::new(BinaryArray::from(vec![b"abc".as_slice()])) as ArrayRef,
+            ),
+            (
+                "nan",
+                Arc::new(Float64Array::from(vec![f64::NAN])) as ArrayRef,
+            ),
+        ]);
+        let shapes = [
+            ("fits", encode(&[ids(3)], ResultBudget::default())),
+            (
+                "cut at the row limit",
+                encode(&[ids(500)], ResultBudget::default()),
+            ),
+            (
+                "cut at the byte budget",
+                encode(
+                    &[ids(5_000)],
+                    ResultBudget::with_limits(10_000, MIN_RESULT_BYTES),
+                ),
+            ),
+            (
+                "too wide to name",
+                encode_batches(&too_wide, &[], ResultBudget::default())
+                    .expect("encodes")
+                    .into_value()
+                    .expect("valid JSON"),
+            ),
+            (
+                "shortened values",
+                encode(&[shortened], ResultBudget::default()),
+            ),
+        ];
+        for (shape, value) in &shapes {
+            assert_eq!(errors(value), Vec::<String>::new(), "{shape}: {value}");
+        }
+        // The shapes cover every optional key, so each one's type is checked.
+        assert_eq!(shapes[1].1["truncated"], json!(true));
+        assert!(shapes[4].1["message"].is_string(), "{}", shapes[4].1);
+
+        // The validator is not vacuous: it rejects what the schema rules out.
+        for wrong in [
+            json!({"rows": []}),
+            json!({"columns": [1], "rows": []}),
+            json!({"columns": ["id"], "rows": [1]}),
+            json!({"columns": ["id"], "rows": [], "truncated": "yes"}),
+        ] {
+            assert!(!validator.is_valid(&wrong), "{wrong}");
+        }
+    }
 }
