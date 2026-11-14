@@ -391,7 +391,7 @@
           }
         ],
         "requestBody": {
-          "description": "On-demand refresh request for a specific dataset.",
+          "description": "Optional overrides for this refresh. An empty body, with or without `Content-Type: application/json`, is the same as `{}`.",
           "content": {
             "application/json": {
               "schema": {
