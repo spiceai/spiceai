@@ -78,6 +78,10 @@ pub struct QueryRequest {
 
     /// Restrict which tables the query may reference.
     pub table_allowlist: Option<ResolvedTableAwareAllowlist>,
+
+    /// The most rows to return, as a `LIMIT` on the query's plan. A statement that writes or
+    /// describes is not limited.
+    pub fetch: Option<usize>,
 }
 
 impl QueryRequest {
@@ -89,6 +93,7 @@ impl QueryRequest {
             read_only: false,
             parameters: None,
             table_allowlist: None,
+            fetch: None,
         }
     }
 
@@ -112,6 +117,33 @@ impl QueryRequest {
         self.table_allowlist = Some(allowlist);
         self
     }
+
+    /// Return at most `rows` rows: the query runs as if it ended in `LIMIT rows`, so it
+    /// finishes once it has them, and sources that take a limit stop early.
+    #[must_use]
+    pub fn fetch(mut self, rows: usize) -> Self {
+        self.fetch = Some(rows);
+        self
+    }
+}
+
+/// Whether a `fetch` limit applies to `plan`. A query takes one. A statement that writes or
+/// describes does not: DML, DDL, `COPY`, `EXPLAIN`, `ANALYZE`, `DESCRIBE`, and the other
+/// statements (`SET`, `PREPARE`, `EXECUTE`, transactions). These answer with a few rows of their
+/// own, `EXPLAIN` and `ANALYZE` must stay at the root of a plan, and a limit over a write would
+/// hide it from the checks that find a write at the root.
+#[must_use]
+pub fn fetch_applies_to(plan: &LogicalPlan) -> bool {
+    !matches!(
+        plan,
+        LogicalPlan::Dml(_)
+            | LogicalPlan::Ddl(_)
+            | LogicalPlan::Copy(_)
+            | LogicalPlan::Statement(_)
+            | LogicalPlan::Explain(_)
+            | LogicalPlan::Analyze(_)
+            | LogicalPlan::DescribeTable(_)
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -34,6 +34,7 @@ use llms::responses::Error as ResponsesError;
 use llms::responses::Responses;
 use llms::{chat::Error as LlmError, progress::Progress};
 use runtime_tools::builtin::list_datasets::catalog_prompt_from_tool;
+use runtime_tools::result::{ResultBudget, with_budget};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -93,6 +94,8 @@ pub struct ToolUsingResponses {
     openai_tools: Vec<OpenAIResponsesTools>,
     tools: Vec<Arc<dyn SpiceModelTool>>,
     recursion_limit: Option<usize>,
+    /// The budget for one tool result, sized from the model's context window.
+    result_budget: ResultBudget,
 }
 
 impl ToolUsingResponses {
@@ -108,7 +111,15 @@ impl ToolUsingResponses {
             openai_tools,
             tools,
             recursion_limit,
+            result_budget: ResultBudget::default(),
         }
+    }
+
+    /// Sizes each tool result for a model with a context window of `context_window` tokens.
+    #[must_use]
+    pub fn with_context_window(mut self, context_window: Option<u64>) -> Self {
+        self.result_budget = ResultBudget::for_context_window(context_window);
+        self
     }
 
     /// `req` with a system message naming the datasets the model can query (see
@@ -201,7 +212,7 @@ impl ToolUsingResponses {
             ..
         } = tool_call;
         match self.as_spiced_tool(name) {
-            Some(t) => match t.call(arguments).await {
+            Some(t) => match with_budget(self.result_budget, t.call(arguments)).await {
                 Ok(v) => {
                     tracing::info!(
                         target: "task_history",

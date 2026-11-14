@@ -73,9 +73,10 @@ use crate::{DEFAULT_TRACING_MODELS, init_tracing};
 /// The name of the model in the Spicepod.
 const MODEL_NAME: &str = "tool_model";
 
-/// The rows of the `orders` dataset. With this many, the result of `sql` (C) is the largest part
-/// of the conversation, so a round that loses the cache before C loses thousands of tokens.
-const ORDER_ROWS: usize = 200;
+/// The rows of the `orders` dataset: as many as one `sql` result shows, so the result of `sql` (C)
+/// holds every row and the model counts them from it, without a second query. C is over a
+/// thousand tokens, so a round that loses the cache before C loses more than the slack allows.
+const ORDER_ROWS: usize = 100;
 
 /// The question of turn 1 (A). It makes the model call `sql`, and keeps the answer (D) short.
 const QUESTION: &str = "Use the sql tool to run exactly this query: \
@@ -88,7 +89,7 @@ const FOLLOW_UP: &str = "What exact SQL query did you run? Quote it verbatim.";
 /// The most prompt tokens of a round that the next round can fail to read from the cache when
 /// Spice keeps the round whole. `OpenAI` and xAI cache a prompt in blocks of 128 tokens. Measured
 /// on 2026-10-15, `OpenAI` read up to 305 tokens fewer than a request had, from a later request that
-/// repeats all of it. A round that loses the cache before the `sql` result loses thousands.
+/// repeats all of it. A round that loses the cache before the `sql` result loses over a thousand.
 const CACHE_SLACK_TOKENS: u64 = 512;
 
 /// The provider of the model that Spice runs its tools for.

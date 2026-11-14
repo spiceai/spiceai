@@ -67,6 +67,10 @@ impl SpiceModelTool for RenamedTool {
         self.tool.parameters()
     }
 
+    fn output_schema(&self) -> Option<Value> {
+        self.tool.output_schema()
+    }
+
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         self.tool.call(arg).await
     }
@@ -146,6 +150,11 @@ mod tests {
             Some(serde_json::json!({ "type": "object" }))
         }
 
+        fn output_schema(&self) -> Option<Value> {
+            self.strict
+                .map(|_| serde_json::json!({ "type": "object", "required": ["rows"] }))
+        }
+
         async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Value::String(format!("inner called with {arg}")))
         }
@@ -174,6 +183,11 @@ mod tests {
             renamed.strict(),
             inner.strict(),
             "strict() must forward the inner tool's value, not the trait's None"
+        );
+        assert_eq!(
+            renamed.output_schema(),
+            inner.output_schema(),
+            "output_schema() must forward the inner tool's schema, not the trait's None"
         );
         assert_eq!(
             renamed.call("x").await.expect("the inner call succeeds"),

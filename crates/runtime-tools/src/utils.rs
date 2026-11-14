@@ -60,35 +60,6 @@ fn result_too_large(max_bytes: usize, fix: &str) -> Box<dyn std::error::Error + 
     format!("The result is larger than {limit}, the size limit for this request. {fix}").into()
 }
 
-/// Writes the rows of `stream` as a JSON array, like [`write_to_json_string`]. Stops reading
-/// and returns an error as soon as the JSON is longer than `max_bytes`.
-pub async fn stream_to_json_string(
-    mut stream: SendableRecordBatchStream,
-    max_bytes: usize,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let mut writer = arrow_json::WriterBuilder::new()
-        .with_explicit_nulls(true)
-        .build::<_, JsonArray>(Vec::new());
-    let too_large = || {
-        result_too_large(
-            max_bytes,
-            "Add a LIMIT clause, select fewer columns, or aggregate the rows.",
-        )
-    };
-    while let Some(batch) = stream.next().await {
-        writer.write(&batch?)?;
-        if writer.get_ref().len() > max_bytes {
-            return Err(too_large());
-        }
-    }
-    writer.finish()?;
-    let json = writer.into_inner();
-    if json.len() > max_bytes {
-        return Err(too_large());
-    }
-    Ok(String::from_utf8(json)?)
-}
-
 /// Collects `stream` into batches. Stops reading and returns an error as soon as the rows of the
 /// batches take more than `max_bytes` of memory.
 pub async fn collect_batches_bounded(
@@ -155,40 +126,6 @@ mod tests {
             schema,
             futures::stream::iter(batches.into_iter().map(Ok)),
         ))
-    }
-
-    #[tokio::test]
-    async fn a_result_under_the_limit_is_the_same_json_as_without_a_limit() {
-        let batches = vec![batch(100), batch(50)];
-        let expected = write_to_json_string(&batches).expect("serialize");
-        let json = stream_to_json_string(stream(batches.clone()), expected.len())
-            .await
-            .expect("a result of exactly the limit is returned");
-        assert_eq!(json, expected);
-        stream_to_json_string(stream(batches), expected.len() - 1)
-            .await
-            .expect_err("a result one byte over the limit fails");
-    }
-
-    #[tokio::test]
-    async fn a_result_over_the_limit_is_an_error_before_the_stream_ends() {
-        let first = batch(100);
-        let limit = write_to_json_string(std::slice::from_ref(&first))
-            .expect("serialize")
-            .len()
-            / 2;
-        let endless = Box::pin(RecordBatchStreamAdapter::new(
-            first.schema(),
-            futures::stream::iter([Ok(first)]).chain(futures::stream::pending()),
-        ));
-        let e = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            stream_to_json_string(endless, limit),
-        )
-        .await
-        .expect("the limit stops reading the stream")
-        .expect_err("a result over the limit fails");
-        assert!(e.to_string().contains("Add a LIMIT clause"), "{e}");
     }
 
     #[tokio::test]

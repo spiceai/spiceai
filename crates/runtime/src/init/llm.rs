@@ -90,8 +90,14 @@ impl Runtime {
             });
         }
 
-        let mut responses_model = match try_to_responses_model(&m, &params, Arc::new(self.clone()))
-            .await
+        let context_window = completions_model.chat.token_limits().await.context_window;
+        let mut responses_model = match try_to_responses_model(
+            &m,
+            &params,
+            Arc::new(self.clone()),
+            context_window,
+        )
+        .await
         {
             Ok(model) => Some(model),
             Err(e) => {

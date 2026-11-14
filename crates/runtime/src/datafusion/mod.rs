@@ -7421,6 +7421,9 @@ impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
         if let Some(allowlist) = request.table_allowlist {
             qb = qb.allow_tables(allowlist);
         }
+        if let Some(rows) = request.fetch {
+            qb = qb.fetch(rows);
+        }
         let query_result =
             qb.build()
                 .run()

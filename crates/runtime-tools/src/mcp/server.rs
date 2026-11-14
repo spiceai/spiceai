@@ -787,8 +787,14 @@ impl RuntimeServer {
             }
         };
 
-        // Tools such as `sql` already return JSON as a string; re-encoding it
-        // would make clients parse the text into a string instead of the data.
+        // A tool that declares an `outputSchema` returns an object matching it, which MCP
+        // carries as `structuredContent` and, for clients that read only text, as JSON text.
+        if resolved.tool.output_schema().is_some() && result.is_object() {
+            return Ok(CallToolResult::structured(result).into());
+        }
+
+        // Tools such as `table_schema` return text; re-encoding it as JSON would make clients
+        // parse the text into a string instead of reading it.
         let text = match result {
             Value::String(text) => text,
             other => serde_json::to_string(&other)
@@ -998,7 +1004,11 @@ fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModel
     let description: Option<Cow<'static, str>> =
         tool.description().map(|s| Cow::Owned(s.into_owned()));
     let schema = to_map(tool.parameters().unwrap_or_else(empty_input_schema));
-    Tool::new_with_raw(name.into(), description, schema)
+    let definition = Tool::new_with_raw(name.into(), description, schema);
+    match tool.output_schema() {
+        Some(output_schema) => definition.with_raw_output_schema(Arc::new(to_map(output_schema))),
+        None => definition,
+    }
 }
 
 /// 1 MiB cap for a `tools/call` payload we will execute or forward.
@@ -4417,6 +4427,93 @@ mod tests {
     /// `request` as a real `/v1/mcp` request reaches rmcp: authenticated, here
     /// with a read-write API key. For tests of something other than auth, which
     /// would otherwise be refused for having no principal.
+    /// A tool that returns a tool result object, and declares its `outputSchema` or not.
+    struct RowsTool {
+        name: &'static str,
+        declares_schema: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for RowsTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.name)
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+        fn output_schema(&self) -> Option<Value> {
+            self.declares_schema.then(crate::result::result_schema)
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({"columns": ["n"], "rows": [[1]]}))
+        }
+    }
+
+    /// A tool with an `outputSchema` lists it, and answers with its object as `structuredContent`
+    /// and the same JSON as its one text block, for clients that read only text. A tool without
+    /// one answers with the text alone.
+    #[tokio::test]
+    async fn a_tool_with_an_output_schema_answers_with_structured_content() {
+        let mut tools = HashMap::new();
+        for (name, declares_schema) in [("rows", true), ("plain_rows", false)] {
+            tools.insert(
+                name.to_string(),
+                Tooling::Tool(Arc::new(RowsTool {
+                    name,
+                    declares_schema,
+                }) as Arc<dyn SpiceModelTool>),
+            );
+        }
+        let service = mcp_http_service(RuntimeServer::new(Arc::new(RwLock::new(tools))));
+
+        let (status, listed) = post_tools_list(&service).await;
+        assert!(status.is_success(), "tools/list: {status} {listed}");
+        let output_schema = |name: &str| {
+            listed
+                .pointer("/result/tools")
+                .and_then(Value::as_array)
+                .and_then(|tools| tools.iter().find(|tool| tool["name"] == name))
+                .map(|tool| tool["outputSchema"].clone())
+        };
+        assert_eq!(output_schema("rows"), Some(crate::result::result_schema()));
+        assert_eq!(output_schema("plain_rows"), Some(Value::Null));
+
+        let object = json!({"columns": ["n"], "rows": [[1]]});
+        let text_of = |called: &Value| -> Value {
+            let content = called["result"]["content"]
+                .as_array()
+                .expect("content blocks");
+            assert_eq!(content.len(), 1, "{called}");
+            assert_eq!(content[0]["type"], "text", "{called}");
+            serde_json::from_str(content[0]["text"].as_str().expect("text")).expect("JSON text")
+        };
+
+        let (status, called) = post_tools_call_param(&service, "rows", "region", None, "x").await;
+        assert!(status.is_success(), "tools/call rows: {status} {called}");
+        assert_eq!(called["result"]["structuredContent"], object, "{called}");
+        assert_eq!(text_of(&called), object);
+        assert_ne!(called["result"]["isError"], json!(true), "{called}");
+
+        let (status, called) =
+            post_tools_call_param(&service, "plain_rows", "region", None, "x").await;
+        assert!(
+            status.is_success(),
+            "tools/call plain_rows: {status} {called}"
+        );
+        assert_eq!(
+            called["result"]["structuredContent"],
+            Value::Null,
+            "{called}"
+        );
+        assert_eq!(text_of(&called), object);
+    }
+
     fn authenticated<B>(mut request: http::Request<B>) -> http::Request<B> {
         insert_spice_ctx(&mut request, spice_ctx_with_api_key("test-key:rw"));
         request
