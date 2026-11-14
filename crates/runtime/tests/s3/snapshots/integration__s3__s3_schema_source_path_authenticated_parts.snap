@@ -7,5 +7,5 @@ expression: schema
 +-------------+-----------+-------------+
 | id          | Int64     | NO          |
 | value       | Float64   | NO          |
-| part_key    | Utf8      | NO          |
+| part_key    | Utf8      | YES         |
 +-------------+-----------+-------------+
