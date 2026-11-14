@@ -14,9 +14,43 @@ expression: tools_list
     "parameters": null
   },
   {
-    "description": "List every dataset, view, and catalog visible to this runtime, with each entry's fully-qualified table name, description, columns, and capability flags (e.g. `can_search_documents`). Call this first whenever you need to discover what data is available before issuing `sql`, `search`, `table_schema`, or sample tools. Takes no arguments. Returns a JSON array; use the `table` field as the identifier for follow-up tool calls.",
+    "description": "List the datasets, views, and catalog tables this runtime can query: each one's fully qualified name (`table`), its description, and `can_search_documents: true` when `search` can query it. Pass `search` to find the datasets whose names, descriptions, columns, or column descriptions match, best match first; omit it to list every dataset by name. Returns `{\"datasets\": [...], \"total\": N, \"has_more\": bool}`, 50 datasets at a time (`limit`, up to 200); read the next page with `offset`. Use `table` as the identifier in `sql`, `search`, and `table_schema`.",
     "name": "list_datasets",
-    "parameters": null
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "default": null,
+          "description": "The most datasets to return: 50 when omitted, at most 200.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "default": null,
+          "description": "How many datasets to skip, to read the next page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "search": {
+          "default": null,
+          "description": "Words to look for in dataset names, descriptions, column names, and column\ndescriptions. Omit to list every dataset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "ListDatasetsParams",
+      "type": "object"
+    }
   },
   {
     "description": "Return the current UTC date and time as an ISO 8601 timestamp. Call this whenever the model needs the actual current time to compute relative durations, evaluate freshness, or stamp generated content; do not guess or rely on training-data dates. Takes no arguments. Returns a string like '2026-05-06T13:45:00Z'.",
@@ -41,13 +75,41 @@ expression: tools_list
     }
   },
   {
-    "description": "List every dataset, view, and catalog visible to this runtime, with each entry's fully-qualified table name, description, columns, and capability flags (e.g. `can_search_documents`). Call this first whenever you need to discover what data is available before issuing `sql`, `search`, `table_schema`, or sample tools. Takes no arguments. Returns a JSON array; use the `table` field as the identifier for follow-up tool calls.",
+    "description": "List the datasets, views, and catalog tables this runtime can query: each one's fully qualified name (`table`), its description, and `can_search_documents: true` when `search` can query it. Pass `search` to find the datasets whose names, descriptions, columns, or column descriptions match, best match first; omit it to list every dataset by name. Returns `{\"datasets\": [...], \"total\": N, \"has_more\": bool}`, 50 datasets at a time (`limit`, up to 200); read the next page with `offset`. Use `table` as the identifier in `sql`, `search`, and `table_schema`.",
     "name": "mcp_from_spiced__list_datasets",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {},
-      "required": [],
-      "title": "empty",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "default": null,
+          "description": "The most datasets to return: 50 when omitted, at most 200.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "default": null,
+          "description": "How many datasets to skip, to read the next page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "search": {
+          "default": null,
+          "description": "Words to look for in dataset names, descriptions, column names, and column\ndescriptions. Omit to list every dataset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "ListDatasetsParams",
       "type": "object"
     }
   },
@@ -185,7 +247,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).",
+    "description": "Return the columns of one or more datasets, one per line with its SQL type, `NOT NULL`, and (with `output=full`, the default) its description and the table's keys. Call this before writing a `sql` query so you know the exact column names and types. Pass `tables` as fully qualified names from `list_datasets`. For a wide table, pass `search` to list only the columns whose names or descriptions match. `output` is `full` or `minimal` (names and types only).",
     "name": "mcp_from_spiced__table_schema",
     "parameters": {
       "$defs": {
@@ -203,10 +265,17 @@ expression: tools_list
         "output": {
           "$ref": "#/$defs/OutputType",
           "default": "full",
-          "description": "If `full` return metadata and semantic details about the columns."
+          "description": "`full` (the default) adds column descriptions and the table's keys; `minimal` lists\ncolumn names and types only."
+        },
+        "search": {
+          "description": "Words to look for in column names and descriptions: only the matching columns are listed,\nbest match first, with a count of the others. Omit to list every column.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "tables": {
-          "description": "Which tables to return the schema of.",
+          "description": "Which tables to return the schema of: fully qualified names from `list_datasets`.",
           "items": {
             "type": "string"
           },
@@ -384,7 +453,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).",
+    "description": "Return the columns of one or more datasets, one per line with its SQL type, `NOT NULL`, and (with `output=full`, the default) its description and the table's keys. Call this before writing a `sql` query so you know the exact column names and types. Pass `tables` as fully qualified names from `list_datasets`. For a wide table, pass `search` to list only the columns whose names or descriptions match. `output` is `full` or `minimal` (names and types only).",
     "name": "table_schema",
     "parameters": {
       "$defs": {
@@ -402,10 +471,17 @@ expression: tools_list
         "output": {
           "$ref": "#/$defs/OutputType",
           "default": "full",
-          "description": "If `full` return metadata and semantic details about the columns."
+          "description": "`full` (the default) adds column descriptions and the table's keys; `minimal` lists\ncolumn names and types only."
+        },
+        "search": {
+          "description": "Words to look for in column names and descriptions: only the matching columns are listed,\nbest match first, with a count of the others. Omit to list every column.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "tables": {
-          "description": "Which tables to return the schema of.",
+          "description": "Which tables to return the schema of: fully qualified names from `list_datasets`.",
           "items": {
             "type": "string"
           },

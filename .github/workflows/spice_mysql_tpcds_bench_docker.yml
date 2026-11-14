@@ -3,6 +3,9 @@ name: spice-mysql-tpcds-bench docker
 on:
   workflow_dispatch:
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   build:
     runs-on: ubuntu-24.04

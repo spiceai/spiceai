@@ -808,3 +808,64 @@ async fn tools_used_counts_only_the_calls_that_ran() {
         );
     }
 }
+
+/// A `list_datasets` tool that lists one dataset, `taxi_trips`.
+struct OneDataset;
+
+#[async_trait]
+impl SpiceModelTool for OneDataset {
+    fn name(&self) -> Cow<'_, str> {
+        "list_datasets".into()
+    }
+
+    fn description(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+
+    fn parameters(&self) -> Option<Value> {
+        None
+    }
+
+    async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(
+            json!({"datasets": [{"table": "spice.public.taxi_trips"}], "total": 1, "has_more": false}),
+        )
+    }
+}
+
+/// The datasets reach the model as a system text block after the request's own `system`, and only
+/// once.
+#[tokio::test]
+async fn the_dataset_list_is_added_after_the_requests_system() {
+    let catalog =
+        "Datasets (use these names in sql, search, and table_schema):\n- spice.public.taxi_trips";
+    let tools = SpiceTools {
+        tools: vec![Arc::new(OneDataset) as Arc<dyn SpiceModelTool>],
+        result_budget: ResultBudget::default(),
+    };
+    let with_catalog = |body: Value| {
+        let tools = &tools;
+        async move {
+            let Value::Object(mut body) = body else {
+                panic!("a request body is an object");
+            };
+            tools.add_catalog(&mut body).await;
+            body.remove("system").unwrap_or_default()
+        }
+    };
+
+    assert_eq!(
+        with_catalog(json!({"system": "Be brief."})).await,
+        json!([{"type": "text", "text": "Be brief."}, {"type": "text", "text": catalog}])
+    );
+    assert_eq!(
+        with_catalog(json!({})).await,
+        json!([{"type": "text", "text": catalog}])
+    );
+    let already = json!([{"type": "text", "text": "Be brief.", "cache_control": {"type": "ephemeral"}}, {"type": "text", "text": catalog}]);
+    assert_eq!(
+        with_catalog(json!({"system": already.clone()})).await,
+        already,
+        "a request that holds the list keeps it once, and the client's blocks as they were"
+    );
+}

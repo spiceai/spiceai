@@ -24,6 +24,7 @@ use crate::{
         DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
         request_context_extension::get_current_datafusion,
     },
+    http::optional_json::OptionalJson,
 };
 use app::App;
 use axum::{
@@ -395,7 +396,7 @@ pub struct AccelerationRequest {
         ("name" = String, Path, description = "The name of the dataset to refresh.")
     ),
     request_body(
-        description = "On-demand refresh request for a specific dataset.",
+        description = "Optional overrides for this refresh. An empty body, with or without `Content-Type: application/json`, is the same as `{}`.",
         content((
             RefreshOverrides = "application/json",
             example = json!({
@@ -435,10 +436,11 @@ pub struct AccelerationRequest {
 pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Path(dataset_name): Path<String>,
-    overrides_opt: Option<Json<RefreshOverrides>>,
-    // No body, or one without a JSON `Content-Type`, is `None`. A JSON body that does
-    // not deserialize is rejected before the handler runs: 400 for malformed JSON, 422
-    // for an unknown field value such as an unknown `refresh_mode`.
+    // An empty or whitespace-only body is `None` whatever the `Content-Type`, the same as
+    // `{}`. A JSON body is rejected before the handler runs: 400 for malformed JSON, 422
+    // for an unknown field value such as an unknown `refresh_mode`. A non-empty body
+    // under a non-JSON `Content-Type` is 415. See `OptionalJson`.
+    OptionalJson(overrides): OptionalJson<RefreshOverrides>,
 ) -> Response {
     let app_lock = tokio::select! {
         lock = app.read() => lock,
@@ -507,10 +509,7 @@ pub(crate) async fn refresh(
 
     let table_ref = TableReference::parse_str(name);
 
-    match df
-        .refresh_table(&table_ref, overrides_opt.map(|Json(overrides)| overrides))
-        .await
-    {
+    match df.refresh_table(&table_ref, overrides).await {
         Ok(_) => (
             status::StatusCode::CREATED,
             Json(MessageResponse {

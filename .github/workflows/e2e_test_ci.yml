@@ -64,6 +64,10 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # Skip the expensive E2E matrix on merge groups that don't touch code (docs,
   # etc.). `build` — which every test job depends on — is gated on this, so the
@@ -517,6 +521,11 @@ jobs:
         uses: ./.github/actions/stop-spice
 
   test_hf_model:
+    permissions:
+      contents: read
+      # test/models/spicepod_hf.yml: a github: dataset searches this repository's issues with GITHUB_TOKEN.
+      issues: read
+      pull-requests: read
     environment: ci
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     timeout-minutes: 10

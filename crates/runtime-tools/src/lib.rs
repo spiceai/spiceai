@@ -20,6 +20,7 @@ pub mod factory;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;
+pub mod metadata;
 pub mod options;
 pub mod result;
 pub mod tooling;
