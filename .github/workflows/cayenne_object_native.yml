@@ -61,11 +61,11 @@ jobs:
       stores: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.stores == 'true' }}
       object_store_occ: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.paths.outputs.object_store_occ == 'true' }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
-      - uses: dorny/paths-filter@v4.0.3
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: paths
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         with:
@@ -122,7 +122,7 @@ jobs:
       RUSTC_WORKSPACE_WRAPPER: ''
       SET: ${{ (github.event_name == 'schedule' || inputs.set == 'all') && 'all' || 'quick' }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # The merge-group path filter diffs against the queue's base.
@@ -165,7 +165,7 @@ jobs:
       CAYENNE_PROPTEST_OPS_SCALE: '0.25'
       RUSTFS_CONTAINER: cayenne-data-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
@@ -242,7 +242,7 @@ jobs:
     runs-on: spiceai-dev-runners
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}

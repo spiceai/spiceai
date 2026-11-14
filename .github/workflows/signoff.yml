@@ -330,7 +330,7 @@ jobs:
         # "origin" pointed at this repo and fetches the fork as a second,
         # separate remote instead.
         if: needs.resolve.outputs.is_fork != 'true'
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.checkout_ref }}
           # Full history so local merge-base with trunk works when trunk is present.
@@ -343,7 +343,7 @@ jobs:
         # checked out over this in the next step; ref is left at whatever
         # triggered this workflow_dispatch since it's immediately replaced.
         if: needs.resolve.outputs.is_fork == 'true'
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           # Defense in depth: the next step pulls in fork-authored code, which

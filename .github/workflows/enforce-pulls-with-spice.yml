@@ -73,7 +73,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: spiceai/pulls-with-spice-action@v2.0.0
+      - uses: spiceai/pulls-with-spice-action@61ef22e4a17be07209f0811fbfe4f0deb2e490a4 # v2.0.0
         if: github.event_name == 'pull_request_target'
         with:
           require_title_min_length: '10'

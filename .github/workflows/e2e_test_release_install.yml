@@ -55,7 +55,7 @@ jobs:
         run: uname -m
 
       - name: checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: install Spice (https://install.spiceai.org)
         if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
@@ -270,10 +270,10 @@ jobs:
       WSLENV: GITHUB_TOKEN
     steps:
       - name: checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup WSL
-        uses: Vampire/setup-wsl@v7.2.0
+        uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
         with:
           distribution: Ubuntu-24.04
           additional-packages: curl

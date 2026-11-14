@@ -90,7 +90,7 @@ runs:
     - name: Cache spidapter binary
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
       id: cache-spidapter
-      uses: actions/cache@v6.1.0
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           target/release/spidapter${{ steps.detect-os.outputs.ext }}
@@ -147,7 +147,7 @@ runs:
 
     - name: Save to cache
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v6.1.0
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           target/release/spidapter${{ steps.detect-os.outputs.ext }}
@@ -191,7 +191,7 @@ runs:
 
     - name: Upload spidapter artifact
       if: inputs.upload_artifact == 'true'
-      uses: actions/upload-artifact@v7.0.2
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: spidapter-${{ steps.detect-os.outputs.os }}
         path: target/release/spidapter${{ steps.detect-os.outputs.ext }}

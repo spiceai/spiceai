@@ -100,7 +100,7 @@ jobs:
       id-token: write  # RustFS credentials, Databricks access tokens, and Google Cloud access tokens for the BigQuery tests
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -218,7 +218,7 @@ jobs:
       # Short-lived AWS credentials, kept out of the job's environment and passed to the step below.
       - name: Assume the Databricks Delta role
         id: aws-databricks-delta
-        uses: aws-actions/configure-aws-credentials@v6.3.0
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
           role-session-name: gha-databricks-delta-${{ github.run_id }}

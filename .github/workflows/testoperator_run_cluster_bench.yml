@@ -227,7 +227,7 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust toolchain
         uses: $/.github/actions/setup-rust
@@ -341,7 +341,7 @@ jobs:
       # match the job timeout rather than the 1-hour default.
       - name: Authorize with the sandbox benchmark role
         if: env.CB_COMPUTE == 'ec2'
-        uses: aws-actions/configure-aws-credentials@v6.3.0
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
           role-session-name: gha-ballista-bench-${{ github.run_id }}
@@ -378,7 +378,7 @@ jobs:
       - name: Assume the Iceberg role
         id: aws-iceberg
         if: env.CB_COMPUTE != 'ec2'
-        uses: aws-actions/configure-aws-credentials@v6.3.0
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
@@ -540,7 +540,7 @@ jobs:
 
       - name: Re-authorize for cleanup
         if: always() && env.CB_COMPUTE == 'ec2'
-        uses: aws-actions/configure-aws-credentials@v6.3.0
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
           role-session-name: gha-ballista-bench-cleanup-${{ github.run_id }}

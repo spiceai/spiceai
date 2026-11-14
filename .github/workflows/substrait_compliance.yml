@@ -69,7 +69,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
     steps:
       - name: Checkout spiceai
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -77,7 +77,7 @@ jobs:
       # identical to v0.1.1) plus the TPC-H q01 shipdate-cutoff correction. Keep
       # this pin, scripts/fetch-ibm.sh, and SUITE_REF in src/main.rs together.
       - name: Checkout spiceai/substrait-compliance
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: spiceai/substrait-compliance
           ref: 43d31411c69ef7594887c7d759037bcf8244eeed
@@ -135,7 +135,7 @@ jobs:
       # commit, the nightly and a dispatch still publish the reports.
       - name: Upload JSON and CSV reports
         if: ${{ !cancelled() && github.event_name != 'merge_group' }}
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: substrait-compliance-mode-a-tpch
           path: |
@@ -149,7 +149,7 @@ jobs:
 
       - name: Upload spiceio logs
         if: always() && runner.os == 'macOS' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiceio-substrait-compliance-logs
           path: ${{ runner.temp }}/spiceio.log
@@ -205,13 +205,13 @@ jobs:
             layouts: ''
     steps:
       - name: Checkout spiceai
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       # The same suite pin as Mode A; see that job.
       - name: Checkout spiceai/substrait-compliance
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: spiceai/substrait-compliance
           ref: 43d31411c69ef7594887c7d759037bcf8244eeed
@@ -283,7 +283,7 @@ jobs:
 
       - name: Upload JSON and CSV reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: substrait-compliance-mode-b-tpch-${{ matrix.engine }}-${{ matrix.mode }}
           path: tools/substrait-compliance/results/mode-b

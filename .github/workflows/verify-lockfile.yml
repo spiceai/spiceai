@@ -1,9 +1,12 @@
 # Fails when .github/workflows/actions.lock is out of sync with the
-# workflows or a locked pin no longer verifies upstream.
+# workflows, a locked pin no longer verifies upstream, or a `uses:` is not
+# pinned to a full-length commit SHA.
 #
-# After adding a workflow or changing any `uses:`, regenerate the lockfile:
+# After adding a workflow or changing any `uses:`, regenerate the lockfile,
+# then put the SHAs back, because `gh actions-lock` rewrites SHA pins to tags:
 #   gh extension install github/gh-actions-lock
 #   gh actions-lock
+#   python3 scripts/pin_actions_to_sha.py
 # See https://github.com/github/gh-actions-lock
 
 name: verify-lockfile
@@ -33,7 +36,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install gh-actions-lock into this job's temp directory
@@ -48,3 +51,9 @@ jobs:
           XDG_DATA_HOME="${RUNNER_TEMP}/gh-data" GH_CONFIG_DIR="${RUNNER_TEMP}/gh-config" \
             gh extension install github/gh-actions-lock --pin v0.4.1
       - run: gh actions-lock --verify
+      # The tests run first: a pattern that stopped matching `uses:` lines would
+      # pass every workflow.
+      - name: Test the full-length SHA pin check
+        run: python3 scripts/test_pin_actions_to_sha.py -v
+      - name: Check every uses is pinned to a full-length commit SHA
+        run: python3 scripts/pin_actions_to_sha.py --check
