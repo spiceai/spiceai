@@ -165,10 +165,12 @@ const PASS_THROUGH: [&str; 3] = [
 ];
 const REMOTE_SCANS: [&str; 2] = ["VirtualExecutionPlan", "SqlExec"];
 
-/// One operator of a physical plan: its name, and its depth in the tree.
+/// One operator of a physical plan: its name, its depth in the tree, and its
+/// whole line, which carries details such as the SQL a remote scan sends.
 struct Operator<'a> {
     name: &'a str,
     depth: usize,
+    line: &'a str,
 }
 
 /// The physical plan text in `plan`, an `EXPLAIN` answer.
@@ -189,6 +191,7 @@ fn operators(physical: &str) -> Vec<Operator<'_>> {
             Some(Operator {
                 name,
                 depth: line.len() - line.trim_start().len(),
+                line: line.trim(),
             })
         })
         .collect()
@@ -196,7 +199,7 @@ fn operators(physical: &str) -> Vec<Operator<'_>> {
 
 /// Each operator of `operators` with no child, a source its rows come from,
 /// with the names of the operators above it.
-fn leaves<'a>(operators: &[Operator<'a>]) -> Vec<(&'a str, Vec<&'a str>)> {
+fn leaves<'o, 'a>(operators: &'o [Operator<'a>]) -> Vec<(&'o Operator<'a>, Vec<&'a str>)> {
     let mut above: Vec<&Operator<'a>> = Vec::new();
     let mut leaves = Vec::new();
     for (i, op) in operators.iter().enumerate() {
@@ -207,7 +210,7 @@ fn leaves<'a>(operators: &[Operator<'a>]) -> Vec<(&'a str, Vec<&'a str>)> {
             .get(i + 1)
             .is_none_or(|next| next.depth <= op.depth)
         {
-            leaves.push((op.name, above.iter().map(|parent| parent.name).collect()));
+            leaves.push((op, above.iter().map(|parent| parent.name).collect()));
         }
         above.push(op);
     }
@@ -370,9 +373,6 @@ fn cases() -> Vec<Case> {
 /// A row as its cells, each rendered, or `None` for NULL.
 type Row = Vec<Option<String>>;
 
-/// A check of an `EXPLAIN` answer, which says what the plan does wrong.
-type PlanCheck = fn(&[Row]) -> Result<(), String>;
-
 /// How a dataset reads `PostgreSQL`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -413,15 +413,13 @@ fn data_dir(dir: &Path, name: &str) -> PathBuf {
 /// directory per dataset `name`.
 fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Dataset {
     let mut ds = Dataset::new(format!("postgres:{table}"), name.to_string());
-    let pg_params = || {
-        Params::from_string_map(
-            get_pg_params(port)
-                .into_iter()
-                .map(|(k, v)| (k, v.expose_secret().to_string()))
-                .collect::<HashMap<String, String>>(),
-        )
-    };
-    ds.params = Some(pg_params());
+    let pg_params = Params::from_string_map(
+        get_pg_params(port)
+            .into_iter()
+            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .collect::<HashMap<String, String>>(),
+    );
+    ds.params = Some(pg_params.clone());
     let full = Acceleration {
         enabled: true,
         refresh_mode: Some(RefreshMode::Full),
@@ -478,7 +476,7 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
         #[cfg(feature = "postgres-accel")]
         Kind::PostgresAccel => Some(Acceleration {
             engine: Some("postgres".to_string()),
-            params: Some(pg_params()),
+            params: Some(pg_params),
             ..full
         }),
     };
@@ -624,14 +622,15 @@ const CONSTANT_SOURCES: [&str; 2] = ["PlaceholderRowExec", "EmptyExec"];
 /// somewhere else, and its agreement says nothing about Cayenne.
 fn check_cayenne_sources(plan: &[Row]) -> Result<(), String> {
     let physical = physical_plan(plan)?;
-    let other: Vec<&str> = leaves(&operators(&physical))
+    let operators = operators(&physical);
+    let other: Vec<&str> = leaves(&operators)
         .into_iter()
         .filter(|(leaf, above)| {
-            *leaf != CAYENNE_SCAN
+            leaf.name != CAYENNE_SCAN
                 && !above.contains(&CAYENNE_SCAN)
-                && !CONSTANT_SOURCES.contains(leaf)
+                && !CONSTANT_SOURCES.contains(&leaf.name)
         })
-        .map(|(leaf, _)| leaf)
+        .map(|(leaf, _)| leaf.line)
         .collect();
     if other.is_empty() {
         Ok(())
@@ -643,52 +642,33 @@ fn check_cayenne_sources(plan: &[Row]) -> Result<(), String> {
 }
 
 /// Checks that every source of the physical plan in `plan`, an `EXPLAIN`
-/// answer, is a scan that sends SQL to the accelerator engine named `engine`
-/// over the accelerator's own copy of a table, or is one of
-/// [`CONSTANT_SOURCES`]. The `PostgreSQL` accelerator writes into the oracle's
-/// server, so its scan names the same engine as the federated one: only the
-/// table in the SQL tells them apart. A side that read the fixture tables, or
-/// anything else, answered from somewhere other than the acceleration.
+/// answer, is one of [`REMOTE_SCANS`] whose SQL reads `subject`'s own tables,
+/// or is one of [`CONSTANT_SOURCES`]. The `SQLite` and `PostgreSQL` accelerators
+/// answer through the same remote scan the federated datasets use, and the
+/// `PostgreSQL` one on the oracle's own server, so only the table the SQL reads
+/// tells an acceleration apart from the fixture it was loaded from.
 #[cfg(any(feature = "sqlite", feature = "postgres-accel"))]
-fn check_accelerator_sources(plan: &[Row], engine: &str) -> Result<(), String> {
+fn check_accelerator_sources(plan: &[Row], subject: &Subject) -> Result<(), String> {
     let physical = physical_plan(plan)?;
-    let lines: Vec<&str> = physical.lines().filter(|l| !l.trim().is_empty()).collect();
-    let depth = |line: &str| line.len() - line.trim_start().len();
-    let scan = format!("name={engine} ");
-    let other: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .filter(|(i, line)| {
-            lines
-                .get(i + 1)
-                .is_none_or(|next| depth(next) <= depth(line))
-        })
-        .map(|(_, line)| line.trim())
+    let operators = operators(&physical);
+    let other: Vec<&str> = leaves(&operators)
+        .into_iter()
+        .map(|(leaf, _)| leaf)
         .filter(|leaf| {
-            let remote = REMOTE_SCANS.iter().any(|op| leaf.starts_with(op))
-                && leaf.contains(&scan)
-                && !leaf.contains("diff_items")
-                && !leaf.contains("diff_regions");
-            !remote && !CONSTANT_SOURCES.iter().any(|op| leaf.starts_with(op))
+            let own_scan = REMOTE_SCANS.contains(&leaf.name)
+                && (leaf.line.contains(subject.items) || leaf.line.contains(subject.regions));
+            !own_scan && !CONSTANT_SOURCES.contains(&leaf.name)
         })
+        .map(|leaf| leaf.line)
         .collect();
     if other.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "the plan reads {other:?}, not only the {engine} acceleration:\n{physical}"
+            "the plan reads {other:?}, not only the tables of the {} side:\n{physical}",
+            subject.name
         ))
     }
-}
-
-#[cfg(feature = "sqlite")]
-fn check_sqlite_sources(plan: &[Row]) -> Result<(), String> {
-    check_accelerator_sources(plan, "sqlite")
-}
-
-#[cfg(feature = "postgres-accel")]
-fn check_postgres_accelerator_sources(plan: &[Row]) -> Result<(), String> {
-    check_accelerator_sources(plan, "postgres")
 }
 
 async fn compare_case(
@@ -734,22 +714,22 @@ async fn compare_case(
         // does not. A Cayenne, SQLite or PostgreSQL-accelerator side must read
         // only its acceleration, or its agreement says nothing about what that
         // acceleration stored.
-        let check: Option<PlanCheck> = match subject.kind {
-            Kind::Federated => Some(check_nothing_local),
-            Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
-                Some(check_cayenne_sources)
-            }
-            Kind::Accelerated => None,
-            #[cfg(feature = "sqlite")]
-            Kind::SqliteMemory | Kind::SqliteFile => Some(check_sqlite_sources),
-            #[cfg(feature = "postgres-accel")]
-            Kind::PostgresAccel => Some(check_postgres_accelerator_sources),
-        };
-        if let Some(check) = check {
+        if subject.kind != Kind::Accelerated {
             let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))
                 .await
                 .map_err(|e| anyhow::anyhow!("EXPLAIN {sql}: {e}"))?;
-            if let Err(reason) = check(&plan) {
+            let verdict = match subject.kind {
+                Kind::Federated => check_nothing_local(&plan),
+                Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
+                    check_cayenne_sources(&plan)
+                }
+                Kind::Accelerated => Ok(()),
+                #[cfg(feature = "sqlite")]
+                Kind::SqliteMemory | Kind::SqliteFile => check_accelerator_sources(&plan, subject),
+                #[cfg(feature = "postgres-accel")]
+                Kind::PostgresAccel => check_accelerator_sources(&plan, subject),
+            };
+            if let Err(reason) = verdict {
                 failures.push(format!("{name}: {sql}\n    {reason}"));
                 all_remote &= subject.kind != Kind::Federated;
             }
