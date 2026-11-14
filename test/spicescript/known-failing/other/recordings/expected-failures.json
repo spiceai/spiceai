@@ -157,6 +157,24 @@
       "group": "other"
     }
   ],
+  "reload-failed-dataset-removal": [
+    {
+      "run": "reload-failed-dataset-removal",
+      "who": "default",
+      "key": "query: SELECT count(*) AS n FROM victim #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: the query succeeded, but the script expected an error:",
+      "group": "other"
+    },
+    {
+      "run": "reload-failed-dataset-removal",
+      "who": "default",
+      "key": "assert-log: {\"lacks\":[\"Unable to unload dataset victim\"]}",
+      "kind": "other",
+      "signature": "1 log problem in <path>",
+      "group": "other"
+    }
+  ],
   "view-over-quoted-name": [
     {
       "run": "view-over-quoted-name",
