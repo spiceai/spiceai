@@ -111,7 +111,7 @@ jobs:
       - uses: $/.github/actions/setup-rust
       - uses: ./.github/actions/setup-cc
       - uses: docker://alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000
-      - run: echo "a uses: actions/checkout@v7.0.1 inside a script is not a step"
+      - run: 'echo "a uses: actions/checkout@v7.0.1 inside a script is not a step"'
   reuse:
     uses: actions/checkout/.github/workflows/reusable.yml@v7.0.1
 """
@@ -134,12 +134,25 @@ jobs:
       - uses: $/.github/actions/setup-rust
       - uses: ./.github/actions/setup-cc
       - uses: docker://alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000
-      - run: echo "a uses: actions/checkout@v7.0.1 inside a script is not a step"
+      - run: 'echo "a uses: actions/checkout@v7.0.1 inside a script is not a step"'
   reuse:
     uses: actions/checkout/.github/workflows/reusable.yml@{CHECKOUT} # v7.0.1
 """
 
-EMPTY_WORKFLOW = "name: empty\non: push\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n"
+# A workflow with no remote action, whose script quotes a `uses:` line: it is
+# data, so its lockfile entry stays `[]` and the line is never rewritten.
+EMPTY_WORKFLOW = """\
+name: empty
+on: push
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat > fixture.yml <<'EOF'
+          uses: actions/checkout@v7.0.1
+          EOF
+"""
 
 ACTION_TAGS = """\
 name: setup
@@ -193,6 +206,39 @@ class PinActionsToShaTest(unittest.TestCase):
         self.assertEqual(self.read(WORKFLOW), workflow)
         self.assertEqual(self.read(ACTION), action)
         self.assertEqual(self.read(LOCK), lockfile)
+        self.assertEqual(self.read(".github/workflows/empty.yml"), EMPTY_WORKFLOW)
+
+    def test_a_quoted_uses_key_is_pinned(self) -> None:
+        workflow = WORKFLOW_TAGS.replace("      - uses: actions/checkout@v7.0.1\n", '      - "uses": actions/checkout@v7.0.1\n')
+        repo(self.root, workflow, ACTION_TAGS, LOCK_TAGS)
+        code, out, _ = run(self.root, "--check")
+        self.assertEqual(code, 1)
+        self.assertIn(".github/workflows/ci.yml:7: uses: actions/checkout@v7.0.1 is not pinned", out)
+        code, _, err = run(self.root)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(f'      - "uses": actions/checkout@{CHECKOUT} # v7.0.1\n', self.read(WORKFLOW))
+        self.assertEqual(run(self.root, "--check")[0], 0)
+
+    def test_a_multi_line_or_flow_uses_is_checked_but_not_rewritten(self) -> None:
+        workflow = WORKFLOW_TAGS.replace(
+            "      - uses: actions/checkout@v7.0.1\n", "      - uses: >-\n          actions/checkout@v7.0.1\n"
+        ).replace("      - uses: 'Swatinem/rust-cache@v2.9.3'\n", "      - {uses: 'Swatinem/rust-cache@v2.9.3'}\n")
+        repo(self.root, workflow, ACTION_TAGS, LOCK_TAGS)
+        code, out, _ = run(self.root, "--check")
+        self.assertEqual(code, 1)
+        self.assertIn(".github/workflows/ci.yml:7: uses: actions/checkout@v7.0.1 is not pinned", out)
+        self.assertIn(".github/workflows/ci.yml:13: uses: Swatinem/rust-cache@v2.9.3 is not pinned", out)
+        code, out, err = run(self.root)
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(
+            err,
+            ".github/workflows/ci.yml:7: uses: actions/checkout@v7.0.1 spans more than one line; "
+            "write it on one line, then run this script again\n"
+            ".github/workflows/ci.yml:13: uses: Swatinem/rust-cache@v2.9.3 shares its line with other YAML; "
+            "give it a line of its own, then run this script again\n"
+            "2 `uses:` refs can't be rewritten in place, so nothing was rewritten.\n",
+        )
+        self.assert_tree(workflow, ACTION_TAGS, LOCK_TAGS)
 
     def test_pins_every_tag_and_keys_the_lockfile_by_commit(self) -> None:
         repo(self.root, WORKFLOW_TAGS, ACTION_TAGS, LOCK_TAGS)

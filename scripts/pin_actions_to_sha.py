@@ -37,6 +37,10 @@ With --check, nothing is written, and the script fails on any remote `uses:`
 that is not a full-length SHA, or that has no lockfile entry under exactly
 that `owner/repo@sha`. CI runs it in verify-lockfile.yml.
 
+A `uses:` is a job's or a step's `uses` key, found by parsing the YAML, so a
+quoted key or a multi-line value counts and script text never does. Needs
+PyYAML (`pip install pyyaml`).
+
 Usage: scripts/pin_actions_to_sha.py [--check] [REPO_ROOT]
 """
 
@@ -48,16 +52,16 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    import yaml
+except ModuleNotFoundError:
+    sys.exit("pin_actions_to_sha.py reads workflows with PyYAML; install it with `pip install pyyaml`.")
+
 LOCKFILE = Path(".github") / "workflows" / "actions.lock"
 WORKFLOWS_DIR = Path(".github") / "workflows"
 ACTIONS_DIR = Path(".github") / "actions"
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
-# A step's or a job's `uses:`, optionally quoted, with an optional trailing comment.
-USES = re.compile(
-    r"""^(?P<lead>\s*(?:-\s+)?uses:\s*)(?P<q>['"]?)(?P<action>[^\s'"@#]+)@(?P<ref>[^\s'"#]+)(?P=q)"""
-    r"""(?P<comment>\s*(?:#.*)?)$"""
-)
 # Local actions run at the workflow's own commit and container images are not
 # actions, so neither takes a commit SHA.
 NOT_REMOTE = ("./", "$/", "docker://")
@@ -220,10 +224,25 @@ class Lockfile:
 
 @dataclass(frozen=True)
 class Uses:
+    """A remote `uses:` value, where the YAML parser found it."""
+
     path: Path
-    line: int
-    action: str
-    ref: str
+    value: str
+    style: str | None
+    start: tuple[int, int]
+    end: tuple[int, int]
+
+    @property
+    def line(self) -> int:
+        return self.start[0] + 1
+
+    @property
+    def action(self) -> str:
+        return self.value.rsplit("@", 1)[0]
+
+    @property
+    def ref(self) -> str:
+        return self.value.rsplit("@", 1)[1] if "@" in self.value else ""
 
     @property
     def repo(self) -> str:
@@ -235,38 +254,91 @@ class Uses:
         return pin_key(self.repo, self.ref)
 
 
+@dataclass
+class ActionFile:
+    path: Path
+    lines: list[str]
+    uses: list[Uses]
+
+
 def action_files(root: Path) -> list[Path]:
     workflows = [p for p in (root / WORKFLOWS_DIR).glob("*") if p.suffix in (".yml", ".yaml")]
     actions = [p for p in (root / ACTIONS_DIR).rglob("action.y*ml") if p.suffix in (".yml", ".yaml")]
     return sorted(p for p in workflows + actions if p.is_file())
 
 
-def remote_uses(path: Path, lines: list[str]) -> list[tuple[int, re.Match[str], Uses]]:
-    found = []
-    for index, text in enumerate(lines):
-        match = USES.match(text)
-        if match and not match["action"].startswith(NOT_REMOTE):
-            found.append((index, match, Uses(path, index + 1, match["action"], match["ref"])))
-    return found
+def uses_nodes(document, workflow: bool):
+    """The `uses:` value node of each job and step: `jobs.<id>.uses` and `jobs.<id>.steps[*].uses` in a
+    workflow, `runs.steps[*].uses` in an action. Script text and other keys are never read."""
+
+    def get(node, key: str):
+        if isinstance(node, yaml.MappingNode):
+            for name, value in node.value:
+                if isinstance(name, yaml.ScalarNode) and name.value == key:
+                    return value
+        return None
+
+    def steps(node):
+        sequence = get(node, "steps")
+        if isinstance(sequence, yaml.SequenceNode):
+            for step in sequence.value:
+                yield get(step, "uses")
+
+    if workflow:
+        jobs = get(document, "jobs")
+        if isinstance(jobs, yaml.MappingNode):
+            for _, job in jobs.value:
+                yield get(job, "uses")
+                yield from steps(job)
+    else:
+        yield from steps(get(document, "runs"))
 
 
-def pinned_line(match: re.Match[str], sha: str) -> str:
-    """The `uses:` line pinned to `sha`, with its tag first in the trailing comment."""
-    note = match["comment"].strip().removeprefix("#").strip()
-    comment = f" # {match['ref']}" + (f" {note}" if note else "")
-    return f"{match['lead']}{match['q']}{match['action']}@{sha}{match['q']}{comment}"
+def parse_action_file(root: Path, path: Path, text: str) -> ActionFile:
+    try:
+        document = yaml.compose(text, Loader=yaml.SafeLoader)
+    except yaml.YAMLError as error:
+        raise LockfileError(f"{path.relative_to(root)}: not valid YAML: {error}") from error
+    found: dict[tuple[int, int], Uses] = {}
+    for node in uses_nodes(document, path.parent == root / WORKFLOWS_DIR):
+        if node is None:
+            continue
+        start = (node.start_mark.line, node.start_mark.column)
+        if not isinstance(node, yaml.ScalarNode):
+            raise LockfileError(f"{path.relative_to(root)}:{start[0] + 1}: `uses:` is not a string")
+        if node.value.startswith(NOT_REMOTE):
+            continue
+        # An alias names its anchor's node again; one source location is one `uses:`.
+        found[start] = Uses(path, node.value, node.style, start, (node.end_mark.line, node.end_mark.column))
+    return ActionFile(path, text.split("\n"), sorted(found.values(), key=lambda uses: uses.start))
 
 
-def problems(root: Path, lock: Lockfile, files: dict[Path, list[str]]) -> list[str]:
+def pin_in_place(root: Path, file: ActionFile, uses: Uses, sha: str) -> str | None:
+    """Rewrite `uses` in `file.lines` to `sha` with its tag first in the trailing comment, or say why not."""
+    where = f"{file.path.relative_to(root)}:{uses.line}: uses: {uses.value}"
+    if uses.style not in (None, "'", '"') or uses.start[0] != uses.end[0]:
+        return f"{where} spans more than one line; write it on one line, then run this script again"
+    line = file.lines[uses.start[0]]
+    rest = line[uses.end[1] :]
+    if rest.strip() and not rest.lstrip().startswith("#"):
+        return f"{where} shares its line with other YAML; give it a line of its own, then run this script again"
+    note = rest.strip().removeprefix("#").strip()
+    quote = uses.style or ""
+    pinned = f"{quote}{uses.action}@{sha}{quote} # {uses.ref}" + (f" {note}" if note else "")
+    file.lines[uses.start[0]] = line[: uses.start[1]] + pinned
+    return None
+
+
+def problems(root: Path, lock: Lockfile, files: list[ActionFile]) -> list[str]:
     """Each remote `uses:` that is not a full SHA or that the backend would find no lockfile entry for,
     and each lockfile pin that is not keyed by a full SHA or names no entry."""
     found = []
-    for path, lines in files.items():
-        relative = path.relative_to(root).as_posix()
-        in_workflows = path.parent == root / WORKFLOWS_DIR
+    for file in files:
+        relative = file.path.relative_to(root).as_posix()
+        in_workflows = file.path.parent == root / WORKFLOWS_DIR
         roots = set(lock.workflow_pins(relative))
-        for _, _, uses in remote_uses(path, lines):
-            where = f"{relative}:{uses.line}: uses: {uses.action}@{uses.ref}"
+        for uses in file.uses:
+            where = f"{relative}:{uses.line}: uses: {uses.value}"
             if not is_full_sha(uses.ref):
                 found.append(f"{where} is not pinned to a full-length commit SHA")
             elif in_workflows and uses.key not in roots:
@@ -282,9 +354,10 @@ def problems(root: Path, lock: Lockfile, files: dict[Path, list[str]]) -> list[s
     return found
 
 
-def read_all(root: Path) -> tuple[Lockfile, str, dict[Path, list[str]]]:
+def read_all(root: Path) -> tuple[Lockfile, str, list[ActionFile]]:
     text = (root / LOCKFILE).read_text()
-    return Lockfile.parse(text), text, {path: path.read_text().split("\n") for path in action_files(root)}
+    files = [parse_action_file(root, path, path.read_text()) for path in action_files(root)]
+    return Lockfile.parse(text), text, files
 
 
 def check(root: Path) -> int:
@@ -306,27 +379,34 @@ def check(root: Path) -> int:
 
 def pin(root: Path) -> int:
     lock, lock_text, files = read_all(root)
-    missing = []
+    missing: list[str] = []
+    unpinnable: list[str] = []
     count = 0
-    for path, lines in files.items():
-        for index, match, uses in remote_uses(path, lines):
+    for file in files:
+        for uses in file.uses:
             if is_full_sha(uses.ref):
                 continue
             sha = lock.commit(uses.key)
             if sha is None:
-                missing.append(f"{path.relative_to(root)}:{uses.line}: {LOCKFILE} has no entry for {uses.key}")
-                continue
-            lines[index] = pinned_line(match, sha)
-            count += 1
-    if missing:
-        for line in missing:
+                missing.append(f"{file.path.relative_to(root)}:{uses.line}: {LOCKFILE} has no entry for {uses.key}")
+            elif reason := pin_in_place(root, file, uses, sha):
+                unpinnable.append(reason)
+            else:
+                count += 1
+    if missing or unpinnable:
+        for line in missing + unpinnable:
             print(line, file=sys.stderr)
-        print(
-            f"{len(missing)} `uses:` refs have no lockfile entry, so nothing was rewritten. "
-            "Run `gh actions-lock` first, then run this script again.",
-            file=sys.stderr,
-        )
+        if missing:
+            print(
+                f"{len(missing)} `uses:` refs have no lockfile entry, so nothing was rewritten. "
+                "Run `gh actions-lock` first, then run this script again.",
+                file=sys.stderr,
+            )
+        if unpinnable:
+            print(f"{len(unpinnable)} `uses:` refs can't be rewritten in place, so nothing was rewritten.", file=sys.stderr)
         return 1
+    # Read the rewritten files back as YAML, so what is checked and written is what a parser sees.
+    files = [parse_action_file(root, file.path, "\n".join(file.lines)) for file in files]
     lock.rekey_by_commit()
     if found := problems(root, lock, files):
         for problem in found:
@@ -337,9 +417,9 @@ def pin(root: Path) -> int:
             file=sys.stderr,
         )
         return 1
-    changed = [path for path, lines in files.items() if "\n".join(lines) != path.read_text()]
-    for path in changed:
-        path.write_text("\n".join(files[path]))
+    changed = [file for file in files if "\n".join(file.lines) != file.path.read_text()]
+    for file in changed:
+        file.path.write_text("\n".join(file.lines))
     rendered = lock.render()
     rekeyed = rendered != lock_text
     if rekeyed:

@@ -53,9 +53,15 @@ jobs:
           XDG_DATA_HOME="${RUNNER_TEMP}/gh-data" GH_CONFIG_DIR="${RUNNER_TEMP}/gh-config" \
             gh extension install github/gh-actions-lock --pin v0.4.1
       - run: gh actions-lock --verify
-      # The tests run first: a pattern that stopped matching `uses:` lines would
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install PyYAML
+        run: pip install pyyaml
+      # The tests run first: a check that stopped finding `uses:` keys would
       # pass every workflow.
       - name: Test the full-length SHA pin check
-        run: python3 scripts/test_pin_actions_to_sha.py -v
+        run: python scripts/test_pin_actions_to_sha.py -v
       - name: Check every uses is pinned to a full-length commit SHA
-        run: python3 scripts/pin_actions_to_sha.py --check
+        run: python scripts/pin_actions_to_sha.py --check
