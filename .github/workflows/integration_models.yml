@@ -44,6 +44,10 @@ env:
   AI_INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive/integration.tar.zst
   AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive-extended/integration-extended.tar.zst
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 # The spiceio setup action exports AWS_ENDPOINT_URL (alongside SCCACHE_ENDPOINT) so that sccache
 # and the AWS CLI reach the local cache. The build jobs need it. The test jobs must not hand it to
 # spiced: it honours AWS_ENDPOINT_URL for every s3:// dataset and for the S3 Vectors API, so the
@@ -485,6 +489,10 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   test-hf:
+    permissions:
+      contents: write  # push-snap-changes: git push of the snapshot-update branch, gh pr merge --auto
+      pull-requests: write  # push-snap-changes: gh pr create/close/list
+      actions: write  # approve_bot_pr_runs.sh: approve the pull_request runs held on its GITHUB_TOKEN push
     name: Test Hugging Face Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}

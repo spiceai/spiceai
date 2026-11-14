@@ -27,6 +27,10 @@ env:
   PREVIOUS_STABLE_VERSION: v1.11.6
   PREVIEW_UPGRADE_VERSION: v2.0.0-rc.2
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # install.spiceai.org serves the install scripts of one release, pinned in
   # the install.spiceai.org Worker's repository and moved there by a reviewed
