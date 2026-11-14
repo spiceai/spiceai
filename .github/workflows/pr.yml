@@ -53,6 +53,10 @@ env:
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: clang
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # On a pull request this is the ONLY job that runs. It validates the developer
   # sign-off — the `signoff` commit status posted by `make signoff` — for the PR's
@@ -278,7 +282,7 @@ jobs:
               return;
             }
 
-            const rustAffecting = /(^(crates|bin|tools|vendor)\/|\.(rs|snap|proto)$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts\/(test_)?rust_guard_common\.py$|^scripts\/(test_)?nextest_build_targets\.py$|^docs\/dev\/fork_patches\.md$|^(Makefile|version\.txt)$|^test\/tpc-bench\/(Makefile|mysql-null-spec\.awk)$|^test\/tls\/|^test\/spicepods\/tpch\/sf1\/accelerated\/postgres\[catalog\]\[changes\]\.yaml$|^test\/source_versions\.json$)/;
+            const rustAffecting = /(^(crates|bin|tools|vendor)\/|\.(rs|snap|proto)$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls|cayenne_data_path_fs)\.py$|^scripts\/cayenne_data_path_fs_allowlist\.json$|^scripts\/(test_)?rust_guard_common\.py$|^scripts\/(test_)?nextest_build_targets\.py$|^docs\/dev\/fork_patches\.md$|^(Makefile|version\.txt)$|^test\/tpc-bench\/(Makefile|mysql-null-spec\.awk)$|^test\/tls\/|^test\/spicepods\/tpch\/sf1\/accelerated\/postgres\[catalog\]\[changes\]\.yaml$|^test\/source_versions\.json$)/;
             for (const file of files) {
               // A rename off a .rs path changes Rust sources even though the new
               // name doesn't match, so both sides of the rename must be clean.
@@ -657,7 +661,7 @@ jobs:
   lint-rust:
     name: Rust Lint
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
     timeout-minutes: 300
     needs: check_changes
@@ -753,9 +757,14 @@ jobs:
 
   # Build and test
   build-test:
+    # Read-only: this job compiles and runs the branch's code (build scripts,
+    # proc macros, tests), so it never holds a write token. Snapshot updates
+    # leave as an artifact for `push-snapshots` below.
+    permissions:
+      contents: read
     name: Build and Test
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
     timeout-minutes: 300
     needs: [check_changes]
@@ -916,12 +925,34 @@ jobs:
             exit 1
           fi
 
-      - name: Push snapshots to branch
+      # `update_snapshots` exists only on workflow_dispatch, so on merge_group
+      # these two steps are skipped. The archive holds only the `*.snap` files
+      # nextest changed or added; `push-snapshots` checks that again before it
+      # writes anything.
+      - name: Archive updated snapshots
+        id: snapshot_archive
         if: ${{ github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true' }}
-        timeout-minutes: 10
-        uses: ./.github/actions/push-snap-changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          { git diff --name-only --diff-filter=d -- '*.snap'; git ls-files -o --exclude-standard -- '*.snap'; } > "${RUNNER_TEMP}/snapshot-files"
+          if [ -s "${RUNNER_TEMP}/snapshot-files" ]; then
+            tr '\n' '\0' < "${RUNNER_TEMP}/snapshot-files" > "${RUNNER_TEMP}/snapshot-files-0"
+            tar --null -czf "${RUNNER_TEMP}/pr-snapshots.tar.gz" -T "${RUNNER_TEMP}/snapshot-files-0"
+            echo "created=true" >> "${GITHUB_OUTPUT}"
+            echo "Archived $(wc -l < "${RUNNER_TEMP}/snapshot-files" | tr -d ' ') snapshot file(s)"
+          else
+            echo "No snapshot changes"
+          fi
+
+      - name: Upload updated snapshots
+        if: ${{ steps.snapshot_archive.outputs.created == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          name: pr-snapshots
+          path: ${{ runner.temp }}/pr-snapshots.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -936,11 +967,61 @@ jobs:
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
+  # Opens the snapshot-update PR from the `pr-snapshots` artifact `build-test`
+  # uploaded. Manual `update_snapshots: always` runs only: it never runs on
+  # pull_request or merge_group. It is the one job here with a write token, and
+  # it runs none of the branch's Rust code: a checkout, the archive check in
+  # extract_snapshot_archives.py (regular `*.snap` files only, nothing under
+  # .github/ or .git/, nothing outside the checkout), and push-snap-changes.
+  # GitHub-hosted, so the token never sits on a self-hosted runner that just
+  # ran the branch's build.
+  push-snapshots:
+    name: Push snapshot updates
+    environment: secret-free
+    needs: [check_changes, build-test]
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true' }}
+    runs-on: ubuntu-latest
+    # A checkout, a download, a commit and a push.
+    timeout-minutes: 20
+    permissions:
+      contents: write  # push-snap-changes: git push of the snapshot-update branch, gh pr merge --auto
+      pull-requests: write  # push-snap-changes: gh pr create/close/list
+      actions: write  # approve_bot_pr_runs.sh: approve the pull_request runs held on its GITHUB_TOKEN push
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download updated snapshots
+        id: download
+        # No artifact means nextest changed no snapshot.
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: pr-snapshots
+          path: ${{ runner.temp }}/pr-snapshots
+
+      - name: Extract snapshots
+        if: steps.download.outcome == 'success'
+        run: python3 .github/scripts/extract_snapshot_archives.py "${RUNNER_TEMP}/pr-snapshots" .
+
+      - name: Push snapshots to branch
+        if: steps.download.outcome == 'success'
+        timeout-minutes: 10
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No snapshot changes
+        if: steps.download.outcome != 'success'
+        run: echo "build-test uploaded no snapshot archive; nothing to push."
+
   # Release-profile installs (make install, install-cli, install-spiced)
   build-install-release:
     name: Build (release profile)
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     # Slowest observed success in the 2026-07-25..08-08 window: 106 min.
     timeout-minutes: 300
     needs: [check_changes]

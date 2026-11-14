@@ -50,6 +50,21 @@ use util::spice_paths::{absolute_dir as absolute_fs_dir, is_local_path};
 /// shared with the Spicepod validation in `app` through `util`.
 pub use util::spice_paths::fs_probe_path;
 
+/// How long a data file of a dataset in the object-native location stays in
+/// storage after the commit that removed it, counted from when the sweep first
+/// observes the removal: a query on another instance that confirmed its head
+/// before the removal finds every file for this long. A dropped dataset's
+/// folder, and the folder `file_create` replaces, stay as long.
+pub const DATA_FILE_RETENTION: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Configuration error for data outside the object-native state location.
+#[must_use]
+pub fn object_native_data_path_refusal(dataset: &str) -> String {
+    format!(
+        "Failed to load dataset '{dataset}' (cayenne): With `runtime.params.cayenne_vnext` enabled, its data must be in `runtime.state.location`. Remove `cayenne_file_path`, `cayenne_s3_zone_ids`, and `cayenne_datalake_location`, use a supported refresh mode (full, append, or changes), and set `runtime.state.location` to an S3 or local file location. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 /// How a configured directory string becomes the filesystem path it names.
 ///
 /// This is not a formatting preference — it decides *which directory* the overlap
@@ -410,5 +425,55 @@ mod tests {
             absolute_data_dir("s3://bucket/orders/").expect("an object store is not a failure"),
             None,
         );
+    }
+}
+
+/// Whether `path` (a table's data path) is a dataset folder's `data` prefix in an
+/// object-native location: `s3://<bucket>/…/v1/datasets/<folder>/data`, or
+/// `file:///<directory>/…/v1/datasets/<folder>/data` for a local directory.
+///
+/// This is where Cayenne puts a dataset's data files when the dataset is created
+/// with its data in `runtime.state.location`, and the table path the metastore
+/// records for it is the record of that placement. Such a table's data files are
+/// the ones its commits name: scans read them from the committed state and never
+/// list the location, and each write records its files before it returns.
+#[must_use]
+pub fn is_object_native_data_path(path: &str) -> bool {
+    if !crate::is_object_store_path(path) {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(path) else {
+        return false;
+    };
+    let segments: Vec<&str> = url.path().trim_matches('/').split('/').collect();
+    matches!(
+        segments.as_slice(),
+        [.., "v1", "datasets", folder, "data"] if !folder.is_empty()
+    )
+}
+
+#[cfg(test)]
+mod object_native_data_path_tests {
+    use super::is_object_native_data_path;
+
+    #[test]
+    fn recognizes_only_a_dataset_folder_data_prefix() {
+        assert!(is_object_native_data_path(
+            "s3://bucket/state/cayenne/v1/datasets/orders-0190c2c4-0000-7000-8000-000000000000/data"
+        ));
+        assert!(is_object_native_data_path(
+            "s3://bucket/cayenne/v1/datasets/orders-x/data/"
+        ));
+        assert!(!is_object_native_data_path("s3://bucket/cayenne/orders/"));
+        assert!(!is_object_native_data_path(
+            "s3://bucket/cayenne/v1/datasets/orders-x/head"
+        ));
+        assert!(!is_object_native_data_path("/var/spice/data/orders"));
+        assert!(is_object_native_data_path(
+            "file:///var/spice/state/cayenne/v1/datasets/orders-x/data"
+        ));
+        assert!(!is_object_native_data_path(
+            "file:///var/spice/data/orders/"
+        ));
     }
 }

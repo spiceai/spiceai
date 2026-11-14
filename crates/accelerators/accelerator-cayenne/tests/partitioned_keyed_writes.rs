@@ -21,11 +21,6 @@ limitations under the License.
 //! own path, so it carries the constraints and `on_conflict` a dataset gets, and
 //! every write goes through the cross-partition coordinator.
 
-#![expect(
-    clippy::expect_used,
-    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
-)]
-
 use std::{path::Path, sync::Arc};
 
 use accelerator_cayenne::CayenneAccelerator;

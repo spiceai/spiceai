@@ -2,10 +2,11 @@ name: build_release
 
 # Builds the binaries. A release build is a dispatch with `release_version`
 # on the release branch: it builds every release binary, CUDA included, on
-# GitHub-hosted runners and keeps them as artifacts of this run with a
-# SHA256SUMS manifest. It creates no tag and publishes nothing. publish_release
-# publishes them after approval, and creates the release tag at the commit
-# this run built.
+# GitHub-hosted runners and keeps them, with the install scripts and a
+# SHA256SUMS manifest of them all, as artifacts of this run. Each of those files
+# gets a build provenance attestation. It creates no tag and publishes nothing.
+# publish_release publishes them after approval, and creates the release tag at
+# the commit this run built.
 on:
   push:
     # Release branches build for the same reason trunk does: the `build` job uploads
@@ -73,6 +74,10 @@ on:
           - 'release'
           - 'release-lto'
         default: 'release'
+
+# Jobs that need more ask for it; setup-matrix reads only the event payload.
+permissions:
+  contents: read
 
 env:
   # Checked against version.txt by get_release_version.py; empty except on a release build.
@@ -180,6 +185,16 @@ jobs:
               // A release build holds every release binary, so it takes no filter.
               if (isRelease && (platform_option !== 'all' || tag_option !== 'all')) {
                 core.setFailed(`A release build builds every platform and build tag, so platform_option and tag_option must be 'all', not '${platform_option}' and '${tag_option}'.`);
+                return [];
+              }
+
+              // The checksums job attests the release files as this workflow at the
+              // dispatched ref, and the install scripts accept only attestations made on a
+              // release branch, so a release build runs on one. Downstream repositories
+              // that merge this workflow attest nothing and keep their own branches.
+              const isSpiceaiRepo = context.repo.owner === 'spiceai' && context.repo.repo === 'spiceai';
+              if (isRelease && isSpiceaiRepo && !context.ref.startsWith('refs/heads/release/')) {
+                core.setFailed(`A release build runs on a release/* branch, not on '${context.ref}': the install scripts accept only release files attested on a release branch.`);
                 return [];
               }
 
@@ -527,6 +542,9 @@ jobs:
   # build_and_release_cuda's own runs.
   build-cuda:
     name: Build CUDA binaries
+    # setup-matrix validates the release dispatch (the version, the filters, and the release/*
+    # branch), so a dispatch it rejects starts no CUDA build either.
+    needs: setup-matrix
     if: inputs.release_version
     permissions:
       contents: read
@@ -535,21 +553,42 @@ jobs:
       release_version: ${{ inputs.release_version }}
 
   # publish_release checks every artifact against this manifest before it
-  # publishes, and publishes exactly the files it lists. It finds this run by
-  # the manifest's artifact name, which carries the version. A release build
-  # that misses a binary fails here, so publish_release never finds it.
+  # publishes, and publishes exactly the files it lists, plus the manifest. It
+  # finds this run by the manifest's artifact name, which carries the version,
+  # so the manifest is uploaded last: a release build that misses a file, or
+  # whose attestations fail, never uploads it, and publish_release never finds it.
+  #
+  # Every file the manifest lists, and the manifest, get a build provenance
+  # attestation signed as this workflow on the release branch. The install
+  # scripts check a download against SHA256SUMS and, with the GitHub CLI, its
+  # attestation; anyone can run the same check (docs/DISTRIBUTIONS.md).
   checksums:
     environment: secret-free
-    name: Record release checksums
+    name: Record and attest release checksums
     needs: [build, build-cuda]
     if: inputs.release_version
     runs-on: ubuntu-24.04
-    permissions: {}
+    permissions:
+      # Checks out the install scripts.
+      contents: read
+      # Signs the attestations with this run's OIDC identity, and stores them.
+      id-token: write
+      attestations: write
     steps:
+      # The install scripts are published as they are at the built commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: source
+          sparse-checkout: install
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: release
           merge-multiple: true
+
+      - name: Add the install scripts
+        run: cp source/install/install.sh source/install/install-spiced.sh source/install/Install.ps1 release/
 
       - name: Write SHA256SUMS
         working-directory: release
@@ -557,6 +596,9 @@ jobs:
           set -euo pipefail
           # The ODBC build is for internal testing and has never been a release asset.
           assets=(
+            install.sh
+            install-spiced.sh
+            Install.ps1
             spice_linux_x86_64.tar.gz
             spice_linux_aarch64.tar.gz
             spice_darwin_aarch64.tar.gz
@@ -582,6 +624,29 @@ jobs:
           sha256sum "${assets[@]}" > SHA256SUMS
           cat SHA256SUMS
 
+      # Downstream repositories that merge this workflow publish their own way.
+      - name: Attest every file SHA256SUMS lists
+        if: github.repository == 'spiceai/spiceai'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS
+
+      - name: Attest SHA256SUMS
+        if: github.repository == 'spiceai/spiceai'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-v${{ inputs.release_version }}-install-scripts
+          path: |
+            release/install.sh
+            release/install-spiced.sh
+            release/Install.ps1
+          if-no-files-found: error
+
+      # Last: its artifact marks the run as a complete release build.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-v${{ inputs.release_version }}-sha256sums

@@ -4370,6 +4370,7 @@ mod tests {
             rule_names,
             vec![
                 "spice_ddl_rewrite",
+                "decimal_comparison_float_constant",
                 "federation_optimizer_rule",
                 "resolve_grouping_function",
                 "type_coercion",

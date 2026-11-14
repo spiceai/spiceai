@@ -44,3 +44,12 @@ SELECT g, bit_xor(DISTINCT a), count(DISTINCT a), sum(DISTINCT a) FROM w GROUP B
 -- PostgreSQL has no DISTINCT in a window function.
 -- oracle-sql: SELECT w.id, d.n FROM w JOIN (SELECT g, count(DISTINCT x) AS n FROM w GROUP BY g) AS d ON w.g = d.g
 SELECT id, count(DISTINCT x) OVER (PARTITION BY g) FROM w;
+
+-- A float constant compared with a decimal compares as a decimal: the decimal
+-- its literal spells, or its float value rounded to the comparison's scale, so
+-- `0.06 + 0.01` is 0.07 and not the double 0.06999999999999999.
+SELECT id FROM q WHERE disc BETWEEN 0.06 - 0.01 AND 0.06 + 0.01;
+SELECT id FROM q WHERE disc = 0.1 + 0.2 - 0.23;
+SELECT id FROM q WHERE disc IN (0.05, 0.03 + 0.04);
+SELECT id FROM q WHERE 0.06 + 0.01 <= disc;
+SELECT id FROM q WHERE disc <> 0.07;

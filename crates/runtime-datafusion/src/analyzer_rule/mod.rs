@@ -16,6 +16,9 @@ limitations under the License.
 pub mod duplicate_plan_node;
 pub use duplicate_plan_node::*;
 
+pub mod decimal_comparison_float_constant;
+pub use decimal_comparison_float_constant::DecimalComparisonFloatConstant;
+
 pub mod exact_float_decimal_cast;
 pub use exact_float_decimal_cast::ExactFloatLiteralDecimalCast;
 
@@ -68,6 +71,10 @@ impl AnalyzerRulesBuilder {
     pub fn build(self) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![];
         if self.include_federation {
+            // Before federation, which hands sources uncoerced comparisons: a
+            // constant float compared with a decimal is sent as the decimal
+            // `DataFusion` compares it as.
+            rules.push(Arc::new(DecimalComparisonFloatConstant::new()));
             rules.push(Arc::new(federation_analyzer_rule()));
         }
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
