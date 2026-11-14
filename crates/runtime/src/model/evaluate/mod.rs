@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Native decision model loader (`TypeSafe` Jev, `OpenAI` decision models). Models without
+//! Native decision model loader (`TypeSafe` Jev, `OpenAI` and `OpenRouter` decision models).
+//! Models without
 //! a native Decisions API get their evaluator from [`super::LoadedChatModel::evaluator`].
 
 #![expect(clippy::implicit_hasher)]
@@ -27,6 +28,7 @@ use async_trait::async_trait;
 use llms::chat::Error as LlmError;
 use llms::evaluate::{Evaluate, EvaluateRequest, EvaluateResponse, Result as EvaluateResult};
 use llms::openai::decisions::OpenAiDecisions;
+use llms::openrouter::decisions::OpenRouterDecisions;
 use llms::typesafe::TypeSafe;
 use opentelemetry::{Key, KeyValue, Value};
 use runtime_rate_control::RateController;
@@ -38,6 +40,7 @@ use tokio::sync::RwLock;
 use super::chat::typed_params;
 use super::metrics::{handle_metrics, handle_token_metrics};
 use super::params::openai::OpenAiModelParams;
+use super::params::openrouter::OpenRouterModelParams;
 use super::params::typesafe::TypeSafeModelParams;
 
 pub use llms::evaluate::EvaluateModelStore;
@@ -46,7 +49,8 @@ pub use llms::evaluate::EvaluateModelStore;
 /// each take a permit from `rate_controller`.
 ///
 /// Supports the providers with a native decisions API: [`ModelSource::TypeSafe`] Jev and
-/// `OpenAI` decision models such as `gpt-6-luna`, including models that also support chat.
+/// `OpenAI` decision models such as `gpt-6-luna`, including models that also support chat,
+/// and [`ModelSource::OpenRouter`] decision models such as `baseten/elephant-1`.
 /// Other models answer decisions through their chat evaluator.
 pub async fn try_to_evaluate_model(
     component: &Model,
@@ -61,6 +65,9 @@ pub async fn try_to_evaluate_model(
     match source {
         ModelSource::TypeSafe => typesafe(component, params, secrets, rate_controller).await,
         ModelSource::OpenAi => openai_decisions(component, params, secrets, rate_controller).await,
+        ModelSource::OpenRouter => {
+            openrouter_decisions(component, params, secrets, rate_controller).await
+        }
         other => Err(LlmError::UnsupportedTaskForModel {
             from: other.to_string(),
             task: "evaluate".to_string(),
@@ -142,6 +149,48 @@ async fn openai_decisions(
             })?
             .with_organization(typed.org_id, typed.project_id)
             .with_rate_controller(rate_controller);
+
+    let metered = Metered {
+        name: component.name.clone(),
+        model: Arc::new(client),
+    };
+    Ok(Arc::new(metered) as Arc<dyn Evaluate>)
+}
+
+/// An `OpenRouter` decision model (`from: openrouter:baseten/elephant-1`), answering
+/// through `OpenRouter`'s Decisions API. The model id keeps its `<provider>/` part.
+async fn openrouter_decisions(
+    component: &Model,
+    params: &HashMap<String, secrecy::SecretString>,
+    secrets: &Arc<RwLock<Secrets>>,
+    rate_controller: Arc<RateController>,
+) -> Result<Arc<dyn Evaluate>, LlmError> {
+    let typed: OpenRouterModelParams =
+        typed_params(component, params, ModelSource::OpenRouter, secrets).await?;
+    let Some(model_id) = component.get_model_id().filter(|id| !id.trim().is_empty()) else {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+                "Model '{}' names no OpenRouter model. Set `from:` to an OpenRouter decision model, such as `openrouter:baseten/elephant-1`. See: https://openrouter.ai/models?output_modalities=decisions",
+                component.name
+            )
+            .into(),
+        });
+    };
+    let Some(api_key) = typed.api_key.as_ref().map(ExposeSecret::expose_secret) else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No OpenRouter API key provided. Set the `openrouter_api_key` param, or export OPENROUTER_API_KEY. See: https://spiceai.org/docs/components/models".into(),
+        });
+    };
+    let client = OpenRouterDecisions::try_new(
+        component.name.clone(),
+        model_id.trim(),
+        typed.endpoint,
+        api_key,
+    )
+    .map_err(|e| LlmError::FailedToLoadModel {
+        source: e.to_string().into(),
+    })?
+    .with_rate_controller(rate_controller);
 
     let metered = Metered {
         name: component.name.clone(),

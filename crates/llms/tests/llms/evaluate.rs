@@ -16,14 +16,17 @@ limitations under the License.
 
 //! Every provider that answers decisions, held to the `evaluate-api` conformance suite.
 //!
-//! Chat models answer through `ChatEvaluator`; `OpenAI` decision models and `TypeSafe` Jev
-//! have native decisions APIs.
+//! Chat models answer through `ChatEvaluator`; `OpenAI` decision models, `OpenRouter`
+//! decision models and `TypeSafe` Jev have native decisions APIs.
 
 use std::sync::{Arc, LazyLock};
 
 use evaluate_api::{Evaluate, conformance};
 use evaluate_chat::ChatEvaluator;
-use llms::{openai::decisions::OpenAiDecisions, typesafe::TypeSafe};
+use llms::{
+    openai::decisions::OpenAiDecisions, openrouter::decisions::OpenRouterDecisions,
+    typesafe::TypeSafe,
+};
 use rstest::rstest;
 
 use super::{DOTENV, TEST_ARGS, create::create_bedrock, get_or_create_model, on_shared_runtime};
@@ -42,6 +45,10 @@ const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
 
 /// Fixture name the `TypeSafe` Jev model is selected by.
 const TYPESAFE: &str = "typesafe";
+
+/// Fixture name the `OpenRouter` decision model is selected by.
+const OPENROUTER: &str = "openrouter";
+const OPENROUTER_DECISION_MODEL: &str = "baseten/elephant-1";
 
 /// Runs the conformance suite on `model` on the shared runtime, which also serves the
 /// provider clients' connection pools, and fails the test with every failed case.
@@ -121,4 +128,30 @@ async fn typesafe_jev_conforms() {
         .unwrap_or_else(|e| panic!("failed to create {TYPESAFE}: {e}"));
 
     assert_conforms(TYPESAFE, Arc::new(model)).await;
+}
+
+#[tokio::test]
+async fn openrouter_decision_model_conforms() {
+    LazyLock::force(&DOTENV);
+    let _tracing_guard = init_tracing(None);
+    if TEST_ARGS.skip_model(OPENROUTER) {
+        return;
+    }
+
+    let model = OpenRouterDecisions::try_new(
+        OPENROUTER,
+        OPENROUTER_DECISION_MODEL,
+        llms::openrouter::DEFAULT_BASE_URL,
+        required_env(OPENROUTER, "OPENROUTER_API_KEY"),
+    )
+    .unwrap_or_else(|e| panic!("failed to create {OPENROUTER}: {e}"));
+    let model: Arc<dyn Evaluate> = Arc::new(model);
+
+    on_shared_runtime({
+        let model = Arc::clone(&model);
+        async move { model.health().await }
+    })
+    .await
+    .unwrap_or_else(|e| panic!("{OPENROUTER} is not healthy: {e}"));
+    assert_conforms(OPENROUTER, model).await;
 }

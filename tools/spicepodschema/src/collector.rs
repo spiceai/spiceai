@@ -265,6 +265,11 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
             prefix: ModelSource::TypeSafe.short_name(),
             parameters: get_params_spec(&ModelSource::TypeSafe),
         },
+        ModelSourceSchema {
+            name: "openrouter",
+            prefix: ModelSource::OpenRouter.short_name(),
+            parameters: get_params_spec(&ModelSource::OpenRouter),
+        },
     ]
 }
 
