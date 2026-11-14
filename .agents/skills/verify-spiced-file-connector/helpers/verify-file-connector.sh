@@ -615,99 +615,128 @@ raise SystemExit(1)
 PY
 }
 
-refresh_task_count() {
-  local name="$1"
-  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid dataset name: $name"
+# Runs a one-row, one-column integer query and prints the value. `what` names
+# the value in failure messages.
+sql_int() {
+  local what="$1"
+  local artifact="$2"
+  local sql="$3"
   local curl_rc=0
   local code
   local body
-  body="$(marker_artifact refresh-task-count.body)"
+  body="$(marker_artifact "$artifact")"
   : >"$body"
   code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 \
     -H "Content-Type: text/plain" \
     -H "Accept: application/json" \
-    --data-binary "SELECT count(*) AS n FROM runtime.task_history WHERE task = 'acceleration_refresh' AND \"input\" = '${name}'" \
+    --data-binary "$sql" \
     "http://${HTTP_ADDR}/v1/sql")" || curl_rc=$?
   if (( curl_rc != 0 )); then
-    die "refresh task count transport failed (curl=${curl_rc} http=${code:-000}) for ${name}"
+    die "${what} transport failed (curl=${curl_rc} http=${code:-000})"
   fi
   if [[ ! "${code}" =~ ^2[0-9][0-9]$ ]]; then
-    die "refresh task count HTTP ${code:-000} for ${name}"
+    die "${what} HTTP ${code:-000}"
   fi
-  python3 - "$body" <<'PY' || die "refresh task count unusable for ${name}"
+  python3 - "$body" "$what" <<'PY' || die "${what} unusable"
 import json, sys
-text = open(sys.argv[1], encoding="utf-8").read()
+path, what = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
 idx = text.find("[")
 if idx < 0:
-    print("refresh task count is not JSON", file=sys.stderr)
+    print(f"{what} is not JSON", file=sys.stderr)
     raise SystemExit(1)
 try:
     data = json.loads(text[idx:])
 except json.JSONDecodeError as e:
-    print(f"refresh task count is not JSON: {e}", file=sys.stderr)
+    print(f"{what} is not JSON: {e}", file=sys.stderr)
     raise SystemExit(1)
 row = data[0] if isinstance(data, list) and data else data
-if not isinstance(row, dict):
-    print("refresh task count has no row", file=sys.stderr)
+if not isinstance(row, dict) or len(row) != 1:
+    print(f"{what} has no single-column row", file=sys.stderr)
     raise SystemExit(1)
-for key, value in row.items():
-    if key == "n" or key.endswith(".n"):
-        print(int(value))
-        raise SystemExit(0)
-print("refresh task count missing n", file=sys.stderr)
-raise SystemExit(1)
+(value,) = row.values()
+if isinstance(value, bool) or not isinstance(value, int):
+    print(f"{what} is not an integer: {value!r}", file=sys.stderr)
+    raise SystemExit(1)
+print(value)
 PY
+}
+
+# The `spiced` clock, in nanoseconds since the Unix epoch. Read just before a
+# refresh POST, it is the cutoff that tells the requested refresh apart from an
+# older one: the requested refresh starts at or after it, while a refresh that
+# was already running or queued (or whose task-history row is exported late)
+# started before it.
+refresh_cutoff_ns() {
+  local ns
+  ns="$(sql_int "refresh cutoff" refresh-cutoff.body "SELECT CAST(now() AS BIGINT) AS ns")" || \
+    die "refresh cutoff could not be read"
+  [[ "$ns" =~ ^[0-9]+$ ]] || die "refresh cutoff is not a timestamp: ${ns}"
+  printf '%s\n' "$ns"
+}
+
+# `acceleration_refresh` task-history rows for `name` that started at or after
+# `since_ns`. A row is written when its refresh ends, success or failure.
+refresh_task_count() {
+  local name="$1"
+  local since_ns="$2"
+  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid dataset name: $name"
+  [[ "$since_ns" =~ ^[0-9]+$ ]] || die "invalid refresh cutoff for ${name}: ${since_ns}"
+  sql_int "refresh task count for ${name}" refresh-task-count.body \
+    "SELECT count(*) AS n FROM runtime.task_history WHERE task = 'acceleration_refresh' AND \"input\" = '${name}' AND CAST(start_time AS BIGINT) >= ${since_ns}"
 }
 
 refresh_completion_marker() {
   local name="$1"
+  local since_ns="$2"
   local fields n
   # Checked assignments, not `printf "$(a)" "$(b)"`: a failed substitution
   # there is hidden and leftover Ready then looks newer than an empty baseline.
   # `set -e` does not abort a failing assignment, so each `|| die` is required.
   fields="$(dataset_refresh_fields "$name")" || \
     die "dataset refresh fields for ${name} could not be captured"
-  n="$(refresh_task_count "$name")" || \
+  n="$(refresh_task_count "$name" "$since_ns")" || \
     die "refresh task count for ${name} could not be captured"
   [[ "$fields" == *$'\t'*$'\t'* ]] || die "incomplete refresh fields for ${name}"
   [[ "$n" =~ ^[0-9]+$ ]] || die "incomplete refresh task count for ${name}: ${n}"
   printf '%s\t%s\n' "$fields" "$n"
 }
 
-# A new completion is a terminal status plus a marker that moved: a new
-# `acceleration_refresh` task-history row, a new `last_refresh` (success), or a
-# new `error_message` (failure does not advance `last_refresh`).
+# A new completion is a terminal status plus a new `acceleration_refresh`
+# task-history row that started at or after the cutoff both markers were
+# counted from. A moved `last_refresh` or `error_message` is not one: a refresh
+# that started before the POST moves them too, while the requested refresh is
+# still queued behind it.
 refresh_is_complete() {
   python3 - "$1" "$2" <<'PY'
 import sys
 
-def split(raw: str) -> tuple[str, str, str, str]:
+def split(raw: str) -> tuple[str, str]:
     parts = raw.split("\t")
     while len(parts) < 4:
         parts.append("")
-    return parts[0], parts[1], parts[2], parts[3]
+    return parts[0], parts[3]
 
-_, b_last, b_err, b_n = split(sys.argv[1])
-n_status, n_last, n_err, n_n = split(sys.argv[2])
+_, b_n = split(sys.argv[1])
+n_status, n_n = split(sys.argv[2])
 terminal = n_status not in {"Refreshing", "Initializing", "missing", ""}
 try:
-    new_task = bool(b_n) and bool(n_n) and int(n_n) > int(b_n)
+    new_task = int(n_n) > int(b_n)
 except ValueError:
     new_task = False
-last_moved = bool(n_last) and n_last != b_last
-err_moved = n_err != b_err
-print("yes" if terminal and (new_task or last_moved or err_moved) else "no")
+print("yes" if terminal and new_task else "no")
 PY
 }
 
 wait_refresh_settled() {
   local name="$1"
   local baseline="$2"
+  local since_ns="$3"
   local deadline=$((SECONDS + 60))
   local now=""
   [[ -n "$baseline" ]] || die "dataset ${name} has no baseline completion marker"
   while (( SECONDS < deadline )); do
-    now="$(refresh_completion_marker "$name")" || \
+    now="$(refresh_completion_marker "$name" "$since_ns")" || \
       die "completion marker for ${name} could not be captured while waiting"
     if [[ "$(refresh_is_complete "$baseline" "$now")" == "yes" ]]; then
       echo "refresh settled ${name} status=${now%%$'\t'*}"
@@ -722,17 +751,22 @@ refresh_all_and_wait() {
   local step="$1"
   local ev="$2"
   local ds
+  local cutoff
   local marker
+  local cutoffs=()
   local baselines=()
   for ds in "${ACC_DATASETS[@]}"; do
-    marker="$(refresh_completion_marker "$ds")" || \
+    cutoff="$(refresh_cutoff_ns)" || \
+      die "refresh cutoff for ${ds} could not be captured"
+    marker="$(refresh_completion_marker "$ds" "$cutoff")" || \
       die "baseline completion marker for ${ds} could not be captured"
+    cutoffs+=("$cutoff")
     baselines+=("$marker")
     refresh_dataset "$ds" "${ev}/refresh-${step}-${ds}"
   done
   local i=0
   for ds in "${ACC_DATASETS[@]}"; do
-    wait_refresh_settled "$ds" "${baselines[$i]}"
+    wait_refresh_settled "$ds" "${baselines[$i]}" "${cutoffs[$i]}"
     i=$((i + 1))
   done
 }
