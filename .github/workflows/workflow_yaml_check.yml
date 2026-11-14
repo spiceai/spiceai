@@ -22,6 +22,8 @@ on:
       - '.github/scripts/test_docker_pull.py'
       - '.github/scripts/mssql_tpch_restore.sh'
       - '.github/scripts/test_mssql_tpch_restore.py'
+      - '.github/scripts/extract_snapshot_archives.py'
+      - '.github/scripts/test_extract_snapshot_archives.py'
   push:
     branches:
       - trunk
@@ -36,6 +38,8 @@ on:
       - '.github/scripts/test_docker_pull.py'
       - '.github/scripts/mssql_tpch_restore.sh'
       - '.github/scripts/test_mssql_tpch_restore.py'
+      - '.github/scripts/extract_snapshot_archives.py'
+      - '.github/scripts/test_extract_snapshot_archives.py'
   workflow_dispatch:
 
 concurrency:
@@ -76,6 +80,7 @@ jobs:
           python .github/scripts/test_codeql_workflow.py -v
           python .github/scripts/test_docker_pull.py -v
           python .github/scripts/test_mssql_tpch_restore.py -v
+          python .github/scripts/test_extract_snapshot_archives.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py

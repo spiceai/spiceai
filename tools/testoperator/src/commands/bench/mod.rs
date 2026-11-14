@@ -366,18 +366,6 @@ const IGNORED_SNAPSHOT_RESULT_QUERIES: &[(&str, &[&str])] = {
                 "clickbench_q30",
             ],
         ),
-        // This scenario has refresh_sql with limit - which makes these queries non-deterministic
-        (
-            "s3[parquet]-postgres",
-            &[
-                "clickbench_q2",
-                "clickbench_q5",
-                "clickbench_q6",
-                "clickbench_q21",
-                "clickbench_q26",
-                "clickbench_q30",
-            ],
-        ),
     ]
 };
 

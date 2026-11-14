@@ -64,6 +64,7 @@ use super::vector_io::{
     cleanup_uncommitted_delete_paths,
 };
 use crate::catalog::MetadataCatalog;
+use crate::dataset_storage::DatasetStorage;
 use crate::metadata::{DeleteFile, TableMetadata};
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef};
@@ -73,15 +74,23 @@ use std::collections::HashMap;
 use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
-use datafusion::datasource::listing::ListingTable;
+use datafusion::catalog::Session;
+use datafusion::datasource::listing::{ListingTable, ListingTableUrl};
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execute_stream;
 use datafusion_catalog::TableProvider;
 use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
+use datafusion_common::utils::project_schema;
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+use datafusion_datasource::{PartitionedFile, TableSchema};
 use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
@@ -105,30 +114,35 @@ const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
 enum StagedPkDelete {
     Int64 {
         delete_files: Vec<DeleteFile>,
-        /// Tombstone snapshot captured when the delete began. Used only to count
-        /// how many keys are newly deleted (not already tombstoned) — it is never
-        /// re-published, so a concurrent update is never observed here.
-        initial: Arc<Int64PkDeletionSnapshot>,
         /// This delete's primary keys, de-duplicated across chunks. Published by
         /// merging (compare-and-swap) onto the live snapshot at commit.
         new_pks: HashSet<i64>,
         /// The single delete sequence shared by every chunk of this delete.
         delete_sequence: Option<i64>,
+        /// The table's storage, which uncommitted vector files are removed through.
+        storage: Option<Arc<DatasetStorage>>,
     },
     RowKeys {
         delete_files: Vec<DeleteFile>,
-        initial: Arc<RowConverterDeletionSnapshot>,
         new_keys: HashSet<Box<[u8]>>,
         delete_sequence: Option<i64>,
+        storage: Option<Arc<DatasetStorage>>,
     },
 }
 
 impl Drop for StagedPkDelete {
     fn drop(&mut self) {
-        let delete_files = match self {
-            Self::Int64 { delete_files, .. } | Self::RowKeys { delete_files, .. } => {
-                std::mem::take(delete_files)
+        let (delete_files, storage) = match self {
+            Self::Int64 {
+                delete_files,
+                storage,
+                ..
             }
+            | Self::RowKeys {
+                delete_files,
+                storage,
+                ..
+            } => (std::mem::take(delete_files), storage.take()),
         };
         if delete_files.is_empty() {
             return;
@@ -139,7 +153,7 @@ impl Drop for StagedPkDelete {
             .collect::<Vec<_>>();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                cleanup_uncommitted_delete_paths(&paths).await;
+                cleanup_uncommitted_delete_paths(&paths, storage.as_deref()).await;
             });
         } else {
             cleanup_uncommitted_delete_paths_blocking(paths);
@@ -162,6 +176,8 @@ pub(crate) struct PreparedDeletionPublish {
     deleted_count: u64,
     cleanup_armed: bool,
     scan_input_version: Option<Arc<AtomicU64>>,
+    /// The table's storage, which uncommitted vector files are removed through.
+    storage: Option<Arc<DatasetStorage>>,
 }
 
 enum PreparedDeletionCache {
@@ -197,6 +213,27 @@ impl PreparedDeletionPublish {
 
     pub(crate) fn deleted_count(&self) -> u64 {
         self.deleted_count
+    }
+
+    /// The keys this delete tombstones; none for a position delete.
+    pub(crate) fn tombstoned_keys(&self) -> crate::provider::table::UnpublishedKeyDeletes {
+        match &self.publish {
+            PreparedDeletionCache::Int64 { pks, .. } => {
+                crate::provider::table::UnpublishedKeyDeletes {
+                    pk_i64: pks.clone(),
+                    ..Default::default()
+                }
+            }
+            PreparedDeletionCache::RowKeys { keys, .. } => {
+                crate::provider::table::UnpublishedKeyDeletes {
+                    row_keys: keys.clone(),
+                    ..Default::default()
+                }
+            }
+            PreparedDeletionCache::Positions { .. } => {
+                crate::provider::table::UnpublishedKeyDeletes::default()
+            }
+        }
     }
 
     /// Replace the computed count with the non-authoritative sentinel `0`. Used
@@ -294,9 +331,10 @@ impl Drop for PreparedDeletionPublish {
             return;
         }
         let paths = self.cleanup_paths();
+        let storage = self.storage.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                cleanup_uncommitted_delete_paths(&paths).await;
+                cleanup_uncommitted_delete_paths(&paths, storage.as_deref()).await;
             });
         } else {
             cleanup_uncommitted_delete_paths_blocking(paths);
@@ -307,6 +345,11 @@ impl Drop for PreparedDeletionPublish {
 fn cleanup_uncommitted_delete_paths_blocking(paths: Vec<std::path::PathBuf>) {
     std::thread::spawn(move || {
         for path in paths {
+            // Object-store files are removed through the store, never as a local
+            // path; without a runtime they are left for the sweep.
+            if crate::is_object_store_path(&path.to_string_lossy()) {
+                continue;
+            }
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -336,7 +379,7 @@ pub(crate) struct DeleteScanSource {
     pub(crate) min_delete_seq: Option<i64>,
     /// Whether a key re-inserted after its delete reads as live again.
     pub(crate) insert_records: InsertRecordHandling,
-    pub(crate) table: Arc<ListingTable>,
+    pub(crate) table: DeleteScanTable,
     /// The deletion index as it stood when `table` was captured, taken under the same
     /// `listing_fence` read. `None` for a source captured without one (the cold tier).
     ///
@@ -352,24 +395,162 @@ pub(crate) struct DeleteScanSource {
     pub(crate) tombstones_at_capture: Option<PkDeletionSnapshot>,
 }
 
+/// The data files of one snapshot a delete reads.
+///
+/// A table whose committed state is the only record of its files (its data is in
+/// the object-native location) reads the files that state names for the
+/// snapshot, captured with the rest of the delete's view of the table. Its
+/// snapshot directory can also hold files an append has uploaded and not
+/// committed, and files no commit will ever name, so a listing of it would let
+/// the delete act on rows that are not in the table: report them, write
+/// deletion vectors for them, and hide them once the append commits. Scans of
+/// such a table read the same committed files. Every other table lists the
+/// snapshot directory, as its scans do.
+#[derive(Clone)]
+pub(crate) struct DeleteScanTable {
+    listing: Arc<ListingTable>,
+    /// The snapshot's committed files; `None` lists the directory.
+    committed_files: Option<Arc<[PartitionedFile]>>,
+}
+
+impl DeleteScanTable {
+    /// Read `listing`'s snapshot directory by listing it.
+    pub(crate) fn listed(listing: Arc<ListingTable>) -> Self {
+        Self {
+            listing,
+            committed_files: None,
+        }
+    }
+
+    /// Read the files `catalog` names for `snapshot_id`, the snapshot of table
+    /// `table_id` that `listing` reads, whose committed state is the only
+    /// record of its files. A row's path is relative to `listing`'s directory:
+    /// the table's own directory in a flat table, the snapshot's folder
+    /// otherwise.
+    ///
+    /// A partitioned table keeps the listing, as its scans do: the committed
+    /// state does not record partition values, which the listing derives from
+    /// each path.
+    pub(crate) async fn committed(
+        listing: Arc<ListingTable>,
+        snapshot_id: &str,
+        catalog: &dyn MetadataCatalog,
+        table_id: &str,
+    ) -> datafusion_common::Result<Self> {
+        if !listing.options().table_partition_cols.is_empty() {
+            return Ok(Self::listed(listing));
+        }
+        let Some(url) = listing.table_paths().first() else {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "the snapshot of table {table_id} a delete reads has no path"
+            )));
+        };
+        let prefix = url.prefix();
+        if !prefix.parts().any(|part| part.as_ref() == table_id) {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "the directory '{prefix}' a delete of table {table_id} reads belongs to another table"
+            )));
+        }
+        let manifest = catalog
+            .get_snapshot_files(table_id, snapshot_id)
+            .await
+            .map_err(|error| datafusion_common::DataFusionError::External(Box::new(error)))?;
+        let files = super::super::table::CayenneTableProvider::manifest_files_as_partitioned_files(
+            prefix, manifest,
+        );
+        Ok(Self {
+            listing,
+            committed_files: Some(files.into()),
+        })
+    }
+
+    /// The snapshot directory, for logs.
+    pub(crate) fn path(&self) -> &str {
+        self.listing
+            .table_paths()
+            .first()
+            .map_or("unknown", ListingTableUrl::as_str)
+    }
+
+    /// The store the snapshot's files are in.
+    pub(crate) fn object_store_url(&self) -> Option<ObjectStoreUrl> {
+        self.listing
+            .table_paths()
+            .first()
+            .map(ListingTableUrl::object_store)
+    }
+
+    /// The snapshot's data files.
+    pub(crate) async fn files(
+        &self,
+        state: &dyn Session,
+    ) -> datafusion_common::Result<Vec<PartitionedFile>> {
+        if let Some(files) = &self.committed_files {
+            return Ok(files.to_vec());
+        }
+        Ok(self
+            .listing
+            .list_files_for_scan(state, &[], None)
+            .await?
+            .file_groups
+            .into_iter()
+            .flat_map(FileGroup::into_inner)
+            .collect())
+    }
+
+    /// A plan reading `projection` of every row of the snapshot's files, with
+    /// the position deletes its file format applies. `filters` may prune what
+    /// is read; the caller re-applies them exactly.
+    pub(crate) async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let Some(files) = &self.committed_files else {
+            return self.listing.scan(state, projection, filters, None).await;
+        };
+        let schema = self.listing.schema();
+        if files.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(project_schema(
+                &schema, projection,
+            )?)));
+        }
+        let Some(object_store_url) = self.object_store_url() else {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "a snapshot a delete reads has no path".to_string(),
+            ));
+        };
+        let format = &self.listing.options().format;
+        let file_source = format.file_source(TableSchema::builder(schema).build());
+        let file_groups =
+            FileGroup::new(files.to_vec()).split_files(state.config().target_partitions());
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_file_groups(file_groups)
+            .with_projection_indices(projection.cloned())?
+            .build();
+        format.create_physical_plan(state, config).await
+    }
+}
+
 impl StagedPkDelete {
-    fn new(strategy: &PkDeletionStrategyWithCache, table_name: &str) -> super::super::Result<Self> {
+    fn new(
+        strategy: &PkDeletionStrategyWithCache,
+        table_name: &str,
+        storage: Option<&Arc<DatasetStorage>>,
+    ) -> super::super::Result<Self> {
         match strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                deletion_snapshot, ..
-            } => Ok(Self::Int64 {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => Ok(Self::Int64 {
                 delete_files: Vec::new(),
-                initial: deletion_snapshot.load_full(),
                 new_pks: HashSet::new(),
                 delete_sequence: None,
+                storage: storage.map(Arc::clone),
             }),
-            PkDeletionStrategyWithCache::RowConverterBased {
-                deletion_snapshot, ..
-            } => Ok(Self::RowKeys {
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => Ok(Self::RowKeys {
                 delete_files: Vec::new(),
-                initial: deletion_snapshot.load_full(),
                 new_keys: HashSet::new(),
                 delete_sequence: None,
+                storage: storage.map(Arc::clone),
             }),
             PkDeletionStrategyWithCache::PositionBased { .. } => Err(Error::Internal {
                 table: table_name.to_string(),
@@ -443,23 +624,13 @@ impl StagedPkDelete {
         Ok(())
     }
 
-    /// Number of keys this delete newly tombstones — keys not already deleted
-    /// when the delete began. Re-deletions of already-tombstoned keys are not
-    /// counted, preserving the pre-refactor "rows affected" semantics.
+    /// Number of rows this delete removes: one per key. Every key it holds is
+    /// the key of a row its scan found live, so a key written again after an
+    /// earlier delete counts, and a key with no live row is never in it.
     fn new_count(&self) -> usize {
         match self {
-            Self::Int64 {
-                initial, new_pks, ..
-            } => new_pks
-                .iter()
-                .filter(|pk| initial.tombstones.get(**pk).is_none())
-                .count(),
-            Self::RowKeys {
-                initial, new_keys, ..
-            } => new_keys
-                .iter()
-                .filter(|key| initial.tombstones.get(key.as_ref()).is_none())
-                .count(),
+            Self::Int64 { new_pks, .. } => new_pks.len(),
+            Self::RowKeys { new_keys, .. } => new_keys.len(),
         }
     }
 }
@@ -553,6 +724,14 @@ pub struct CayenneDeletionSink {
     /// superseded position deletion vectors waits for. `None` leaves those files
     /// on disk.
     file_deletion_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    /// The owning table's storage when its data path is an object-store URL;
+    /// deletion vectors are written, read and removed through its store.
+    dataset_storage: Option<Arc<DatasetStorage>>,
+    /// Whether the main source reads the current snapshot's committed files
+    /// instead of listing its directory (see [`DeleteScanTable`]).
+    /// The owning table's current snapshot id, when the main source is read from
+    /// its committed files; `None` lists the directory.
+    committed_snapshot: Option<Arc<parking_lot::RwLock<String>>>,
 }
 
 /// The locks a coherent (listing, deletion index) capture holds, outer first.
@@ -596,6 +775,7 @@ impl CayenneDeletionSink {
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+        dataset_storage: Option<Arc<DatasetStorage>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -618,7 +798,21 @@ impl CayenneDeletionSink {
             scan_input_version: None,
             capture_locks: None,
             file_deletion_fence: None,
+            dataset_storage,
+            committed_snapshot: None,
         }
+    }
+
+    /// Read the main source from the committed files of the current snapshot
+    /// `current_snapshot` names, for a table whose committed state is the only
+    /// record of its files; `None` lists the main directory.
+    #[must_use]
+    pub(crate) fn with_committed_files(
+        mut self,
+        current_snapshot: Option<Arc<parking_lot::RwLock<String>>>,
+    ) -> Self {
+        self.committed_snapshot = current_snapshot;
+        self
     }
 
     /// Wire the owning table's `file_deletion_fence`, so a position delete removes
@@ -674,7 +868,11 @@ impl CayenneDeletionSink {
     /// has succeeded. See [`super::vector_io::remove_dropped_deletion_vector_files`].
     pub(crate) fn remove_replaced_deletion_vector_files(&self, replaced: Vec<DeleteFile>) {
         if let Some(fence) = &self.file_deletion_fence {
-            super::vector_io::remove_dropped_deletion_vector_files(replaced, Arc::clone(fence));
+            super::vector_io::remove_dropped_deletion_vector_files(
+                replaced,
+                Arc::clone(fence),
+                self.dataset_storage.clone(),
+            );
         }
     }
 
@@ -698,20 +896,35 @@ impl CayenneDeletionSink {
     }
 
     /// The main listing as a scan source, captured together with the deletion index
-    /// under the same read guards `scan` captures the same rows under.
-    async fn capture_main_scan_source(&self) -> DeleteScanSource {
+    /// under the same read guards `scan` captures the same rows under. Its
+    /// committed files, when it reads them, are read under the same guards.
+    async fn capture_main_scan_source(&self) -> datafusion_common::Result<DeleteScanSource> {
         let _guards = match &self.capture_locks {
             Some(locks) => Some(locks.read().await),
             None => None,
         };
-        let table = self.listing_table.load_full();
+        let listing = self.listing_table.load_full();
         let tombstones_at_capture = pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy);
-        DeleteScanSource {
+        let table = if let Some(current) = &self.committed_snapshot {
+            // Read under the same guards as the listing, which the owning table
+            // publishes together with the snapshot id.
+            let snapshot_id = current.read().clone();
+            DeleteScanTable::committed(
+                listing,
+                &snapshot_id,
+                self.catalog.as_ref(),
+                &self.table_metadata.table_id,
+            )
+            .await?
+        } else {
+            DeleteScanTable::listed(listing)
+        };
+        Ok(DeleteScanSource {
             min_delete_seq: None,
             insert_records: self.live_main_insert_records(),
             table,
             tombstones_at_capture: Some(tombstones_at_capture),
-        }
+        })
     }
 
     /// Wire the owning table's scan-input version so a published delete
@@ -745,131 +958,12 @@ impl CayenneDeletionSink {
         })
     }
 
-    async fn prepare_delete_all_rows_from_tables(
-        &self,
-        ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
-    ) -> super::super::Result<Option<PreparedDeletionPublish>> {
-        let table_name = &self.table_metadata.table_name;
-        // For position-based deletions, we need per-file row tracking
-        // For PK-based deletions, we can still batch across all files
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                let mut pending_pk_values = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
-                let mut delete_sequence = None;
-                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
-                for table in tables {
-                    let scan_plan = table
-                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
-                        .await?;
-                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
-                    while let Some(batch) = stream.next().await {
-                        let batch = batch?;
-                        pending_pk_values.extend(self.extract_int64_pk_values(&batch, &[0])?);
-                        if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
-                            let row_keys = pending_pk_values.drain().map(i64_key).collect();
-                            let results = self
-                                .write_key_based_chunk_with_shared_sequence(
-                                    row_keys,
-                                    &mut delete_sequence,
-                                )
-                                .await?;
-                            staged.absorb(
-                                results,
-                                Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                                table_name,
-                            )?;
-                        }
-                    }
-                }
-                if !pending_pk_values.is_empty() {
-                    let row_keys = pending_pk_values.into_iter().map(i64_key).collect();
-                    let results = self
-                        .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
-                        .await?;
-                    staged.absorb(
-                        results,
-                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                        table_name,
-                    )?;
-                }
-                if delete_sequence.is_none() {
-                    return Ok(None);
-                }
-                self.prepare_staged_pk_deletions(staged).map(Some)
-            }
-            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                let Some(ref row_converter) = self.pk_row_converter else {
-                    return Err(Error::Internal {
-                        table: table_name.clone(),
-                        message: "RowConverter not available for RowConverterBased strategy"
-                            .to_string(),
-                    });
-                };
-                let mut pending_row_keys = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
-                let mut delete_sequence = None;
-                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
-                for table in tables {
-                    let scan_plan = table
-                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
-                        .await?;
-                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
-                    let projected_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
-                    while let Some(batch) = stream.next().await {
-                        let batch = batch?;
-                        let pk_columns: Vec<ArrayRef> = projected_indices
-                            .iter()
-                            .map(|&index| Arc::clone(batch.column(index)))
-                            .collect();
-                        if pk_columns.iter().any(|column| column.null_count() > 0) {
-                            return Err(Error::DataValidation {
-                                table: table_name.clone(),
-                                message: null_primary_key_message(&batch, &projected_indices),
-                            });
-                        }
-                        let rows = row_converter.convert_columns(&pk_columns)?;
-                        pending_row_keys.extend(rows.iter().map(|row| bytes_key(row.as_ref())));
-                        if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
-                            let results = self
-                                .write_key_based_chunk_with_shared_sequence(
-                                    pending_row_keys.drain().collect(),
-                                    &mut delete_sequence,
-                                )
-                                .await?;
-                            staged.absorb(
-                                results,
-                                Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                                table_name,
-                            )?;
-                        }
-                    }
-                }
-                if !pending_row_keys.is_empty() {
-                    let results = self
-                        .write_key_based_chunk_with_shared_sequence(
-                            pending_row_keys.into_iter().collect(),
-                            &mut delete_sequence,
-                        )
-                        .await?;
-                    staged.absorb(
-                        results,
-                        Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                        table_name,
-                    )?;
-                }
-                if delete_sequence.is_none() {
-                    return Ok(None);
-                }
-                self.prepare_staged_pk_deletions(staged).map(Some)
-            }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
-                // Position-based deletion for "delete all" (delete w/o filters)
-                // Note: Delete all is NOT available using retention so this is unreachable
-                Err(Error::Internal {
-                    table: table_name.clone(),
-                    message: "Position-based deletion without primary key is not yet supported for delete-all operations".to_string(),
-                })
-            }
+    /// A `DELETE` without a filter of a table without a primary key, which
+    /// deletes by position: not supported (retention always has a filter).
+    fn delete_all_by_position_unsupported(&self) -> Error {
+        Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message: "Position-based deletion without primary key is not yet supported for delete-all operations".to_string(),
         }
     }
 
@@ -1081,7 +1175,11 @@ impl CayenneDeletionSink {
                         return Ok(None);
                     }
                     let mut delete_sequence = None;
-                    let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                    let mut staged = StagedPkDelete::new(
+                        &self.pk_deletion_strategy,
+                        table_name,
+                        self.dataset_storage.as_ref(),
+                    )?;
                     let row_keys = pk_values.into_iter().map(i64_key).collect();
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
@@ -1105,7 +1203,11 @@ impl CayenneDeletionSink {
                         return Ok(None);
                     }
                     let mut delete_sequence = None;
-                    let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                    let mut staged = StagedPkDelete::new(
+                        &self.pk_deletion_strategy,
+                        table_name,
+                        self.dataset_storage.as_ref(),
+                    )?;
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
@@ -1134,12 +1236,16 @@ impl CayenneDeletionSink {
                 let mut pending_pk_values: Vec<i64> =
                     Vec::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
                 let mut delete_sequence: Option<i64> = None;
-                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                let mut staged = StagedPkDelete::new(
+                    &self.pk_deletion_strategy,
+                    table_name,
+                    self.dataset_storage.as_ref(),
+                )?;
 
                 for source in tables {
                     let scan_plan = source
                         .table
-                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters)
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
@@ -1209,12 +1315,16 @@ impl CayenneDeletionSink {
                 let mut pending_row_keys: Vec<Box<[u8]>> =
                     Vec::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
                 let mut delete_sequence: Option<i64> = None;
-                let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
+                let mut staged = StagedPkDelete::new(
+                    &self.pk_deletion_strategy,
+                    table_name,
+                    self.dataset_storage.as_ref(),
+                )?;
 
                 for source in tables {
                     let scan_plan = source
                         .table
-                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters, None)
+                        .scan(&ctx.state(), Some(&scan_projection), &coerced_filters)
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
@@ -1284,22 +1394,16 @@ impl CayenneDeletionSink {
             util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
         );
-        let mut all_tables = vec![self.capture_main_scan_source().await];
+        let mut all_tables = vec![self.capture_main_scan_source().await?];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
-        if self.filters.is_empty() {
-            // Delete-all removes every row, so no version is preferred over another and
-            // the thresholds carry no information.
-            let plain: Vec<Arc<ListingTable>> = all_tables
-                .iter()
-                .map(|source| Arc::clone(&source.table))
-                .collect();
-            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
+        if self.filters.is_empty() && self.pk_deletion_strategy.is_position_based() {
+            Err(self.delete_all_by_position_unsupported())
         } else if self.pk_deletion_strategy.is_position_based() {
             // As in `delete_from`: a position tombstone can only hide the version it
             // matched, so the per-snapshot visibility rules carry nothing for it.
-            let position_tables: Vec<Arc<ListingTable>> = all_tables
+            let position_tables: Vec<DeleteScanTable> = all_tables
                 .iter()
-                .map(|source| Arc::clone(&source.table))
+                .map(|source| source.table.clone())
                 .collect();
             self.prepare_delete_filtered_rows_position_based(&ctx, &position_tables)
                 .await
@@ -1475,7 +1579,7 @@ impl CayenneDeletionSink {
         };
         let mut metadata = self.table_metadata.clone();
         metadata.current_sequence_number = sequence;
-        DeletionVectorWriter::new(&metadata)
+        DeletionVectorWriter::new(&metadata, self.dataset_storage.as_ref())
             .write(vec![DeletionVectorWriteSpec::new_key_based(row_keys)])
             .await
     }
@@ -1525,6 +1629,7 @@ impl CayenneDeletionSink {
             deleted_count,
             cleanup_armed: true,
             scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
+            storage: self.dataset_storage.clone(),
         })
     }
 }
@@ -1543,7 +1648,11 @@ impl DeletionSink for CayenneDeletionSink {
             None => None,
         };
         if let Some(flag) = &self.publication_outcome_unknown {
-            super::super::table::ensure_outcome_known(flag, &self.table_metadata.table_name)?;
+            super::super::table::ensure_outcome_known(
+                flag,
+                &self.table_metadata.table_name,
+                crate::metastore_layout::is_object_native_data_path(&self.table_metadata.path),
+            )?;
         }
 
         let ctx = SessionContext::new_with_config_rt(
@@ -1553,23 +1662,19 @@ impl DeletionSink for CayenneDeletionSink {
 
         // Collect all tables to scan: main listing table + the extra tables
         // (protected snapshots and, for cold-tier tables, the cold-tier files).
-        let mut all_tables = vec![self.capture_main_scan_source().await];
+        let mut all_tables = vec![self.capture_main_scan_source().await?];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
 
-        let prepared = if self.filters.is_empty() {
-            // See above: delete-all needs no per-snapshot visibility.
-            let plain: Vec<Arc<ListingTable>> = all_tables
-                .iter()
-                .map(|source| Arc::clone(&source.table))
-                .collect();
-            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
-        } else if self.pk_deletion_strategy.is_position_based() {
+        if self.filters.is_empty() && self.pk_deletion_strategy.is_position_based() {
+            return Err(Box::new(self.delete_all_by_position_unsupported()));
+        }
+        let prepared = if self.pk_deletion_strategy.is_position_based() {
             // A position tombstone names a file and row position, so it can only ever
             // hide the version it matched — the per-snapshot thresholds that keep a key
             // tombstone off a live row carry nothing for it.
-            let position_tables: Vec<Arc<ListingTable>> = all_tables
+            let position_tables: Vec<DeleteScanTable> = all_tables
                 .iter()
-                .map(|source| Arc::clone(&source.table))
+                .map(|source| source.table.clone())
                 .collect();
             return self
                 .delete_filtered_rows_position_based(&ctx, &position_tables)

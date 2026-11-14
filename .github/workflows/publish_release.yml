@@ -6,9 +6,11 @@ name: publish_release
 # publish an earlier commit of the branch instead, when the branch has moved
 # since its build with no change to the released code. Every job that
 # publishes runs in `github-publish` and needs its own approval:
-#   1. `publish` attaches the binaries of that run to the tag's draft release,
-#      or a new one, checking each against the run's SHA256SUMS, and publishes
-#      the release at the built commit, which creates the tag there;
+#   1. `publish` attaches the files of that run that its SHA256SUMS lists (the
+#      binaries and the install scripts) and SHA256SUMS itself to the tag's draft
+#      release, or a new one, checking each against SHA256SUMS, and publishes
+#      the release at the built commit, which creates the tag there. The
+#      build_release run attested each of them;
 #   2. `images` builds the Docker images from the published binaries, and its
 #      two push jobs (the multi-arch image and the CUDA image) push them.
 # Only publishing creates a release tag. Nothing already published is

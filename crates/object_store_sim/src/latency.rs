@@ -37,14 +37,17 @@ use parking_lot::Mutex;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-/// The kinds of request a [`LatencyProfile`] can delay differently.
+/// The kinds of request a [`LatencyProfile`] can delay and a
+/// [`FaultStore`](super::fault::FaultStore) can fault. The first nine are the
+/// latency classes; the multipart and rename variants are delayed as their
+/// class ([`Op::latency_class`]) but faulted on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Op {
     /// `PUT` with `If-None-Match: *`.
     Create,
     /// `PUT` with `If-Match`.
     Cas,
-    /// Unconditional `PUT`, and multipart uploads.
+    /// Unconditional `PUT`; also the latency class of multipart uploads.
     Put,
     /// `GET` with `If-None-Match`.
     GetConditional,
@@ -52,16 +55,26 @@ pub enum Op {
     Get,
     /// `HEAD`.
     Head,
-    /// `LIST`, with or without a delimiter.
+    /// `LIST`, with or without a delimiter or offset.
     List,
-    /// `DELETE`.
+    /// `DELETE`, one per path of a delete stream.
     Delete,
-    /// `COPY` and `RENAME`.
+    /// `COPY`; also the latency class of `RENAME`.
     Copy,
+    /// Multipart upload creation.
+    MultipartBegin,
+    /// One multipart part upload.
+    MultipartPart,
+    /// Multipart completion, which makes the object visible.
+    MultipartComplete,
+    /// Multipart abort.
+    MultipartAbort,
+    /// `RENAME` (copy and delete, or an atomic move where the store has one).
+    Rename,
 }
 
 impl Op {
-    pub const ALL: [Op; 9] = [
+    pub const ALL: [Op; 14] = [
         Op::Create,
         Op::Cas,
         Op::Put,
@@ -71,10 +84,27 @@ impl Op {
         Op::List,
         Op::Delete,
         Op::Copy,
+        Op::MultipartBegin,
+        Op::MultipartPart,
+        Op::MultipartComplete,
+        Op::MultipartAbort,
+        Op::Rename,
     ];
 
+    /// The latency class a [`LatencyProfile`] delays this request as.
+    #[must_use]
+    pub fn latency_class(self) -> Op {
+        match self {
+            Op::MultipartBegin | Op::MultipartPart | Op::MultipartComplete | Op::MultipartAbort => {
+                Op::Put
+            }
+            Op::Rename => Op::Copy,
+            op => op,
+        }
+    }
+
     fn index(self) -> usize {
-        self as usize
+        self.latency_class() as usize
     }
 }
 

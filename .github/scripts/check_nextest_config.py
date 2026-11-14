@@ -57,10 +57,10 @@ from pathlib import Path
 # matched by a `(binary_id(=package::binary) & test(/^module::/))` term. Cayenne's
 # integration tests are modules of its single `integration` binary.
 QUIET_BASELINE_SECONDS = {
-    "cayenne::integration::mutation_property_test": 239.5,  # prop_concurrent_mixed_position_sqlite
+    "cayenne::integration::mutation_property_test": 239.5,  # prop_concurrent_mixed_position
     "cayenne::integration::partition_chunking_test": 247.9,  # ..._timestamp_partition_with_date_part_impl_sqlite
     "cayenne::integration::layout_pruning_ab_test": 170.1,  # pruning_ab_inferred_vs_authoritative_sort
-    "cayenne::integration::mutation_model_test": 107.1,  # test_exhaustive_composite_single_row_sequences_impl_sqlite
+    "cayenne::integration::mutation_model_test": 107.1,  # test_exhaustive_composite_single_row_sequences_impl_on_data_store
     # tpcds_and_clickbench_parity_vs_duckdb, measured with fixtures already on
     # disk. CI regenerates them with `dsdgen` on every fresh runner, so the
     # baseline is rounded up from the observed 127.7s to cover that.
@@ -74,7 +74,7 @@ QUIET_BASELINE_SECONDS = {
 # Worst same-test slowdown measured between a quiet pool and a saturated one.
 #
 # Source: sign-off run 31239284344, where
-# `mutation_property_test prop_concurrent_upsert_only_key_sqlite` passed at
+# `mutation_property_test prop_concurrent_upsert_only_key` passed at
 # 422.1s against a 92.0s quiet baseline in run 30833882620. Contention on this
 # pool is shared-machine CPU starvation, so it applies to any test set here.
 CONTENTION_FACTOR = 4.6
