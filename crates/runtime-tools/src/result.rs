@@ -66,9 +66,10 @@ pub const MAX_TEXT_CHARS: usize = 1_024;
 pub const MAX_LIST_ITEMS: usize = 16;
 
 /// Bytes per token used to turn a context window into a byte budget. Tokens of tabular JSON
-/// average 2–4 bytes, so this errs toward a smaller result.
+/// average 2–4 bytes and this is the largest, so the share of the window a full result takes is
+/// nominal: a tenth at four bytes per token, up to a fifth at two.
 const BYTES_PER_TOKEN: u64 = 4;
-/// A result may use one tenth of the model's context window.
+/// A result may use a nominal one tenth of the model's context window (see [`BYTES_PER_TOKEN`]).
 const CONTEXT_WINDOW_SHARE: u64 = 10;
 /// Every decimal with at most this many significant digits converts to the nearest `f64` and
 /// back to the same digits (`f64::DIGITS`), so it is written as a JSON number. Wider decimals are
@@ -120,7 +121,8 @@ impl Default for ResultBudget {
 
 impl ResultBudget {
     /// The budget for a model with a context window of `context_window_tokens`: one tenth of the
-    /// window at four bytes per token, between [`MIN_RESULT_BYTES`] and [`MAX_RESULT_BYTES`].
+    /// window at four bytes per token, between [`MIN_RESULT_BYTES`] and [`MAX_RESULT_BYTES`]. The
+    /// share is nominal: a result of two-byte tokens takes up to a fifth of the window.
     #[must_use]
     pub fn for_context_window(context_window_tokens: Option<u64>) -> Self {
         let Some(tokens) = context_window_tokens else {
