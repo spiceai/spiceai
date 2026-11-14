@@ -35,9 +35,14 @@ limitations under the License.
 //! The rewrite only does early what coercion and constant folding do anyway:
 //! comparing the decimal with a decimal literal of the type coercion chose
 //! coerces to that same type. A constant whose cast fails (it overflows the
-//! type) is left as it was, so the query fails or answers as before.
+//! type) is left as it was, so the query fails or answers as before. So is a
+//! constant whose integer arithmetic overflows: the fold checks it as
+//! [`CheckedIntegerOverflow`] would, because `DataFusion`'s own integer `+`
+//! wraps, and `(9223372036854775807 + 1) * 1e-19` would otherwise fold to
+//! `-0.922337203685478` where the query fails with an overflow.
 //!
 //! [`ExactFloatLiteralDecimalCast`]: super::ExactFloatLiteralDecimalCast
+//! [`CheckedIntegerOverflow`]: crate::checked_arithmetic::CheckedIntegerOverflow
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -53,6 +58,7 @@ use datafusion::optimizer::AnalyzerRule;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 
 use super::exact_float_decimal_cast::exact_literal_decimal;
+use crate::checked_arithmetic::checked_integer_arith;
 
 /// Replaces constant float operands of decimal comparisons with decimal
 /// literals. See the module docs.
@@ -198,12 +204,13 @@ fn decimal_operand(against: &Expr, constant: &Expr, schema: &DFSchema) -> Option
     {
         return Some(Expr::Literal(decimal, None));
     }
-    // What the optimizer folds the coerced cast to: the float evaluated, then
-    // cast by Arrow.
+    // What the optimizer folds the coerced cast to: the float evaluated, its
+    // integer arithmetic checked, then cast by Arrow.
     let simplifier = ExprSimplifier::new(SimplifyContext::default());
     let cast = Expr::Cast(Cast::new(Box::new(constant.clone()), target.clone()));
     let folded = simplifier
         .coerce(cast, DFSchema::empty_ref())
+        .and_then(|cast| checked_integer_arith(cast, DFSchema::empty_ref()))
         .and_then(|cast| simplifier.simplify(cast))
         .ok()?;
     match folded {
@@ -303,6 +310,19 @@ mod tests {
                 .and(lit(0.07).gt_eq(col("disc"))),
         );
         insta::assert_snapshot!("literals_in_an_in_list_and_on_either_side", mysql);
+    }
+
+    #[test]
+    fn integer_arithmetic_folds_only_when_it_does_not_overflow() {
+        let (mysql, _) = analyzed_sql(
+            col("disc")
+                .gt((lit(i64::MAX) + lit(1_i64)) * lit(1e-19))
+                .and(col("disc").lt((lit(1_i64) + lit(2_i64)) * lit(0.01))),
+        );
+        insta::assert_snapshot!(
+            "integer_arithmetic_folds_only_when_it_does_not_overflow",
+            mysql
+        );
     }
 
     #[test]

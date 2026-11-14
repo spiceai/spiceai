@@ -176,6 +176,19 @@ steps:
   - query: SELECT id, c / k FROM edge
     expect-error: 'ERROR: bigint out of range'
     when: { backend: postgres }
+  # An integer overflow inside a float constant compared with a decimal fails
+  # as well, rather than folding to the wrapped value before federation:
+  # MySQL and ClickHouse leave the comparison to Spice, the others receive it
+  # as written.
+  - query: SELECT id FROM q WHERE disc > (9223372036854775807 + 1) * 1e-19
+    expect-error: 'Overflow happened on: 9223372036854775807 + 1'
+    when: { backend: [mysql, clickhouse] }
+  - query: SELECT id FROM q WHERE disc > (9223372036854775807 + 1) * 1e-19
+    expect-error: 'ERROR: bigint out of range'
+    when: { backend: postgres }
+  - query: SELECT id FROM q WHERE disc > (9223372036854775807 + 1) * 1e-19
+    expect-error: 'Overflow in addition of INT64'
+    when: { backend: [duckdb, ducklake] }
   # MySQL reads `||` as OR, divides integers exactly with `/`, and reads
   # `30000.0` as a DECIMAL, so it is sent CONCAT, DIV and a float literal.
   - explain: SELECT id, s || '!' FROM t
@@ -220,9 +233,10 @@ steps:
     contains: [VirtualExecutionPlan, "stddev_samp(DISTINCT "]
     when: { backend: postgres }
   # So Spice computes `bit_xor(DISTINCT a)` beside a second DISTINCT argument,
-  # and keeps the DISTINCT rather than rewriting it into a GROUP BY.
+  # and the aggregate itself keeps the DISTINCT: a rewrite into a GROUP BY
+  # would keep only the output name `bit_xor(DISTINCT w.a)`.
   - explain: SELECT g, bit_xor(DISTINCT a), count(DISTINCT k), sum(DISTINCT a) FROM w GROUP BY g
-    contains: [VirtualExecutionPlan, "bit_xor(DISTINCT w.a)"]
+    contains: [VirtualExecutionPlan, "aggr=[bit_xor(DISTINCT w.a)"]
     when: { backend: mysql }
   # Neither MySQL nor PostgreSQL takes DISTINCT in a window function.
   - explain: SELECT id, count(DISTINCT x) OVER (PARTITION BY g) FROM w
