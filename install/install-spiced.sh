@@ -111,14 +111,15 @@ verifySupported() {
     exit 1
 }
 
+# Runs its arguments as one command, through sudo when the install directory needs it. The
+# arguments pass through as they are and are never parsed again, so a path holding spaces,
+# quotes or `;` stays one literal argument and never runs as shell syntax.
 runAsRoot() {
-    local CMD="$*"
-
     if [ $EUID -ne 0 ] && [ "$USE_SUDO" = "true" ]; then
-        CMD="sudo $CMD"
+        sudo -- "$@"
+    else
+        "$@"
     fi
-
-    eval "$CMD"
 }
 
 checkHttpRequestCLI() {
@@ -493,9 +494,14 @@ installCompleted() {
 # -----------------------------------------------------------------------------
 trap "fail_trap" EXIT
 
-mkdir -p "$SPICED_INSTALL_DIR"
-
 getSystemInfo
+
+# Only now, once getSystemInfo has decided whether the install directory needs sudo. A plain
+# mkdir before that fails under `set -e` for a non-root user whose /usr/local/bin is missing.
+if [ ! -d "$SPICED_INSTALL_DIR" ]; then
+    runAsRoot mkdir -p "$SPICED_INSTALL_DIR"
+fi
+
 verifySupported
 checkHttpRequestCLI
 
