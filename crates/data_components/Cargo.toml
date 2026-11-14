@@ -207,7 +207,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 wiremock = "0.6"
-zstd = "0.13.3"
+zstd = "0.13.5"
 
 [[bench]]
 harness = false

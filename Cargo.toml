@@ -207,7 +207,7 @@ arrow-json = "59.3.2"
 arrow-odbc = "25.3" # 25.2+ accepts arrow ">=29, <60", so it resolves to the workspace Arrow 59
 arrow-row = "59.3.2"
 arrow-schema = "59.3.2"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "307eaf407cbf71afa967f3008250ba96c79626b7", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c1bf4a090c50e18f27663b008dac4c108e49b994", features = [
     "byot",
     "embedding",
     "chat-completion",
@@ -408,7 +408,7 @@ regex = "1.12.3"
 regex-syntax = "0.8.10"
 reqwest = { version = "0.13", features = ["json", "query", "rustls", "gzip", "brotli", "zstd", "deflate"] }
 reqsign-core = "3.0.0"
-rmcp = { version = "3.3.0", default-features = false }
+rmcp = { version = "3.10.0", default-features = false }
 rayon = "1.11.0"
 roaring = "0.11"
 rusqlite = { version = "0.40", features = ["bundled-decimal", "chrono"] }
@@ -436,7 +436,7 @@ spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "f5557381f79f1535014e0dc0555c53ac8de1cafc" } # branch: spiceai-59
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
-suppaftp = { version = "6.3.0", features = ["async"] }
+suppaftp = { version = "12.2.1", features = ["tokio"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.4"
 system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "8a90555dcb14e2bbbde8263d225f2c4e7ee547fc", features = ["client", "server"] }
@@ -492,7 +492,7 @@ turso-shared = { path = "crates/turso-shared" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }
-utoipa = { version = "5" }
+utoipa = { version = "6" }
 uuid = "1"
 # Specification and proof vocabulary for every crate that opts into
 # `[package.metadata.verus]`. A normal `cargo build` erases the specifications,
@@ -500,7 +500,7 @@ uuid = "1"
 # verifier and `vstd` ship together, so this moves with `VERUS_VSTD_VERSION` in
 # `.github/workflows/verus_verify.yml`.
 vstd = "=0.0.0-2026-09-20-0158"
-wasmtime = { version = "48.0.7", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "48.0.8", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"
 
 flatbuffers = "25.2.10"
@@ -686,3 +686,8 @@ vortex-datafusion = { path = "crates/vortex" }
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
+
+# `ttf-parser` is unmaintained (RUSTSEC-2026-0192). The workspace vendors it under
+# `crates/vendor/ttf-parser` for `lopdf` and `pdf-extract`; this patch routes the
+# crates.io consumers (`pdf-inspector` and its `lopdf` 0.42) to the same vendored copy.
+ttf-parser = { path = "crates/vendor/ttf-parser" }
