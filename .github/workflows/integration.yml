@@ -1458,6 +1458,25 @@ jobs:
           mkdir -p ./integration_tests
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
+      # hadoop_catalog_test reads a Spark-written Iceberg warehouse from the `hadoop` bucket.
+      # The bucket used to be seeded by hand once, so when the shared MinIO lost it every
+      # run failed with NoSuchBucket. Mirror the checked-in copy on each run: `--remove`
+      # keeps the bucket to exactly the fixture, because the test asserts exact namespace
+      # and table counts. Concurrent runs write identical bytes, so they cannot disturb
+      # each other.
+      - name: Restore the Hadoop warehouse fixture in MinIO
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        run: |
+          set -euo pipefail
+          fixture=crates/data_components/tests/hadoop_data/warehouse
+          test -f "${fixture}/test/my_table_1/metadata/version-hint.text" || {
+            echo "::error::${fixture} is missing its checked-in tables; see crates/data_components/tests/hadoop_data/README.md."
+            exit 1
+          }
+          mc mb --ignore-existing spice-minio/hadoop
+          mc mirror --overwrite --remove "${fixture}" spice-minio/hadoop
+          mc ls --recursive spice-minio/hadoop
+
       - name: Download data components test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
