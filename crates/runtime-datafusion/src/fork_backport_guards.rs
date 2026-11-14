@@ -550,35 +550,22 @@ async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows
     }
 }
 
-/// spiceai/datafusion#277. An ordered aggregate (here one whose leading group
-/// key is a constant, as TPC-DS Q78's `d_year` is under `d_year = 2000`) must
-/// emit the groups left at end of input with one `EmitTo::All`. Emitting them as
-/// repeated `EmitTo::First(batch_size)` renumbers every group still held, so the
-/// drain costs time quadratic in the group count.
-#[tokio::test]
-async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
+/// An aggregate UDF computing `SUM(v)` over `Int64` that records every `EmitTo`
+/// it is asked for, so a guard can see how an aggregate drains its groups.
+mod emit_probe {
     use std::sync::{Arc, Mutex};
 
-    use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{ArrayRef, BooleanArray, Int64Array};
+    use arrow::datatypes::DataType;
     use datafusion::common::{Result, not_impl_err};
-    use datafusion::datasource::memory::MemorySourceConfig;
-    use datafusion::datasource::source::DataSourceExec;
-    use datafusion::execution::TaskContext;
     use datafusion::logical_expr::function::AccumulatorArgs;
     use datafusion::logical_expr::{
         Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Signature,
         Volatility,
     };
-    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
-    use datafusion::physical_expr::expressions::col;
-    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
-    use datafusion::physical_plan::{ExecutionPlan, InputOrderMode, collect};
 
-    type Emits = Arc<Mutex<Vec<EmitTo>>>;
+    pub(super) type Emits = Arc<Mutex<Vec<EmitTo>>>;
 
-    /// `SUM(v)` that records every `EmitTo` it is asked for.
     #[derive(Debug)]
     struct EmitProbe {
         signature: Signature,
@@ -683,19 +670,67 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
         }
     }
 
-    const BATCH_SIZE: usize = 8;
-    const GROUPS: usize = 10 * BATCH_SIZE;
+    /// A probe UDF and the log its accumulators append to.
+    pub(super) fn probe() -> (Arc<AggregateUDF>, Emits) {
+        let emits = Emits::default();
+        let udf = Arc::new(AggregateUDF::from(EmitProbe {
+            signature: Signature::exact(vec![DataType::Int64], Volatility::Immutable),
+            emits: Arc::clone(&emits),
+        }));
+        (udf, emits)
+    }
+}
+
+/// `(k, g, probe)` rows of `batches`, sorted.
+fn emitted_groups(batches: &[arrow::array::RecordBatch]) -> Vec<(i32, i32, i64)> {
+    use arrow::array::{Int32Array, Int64Array};
+    let mut got: Vec<(i32, i32, i64)> = batches
+        .iter()
+        .flat_map(|batch| {
+            let column = |index: usize| batch.column(index).as_any();
+            let k = column(0).downcast_ref::<Int32Array>().expect("k is Int32");
+            let g = column(1).downcast_ref::<Int32Array>().expect("g is Int32");
+            let probe = column(2)
+                .downcast_ref::<Int64Array>()
+                .expect("probe is Int64");
+            (0..batch.num_rows())
+                .map(|row| (k.value(row), g.value(row), probe.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    got.sort_unstable();
+    got
+}
+
+const ORDERED_AGGREGATE_BATCH_SIZE: usize = 8;
+const ORDERED_AGGREGATE_GROUPS: usize = 10 * ORDERED_AGGREGATE_BATCH_SIZE;
+
+/// Rows `(k = 2000, g, v = g)` for every group `g`, declared sorted on `k`, and
+/// their schema. The leading group key is a constant, as TPC-DS Q78's `d_year`
+/// is under `d_year = 2000`, so every group is still open at end of input.
+fn ordered_aggregate_input() -> (
+    arrow::datatypes::SchemaRef,
+    std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) {
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int32, false),
         Field::new("g", DataType::Int32, false),
         Field::new("v", DataType::Int64, false),
     ]));
-    let groups = i32::try_from(GROUPS).expect("group count fits in i32");
+    let groups = i32::try_from(ORDERED_AGGREGATE_GROUPS).expect("group count fits in i32");
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
-            Arc::new(Int32Array::from(vec![2000; GROUPS])),
+            Arc::new(Int32Array::from(vec![2000; ORDERED_AGGREGATE_GROUPS])),
             Arc::new(Int32Array::from_iter_values(0..groups)),
             Arc::new(Int64Array::from_iter_values((0..groups).map(i64::from))),
         ],
@@ -709,13 +744,28 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
         .expect("memory source builds")
         .try_with_sort_information(vec![ordering])
         .expect("input is sorted on k");
-    let input = DataSourceExec::from_data_source(input);
+    (schema, DataSourceExec::from_data_source(input))
+}
 
-    let emits = Emits::default();
-    let probe = Arc::new(AggregateUDF::from(EmitProbe {
-        signature: Signature::exact(vec![DataType::Int64], Volatility::Immutable),
-        emits: Arc::clone(&emits),
-    }));
+/// spiceai/datafusion#277, the ordered partial path (upstream from `DataFusion`
+/// 55.3.0 as apache/datafusion#25312). An ordered aggregate must emit the
+/// groups left at end of input with one `EmitTo::All`. Emitting them as
+/// repeated `EmitTo::First(batch_size)` renumbers every group still held, so
+/// the drain costs time quadratic in the group count.
+#[tokio::test]
+async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
+    use std::sync::Arc;
+
+    use arrow::array::RecordBatch;
+    use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::EmitTo;
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::{ExecutionPlan, InputOrderMode, collect};
+
+    let (schema, input) = ordered_aggregate_input();
+    let (probe, emits) = emit_probe::probe();
     let aggregate = AggregateExec::try_new(
         AggregateMode::Partial,
         PhysicalGroupBy::new_single(vec![
@@ -743,32 +793,22 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
         aggregate.input_order_mode()
     );
 
-    let config = get_df_default_config().with_batch_size(BATCH_SIZE);
+    let config = get_df_default_config().with_batch_size(ORDERED_AGGREGATE_BATCH_SIZE);
     let task = Arc::new(TaskContext::default().with_session_config(config));
     let output = collect(Arc::new(aggregate) as Arc<dyn ExecutionPlan>, task)
         .await
         .expect("aggregate runs");
 
     let rows: Vec<usize> = output.iter().map(RecordBatch::num_rows).collect();
-    assert_eq!(rows, vec![BATCH_SIZE; GROUPS / BATCH_SIZE]);
-    let mut got: Vec<(i32, i32, i64)> = output
-        .iter()
-        .flat_map(|batch| {
-            let column = |index: usize| batch.column(index).as_any();
-            let k = column(0).downcast_ref::<Int32Array>().expect("k is Int32");
-            let g = column(1).downcast_ref::<Int32Array>().expect("g is Int32");
-            let probe = column(2)
-                .downcast_ref::<Int64Array>()
-                .expect("probe is Int64");
-            (0..batch.num_rows())
-                .map(|row| (k.value(row), g.value(row), probe.value(row)))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    got.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![ORDERED_AGGREGATE_BATCH_SIZE; ORDERED_AGGREGATE_GROUPS / ORDERED_AGGREGATE_BATCH_SIZE]
+    );
+    let groups = i32::try_from(ORDERED_AGGREGATE_GROUPS).expect("group count fits in i32");
     let expected: Vec<(i32, i32, i64)> = (0..groups).map(|g| (2000, g, i64::from(g))).collect();
     assert_eq!(
-        got, expected,
+        emitted_groups(&output),
+        expected,
         "every group must be emitted once with its sum"
     );
     let emits = emits.lock().expect("emit log lock is not poisoned").clone();
@@ -776,6 +816,105 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
         emits,
         vec![EmitTo::All],
         "the groups left at end of input must be emitted once"
+    );
+}
+
+/// An ordered final aggregate over sorted partial states, holding more groups
+/// than `batch_size` at end of input, returns every group exactly once with its
+/// merged state, in `batch_size` batches. The fork drains this path through
+/// spiceai/datafusion#277's single `EmitTo::All`, so the test checks that the
+/// drain neither drops, repeats nor mis-slices a group.
+#[tokio::test]
+async fn an_ordered_final_aggregate_returns_every_group_once() {
+    use std::sync::Arc;
+
+    use arrow::array::RecordBatch;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::{ExecutionPlan, InputOrderMode, collect};
+
+    let (schema, input) = ordered_aggregate_input();
+    let group_by = PhysicalGroupBy::new_single(vec![
+        (col("k", &schema).expect("k exists"), "k".to_string()),
+        (col("g", &schema).expect("g exists"), "g".to_string()),
+    ]);
+    let aggregate_expr = |probe| {
+        vec![Arc::new(
+            AggregateExprBuilder::new(probe, vec![col("v", &schema).expect("v exists")])
+                .schema(Arc::clone(&schema))
+                .alias("probe")
+                .build()
+                .expect("aggregate builds"),
+        )]
+    };
+    let config = get_df_default_config().with_batch_size(ORDERED_AGGREGATE_BATCH_SIZE);
+    let task = Arc::new(TaskContext::default().with_session_config(config));
+
+    // The partial states, as a sorted input to the final aggregate.
+    let (partial_probe, _) = emit_probe::probe();
+    let partial = AggregateExec::try_new(
+        AggregateMode::Partial,
+        group_by.clone(),
+        aggregate_expr(partial_probe),
+        vec![None],
+        input,
+        Arc::clone(&schema),
+    )
+    .expect("partial aggregate plans");
+    let partial_schema = partial.schema();
+    let states = collect(
+        Arc::new(partial) as Arc<dyn ExecutionPlan>,
+        Arc::clone(&task),
+    )
+    .await
+    .expect("partial aggregate runs");
+    let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+        col("k", &partial_schema).expect("k exists"),
+    )])
+    .expect("ordering is not empty");
+    let states = MemorySourceConfig::try_new(&[states], Arc::clone(&partial_schema), None)
+        .expect("memory source builds")
+        .try_with_sort_information(vec![ordering])
+        .expect("states are sorted on k");
+
+    let (final_probe, _) = emit_probe::probe();
+    let aggregate = AggregateExec::try_new(
+        AggregateMode::Final,
+        group_by.as_final(),
+        aggregate_expr(final_probe),
+        vec![None],
+        DataSourceExec::from_data_source(states),
+        Arc::clone(&schema),
+    )
+    .expect("final aggregate plans");
+    assert!(
+        matches!(
+            aggregate.input_order_mode(),
+            InputOrderMode::PartiallySorted(_)
+        ),
+        "the guard needs the ordered aggregate path, got {:?}",
+        aggregate.input_order_mode()
+    );
+    let output = collect(Arc::new(aggregate) as Arc<dyn ExecutionPlan>, task)
+        .await
+        .expect("final aggregate runs");
+
+    let rows: Vec<usize> = output.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(
+        rows,
+        vec![ORDERED_AGGREGATE_BATCH_SIZE; ORDERED_AGGREGATE_GROUPS / ORDERED_AGGREGATE_BATCH_SIZE]
+    );
+    let groups = i32::try_from(ORDERED_AGGREGATE_GROUPS).expect("group count fits in i32");
+    let expected: Vec<(i32, i32, i64)> = (0..groups).map(|g| (2000, g, i64::from(g))).collect();
+    assert_eq!(
+        emitted_groups(&output),
+        expected,
+        "every group must be emitted once with its sum"
     );
 }
 

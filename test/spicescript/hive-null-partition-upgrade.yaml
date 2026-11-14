@@ -1,0 +1,71 @@
+name: hive-null-partition-upgrade
+description: >
+  A Cayenne file acceleration of a Hive-partitioned dataset written by the 2.4
+  release, which reads the `__HIVE_DEFAULT_PARTITION__` directory as that
+  literal string in a NOT NULL partition column, is upgraded to the binary
+  under test with `on_schema_change: sync_all_columns`. A full refresh then
+  replaces the marker with NULL in a nullable column, as a fresh acceleration
+  reads it (apache/datafusion#26310).
+
+from: 2.4.x
+
+sources:
+  lake: { kind: files }
+
+variants:
+  cayenne:
+    datasets:
+      h:
+        acceleration:
+          enabled: true
+          engine: cayenne
+          mode: file
+          refresh_mode: full
+          refresh_check_interval: 1h
+          params: { cayenne_file_path: '${instance.dir}/h', cayenne_metadata_dir: '${instance.dir}/meta' }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: hive-null-partition-upgrade
+  datasets:
+    - from: 'file://${sources.lake.path}/h/'
+      name: h
+      params: { file_format: parquet, hive_partitioning_enabled: true }
+
+steps:
+  - generate:
+      lake:
+        table: h/year=2024
+        rows: 3
+        seed: 1
+        columns: [{ name: id, sequence: 1 }]
+  - generate:
+      lake:
+        table: h/year=__HIVE_DEFAULT_PARTITION__
+        rows: 2
+        seed: 2
+        columns: [{ name: id, sequence: 100 }]
+  - start: {}
+  # On the release: the marker is read as the literal string, in a NOT NULL column.
+  - query: SELECT id, year FROM h ORDER BY id LIMIT 5
+    id: release-rows
+    expect: { rows: [['1', '2024'], ['2', '2024'], ['3', '2024'], ['100', '__HIVE_DEFAULT_PARTITION__'], ['101', '__HIVE_DEFAULT_PARTITION__']] }
+  - query: SELECT data_type, is_nullable FROM information_schema.columns WHERE table_name = 'h' AND column_name = 'year'
+    expect: { rows: [['Utf8', 'NO']] }
+  # `sync_all_columns` lets the acceleration take the nullable column; without
+  # it the acceleration keeps NOT NULL and the refresh below fails on the NULLs.
+  - upgrade: { patch: { datasets: { h: { on_schema_change: sync_all_columns } } } }
+  # Before any refresh: the column is widened at startup, and the acceleration
+  # still serves the rows the release wrote.
+  - query: SELECT id, year FROM h ORDER BY id LIMIT 5
+    expect: { same-as: release-rows }
+  - query: SELECT data_type, is_nullable FROM information_schema.columns WHERE table_name = 'h' AND column_name = 'year'
+    expect: { rows: [['Utf8', 'YES']] }
+  - refresh: h
+  - query: SELECT count(*) AS n FROM h WHERE year IS NULL
+    expect: { rows: [['2']] }
+  - query: SELECT id, year FROM h ORDER BY id LIMIT 5
+    expect: { rows: [['1', '2024'], ['2', '2024'], ['3', '2024'], ['100', null], ['101', null]] }
+  - query: SELECT data_type, is_nullable FROM information_schema.columns WHERE table_name = 'h' AND column_name = 'year'
+    expect: { rows: [['Utf8', 'YES']] }
