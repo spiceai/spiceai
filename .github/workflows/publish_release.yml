@@ -13,6 +13,12 @@ name: publish_release
 #      build_release run attested each of them;
 #   2. `images` builds the Docker images from the published binaries, and its
 #      two push jobs (the multi-arch image and the CUDA image) push them.
+# After `publish`, `install-site` checks install.spiceai.org and needs no
+# approval. The site serves the scripts of a release pinned in the
+# install.spiceai.org Worker's repository, which cannot be this release yet,
+# so the job fails only when what the site serves is not exactly a published
+# release's scripts at that release's tagged commit, and warns with the pin to
+# make when that release is earlier than the latest.
 # Only publishing creates a release tag. Nothing already published is
 # replaced. To retry a failed step, re-run the failed jobs of the same run.
 on:
@@ -149,6 +155,25 @@ jobs:
             echo "arm64=$(sum spiced_linux_aarch64.tar.gz)"
             echo "cuda=$(sum spiced_cuda_80_linux_x86_64.tar.gz)"
           } | tee -a "$GITHUB_OUTPUT"
+
+  install-site:
+    environment: secret-free
+    name: Check install.spiceai.org
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Check install.spiceai.org against the latest release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 ./.github/scripts/verify_install_site.py --allow-earlier-release
 
   images:
     name: Docker images

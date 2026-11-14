@@ -11963,6 +11963,7 @@ dependencies = [
  "llama-cpp",
  "llms",
  "mistralrs-core",
+ "nix 0.30.1",
  "rand 0.10.1",
  "runtime-request-context",
  "runtime-resources",

@@ -69,6 +69,10 @@ on:
         description: 'The published image tag (echo of the input)'
         value: ${{ jobs.setup.outputs.tag }}
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   setup:
     environment: secret-free
