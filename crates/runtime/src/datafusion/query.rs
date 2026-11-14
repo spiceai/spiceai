@@ -2315,7 +2315,11 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
     } else {
         let mut builder = SchemaBuilder::new();
         for (name, typ) in parameters {
-            builder.push(Field::new(name, typ, false));
+            // A placeholder accepts NULL like any other SQL value, and the plan
+            // carries no constraint that would forbid it. Clients that follow
+            // the advertised schema (Arrow Flight SQL JDBC) refuse to bind NULL
+            // to a non-nullable parameter.
+            builder.push(Field::new(name, typ, true));
         }
         Some(builder.finish())
     };
