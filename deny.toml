@@ -5,11 +5,8 @@ all-features = true
 [advisories]
 # cargo-deny v2 schema: vulnerability, unmaintained, unsound, and notice
 # advisories all fail the check by default. Yanked crates also fail.
-# To bypass a specific advisory, add its RUSTSEC ID (or, for a yanked crate,
-# its `crate@version`) to `ignore` with a comment explaining why and an owner.
-# Do not add new unmaintained advisories: they stay in the nightly advisory
-# report until the crate is upgraded, replaced, or vendored under
-# `crates/vendor/`. The unmaintained entries below predate this rule.
+# To bypass a specific advisory, add its RUSTSEC ID to `ignore` with a
+# comment explaining why and an owner.
 version = 2
 yanked = "deny"
 ignore = [
