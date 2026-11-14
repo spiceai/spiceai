@@ -266,6 +266,10 @@ seed_files() {
   write_all_json_shapes "$JSON_BASELINE_1" "$JSON_BASELINE_2"
 }
 
+# Each accelerated dataset makes one refresh attempt. A refresh's task-history
+# row is written when it ends, and refresh completion waits for that row
+# (`refresh_is_complete`); a failed refresh that kept retrying would write no row
+# until its retries ran out.
 seed_spicepod() {
   mkdir -p "${WORK}/data"
   local data
@@ -287,6 +291,7 @@ datasets:
       enabled: true
       engine: arrow
       refresh_mode: full
+      refresh_retry_max_attempts: 1
   - from: file:${data}/events.jsonl
     name: json_fed
     params:
@@ -299,6 +304,7 @@ datasets:
       enabled: true
       engine: arrow
       refresh_mode: full
+      refresh_retry_max_attempts: 1
   - from: file:${data}/events.json
     name: json_array_fed
     params:
@@ -311,6 +317,7 @@ datasets:
       enabled: true
       engine: arrow
       refresh_mode: full
+      refresh_retry_max_attempts: 1
   - from: file:${data}/events_pointer.json
     name: json_ptr_fed
     params:
@@ -325,6 +332,7 @@ datasets:
       enabled: true
       engine: arrow
       refresh_mode: full
+      refresh_retry_max_attempts: 1
 YAML
   seed_files
 }
