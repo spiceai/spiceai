@@ -5,27 +5,16 @@ all-features = true
 [advisories]
 # cargo-deny v2 schema: vulnerability, unmaintained, unsound, and notice
 # advisories all fail the check by default. Yanked crates also fail.
-# To bypass a specific advisory, add its RUSTSEC ID to `ignore` with a
-# comment explaining why and an owner.
+# To bypass a vulnerability, unsound, or yanked finding, add its RUSTSEC ID (or,
+# for a yanked crate, its `crate@version`) to `ignore` with a comment explaining
+# why and an owner. Unmaintained advisories are never ignored: they stay in the
+# nightly advisory report until the crate is upgraded, replaced, or vendored
+# under `crates/vendor/`.
 version = 2
 yanked = "deny"
 ignore = [
-  # Runtime serialization pulls `atomic-polyfill` through `postcard`/`heapless`; no safe upgrade is available yet. Owner: runtime.
-  "RUSTSEC-2023-0089",
-  # A transitive local-model dependency still pulls `dotenv`; no safe upgrade is available yet. Owner: llms.
-  "RUSTSEC-2021-0141",
-  # Local model search dependencies pull `fxhash`; no safe upgrade is available yet. Owner: llms.
-  "RUSTSEC-2025-0057",
-  # Progress-display dependencies pull `number_prefix`; no safe upgrade is available yet. Owner: llms.
-  "RUSTSEC-2025-0119",
-  # `paste` is widely used by proc-macro/data connector dependencies; no safe upgrade is available yet. Owner: runtime/data connectors.
-  "RUSTSEC-2024-0436",
   # Object store signing dependencies pull `rsa`; no safe upgrade is available yet. Owner: data components/runtime.
   "RUSTSEC-2023-0071",
-  # `rustls-pemfile` is unmaintained. Runtime no longer depends on it directly
-  # (uses `rustls::pki_types::pem` instead), but the spice-rs SDK (`spiceai`
-  # crate) still pulls v1.x transitively. Owner: spice-rs / runtime.
-  "RUSTSEC-2025-0134",
   # `quick-xml` quadratic duplicate-attribute check on start tags (DoS). Pulled
   # transitively in several versions (via vortex, AWS-XML, and serialization
   # dependencies); no single safe upgrade across all pins yet. Owner: data components/runtime.
@@ -34,32 +23,14 @@ ignore = [
   # (memory-exhaustion DoS), same transitive chain as RUSTSEC-2026-0194; no safe
   # upgrade yet. Owner: data components/runtime.
   "RUSTSEC-2026-0195",
-  # `pin-utils` is unmaintained. It is pulled by `aws-smithy-http` 0.63, the line
-  # the AWS SDK crates still require, and by `wasmtimer`; no release of either
-  # drops it yet. Owner: data connectors/runtime.
-  "RUSTSEC-2026-0441",
-  # `proc-macro-error2` is unmaintained. It is a compile-time proc-macro helper
-  # of `tabled_derive`, pulled by `sideway` through `mistralrs-quant`; no safe
-  # upgrade is available yet. Owner: llms.
-  "RUSTSEC-2026-0173",
-  # `unsafe-libyaml` is unmaintained. `substrait` uses it through `serde_yaml` in
-  # its build script only, to read its own bundled extension YAML; the version is
-  # pinned by `datafusion-substrait`. Owner: runtime.
-  "RUSTSEC-2024-0449",
   # `h2` unbounded empty DATA frames. The shipped `h2` 0.4 is on a fixed release;
   # only `h2` 0.3 remains, reached solely through `chdb-rust` 1.x, whose build
   # script downloads `libchdb` with `reqwest` 0.11. `chdb-rust` is optional and
   # enabled only by cayenne's chDB oracle tests and benches; it is not linked into
   # `spiced`. Owner: cayenne.
   "RUSTSEC-2026-0258",
-  # `im` is unmaintained, as are its `bitmaps` and `sized-chunks` dependencies.
-  # Cayenne uses only `im::HashMap` for its deletion-index and mem-tier tombstone
-  # maps, never the `OrdSet` that RUSTSEC-2023-0126 concerns. The maintained fork
-  # `imbl` measured slower on the deletion index's insert and clone paths, so the
-  # swap needs its own performance work. Owner: cayenne.
-  "RUSTSEC-2026-0248",
-  "RUSTSEC-2026-0247",
-  "RUSTSEC-2026-0251",
+  # `im` `OrdSet` insertion aliasing violation. Cayenne uses only `im::HashMap`,
+  # never `OrdSet`. Owner: cayenne.
   "RUSTSEC-2023-0126",
   # `tpcdsgen` 0.1.0-alpha.1 is yanked. It is a dev-dependency of cayenne that
   # generates the TPC-DS fixture of the SQLite and chDB correctness lanes, whose
