@@ -219,6 +219,11 @@ steps:
   - explain: SELECT g, stddev(DISTINCT x) FROM w GROUP BY g
     contains: [VirtualExecutionPlan, "stddev_samp(DISTINCT "]
     when: { backend: postgres }
+  # So Spice computes `bit_xor(DISTINCT a)` beside a second DISTINCT argument,
+  # and keeps the DISTINCT rather than rewriting it into a GROUP BY.
+  - explain: SELECT g, bit_xor(DISTINCT a), count(DISTINCT k), sum(DISTINCT a) FROM w GROUP BY g
+    contains: [VirtualExecutionPlan, "bit_xor(DISTINCT w.a)"]
+    when: { backend: mysql }
   # Neither MySQL nor PostgreSQL takes DISTINCT in a window function.
   - explain: SELECT id, count(DISTINCT x) OVER (PARTITION BY g) FROM w
     contains: [VirtualExecutionPlan]

@@ -40,7 +40,10 @@ SELECT stddev(f), stddev_pop(f), var_samp(f), var_pop(f) FROM t WHERE id < 0;
 SELECT id, stddev(x) OVER (PARTITION BY g), var_samp(x) OVER (PARTITION BY g) FROM w;
 SELECT id, stddev_pop(x) OVER (PARTITION BY g), var_pop(x) OVER (PARTITION BY g) FROM w;
 SELECT g, stddev(DISTINCT x), var_samp(DISTINCT x), stddev_pop(DISTINCT x), var_pop(DISTINCT x) FROM w GROUP BY g;
-SELECT g, bit_xor(DISTINCT a), count(DISTINCT a), sum(DISTINCT a) FROM w GROUP BY g;
+-- Two DISTINCT arguments keep `SingleDistinctToGroupBy` from rewriting the
+-- DISTINCTs into a GROUP BY, so `bit_xor(DISTINCT a)` runs on its distinct
+-- accumulator wherever it is computed locally.
+SELECT g, bit_xor(DISTINCT a), count(DISTINCT k), sum(DISTINCT a) FROM w GROUP BY g;
 -- PostgreSQL has no DISTINCT in a window function.
 -- oracle-sql: SELECT w.id, d.n FROM w JOIN (SELECT g, count(DISTINCT x) AS n FROM w GROUP BY g) AS d ON w.g = d.g
 SELECT id, count(DISTINCT x) OVER (PARTITION BY g) FROM w;
