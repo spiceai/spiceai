@@ -8369,32 +8369,6 @@ mod tests {
         generic_engine_compaction_support(&AccelerationEngine::Cayenne, false);
     }
 
-    // ==================== SQLite Engine Tests ====================
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn sqlite_download_returns_none_without_metadata() {
-        generic_download_returns_none_without_metadata(&AccelerationEngine::Sqlite).await;
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn sqlite_create_snapshot_updates_metadata() {
-        generic_create_snapshot_updates_metadata(&AccelerationEngine::Sqlite).await;
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn sqlite_download_snapshot_with_valid_metadata() {
-        generic_download_snapshot_with_valid_metadata(&AccelerationEngine::Sqlite).await;
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[test]
-    fn sqlite_engine_does_not_support_compaction() {
-        generic_engine_compaction_support(&AccelerationEngine::Sqlite, false);
-    }
-
     /// An absent accelerator file must fail the snapshot, not become one. Every engine
     /// hook opens that file as a database, and each driver's open creates one at a path
     /// that has none — so without the guard in `create_file_snapshot` the hook would

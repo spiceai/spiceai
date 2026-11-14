@@ -66,37 +66,28 @@ use crate::utils::{register_test_connectors, runtime_ready_check, test_request_c
 use crate::{init_tracing, run_query};
 
 mod cayenne;
-#[cfg(feature = "sqlite")]
-mod sqlite;
 
 const DATASET_NAME: &str = "trips";
 const SNAPSHOT_BUCKET: &str = "spiceai-snapshot-integration-tests";
 const SNAPSHOT_REGION: &str = "us-west-2";
 
-/// Engine variants exercised by these tests. Each variant is enabled at
-/// compile time only when the corresponding feature is on, mirroring the
-/// `AccelerationEngine` enum in `runtime-acceleration`.
+/// Engine variants exercised by these tests, mirroring the `AccelerationEngine`
+/// enum in `runtime-acceleration`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum EngineKind {
     Cayenne,
-    #[cfg(feature = "sqlite")]
-    Sqlite,
 }
 
 impl EngineKind {
     fn engine_name(self) -> &'static str {
         match self {
             Self::Cayenne => "cayenne",
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite => "sqlite",
         }
     }
 
     fn file_extension(self) -> &'static str {
         match self {
             Self::Cayenne => "cayenne",
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite => "sqlite",
         }
     }
 }
@@ -249,13 +240,6 @@ impl SnapshotRefreshFixture {
                 params.insert(
                     "cayenne_metadata_dir".to_string(),
                     metadata_dir.to_string_lossy().into_owned(),
-                );
-            }
-            #[cfg(feature = "sqlite")]
-            EngineKind::Sqlite => {
-                params.insert(
-                    "sqlite_file".to_string(),
-                    local_db_path.to_string_lossy().into_owned(),
                 );
             }
         }

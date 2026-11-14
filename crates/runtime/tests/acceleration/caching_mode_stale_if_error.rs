@@ -1072,7 +1072,6 @@ async fn a_5xx_response_is_not_cached_by_the_sql_results_cache_under_a_narrow_pr
 /// Regression tests for #15356: an origin that answers `[]` to a cached request
 /// has retracted the rows it returned before, so that answer replaces the
 /// entry, on the file-mode Cayenne acceleration the issue was reported on.
-#[cfg(feature = "sqlite")]
 mod empty_response {
     use super::*;
 

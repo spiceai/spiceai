@@ -4848,7 +4848,7 @@ mod tests {
         }
 
         let not_cayenne = Acceleration {
-            engine: Engine::Sqlite,
+            engine: Engine::Arrow,
             ..acceleration_with_params(WriteMode::WriteThrough, &none)
         };
         assert_eq!(

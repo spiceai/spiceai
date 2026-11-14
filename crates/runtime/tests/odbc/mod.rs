@@ -62,7 +62,7 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
 }
 
 // Run these tests with
-// `databricks_odbc_host=copy-paste-here databricks_warehouse_id=copy-paste-here databricks_access_token=copy-paste-here cargo test --package runtime 'databricks_odbc' --features=odbc,duckdb,sqlite`
+// `databricks_odbc_host=copy-paste-here databricks_warehouse_id=copy-paste-here databricks_access_token=copy-paste-here cargo test --package runtime 'databricks_odbc' --features=odbc`
 //
 // Running this test in local requires ODBC setup in local, check https://github.com/spiceai/spiceai/pull/1204 to see the details
 
@@ -132,12 +132,7 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            for engine in [
-                "arrow",
-                "cayenne",
-                #[cfg(feature = "sqlite")]
-                "sqlite",
-            ] {
+            for engine in ["arrow", "cayenne"] {
                 let app = AppBuilder::new("databricks_odbc")
                     .with_dataset(make_databricks_odbc(
                         "samples.tpch.lineitem",

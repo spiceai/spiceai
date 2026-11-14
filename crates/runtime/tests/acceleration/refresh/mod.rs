@@ -11,5 +11,3 @@ mod refresh_cayenne;
 mod refresh_modes;
 #[cfg(feature = "postgres-accel")]
 mod refresh_postgres;
-#[cfg(all(feature = "sqlite", feature = "postgres-accel"))]
-mod refresh_sqlite;
