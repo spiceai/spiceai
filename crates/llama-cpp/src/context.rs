@@ -18,9 +18,11 @@ limitations under the License.
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use snafu::ensure;
 
+use crate::lora::LoraAdapter;
 use crate::mtp::DraftKind;
 use crate::{BatchFullSnafu, Error, Result, Token, sys};
 
@@ -49,6 +51,8 @@ pub struct ContextParams {
     n_rs_seq: u32,
     n_seq_max: Option<u32>,
     kv_unified: Option<bool>,
+    hidden_states: bool,
+    n_threads: Option<NonZeroU32>,
 }
 
 impl ContextParams {
@@ -89,6 +93,23 @@ impl ContextParams {
         self
     }
 
+    /// The CPU threads a decode uses, for both single-token and batch decodes; llama.cpp's
+    /// default when unset.
+    #[must_use]
+    pub fn with_n_threads(mut self, n_threads: Option<NonZeroU32>) -> Self {
+        self.n_threads = n_threads;
+        self
+    }
+
+    /// Makes every decode output the final hidden state of each token it marks for output,
+    /// one per token rather than pooled per sequence: the model's last layer after its final
+    /// norm, the input to its output head. [`Context::hidden_state`] reads them.
+    #[must_use]
+    pub fn with_hidden_states(mut self, hidden_states: bool) -> Self {
+        self.hidden_states = hidden_states;
+        self
+    }
+
     /// The C parameters; `draft_of` makes a draft context that reads that target, an MTP
     /// context for an MTP head.
     pub(crate) fn raw(
@@ -109,6 +130,17 @@ impl ContextParams {
         }
         if let Some(kv_unified) = self.kv_unified {
             raw.kv_unified = kv_unified;
+        }
+        if let Some(n_threads) = self.n_threads {
+            let n_threads = i32::try_from(n_threads.get()).unwrap_or(i32::MAX);
+            raw.n_threads = n_threads;
+            raw.n_threads_batch = n_threads;
+        }
+        if self.hidden_states {
+            // With no pooling, llama.cpp keeps a row per output token: the graph's `t_embd`,
+            // which every decoder sets to the output-normed state before the output head.
+            raw.embeddings = true;
+            raw.pooling_type = sys::llama_pooling_type_LLAMA_POOLING_TYPE_NONE;
         }
         if let Some((target, kind)) = draft_of {
             if kind == DraftKind::Mtp {
@@ -132,19 +164,77 @@ pub struct Context<'m> {
     /// Whether the decodes that follow output each row's greedy pick instead of its logits
     /// ([`Context::set_argmax_output`]).
     argmax: bool,
+    /// Whether decodes output hidden states ([`ContextParams::with_hidden_states`]).
+    hidden_states: bool,
+    /// The adapters llama.cpp applies to this context's decodes. It keeps only their pointers,
+    /// so the context holds them until it is freed or they are replaced.
+    loras: Vec<Arc<LoraAdapter<'m>>>,
 }
 
 // SAFETY: a context is used by one thread at a time, which `&mut self` on every call that
 // changes it enforces; nothing in it is tied to the thread that created it.
 unsafe impl Send for Context<'_> {}
 
-impl Context<'_> {
-    pub(crate) fn from_raw(raw: NonNull<sys::llama_context>) -> Self {
+impl<'m> Context<'m> {
+    /// Takes ownership of `raw`, which llama.cpp created with `params`.
+    pub(crate) fn from_raw(raw: NonNull<sys::llama_context>, params: &ContextParams) -> Self {
         Self {
             raw,
             _model: PhantomData,
             argmax: false,
+            hidden_states: params.hidden_states,
+            loras: Vec::new(),
         }
+    }
+
+    /// Applies `adapters`, each with its scale, to the decodes that follow, in place of the
+    /// adapters set before; an empty list removes them. A scale of 1 applies an adapter as
+    /// trained (llama.cpp multiplies it by the adapter's `alpha / rank`). The base weights are
+    /// never changed, so contexts of one model can apply different adapters.
+    pub fn set_lora_adapters(&mut self, adapters: &[(Arc<LoraAdapter<'m>>, f32)]) {
+        let mut raw: Vec<*mut sys::llama_adapter_lora> = adapters
+            .iter()
+            .map(|(adapter, _)| adapter.as_ptr())
+            .collect();
+        let mut scales: Vec<f32> = adapters.iter().map(|&(_, scale)| scale).collect();
+        let (raw_ptr, scales_ptr) = if adapters.is_empty() {
+            (std::ptr::null_mut(), std::ptr::null_mut())
+        } else {
+            (raw.as_mut_ptr(), scales.as_mut_ptr())
+        };
+        // SAFETY: the context is live, both arrays hold `adapters.len()` entries (or are null
+        // for none), and llama.cpp copies them. Every adapter belongs to this context's model
+        // (`'m`), and `self.loras` keeps each alive for as long as the context may read it.
+        unsafe {
+            sys::llama_set_adapters_lora(self.raw.as_ptr(), raw_ptr, adapters.len(), scales_ptr);
+        }
+        self.loras = adapters
+            .iter()
+            .map(|(adapter, _)| Arc::clone(adapter))
+            .collect();
+    }
+
+    /// The final hidden state of the token at position `index` of the last decoded batch, one
+    /// value per dimension of the model's output embedding ([`crate::Model::n_embd_out`]). A
+    /// negative index counts back from the batch's last output. `None` when the context was
+    /// not created [`ContextParams::with_hidden_states`], or when the batch did not mark that
+    /// token for output.
+    #[must_use]
+    pub fn hidden_state(&self, index: i32) -> Option<&[f32]> {
+        if !self.hidden_states {
+            return None;
+        }
+        let ctx = self.raw.as_ptr();
+        // SAFETY: the context is live; the call waits for the last decode to finish and
+        // returns null for a row it did not output.
+        let row = NonNull::new(unsafe { sys::llama_get_embeddings_ith(ctx, index) })?;
+        // SAFETY: the model outlives the context.
+        let n_embd = unsafe { sys::llama_model_n_embd_out(sys::llama_get_model(ctx)) };
+        let n_embd = usize::try_from(n_embd).ok()?;
+        // SAFETY: with no pooling llama.cpp keeps `n_embd_out` floats per output row, written by
+        // the decode the call above waited for. Only another decode writes them again, and it
+        // takes `&mut self`, so it cannot start while the returned row borrows `self`.
+        Some(unsafe { std::slice::from_raw_parts(row.as_ptr(), n_embd) })
     }
 
     pub(crate) fn as_ptr(&self) -> *mut sys::llama_context {
@@ -281,6 +371,21 @@ impl Context<'_> {
         }
         // SAFETY: the context is live, and `seq` is one of its sequences; -1 means "to the end".
         unsafe { sys::llama_memory_seq_rm(sys::llama_get_memory(self.raw.as_ptr()), seq, from, -1) }
+    }
+
+    /// Makes sequence `dst` a copy of sequence `src`, so both continue from the same prefix:
+    /// the attention cache is shared, and a recurrent layer's state is copied when `dst` is
+    /// next decoded. Returns false when either sequence is not one the context holds.
+    pub fn copy_seq(&mut self, src: i32, dst: i32) -> bool {
+        if !self.holds(src) || !self.holds(dst) {
+            return false;
+        }
+        // SAFETY: the context is live, and both sequences are among its sequences; -1, -1 means
+        // every position.
+        unsafe {
+            sys::llama_memory_seq_cp(sys::llama_get_memory(self.raw.as_ptr()), src, dst, -1, -1);
+        }
+        true
     }
 
     /// How far this context's cache can be cut back, found as llama.cpp's server finds it: a

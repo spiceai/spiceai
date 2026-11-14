@@ -20908,6 +20908,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "strands-decider"
+version = "2.5.0-unstable"
+dependencies = [
+ "clap",
+ "llama-cpp",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
 name = "strength_reduce"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

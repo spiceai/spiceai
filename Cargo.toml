@@ -48,6 +48,7 @@ members = [
     "crates/llama-cpp",
     "crates/llms-llamacpp",
     "crates/llms",
+    "crates/strands-decider",
     "crates/chat-api",
     "crates/embed-api",
     "crates/rerank-api",

@@ -1,0 +1,36 @@
+[package]
+description = "The Strands decider readout: renders typed questions about a state, and scores their options from a decoder's hidden states with the checkpoint's pointer head"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "strands-decider"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+llama-cpp = { path = "../llama-cpp", optional = true }
+safetensors = "0.8"
+serde.workspace = true
+# Structured content renders its keys in the order they were written, as upstream does.
+serde_json = { workspace = true, features = ["preserve_order"] }
+snafu.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+clap.workspace = true
+
+[features]
+# The hidden-state backend on llama.cpp; without it, the crate renders prompts and runs the
+# head on hidden states from any backend.
+llama = ["dep:llama-cpp"]
+# The GPU backend llama.cpp is built with; without either, it runs on the CPU.
+cuda = ["llama", "llama-cpp/cuda"]
+metal = ["llama", "llama-cpp/metal"]
+
+[[example]]
+name = "decide"
+required-features = ["llama"]
+
+[lints]
+workspace = true
