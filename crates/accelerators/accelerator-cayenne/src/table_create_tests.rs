@@ -42,7 +42,7 @@ use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_acceleration::testing::TestAccelerationSource;
 use spicepod::component::runtime::RuntimeState;
 
-use crate::{CAYENNE_VNEXT_PARAM, CayenneAccelerator};
+use crate::{CayenneAccelerator, metastore::CAYENNE_VNEXT_PARAM};
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
