@@ -11,6 +11,7 @@ on:
       - 'install/**'
       - 'test/scripts/install-scripts-test.sh'
       - 'test/scripts/install-ps1-test.ps1'
+      - 'test/scripts/install-ps1-path-test.ps1'
       - 'test/scripts/install-download-test.py'
       - '.github/workflows/install_scripts_test.yml'
   push:
@@ -20,6 +21,7 @@ on:
       - 'install/**'
       - 'test/scripts/install-scripts-test.sh'
       - 'test/scripts/install-ps1-test.ps1'
+      - 'test/scripts/install-ps1-path-test.ps1'
       - 'test/scripts/install-download-test.py'
       - '.github/workflows/install_scripts_test.yml'
   workflow_dispatch:
@@ -666,6 +668,10 @@ jobs:
       - name: Test Install.ps1 download verification (Windows PowerShell 5.1)
         shell: powershell
         run: ./test/scripts/install-ps1-test.ps1
+
+      - name: Test Install.ps1 PATH update
+        shell: pwsh
+        run: ./test/scripts/install-ps1-path-test.ps1
 
       - name: PSScriptAnalyzer
         shell: pwsh
