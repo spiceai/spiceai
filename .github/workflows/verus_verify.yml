@@ -144,7 +144,7 @@ jobs:
       # this job runs on `merge_group`, where a textual lockfile merge is what
       # that guard exists to name before any cargo work.
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       # The crates that opted into verification, from the manifests themselves,
       # so the path filter, the pin check and the verify loop below cannot drift
@@ -219,7 +219,7 @@ jobs:
       # reports the required context green with the verifier never invoked.
       - name: Check for changes this gate covers
         id: changes
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           filters: ${{ steps.crates.outputs.filters }}
 
@@ -250,7 +250,7 @@ jobs:
       # rather than rely on the image, as `object_store_wal.yml` does.
       - name: Set up the C toolchain
         if: steps.gate.outputs.verify == 'true'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       # The tools the steps below call, checked up front so a runner image that
       # lacks one fails here by name instead of as exit 127 mid-step. `gh`

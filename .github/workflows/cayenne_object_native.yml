@@ -127,9 +127,9 @@ jobs:
           persist-credentials: false
           # The merge-group path filter diffs against the queue's base.
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
       # The dev runner image has no C toolchain; mimalloc builds C.
-      - uses: ./.github/actions/setup-cc
+      - uses: $/.github/actions/setup-cc
       - name: Build the model
         run: cargo build --locked --release -p cayenne-metastore-model
       - name: Check the design documents' model citations
@@ -169,11 +169,11 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
       # The dev runner image has no C toolchain, and rustc links through cc.
-      - uses: ./.github/actions/setup-cc
-      - uses: ./.github/actions/install-protoc
-      - uses: ./.github/actions/setup-nextest
+      - uses: $/.github/actions/setup-cc
+      - uses: $/.github/actions/install-protoc
+      - uses: $/.github/actions/setup-nextest
 
       - name: Start RustFS
         env:
@@ -246,11 +246,11 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
       # The dev runner image has no C toolchain, and rustc links through cc.
-      - uses: ./.github/actions/setup-cc
-      - uses: ./.github/actions/install-protoc
-      - uses: ./.github/actions/setup-nextest
+      - uses: $/.github/actions/setup-cc
+      - uses: $/.github/actions/install-protoc
+      - uses: $/.github/actions/setup-nextest
 
       - name: Run conditional-write and data-file replay tests
         run: cargo nextest run --locked -p object_store_occ --retries 0

@@ -153,7 +153,7 @@ jobs:
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Build LLMs integration test binary
         env:
@@ -167,7 +167,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.SMB_PASSWORD }}
@@ -192,7 +192,7 @@ jobs:
 
       # The `test` legs run in `ci`, which has no NAS password, so they read this copy.
       - name: Upload test binary
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: llms-integration-test-binary
           path: ./llms_integration_test
@@ -265,7 +265,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.SMB_PASSWORD }}
@@ -291,7 +291,7 @@ jobs:
 
       - name: Download test binary
         if: env.HAS_SPICEIO_SECRET != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: llms-integration-test-binary
           path: ./integration_test
@@ -390,10 +390,10 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up the C and C++ toolchain
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Run the llama.cpp engine's model, content-part, differential, greedy-pick, Harmony, MTP, prefix-reuse, Hugging Face resolution and unsupported-architecture tests
         env:

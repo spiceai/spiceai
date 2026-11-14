@@ -496,7 +496,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup WSL
-        uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7
+        uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
         with:
           distribution: ${{ matrix.distro }}
           additional-packages: curl wget python3

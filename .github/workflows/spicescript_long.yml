@@ -47,7 +47,7 @@ jobs:
       - name: Check the run is a trusted build
         id: trusted
         if: inputs.run_id != ''
-        uses: ./.github/actions/check-trusted-run
+        uses: $/.github/actions/check-trusted-run
         with:
           run-id: ${{ inputs.run_id }}
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -111,14 +111,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '3600'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -127,7 +127,7 @@ jobs:
 
       - name: Download spicescript
         id: spicescript
-        uses: ./.github/actions/build-tool
+        uses: $/.github/actions/build-tool
         with:
           package: spicescript
 
@@ -155,7 +155,7 @@ jobs:
 
       - name: Upload script results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spicescript-results-long
           path: ${{ runner.temp }}/spicescript-results.json
@@ -164,7 +164,7 @@ jobs:
 
       - name: Upload captured logs
         if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spicescript-logs-long
           path: ${{ runner.temp }}/spicescript-logs

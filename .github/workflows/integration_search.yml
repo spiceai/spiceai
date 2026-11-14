@@ -62,7 +62,7 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       # The step below builds the tests before it runs them, so the credentials last as long as
       # the job's default 6-hour limit.
@@ -101,7 +101,7 @@ jobs:
         #  to make PR if 'always' update snapshots.
         if: ${{ always() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
         timeout-minutes: 10
-        uses: ./.github/actions/push-snap-changes
+        uses: $/.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           title: 'fix: Update Search integration test snapshots'

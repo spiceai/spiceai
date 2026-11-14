@@ -135,14 +135,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '43200'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -150,7 +150,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           ref: refs/heads/${{ matrix.branch }}
@@ -312,7 +312,7 @@ jobs:
 
       - name: Upload the record of the re-run
         if: ${{ steps.retry.outputs.record == 'true' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.retry.outputs.marker }}
           path: retried-commit.txt
@@ -320,7 +320,7 @@ jobs:
 
       - name: Build Testoperator
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -330,7 +330,7 @@ jobs:
       - name: Build spicepod validator
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         id: build-spicepod-validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -539,7 +539,7 @@ jobs:
 
       - name: Upload the benchmarked release commit
         if: ${{ matrix.schedule == '' && steps.benchmarked.outputs.skip != 'true' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.benchmarked.outputs.marker }}
           path: benchmarked-commit.txt
@@ -564,14 +564,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '21600'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -579,7 +579,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
@@ -589,7 +589,7 @@ jobs:
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -598,7 +598,7 @@ jobs:
 
       - name: Build spicepod validator
         id: build-spicepod-validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}

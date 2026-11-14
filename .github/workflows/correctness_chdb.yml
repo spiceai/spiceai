@@ -57,7 +57,7 @@ jobs:
 
       - name: Check for code changes
         id: check
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
 
   test:
     environment: ci
@@ -93,25 +93,25 @@ jobs:
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Install protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Get RustFS credentials
         id: rustfs
         if: needs.check_changes.outputs.relevant_changes == 'true'
         continue-on-error: true
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '5400'
@@ -119,7 +119,7 @@ jobs:
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}

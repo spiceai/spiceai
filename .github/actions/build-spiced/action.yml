@@ -190,7 +190,7 @@ runs:
 
     - name: Set up sccache
       if: steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
-      uses: ./.github/actions/setup-sccache
+      uses: $/.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
         spiceio_endpoint: ${{ inputs.spiceio_endpoint }}
@@ -323,7 +323,7 @@ runs:
 
     - name: Upload spiced artifact
       if: inputs.upload_artifact == 'true' && inputs.build_cli != 'true'
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: ${{ inputs.artifact_name }}
         path: spiced${{ steps.detect-os.outputs.ext }}
@@ -331,7 +331,7 @@ runs:
 
     - name: Upload spiced and spice CLI artifacts
       if: inputs.upload_artifact == 'true' && inputs.build_cli == 'true'
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: ${{ inputs.artifact_name }}
         path: |

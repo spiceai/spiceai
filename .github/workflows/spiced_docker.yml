@@ -107,7 +107,7 @@ jobs:
           docker run --rm localhost:5000/spiceai:default-amd64 --version
 
       - name: Upload AMD64 artifacts
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: images-amd64
           path: /tmp/image-amd64-default.tar
@@ -166,7 +166,7 @@ jobs:
           docker run --rm localhost:5000/spiceai:default-arm64 --version
 
       - name: Upload ARM64 artifacts
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: images-arm64
           path: /tmp/image-arm64-default.tar
@@ -206,7 +206,7 @@ jobs:
           docker run --rm localhost:5000/spiceai:cuda-amd64 --version
 
       - name: Upload CUDA artifacts
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: images-amd64-cuda
           path: /tmp/images-amd64-cuda.tar
@@ -230,7 +230,7 @@ jobs:
           persist-credentials: false
 
       - name: Download images
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: images-*64
           path: /tmp
@@ -293,7 +293,7 @@ jobs:
           persist-credentials: false
 
       - name: Download CUDA image
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: images-amd64-cuda
           path: /tmp

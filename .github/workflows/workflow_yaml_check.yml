@@ -133,3 +133,27 @@ jobs:
           # backlog with its own findings here; this gate is about whether GitHub
           # can schedule the definition at all. Enabling them is tracked in #14222.
           actionlint -color -shellcheck= -pyflakes=
+
+      - name: Lint same-repository action calls (actionlint, `$/` read as `./`)
+        run: |
+          set -euo pipefail
+          # actionlint does not parse `uses: $/…` and skips those steps (see
+          # `.github/actionlint.yaml`). `$/` and `./` name the same action file, so
+          # linting a copy with `./` keeps the check of each call's `with:`
+          # against that action's inputs. actionlint finds the project by its Git
+          # root, so the copy is a repository of its own. Every `$/.github/` is
+          # rewritten, not only one right after `uses: `, so a quoted value, a
+          # quoted key, a flow-style step or a folded value can't keep its `$/`
+          # and skip the check. The copy is only linted, so rewriting the same
+          # text in a comment or a script changes nothing.
+          copy="$(mktemp -d)"
+          cp -R .github "$copy/"
+          git -C "$copy" init --quiet
+          find "$copy/.github" -type f \( -name '*.yml' -o -name '*.yaml' \) \
+            -exec sed -i -E 's#\$/\.github/#./.github/#g' {} +
+          if grep -rqF '$/.github/' "$copy/.github"; then
+            echo "::error::A \`uses: \$/\` call was left in the copy, so its inputs would go unchecked."
+            exit 1
+          fi
+          cd "$copy"
+          actionlint -color -shellcheck= -pyflakes=

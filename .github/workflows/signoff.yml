@@ -42,11 +42,14 @@
 # misdirect every `gh`-based repo lookup in scripts/signoff (status posts,
 # PR/run lookups) at the fork instead of this repo.
 #
-# scripts/signoff and the setup-* composite actions below are also saved to
-# .trusted-ci/, read out of the object database at this workflow file's own
-# commit (github.sha) *before* any fork commit is checked out, and every later
-# step references those copies (literal `.trusted-ci/...` paths) rather than
-# the working tree. This runs unconditionally, not just for fork
+# scripts/signoff (and .github/actions) are also saved to .trusted-ci/, read
+# out of the object database at this workflow file's own commit (github.sha)
+# *before* any fork commit is checked out, and every later step runs that copy
+# (literal `.trusted-ci/signoff`) rather than the working tree. The setup-*
+# composite actions are referenced as `$/.github/actions/...`, which the runner
+# always resolves at this workflow file's own commit regardless of what is
+# checked out, so they get the same guarantee and are covered by actions.lock.
+# The .trusted-ci copy runs unconditionally, not just for fork
 # PRs, so every step downstream has one fixed path to depend on instead of
 # branching on is_fork — `uses:` can't read a step output (the `steps`
 # context isn't available there), so a per-case path chosen at runtime
@@ -456,15 +459,15 @@ jobs:
         run: .trusted-ci/signoff preflight-disk
 
       - name: Set up Rust
-        uses: ./.trusted-ci/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up Nextest
-        uses: ./.trusted-ci/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.SMB_PASSWORD }}
@@ -479,19 +482,21 @@ jobs:
           machine: ${{ runner.name }}
 
       - name: Set up sccache
-        uses: ./.trusted-ci/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
+        # spiceio only, as in pr.yml's macOS jobs: that path signs no requests, so it
+        # needs no MinIO keys. A `minio_endpoint` fallback would sign with keys this job
+        # does not hold, and the cache pre-flight would turn it off anyway.
         with:
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
-        uses: ./.trusted-ci/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Set up make
-        uses: ./.trusted-ci/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
-        uses: ./.trusted-ci/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Sign off
         id: sign_off

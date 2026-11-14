@@ -22,7 +22,7 @@ runs:
   steps:
     - name: Configure apt mirrors (Linux)
       if: runner.os == 'Linux'
-      uses: ./.github/actions/configure-apt
+      uses: $/.github/actions/configure-apt
 
     - name: Prepare file-based data directory (Linux/macOS)
       if: runner.os != 'Windows'

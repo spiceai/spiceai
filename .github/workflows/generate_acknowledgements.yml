@@ -23,11 +23,11 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up make
         if: runner.os != 'macOS'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Generate Acknowledgements
         shell: bash
