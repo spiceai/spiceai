@@ -932,6 +932,7 @@ pub fn soda_schema_from_meta(
 pub struct SodaReader {
     inner: io::Cursor<Vec<u8>>,
     schema: Schema,
+    row_count: usize,
 }
 
 impl SodaReader {
@@ -1057,6 +1058,7 @@ impl SodaReader {
         Ok(Self {
             inner: io::Cursor::new(ndjson),
             schema,
+            row_count: data.len(),
         })
     }
 
@@ -1064,6 +1066,12 @@ impl SodaReader {
     #[must_use]
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Returns how many rows the response's `data` array holds.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.row_count
     }
 }
 
