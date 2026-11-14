@@ -27,6 +27,20 @@ if os.getenv("GITHUB_REF_TYPE") == "tag":
         )
         sys.exit(1)
 
+# A release build is dispatched with the version it releases. It builds the
+# commit whose version.txt says so, or nothing.
+requestedVersion = os.getenv("RELEASE_VERSION", "")
+if requestedVersion and requestedVersion != releaseVersion:
+    print(
+        "::error title=Release version does not match version.txt::Release version "
+        "'{requested}' does not match version.txt '{version}' at this commit, so this "
+        "build would release the wrong version. Start the build on the branch whose "
+        "version.txt is '{requested}', or bump version.txt to '{requested}' first.".format(
+            requested=requestedVersion, version=releaseVersion
+        )
+    )
+    sys.exit(1)
+
 with open(os.getenv("GITHUB_ENV"), "a") as githubEnv:
     releaseNotePath = "docs/release_notes/v{}.md".format(releaseVersion)
 

@@ -52,9 +52,9 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use cayenne::CayenneTableProvider;
 use cayenne::lookup_index::{IndexPersistence, LookupIndexCounters};
 use cayenne::metadata::{IndexRunRecord, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;

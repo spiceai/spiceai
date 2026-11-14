@@ -828,22 +828,6 @@ async fn test_ready_state_on_registration_native_cayenne_acceleration() -> Resul
     .await
 }
 
-// Test that the runtime is ready immediately with ready_state = on_registration for native provider
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn test_ready_state_on_registration_native_duckdb_acceleration() -> Result<(), anyhow::Error>
-{
-    // Native provider, OnRegistration, DuckDB engine, should not error initially
-    run_ready_state_test(
-        true,
-        ReadyState::OnRegistration,
-        Some("duckdb".to_string()),
-        false,
-        "test_ready_state_on_registration_native_duckdb_acceleration",
-    )
-    .await
-}
-
 // Test that the runtime is ready immediately with ready_state = on_registration for federated provider
 #[tokio::test]
 async fn test_ready_state_on_registration_federated_cayenne_acceleration()
@@ -855,22 +839,6 @@ async fn test_ready_state_on_registration_federated_cayenne_acceleration()
         Some("cayenne".to_string()),
         false,
         "test_ready_state_on_registration_federated_cayenne_acceleration",
-    )
-    .await
-}
-
-// Test that the runtime is ready immediately with ready_state = on_registration for federated provider
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn test_ready_state_on_registration_federated_duckdb_acceleration()
--> Result<(), anyhow::Error> {
-    // Federated provider, OnRegistration, DuckDB engine, should not error initially
-    run_ready_state_test(
-        false,
-        ReadyState::OnRegistration,
-        Some("duckdb".to_string()),
-        false,
-        "test_ready_state_on_registration_federated_duckdb_acceleration",
     )
     .await
 }
@@ -891,21 +859,6 @@ async fn test_ready_state_on_schema_resolved_native_cayenne_acceleration()
     .await
 }
 
-// Test that the runtime is ready immediately with ready_state = on_schema_resolved for native provider
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn test_ready_state_on_schema_resolved_native_duckdb_acceleration()
--> Result<(), anyhow::Error> {
-    run_ready_state_test(
-        true,
-        ReadyState::OnSchemaResolved,
-        Some("duckdb".to_string()),
-        false,
-        "test_ready_state_on_schema_resolved_native_duckdb_acceleration",
-    )
-    .await
-}
-
 // Test that the runtime is ready immediately with ready_state = on_schema_resolved for federated provider
 #[tokio::test]
 async fn test_ready_state_on_schema_resolved_federated_cayenne_acceleration()
@@ -916,21 +869,6 @@ async fn test_ready_state_on_schema_resolved_federated_cayenne_acceleration()
         Some("cayenne".to_string()),
         false,
         "test_ready_state_on_schema_resolved_federated_cayenne_acceleration",
-    )
-    .await
-}
-
-// Test that the runtime is ready immediately with ready_state = on_schema_resolved for federated provider
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn test_ready_state_on_schema_resolved_federated_duckdb_acceleration()
--> Result<(), anyhow::Error> {
-    run_ready_state_test(
-        false,
-        ReadyState::OnSchemaResolved,
-        Some("duckdb".to_string()),
-        false,
-        "test_ready_state_on_schema_resolved_federated_duckdb_acceleration",
     )
     .await
 }
@@ -949,21 +887,6 @@ async fn test_ready_state_on_load_native_cayenne_acceleration() -> Result<(), an
     .await
 }
 
-// Test that the runtime is NOT ready until data loads with ready_state = on_load for native provider
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn test_ready_state_on_load_native_duckdb_acceleration() -> Result<(), anyhow::Error> {
-    // Native provider, OnLoad, DuckDB engine, should error initially
-    run_ready_state_test(
-        true,
-        ReadyState::OnLoad,
-        Some("duckdb".to_string()),
-        true,
-        "test_ready_state_on_load_native_duckdb_acceleration",
-    )
-    .await
-}
-
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
 #[tokio::test]
 async fn test_ready_state_on_load_federated_cayenne_acceleration() -> Result<(), anyhow::Error> {
@@ -974,21 +897,6 @@ async fn test_ready_state_on_load_federated_cayenne_acceleration() -> Result<(),
         Some("cayenne".to_string()),
         true,
         "test_ready_state_on_load_federated_cayenne_acceleration",
-    )
-    .await
-}
-
-// Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn test_ready_state_on_load_federated_duckdb_acceleration() -> Result<(), anyhow::Error> {
-    // Federated provider, OnLoad, DuckDB engine, should error initially
-    run_ready_state_test(
-        false,
-        ReadyState::OnLoad,
-        Some("duckdb".to_string()),
-        true,
-        "test_ready_state_on_load_federated_duckdb_acceleration",
     )
     .await
 }
@@ -1013,121 +921,6 @@ async fn test_ready_state_mixed_cayenne_acceleration() -> Result<(), anyhow::Err
                     "federated_on_load_mixed",
                     ReadyState::OnLoad,
                     Some("cayenne".to_string()),
-                ))
-                .build();
-
-             configure_test_datafusion();
-            let rt =
-                Runtime::builder()
-                    .with_app(app)
-                    .build()
-                    .await;
-
-            let cloned_rt = Arc::new(rt.clone());
-
-            tracing::info!("Loading components");
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            // Queries to native_on_registration_mixed should work right away
-            let query_result = rt
-                .datafusion()
-                .query_builder("SELECT * FROM native_on_registration_mixed")
-                .build()
-                .run()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            // Convert the stream to a vector with timeout
-            let results: Result<Vec<RecordBatch>, _> = tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    Err(DataFusionError::Execution("Timed out waiting for query results".to_string()))
-                }
-                result = query_result.data.try_collect::<Vec<_>>() => {
-                    result
-                }
-            };
-            let results = results.expect("Query to native_on_registration_mixed should not return an error");
-            assert_eq!(results.len(), 1, "Query should return 1 record batch");
-            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-            // But queries to federated_on_load_mixed should fail because it's not ready yet
-            let query_result = tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
-                }
-                result = rt
-                    .datafusion()
-                    .query_builder("SELECT * FROM federated_on_load_mixed")
-                    .build()
-                    .run() => {result}
-            };
-            let results = query_result.expect_err("Query should return an error - the acceleration should still be loading data");
-            assert!(results.to_string().contains("Acceleration not ready; loading initial data for federated_on_load_mixed"));
-
-            // Wait for acceleration to load for the second dataset
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-
-            // Now queries to federated_on_load_mixed should work
-            let query_result = rt
-                .datafusion()
-                .query_builder("SELECT * FROM federated_on_load_mixed")
-                .build()
-                .run()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            // Convert the stream to a vector
-            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
-
-            assert_eq!(results.len(), 1, "Query should return 1 record batch");
-            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-            // Make sure the first dataset still works
-            let query_result = rt
-                .datafusion()
-                .query_builder("SELECT * FROM native_on_registration_mixed")
-                .build()
-                .run()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            // Convert the stream to a vector
-            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
-
-            assert_eq!(results.len(), 1, "Query should return 1 record batch");
-            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-            Ok(())
-        })
-        .await
-}
-
-// Test both native and federated providers together with different ready states
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    register_slow_loading_providers().await;
-
-    let request_context = Arc::new(RequestContext::builder(Protocol::Http).build());
-    request_context
-        .scope(async {
-            let app = AppBuilder::new("ready_state_mixed_tests")
-                .with_dataset(get_native_dataset(
-                    "native_on_registration_mixed",
-                    ReadyState::OnRegistration,
-                    Some("duckdb".to_string()),
-                ))
-                .with_dataset(get_federated_dataset(
-                    "federated_on_load_mixed",
-                    ReadyState::OnLoad,
-                    Some("duckdb".to_string()),
                 ))
                 .build();
 

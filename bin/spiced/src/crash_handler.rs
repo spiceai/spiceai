@@ -106,8 +106,8 @@ pub fn install(version: &str) -> Result<(), InstallError> {
     resolve_image();
     // Formatted now, not in the handler: allocating there is not signal-safe, and a
     // pre-built line cannot crowd out the rest of the report's fixed buffer.
-    // The commit and target are their own fields: a `release` build's version omits
-    // the commit, and every architecture ships under one version.
+    // The commit and target are their own fields: `version` is passed without the
+    // commit, and every architecture ships under one version.
     let mut identity = format!(
         "spiced={version} commit={} target={}_{} features={} profile={}",
         env!("GIT_COMMIT_HASH"),

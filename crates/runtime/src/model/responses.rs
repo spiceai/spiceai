@@ -20,7 +20,7 @@ use crate::model::params::azure::AzureModelParams;
 use crate::model::params::openai::OpenAiModelParams;
 use crate::model::params::xai::XaiModelParams;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
-use crate::model::wrapper::responses::ResponsesWrapper;
+use crate::model::wrapper::responses::{ResponsesRequestDefaults, ResponsesWrapper};
 use crate::tools::registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools};
 use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
@@ -114,7 +114,16 @@ pub async fn try_to_responses_model(
         Some(_) | None => model,
     };
 
-    Ok(tool_model)
+    // The Spicepod's request defaults go above the tool loop, so they apply once to each client
+    // request rather than again to each round of the loop.
+    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
+        from: component.from.clone(),
+    })?;
+    Ok(Arc::new(ResponsesRequestDefaults::new(
+        tool_model,
+        component.name.as_str(),
+        get_openai_responses_request_overrides(component, source.short_name()),
+    )))
 }
 
 async fn typed_params<P: TypedParams>(
@@ -177,7 +186,6 @@ async fn construct_model(
         model,
         component.name.as_str(),
         system_prompt,
-        get_openai_responses_request_overrides(component, source.short_name()),
     )))
 }
 
@@ -222,8 +230,9 @@ async fn openai(
     }
 
     let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
+    let label = format!("model '{model_name}' (openai)");
     if let Some(client) = llms::workload_identity::openai_federated_client(
-        &format!("model '{model_name}' (openai)"),
+        &label,
         &model,
         &params.federation(),
         llms::workload_identity::openai_api_key_in_spicepod(raw_params),
@@ -233,6 +242,15 @@ async fn openai(
     .map_err(llms::workload_identity::FederationError::into_llm_error)?
     {
         return Ok(Arc::new(client) as Arc<dyn Responses>);
+    }
+    if let Some(message) = llms::workload_identity::openai_missing_credential(
+        &label,
+        api_key,
+        params.endpoint.as_str(),
+    ) {
+        return Err(LlmError::FailedToAuthenticate {
+            source: message.into(),
+        });
     }
 
     Ok(Arc::new(llms::openai::new_openai_client(

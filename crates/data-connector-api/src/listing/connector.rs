@@ -19,7 +19,7 @@ use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::csv_header_projection::HeaderProjectedCsvFormat;
 use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
-use data_components::fresh_file_listing::FreshFileListingLayer;
+use data_components::fresh_file_listing::{FreshFileListingLayer, ScanSkipsListing};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -262,20 +262,27 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        let table: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
+        let pruning = has_location_metadata(table.options()).then(|| {
             Arc::new(LocationPruningListingTable::new(
-                table,
+                Arc::clone(&table),
                 Arc::clone(&self.object_store),
                 table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
-        } else {
-            table
-        };
+        });
         // A file dataset is read as its files are at query time, not as they were
-        // listed at its first scan.
-        let table = FreshFileListingLayer::over(table, vec![table_path]);
+        // listed at its first scan. A listing with no matching data file is an
+        // error (the path is missing, or every matching file was removed) rather
+        // than an empty table, so a full refresh cannot persist a wipe. A file
+        // that still exists and holds no rows still scans as zero rows.
+        let table = reject_empty_listing(
+            table,
+            pruning,
+            table_path,
+            self.dataset_name.clone(),
+            self.extension.clone(),
+        );
         match self.schema_drift_guard() {
             Some(guard) => FileSchemaDriftLayer::over(table, guard),
             None => table,
@@ -294,6 +301,61 @@ impl ListingTableTemplate {
                 Arc::clone(&self.options.format),
             )
         })
+    }
+}
+
+/// Stacks the empty-listing guard over a single-object table that does not go
+/// through [`ListingTableTemplate::wrap`] (the S3 single-file version cache). A
+/// deleted object (`404 NoSuchKey`) lists nothing, so the scan fails rather than
+/// refreshing the acceleration to zero rows.
+fn reject_empty_single_object(
+    below: Arc<dyn TableProvider>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    FreshFileListingLayer::over_rejecting_empty(
+        below,
+        vec![table_path],
+        dataset_name,
+        move |meta: &ObjectMeta| listed_object_is_data_file(meta, &extension),
+    )
+}
+
+/// Stacks the empty-listing guard over `table`, or over `pruning` when the dataset
+/// has `_location` metadata. A scan the pruning table answers by `head()`ing the
+/// named objects skips the guard's listing, so it needs no list call (or list
+/// permission) it did not need before.
+fn reject_empty_listing(
+    table: Arc<ListingTable>,
+    pruning: Option<Arc<LocationPruningListingTable>>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    let is_data_file = move |meta: &ObjectMeta| listed_object_is_data_file(meta, &extension);
+    match pruning {
+        Some(pruning) => {
+            let skips: ScanSkipsListing = {
+                let pruning = Arc::clone(&pruning);
+                Arc::new(move |filters: &[datafusion_expr::Expr]| {
+                    pruning.answers_without_listing(filters)
+                })
+            };
+            FreshFileListingLayer::over_rejecting_empty_unless(
+                pruning,
+                vec![table_path],
+                dataset_name,
+                is_data_file,
+                Some(skips),
+            )
+        }
+        None => FreshFileListingLayer::over_rejecting_empty(
+            table,
+            vec![table_path],
+            dataset_name,
+            is_data_file,
+        ),
     }
 }
 
@@ -342,6 +404,17 @@ impl LocationPruningListingTable {
     /// through to `inner`.
     fn has_location_column(&self) -> bool {
         self.inner.schema().field_with_name("_location").is_ok()
+    }
+
+    /// Whether [`TableProvider::scan`] answers `filters` without listing the prefix:
+    /// an unsatisfiable pushed-down filter, or `_location` predicates it `head()`s.
+    fn answers_without_listing(&self, filters: &[datafusion_expr::Expr]) -> bool {
+        filters.iter().any(|filter| {
+            matches!(
+                filter,
+                datafusion_expr::Expr::Literal(ScalarValue::Boolean(None | Some(false)), _)
+            )
+        }) || (self.has_location_column() && extract_location_predicates(filters).is_some())
     }
 
     fn partition_column_types(&self) -> &[(String, datafusion::arrow::datatypes::DataType)] {
@@ -1782,7 +1855,14 @@ pub trait ListingTableConnector: DataConnector {
                 Some(guard) => cached_table.with_schema_drift_guard(guard),
                 None => cached_table,
             };
-            return Ok(Arc::new(cached_table));
+            // This table skips `template.wrap`, so it needs the same guard: a deleted
+            // object must fail the refresh, not replace the acceleration with zero rows.
+            return Ok(reject_empty_single_object(
+                Arc::new(cached_table),
+                table_path,
+                dataset.name.to_string(),
+                template.extension.clone(),
+            ));
         }
 
         Ok(template.wrap(table_arc, table_path))
@@ -7153,6 +7233,110 @@ mod tests {
         }
     }
 
+    /// The S3 single-object table (`S3SingleFileCached`) does not go through `wrap`,
+    /// so it gets the guard from `reject_empty_single_object`: a deleted key
+    /// (`404 NoSuchKey`, which lists nothing) fails the scan instead of answering
+    /// zero rows, and the refresh-skip check still reaches the cached table beneath.
+    #[tokio::test]
+    async fn reject_empty_single_object_errors_on_a_deleted_s3_key() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(
+            &Url::parse("s3://bucket").expect("store url"),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        );
+        let key = Path::from("one/orders.parquet");
+        let parquet = |ids: &[i64]| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::Int64Array::from(ids.to_vec()))],
+            )
+            .expect("batch");
+            let mut buffer = Vec::new();
+            let mut writer =
+                datafusion::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None)
+                    .expect("parquet writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close parquet writer");
+            object_store::PutPayload::from(buffer)
+        };
+        let id_rows = |ctx: SessionContext| async move {
+            let batches = ctx.sql("SELECT id FROM facts").await?.collect().await?;
+            DFResult::Ok(batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+        };
+        store
+            .put(&key, parquet(&[1, 2, 3]))
+            .await
+            .expect("put object");
+
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/one/orders.parquet").expect("listing table url");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let listing = Arc::new(
+            ListingTable::try_new(
+                ListingTableConfig::new(table_path.clone())
+                    .with_listing_options(
+                        ListingOptions::new(Arc::new(ParquetFormat::default()))
+                            .with_file_extension(".parquet"),
+                    )
+                    .with_schema(schema),
+            )
+            .expect("create listing table"),
+        );
+        let cached = data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+            listing,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "facts".to_string(),
+        )
+        .expect("a single object is cached");
+        let provider = reject_empty_single_object(
+            Arc::new(cached),
+            table_path,
+            "facts".to_string(),
+            ".parquet".to_string(),
+        );
+        assert!(
+            data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                provider.as_ref()
+            )
+            .await
+            .expect("skip check")
+            .is_some(),
+            "the refresh-skip check must still reach the cached table under the guard"
+        );
+        ctx.register_table("facts", provider)
+            .expect("register table");
+        assert_eq!(id_rows(ctx.clone()).await.expect("initial scan"), 3);
+
+        store.delete(&key).await.expect("delete object");
+        let err: DataFusionError = id_rows(ctx.clone())
+            .await
+            .expect_err("a deleted key is an error, not zero rows");
+        let err = err.to_string();
+        assert!(
+            err.contains("No data files are yet available for dataset facts"),
+            "{err}"
+        );
+
+        store
+            .put(&key, parquet(&[1, 2, 3, 4]))
+            .await
+            .expect("restore object");
+        assert_eq!(
+            id_rows(ctx.clone()).await.expect("a restored key is read"),
+            4
+        );
+    }
+
     #[tokio::test]
     async fn test_location_pruning_skips_listing() {
         let ctx = SessionContext::new();
@@ -7186,17 +7370,27 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = LocationPruningListingTable::new(
-            Arc::new(listing),
+        let listing = Arc::new(listing);
+        let pruning = Arc::new(LocationPruningListingTable::new(
+            Arc::clone(&listing),
             ctx.runtime_env()
                 .object_store(&table_path)
                 .expect("object store"),
             table_path.clone(),
             file_schema,
             ".parquet",
+        ));
+        // The stack `ListingTableTemplate::wrap` registers: the empty-listing guard
+        // over the pruning table must not list for a `_location`-pruned scan either.
+        let provider = reject_empty_listing(
+            listing,
+            Some(pruning),
+            table_path.clone(),
+            "test_table".to_string(),
+            ".parquet".to_string(),
         );
 
-        ctx.register_table("test_table", Arc::new(provider))
+        ctx.register_table("test_table", provider)
             .expect("register table");
 
         let df = ctx

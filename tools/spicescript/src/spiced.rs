@@ -45,7 +45,12 @@ pub struct Spiced {
     pub binary: PathBuf,
     pub dir: PathBuf,
     env: BTreeMap<String, String>,
+    /// Variables of the runner's own environment the process does not inherit.
+    env_removed: Vec<String>,
     http: u16,
+    /// Serves HTTP on every interface, not only loopback, for a container
+    /// that cannot reach this machine's loopback.
+    http_on_every_interface: bool,
     flight: u16,
     metrics: u16,
     otel: u16,
@@ -75,15 +80,70 @@ pub struct Spiced {
 }
 
 /// A container `spiced` runs in: on the host's network, so it serves on the
-/// same local ports a process would, with the binary and `volumes` mounted
-/// and its working directory at the same path as on the host. Everything
-/// else, the temporary directory included, is its own.
+/// same local ports a process would, or, with `bridge`, on Docker's default
+/// bridge network with those ports published; with the binary and `volumes`
+/// mounted and its working directory at the same path as on the host.
+/// Everything else, the temporary directory included, is its own.
 #[derive(Debug, Clone)]
 pub struct ContainerRun {
     pub image: String,
     pub name: String,
     /// `docker run -v` specifications.
     pub volumes: Vec<String>,
+    /// Whether the daemon runs rootless, so its containers live in a user
+    /// namespace where the daemon's own user is root.
+    pub rootless: bool,
+    /// Runs the container on Docker's default bridge network instead of the
+    /// host's, serving on every interface inside it, and publishes each port
+    /// `spiced` serves where it is reached on loopback and at this address,
+    /// the one its cluster peers reach it at.
+    ///
+    /// A rootless daemon's `host` network is `RootlessKit`'s namespace, not
+    /// this machine's, so nothing here reaches a listener in a host-network
+    /// container: a scheduler running here never hears from its executors.
+    /// A published port is forwarded from this machine's namespace, and a
+    /// bridge container reaches this machine's routable address.
+    pub bridge: Option<std::net::IpAddr>,
+}
+
+/// The ports a container [`ContainerRun::bridge`] publishes, `-p` by `-p`:
+/// each of `ports` at the same number inside, on every interface, which is
+/// loopback and the routable address. A rootless daemon cannot publish one
+/// port on both: it binds each at its own loopback, and the second fails
+/// with "address already in use".
+fn publish_args(ports: &[u16]) -> Vec<String> {
+    ports
+        .iter()
+        .flat_map(|port| ["-p".to_string(), format!("0.0.0.0:{port}:{port}")])
+        .collect()
+}
+
+/// The port of the `--node-bind-address` among `args`, the one a cluster node
+/// serves its peers on, if it has one.
+fn node_bind_port(args: &[String]) -> Option<u16> {
+    args.iter()
+        .position(|a| a == "--node-bind-address")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|address| address.rsplit_once(':'))
+        .and_then(|(_, port)| port.parse().ok())
+}
+
+/// The `docker run --user` a container runs as, so that it may write in, and
+/// leave files the runner owns in, the instance directory owned by `uid:gid`.
+///
+/// A rootful daemon maps container IDs to the host's one for one, so the
+/// directory's own owner is the answer. A rootless daemon maps its own user to
+/// root and every other container ID to a subordinate ID the host never gave
+/// the directory, so a container under the owner's ID cannot create anything
+/// there: `spiced` then fails to take its instance lock with "Permission
+/// denied". Root in that namespace is the daemon's user, the one the runner
+/// shares the directory with.
+fn container_user(rootless: bool, uid: u32, gid: u32) -> String {
+    if rootless {
+        "0:0".to_string()
+    } else {
+        format!("{uid}:{gid}")
+    }
 }
 
 /// Which API key a request presents.
@@ -95,6 +155,27 @@ pub enum Key {
     Given(String),
 }
 
+/// The `--http` address `spiced` listens on.
+fn http_listen(every_interface: bool, port: impl std::fmt::Display) -> String {
+    let host = if every_interface {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    format!("{host}:{port}")
+}
+
+/// Whether `command_line` is a `spiced` this tool started serving HTTP on
+/// `port`, on either address [`Spiced::start`] passes.
+pub fn serves_http_on(command_line: &str, port: impl std::fmt::Display + Copy) -> bool {
+    let args: Vec<&str> = command_line.split_whitespace().collect();
+    [false, true].into_iter().any(|every| {
+        let address = http_listen(every, port);
+        args.windows(2)
+            .any(|pair| pair[0] == "--http" && pair[1] == address)
+    })
+}
+
 impl Spiced {
     pub fn new(binary: PathBuf, dir: PathBuf, env: BTreeMap<String, String>) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
@@ -102,7 +183,9 @@ impl Spiced {
             binary,
             dir,
             env,
+            env_removed: Vec::new(),
             http: free_port()?,
+            http_on_every_interface: false,
             flight: free_port()?,
             metrics: free_port()?,
             otel: free_port()?,
@@ -125,14 +208,57 @@ impl Spiced {
     }
 
     /// Runs `spiced` in this container on every start.
-    pub fn set_container(&mut self, run: ContainerRun) {
+    /// The container this instance runs in, if it runs in one.
+    pub fn container_name(&self) -> Option<&str> {
+        self.container.as_ref().map(|run| run.name.as_str())
+    }
+
+    /// Runs `spiced` in `run`'s container. A bridged one publishes its ports
+    /// on every interface, so they are given out again from those free on
+    /// every interface: a loopback probe misses a listener on another address.
+    pub fn set_container(&mut self, run: ContainerRun) -> Result<()> {
+        if run.bridge.is_some() {
+            let every = std::net::Ipv4Addr::UNSPECIFIED.into();
+            self.http = crate::docker::free_port_on(every)?;
+            self.flight = crate::docker::free_port_on(every)?;
+            self.metrics = crate::docker::free_port_on(every)?;
+            self.otel = crate::docker::free_port_on(every)?;
+        }
         self.container = Some(run);
+        Ok(())
     }
 
     /// Serves HTTP on `port`, one a script was told in advance
     /// (`${instance.http_port}`) so that a container can reach it.
     pub fn set_http_port(&mut self, port: u16) {
         self.http = port;
+    }
+
+    /// Serves HTTP on every interface (`0.0.0.0`) rather than only loopback,
+    /// so a container behind a rootless Docker daemon, which reaches this
+    /// machine only at its routable address, can post to it.
+    pub fn set_http_on_every_interface(&mut self, every: bool) {
+        self.http_on_every_interface = every;
+    }
+
+    /// Serves Flight on `port`, one a script was told in advance
+    /// (`${instance.flight_port}`) so that a sidecar can read from it.
+    pub fn set_flight_port(&mut self, port: u16) {
+        self.flight = port;
+    }
+
+    /// Starts the process without `key` from the runner's environment.
+    pub fn remove_env(&mut self, key: &str) {
+        self.env_removed.push(key.to_string());
+    }
+
+    /// What a client of its own needs to reach this `spiced` over Flight.
+    pub fn flight_target(&self) -> FlightTarget {
+        FlightTarget {
+            endpoint: Arc::from(self.flight_endpoint()),
+            api_key: self.api_key.clone(),
+            tls_ca: self.tls_ca.clone(),
+        }
     }
 
     fn scheme(&self) -> &'static str {
@@ -183,18 +309,13 @@ impl Spiced {
     }
 
     async fn connect_flight(&self, key: Option<&str>) -> Result<FlightClient> {
-        let credentials = match key {
-            Some(key) => Credentials::new("spicescript", SecretString::from(key.to_string())),
-            None => Credentials::anonymous(),
-        };
-        FlightClient::try_new(
-            Arc::from(format!("{}://127.0.0.1:{}", self.scheme(), self.flight)),
-            credentials,
-            None,
-            self.tls_ca.as_deref(),
-        )
+        FlightTarget {
+            endpoint: Arc::from(self.flight_endpoint()),
+            api_key: key.map(str::to_string),
+            tls_ca: self.tls_ca.clone(),
+        }
+        .connect()
         .await
-        .context("Failed to connect to spiced over Flight")
     }
 
     /// The runtime's HTTP endpoint, as the `spice` CLI takes it.
@@ -240,6 +361,12 @@ impl Spiced {
         let mut command = match self.container.clone() {
             None => {
                 let mut command = Command::new(&self.binary);
+                for key in &self.env_removed {
+                    command.env_remove(key);
+                }
+                if !self.env_removed.is_empty() {
+                    shadow_dotenv_files(&self.dir)?;
+                }
                 command.current_dir(&self.dir).envs(&self.env);
                 command
             }
@@ -248,12 +375,22 @@ impl Spiced {
                 self.container_command(&run, &binary)?
             }
         };
+        // In a bridge container, loopback is the container's own, so `spiced`
+        // serves on every interface there and its published ports reach it.
+        let bridged = self
+            .container
+            .as_ref()
+            .is_some_and(|run| run.bridge.is_some());
+        let host = if bridged { "0.0.0.0" } else { "127.0.0.1" };
         let child = command
             .arg("--telemetry-enabled=false")
-            .args(["--http", &format!("127.0.0.1:{}", self.http)])
-            .args(["--flight", &format!("127.0.0.1:{}", self.flight)])
-            .args(["--metrics", &format!("127.0.0.1:{}", self.metrics)])
-            .args(["--open_telemetry", &format!("127.0.0.1:{}", self.otel)])
+            .args([
+                "--http",
+                &http_listen(self.http_on_every_interface || bridged, self.http),
+            ])
+            .args(["--flight", &format!("{host}:{}", self.flight)])
+            .args(["--metrics", &format!("{host}:{}", self.metrics)])
+            .args(["--open_telemetry", &format!("{host}:{}", self.otel)])
             .args(&self.extra_args)
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -305,6 +442,7 @@ impl Spiced {
     /// and the signals `stop` sends reach `spiced`.
     fn container_command(&self, run: &ContainerRun, binary: &Path) -> Result<Command> {
         use std::os::unix::fs::MetadataExt;
+
         // A container left behind by an interrupted run would hold the name.
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", &run.name])
@@ -312,8 +450,15 @@ impl Spiced {
         let dir = std::path::absolute(&self.dir)?;
         let owner = std::fs::metadata(&dir)?;
         let mut command = Command::new("docker");
+        command.args(["run", "--rm", "--init"]);
+        if run.bridge.is_some() {
+            let mut ports = vec![self.http, self.flight, self.metrics, self.otel];
+            ports.extend(node_bind_port(&self.extra_args));
+            command.args(publish_args(&ports));
+        } else {
+            command.args(["--network", "host"]);
+        }
         command
-            .args(["run", "--rm", "--init", "--network", "host"])
             .args(["--name", &run.name])
             .arg("--label")
             .arg(format!(
@@ -322,7 +467,10 @@ impl Spiced {
                 std::process::id()
             ))
             // Files it writes in the shared directories stay the runner's.
-            .args(["--user", &format!("{}:{}", owner.uid(), owner.gid())])
+            .args([
+                "--user",
+                &container_user(run.rootless, owner.uid(), owner.gid()),
+            ])
             .arg("-v")
             .arg(format!("{}:/usr/local/bin/spiced:ro", binary.display()))
             .arg("-v")
@@ -643,16 +791,7 @@ impl Spiced {
             Key::None => self.connect_flight(None).await?,
             Key::Given(key) => self.connect_flight(Some(key)).await?,
         };
-        let mut stream = client.query(sql).await?;
-        let mut batches = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            batches.push(batch);
-        }
-        if batches.is_empty() {
-            let schema = stream.schema().context("Flight returned no schema")?;
-            batches.push(RecordBatch::new_empty(Arc::clone(schema)));
-        }
-        Ok(batches)
+        answer_with_schema(&client, sql).await
     }
 
     /// Runs an unprepared Flight SQL statement and consumes every endpoint.
@@ -974,6 +1113,48 @@ impl Spiced {
     }
 }
 
+/// A `spiced`'s Flight endpoint and the credentials its clients present,
+/// for clients that each open a connection of their own (a `load`).
+#[derive(Debug, Clone)]
+pub struct FlightTarget {
+    endpoint: Arc<str>,
+    api_key: Option<String>,
+    tls_ca: Option<PathBuf>,
+}
+
+impl FlightTarget {
+    /// Opens a connection of its own.
+    pub async fn connect(&self) -> Result<FlightClient> {
+        let credentials = match &self.api_key {
+            Some(key) => Credentials::new("spicescript", SecretString::from(key.clone())),
+            None => Credentials::anonymous(),
+        };
+        FlightClient::try_new(
+            Arc::clone(&self.endpoint),
+            credentials,
+            None,
+            self.tls_ca.as_deref(),
+        )
+        .await
+        .context("Failed to connect to spiced over Flight")
+    }
+}
+
+/// The answer to `sql`, keeping the stream's schema in an empty batch when
+/// Flight sends no batch at all.
+pub async fn answer_with_schema(client: &FlightClient, sql: &str) -> Result<Vec<RecordBatch>> {
+    let mut stream = client.query(sql).await?;
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.try_next().await? {
+        batches.push(batch);
+    }
+    if batches.is_empty() {
+        let schema = stream.schema().context("Flight returned no schema")?;
+        batches.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    Ok(batches)
+}
+
 impl Drop for Spiced {
     /// Dropping the `docker run` process leaves its container running, so a
     /// container instance dropped without being stopped is removed here,
@@ -983,6 +1164,22 @@ impl Drop for Spiced {
             crate::cleanup::remove_if_tracked(&run.name);
         }
     }
+}
+
+/// Writes an empty `.env` and `.env.local` into `dir` unless it has them.
+/// `spiced` reads each name from its working directory or the nearest ancestor
+/// that has it, so a variable kept out of its environment would come back from
+/// a file above the run directory, such as a checkout's `.env`. Variables a
+/// script sets reach it through its environment, as before.
+fn shadow_dotenv_files(dir: &Path) -> Result<()> {
+    for name in [".env", ".env.local"] {
+        let path = dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, "")
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The names of the datasets a spicepod declares.
@@ -1051,5 +1248,90 @@ mod not_yet_loaded_tests {
         assert_eq!(not_yet_loaded("[]", &declared), ["a", "u", "b"]);
         assert!(not_yet_loaded("[]", &[]).is_empty());
         assert!(declared_datasets("not: [yaml").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod container_user_tests {
+    use super::container_user;
+
+    // A non-root owner, so the two answers differ: with a root-owned
+    // directory both would be `0:0` and a lost rootless branch would pass.
+    const UID: u32 = 1001;
+    const GID: u32 = 121;
+
+    #[test]
+    fn rootful_runs_as_the_directory_owner() {
+        assert_eq!(container_user(false, UID, GID), "1001:121");
+    }
+
+    #[test]
+    fn rootless_runs_as_the_daemon_user_not_the_directory_owner() {
+        assert_eq!(container_user(true, UID, GID), "0:0");
+    }
+}
+
+#[cfg(test)]
+mod http_listen_tests {
+    use super::{http_listen, serves_http_on};
+
+    #[test]
+    fn listens_on_loopback_unless_asked_for_every_interface() {
+        assert_eq!(http_listen(false, 29141), "127.0.0.1:29141");
+        assert_eq!(http_listen(true, 29141), "0.0.0.0:29141");
+    }
+
+    #[test]
+    fn recognizes_its_spiced_on_either_address_and_nothing_else() {
+        let loopback =
+            "spiced --telemetry-enabled=false --http 127.0.0.1:29141 --flight 127.0.0.1:29142";
+        let every =
+            "spiced --telemetry-enabled=false --http 0.0.0.0:29141 --flight 127.0.0.1:29142";
+        assert!(serves_http_on(loopback, 29141));
+        assert!(serves_http_on(every, "29141"));
+        // Another port, another host, or the port given to another flag.
+        assert!(!serves_http_on(loopback, 29143));
+        // A port that is only a prefix of the one served.
+        assert!(!serves_http_on(loopback, 2914));
+        assert!(!serves_http_on("spiced --http 10.0.0.5:29141", 29141));
+        assert!(!serves_http_on(
+            "spiced --http 127.0.0.1:1 --flight 127.0.0.1:29142",
+            29142
+        ));
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::{node_bind_port, publish_args};
+
+    #[test]
+    fn publishes_each_port_once_on_every_interface() {
+        assert_eq!(
+            publish_args(&[29141, 29150]),
+            ["-p", "0.0.0.0:29141:29141", "-p", "0.0.0.0:29150:29150"]
+        );
+    }
+
+    #[test]
+    fn finds_the_node_port_only_after_its_flag() {
+        let args = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            node_bind_port(&args(&[
+                "--role",
+                "executor",
+                "--node-bind-address",
+                "0.0.0.0:29160",
+                "--node-mtls-ca-certificate-file",
+                "ca.crt",
+            ])),
+            Some(29160)
+        );
+        // A scheduler address carries a port too, but is not the node's own.
+        assert_eq!(
+            node_bind_port(&args(&["--scheduler-address", "https://127.0.0.1:29170"])),
+            None
+        );
+        assert_eq!(node_bind_port(&args(&["--node-bind-address"])), None);
     }
 }

@@ -49,7 +49,7 @@ util = { path = "../../util" }
 
 [dev-dependencies]
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }
-datafusion-table-providers = { workspace = true, features = ["sqlite", "duckdb"] }
+datafusion-table-providers = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

@@ -3,6 +3,10 @@ name: Test types support
 on:
   workflow_dispatch:
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   build:
     environment: secret-free
@@ -73,7 +77,7 @@ jobs:
         acceleration:
           [
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: sqlite, mode: memory },
             { engine: postgres },
           ]

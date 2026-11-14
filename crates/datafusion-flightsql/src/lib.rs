@@ -293,18 +293,25 @@ impl FlightSqlService {
                         // the expanded schema we advertised in GetFlightInfo.
                         let batch = arrow_tools::schema::cast_view_columns(batch, &schema)
                             .map_err(|e| Status::internal(e.to_string()))?;
-                        let (dicts, batch_data) = encoder
-                            .encode(
-                                &batch,
-                                &mut dict_tracker,
-                                &options,
-                                &mut compression_context,
-                            )
-                            .map_err(|e| Status::internal(e.to_string()))?;
-                        for dict in dicts {
-                            yield dict.into();
+                        // Split a large batch so no single message exceeds a
+                        // client's default gRPC receive limit.
+                        for slice in arrow_tools::ipc::split_batch_for_flight(
+                            batch,
+                            arrow_tools::ipc::FLIGHT_TARGET_MESSAGE_BYTES,
+                        ) {
+                            let (dicts, batch_data) = encoder
+                                .encode(
+                                    &slice,
+                                    &mut dict_tracker,
+                                    &options,
+                                    &mut compression_context,
+                                )
+                                .map_err(|e| Status::internal(e.to_string()))?;
+                            for dict in dicts {
+                                yield dict.into();
+                            }
+                            yield batch_data.into();
                         }
-                        yield batch_data.into();
                     }
                     Err(e) => {
                         Err(handle_datafusion_error(e))?;

@@ -33,7 +33,7 @@ use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::config::{ClusterConfig, ClusterRole, Config};
+use runtime::config::{ClusterConfig, Config, Role};
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::param::Params;
@@ -46,7 +46,7 @@ use spicepod::param::Params;
 /// `CayenneDdlAnalyzerRule` is not gated on the cluster role.
 fn test_cluster_config() -> ResolvedClusterConfig {
     ResolvedClusterConfig::try_new(ClusterConfig {
-        role: Some(ClusterRole::Executor),
+        role: Some(Role::Executor),
         allow_insecure_connections: true,
         node_advertise_address: Some("127.0.0.1".to_string()),
         ..Default::default()

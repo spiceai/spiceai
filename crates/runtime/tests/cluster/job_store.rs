@@ -101,7 +101,7 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
                 http_bind_address: scheduler_ports.http_addr(),
                 flight_bind_address: scheduler_ports.flight_addr(),
                 cluster: ClusterConfig {
-                    role: Some(runtime::config::ClusterRole::Scheduler),
+                    role: Some(runtime::config::Role::Scheduler),
                     node_bind_address: scheduler_ports.cluster_addr(),
                     node_advertise_address: Some("127.0.0.1".to_string()),
                     node_mtls_ca_certificate_file: Some(
@@ -151,7 +151,7 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
                 http_bind_address: executor_ports.http_addr(),
                 flight_bind_address: executor_ports.flight_addr(),
                 cluster: ClusterConfig {
-                    role: Some(runtime::config::ClusterRole::Executor),
+                    role: Some(runtime::config::Role::Executor),
                     node_bind_address: executor_ports.cluster_addr(),
                     scheduler_address: Some(scheduler_ports.cluster_advertise()),
                     node_advertise_address: Some("127.0.0.1".to_string()),

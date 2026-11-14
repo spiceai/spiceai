@@ -14,7 +14,7 @@ SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "get_release_v
 
 
 class GetReleaseVersionTests(unittest.TestCase):
-    def run_script(self, version, ref_type=None, ref_name=None, release_notes=False):
+    def run_script(self, version, ref_type=None, ref_name=None, release_notes=False, release_version=None):
         with tempfile.TemporaryDirectory() as workdir:
             with open(os.path.join(workdir, "version.txt"), "w") as f:
                 f.write(version + "\n")
@@ -28,13 +28,15 @@ class GetReleaseVersionTests(unittest.TestCase):
             env = {
                 k: v
                 for k, v in os.environ.items()
-                if k not in ("GITHUB_REF_TYPE", "GITHUB_REF_NAME")
+                if k not in ("GITHUB_REF_TYPE", "GITHUB_REF_NAME", "RELEASE_VERSION")
             }
             env["GITHUB_ENV"] = github_env
             if ref_type is not None:
                 env["GITHUB_REF_TYPE"] = ref_type
             if ref_name is not None:
                 env["GITHUB_REF_NAME"] = ref_name
+            if release_version is not None:
+                env["RELEASE_VERSION"] = release_version
 
             proc = subprocess.run(
                 [sys.executable, SCRIPT],
@@ -103,6 +105,24 @@ class GetReleaseVersionTests(unittest.TestCase):
 
         self.assert_ok(proc)
         self.assertEqual(written, "PRE_RELEASE=true\nREL_VERSION=2.4.0-rc.1-enterprise\n")
+
+    def test_release_build_matching_version_txt(self):
+        proc, written = self.run_script("2.4.2", "branch", "release/2.4", release_notes=True, release_version="2.4.2")
+
+        self.assert_ok(proc)
+        self.assertEqual(written, "HAS_RELEASE_NOTES=true\nREL_VERSION=2.4.2\n")
+
+    def test_release_build_of_another_version_is_rejected(self):
+        proc, written = self.run_script("2.4.1", "branch", "release/2.4", release_version="2.4.2")
+
+        self.assertNotEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertIn(written, (None, ""))
+        self.assertIn("::error title=Release version does not match version.txt::Release version '2.4.2' does not match version.txt '2.4.1'", proc.stdout)
+
+    def test_empty_release_version_is_not_checked(self):
+        proc, written = self.run_script("2.5.0-dev", "branch", "trunk", release_version="")
+
+        self.assert_ok(proc)
 
     def test_branch_ref_is_not_checked(self):
         # trunk, release branches, PRs and branch dispatches never match a tag.

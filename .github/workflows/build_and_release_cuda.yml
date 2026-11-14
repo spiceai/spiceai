@@ -2,14 +2,13 @@ name: build_and_release_cuda
 
 # CUDA is not part of pull-request CI: a single compute-cap 90 compile takes
 # hours on the large runners, and the workflow is not a required check. Trunk
-# pushes, tagged releases, and manual dispatches still build every compute
-# capability.
+# pushes and manual dispatches still build every compute capability. A release
+# build builds CUDA inside build_release, which calls this workflow, so the
+# release's CUDA binaries are artifacts of the same run as every other binary.
 on:
   push:
     branches:
       - trunk
-    tags:
-      - v*
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -28,6 +27,13 @@ on:
       - 'monitoring/**'
       - 'acknowledgements.md'
       - 'Dockerfile*'
+
+  workflow_call:
+    inputs:
+      release_version:
+        description: Version of the release build calling this workflow
+        required: true
+        type: string
 
   workflow_dispatch:
     inputs:
@@ -61,16 +67,19 @@ on:
         default: 'release'
 
 # A trunk push cancels the CUDA build of any older trunk push, queued or
-# running. A tag run cancels any older run for the same tag, so a moved tag
-# publishes the CUDA binaries of one build. Other manual runs each get a group
-# of their own, so they never cancel or wait on another run. The tag group name
-# differs from build_and_release's, since groups are shared across workflows.
+# running. Every other run, including a call from build_release, gets a group
+# of its own, so it never cancels or waits on another run. A cancelled
+# build_release run cancels its call with it.
 concurrency:
-  group: ${{ github.ref_type == 'tag' && format('build-release-cuda-{0}', github.ref) || format('{0}-{1}', github.workflow, (github.event_name == 'push' && github.ref == 'refs/heads/trunk') && 'trunk' || github.run_id) }}
+  group: ${{ format('build-cuda-{0}', (github.event_name == 'push' && github.ref == 'refs/heads/trunk') && 'trunk' || github.run_id) }}
   cancel-in-progress: true
 
 permissions:
   contents: read
+
+env:
+  # Checked against version.txt by get_release_version.py; set only by a release build.
+  RELEASE_VERSION: ${{ inputs.release_version }}
 
 jobs:
   setup-matrix:
@@ -86,8 +95,10 @@ jobs:
         id: setup-matrix
         with:
           script: |
-            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
-            const runner = isTaggedRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
+            // A release build calls this workflow with its version and builds on
+            // GitHub-hosted runners.
+            const isRelease = process.env.RELEASE_VERSION !== '';
+            const runner = isRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
 
             const matrix = [
               {
@@ -122,10 +133,13 @@ jobs:
               }
             ];
 
-            // If running via workflow_dispatch, filter based on input
+            // If running via workflow_dispatch, filter based on input. A call from
+            // build_release sees build_release's dispatch inputs, which have no
+            // `compute_cap`, so a missing input means 'all'. Its `platform_option`
+            // keeps every entry, since every CUDA build is Linux.
             if (context.eventName === 'workflow_dispatch') {
-              const platform_option = context.payload.inputs.platform_option;
-              const compute_cap = context.payload.inputs.compute_cap;
+              const platform_option = context.payload.inputs.platform_option ?? 'all';
+              const compute_cap = context.payload.inputs.compute_cap ?? 'all';
               let filtered = matrix;
 
               // Filter by platform if specified
@@ -169,10 +183,9 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Set up wget
-        if: matrix.target.target_os == 'linux'
-        run: sudo apt-get update && sudo apt-get install wget -y
-
+      # setup-make runs configure-apt, which gives apt its mirror failover.
+      # Keep every bare apt-get step after it, so security.ubuntu.com being
+      # down cannot fail the build here.
       - name: Set up make
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-make
@@ -180,6 +193,10 @@ jobs:
       - name: Set up cc
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-cc
+
+      - name: Set up wget
+        if: matrix.target.target_os == 'linux'
+        run: sudo apt-get update && sudo apt-get install wget -y
 
       - name: Install protoc
         uses: ./.github/actions/install-protoc
@@ -193,82 +210,3 @@ jobs:
           target_os: ${{ matrix.target.target_os }}
           rust-profile: ${{ env.RUST_PROFILE }}
 
-  publish:
-    environment: github-publish
-    name: Publish CUDA binaries
-    needs: build
-    if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
-    permissions:
-      contents: write  # Upload assets to the GitHub release
-    env:
-      ARTIFACT_DIR: ./release
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
-
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Create artifact directory
-        run: mkdir -p ${{ env.ARTIFACT_DIR }}
-
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      # Download all CUDA artifacts for this platform
-      - name: Download CUDA artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        continue-on-error: true
-        with:
-          path: ${{ env.ARTIFACT_DIR }}
-          merge-multiple: true
-
-      - name: List artifacts
-        run: ls -l ${{ env.ARTIFACT_DIR }}
-
-      - name: Publish CUDA binaries to GitHub
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Parse repository to get owner and repo names
-          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
-          REPO_NAME="${GITHUB_REPOSITORY#*/}"
-
-          # First check if we have any files to upload
-          if [ -z "$(ls -A ${ARTIFACT_DIR})" ]; then
-            echo "No artifacts found in ${ARTIFACT_DIR}"
-            exit 1
-          fi
-
-          # Create an array of actual files (no globs)
-          RELEASE_ARTIFACTS=()
-          for file in ${ARTIFACT_DIR}/*; do
-            if [ -f "$file" ]; then
-              RELEASE_ARTIFACTS+=("$file")
-            fi
-          done
-
-          # Delete existing release artifact
-          python ./.github/scripts/github_release.py delete \
-            --owner $OWNER_NAME --repo $REPO_NAME \
-            --tag "v${{ env.REL_VERSION }}" \
-            "${RELEASE_ARTIFACTS[@]}"
-
-          # Pass the notes by path, not by value: a release body over 128 KiB
-          # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
-          # after every build has already succeeded.
-          if [ "$HAS_RELEASE_NOTES" = "true" ]; then
-            BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
-          else
-            BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")
-          fi
-
-          echo "Uploading Spice.ai CUDA Binaries to GitHub Release"
-          python ./.github/scripts/github_release.py upload \
-            --owner $OWNER_NAME --repo $REPO_NAME \
-            --tag "v${{ env.REL_VERSION }}" \
-            --release-name "v${{ env.REL_VERSION }}" \
-            "${BODY_ARGS[@]}" \
-            --prerelease "$PRE_RELEASE" \
-            "${RELEASE_ARTIFACTS[@]}"

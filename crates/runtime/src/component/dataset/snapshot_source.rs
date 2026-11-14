@@ -442,7 +442,6 @@ fn local_copy_params(
             .into_owned()
     };
     match engine {
-        Engine::DuckDB => vec![("duckdb_file", path("duckdb"))],
         Engine::Sqlite => vec![("sqlite_file", path("sqlite"))],
         _ => Vec::new(),
     }
@@ -841,30 +840,25 @@ mod tests {
             "sales.modules-{}",
             &location_hash("s3://bucket-b/snapshots/")[..12]
         );
-        for (engine, param, suffix) in [
-            (Engine::DuckDB, "duckdb_file", "duckdb"),
-            (Engine::Sqlite, "sqlite_file", "sqlite"),
-        ] {
-            let path = path_of(&source, engine, param);
-            assert!(
-                path.ends_with(&format!("{stem}.{suffix}")),
-                "unexpected {param} for {engine}: {path}"
-            );
-            assert!(path.contains(".spice"), "{path}");
-        }
+        let path = path_of(&source, Engine::Sqlite, "sqlite_file");
+        assert!(
+            path.ends_with(&format!("{stem}.sqlite")),
+            "unexpected sqlite_file for sqlite: {path}"
+        );
+        assert!(path.contains(".spice"), "{path}");
 
         let elsewhere = self::source(&dataset_at("s3://bucket-a/snapshots/"));
         assert_ne!(
-            path_of(&source, Engine::DuckDB, "duckdb_file"),
-            path_of(&elsewhere, Engine::DuckDB, "duckdb_file"),
+            path_of(&source, Engine::Sqlite, "sqlite_file"),
+            path_of(&elsewhere, Engine::Sqlite, "sqlite_file"),
             "another location never reuses this location's copy"
         );
         assert_eq!(
-            path_of(&source, Engine::DuckDB, "duckdb_file"),
+            path_of(&source, Engine::Sqlite, "sqlite_file"),
             path_of(
                 &self::source(&dataset_at("s3://bucket-b/snapshots")),
-                Engine::DuckDB,
-                "duckdb_file"
+                Engine::Sqlite,
+                "sqlite_file"
             ),
             "a trailing slash names the same location, and so the same copy"
         );
@@ -896,22 +890,22 @@ mod tests {
         let mut tuned = snapshot_dataset();
         tuned.acceleration = Some(spicepod_acceleration::Acceleration {
             params: Some(Params::from_string_map(HashMap::from([(
-                "duckdb_memory_limit".to_string(),
-                "2GB".to_string(),
+                "busy_timeout".to_string(),
+                "5000".to_string(),
             )]))),
             ..Default::default()
         });
         let acceleration = source(&tuned)
-            .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
+            .acceleration(&TableReference::bare("modules"), Engine::Sqlite)
             .expect("engine tuning params are kept");
         assert_eq!(
             acceleration
                 .params
                 .as_ref()
-                .and_then(|params| params.data.get("duckdb_memory_limit"))
+                .and_then(|params| params.data.get("busy_timeout"))
                 .map(ParamValue::as_string)
                 .as_deref(),
-            Some("2GB")
+            Some("5000")
         );
     }
 
@@ -951,8 +945,8 @@ mod tests {
         );
 
         let message = source(&declared)
-            .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
-            .expect_err("Cayenne paths do not apply to DuckDB snapshots")
+            .acceleration(&TableReference::bare("modules"), Engine::Sqlite)
+            .expect_err("Cayenne paths do not apply to SQLite snapshots")
             .to_string();
         assert!(
             message.contains("Remove `acceleration.params.cayenne_"),
@@ -964,25 +958,27 @@ mod tests {
     fn an_engine_the_snapshots_were_not_created_with_is_rejected() {
         let mut declared = snapshot_dataset();
         declared.acceleration = Some(spicepod_acceleration::Acceleration {
-            engine: Some("duckdb".to_string()),
+            engine: Some("arrow".to_string()),
             ..Default::default()
         });
-        let source = source(&declared);
-
-        let message = source
+        let message = source(&declared)
             .acceleration(&TableReference::bare("modules"), Engine::Cayenne)
             .expect_err("the configured engine differs")
             .to_string();
         assert_eq!(
             message,
             format!(
-                "Invalid configuration for 'acceleration.engine': Dataset 'modules' reads snapshots from 's3://bucket-b/snapshots/' that were created with the 'cayenne' engine, but `acceleration.engine` is 'duckdb'. Remove `acceleration.engine`, which a snapshot dataset takes from its snapshots. See: {SNAPSHOT_SOURCE_DOCS}"
+                "Invalid configuration for 'acceleration.engine': Dataset 'modules' reads snapshots from 's3://bucket-b/snapshots/' that were created with the 'cayenne' engine, but `acceleration.engine` is 'arrow'. Remove `acceleration.engine`, which a snapshot dataset takes from its snapshots. See: {SNAPSHOT_SOURCE_DOCS}"
             )
         );
 
+        declared.acceleration = Some(spicepod_acceleration::Acceleration {
+            engine: Some("cayenne".to_string()),
+            ..Default::default()
+        });
         assert!(
-            source
-                .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
+            source(&declared)
+                .acceleration(&TableReference::bare("modules"), Engine::Cayenne)
                 .is_ok(),
             "the engine the snapshots were created with is accepted"
         );
@@ -1120,7 +1116,7 @@ mod tests {
         let registry = Arc::new(SnapshotSourceRegistry::default());
         let modules = TableReference::bare("modules");
         let orders = TableReference::bare("orders");
-        registry.record(&modules, "s3://bucket/a/", Engine::DuckDB);
+        registry.record(&modules, "s3://bucket/a/", Engine::Sqlite);
         registry.record(&modules, "s3://bucket/b/", Engine::Cayenne);
         registry.record(&orders, "s3://bucket/a/", Engine::Sqlite);
         let resolution = registry.begin_resolution(&modules);

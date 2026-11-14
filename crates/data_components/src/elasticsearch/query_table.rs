@@ -894,6 +894,10 @@ mod tests {
             score: Some(1.0),
             sort: None,
             source,
+            seq_no: None,
+            primary_term: None,
+            index: None,
+            routing: None,
         }
     }
 
@@ -903,12 +907,18 @@ mod tests {
             score: Some(1.0),
             sort: Some(vec![json!(id)]),
             source: json!({ "title": format!("title-{id}") }),
+            seq_no: None,
+            primary_term: None,
+            index: None,
+            routing: None,
         }
     }
 
     fn search_response(hits: Vec<Hit>, pit_id: Option<&str>) -> SearchResponse {
         SearchResponse {
             pit_id: pit_id.map(ToString::to_string),
+            timed_out: false,
+            shards: None,
             hits: HitsEnvelope {
                 total: Some(HitsTotal {
                     value: u64::try_from(hits.len()).expect("hit count should fit in u64"),
@@ -1097,6 +1107,13 @@ mod tests {
             _query: &serde_json::Value,
         ) -> elasticsearch::Result<serde_json::Value> {
             Err(unexpected_call_error("delete_by_query"))
+        }
+
+        async fn bulk_delete_if_unchanged(
+            &self,
+            _docs: &[elasticsearch::DocumentVersion],
+        ) -> elasticsearch::Result<serde_json::Value> {
+            Err(unexpected_call_error("bulk_delete_if_unchanged"))
         }
     }
 

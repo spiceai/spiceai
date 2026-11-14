@@ -188,3 +188,125 @@ async fn probe_subset_path_append_only() {
         LastSmallFileCompactPath::Subset
     );
 }
+
+/// With the object-native metastore off (a `SQLite` catalog and a local data
+/// path), the data path keeps a folder per snapshot: files are written under
+/// `<table_id>/<snapshot>/`, and a subset compaction hard-links the files it
+/// does not rewrite into the new snapshot's folder.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flag_off_keeps_snapshot_folders_and_hard_links_on_subset_compaction() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().expect("tmp");
+    let data_path = temp.path().join("data");
+    tokio::fs::create_dir_all(&data_path).await.expect("dir");
+    let catalog = Arc::new(
+        CayenneCatalog::new(format!(
+            "sqlite://{}",
+            temp.path().join("c.db").to_string_lossy()
+        ))
+        .expect("cat"),
+    );
+    catalog.init().await.expect("init");
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            CreateTableOptions {
+                table_name: "folders".into(),
+                schema: schema(),
+                primary_key: vec!["id".into()],
+                on_conflict: None,
+                base_path: data_path.to_string_lossy().into(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    target_vortex_file_size_mb: 1,
+                    compaction_trigger_files: 4,
+                    compaction_max_levels: 3,
+                    compaction_max_files_per_pick: 4,
+                    compaction_background_interval_ms: 0,
+                    inline_max_rows: 0,
+                    deletion_mode: DeletionMode::Key,
+                    ..VortexConfig::default()
+                },
+            },
+            ctx.runtime_env(),
+        )
+        .await
+        .expect("create"),
+    );
+    for i in 0..12 {
+        insert(&table, batch(i * 1500, 1500)).await;
+    }
+    for _ in 0..50 {
+        if table.last_small_file_compact_path() == LastSmallFileCompactPath::Subset {
+            break;
+        }
+        let _ = table.maybe_compact_small_files().await.expect("compact");
+        tokio::task::yield_now().await;
+    }
+
+    let table_dir = data_path.join(table.table_id());
+    let current = catalog
+        .get_table("folders")
+        .await
+        .expect("stored table")
+        .current_snapshot_id;
+    // Every data file is in a snapshot's folder, and none is at the table's root.
+    let mut at_root = Vec::new();
+    for entry in std::fs::read_dir(&table_dir).expect("table dir") {
+        let path = entry.expect("entry").path();
+        if path.is_file() {
+            at_root.push(path.display().to_string());
+        }
+    }
+    let current_files: Vec<std::path::PathBuf> = std::fs::read_dir(table_dir.join(&current))
+        .expect("current snapshot folder")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "vortex"))
+        .collect();
+    // A hard-linked file has a second name: the source snapshot's folder.
+    let linked = current_files
+        .iter()
+        .filter(|path| std::fs::metadata(path).expect("metadata").nlink() >= 2)
+        .count();
+    let ctx = SessionContext::new();
+    ctx.register_table("folders", Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    let counted = ctx
+        .sql("SELECT count(*), count(DISTINCT id), min(id), max(id) FROM folders")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("count");
+    let column = |i: usize| {
+        counted[0]
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64")
+            .value(0)
+    };
+    assert_eq!(
+        (
+            table.last_small_file_compact_path(),
+            uuid::Uuid::parse_str(&current).is_ok(),
+            at_root,
+            current_files.is_empty(),
+            linked > 0,
+            (column(0), column(1), column(2), column(3)),
+        ),
+        (
+            LastSmallFileCompactPath::Subset,
+            true,
+            Vec::<String>::new(),
+            false,
+            true,
+            (18_000, 18_000, 0, 17_999),
+        ),
+        "subset path, the current snapshot's folder, no file at the table root, files hard-linked from the source folder ({linked} of {}), rows",
+        current_files.len()
+    );
+}

@@ -78,7 +78,17 @@ spec:
               "0.0.0.0:50051"
             ]
           {{- end }}
+          {{- with include "spiceai.roleArgs" . }}
+          args: {{- . | trim | nindent 12 }}
+          {{- end }}
           env:
+            {{- if include "spiceai.clusterNode" . }}
+            {{- /* Referenced as $(SPICE_POD_IP) by the default --node-advertise-address. */}}
+            - name: SPICE_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            {{- end }}
             {{- /*
               The pod's own CPU request, so spiced sizes its thread pools and query
               fan-out for the CPU it was scheduled against rather than for the whole
@@ -106,10 +116,14 @@ spec:
               name: metrics
             - containerPort: 50051
               name: flight
+            {{- if include "spiceai.clusterNode" . }}
+            - containerPort: {{ .Values.cluster.port }}
+              name: cluster
+            {{- end }}
           livenessProbe:
             {{- include "spiceai.probe" (dict "probe" .Values.livenessProbe "path" "/health" "port" 8090) | nindent 12 }}
           readinessProbe:
-            {{- include "spiceai.probe" (dict "probe" .Values.readinessProbe "path" "/v1/ready" "port" 8090) | nindent 12 }}
+            {{- include "spiceai.probe" (dict "probe" (include "spiceai.readinessProbe" . | fromYaml) "path" (include "spiceai.readinessPath" .) "port" 8090) | nindent 12 }}
           startupProbe:
             {{- include "spiceai.probe" (dict "probe" .Values.startupProbe "path" "/health" "port" 8090) | nindent 12 }}
           volumeMounts:
@@ -119,6 +133,11 @@ spec:
             - name: spiceai-config-volume
               mountPath: /app/spicepod.yaml
               subPath: spicepod.yaml
+            {{- if and (include "spiceai.clusterNode" .) .Values.cluster.tls.secretName }}
+            - name: spiceai-cluster-tls
+              mountPath: /etc/spice/cluster-tls
+              readOnly: true
+            {{- end }}
             {{- if .Values.stateful.enabled }}
             - name: {{ .Release.Name }}-data
               mountPath: {{ .Values.stateful.mountPath }}
@@ -136,6 +155,13 @@ spec:
         - name: spiceai-config-volume
           configMap:
             name: {{ template "spiceai.fullname" .  }}-spicepod
+        {{- if and (include "spiceai.clusterNode" .) .Values.cluster.tls.secretName }}
+        - name: spiceai-cluster-tls
+          secret:
+            secretName: {{ .Values.cluster.tls.secretName }}
+            {{- /* Readable by the runtime's group (fsGroup 65534) only. */}}
+            defaultMode: 0440
+        {{- end }}
   {{- if .Values.stateful.enabled }}
   volumeClaimTemplates:
     - metadata:

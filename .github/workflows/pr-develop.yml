@@ -24,10 +24,17 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   check_changes:
     environment: secret-free
     name: Check for code changes
+    permissions:
+      contents: read
+      pull-requests: read  # dorny/paths-filter (check-code-changes) lists the PR's files via the API on pull_request
     runs-on: spiceai-macos
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
@@ -46,7 +53,7 @@ jobs:
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
@@ -126,7 +133,7 @@ jobs:
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 

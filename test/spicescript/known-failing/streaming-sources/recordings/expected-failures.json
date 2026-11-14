@@ -2,85 +2,96 @@
   "dynamodb-declared-streams-race": [
     {
       "run": "dynamodb-declared-streams-race",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, name FROM created0",
       "kind": "error",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
       "varies": true,
       "group": "streaming-sources",
       "may-pass": true,
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}"
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}|Spice returned no rows, expected 3"
     },
     {
       "run": "dynamodb-declared-streams-race",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, name FROM created1",
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}|Spice returned no rows, expected 3",
       "may-pass": true
     },
     {
       "run": "dynamodb-declared-streams-race",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, name FROM created2",
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}|Spice returned no rows, expected 3",
       "may-pass": true
     },
     {
       "run": "dynamodb-declared-streams-race",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, name FROM created3",
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}|Spice returned no rows, expected 3",
       "may-pass": true
     },
     {
       "run": "dynamodb-declared-streams-race",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, name FROM streamed0",
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}|Spice returned no rows, expected 3",
       "may-pass": true
     },
     {
       "run": "dynamodb-declared-streams-race",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, name FROM streamed1",
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}|Spice returned no rows, expected 3",
       "may-pass": true
     },
     {
       "run": "dynamodb-declared-streams-race",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, name FROM streamed2",
       "kind": "error",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
       "varies": true,
       "group": "streaming-sources",
       "may-pass": true,
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}"
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}|Spice returned no rows, expected 3"
     },
     {
       "run": "dynamodb-declared-streams-race",
-      "who": "default",
+      "who": "as-written",
       "key": "query: SELECT id, name FROM streamed3",
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}|Spice returned no rows, expected 3",
       "may-pass": true
+    },
+    {
+      "run": "dynamodb-declared-streams-race",
+      "who": "object-native",
+      "key": "query: SELECT id, name FROM streamed2",
+      "kind": "error",
+      "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "varies": true,
+      "group": "streaming-sources",
+      "may-pass": true,
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}|Spice returned no rows, expected 3"
     }
   ],
   "kafka-tombstone": [
@@ -96,7 +107,15 @@
   "mongodb-cdc-resume-numeric-id": [
     {
       "run": "mongodb-cdc-resume-numeric-id",
-      "who": "default",
+      "who": "as-written",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.auth\",\"type\":\"auth\"},\"error_message\":\"External error: Failed to start MongoDB Change Stream for dataset `t` collection `t` while resuming from persisted token: Kind: Command failed: E",
+      "group": "streaming-sources"
+    },
+    {
+      "run": "mongodb-cdc-resume-numeric-id",
+      "who": "object-native",
       "key": "restart: {}",
       "kind": "error",
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.auth\",\"type\":\"auth\"},\"error_message\":\"External error: Failed to start MongoDB Change Stream for dataset `t` collection `t` while resuming from persisted token: Kind: Command failed: E",
@@ -106,7 +125,17 @@
   "mongodb-cdc-source-restart": [
     {
       "run": "mongodb-cdc-source-restart",
-      "who": "default",
+      "who": "as-written",
+      "key": "query: SELECT _id, v FROM t ORDER BY _id",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "varies": true,
+      "group": "streaming-sources",
+      "may-pass": true
+    },
+    {
+      "run": "mongodb-cdc-source-restart",
+      "who": "object-native",
       "key": "query: SELECT _id, v FROM t ORDER BY _id",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",

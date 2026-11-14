@@ -481,7 +481,9 @@ fn file_scan_config(
 
 /// The object store and files of every file scan in `plan`, or `None` when `plan` scans no
 /// files (or scans more than one object store, which a listing table never does).
-fn scanned_files(plan: &Arc<dyn ExecutionPlan>) -> Option<(ObjectStoreUrl, Vec<ObjectMeta>)> {
+pub(crate) fn scanned_files(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<(ObjectStoreUrl, Vec<ObjectMeta>)> {
     let mut store_url = None;
     let mut files: Vec<ObjectMeta> = Vec::new();
     let mut mixed_stores = false;

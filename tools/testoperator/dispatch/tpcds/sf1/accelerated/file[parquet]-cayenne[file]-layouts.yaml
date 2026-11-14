@@ -15,4 +15,5 @@ tests:
       - sort,time_column
       - cluster
       - partition
+      - primary_key,indexes,sort,time_column
       - primary_key,indexes,sort,time_column,partition

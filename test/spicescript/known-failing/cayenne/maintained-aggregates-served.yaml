@@ -17,6 +17,8 @@ sources:
 variants:
   full: {}
   changes: { datasets: { orders: { acceleration: { refresh_mode: changes } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
@@ -72,7 +74,7 @@ steps:
         UPDATE orders SET region = 'eu' WHERE id % 7 = 0;
         INSERT INTO orders SELECT g, g % 5, 'us', 1000 + g % 3 FROM generate_series(2001, 2100) g;
   - refresh: orders
-    only: full
+    only: [full, object-native]
   - query: SELECT count(*) AS n, sum(amount) AS s FROM orders
     eventually: 60s
   - corpus: ../../corpus/maintained-aggregates-plans.sql

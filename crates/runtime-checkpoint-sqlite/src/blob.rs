@@ -80,7 +80,7 @@ impl BlobCheckpointStore for SqliteBlobCheckpointStore {
                 conn.execute(&Self::create_table_sql(table), [])?;
 
                 let query = format!(
-                    "SELECT checkpoint_data, strftime('%s', updated_at) FROM {table} WHERE dataset_name = ?"
+                    "SELECT checkpoint_data, CAST(strftime('%s', updated_at) AS INTEGER) FROM {table} WHERE dataset_name = ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([dataset_name])?;
@@ -154,5 +154,53 @@ impl BlobCheckpointStore for SqliteBlobCheckpointStore {
             )
             .await
             .map_err(crate::store_error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::*;
+    use crate::test_support::temp_pool;
+
+    const TABLE: &str = "spice_sys_blob_test";
+
+    /// A connector decides whether a checkpoint is too old to resume from by its
+    /// `updated_at`, so the store must report when the checkpoint was written, not
+    /// `None`: `SQLite`'s `strftime` returns text, which does not read as an integer.
+    #[tokio::test]
+    async fn get_reports_when_the_checkpoint_was_written() {
+        let (pool, _dir) = temp_pool("blob_updated_at").await;
+        let store = SqliteBlobCheckpointStore::new(Arc::clone(&pool), "orders".to_string(), TABLE);
+        store.upsert("{}").await.expect("upsert the checkpoint");
+
+        let conn_sync = pool.connect_sync();
+        let conn = conn_sync
+            .as_any()
+            .downcast_ref::<SqliteConnection>()
+            .expect("sqlite connection");
+        conn.conn
+            .call(|conn| {
+                conn.execute(
+                    &format!("UPDATE {TABLE} SET updated_at = '2026-11-07 10:00:00'"),
+                    [],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .expect("set updated_at");
+
+        let checkpoint = store
+            .get()
+            .await
+            .expect("read the checkpoint")
+            .expect("the checkpoint exists");
+        assert_eq!(checkpoint.data, "{}");
+        // 2026-11-07T10:00:00Z
+        assert_eq!(
+            checkpoint.updated_at,
+            Some(UNIX_EPOCH + Duration::from_hours(498_346))
+        );
     }
 }

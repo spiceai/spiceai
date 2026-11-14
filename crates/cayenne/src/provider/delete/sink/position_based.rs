@@ -26,19 +26,17 @@ limitations under the License.
 #![expect(deprecated)]
 
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
-use super::{CayenneDeletionSink, PreparedDeletionCache, PreparedDeletionPublish};
+use super::{CayenneDeletionSink, DeleteScanTable, PreparedDeletionCache, PreparedDeletionPublish};
 use crate::provider::Error;
 use crate::provider::deletion_strategy::PositionDeletionVector;
 use crate::provider::utils::convert_to_u64_box;
 use crate::row_converter::{OwnedRow, RowConverter};
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, StructArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
-use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::utils::split_conjunction_owned;
 use datafusion_physical_expr::expressions as phys_expr;
@@ -81,7 +79,7 @@ impl CayenneDeletionSink {
     pub(super) async fn delete_filtered_rows_position_based(
         &self,
         ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
+        tables: &[DeleteScanTable],
     ) -> crate::provider::Result<u64> {
         let row_ids = self.scan_filtered_rows_position_based(ctx, tables).await?;
         self.persist_position_based_deletions(row_ids).await
@@ -93,7 +91,7 @@ impl CayenneDeletionSink {
     pub(super) async fn prepare_delete_filtered_rows_position_based(
         &self,
         ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
+        tables: &[DeleteScanTable],
     ) -> crate::provider::Result<Option<PreparedDeletionPublish>> {
         let row_ids = self.scan_filtered_rows_position_based(ctx, tables).await?;
         self.prepare_position_based_deletions(row_ids).await
@@ -104,7 +102,7 @@ impl CayenneDeletionSink {
     async fn scan_filtered_rows_position_based(
         &self,
         ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
+        tables: &[DeleteScanTable],
     ) -> crate::provider::Result<HashMap<String, Vec<u64>>> {
         let table_name = &self.table_metadata.table_name;
 
@@ -124,28 +122,15 @@ impl CayenneDeletionSink {
         for table in tables {
             let table_scan_start = std::time::Instant::now();
 
-            // Future optimization: extract partition-only filters from self.filters when partition
-            // pruning is supported for Cayenne. Pass them to list_files_for_scan for partition pruning,
-            // reducing the number of files to scan. Note: self.filters may contain non-partition column
-            // filters which would cause errors in pruned_partition_list, so filtering by partition
-            // column names would be required.
-            let partition_filters: &[Expr] = &[];
-
-            // List files for this table with partition pruning applied (if partitioned)
-            let list_result = table
-                .list_files_for_scan(&ctx.state(), partition_filters, None)
-                .await?;
-            let file_groups = list_result.file_groups;
+            // Future optimization: prune the files by the partition-only filters of
+            // self.filters once Cayenne supports partition pruning here.
+            let files = table.files(&ctx.state()).await?;
 
             // Get the object store URL for this table
-            let object_store_url = table
-                .table_paths()
-                .first()
-                .map(datafusion_datasource::ListingTableUrl::object_store)
-                .ok_or_else(|| Error::Internal {
-                    table: table_name.clone(),
-                    message: "Table has no paths".to_string(),
-                })?;
+            let object_store_url = table.object_store_url().ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message: "Table has no paths".to_string(),
+            })?;
 
             // Get the object store from the runtime env
             let object_store = ctx
@@ -156,40 +141,36 @@ impl CayenneDeletionSink {
             // Scan files in parallel with bounded concurrency using buffer_unordered
             let vortex_session = VortexSession::default();
 
-            // Build futures directly using a for loop to avoid iterator lifetime issues:
-            // 1. FileGroup::iter() returns `impl Iterator` (opaque type) - flat_map can't unify these
-            // 2. Async futures for buffer_unordered must be 'static, requiring owned data
+            // Each future owns its file path, session, store and filter.
             let mut scan_futures = Vec::new();
-            for fg in &file_groups {
-                for pf in fg.iter() {
-                    let file_path = pf.path().to_string();
-                    let vortex_session = vortex_session.clone();
-                    let object_store = Arc::clone(&object_store);
-                    let position_filter = &position_filter;
-                    scan_futures.push(async move {
-                        let result = match position_filter {
-                            PositionFilter::Vortex(vortex_filter) => {
-                                self.scan_file_for_new_deletions(
-                                    &file_path,
-                                    &vortex_session,
-                                    &object_store,
-                                    vortex_filter.as_ref(),
-                                )
-                                .await
-                            }
-                            PositionFilter::DataFusion(filter) => {
-                                self.scan_file_for_filter_matches(
-                                    &file_path,
-                                    &vortex_session,
-                                    &object_store,
-                                    filter,
-                                )
-                                .await
-                            }
-                        };
-                        (file_path, result)
-                    });
-                }
+            for pf in &files {
+                let file_path = pf.path().to_string();
+                let vortex_session = vortex_session.clone();
+                let object_store = Arc::clone(&object_store);
+                let position_filter = &position_filter;
+                scan_futures.push(async move {
+                    let result = match position_filter {
+                        PositionFilter::Vortex(vortex_filter) => {
+                            self.scan_file_for_new_deletions(
+                                &file_path,
+                                &vortex_session,
+                                &object_store,
+                                vortex_filter.as_ref(),
+                            )
+                            .await
+                        }
+                        PositionFilter::DataFusion(filter) => {
+                            self.scan_file_for_filter_matches(
+                                &file_path,
+                                &vortex_session,
+                                &object_store,
+                                filter,
+                            )
+                            .await
+                        }
+                    };
+                    (file_path, result)
+                });
             }
 
             let mut stream =
@@ -215,7 +196,7 @@ impl CayenneDeletionSink {
             }
 
             tracing::debug!(
-                table_path = %table.table_paths().first().map_or("unknown", datafusion_datasource::ListingTableUrl::as_str),
+                table_path = %table.path(),
                 files_scanned = table_files_scanned,
                 rows_matched = table_rows_matched,
                 elapsed = ?table_scan_start.elapsed(),
@@ -258,7 +239,7 @@ impl CayenneDeletionSink {
     pub(crate) async fn delete_by_key_hash_probe(
         &self,
         ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
+        tables: &[DeleteScanTable],
         matched_keys: std::collections::HashSet<Vec<datafusion_common::ScalarValue>>,
         key_columns: &[String],
     ) -> crate::provider::Result<u64> {
@@ -273,20 +254,12 @@ impl CayenneDeletionSink {
         for table in tables {
             let table_scan_start = std::time::Instant::now();
 
-            let partition_filters: &[Expr] = &[];
-            let list_result = table
-                .list_files_for_scan(&ctx.state(), partition_filters, None)
-                .await?;
-            let file_groups = list_result.file_groups;
+            let files = table.files(&ctx.state()).await?;
 
-            let object_store_url = table
-                .table_paths()
-                .first()
-                .map(datafusion_datasource::ListingTableUrl::object_store)
-                .ok_or_else(|| Error::Internal {
-                    table: table_name.clone(),
-                    message: "Table has no paths".to_string(),
-                })?;
+            let object_store_url = table.object_store_url().ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message: "Table has no paths".to_string(),
+            })?;
 
             let object_store = ctx
                 .runtime_env()
@@ -295,28 +268,25 @@ impl CayenneDeletionSink {
 
             let vortex_session = VortexSession::default();
 
-            // Build futures with owned values to avoid lifetime issues from
-            // nested iterator adapters over `FileGroup::iter()`.
+            // Each future owns its file path, session and store.
             let mut scan_futures = Vec::new();
-            for fg in &file_groups {
-                for pf in fg.iter() {
-                    let file_path = pf.path().to_string();
-                    let vortex_session = vortex_session.clone();
-                    let object_store = Arc::clone(&object_store);
-                    let matched_keys = &matched_keys;
-                    scan_futures.push(async move {
-                        let result = self
-                            .scan_file_for_key_matches(
-                                &file_path,
-                                &vortex_session,
-                                &object_store,
-                                matched_keys,
-                                key_columns,
-                            )
-                            .await;
-                        (file_path, result)
-                    });
-                }
+            for pf in &files {
+                let file_path = pf.path().to_string();
+                let vortex_session = vortex_session.clone();
+                let object_store = Arc::clone(&object_store);
+                let matched_keys = &matched_keys;
+                scan_futures.push(async move {
+                    let result = self
+                        .scan_file_for_key_matches(
+                            &file_path,
+                            &vortex_session,
+                            &object_store,
+                            matched_keys,
+                            key_columns,
+                        )
+                        .await;
+                    (file_path, result)
+                });
             }
             let mut stream =
                 futures::stream::iter(scan_futures).buffer_unordered(*MAX_CONCURRENT_FILE_SCANS);
@@ -344,7 +314,7 @@ impl CayenneDeletionSink {
             }
 
             tracing::debug!(
-                table_path = %table.table_paths().first().map_or("unknown", datafusion_datasource::ListingTableUrl::as_str),
+                table_path = %table.path(),
                 files_scanned = table_files_scanned,
                 rows_matched = table_rows_matched,
                 elapsed = ?table_scan_start.elapsed(),
@@ -1102,7 +1072,7 @@ impl CayenneDeletionSink {
         // deleted-position bitmap/access-plan data itself.
         let existing_deletions = cached_deleted_row_ids.load_full();
 
-        let writer = DeletionVectorWriter::new(&self.table_metadata);
+        let writer = DeletionVectorWriter::new(&self.table_metadata, self.dataset_storage.as_ref());
 
         // Build write specs and precompute cache updates while counting TRUE new deletions
         // (set difference between incoming row_ids and existing cache per file).
@@ -1202,6 +1172,7 @@ impl CayenneDeletionSink {
             )?,
             cleanup_armed: true,
             scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
+            storage: self.dataset_storage.clone(),
         };
         if results
             .iter()

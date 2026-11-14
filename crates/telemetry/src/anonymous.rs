@@ -62,6 +62,7 @@ async fn resource(
     spicepod_name: &str,
     telemetry_properties: Vec<KeyValue>,
     configured_cpu_cores: Option<usize>,
+    build_commit: &str,
 ) -> Resource {
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
@@ -97,6 +98,9 @@ async fn resource(
             KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
             KeyValue::new("name", "spiced"),
             KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            // Builds of different commits can share a version (trunk builds all
+            // report the next release's), so the commit tells their reports apart.
+            KeyValue::new("vcs.ref.head.revision", build_commit.to_string()),
             KeyValue::new("service.instance.id", instance_id),
             KeyValue::new("spicepod.id", spicepod_id),
             KeyValue::new(
@@ -121,12 +125,22 @@ async fn resource(
 /// `SPICE_CPU_CORES` or `--cpu-cores`, reported as `host.cpu.count` in place of
 /// the detected count. It is a plain scalar because `telemetry` is a foundation
 /// crate and does not depend on `cpu-budget`.
+///
+/// `build_commit` is the full hash of the commit the runtime was built from,
+/// reported as `vcs.ref.head.revision`.
 pub async fn start(
     spicepod_name: &str,
     telemetry_properties: Vec<KeyValue>,
     configured_cpu_cores: Option<usize>,
+    build_commit: &str,
 ) {
-    let resource = resource(spicepod_name, telemetry_properties, configured_cpu_cores).await;
+    let resource = resource(
+        spicepod_name,
+        telemetry_properties,
+        configured_cpu_cores,
+        build_commit,
+    )
+    .await;
 
     let Ok(exporter) = TelemetryExporterBuilder::new()
         .with_endpoint(Arc::clone(&ENDPOINT))
@@ -197,6 +211,8 @@ pub async fn start(
 mod tests {
     use super::*;
 
+    const TEST_COMMIT: &str = "6c9b6e4a7e0123456789abcdef0123456789abcd";
+
     #[test]
     fn test_usize_to_i64_telemetry_normal_value() {
         assert_eq!(usize_to_i64_telemetry(0, "test"), 0);
@@ -246,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_hashes_hostname_and_spicepod_name() {
-        let resource = resource("test-spicepod", vec![], None).await;
+        let resource = resource("test-spicepod", vec![], None, TEST_COMMIT).await;
 
         // Verify instance_id is a SHA256 hash (64 hex chars)
         let instance_id = resource
@@ -281,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_does_not_contain_raw_spicepod_name() {
-        let resource = resource("my-secret-project", vec![], None).await;
+        let resource = resource("my-secret-project", vec![], None, TEST_COMMIT).await;
 
         // Verify the raw spicepod name doesn't appear in any attribute value
         for (key, value) in &resource {
@@ -295,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_contains_required_attributes() {
-        let resource = resource("test", vec![], None).await;
+        let resource = resource("test", vec![], None, TEST_COMMIT).await;
 
         let keys: Vec<&str> = resource.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"service.name"), "Missing service.name");
@@ -313,6 +329,19 @@ mod tests {
         );
     }
 
+    /// Two builds can share a version, so every report names the commit it was
+    /// built from.
+    #[tokio::test]
+    async fn test_resource_reports_the_build_commit() {
+        let resource = resource("test", vec![], None, TEST_COMMIT).await;
+        let revision = resource
+            .iter()
+            .find(|(k, _)| k.as_str() == "vcs.ref.head.revision")
+            .map(|(_, v)| v.to_string())
+            .expect("resource should have vcs.ref.head.revision");
+        assert_eq!(revision, TEST_COMMIT);
+    }
+
     #[tokio::test]
     async fn test_resource_reports_configured_cpu_cores_in_place_of_detected() {
         let detected = HardwareInfo::detect_async()
@@ -328,10 +357,10 @@ mod tests {
                 .expect("resource should have host.cpu.count")
         };
 
-        let reported = resource("test", vec![], Some(configured)).await;
+        let reported = resource("test", vec![], Some(configured), TEST_COMMIT).await;
         assert_eq!(host_cpu_count(&reported), configured.to_string());
 
-        let reported = resource("test", vec![], None).await;
+        let reported = resource("test", vec![], None, TEST_COMMIT).await;
         assert_eq!(host_cpu_count(&reported), detected.to_string());
     }
 
@@ -341,7 +370,7 @@ mod tests {
             KeyValue::new("custom.key", "custom_value"),
             KeyValue::new("env", "staging"),
         ];
-        let resource = resource("test", properties, None).await;
+        let resource = resource("test", properties, None, TEST_COMMIT).await;
 
         let custom = resource
             .iter()
@@ -356,8 +385,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_deterministic_for_same_inputs() {
-        let r1 = resource("deterministic-test", vec![], None).await;
-        let r2 = resource("deterministic-test", vec![], None).await;
+        let r1 = resource("deterministic-test", vec![], None, TEST_COMMIT).await;
+        let r2 = resource("deterministic-test", vec![], None, TEST_COMMIT).await;
 
         let spicepod_id_1 = r1
             .iter()
@@ -392,8 +421,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_different_names_produce_different_ids() {
-        let r1 = resource("project-a", vec![], None).await;
-        let r2 = resource("project-b", vec![], None).await;
+        let r1 = resource("project-a", vec![], None, TEST_COMMIT).await;
+        let r2 = resource("project-b", vec![], None, TEST_COMMIT).await;
 
         let id1 = r1
             .iter()

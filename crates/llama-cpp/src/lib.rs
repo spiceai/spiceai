@@ -39,7 +39,7 @@ use snafu::Snafu;
 pub use context::{Batch, Context, ContextParams, Truncation};
 pub use devices::gpu_free_memory;
 pub use model::{Model, ModelParams, Vocab};
-pub use mtp::{DraftKind, Mtp, MtpParams};
+pub use mtp::{DraftKind, DraftRequest, Mtp, MtpParams};
 pub use sampler::Sampler;
 
 /// The llama.cpp release this crate is built from, such as `b11999`.

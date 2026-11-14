@@ -30,14 +30,15 @@ use datafusion::{
 };
 use flight_client::{Credentials, FlightClient};
 use futures::TryStreamExt;
-use runtime::{Runtime, datafusion::query::QueryBuilder};
+use runtime::{
+    Runtime,
+    config::{ClusterConfig, Config, Role},
+    datafusion::query::QueryBuilder,
+};
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use secrecy::SecretString;
 use spicepod::{
-    component::{
-        dataset::Dataset,
-        runtime::{ApiKey, Runtime as RuntimeConfig, RuntimeMode},
-    },
+    component::{dataset::Dataset, runtime::ApiKey},
     param::Params,
 };
 
@@ -107,10 +108,7 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
         oracle.register_batch("orders", input.clone())?;
         oracle.register_batch("other_orders", input.clone())?;
 
-        let mut app = AppBuilder::new("sidecar_roundtrip").with_runtime(RuntimeConfig {
-            mode: RuntimeMode::Sidecar,
-            ..Default::default()
-        });
+        let mut app = AppBuilder::new("sidecar_roundtrip");
         for (prefix, name) in [("spice.ai", "orders"), ("spiceai", "other_orders")] {
             let mut dataset = Dataset::new(format!("{prefix}:remote_orders"), name.to_string());
             dataset.params = Some(Params::from_string_map(HashMap::from([
@@ -119,7 +117,17 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
             ])));
             app = app.with_dataset(dataset);
         }
-        let sidecar = Arc::new(Runtime::builder().with_app(app.build()).build().await);
+        let sidecar = Arc::new(
+            Runtime::builder()
+                .with_app(app.build())
+                .with_runtime_config(Config {
+                    cluster: ClusterConfig::default().with_role(Role::Sidecar),
+                    ..Config::default()
+                })
+                .build()
+                .await,
+        );
+        assert_eq!(sidecar.role(), Role::Sidecar);
         tokio::time::timeout(Duration::from_secs(30), Arc::clone(&sidecar).load_components()).await?;
         assert_eq!(sidecar.datafusion().ctx.state().config().target_partitions(), 1);
 

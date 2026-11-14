@@ -1,0 +1,30 @@
+name: databricks-static-token
+description: >
+  A Databricks dataset (mode: delta_lake) authenticates with a static
+  `databricks_token` read through `${secrets:…}`, and returns the table's row.
+  Needs DATABRICKS_HOST, DATABRICKS_TOKEN (a real token for that workspace) and
+  the AWS_DATABRICKS_DELTA_* credentials of its storage. CI mints a short-lived
+  token from its GitHub OIDC token (.github/scripts/databricks_oidc_token.sh)
+  right before this script.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: databricks-static-token
+  datasets:
+    - from: databricks:spiceai_sandbox.integration.delta_all_types_table
+      name: datatypes
+      params:
+        mode: delta_lake
+        databricks_endpoint: ${env:DATABRICKS_HOST}
+        databricks_token: ${secrets:DATABRICKS_TOKEN}
+        databricks_aws_access_key_id: ${secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID}
+        databricks_aws_secret_access_key: ${secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY}
+        databricks_aws_session_token: ${secrets:AWS_DATABRICKS_DELTA_SESSION_TOKEN}
+        databricks_aws_region: us-west-2
+        client_timeout: 120s
+
+steps:
+  - start: {}
+  - query: SELECT string_col, long_col, int_col, short_col FROM datatypes
+    expect: { rows: [[example_string, '123456789012345', '123456789', '12345']] }
