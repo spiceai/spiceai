@@ -109,14 +109,14 @@ own section below — a count here would be one more thing to keep true by hand.
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `7caad4ccc7050b0721778a426eef38f0f151fef9` | `spiceai-25` |
 | [arrow-rs](#arrow-rs) | `510ef234e1444f2c4aaf748d0c905787738afa7a` | `spiceai-59.3.2` |
-| [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
+| [async-openai](#async-openai) | `c1bf4a090c50e18f27663b008dac4c108e49b994` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `5a67f5ecd62321b019c0daffd6613cfb9f71505e` | `spiceai-release-2.4` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `19ecca8e06a3e764f7cf4a550f3abba7a137f3c7` | `spiceai-55-release-2.4` |
+| [datafusion](#datafusion) | `8511619b714ad672b782ccf8f5ba577cf22117ba` | `spiceai-55-release-2.4` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `bc28b14282501d7c3bb9ee8ae7a941f86d707910` | `spiceai-55-release-2.4` |
@@ -217,7 +217,7 @@ fetch through a single-input repartition. On top of #260's merge commit, `spicea
 #287 (merged to `spiceai-55` separately), which stores a compacted copy of each nested `COUNT(DISTINCT …)` value,
 #275 (cherry-picked in #289), which limits the nesting depth of a SQL data type, and #288 (backported in #293), which
 keeps a struct column in a Parquet scan's projection and row filter when `get_field` keys into a map inside it, and
-makes `get_field` apply the parent's nulls to the field it extracts. The pin is #293's merge commit. None changes a
+makes `get_field` apply the parent's nulls to the field it extracts. On top of #293's merge commit, spiceai/datafusion#299 merges upstream `55.3.0` (apache/datafusion@7941823), with the conflict resolutions reviewed for `spiceai-55` in spiceai/datafusion#298: #251's empty-file rule and apache/datafusion#26310's NULL-partition rule are both kept in `PartitionedFile::with_statistics`, and the metadata-column code in `catalog-listing` keeps upstream's nullable partition columns. That merge drops no Spice patch: for every file the fork changes, its diff against the release is line for line the same before and after it, except those resolutions and `Cargo.lock`. The pin is #299's merge into `spiceai-55-release-2.4` (`8511619b`). None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
@@ -570,6 +570,7 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 | Response `service_tier` keeps a tier the enum does not name (`ServiceTierResponse::Other`, fork PRs #42, #44) | A provider reply naming a new tier fails to deserialize, so every request answered on that tier errors | silent (request failure) | `crates/llms/src/openai/chat.rs::tests::a_reply_naming_an_unknown_service_tier_keeps_it_verbatim`, for both the reply and a streamed chunk, with a named tier as the control |
 | Chat Completions `allowed_tools` is one `{mode, tools}` object, not a list (fork PR #43) | A `tool_choice` in OpenAI's shape is refused with 422, and the list shape is forwarded to OpenAI, which rejects it with 400 | build + silent (request failure) | compile-guarded by `crates/runtime/src/model/tool_use.rs` and `crates/llms/src/openai/responses_adapter.rs`; `crates/llms/src/openai/mod.rs::allowed_tools_wire_tests::an_allowed_tools_choice_reaches_the_provider_as_one_object` reads a request in OpenAI's shape and asserts the body a local endpoint receives carries the same object; `crates/llms/src/chat/mistral.rs::tests::allowed_tools_keeps_its_mode_and_tools` deserializes OpenAI's shape |
 | A JSON request carries one `Content-Type` (fork commit `f63bb212`) | `HostedModelConfig` (Anthropic, Databricks, Spice.ai) carries `Content-Type` in its default headers and the client appends another, so every request carries two and a server can refuse it as an unsupported content type | silent (request failure) | `crates/llms/src/spiceai/chat.rs::tests::a_hosted_model_request_carries_one_content_type`, which reads the headers a one-shot local endpoint received |
+| Built with `utoipa` 6 (fork PR #46) | Spice builds its OpenAPI document with `utoipa` 6, so `ToSchema` impls from `utoipa` 5 on these request and response types do not satisfy its traits and the document does not compile | build | compile-guarded by `runtime`'s `openapi` feature, which references these types in its API schema |
 
 ## clickhouse-rs
 
