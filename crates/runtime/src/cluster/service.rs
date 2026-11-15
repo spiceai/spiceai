@@ -447,11 +447,15 @@ impl ClusterService for ClusterServiceImpl {
         // reference scoped to a specific store (e.g. `${ env:KEY }`) is
         // restricted to that store, so a same-named key in an unrelated
         // store can't answer in its place.
+        //
+        // The `_or_outage` lookups report a miss as an error when a consulted
+        // store failed, so the executor sees a retriable store error rather
+        // than a definitive "not found".
         let lookup = if allowed_stores.contains(SECRETS) {
-            secrets.get_secret(&request.key).await
+            secrets.get_secret_or_outage(&request.key).await
         } else {
             secrets
-                .get_secret_from_stores(&request.key, allowed_stores)
+                .get_secret_from_stores_or_outage(&request.key, allowed_stores)
                 .await
         };
         let Some(value) =

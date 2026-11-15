@@ -1155,6 +1155,25 @@ pub trait ListingTableConnector: DataConnector {
             detected_extension.and_then(|ext| ext.compression),
         )?;
 
+        // An explicitly empty `file_format` (for example `""`, or a secret
+        // reference that resolved to nothing) is a configuration error. It
+        // used to fall through to the text-table path and load a CSV as a
+        // one-row document table while the dataset reported Ready.
+        if file_format_param
+            .as_deref()
+            .is_some_and(|format| format.trim().is_empty())
+        {
+            return Err(crate::DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: format!(
+                    "The `file_format` parameter for dataset '{}' is empty. Set it to a supported format (for example csv, tsv, json, parquet), or remove it to infer the format from the file extension. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats",
+                    dataset.name
+                ),
+                connector_component: ConnectorComponent::from(dataset),
+                source: "Empty file format".into(),
+            });
+        }
+
         // Annotate before `?` so rustc unifies each arm as `Arc<dyn FileFormat>`
         // instead of pinning the match to the first (`CsvFormat`) arm.
         let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)> =
@@ -2977,6 +2996,38 @@ mod tests {
                 "Cannot setup the dataset test (TestConnector) with an invalid configuration. The required 'file_format' parameter is missing. Ensure the parameter is provided, and try again."
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_empty_file_format_is_rejected_not_loaded_as_text() {
+        // An empty `file_format` used to fall through to the text-table path,
+        // so a CSV loaded as a one-row `location`/`content` table.
+        for format in ["", "  "] {
+            let (connector, dataset) = setup_connector(
+                "test:nation.csv".to_string(),
+                HashMap::from([("file_format".to_string(), format.to_string())]),
+            );
+            let err = connector
+                .get_file_format_and_extension(&dataset)
+                .await
+                .expect_err("an empty file_format must fail dataset setup");
+            let message = err.to_string();
+            assert!(
+                message.contains("The `file_format` parameter for dataset 'test' is empty"),
+                "{message}"
+            );
+        }
+
+        // The same CSV with an explicit `csv` format is unchanged.
+        let (connector, dataset) = setup_connector(
+            "test:nation.csv".to_string(),
+            HashMap::from([("file_format".to_string(), "csv".to_string())]),
+        );
+        let (file_format, _) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv resolves");
+        assert!(file_format.is_some(), "csv uses the structured reader");
     }
 
     #[tokio::test]
