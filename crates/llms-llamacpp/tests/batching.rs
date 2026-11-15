@@ -26,7 +26,7 @@ use std::time::Duration;
 use async_openai::types::chat::ChatCompletionResponseStream;
 use futures::StreamExt;
 use llms::chat::{Chat, LocalModelOptions, ReasoningDefault};
-use llms_llamacpp::STREAM_BUFFER;
+use llms_llamacpp::{LlamaCpp, STREAM_BUFFER};
 use serde_json::{Value, json};
 
 use crate::mtp::qwen35_gguf;
@@ -205,6 +205,64 @@ async fn requests_drafted_for_together_reply_as_each_does_alone() {
         "every reply has content: {alone:?}"
     );
     assert_eq!(together, alone, "replies served together, against alone");
+}
+
+/// A request admitted while another decodes reads the end of its prompt in the other's next
+/// step, beside its draft, instead of in a decode of its own, and both reply as each does alone.
+/// `Qwen3.5`'s recurrent state saves a checkpoint four tokens before the prompt's end, and those
+/// four are what the step reads; its MTP head drafts for the running request in the same step.
+#[tokio::test]
+async fn a_request_admitted_mid_reply_reads_its_prompts_end_in_the_running_ones_step() {
+    let gguf = qwen35_gguf().await;
+    let name = "qwen3.5";
+    let (first_prompt, second_prompt) = (PROMPTS[0], PROMPTS[1]);
+    let alone = {
+        let model = load(&gguf, name, 1, 4096).await;
+        (
+            reply(&model, body(name, first_prompt, 96)).await,
+            reply(&model, body(name, second_prompt, 96)).await,
+        )
+    };
+    let engine = Arc::new(
+        LlamaCpp::from(
+            std::slice::from_ref(&gguf),
+            LocalModelOptions {
+                reasoning: ReasoningDefault {
+                    model_name: name,
+                    effort: None,
+                },
+                context_length: Some(4096),
+                concurrent_requests: NonZeroU32::new(2),
+                ..LocalModelOptions::default()
+            },
+        )
+        .await
+        .expect("the model loads"),
+    );
+    let model: Arc<dyn Chat> = Arc::clone(&engine) as Arc<dyn Chat>;
+    let mut first = model
+        .chat_stream(request(body(name, first_prompt, 96)))
+        .await
+        .expect("a stream");
+    // the first reply is under way, and its client keeps reading while the second arrives
+    let mut first_text = first_content(&mut first).await;
+    let (rest_of_first, second) = tokio::time::timeout(
+        SERVED_WITHIN,
+        futures::future::join(rest(first), reply(&model, body(name, second_prompt, 96))),
+    )
+    .await
+    .expect("both requests reply");
+    first_text.push_str(&rest_of_first);
+    assert_eq!(
+        (first_text, second),
+        alone,
+        "a reply and one admitted beside it mid reply, against each alone"
+    );
+    assert_eq!(
+        engine.prompt_ends_in_steps(),
+        1,
+        "the second request read its prompt's end in the first one's step"
+    );
 }
 
 /// Requests whose output limits together pass the shared cache still all reply, as each does
