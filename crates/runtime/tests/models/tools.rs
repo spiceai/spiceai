@@ -703,7 +703,7 @@ params:
         .await?;
         assert_eq!(
             sql_tool_rows(&inserted)?,
-            serde_json::json!([{ "count": 1 }])
+            serde_json::json!({ "columns": ["count"], "rows": [[1]] })
         );
 
         let stored = call_tool_modern(
@@ -739,10 +739,10 @@ params:
         .await?;
         assert_eq!(
             sql_tool_rows(&read)?,
-            serde_json::json!([
-                { "value": "sql insert by read-write key" },
-                { "value": "store_memory by read-write key" },
-            ]),
+            serde_json::json!({
+                "columns": ["value"],
+                "rows": [["sql insert by read-write key"], ["store_memory by read-write key"]],
+            }),
             "a read-only key must still read through MCP"
         );
 
@@ -770,7 +770,7 @@ params:
         .await?;
         assert_eq!(
             sql_tool_rows(&inserted)?,
-            serde_json::json!([{ "count": 1 }])
+            serde_json::json!({ "columns": ["count"], "rows": [[1]] })
         );
 
         let denied = call_tool_legacy(
@@ -1224,9 +1224,20 @@ params:
             .ok_or_else(|| anyhow::anyhow!("tools/call returned no text content: {response}"))
     }
 
-    /// The rows a successful `sql` tool call returned, as a JSON array.
+    /// The result of a successful `sql` tool call. It arrives twice, as `structuredContent` and as
+    /// that object's JSON text, and the two must agree.
     fn sql_tool_rows(response: &Value) -> anyhow::Result<Value> {
-        Ok(serde_json::from_str(tool_result_text(response)?)?)
+        let text: Value = serde_json::from_str(tool_result_text(response)?)?;
+        let structured = response
+            .pointer("/result/structuredContent")
+            .ok_or_else(|| {
+                anyhow::anyhow!("tools/call returned no structuredContent: {response}")
+            })?;
+        anyhow::ensure!(
+            &text == structured,
+            "structuredContent {structured} differs from the text content {text}"
+        );
+        Ok(text)
     }
 
     /// An INSERT of one row whose `id` and `value` are `value` into
