@@ -41,6 +41,7 @@ use std::{
     },
 };
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tools::SpiceModelTool;
 use tools::naming::{decode_tool_name, encode_tool_name};
 use tools::rename::with_name;
@@ -667,11 +668,14 @@ fn missing_principal_refusal(tool_name: &str) -> String {
 }
 
 impl RuntimeServer {
+    /// `request_ct` is the `/v1/mcp` request's token. rmcp cancels it when the client sends
+    /// `notifications/cancelled`, disconnects before a per-request response, or ends its session.
     async fn call_tool_with_auth(
         &self,
         request: CallToolRequestParams,
         tool_name: String,
         arguments: Option<Map<String, Value>>,
+        request_ct: CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         const MAX_TOOL_NAME_LENGTH: usize = 256;
 
@@ -744,11 +748,19 @@ impl RuntimeServer {
                 tracing::info!(target: "task_history", parent: &span, mcp_server = %mcp_server, "labels");
             }
 
-            return match mcp_proxy
-                .call_tool_once(request)
-                .instrument(span.clone())
-                .await
-            {
+            // rmcp only cancels the token; the handler keeps running unless it stops itself.
+            // Dropping the proxied call makes the MCP client cancel it on the upstream server.
+            let call = mcp_proxy.call_tool_once(request).instrument(span.clone());
+            let result = tokio::select! {
+                biased;
+                result = call => result,
+                () = request_ct.cancelled() => {
+                    let message = format!("The MCP client cancelled the call to '{exposed_name}'");
+                    tracing::error!(target: "task_history", parent: &span, "{message}");
+                    return Err(McpError::internal_error(message, None));
+                }
+            };
+            return match result {
                 Ok(response) => {
                     if let CallToolResponse::Complete(result) = &response
                         && let Ok(captured_output) = serde_json::to_string(&result.content)
@@ -823,6 +835,7 @@ impl ServerHandler for RuntimeServer {
     ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         let tool_name = request.name.clone().into_owned();
         let arguments = request.arguments.clone();
+        let request_ct = context.ct.clone();
         Box::pin(async move {
             let spice_ctx = spice_request_context_from_mcp(&context)
                 .filter(|ctx| AuthRequestContext::auth_principal(ctx.as_ref()).is_some());
@@ -835,7 +848,7 @@ impl ServerHandler for RuntimeServer {
                 return Err(McpError::internal_error(message, None));
             };
             spice_ctx
-                .scope(self.call_tool_with_auth(request, tool_name, arguments))
+                .scope(self.call_tool_with_auth(request, tool_name, arguments, request_ct))
                 .await
         })
     }
@@ -3782,6 +3795,139 @@ mod tests {
             0,
             "oversized requestState must not reach call_tool_once"
         );
+    }
+
+    /// Notifies `dropped` when the proxied call that holds it is dropped.
+    struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    /// A proxied tool whose upstream call never answers.
+    struct HangingProxyTool {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for HangingProxyTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("ask")
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("never answers"))
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({ "type": "object", "properties": {} }))
+        }
+        async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
+            Some(self)
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpProxy for HangingProxyTool {
+        async fn call_tool(
+            &self,
+            _arguments: Option<rmcp::model::JsonObject>,
+        ) -> Result<CallToolResult, ServiceError> {
+            std::future::pending().await
+        }
+
+        async fn call_tool_once(
+            &self,
+            _request: CallToolRequestParams,
+        ) -> Result<CallToolResponse, ServiceError> {
+            let _dropped = NotifyOnDrop(Arc::clone(&self.dropped));
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    /// regression test: rmcp only cancels the request's token when a `/v1/mcp` client
+    /// disconnects (or sends `notifications/cancelled`); it does not stop the handler. The
+    /// gateway kept awaiting the proxied call, so the upstream MCP server was never told to
+    /// stop. The gateway must drop the proxied call, which cancels it upstream.
+    #[tokio::test]
+    async fn proxied_call_is_dropped_when_the_mcp_client_disconnects() {
+        let tool = Arc::new(HangingProxyTool {
+            started: Arc::new(tokio::sync::Notify::new()),
+            dropped: Arc::new(tokio::sync::Notify::new()),
+        });
+        let mut tools = HashMap::new();
+        tools.insert(
+            "ask".to_string(),
+            Tooling::Tool(Arc::clone(&tool) as Arc<dyn SpiceModelTool>),
+        );
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ask",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "runtime-tools-test",
+                        "version": "0.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "ask")
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .expect("valid tools/call request");
+
+        // Leaving the `select!` drops the request future, which is what rmcp sees when the
+        // client disconnects before the response.
+        let started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                response = service.handle(authenticated(request)) => {
+                    panic!("the hanging tool must not answer, got {}", response.status());
+                }
+                () = tool.started.notified() => {}
+            }
+        })
+        .await;
+        started.expect("the gateway did not start the proxied call within 10 s");
+
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_secs(10), tool.dropped.notified()).await;
+        dropped
+            .expect("the gateway must drop the proxied call when its `/v1/mcp` client disconnects");
     }
 
     /// A proxied catalog TTL refresh used to update only the catalog

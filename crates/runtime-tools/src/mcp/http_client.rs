@@ -593,12 +593,16 @@ mod tests {
         },
     };
     use serde_json::{Value, json};
+    use tools::SpiceModelTool;
     use tower::ServiceExt;
 
     use super::*;
     use crate::{
         catalog::SpiceToolCatalog,
-        mcp::{MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCPConfig, catalog::McpToolCatalog},
+        mcp::{
+            MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCPConfig, McpCallTimeout,
+            catalog::McpToolCatalog,
+        },
     };
 
     const SERVER_NAME: &str = "hostile";
@@ -671,6 +675,80 @@ mod tests {
         flood_bytes_sent: Arc<AtomicUsize>,
         /// Notified when a `tools/call` of `hang` arrives.
         hang_received: Arc<tokio::sync::Notify>,
+        /// JSON-RPC ids of the `tools/call` requests of `hang`, in arrival order.
+        hang_ids: Arc<std::sync::Mutex<Vec<Value>>>,
+        /// Ids of the requests the client cancelled, in order. A legacy-era client POSTs
+        /// `notifications/cancelled`; a `2026-07-28` client instead closes the request's HTTP
+        /// stream, which drops the `hang` handler.
+        cancelled_ids: Arc<std::sync::Mutex<Vec<Value>>>,
+        /// Notified when a request is cancelled.
+        cancel_received: Arc<tokio::sync::Notify>,
+    }
+
+    impl Upstream {
+        fn record_cancel(&self, id: Value) {
+            self.cancelled_ids
+                .lock()
+                .expect("cancelled ids lock")
+                .push(id);
+            self.cancel_received.notify_one();
+        }
+
+        fn new(mcp: StreamableHttpService<SizedResultServer, LocalSessionManager>) -> Self {
+            Self {
+                mcp,
+                flood_requests: Arc::new(AtomicUsize::new(0)),
+                flood_bytes_sent: Arc::new(AtomicUsize::new(0)),
+                hang_received: Arc::new(tokio::sync::Notify::new()),
+                hang_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                cancelled_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                cancel_received: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        fn last_hang_id(&self) -> Value {
+            self.hang_ids
+                .lock()
+                .expect("hang ids lock")
+                .last()
+                .cloned()
+                .expect("the server received a `hang` call")
+        }
+
+        fn cancelled_ids(&self) -> Vec<Value> {
+            self.cancelled_ids
+                .lock()
+                .expect("cancelled ids lock")
+                .clone()
+        }
+
+        /// Waits, on the real clock, until the client cancels request `id`.
+        async fn wait_for_cancel_of(&self, id: &Value, what: &str) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !self.cancelled_ids().contains(id) {
+                    self.cancel_received.notified().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{what}: the client did not cancel request {id} within 10 s; it cancelled {:?}",
+                    self.cancelled_ids()
+                )
+            });
+        }
+    }
+
+    /// Records request `id` as cancelled when the handler that holds it is dropped.
+    struct RecordCancelOnDrop {
+        upstream: Upstream,
+        id: Value,
+    }
+
+    impl Drop for RecordCancelOnDrop {
+        fn drop(&mut self) {
+            self.upstream.record_cancel(self.id.take());
+        }
     }
 
     /// Forwards to the real MCP server, except a `tools/call` of `hang`, which never gets a
@@ -686,8 +764,25 @@ mod tests {
             .expect("read the MCP request body")
             .to_bytes();
         let message: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if message["method"] == "notifications/cancelled" {
+            upstream.record_cancel(message["params"]["requestId"].clone());
+            return Response::builder()
+                .status(http::StatusCode::ACCEPTED)
+                .body(Body::empty())
+                .expect("valid accepted response");
+        }
         if message["method"] == "tools/call" && message["params"]["name"] == "hang" {
+            upstream
+                .hang_ids
+                .lock()
+                .expect("hang ids lock")
+                .push(message["id"].clone());
             upstream.hang_received.notify_one();
+            // The server drops this handler when the client closes the request's connection.
+            let _closed = RecordCancelOnDrop {
+                upstream: upstream.clone(),
+                id: message["id"].clone(),
+            };
             return std::future::pending().await;
         }
         let is_flood = message["method"] == "tools/call" && message["params"]["name"] == "flood";
@@ -754,12 +849,7 @@ mod tests {
                 .disable_allowed_hosts()
                 .with_json_response(json_response),
         );
-        let upstream = Upstream {
-            mcp,
-            flood_requests: Arc::new(AtomicUsize::new(0)),
-            flood_bytes_sent: Arc::new(AtomicUsize::new(0)),
-            hang_received: Arc::new(tokio::sync::Notify::new()),
-        };
+        let upstream = Upstream::new(mcp);
         let app = axum::Router::new()
             .route("/mcp", axum::routing::any(route))
             .with_state(upstream.clone());
@@ -773,12 +863,17 @@ mod tests {
     }
 
     async fn connect(url: url::Url) -> McpToolCatalog {
+        connect_with_timeout(url, McpCallTimeout::default()).await
+    }
+
+    async fn connect_with_timeout(url: url::Url, call_timeout: McpCallTimeout) -> McpToolCatalog {
         McpToolCatalog::try_new(
             MCPConfig::StreamableHttp {
                 url,
                 auth_token: None,
                 headers: HashMap::new(),
             },
+            call_timeout,
             SERVER_NAME,
             None,
         )
@@ -944,6 +1039,7 @@ mod tests {
                 auth_token: None,
                 headers: HashMap::new(),
             },
+            McpCallTimeout::default(),
             SERVER_NAME,
             None,
         ));
@@ -989,6 +1085,93 @@ mod tests {
         }
     }
 
+    /// Short `mcp_call_timeout` for the cancellation tests, which run on the real clock.
+    const SHORT_CALL_TIMEOUT: McpCallTimeout = McpCallTimeout(Duration::from_secs(1));
+
+    /// Calls `hang` through the gateway path (`McpProxy::call_tool_once`, one round).
+    async fn call_hang_once(tool: &dyn SpiceModelTool) -> Result<CallToolResponse, String> {
+        let proxy = tool
+            .as_mcp_proxy()
+            .await
+            .expect("an MCP tool is an MCP proxy");
+        proxy
+            .call_tool_once(CallToolRequestParams::new("hang"))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// regression test: a `tools/call` that timed out failed in Spice but kept running on the
+    /// MCP server, because Spice did not cancel it. Covers the model path (`call`, which drives
+    /// MRTR rounds) and the `/v1/mcp` gateway path (`call_tool_once`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timed_out_tool_call_is_cancelled_on_the_server() {
+        for json_response in [true, false] {
+            let (url, upstream) = start_upstream(json_response).await;
+            let catalog = connect_with_timeout(url, SHORT_CALL_TIMEOUT).await;
+            let tool = catalog.get("hang").await.expect("tool 'hang' is listed");
+
+            let error = tokio::time::timeout(CALL_TIMEOUT, tool.call("{}"))
+                .await
+                .expect("the configured timeout ends the call")
+                .expect_err("a call that is never answered must fail")
+                .to_string();
+            assert!(
+                error.contains("timeout"),
+                "model path (json_response={json_response}): unexpected error: {error}"
+            );
+            upstream
+                .wait_for_cancel_of(
+                    &upstream.last_hang_id(),
+                    &format!("model path (json_response={json_response})"),
+                )
+                .await;
+
+            let error = tokio::time::timeout(CALL_TIMEOUT, call_hang_once(tool.as_ref()))
+                .await
+                .expect("the configured timeout ends the call")
+                .expect_err("a call that is never answered must fail");
+            assert!(
+                error.contains("timeout"),
+                "gateway path (json_response={json_response}): unexpected error: {error}"
+            );
+            upstream
+                .wait_for_cancel_of(
+                    &upstream.last_hang_id(),
+                    &format!("gateway path (json_response={json_response})"),
+                )
+                .await;
+        }
+    }
+
+    /// regression test: when the caller of a proxied tool went away (its future was dropped),
+    /// the MCP server kept running the tool. The call here would only time out after the
+    /// default 10 minutes, so the cancel can only come from the drop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_tool_call_is_cancelled_on_the_server() {
+        for gateway in [false, true] {
+            let (url, upstream) = start_upstream(true).await;
+            let catalog = connect(url).await;
+            let tool = catalog.get("hang").await.expect("tool 'hang' is listed");
+
+            let call = tokio::spawn(async move {
+                if gateway {
+                    call_hang_once(tool.as_ref()).await.map(|_| ())
+                } else {
+                    tool.call("{}").await.map(|_| ()).map_err(|e| e.to_string())
+                }
+            });
+            wait_until_received(&upstream.hang_received, "the tool call").await;
+            call.abort();
+            assert!(
+                call.await.is_err_and(|e| e.is_cancelled()),
+                "the call must still be running when it is dropped"
+            );
+            upstream
+                .wait_for_cancel_of(&upstream.last_hang_id(), &format!("gateway={gateway}"))
+                .await;
+        }
+    }
+
     /// A transport error does not show the MCP server URL, which can carry a credential.
     #[tokio::test(flavor = "multi_thread")]
     async fn transport_errors_do_not_show_the_server_url() {
@@ -1000,12 +1183,7 @@ mod tests {
                 .disable_allowed_hosts()
                 .with_json_response(true),
         );
-        let upstream = Upstream {
-            mcp,
-            flood_requests: Arc::new(AtomicUsize::new(0)),
-            flood_bytes_sent: Arc::new(AtomicUsize::new(0)),
-            hang_received: Arc::new(tokio::sync::Notify::new()),
-        };
+        let upstream = Upstream::new(mcp);
         let app = axum::Router::new()
             .route("/s/{token}/mcp", axum::routing::any(route))
             .with_state(upstream);

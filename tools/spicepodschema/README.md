@@ -317,7 +317,7 @@ Parameters are currently extracted directly in `crates/runtime/src/model/embed.r
 
 Tool types:
 - `auto` - Builtin tools (get_readiness, list_datasets, sql, search, etc.)
-- `mcp` - Model Context Protocol tools (has `mcp_args`, `mcp_auth_token`, and `mcp_headers` params; `mcp_headers` is `Name: Value` pairs separated by `,`, or by `;` only if the value contains any `;`)
+- `mcp` - Model Context Protocol tools (has `mcp_args`, `mcp_auth_token`, `mcp_headers`, and `mcp_call_timeout` params; `mcp_headers` is `Name: Value` pairs separated by `,`, or by `;` only if the value contains any `;`; `mcp_call_timeout` is the longest wait for one `tools/call`, as a duration such as `30m` (default `10m`; `0` and `inf` are rejected), after which Spice fails the call and sends `notifications/cancelled` to the MCP server)
 - `memory` - Memory tools (store, load)
 
 Parameters are currently handled inline in `crates/runtime/src/tools/`.
