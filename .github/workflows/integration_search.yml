@@ -16,13 +16,9 @@ on:
           - 'always'
           - 'no'
 
+# test-search declares the write grants it uses.
 permissions:
-  contents: write
-  pull-requests: write
-  # Approves the snapshot PR's held pull_request runs.
-  actions: write
-  # Exchanged for OpenAI access tokens: workload identity federation.
-  id-token: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -36,10 +32,20 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
+  # Keeps the `integration_models` test binary loadable on Apple Silicon; see
+  # `CARGO_PROFILE_DEV_STRIP` in `integration_models.yml`.
+  CARGO_PROFILE_DEV_STRIP: debuginfo
 
 jobs:
   test-search:
     name: Test Search Integration
+    permissions:
+      contents: write  # push-snap-changes pushes a snapshot branch
+      pull-requests: write  # and opens, auto-merges or closes its PR
+      # Approves the snapshot PR's held pull_request runs.
+      actions: write
+      # Exchanged for OpenAI access tokens: workload identity federation.
+      id-token: write
     runs-on: spiceai-macos-large
     # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
     environment: ci

@@ -6,6 +6,6 @@
   "license": "Apache-2.0",
   "devDependencies": {
     "@mermaid-js/mermaid-cli": "11.17.0",
-    "puppeteer": "25.11.0"
+    "puppeteer": "25.17.0"
   }
 }

@@ -1,0 +1,115 @@
+name: tool-metadata
+description: >
+  `list_datasets` returns datasets a page at a time ({"datasets", "total",
+  "has_more"}), searchable by name, description and column names, with only
+  the fields a dataset has; `table_schema` returns a compact listing (SQL types
+  with precision, NOT NULL, descriptions, the primary key) and, with `search`,
+  only the matching columns and a count of the rest. Called with
+  `POST /v1/tools/{name}`, as an MCP client or an agent framework calls them.
+
+sources:
+  lake: { kind: files }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: tool-metadata
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [tool-key]
+  datasets:
+    - from: 'file://${sources.lake.path}/orders/'
+      name: orders
+      description: Customer orders
+      params: { file_format: parquet }
+      columns:
+        - name: total
+          description: Order total in dollars
+      acceleration: { enabled: true, primary_key: id }
+    - from: 'file://${sources.lake.path}/store_sales/'
+      name: store_sales
+      params: { file_format: parquet }
+    - from: 'file://${sources.lake.path}/pages/'
+      name: pages
+      description: Product docs
+      params: { file_format: parquet }
+
+defaults:
+  api-key: tool-key
+
+steps:
+  - generate:
+      lake:
+        table: orders
+        rows: 10
+        seed: 21
+        primary-key: id
+        format: parquet
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: customer_id, int: [1, 5] }
+          - { name: total, decimal: { range: [0, 1000], scale: 2 } }
+  - generate:
+      lake:
+        table: store_sales
+        rows: 10
+        seed: 22
+        primary-key: ss_id
+        format: parquet
+        columns:
+          - { name: ss_id, sequence: 1 }
+          - { name: ss_net_paid, float: [0, 100] }
+  - generate:
+      lake:
+        table: pages
+        rows: 3
+        seed: 23
+        primary-key: page_id
+        format: parquet
+        columns:
+          - { name: page_id, sequence: 1 }
+          - { name: customer_note, text: [5, 10] }
+  - start: {}
+
+  # Every dataset, by name, with only the fields each has.
+  - http: { method: POST, path: /v1/tools/list_datasets, headers: { content-type: application/json }, body: '{}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: '', equals: { datasets: [{ table: spice.public.orders, description: Customer orders }, { table: spice.public.pages, description: Product docs }, { table: spice.public.store_sales }], total: 3, has_more: false } }
+
+  # Search ranks a name match above a column match above a description match, and counts only matches.
+  - http: { method: POST, path: /v1/tools/list_datasets, headers: { content-type: application/json }, body: '{"search": "customer sales"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /datasets/0/table, equals: spice.public.store_sales }
+        - { pointer: /total, equals: 3 }
+  - http: { method: POST, path: /v1/tools/list_datasets, headers: { content-type: application/json }, body: '{"search": "docs"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: '', equals: { datasets: [{ table: spice.public.pages, description: Product docs }], total: 1, has_more: false } }
+
+  # Pages follow limit and offset.
+  - http: { method: POST, path: /v1/tools/list_datasets, headers: { content-type: application/json }, body: '{"limit": 1, "offset": 1}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: '', equals: { datasets: [{ table: spice.public.pages, description: Product docs }], total: 3, has_more: true } }
+
+  # The compact listing: SQL types, NOT NULL, the Spicepod's column description, the primary key.
+  - http: { method: POST, path: /v1/tools/table_schema, headers: { content-type: application/json }, body: '{"tables": ["orders"]}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: '', equals: "spice.public.orders: Customer orders\n  id BIGINT\n  customer_id INT\n  total DECIMAL(18,2) -- Order total in dollars\n  primary key (id)\n" }
+
+  # Search keeps only the matching columns and counts the others.
+  - http: { method: POST, path: /v1/tools/table_schema, headers: { content-type: application/json }, body: '{"tables": ["orders"], "search": "total", "output": "minimal"}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: '', equals: "spice.public.orders\n  total DECIMAL(18,2)\n  (2 other columns not shown)\n" }

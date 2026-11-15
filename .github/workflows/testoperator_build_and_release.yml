@@ -19,9 +19,10 @@ on:
         type: boolean
         default: false
 
+# Both jobs declare their own blocks; build-docker holds packages: write.
 permissions:
   contents: read
-  packages: write
+
 jobs:
   build-binary:
     environment: ci

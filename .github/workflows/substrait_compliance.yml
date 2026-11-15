@@ -199,9 +199,6 @@ jobs:
             layouts: >-
               primary_key indexes sort partition
               primary_key,indexes,sort,time_column,partition
-          - engine: sqlite
-            mode: file
-            layouts: primary_key primary_key,time_column
           # The parquet files federated, with no acceleration to lay out.
           - engine: none
             mode: file

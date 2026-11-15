@@ -55,6 +55,10 @@ env:
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   setup-matrix:
     environment: secret-free

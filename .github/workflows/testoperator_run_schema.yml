@@ -25,6 +25,9 @@ on:
         required: false
         type: string
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-schema:
     # The service principal's federation policy trusts this environment's subject.

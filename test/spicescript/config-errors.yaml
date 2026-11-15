@@ -5,7 +5,9 @@ description: >
   (listing the known ones), an unreachable host, a rejected password, a
   primary key, time column or partition naming no column, refresh_sql over
   another table, a missing file, a missing table — while a healthy dataset
-  beside them serves. A Cayenne dataset that still names the retired Turso
+  beside them serves. A partitioned Cayenne dataset serves, and fails to load
+  with a message naming the fix while `runtime.params.cayenne_vnext` is
+  enabled. A Cayenne dataset that still names the retired Turso
   metastore loads on the SQLite metastore it shares with a healthy one, and
   is warned once to drop the param. A dataset and a view that set the removed
   `turso` or `duckdb` acceleration engine each fail to load with one error
@@ -17,10 +19,16 @@ description: >
 sources:
   src: { kind: postgres }
 # The spicepod as written, and the same with the prototype object-native
-# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite. With
+# the flag on, a dataset's data is in the state location, so the Cayenne
+# datasets drop their `cayenne_file_path`, which the flag refuses.
 variants:
   as-written: federated
-  object-native: object-native
+  object-native:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets:
+      healthy_cayenne: { acceleration: { params: { cayenne_file_path: null } } }
+      turso_param: { acceleration: { params: { cayenne_file_path: null } } }
 
 spicepod:
   version: v1
@@ -36,6 +44,7 @@ spicepod:
     - { from: 'postgres:public.t', name: bad_pk, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, primary_key: nosuchcol } }
     - { from: 'postgres:public.t', name: bad_time_column, params: '${sources.src.params}', time_column: nosuchcol, acceleration: { enabled: true, engine: cayenne, refresh_mode: append } }
     - { from: 'postgres:public.t', name: bad_partition, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, partition_by: [nosuchcol] } }
+    - { from: 'postgres:public.t', name: partitioned_cayenne, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, partition_by: [{ bucket: 'bucket(2, id)' }], params: { cayenne_metadata_dir: '${instance.dir}/meta' } } }
     - { from: 'postgres:public.t', name: bad_refresh_sql, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, refresh_sql: 'SELECT * FROM somewhere_else' } }
     - { from: 'file:/no/such/file.parquet', name: bad_file }
     - { from: 'postgres:public.no_such_table', name: bad_table, params: '${sources.src.params}' }
@@ -66,6 +75,16 @@ steps:
   - assert-status: { dataset: bad_time_column, status: Error, message-contains: "time_column 'nosuchcol' was not found in dataset bad_time_column" }
     eventually: 30s
   - assert-status: { dataset: bad_partition, status: Error, message-contains: "Failed to setup the dataset bad_partition (postgres)" }
+    eventually: 30s
+  # A partitioned dataset serves with the flag off. With `cayenne_vnext` enabled
+  # it fails to load until the object-native metastore supports `partition_by`
+  # (#16308): it would otherwise return missing rows.
+  - query: SELECT * FROM partitioned_cayenne
+    expect: { rows: [['1', a]] }
+    eventually: 30s
+    only: as-written
+  - assert-status: { dataset: partitioned_cayenne, status: Error, message-contains: "Failed to load dataset 'partitioned_cayenne' (cayenne): `acceleration.partition_by` is not supported yet with `runtime.params.cayenne_vnext` enabled. Remove `partition_by` from the dataset, or set `runtime.params.cayenne_vnext: disabled`." }
+    only: object-native
     eventually: 30s
   - assert-status: { dataset: bad_refresh_sql, status: Error, message-contains: "Table name in refresh_sql should be bad_refresh_sql, is somewhere_else" }
     eventually: 30s

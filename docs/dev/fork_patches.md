@@ -78,8 +78,9 @@ list below. `kind(=lib)` sweeps up every unit test, so the exposure is the
 integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
 the gate builds only the targets it selects, so an unnamed binary is neither
 built nor run, and nothing fails. Guards were found running nowhere for that reason, in integration-test
-targets now named there: `adbc_cancellation` for the two `arrow-adbc`
-cancellation rows (fork PRs #4 and #65, which share one test), and `spiced`'s
+targets now named there: `adbc_cancellation` for the ADBC cancellation row
+(`datafusion-table-providers` fork PR #65; the same test guards the lock-free
+statement cancel that ADBC 25 took upstream from `arrow-adbc` fork PR #4), and `spiced`'s
 `integration` binary, whose `cpu_budget` module guards vortex's
 `set_available_parallelism`. (`json_semantics` is named there too; it
 guarded the `datafusion-functions-json` fork, which is now taken from crates.io.)
@@ -106,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 
 | Fork | Pinned revision | Branch |
 |---|---|---|
-| [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
+| [arrow-adbc](#arrow-adbc) | `7caad4ccc7050b0721778a426eef38f0f151fef9` | `spiceai-25` |
 | [arrow-rs](#arrow-rs) | `510ef234e1444f2c4aaf748d0c905787738afa7a` | `spiceai-59.3.2` |
 | [async-openai](#async-openai) | `e92cdef14c1e1c027f4e18cdbd5a957148462889` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `829b57522e601ea169b04e2d4a375c3abe3ed58c` | `spiceai` |
@@ -118,13 +119,13 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `59a3510f01992a0fe486c5c4bf337422a7533403` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `9d30d58cbdb4d9f7e511738bedd896603a5a256f` | `spiceai-55` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `daa91fe928174edb95473e644059aee9958dca06` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `8829a4085c203f73ff7da86256ef9c832a12cf42` | `spiceai-b11999` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec` | `spiceai` |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aaf0209ec2a5dd1f61c5dedde20726ff04ac35a0` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -514,6 +515,11 @@ test-connection row after it, with their tests (`mysqlpool.rs`, `core/tests/mysq
 Between `d323656` and `9d30d58` (spiceai/datafusion-table-providers#105 and #120, squash-merged), it adds
 only the `SQLite` `UNNEST` row below and its tests (`core/src/sqlite/federation.rs`), and
 moves its own federation pin to match this workspace's.
+Between `9d30d58` and `daa91fe` (spiceai/datafusion-table-providers#121, squash-merged), it moves its ADBC
+requirement and its own ADBC patch lines to 0.25 (`3e423748`, spiceai/arrow-adbc#9), and
+cancels an ADBC statement through `get_cancel_handle().try_cancel()`, which 0.25 issues without
+the statement lock (`core/src/sql/db_connection_pool/dbconnection/adbcconn.rs`). No row below
+changes.
 
 The federation pin adds [#95](https://github.com/spiceai/datafusion-federation/pull/95) on `109661c`: unnamed computed projection outputs retain their logical names when local table qualifiers are replaced with remote ones. Its test dependency pins match the DataFusion revision used here. It then adds [#96](https://github.com/spiceai/datafusion-federation/pull/96) on `300acfc`: a grouping-set aggregate federated beneath a node that stays local is not asked for its internal grouping id.
 
@@ -529,7 +535,7 @@ One of them has a known problem at this pin:
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | Federation pushes filters into scans it does not own, so a scan must decline what it cannot evaluate (repo-side guard against `datafusion-federation` `contains_federated_table`, which arms the analyzer's whole-plan filter pushdown as soon as *any* table in the statement is federated) | The analyzer runs before decorrelation, so a subquery accepted by a non-federated scan is written into its filters and then fails physical planning with "Physical plan does not support logical expression". Verified: with one federated table present, `EXISTS`/`IN`/`ANY` are offered to an unrelated non-federated scan | silent (query failure) | `crates/runtime/tests/acceleration/on_zero_results_subqueries.rs`: `sqlite_on_zero_results_subqueries` executes correlated scalar, `IN`, and `EXISTS` queries with populated and empty acceleration, explicit `return_empty` controls, and mixed federation. `cayenne_on_zero_results_subqueries` is the local-accelerator control. The guard reads storage directly before querying through the runtime. Requires runtime feature `sqlite`. This is a repo-side guard rather than a patch carried on the fork: it is listed here so a pin move re-checks whether the fork still needs it |
-| Cancel an abandoned ADBC query and release its pooled connection (fork PR #65) | Dropping the record-batch stream only detaches the `spawn_blocking` task; it stays inside `Statement::execute` until the remote query finishes on its own, and owns the pooled connection for that whole time. Repeated cancellations then exhaust the pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection`, which fails if either this patch or the `arrow-adbc` one is missing |
+| Cancel an abandoned ADBC query and release its pooled connection (fork PR #65) | Dropping the record-batch stream only detaches the `spawn_blocking` task; it stays inside `Statement::execute` until the remote query finishes on its own, and owns the pooled connection for that whole time. Repeated cancellations then exhaust the pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection`, which fails if either this patch or the ADBC driver manager's lock-free statement cancel (upstream since ADBC 25; see [arrow-adbc](#arrow-adbc)) is missing |
 | `FunctionSupport` per-call check (fork PR #61) | A function a backend carves out of the deny-list because its dialect rewrites it federates in *every* call shape, including the ones the dialect cannot render. The unparser then emits the function verbatim into the remote SQL — the unknown-function failure of [#10703](https://github.com/spiceai/spiceai/issues/10703) | build, then silent | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate` and `::an_untranslatable_predicate_is_left_above_the_federated_scan`. Losing the API fails `cargo check`; a re-cut that keeps `with_scalar_call_support` and drops its use in `contains_unsupported_functions` fails these instead |
 | `FunctionSupport::with_aggregate_call_support` and `with_window_call_support`, and the aggregate/window arms of the walk that consult them (table-providers PR #70; re-confirmed at the pinned revision) | The name-based `FunctionRestriction` cannot refuse a *shape*, and the aggregate and window slots were unused entirely — so every aggregate and window call federated unconditionally. The BigQuery dialect declines the filtered-aggregate shapes it cannot rewrite exactly, and a declined rendering is a **failed query** unless federation refuses the same shape, because a federated statement has no local-execution fallback. Losing this patch therefore does not lose a pushdown, it breaks the query: `array_agg(v) FILTER (…)` reaches BigQuery as `FILTER` it cannot parse, and `COUNT(x) FILTER (…) OVER (…)` does the same through the window arm (measured: `Syntax error: Expected ")" but got "("`) | silent (query failure) | `crates/data-connectors/connector-adbc/src/lib.rs::bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite`, which tests the allowlist *boundary* rather than a fixed set because the two sides live in different repositories, and `::bigquery_refuses_a_filtered_window_call` |
 | `FunctionSupport` expression policy gates logical federation, scan filter admission, and convertible physical-filter pushdown ([table-providers PR #75](https://github.com/spiceai/datafusion-table-providers/pull/75)) | BigQuery has no `ILIKE` operator. Losing any gate either emits invalid GoogleSQL or lets a remote `LIMIT` run before the residual local predicate, which can return the wrong row or no row | silent (query failure / wrong rows) | `crates/runtime-datafusion/src/function_support.rs::tests::bigquery_refuses_only_case_insensitive_like_expressions`; `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::{bigquery_refuses_case_insensitive_like_but_keeps_like,bigquery_catalog_refuses_case_insensitive_like_but_keeps_like,bigquery_ilike_stays_local_before_limit_on_every_registration_path,bigquery_ilike_residuals_preserve_boolean_and_projection_boundaries,bigquery_supported_like_and_comparison_still_push_down}`; the fork's `supported_functions`, `federation`, scan-filter, and physical-filter policy tests |
@@ -561,16 +567,29 @@ One of them has a known problem at this pin:
 ## arrow-adbc
 
 Upstream [apache/arrow-adbc](https://github.com/apache/arrow-adbc), branch
-`spiceai-24-patches`: upstream tag `apache-arrow-adbc-24` — the commit the
-`adbc_core` / `adbc_driver_manager` / `adbc_ffi` 0.24.0 crates were published from —
-merged into the previous line, so the only delta a build picks up is the patches
-below. Both were re-confirmed at the pinned revision. All three crates are replaced together through `[patch.crates-io]`: the patch changes an
-`adbc_ffi` signature that `adbc_driver_manager` calls.
+`spiceai-25`: upstream tag `apache-arrow-adbc-25` — the commit the
+`adbc_core` / `adbc_driver_manager` / `adbc_ffi` 0.25.0 crates were published from —
+merged into the previous line (`spiceai-24`), so the only delta a build picks up is the
+patch below, re-confirmed at the pinned revision. All three crates are replaced
+together through `[patch.crates-io]`: the arrow requirement below is declared once,
+in the fork's workspace, for all three.
+
+The statement-cancel patch the fork carried through ADBC 24 — `AdbcStatementCancel`
+issued without the statement lock, and statement release moved from the clonable
+handle to the shared inner (fork PR #4) — is upstream since ADBC 25:
+[apache/arrow-adbc#4858](https://github.com/apache/arrow-adbc/pull/4858), on the
+`CancelHandle` API of [#3905](https://github.com/apache/arrow-adbc/pull/3905), does the
+same for statements and connections. The merge of ADBC 25 took upstream's
+`rust/driver_manager` and `rust/ffi` verbatim, so the fork carries no source change
+there. `Statement::cancel` is deprecated in 0.25 in favour of
+`get_cancel_handle().try_cancel()`, which `datafusion-table-providers` calls. Losing it
+upstream would still be silent, so its guard stays:
+`crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection`
+(also the guard of the `datafusion-table-providers` row for fork PR #65).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| `AdbcStatementCancel` issued without the statement lock, and statement release moved from the clonable handle to the shared inner (fork PR #4) | `cancel` is serialized behind the `execute` it exists to interrupt, so it returns only once the query has finished on its own and cancels nothing. A Flight client that goes away then leaves the remote query running — billing, on BigQuery — and holds its pooled connection for the rest of that query's life, which exhausts a small pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection` |
-| Arrow requirement narrowed to the one major the workspace builds against, now `>=59.0.0, <60` (fork PR #4 set it to 58; moved to 59 in the merge of ADBC 24, where upstream's own range is `>=58, <60`) | A range spanning two majors lets a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — resolve the ADBC crates onto it while the rest of the workspace runs on 59. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the requirement is widened |
+| Arrow requirement narrowed to the one major the workspace builds against, `>=59.0.0, <60` (fork PR #4 set it to 58; moved to 59 in the merge of ADBC 24; upstream's own range is `>=58, <61` since ADBC 25) | A range spanning more than one major lets a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — resolve the ADBC crates onto it while the rest of the workspace runs on 59. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the requirement is widened |
 
 ## iceberg-rust
 
@@ -733,7 +752,8 @@ as `aa8e8d43`, the tool-call parser, spiceai/mistral.rs#53, squash-merged as `fc
 ring collectives over RDMA, spiceai/mistral.rs#54, squash-merged as `2f58f444`, the
 DeepSeek-V4 DSML tool-call parser, spiceai/mistral.rs#55, squash-merged as
 `e40436e4`, the candle pin at `zip` 9.1, and spiceai/mistral.rs#58, squash-merged as
-`d7ddf3bb`, Mistral's `[THINK]` reasoning, so `git diff v0.9.4 d7ddf3bb`
+`d7ddf3bb`, Mistral's `[THINK]` reasoning, and spiceai/mistral.rs#59, squash-merged as `aaf0209e`, Gemma and
+Gemma 2 tying `lm_head` to the embeddings, so `git diff v0.9.4 aaf0209e`
 is the whole fork delta. #47 built it in 32 commits. The first replays the Spice patches from the
 `v0.9.0` line: `glm-dsa`
 GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
@@ -772,6 +792,7 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 | `mistral.rs`: Mistral's `[THINK]…[/THINK]` reasoning tokens are a reasoning format: `TagReasoningContext::new_mistral_think` and `new_in_mistral_think_block`, `is_mistral_think_template`, and the mistral.rs engine's parser choice (spiceai/mistral.rs#58) | Magistral's and Mistral Large 4's reasoning comes back as content, `[THINK]` tags included, with `reasoning_content` empty; losing the constructors fails the build | silent (wrong text) | `mistral_reasoning_is_split_at_its_think_tokens` (`crates/llms-llamacpp/src/lib.rs`) for the llama.cpp engine; the mistral.rs engine's branch is guarded in the fork by `mistral_think_block_splits_reasoning_from_content` and `mistral_think_block_opened_by_the_prompt` |
 | `mistral.rs`: GGUF `eot_token_id` and `eom_token_id` stop generation, as `eos_token_id` does | GLM-5.3-Flash's reply runs past `<|user|>` into an invented next turn until `max_tokens` | silent (wrong text) | **GAP** |
 | `mistral.rs`: a `distributed` build serves a single-node model, and a ring head keeps a second request queued while one runs | A model without `distributed_backend` never finishes loading in a `distributed` build, and a second request to a ring deadlocks every rank at the next all-reduce | load failure / hang | **GAP** |
+| `mistral.rs`: Gemma and Gemma 2 configs without `tie_word_embeddings` tie `lm_head` to the token embeddings, as Hugging Face's `GemmaConfig` and `Gemma2Config` default it (spiceai/mistral.rs#59) | `google/gemma-2-2b-it` and `google/gemma-2b-it`, whose `config.json` omits the key and which ship no `lm_head.weight`, fail to load with ``Missing required tensor(s) for replicated_linear at prefix `lm_head` `` | load failure | guarded in the fork, not here: `a_config_without_tie_word_embeddings_ties_lm_head_to_the_embeddings` in `models/gemma.rs` and `models/gemma2.rs`; here, `models::hf::huggingface_test_gemma_chat_completion` in the nightly `integration tests (models)` |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |
 | `text-embeddings-inference`: pooling/model-loading fixes | Embeddings differ from the reference implementation | silent (wrong vectors) | **GAP** |
 
