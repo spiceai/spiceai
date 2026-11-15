@@ -2952,6 +2952,29 @@ params:
         unsafe { std::env::remove_var(&present) };
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_non_unicode_env_value_is_not_echoed_in_the_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env_guard = lock_env().await;
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully");
+        let key = format!("SPICE_NON_UNICODE_{}", rand::random::<u64>());
+        unsafe {
+            std::env::set_var(
+                &key,
+                std::ffi::OsStr::from_bytes(b"do-not-leak-this-value\xff"),
+            );
+        }
+        let err = secrets
+            .get_secret(&key)
+            .await
+            .expect_err("a non-Unicode value is an error");
+        let message = err.to_string();
+        unsafe { std::env::remove_var(&key) };
+        assert!(!message.contains("do-not-leak-this-value"), "{message}");
+    }
+
     #[tokio::test]
     async fn test_try_inject_secrets_accepts_secret_defined_as_empty() {
         // The opt-out for an intentionally optional secret: define it as "".
