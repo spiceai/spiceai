@@ -122,6 +122,9 @@ env:
   # same toolchain.
   RUSTC: rustc
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   # Its own job purely so `sign-off` can key `concurrency` on the commit this
   # resolves to: a job-level `concurrency` group can read `needs`, but a

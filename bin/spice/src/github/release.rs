@@ -70,16 +70,17 @@ pub async fn get_latest_release(client: &GitHubClient) -> Result<RepoRelease, Gi
 }
 
 /// Get a specific release by version tag.
+///
+/// The release is fetched by its tag rather than searched for in the release list, which
+/// GitHub pages 30 at a time: a search of the first page cannot find any older release.
 pub async fn get_release(client: &GitHubClient, version: &str) -> Result<RepoRelease, GitHubError> {
-    let url = client.releases_url();
-    let releases: Vec<RepoRelease> = client.get(&url).await?;
-
-    releases
-        .into_iter()
-        .find(|r| r.tag_name == version)
-        .ok_or(GitHubError::ReleaseNotFound {
+    let url = client.release_by_tag_url(version);
+    match client.get(&url).await {
+        Err(GitHubError::Api { status: 404, .. }) => Err(GitHubError::ReleaseNotFound {
             version: version.to_string(),
-        })
+        }),
+        result => result,
+    }
 }
 
 /// Download a release asset and extract it to a directory.
@@ -803,5 +804,98 @@ mod tests {
         assert!(is_v2_or_later("v2.1.0"));
         assert!(is_v2_or_later("v10.0.0"));
         assert!(!is_v2_or_later("invalid"));
+    }
+
+    /// A release tagged `tag`, in the shape the releases API serves.
+    fn release_json(tag: &str) -> serde_json::Value {
+        serde_json::json!({
+            "url": "",
+            "html_url": "",
+            "assets_url": "",
+            "tag_name": tag,
+            "name": tag,
+            "draft": false,
+            "prerelease": false,
+            "created_at": "",
+            "published_at": null,
+            "assets": [],
+        })
+    }
+
+    /// A mock API serving `GET /repos/spiceai/spiceai/releases` as GitHub does without
+    /// `per_page`: only the 30 newest releases, none of them `v1.11.4`.
+    async fn api_listing_only_the_newest_releases() -> MockServer {
+        let server = MockServer::start().await;
+        let newest: Vec<_> = (0..30)
+            .map(|patch| release_json(&format!("v2.0.{patch}")))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(newest))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `spice install v1.11.4` failed with `Release not found: v1.11.4` once 30 newer releases
+    /// were published, because the lookup searched only the first page of the release list.
+    #[tokio::test]
+    async fn a_release_older_than_the_first_page_of_the_list_is_found_by_its_tag() {
+        let server = api_listing_only_the_newest_releases().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v1.11.4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_json("v1.11.4")))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri());
+
+        let release = match get_release(&client, "v1.11.4").await {
+            Ok(release) => release,
+            Err(error) => panic!("v1.11.4 is published, so it must be found: {error}"),
+        };
+
+        assert_eq!(release.tag_name, "v1.11.4");
+    }
+
+    #[tokio::test]
+    async fn a_tag_with_no_release_is_reported_as_release_not_found() {
+        let server = api_listing_only_the_newest_releases().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v9.9.9"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(r#"{"message":"Not Found"}"#))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri());
+
+        let Err(error) = get_release(&client, "v9.9.9").await else {
+            panic!("an unpublished tag must not resolve to a release");
+        };
+
+        assert!(
+            matches!(&error, GitHubError::ReleaseNotFound { version } if version == "v9.9.9"),
+            "expected ReleaseNotFound for v9.9.9, got: {error}"
+        );
+    }
+
+    /// Only a 404 means the release does not exist. A server error must still read as one,
+    /// rather than telling the user that a published release is missing.
+    #[tokio::test]
+    async fn a_server_error_is_not_reported_as_a_missing_release() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v1.11.4"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("Bad Gateway"))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri());
+
+        let Err(error) = get_release(&client, "v1.11.4").await else {
+            panic!("a 502 must not resolve to a release");
+        };
+
+        assert!(
+            matches!(error, GitHubError::Api { status: 502, .. }),
+            "expected the 502 to surface as an API error, got: {error}"
+        );
     }
 }

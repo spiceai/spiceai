@@ -2643,8 +2643,13 @@ async fn attach_member(
     // replay from re-delivering commits the acceleration durably holds (see
     // `AckSlot::seat_recorded` for why re-delivery loses writes on a durable
     // write-back dataset).
+    //
+    // A rebuild whose position is still sound seats it too: the re-read already
+    // holds every change at or below it, and replaying them after the dataset is
+    // ready serves older states of the table (see
+    // `RebuildCause::keeps_recorded_position`).
     if let (Some(slot), super::RecordedPosition::At(resumed)) = (&ack_slot, &watermark)
-        && !rebuild_via_consumer
+        && rebuild_cause.is_none_or(super::RebuildCause::keeps_recorded_position)
     {
         slot.seat_recorded(resumed.lsn);
     }

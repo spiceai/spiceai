@@ -11,6 +11,9 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   advisories:
     environment: secret-free

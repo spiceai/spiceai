@@ -41,6 +41,9 @@ on:
           - 'sf1-source-versions'
           - 'sf1-layouts'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   dispatch-htap:
     environment: ci

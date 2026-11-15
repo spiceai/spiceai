@@ -38,6 +38,7 @@ use llms::progress::Progress;
 use messages_api::stream::event_type;
 use messages_api::{MessageStream, Messages, MessagesError, MessagesRequest};
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_tools::builtin::list_datasets::catalog_prompt_from_tool;
 use serde_json::{Map, Value, json};
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
@@ -65,6 +66,35 @@ impl SpiceTools {
         self.tools
             .iter()
             .find(|tool| encode_tool_name(tool.name().as_ref()) == name)
+    }
+
+    /// Adds a system text block naming the datasets the model can query (see
+    /// [`catalog_prompt_from_tool`]) after the request's own `system`, unless the request already
+    /// holds the same block.
+    async fn add_catalog(&self, body: &mut Map<String, Value>) {
+        let Some(list_datasets) = self.tools.iter().find(|t| t.name() == "list_datasets") else {
+            return;
+        };
+        let Some(catalog) = catalog_prompt_from_tool(list_datasets.as_ref()).await else {
+            return;
+        };
+        let block = json!({"type": "text", "text": catalog});
+        let blocks = match body.remove("system") {
+            None | Some(Value::Null) => vec![block],
+            Some(Value::String(text)) if text == catalog => vec![block],
+            Some(Value::String(text)) => vec![json!({"type": "text", "text": text}), block],
+            Some(Value::Array(mut blocks)) => {
+                if !blocks
+                    .iter()
+                    .any(|b| b.get("text").and_then(Value::as_str) == Some(&catalog))
+                {
+                    blocks.push(block);
+                }
+                blocks
+            }
+            Some(other) => vec![other, block],
+        };
+        body.insert("system".to_string(), Value::Array(blocks));
     }
 
     /// Each tool as the Messages API defines a tool.
@@ -388,6 +418,7 @@ impl Messages for ToolUsingMessages {
             version,
         } = request;
         let spice = self.tools.offer(&mut body);
+        self.tools.add_catalog(&mut body).await;
         let request_context = RequestContext::current(AsyncMarker::new().await);
 
         let mut earlier: Vec<Value> = Vec::new();
@@ -489,6 +520,7 @@ impl Messages for ToolUsingMessages {
             version,
         } = request;
         let spice = self.tools.offer(&mut body);
+        self.tools.add_catalog(&mut body).await;
         let events = self
             .inner
             .create_stream(MessagesRequest {
@@ -559,6 +591,7 @@ impl Messages for ToolUsingMessages {
             version,
         } = request;
         self.tools.offer(&mut body);
+        self.tools.add_catalog(&mut body).await;
         self.inner
             .count_tokens(MessagesRequest {
                 body,
