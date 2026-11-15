@@ -132,6 +132,24 @@ jobs:
       - uses: ./.github/actions/setup-cc
       - name: Build the model
         run: cargo build --locked --release -p cayenne-metastore-model
+      # The checker defaults to 6 threads and stops any check that runs past its
+      # 540-second watchdog. On the dev runners 6 threads are too slow for the
+      # largest exhaustive checks, so use every CPU the job's cgroup quota allows.
+      # Results do not depend on the thread count. `nproc` counts the host's CPUs,
+      # not the quota.
+      - name: Size the checker threads to the job's CPU quota
+        run: |
+          set -euo pipefail
+          threads=$(nproc)
+          if [ -r /sys/fs/cgroup/cpu.max ]; then
+            read -r quota period < /sys/fs/cgroup/cpu.max
+            if [ "$quota" != max ] && [ $(( quota / period )) -lt "$threads" ]; then
+              threads=$(( quota / period ))
+            fi
+          fi
+          if [ "$threads" -lt 1 ]; then threads=1; fi
+          echo "Checker threads: $threads (nproc $(nproc), cpu.max $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo absent))"
+          echo "MODEL_THREADS=$threads" >> "$GITHUB_ENV"
       - name: Check the design documents' model citations
         run: target/release/cayenne-metastore-model cite-check docs/design/object-native-metastore.md docs/design/object-native-metastore-technical.md
       - name: Run the ${{ env.SET }} model set

@@ -117,6 +117,13 @@ impl SpiceModelTool for McpToolWrapper {
         ))
     }
 
+    fn output_schema(&self) -> Option<Value> {
+        self.spec
+            .output_schema
+            .as_ref()
+            .map(|schema| Value::Object(schema.as_ref().clone()))
+    }
+
     async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
         Some(self)
     }
