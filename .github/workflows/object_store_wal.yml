@@ -30,7 +30,7 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: spiceai-dev-runners
-    environment: ci-build
+    environment: ci
     # A merge group's checkout takes the full history, sized for a cold runner
     # cloning from scratch.
     timeout-minutes: 45
@@ -126,7 +126,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.legs) }}
     runs-on: ${{ matrix.runner }}
-    environment: ci-build
+    environment: ci
     timeout-minutes: 45
     services:
       redis:
