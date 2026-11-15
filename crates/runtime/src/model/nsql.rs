@@ -397,14 +397,10 @@ impl NsqlContextOptions {
     }
 }
 
+/// A tool result as context text: a string as it is, anything else as compact JSON. Pretty JSON
+/// would put each value of a row on a line of its own.
 fn value_to_context_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        _ => match serde_json::to_string_pretty(value) {
-            Ok(text) => text,
-            Err(_) => value.to_string(),
-        },
-    }
+    runtime_tools::result::tool_result_text(value).into_owned()
 }
 
 async fn tool_context_text(

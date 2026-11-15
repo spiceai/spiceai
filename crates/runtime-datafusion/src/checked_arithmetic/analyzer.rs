@@ -87,6 +87,15 @@ impl AnalyzerRule for CheckedIntegerOverflow {
     }
 }
 
+/// `expr` with its integer `+` / `-` / `*` replaced as
+/// [`CheckedIntegerOverflow`] replaces them in a plan, its types read from
+/// `schema`. For a rule that folds an expression before this one runs, so
+/// the fold fails where the query would instead of wrapping.
+pub(crate) fn checked_integer_arith(expr: Expr, schema: &DFSchema) -> Result<Expr> {
+    expr.transform_up(|expr| Ok(rewrite_integer_arith(expr, schema)))
+        .map(|transformed| transformed.data)
+}
+
 fn expression_schema(plan: &LogicalPlan) -> Arc<DFSchema> {
     let inputs = plan.inputs();
     if let [input] = inputs.as_slice() {
