@@ -44,7 +44,7 @@ use crate::{
     dataaccelerator::spice_sys,
     parameters::Parameters,
 };
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_secrets::{Secrets, try_get_params_with_secrets};
 
 use super::{ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError};
 use crate::dataconnector::{ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR, SCYLLADB_FEATURE};
@@ -204,8 +204,10 @@ impl ConnectorParamsBuilder {
                     (factory.prefix(), factory.parameters())
                 };
 
+                // Strict: an unresolved `${ store:key }` fails the catalog
+                // rather than loading it with an empty value.
                 (
-                    get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
+                    try_get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await?,
                     prefix,
                     parameters,
                 )
@@ -239,7 +241,13 @@ impl ConnectorParamsBuilder {
                     (factory.prefix(), factory.parameters())
                 };
 
-                let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
+                // Strict: an unresolved `${ store:key }` fails the dataset
+                // rather than substituting the empty string, which can change
+                // what the connector reads (an empty `file_format` loaded a
+                // CSV as a one-row document table) and serve wrong results
+                // while the dataset reports Ready.
+                let params =
+                    try_get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await?;
 
                 (params, prefix, parameters)
             }
