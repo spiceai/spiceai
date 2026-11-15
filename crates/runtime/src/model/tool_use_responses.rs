@@ -143,7 +143,7 @@ impl ToolUsingResponses {
             return req;
         }
         req.instructions = Some(match req.instructions.take() {
-            Some(instructions) if instructions.contains(&catalog) => instructions,
+            Some(instructions) if holds_paragraph(&instructions, &catalog) => instructions,
             Some(instructions) if !instructions.trim().is_empty() => {
                 format!("{instructions}\n\n{catalog}")
             }
@@ -1143,6 +1143,15 @@ fn to_input_item(input: InputParam) -> Vec<InputItem> {
     }
 }
 
+/// Whether `instructions` hold `catalog` as a paragraph of its own, between blank lines or the
+/// ends of the text. A list that only starts with `catalog`, such as an older one that names a
+/// dataset since renamed or dropped, is a different list and does not count.
+fn holds_paragraph(instructions: &str, catalog: &str) -> bool {
+    instructions
+        .split("\n\n")
+        .any(|paragraph| paragraph.trim_matches('\n') == catalog)
+}
+
 /// Whether `item` is a system message holding `catalog`, as its text or as one of its text parts,
 /// in either message shape the Responses API accepts.
 fn holds_catalog(item: &InputItem, catalog: &str) -> bool {
@@ -1334,6 +1343,49 @@ mod tests {
             instructions.as_str(),
             "instructions that hold the list keep it once"
         );
+    }
+
+    /// Instructions hold the current dataset list only when it is a paragraph of its own. An older
+    /// list that merely starts with the current one, because a dataset was renamed, dropped, or
+    /// described since, does not count, and the current list follows it.
+    #[tokio::test]
+    async fn an_older_dataset_list_in_the_instructions_does_not_hide_the_current_one() {
+        let header = "Datasets (use these names in sql, search, and table_schema):";
+        let catalog = format!("{header}\n- spice.public.taxi_trips");
+        for instructions in [
+            catalog.clone(),
+            format!("Answer in French.\n\n{catalog}"),
+            format!("{catalog}\n\nAnswer in French."),
+            format!("Answer in French.\n\n\n{catalog}\n"),
+        ] {
+            let request = request_with_catalog(
+                json!({"model": "m", "instructions": instructions, "input": "Hi"}),
+            )
+            .await;
+            assert_eq!(
+                request["instructions"],
+                instructions.as_str(),
+                "the current list is kept once"
+            );
+        }
+        let older = [
+            format!("{header}\n- spice.public.taxi_trips_2025"),
+            format!("{header}\n- spice.public.taxi_trips\n- spice.public.zones"),
+            format!("{header}\n- spice.public.taxi_trips: Trips before 2025"),
+        ];
+        let mut given = Vec::new();
+        for instructions in &older {
+            let request = request_with_catalog(
+                json!({"model": "m", "instructions": instructions, "input": "Hi"}),
+            )
+            .await;
+            given.push(request["instructions"].clone());
+        }
+        let expected: Vec<Value> = older
+            .iter()
+            .map(|instructions| Value::from(format!("{instructions}\n\n{catalog}")))
+            .collect();
+        assert_eq!(given, expected, "the current list follows an older one");
     }
 
     /// A client that sends the dataset list back as a system message, as text or as `input_text`
