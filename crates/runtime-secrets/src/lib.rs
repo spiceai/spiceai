@@ -488,6 +488,69 @@ impl Secrets {
         }
     }
 
+    /// Like [`Self::get_secret`], but a miss is an error when any consulted
+    /// store failed: the failed store may hold the key, so the caller must not
+    /// treat the miss as definitive.
+    ///
+    /// For the scheduler's `ExpandSecret`, so an executor's strict lookup sees
+    /// a partial outage as a (retriable) store error rather than "not found".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no store holds the key and at least one consulted
+    /// store failed.
+    pub async fn get_secret_or_outage(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+        self.get_secret_from_or_outage(key, |_| true).await
+    }
+
+    /// [`Self::get_secret_from_stores`] with the partial-outage semantics of
+    /// [`Self::get_secret_or_outage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no allowed store holds the key and at least one
+    /// consulted store failed.
+    pub async fn get_secret_from_stores_or_outage(
+        &self,
+        key: &str,
+        allowed_stores: &HashSet<String>,
+    ) -> AnyErrorResult<Option<SecretString>> {
+        self.get_secret_from_or_outage(key, |store_name| allowed_stores.contains(store_name))
+            .await
+    }
+
+    async fn get_secret_from_or_outage(
+        &self,
+        key: &str,
+        allow: impl Fn(&str) -> bool,
+    ) -> AnyErrorResult<Option<SecretString>> {
+        let mut failed: Vec<String> = Vec::new();
+        for (store_name, store) in &self.stores {
+            if !allow(store_name) {
+                continue;
+            }
+            match store.get_secret(key).await {
+                Ok(Some(secret)) => return Ok(Some(secret)),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Secret store `{store_name}` failed while looking up secret `{key}`: {e}. Trying the next store in precedence order."
+                    );
+                    failed.push(format!("`{store_name}`: {e}"));
+                }
+            }
+        }
+        if failed.is_empty() {
+            Ok(None)
+        } else {
+            Err(format!(
+                "secret `{key}` was not found, and some secret stores failed while looking it up ({})",
+                failed.join("; ")
+            )
+            .into())
+        }
+    }
+
     /// Reports whether a `${ store_name:key }` reference would resolve,
     /// without exposing the value.
     ///
@@ -1702,6 +1765,40 @@ mod tests {
             !err.is_retriable(),
             "a missing key will not appear on retry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_secret_or_outage_reports_partial_outage() {
+        let partial = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            ("env", std::sync::Arc::new(MapStore::new(&[("FOUND", "v")]))),
+        ]);
+        // A hit still wins over an erroring store.
+        let hit = partial.get_secret_or_outage("FOUND").await.expect("hit");
+        assert_eq!(hit.expect("value").expose_secret(), "v");
+        // A miss with a failed store is an error, not a definitive miss,
+        // while the lenient lookup keeps returning `Ok(None)`.
+        let err = partial
+            .get_secret_or_outage("MISSING")
+            .await
+            .expect_err("a partial outage is not a definitive miss");
+        assert!(err.to_string().contains("vault is down"), "{err}");
+        assert!(
+            partial
+                .get_secret("MISSING")
+                .await
+                .expect("lenient")
+                .is_none()
+        );
+        // Scoped to the healthy store only, the miss is definitive.
+        let scoped = partial
+            .get_secret_from_stores_or_outage(
+                "MISSING",
+                &std::collections::HashSet::from(["env".to_string()]),
+            )
+            .await
+            .expect("only a healthy store was consulted");
+        assert!(scoped.is_none());
     }
 
     #[tokio::test]
