@@ -52,10 +52,13 @@ from pathlib import Path
 # Source: `Remote Sign-off` run 30833882620 (trunk @ 7b98c234), which ran with no
 # other sign-off in flight. Value is the slowest single test in that set.
 #
-# A key is either a binary name, matched by a `binary(=name)` filter term, or
+# A key is either a binary name, matched by a `binary(=name)` filter term,
 # `package::binary::module` for one module of a test binary that holds many,
-# matched by a `(binary_id(=package::binary) & test(/^module::/))` term. Cayenne's
-# integration tests are modules of its single `integration` binary.
+# matched by a `(binary_id(=package::binary) & test(/^module::/))` term, or
+# `binary_id#test::path` for one test, matched by a
+# `(binary_id(=binary_id) & test(=test::path))` term. Cayenne's integration tests
+# are modules of its single `integration` binary; its unit tests are in the
+# `cayenne` library binary, whose `binary_id` is the package name alone.
 QUIET_BASELINE_SECONDS = {
     "cayenne::integration::mutation_property_test": 239.5,  # prop_concurrent_mixed_position
     "cayenne::integration::partition_chunking_test": 247.9,  # ..._timestamp_partition_with_date_part_impl_sqlite
@@ -69,6 +72,15 @@ QUIET_BASELINE_SECONDS = {
     # fixture on disk, plus the 25.4s `tpcdsgen` takes to write it on a fresh
     # runner, rounded up.
     "cayenne::integration::result_correctness_vs_sqlite_test": 200.0,
+    # The three below come from one sign-off a day, 2026-10-20 to 2026-11-11, on
+    # `macmini-runner-01-01` and `-04-01`, the hosts not over-subscribed in that
+    # window (#14557): the slowest pass of each. The times are flat across it.
+    # Run 41931913741 (04-01).
+    "cayenne#provider::table::tests::small_tier_merge_runs_while_large_tier_merge_is_in_flight": 122.5,
+    # file_mode_widened_keys_return_the_rows_of_an_unindexed_table, run 40144055680 (01-01).
+    "cayenne::integration::lookup_index_widening_test": 140.9,
+    # bulk_load_with_repeats_is_indexed_when_it_returns_impl_sqlite, run 41136640039 (04-01).
+    "cayenne::integration::bulk_load_index_coverage_test": 91.7,
 }
 
 # Worst same-test slowdown measured between a quiet pool and a saturated one.
@@ -143,7 +155,16 @@ _MODULE_TERM = re.compile(
     r"\(\s*binary_id\(=([A-Za-z0-9_-]+)::([A-Za-z0-9_]+)\)"
     r"\s*&\s*test\(/\^([A-Za-z0-9_]+)::/\)\s*\)"
 )
+# One test of a binary, by its exact name. `binary_id` is `package` for a
+# library's unit tests and `package::binary` for an integration-test binary.
+_TEST_TERM = re.compile(
+    r"\(\s*binary_id\(=([A-Za-z0-9_-]+(?:::[A-Za-z0-9_]+)?)\)"
+    r"\s*&\s*test\(=([A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*)\)\s*\)"
+)
 _OTHER_BINARY_TERM = re.compile(r"binary(?:-id|_id)?\((?!=[A-Za-z0-9_]+\))")
+# What may remain once every resolved term is removed: union operators and
+# whitespace, nothing that could narrow or negate the terms.
+_UNION_ONLY = re.compile(r"\s+|\||\+|\bor\b")
 
 
 def parse_duration(text: str) -> float:
@@ -258,7 +279,8 @@ def selectors_matched(filter_expr: str) -> set[str]:
     """Return the test-set keys a filter expression matches exactly.
 
     A `binary(=name)` term yields `name`; a
-    `(binary_id(=p::b) & test(/^module::/))` term yields `p::b::module`.
+    `(binary_id(=p::b) & test(/^module::/))` term yields `p::b::module`; a
+    `(binary_id(=id) & test(=path))` term yields `id#path`.
     A filter selecting tests by name alone (for example `test(=mysql::…)`)
     matches nothing here, which is correct: it cannot be resolved to a test set
     without knowing every binary's test names.
@@ -267,27 +289,116 @@ def selectors_matched(filter_expr: str) -> set[str]:
         f"{package}::{binary}::{module}"
         for package, binary, module in _MODULE_TERM.findall(filter_expr)
     }
-    rest = _MODULE_TERM.sub("", filter_expr)
+    selectors |= {f"{binary_id}#{path}" for binary_id, path in _TEST_TERM.findall(filter_expr)}
+    rest = _TEST_TERM.sub("", _MODULE_TERM.sub("", filter_expr))
     if _OTHER_BINARY_TERM.search(rest) or (
         "&" in rest and _BINARY_EQ_TERM.search(rest)
     ):
         raise ValueError(
             f"unsupported binary filter spelling, cannot resolve a ceiling: {filter_expr!r}"
         )
-    return selectors | set(_BINARY_EQ_TERM.findall(rest))
+    selectors |= set(_BINARY_EQ_TERM.findall(rest))
+    # The terms above are read as a plain union. Anything else around them —
+    # `not`, `!`, `-`, `&`, `and`, `none()`, another predicate — can exclude the
+    # very tests a term names (`not (binary_id(=x) & test(=t))` selects every
+    # test but `t`), so it is refused rather than read as selecting them.
+    operators = _UNION_ONLY.sub("", _BINARY_EQ_TERM.sub("", rest))
+    if selectors and operators:
+        raise ValueError(
+            "unsupported operator around a binary filter term; only a union "
+            f"(`|`, `or`, `+`) of them can be resolved: {filter_expr!r}"
+        )
+    return selectors
 
 
 def selected(key: str, filter_expr: str) -> bool:
     """Return whether the filter expression selects the test set `key`.
 
     A `package::binary::module` key is also selected by a `binary(=binary)` term,
-    which selects every module of that binary, as nextest applies it.
+    which selects every module of that binary, as nextest applies it. A
+    `binary_id#test::path` key is also selected by a module term of the same
+    binary whose module the path is in, and by a `binary(=…)` term naming its
+    binary: the last segment of `binary_id`, which for a library is the package.
     """
     selectors = selectors_matched(filter_expr)
     if key in selectors:
         return True
+    if "#" in key:
+        binary_id, path = key.split("#", 1)
+        for selector in selectors:
+            if "#" in selector:
+                continue
+            selector_binary, _, module = selector.rpartition("::")
+            if selector.count("::") == 2 and selector_binary == binary_id and path.startswith(
+                f"{module}::"
+            ):
+                return True
+        return binary_id.split("::")[-1] in selectors
     parts = key.split("::")
     return len(parts) == 3 and parts[1] in selectors
+
+
+def contained_in(selector: str, key: str) -> bool:
+    """Return whether every test `selector` names is in the larger test set `key`.
+
+    An exact test `binary_id#module::…` is in the module key
+    `binary_id::module` and in the binary key naming its binary; a module key
+    `package::binary::module` is in the binary key `binary`. A set is not
+    counted as contained in itself.
+    """
+    if "#" in key or selector == key:
+        return False
+    if "#" in selector:
+        binary_id, path = selector.split("#", 1)
+        if key.count("::") == 2:
+            key_binary, _, module = key.rpartition("::")
+            return key_binary == binary_id and path.startswith(f"{module}::")
+        return "::" not in key and binary_id.split("::")[-1] == key
+    parts = selector.split("::")
+    return len(parts) == 3 and "::" not in key and parts[1] == key
+
+
+def baselines_to_check(config: dict) -> dict[str, float]:
+    """Return every test set whose ceiling must clear a baseline, with that baseline.
+
+    That is each key of QUIET_BASELINE_SECONDS, plus each narrower set an override
+    names inside one of them: an exact test in a measured module, or a module of a
+    measured binary. nextest gives such a test the first override it matches, so
+    a narrower override placed ahead of the measured set's own one would lower
+    that test's ceiling while the set's key still resolves to the set's ceiling.
+    The narrower set is held to the baseline of the set holding it, which is its
+    slowest test and so an upper bound on the narrower set's own.
+    """
+    baselines = dict(QUIET_BASELINE_SECONDS)
+    for override in config.get("profile", {}).get("default", {}).get("overrides", []):
+        for selector in selectors_matched(override.get("filter", "")):
+            if selector in baselines:
+                continue
+            holding = [
+                baseline
+                for key, baseline in QUIET_BASELINE_SECONDS.items()
+                if contained_in(selector, key)
+            ]
+            if holding:
+                baselines[selector] = max(holding)
+    return baselines
+
+
+def zero_retry_sets_to_check(config: dict) -> list[str]:
+    """Return every test set that must keep retries = 0 and an explicit ceiling.
+
+    That is each key of ZERO_RETRY_BINARIES, plus each narrower set an override
+    names inside one of them, such as an exact test of a zero-retry module. An
+    override for that test placed ahead of the module's own one is the first
+    match nextest gives it, so it could set retries or drop the ceiling while
+    the module key still resolves to the module's settings.
+    """
+    sets = set(ZERO_RETRY_BINARIES)
+    for override in config.get("profile", {}).get("default", {}).get("overrides", []):
+        for selector in selectors_matched(override.get("filter", "")):
+            if any(contained_in(selector, key) for key in ZERO_RETRY_BINARIES):
+                sets.add(selector)
+    return sorted(sets)
 
 
 def resolve(config: dict, binary: str, setting: str) -> object | None:
@@ -343,7 +454,7 @@ def check_config(config_path: Path, repo_root: Path | None = None) -> list[str]:
             "the affected binaries their own override and record why."
         )
 
-    for binary, baseline in sorted(QUIET_BASELINE_SECONDS.items()):
+    for binary, baseline in sorted(baselines_to_check(config).items()):
         required = baseline * CONTENTION_FACTOR * CONTENTION_HEADROOM
         try:
             ceiling = ceiling_seconds(resolve(config, binary, "slow-timeout"))
@@ -353,15 +464,20 @@ def check_config(config_path: Path, repo_root: Path | None = None) -> list[str]:
         if ceiling is None:
             continue  # No ceiling at all cannot be breached by contention.
         if ceiling < required:
+            measured = (
+                "its slowest test"
+                if binary in QUIET_BASELINE_SECONDS
+                else "the slowest test measured in the test set holding it"
+            )
             problems.append(
-                f"{name}: {binary} is killed after {ceiling:.0f}s, but its slowest test "
+                f"{name}: {binary} is killed after {ceiling:.0f}s, but {measured} "
                 f"needs {baseline:.1f}s on a quiet pool and contention has been measured "
                 f"multiplying runtimes by {CONTENTION_FACTOR}x, so with {CONTENTION_HEADROOM}x "
                 f"headroom for the next increment it needs at least {required:.0f}s. As "
                 "configured, pool load decides whether unrelated PRs pass. See #12336 / #12811."
             )
 
-    for binary in sorted(ZERO_RETRY_BINARIES):
+    for binary in zero_retry_sets_to_check(config):
         if resolve(config, binary, "retries") != 0:
             problems.append(
                 f"{name}: {binary} no longer has retries = 0. These tests assert the "
