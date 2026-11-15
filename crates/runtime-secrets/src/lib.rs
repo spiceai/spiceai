@@ -594,22 +594,6 @@ impl Secrets {
         };
 
         if store_name == SECRETS {
-            // A cluster executor resolves through the scheduler, which owns
-            // the precedence walk.
-            if let Some(search) = &self.scheduler_search {
-                return match search.get_secret(key).await {
-                    Ok(Some(secret)) => Ok(secret),
-                    Ok(None) => Err(failure(
-                        UnresolvedSecretKind::NotFound,
-                        format!("Secret `${{ secrets:{key} }}` not found by the scheduler"),
-                    )),
-                    Err(e) => Err(failure(
-                        UnresolvedSecretKind::StoreError,
-                        format!("Error looking up secret `${{ secrets:{key} }}`: {e}"),
-                    )),
-                };
-            }
-
             // Same walk as `get_secret_from`, but remembers whether any store
             // failed: a miss in the healthy stores plus an outage in another
             // is not a definitive "not found", since the failed store may hold
