@@ -177,19 +177,9 @@ on:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
 
+# run-cluster-bench declares the write grants it uses.
 permissions:
-  # `write` on contents + pull-requests so the "Open snapshot-update PR" step
-  # can push a branch and open a PR. `packages: read` covers the spidapter
-  # GHCR image pull. Matches the implicit permissions
-  # `testoperator_run_bench.yml` inherits from the repo default.
-  contents: write
-  packages: read
-  pull-requests: write
-  # `actions: write` approves the PR's held pull_request runs
-  # (.github/scripts/approve_bot_pr_runs.sh).
-  actions: write
-  # `compute: ec2` assumes the sandbox benchmark role over OIDC.
-  id-token: write
+  contents: read
 
 # Centralized defaults so workflow_dispatch runs have one fallback chain.
 # Defaults exercise the public-S3 TPC-H Ballista distributed-query path
@@ -223,6 +213,18 @@ env:
 jobs:
   run-cluster-bench:
     environment: ci
+    permissions:
+      # `write` on contents + pull-requests so the "Open snapshot-update PR" step
+      # can push a branch and open a PR. `packages: read` covers the spidapter
+      # GHCR image pull.
+      contents: write
+      packages: read
+      pull-requests: write
+      # `actions: write` approves the PR's held pull_request runs
+      # (.github/scripts/approve_bot_pr_runs.sh).
+      actions: write
+      # `compute: ec2` assumes the sandbox benchmark role over OIDC.
+      id-token: write
     name: Run cluster benchmark
     runs-on: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
     timeout-minutes: 600
