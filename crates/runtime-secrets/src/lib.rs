@@ -658,20 +658,57 @@ impl Secrets {
         };
 
         if store_name == SECRETS {
-            return match self.get_secret(key).await {
-                Ok(Some(secret)) => Ok(secret),
-                Ok(None) => Err(failure(
+            // A cluster executor resolves through the scheduler, which owns
+            // the precedence walk.
+            if let Some(search) = &self.scheduler_search {
+                return match search.get_secret(key).await {
+                    Ok(Some(secret)) => Ok(secret),
+                    Ok(None) => Err(failure(
+                        UnresolvedSecretKind::NotFound,
+                        format!("Secret `${{ secrets:{key} }}` not found by the scheduler"),
+                    )),
+                    Err(e) => Err(failure(
+                        UnresolvedSecretKind::StoreError,
+                        format!("Error looking up secret `${{ secrets:{key} }}`: {e}"),
+                    )),
+                };
+            }
+
+            // Same walk as `get_secret_from`, but remembers whether any store
+            // failed: a miss in the healthy stores plus an outage in another
+            // is not a definitive "not found", since the failed store may hold
+            // the key once it recovers.
+            let mut failed: Vec<String> = Vec::new();
+            for (name, store) in &self.stores {
+                match store.get_secret(key).await {
+                    Ok(Some(secret)) => return Ok(secret),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "Secret store `{name}` failed while looking up secret `{key}`: {e}. Trying the next store in precedence order."
+                        );
+                        failed.push(format!("`{name}`: {e}"));
+                    }
+                }
+            }
+            return Err(if failed.is_empty() {
+                failure(
                     UnresolvedSecretKind::NotFound,
                     format!(
                         "Secret `${{ secrets:{key} }}` not found in any configured secret store (searched: [{}])",
                         configured_stores()
                     ),
-                )),
-                Err(e) => Err(failure(
+                )
+            } else {
+                failure(
                     UnresolvedSecretKind::StoreError,
-                    format!("Error looking up secret `${{ secrets:{key} }}`: {e}"),
-                )),
-            };
+                    format!(
+                        "Secret `${{ secrets:{key} }}` was not found, and some secret stores failed while looking it up ({}), so it may exist there (searched: [{}])",
+                        failed.join("; "),
+                        configured_stores()
+                    ),
+                )
+            });
         }
 
         let Some(store) = self.stores.get(store_name) else {
@@ -1852,6 +1889,25 @@ mod tests {
             super::UnresolvedSecretKind::StoreError
         );
         assert!(err.is_retriable(), "a store outage may clear on retry");
+
+        // A miss in a healthy store plus an outage in another is retriable too:
+        // the failed store may hold the key.
+        let partial = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            ("env", std::sync::Arc::new(MapStore::new(&[("OTHER", "x")]))),
+        ]);
+        let err = super::try_get_params_with_secrets(
+            std::sync::Arc::new(tokio::sync::RwLock::new(partial)),
+            &params,
+        )
+        .await
+        .expect_err("a partial outage must still fail the component");
+        assert_eq!(
+            err.unresolved[0].1.kind,
+            super::UnresolvedSecretKind::StoreError
+        );
+        assert!(err.is_retriable(), "the failed store may hold the key");
+        assert!(err.to_string().contains("vault is down"), "{err}");
 
         let missing = secrets_with_stores(vec![(
             "env",
