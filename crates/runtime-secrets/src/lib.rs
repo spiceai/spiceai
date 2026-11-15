@@ -651,39 +651,51 @@ impl Secrets {
         key: &str,
     ) -> std::result::Result<SecretString, UnresolvedSecretReference> {
         let configured_stores = || self.stores.keys().cloned().collect::<Vec<_>>().join(", ");
-        let failure = |cause: String| UnresolvedSecretReference {
+        let failure = |kind: UnresolvedSecretKind, cause: String| UnresolvedSecretReference {
             reference: format!("${{ {store_name}:{key} }}"),
+            kind,
             cause,
         };
 
         if store_name == SECRETS {
             return match self.get_secret(key).await {
                 Ok(Some(secret)) => Ok(secret),
-                Ok(None) => Err(failure(format!(
-                    "Secret `${{ secrets:{key} }}` not found in any configured secret store (searched: [{}])",
-                    configured_stores()
-                ))),
-                Err(e) => Err(failure(format!(
-                    "Error looking up secret `${{ secrets:{key} }}`: {e}"
-                ))),
+                Ok(None) => Err(failure(
+                    UnresolvedSecretKind::NotFound,
+                    format!(
+                        "Secret `${{ secrets:{key} }}` not found in any configured secret store (searched: [{}])",
+                        configured_stores()
+                    ),
+                )),
+                Err(e) => Err(failure(
+                    UnresolvedSecretKind::StoreError,
+                    format!("Error looking up secret `${{ secrets:{key} }}`: {e}"),
+                )),
             };
         }
 
         let Some(store) = self.stores.get(store_name) else {
-            return Err(failure(format!(
-                "Secret reference `${{ {store_name}:{key} }}` uses an undefined store `{store_name}`. Configured stores: [{}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores",
-                configured_stores()
-            )));
+            return Err(failure(
+                UnresolvedSecretKind::UndefinedStore,
+                format!(
+                    "Secret reference `${{ {store_name}:{key} }}` uses an undefined store `{store_name}`. Configured stores: [{}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores",
+                    configured_stores()
+                ),
+            ));
         };
 
         match store.get_secret(key).await {
             Ok(Some(secret)) => Ok(secret),
-            Ok(None) => Err(failure(format!(
-                "Secret `${{ {store_name}:{key} }}` not found in secret store `{store_name}`"
-            ))),
-            Err(e) => Err(failure(format!(
-                "Error looking up secret `${{ {store_name}:{key} }}`: {e}"
-            ))),
+            Ok(None) => Err(failure(
+                UnresolvedSecretKind::NotFound,
+                format!(
+                    "Secret `${{ {store_name}:{key} }}` not found in secret store `{store_name}`"
+                ),
+            )),
+            Err(e) => Err(failure(
+                UnresolvedSecretKind::StoreError,
+                format!("Error looking up secret `${{ {store_name}:{key} }}`: {e}"),
+            )),
         }
     }
 
@@ -736,9 +748,23 @@ impl Secrets {
 pub struct UnresolvedSecretReference {
     /// The reference as written, normalized to `${ store:key }`.
     pub reference: String,
+    /// Why the reference did not resolve, for retry classification.
+    pub kind: UnresolvedSecretKind,
     /// Why it did not resolve (not found, undefined store, store error).
     /// Never contains a secret value.
     pub cause: String,
+}
+
+/// Why a `${ store:key }` reference did not resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnresolvedSecretKind {
+    /// Every consulted store answered, and none holds the key.
+    NotFound,
+    /// The reference names a store that is not configured.
+    UndefinedStore,
+    /// Every consulted store failed (for example an expired token or a
+    /// network error), so the key may exist.
+    StoreError,
 }
 
 /// A component's `params:` referenced secrets that could not be resolved.
@@ -760,6 +786,19 @@ impl std::fmt::Display for UnresolvedSecretsError {
             f,
             "Unable to resolve secret reference(s): {details}. The component was not loaded, instead of loading with an empty value. Define the secret in a configured secret store (an empty value is accepted for an intentionally optional secret), or remove the reference. Docs: https://spiceai.org/docs/components/secret-stores"
         )
+    }
+}
+
+impl UnresolvedSecretsError {
+    /// Whether retrying the load could clear this error: true when any
+    /// reference failed because its store errored. A key that is not found,
+    /// or a store that is not configured, is a function of the spicepod and
+    /// the stores' contents, so retrying in a loop would not help.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        self.unresolved
+            .iter()
+            .any(|(_, failure)| failure.kind == UnresolvedSecretKind::StoreError)
     }
 }
 
@@ -1790,6 +1829,48 @@ mod tests {
             .await
             .expect("empty registry should not error");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_try_get_params_with_secrets_store_outage_is_retriable() {
+        let outage = secrets_with_stores(vec![(
+            "vault",
+            std::sync::Arc::new(ErroringStore("vault is down")),
+        )]);
+        let params = std::collections::HashMap::from([(
+            "password".to_string(),
+            "${ secrets:DB_PASSWORD }".to_string(),
+        )]);
+        let err = super::try_get_params_with_secrets(
+            std::sync::Arc::new(tokio::sync::RwLock::new(outage)),
+            &params,
+        )
+        .await
+        .expect_err("a total store outage must not become an empty password");
+        assert_eq!(
+            err.unresolved[0].1.kind,
+            super::UnresolvedSecretKind::StoreError
+        );
+        assert!(err.is_retriable(), "a store outage may clear on retry");
+
+        let missing = secrets_with_stores(vec![(
+            "env",
+            std::sync::Arc::new(MapStore::new(&[("OTHER", "x")])),
+        )]);
+        let err = super::try_get_params_with_secrets(
+            std::sync::Arc::new(tokio::sync::RwLock::new(missing)),
+            &params,
+        )
+        .await
+        .expect_err("a missing key must fail");
+        assert_eq!(
+            err.unresolved[0].1.kind,
+            super::UnresolvedSecretKind::NotFound
+        );
+        assert!(
+            !err.is_retriable(),
+            "a missing key will not appear on retry"
+        );
     }
 
     #[tokio::test]
@@ -2932,6 +3013,11 @@ params:
 
         assert_eq!(failures.len(), 2, "{failures:?}");
         assert_eq!(failures[0].reference, format!("${{ secrets:{missing} }}"));
+        assert_eq!(failures[0].kind, super::UnresolvedSecretKind::NotFound);
+        assert_eq!(
+            failures[1].kind,
+            super::UnresolvedSecretKind::UndefinedStore
+        );
         assert!(
             failures[0]
                 .cause
