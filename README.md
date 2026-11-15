@@ -454,6 +454,8 @@ On **Windows** using PowerShell:
 iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1"))
 ```
 
+The installers check the sha256 of each download against the release before installing it, and stop if it does not match. For a release that publishes `SHA256SUMS`, they also check the download's build attestation when the [GitHub CLI](https://cli.github.com/) is installed and logged in; older releases have no attestations, so their downloads are checked against the sha256 GitHub recorded instead. To install an old release that recorded no checksum, set `SPICE_INSTALL_ALLOW_UNVERIFIED=1`; that never installs a download whose check fails.
+
 > **Note:** Native Windows runtime builds are not provided in v2.0+. Use [WSL](https://learn.microsoft.com/en-us/windows/wsl/) for local development.
 
 ### Usage
