@@ -497,7 +497,7 @@ impl McpToolCatalog {
         let missing = catalog.filter.missing_from(&listed);
         if !missing.is_empty() {
             tracing::warn!(
-                "Tool '{name}': the MCP server does not list these tools from 'mcp_tools': {}. They are not available until the server lists them.",
+                "Tool '{name}': the MCP server does not list these tools from 'tool_allowlist': {}. They are not available until the server lists them.",
                 missing.join(", ")
             );
         }
@@ -1597,9 +1597,9 @@ mod tests {
         );
     }
 
-    /// Tools outside `mcp_tools` must not be listed, looked up, or callable.
+    /// Tools outside `tool_allowlist` must not be listed, looked up, or callable.
     #[tokio::test]
-    async fn filtered_catalog_hides_tools_outside_mcp_tools() {
+    async fn filtered_catalog_hides_tools_outside_tool_allowlist() {
         let filter = McpToolFilter::Only(Arc::new(HashSet::from(["allowed".to_string()])));
         let catalog = McpToolCatalog::for_test_with_filter(
             "srv",

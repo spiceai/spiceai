@@ -55,9 +55,9 @@ pub enum Error {
     InvalidMcpArgs { source: shell_words::ParseError },
 
     #[snafu(display(
-        "Invalid param '{MCP_TOOLS_PARAM}': it names no tools. Give a comma-separated list of tool names, or remove the param to expose all tools."
+        "Invalid param '{TOOL_ALLOWLIST_PARAM}': it names no tools. Give a comma-separated list of tool names, or remove the param to expose all tools."
     ))]
-    EmptyMcpTools,
+    EmptyToolAllowlist,
 
     #[snafu(display(
         "Error occurred in underlying communication to MCP tool. Error: {}",
@@ -80,7 +80,9 @@ impl Error {
     pub fn is_configuration_error(&self) -> bool {
         matches!(
             self,
-            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. } | Error::EmptyMcpTools
+            Error::InvalidMCPDirective { .. }
+                | Error::InvalidMcpArgs { .. }
+                | Error::EmptyToolAllowlist
         )
     }
 }
@@ -142,7 +144,7 @@ const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
 /// headers (so values may contain `,`); otherwise `,` separates them.
 const MCP_HEADERS_PARAM: &str = "mcp_headers";
 /// Comma-separated names of the MCP server's tools that the component exposes.
-const MCP_TOOLS_PARAM: &str = "mcp_tools";
+const TOOL_ALLOWLIST_PARAM: &str = "tool_allowlist";
 
 /// The tools of an MCP server that a `from: mcp:` component exposes.
 ///
@@ -150,7 +152,7 @@ const MCP_TOOLS_PARAM: &str = "mcp_tools";
 /// tools, so they are never cached, listed, looked up, or called.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum McpToolFilter {
-    /// No `mcp_tools` param: expose every tool the server lists.
+    /// No `tool_allowlist` param: expose every tool the server lists.
     #[default]
     All,
     /// Expose only these tool names, as the MCP server spells them.
@@ -159,7 +161,7 @@ pub(crate) enum McpToolFilter {
 
 impl McpToolFilter {
     fn from_params(params: &HashMap<String, SecretString>) -> Result<Self> {
-        let Some(value) = params.get(MCP_TOOLS_PARAM) else {
+        let Some(value) = params.get(TOOL_ALLOWLIST_PARAM) else {
             return Ok(Self::All);
         };
         let names: HashSet<String> = value
@@ -170,7 +172,7 @@ impl McpToolFilter {
             .map(ToString::to_string)
             .collect();
         if names.is_empty() {
-            return Err(Error::EmptyMcpTools);
+            return Err(Error::EmptyToolAllowlist);
         }
         Ok(Self::Only(Arc::new(names)))
     }
@@ -398,7 +400,7 @@ mod tests {
     }
 
     fn tools_param(value: &str) -> HashMap<String, SecretString> {
-        HashMap::from([(MCP_TOOLS_PARAM.to_string(), SecretString::from(value))])
+        HashMap::from([(TOOL_ALLOWLIST_PARAM.to_string(), SecretString::from(value))])
     }
 
     #[test]
@@ -411,7 +413,7 @@ mod tests {
     #[test]
     fn mcp_tool_filter_allows_only_listed_names() {
         let filter = McpToolFilter::from_params(&tools_param(" list_issues, get_issue ,,"))
-            .expect("valid mcp_tools");
+            .expect("valid tool_allowlist");
         assert!(filter.allows("list_issues"));
         assert!(filter.allows("get_issue"));
         assert!(!filter.allows("create_issue"));
@@ -423,8 +425,8 @@ mod tests {
     fn mcp_tool_filter_rejects_a_param_that_names_no_tools() {
         for value in ["", " ", " , ,"] {
             let err = McpToolFilter::from_params(&tools_param(value))
-                .expect_err("an empty mcp_tools must not expose zero or all tools");
-            assert!(matches!(err, Error::EmptyMcpTools), "{value:?}: {err}");
+                .expect_err("an empty tool_allowlist must not expose zero or all tools");
+            assert!(matches!(err, Error::EmptyToolAllowlist), "{value:?}: {err}");
             assert!(err.is_configuration_error());
         }
     }
@@ -432,7 +434,7 @@ mod tests {
     #[test]
     fn mcp_tool_filter_reports_names_the_server_does_not_list() {
         let filter =
-            McpToolFilter::from_params(&tools_param("b, a, listed")).expect("valid mcp_tools");
+            McpToolFilter::from_params(&tools_param("b, a, listed")).expect("valid tool_allowlist");
         let listed = [rmcp::model::Tool::new_with_raw(
             "listed",
             None,
