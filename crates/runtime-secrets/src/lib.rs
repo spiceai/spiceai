@@ -612,6 +612,9 @@ impl Secrets {
     /// Internal helper for [`Self::inject_secrets`]. Returns the value
     /// wrapped in a [`SecretString`] (never a plain `String`) so the caller
     /// can splice the bytes without an intermediate non-zeroizing allocation.
+    ///
+    /// Logs the failure and returns `None` when the reference cannot be
+    /// resolved; the caller substitutes the empty string (the lenient path).
     async fn lookup_for_injection(
         &self,
         param_str: &str,
@@ -622,62 +625,145 @@ impl Secrets {
         // component layer then reports as "missing required parameter" without any
         // back-reference to the failed secret lookup. Include enough context in the
         // error branches (store, key, source of reference) that users can tie cause
-        // to effect. The store-list is allocated lazily — `inject_secrets` calls this
-        // in a tight loop for every `${...}` substitution, so we don't pay for it on
-        // the hot (success) path.
-        let configured_stores = || self.stores.keys().cloned().collect::<Vec<_>>().join(", ");
-
-        // Special case: the `secrets:` sentinel means "walk the registry in
-        // precedence order", which matches `get_secret`.
-        if store_name == SECRETS {
-            return match self.get_secret(key).await {
-                Ok(Some(secret)) => Some(secret),
-                Ok(None) => {
-                    tracing::error!(
-                        "Secret `${{ secrets:{key} }}` (referenced by `{}`) not found in any configured secret store (searched: [{}]). The parameter will be empty, which typically surfaces later as a missing/invalid parameter. Docs: https://spiceai.org/docs/components/secret-stores",
-                        param_str,
-                        configured_stores()
-                    );
-                    None
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Error looking up secret `${{ secrets:{key} }}` (referenced by `{}`): {e}",
-                        param_str
-                    );
-                    None
-                }
-            };
-        }
-
-        let Some(store) = self.stores.get(store_name) else {
-            tracing::error!(
-                "Secret reference `${{ {store_name}:{key} }}` in `{}` uses an undefined store `{store_name}`. Configured stores: [{}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores. Docs: https://spiceai.org/docs/components/secret-stores",
-                param_str,
-                configured_stores()
-            );
-            return None;
-        };
-
-        match store.get_secret(key).await {
-            Ok(Some(secret)) => Some(secret),
-            Ok(None) => {
+        // to effect.
+        match self.resolve_reference(store_name, key).await {
+            Ok(secret) => Some(secret),
+            Err(failure) => {
                 tracing::error!(
-                    "Secret `${{ {store_name}:{key} }}` (referenced by `{}`) not found in secret store `{store_name}`. The parameter will be empty. Docs: https://spiceai.org/docs/components/secret-stores",
-                    param_str
-                );
-                None
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Error looking up secret `${{ {store_name}:{key} }}` (referenced by `{}`): {e}",
-                    param_str
+                    "{} (referenced by `{param_str}`). The parameter will be empty, which typically surfaces later as a missing/invalid parameter. Docs: https://spiceai.org/docs/components/secret-stores",
+                    failure.cause
                 );
                 None
             }
         }
     }
+
+    /// Resolves one `${ store_name:key }` reference.
+    ///
+    /// The `secrets:` sentinel walks the registry in precedence order (as
+    /// [`Self::get_secret`] does); any other name targets that store directly.
+    /// The failure describes the cause without any secret value. The store
+    /// list is allocated lazily, only on the failure path, because
+    /// `inject_secrets` calls this for every `${...}` substitution.
+    async fn resolve_reference(
+        &self,
+        store_name: &str,
+        key: &str,
+    ) -> std::result::Result<SecretString, UnresolvedSecretReference> {
+        let configured_stores = || self.stores.keys().cloned().collect::<Vec<_>>().join(", ");
+        let failure = |cause: String| UnresolvedSecretReference {
+            reference: format!("${{ {store_name}:{key} }}"),
+            cause,
+        };
+
+        if store_name == SECRETS {
+            return match self.get_secret(key).await {
+                Ok(Some(secret)) => Ok(secret),
+                Ok(None) => Err(failure(format!(
+                    "Secret `${{ secrets:{key} }}` not found in any configured secret store (searched: [{}])",
+                    configured_stores()
+                ))),
+                Err(e) => Err(failure(format!(
+                    "Error looking up secret `${{ secrets:{key} }}`: {e}"
+                ))),
+            };
+        }
+
+        let Some(store) = self.stores.get(store_name) else {
+            return Err(failure(format!(
+                "Secret reference `${{ {store_name}:{key} }}` uses an undefined store `{store_name}`. Configured stores: [{}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores",
+                configured_stores()
+            )));
+        };
+
+        match store.get_secret(key).await {
+            Ok(Some(secret)) => Ok(secret),
+            Ok(None) => Err(failure(format!(
+                "Secret `${{ {store_name}:{key} }}` not found in secret store `{store_name}`"
+            ))),
+            Err(e) => Err(failure(format!(
+                "Error looking up secret `${{ {store_name}:{key} }}`: {e}"
+            ))),
+        }
+    }
+
+    /// Like [`Self::inject_secrets`], but fails instead of substituting the
+    /// empty string when any `${ store:key }` reference cannot be resolved.
+    ///
+    /// A secret that resolves to the empty string (for example an env var set
+    /// to `""`) is resolved, so an intentionally optional secret can still be
+    /// expressed by defining it as empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns every reference in `param_str` that could not be resolved, in
+    /// document order. No secret values are included.
+    pub async fn try_inject_secrets(
+        &self,
+        key: &str,
+        param_str: ParamStr<'_>,
+    ) -> std::result::Result<SecretString, Vec<UnresolvedSecretReference>> {
+        tracing::trace!("Injecting secrets (strict) for: {}", key);
+        let input = param_str.0;
+        let mut result = String::with_capacity(input.len().saturating_add(256));
+        let mut last_end = 0;
+        let mut unresolved = Vec::new();
+        for secret_replacement in SecretReplacementMatcher::new(input) {
+            result.push_str(&input[last_end..secret_replacement.span.start]);
+            match self
+                .resolve_reference(&secret_replacement.store_name, &secret_replacement.key)
+                .await
+            {
+                Ok(secret) => result.push_str(secret.expose_secret()),
+                Err(failure) => unresolved.push(failure),
+            }
+            last_end = secret_replacement.span.end;
+        }
+        result.push_str(&input[last_end..]);
+        // Wrap before returning either way, so the partial buffer is zeroized
+        // on drop even on the error path.
+        let result = SecretString::from(result);
+        if unresolved.is_empty() {
+            Ok(result)
+        } else {
+            Err(unresolved)
+        }
+    }
 }
+
+/// One `${ store:key }` reference that could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedSecretReference {
+    /// The reference as written, normalized to `${ store:key }`.
+    pub reference: String,
+    /// Why it did not resolve (not found, undefined store, store error).
+    /// Never contains a secret value.
+    pub cause: String,
+}
+
+/// A component's `params:` referenced secrets that could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedSecretsError {
+    /// `(parameter name, failure)` pairs, sorted by parameter name.
+    pub unresolved: Vec<(String, UnresolvedSecretReference)>,
+}
+
+impl std::fmt::Display for UnresolvedSecretsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let details = self
+            .unresolved
+            .iter()
+            .map(|(param, failure)| format!("parameter `{param}`: {}", failure.cause))
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            f,
+            "Unable to resolve secret reference(s): {details}. The component was not loaded, instead of loading with an empty value. Define the secret in a configured secret store (an empty value is accepted for an intentionally optional secret), or remove the reference. Docs: https://spiceai.org/docs/components/secret-stores"
+        )
+    }
+}
+
+impl std::error::Error for UnresolvedSecretsError {}
 
 impl Default for Secrets {
     fn default() -> Self {
@@ -961,6 +1047,52 @@ pub async fn get_params_with_secrets(
     }
 
     params_with_secrets
+}
+
+/// Like [`get_params_with_secrets`], but fails when any `${ store:key }`
+/// reference in `params` cannot be resolved instead of substituting the empty
+/// string.
+///
+/// Used for dataset and catalog connector params, where an empty substitution
+/// can change what the component reads (for example an empty `file_format`)
+/// and serve wrong results as if the component were healthy.
+///
+/// # Errors
+///
+/// Returns [`UnresolvedSecretsError`] naming every parameter and reference
+/// that did not resolve.
+#[expect(clippy::implicit_hasher)]
+pub async fn try_get_params_with_secrets(
+    secrets: Arc<RwLock<Secrets>>,
+    params: &HashMap<String, String>,
+) -> std::result::Result<HashMap<String, SecretString>, UnresolvedSecretsError> {
+    if params.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let secrets = Secrets::snapshot(&secrets).await;
+
+    let mut params_with_secrets: HashMap<String, SecretString> =
+        HashMap::with_capacity(params.len());
+    let mut unresolved = Vec::new();
+
+    for (k, v) in params {
+        match secrets.try_inject_secrets(k, ParamStr(v)).await {
+            Ok(secret) => {
+                params_with_secrets.insert(k.clone(), secret);
+            }
+            Err(failures) => {
+                unresolved.extend(failures.into_iter().map(|failure| (k.clone(), failure)));
+            }
+        }
+    }
+
+    if unresolved.is_empty() {
+        Ok(params_with_secrets)
+    } else {
+        unresolved.sort_by(|a, b| a.0.cmp(&b.0));
+        Err(UnresolvedSecretsError { unresolved })
+    }
 }
 
 /// Injects secrets from spicepod `params` templates and deserializes them
@@ -2746,6 +2878,162 @@ params:
             )
             .await;
         assert_eq!("This is a secret: ! 🫡", result.expose_secret());
+    }
+
+    #[tokio::test]
+    async fn test_try_inject_secrets_resolves_like_inject_secrets() {
+        let _env_guard = lock_env().await;
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully");
+
+        let key = &format!("STRICT_SECRET_KEY_{}", rand::random::<u64>());
+        unsafe { std::env::set_var(key, "csv") };
+
+        let template = format!("fmt=${{ secrets:{key} }}/${{ env:{key} }}");
+        let strict = secrets
+            .try_inject_secrets("file_format", super::ParamStr(&template))
+            .await
+            .expect("a defined secret resolves");
+        let lenient = secrets
+            .inject_secrets("file_format", super::ParamStr(&template))
+            .await;
+        assert_eq!("fmt=csv/csv", strict.expose_secret());
+        assert_eq!(lenient.expose_secret(), strict.expose_secret());
+
+        // No references at all is passed through unchanged.
+        let literal = secrets
+            .try_inject_secrets("file_format", super::ParamStr("parquet"))
+            .await
+            .expect("a literal has nothing to resolve");
+        assert_eq!("parquet", literal.expose_secret());
+
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[tokio::test]
+    async fn test_try_inject_secrets_fails_on_missing_secret() {
+        let _env_guard = lock_env().await;
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully");
+
+        let missing = format!("STRICT_MISSING_{}", rand::random::<u64>());
+        let present = format!("STRICT_PRESENT_{}", rand::random::<u64>());
+        unsafe {
+            std::env::remove_var(&missing);
+            std::env::set_var(&present, "do-not-leak-this-value");
+        }
+
+        let template =
+            format!("${{ env:{present} }}-${{ secrets:{missing} }}-${{ nostore:{missing} }}");
+        let failures = secrets
+            .try_inject_secrets("file_format", super::ParamStr(&template))
+            .await
+            .expect_err("an unresolved reference must fail, not become empty");
+
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(failures[0].reference, format!("${{ secrets:{missing} }}"));
+        assert!(
+            failures[0]
+                .cause
+                .contains("not found in any configured secret store"),
+            "{}",
+            failures[0].cause
+        );
+        assert_eq!(failures[1].reference, format!("${{ nostore:{missing} }}"));
+        assert!(
+            failures[1].cause.contains("undefined store `nostore`"),
+            "{}",
+            failures[1].cause
+        );
+        for failure in &failures {
+            assert!(!failure.cause.contains("do-not-leak-this-value"));
+        }
+
+        unsafe { std::env::remove_var(&present) };
+    }
+
+    #[tokio::test]
+    async fn test_try_inject_secrets_accepts_secret_defined_as_empty() {
+        // The opt-out for an intentionally optional secret: define it as "".
+        let _env_guard = lock_env().await;
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully");
+
+        let key = format!("STRICT_EMPTY_{}", rand::random::<u64>());
+        unsafe { std::env::set_var(&key, "") };
+
+        let result = secrets
+            .try_inject_secrets("token", super::ParamStr(&format!("${{ secrets:{key} }}")))
+            .await
+            .expect("a secret defined as empty is resolved");
+        assert_eq!("", result.expose_secret());
+
+        unsafe { std::env::remove_var(&key) };
+    }
+
+    #[tokio::test]
+    async fn test_try_get_params_with_secrets_names_every_unresolved_param() {
+        let _env_guard = lock_env().await;
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully");
+        let secrets = std::sync::Arc::new(tokio::sync::RwLock::new(secrets));
+
+        let fmt = format!("STRICT_FMT_{}", rand::random::<u64>());
+        let token = format!("STRICT_TOKEN_{}", rand::random::<u64>());
+        let defined = format!("STRICT_DEFINED_{}", rand::random::<u64>());
+        unsafe {
+            std::env::remove_var(&fmt);
+            std::env::remove_var(&token);
+            std::env::set_var(&defined, "do-not-leak-this-value");
+        }
+
+        let params = std::collections::HashMap::from([
+            ("file_format".to_string(), format!("${{ secrets:{fmt} }}")),
+            ("token".to_string(), format!("${{ env:{token} }}")),
+            ("user".to_string(), format!("${{ secrets:{defined} }}")),
+            ("literal".to_string(), "value".to_string()),
+        ]);
+
+        let err = super::try_get_params_with_secrets(std::sync::Arc::clone(&secrets), &params)
+            .await
+            .expect_err("unresolved references must fail the component");
+        let params_named: Vec<&str> = err.unresolved.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(params_named, vec!["file_format", "token"]);
+
+        let message = err.to_string();
+        assert!(message.contains("parameter `file_format`"), "{message}");
+        assert!(
+            message.contains(&format!("${{ secrets:{fmt} }}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("${{ env:{token} }}")),
+            "{message}"
+        );
+        assert!(message.contains("empty value is accepted"), "{message}");
+        assert!(!message.contains("do-not-leak-this-value"), "{message}");
+
+        // Once every reference resolves, the strict and lenient paths agree.
+        unsafe {
+            std::env::set_var(&fmt, "csv");
+            std::env::set_var(&token, "t");
+        }
+        let strict = super::try_get_params_with_secrets(std::sync::Arc::clone(&secrets), &params)
+            .await
+            .expect("all references resolve");
+        let lenient =
+            super::get_params_with_secrets(std::sync::Arc::clone(&secrets), &params).await;
+        assert_eq!(strict.len(), lenient.len());
+        for (k, v) in &strict {
+            assert_eq!(v.expose_secret(), lenient[k].expose_secret(), "{k}");
+        }
+        assert_eq!(strict["file_format"].expose_secret(), "csv");
+
+        unsafe {
+            std::env::remove_var(&fmt);
+            std::env::remove_var(&token);
+            std::env::remove_var(&defined);
+        }
     }
 
     #[tokio::test]
