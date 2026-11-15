@@ -1,16 +1,11 @@
 ---
 source: crates/runtime/tests/duckdb/mod.rs
-expression: pretty
+expression: stable_plan(&explain_plan)
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                    |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                               |
-|               |  Projection: regexp_count(csv_test.region, Utf8("AMERICA"))                                                                                             |
-|               |   TableScan: csv_test projection=[region]                                                                                                               |
-| physical_plan | SchemaCastScanExec                                                                                                                                      |
-|               |   CooperativeExec                                                                                                                                       |
-|               |     BytesProcessedExec                                                                                                                                  |
-|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT len(regexp_extract_all("csv_test"."region", 'AMERICA')) FROM "csv_test" |
-|               |                                                                                                                                                         |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+
+logical_plan: Federated
+logical_plan:  Projection: regexp_count(csv_test.region, Utf8("AMERICA"))
+logical_plan:   TableScan: csv_test projection=[region]
+physical_plan: SchemaCastScanExec
+physical_plan:   CooperativeExec
+physical_plan:     BytesProcessedExec
+physical_plan:       VirtualExecutionPlan name=adbc compute_context=<id> base_sql=SELECT len(regexp_extract_all("<duckdb_view>"."region", 'AMERICA')) AS "regexp_count(csv_test.region,Utf8(""AMERICA""))" FROM "<duckdb_view>"
