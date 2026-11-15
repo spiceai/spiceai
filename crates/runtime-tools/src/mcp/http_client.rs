@@ -598,7 +598,10 @@ mod tests {
     use super::*;
     use crate::{
         catalog::SpiceToolCatalog,
-        mcp::{MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCPConfig, catalog::McpToolCatalog},
+        mcp::{
+            MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCPConfig, McpToolFilter,
+            catalog::McpToolCatalog,
+        },
     };
 
     const SERVER_NAME: &str = "hostile";
@@ -779,6 +782,7 @@ mod tests {
                 auth_token: None,
                 headers: HashMap::new(),
             },
+            McpToolFilter::All,
             SERVER_NAME,
             None,
         )
@@ -944,6 +948,7 @@ mod tests {
                 auth_token: None,
                 headers: HashMap::new(),
             },
+            McpToolFilter::All,
             SERVER_NAME,
             None,
         ));

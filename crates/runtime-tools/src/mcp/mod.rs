@@ -28,7 +28,12 @@ pub mod tool;
 
 pub use catalog::attach_mcp_schema_snapshot;
 
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
 use rmcp::ErrorData as McpError;
@@ -48,6 +53,11 @@ pub enum Error {
         "Invalid param 'mcp_args': {source}. Quote arguments with spaces, e.g. `--flag \"a b\"`."
     ))]
     InvalidMcpArgs { source: shell_words::ParseError },
+
+    #[snafu(display(
+        "Invalid param '{MCP_TOOLS_PARAM}': it names no tools. Give a comma-separated list of tool names, or remove the param to expose all tools."
+    ))]
+    EmptyMcpTools,
 
     #[snafu(display(
         "Error occurred in underlying communication to MCP tool. Error: {}",
@@ -70,7 +80,7 @@ impl Error {
     pub fn is_configuration_error(&self) -> bool {
         matches!(
             self,
-            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. }
+            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. } | Error::EmptyMcpTools
         )
     }
 }
@@ -131,6 +141,61 @@ const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
 /// connector's `http_headers`. If the value contains `;`, only `;` separates
 /// headers (so values may contain `,`); otherwise `,` separates them.
 const MCP_HEADERS_PARAM: &str = "mcp_headers";
+/// Comma-separated names of the MCP server's tools that the component exposes.
+const MCP_TOOLS_PARAM: &str = "mcp_tools";
+
+/// The tools of an MCP server that a `from: mcp:` component exposes.
+///
+/// Tools that the filter rejects are dropped when Spice lists the server's
+/// tools, so they are never cached, listed, looked up, or called.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum McpToolFilter {
+    /// No `mcp_tools` param: expose every tool the server lists.
+    #[default]
+    All,
+    /// Expose only these tool names, as the MCP server spells them.
+    Only(Arc<HashSet<String>>),
+}
+
+impl McpToolFilter {
+    fn from_params(params: &HashMap<String, SecretString>) -> Result<Self> {
+        let Some(value) = params.get(MCP_TOOLS_PARAM) else {
+            return Ok(Self::All);
+        };
+        let names: HashSet<String> = value
+            .expose_secret()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if names.is_empty() {
+            return Err(Error::EmptyMcpTools);
+        }
+        Ok(Self::Only(Arc::new(names)))
+    }
+
+    pub(crate) fn allows(&self, tool_name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(names) => names.contains(tool_name),
+        }
+    }
+
+    /// Allowed names that `listed` does not contain, sorted.
+    pub(crate) fn missing_from(&self, listed: &[rmcp::model::Tool]) -> Vec<String> {
+        let Self::Only(names) = self else {
+            return Vec::new();
+        };
+        let mut missing: Vec<String> = names
+            .iter()
+            .filter(|name| !listed.iter().any(|tool| tool.name == name.as_str()))
+            .cloned()
+            .collect();
+        missing.sort();
+        missing
+    }
+}
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -330,6 +395,51 @@ mod tests {
             }
             MCPConfig::Stdio { .. } => panic!("expected https config"),
         }
+    }
+
+    fn tools_param(value: &str) -> HashMap<String, SecretString> {
+        HashMap::from([(MCP_TOOLS_PARAM.to_string(), SecretString::from(value))])
+    }
+
+    #[test]
+    fn mcp_tool_filter_without_param_allows_every_tool() {
+        let filter = McpToolFilter::from_params(&HashMap::new()).expect("no param is valid");
+        assert_eq!(filter, McpToolFilter::All);
+        assert!(filter.allows("anything"));
+    }
+
+    #[test]
+    fn mcp_tool_filter_allows_only_listed_names() {
+        let filter = McpToolFilter::from_params(&tools_param(" list_issues, get_issue ,,"))
+            .expect("valid mcp_tools");
+        assert!(filter.allows("list_issues"));
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("create_issue"));
+        // Names match exactly, as the MCP server spells them.
+        assert!(!filter.allows("List_Issues"));
+    }
+
+    #[test]
+    fn mcp_tool_filter_rejects_a_param_that_names_no_tools() {
+        for value in ["", " ", " , ,"] {
+            let err = McpToolFilter::from_params(&tools_param(value))
+                .expect_err("an empty mcp_tools must not expose zero or all tools");
+            assert!(matches!(err, Error::EmptyMcpTools), "{value:?}: {err}");
+            assert!(err.is_configuration_error());
+        }
+    }
+
+    #[test]
+    fn mcp_tool_filter_reports_names_the_server_does_not_list() {
+        let filter =
+            McpToolFilter::from_params(&tools_param("b, a, listed")).expect("valid mcp_tools");
+        let listed = [rmcp::model::Tool::new_with_raw(
+            "listed",
+            None,
+            serde_json::Map::new(),
+        )];
+        assert_eq!(filter.missing_from(&listed), vec!["a", "b"]);
+        assert!(McpToolFilter::All.missing_from(&[]).is_empty());
     }
 
     #[test]
