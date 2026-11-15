@@ -39,6 +39,7 @@ use arrow_flight::{
     Ticket, flight_service_server::FlightServiceServer,
 };
 use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
+use arrow_tools::ipc::{FLIGHT_TARGET_MESSAGE_BYTES, split_batch_for_flight};
 use bytes::Bytes;
 use cache::result::{
     CacheStatus,
@@ -629,11 +630,10 @@ impl Stream for InlineFlightStream {
                         &args.options,
                         &mut args.compression_context,
                     ) {
-                        Ok((dicts, batch_data)) => {
-                            for dict in dicts {
-                                this.queue_encoded(dict);
+                        Ok(messages) => {
+                            for message in messages {
+                                this.queue_encoded(message);
                             }
-                            this.queue_encoded(batch_data);
                         }
                         Err(status) => {
                             // Drop the source so a later poll cannot encode the
@@ -723,16 +723,12 @@ fn spawn_flight_encode_stream(
                         &options,
                         &mut compression_context,
                     ) {
-                        Ok((dicts, batch_data)) => {
-                            for dict in dicts {
-                                account.reserve(flight_data_size(&dict)).await;
-                                if tx.send(Ok(dict)).await.is_err() {
+                        Ok(messages) => {
+                            for message in messages {
+                                account.reserve(flight_data_size(&message)).await;
+                                if tx.send(Ok(message)).await.is_err() {
                                     return;
                                 }
-                            }
-                            account.reserve(flight_data_size(&batch_data)).await;
-                            if tx.send(Ok(batch_data)).await.is_err() {
-                                return;
                             }
                         }
                         Err(status) => {
@@ -760,8 +756,14 @@ fn spawn_flight_encode_stream(
 }
 
 /// Encode one served batch into its Flight dictionary + record-batch
-/// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
-/// advertised schema was expanded.
+/// messages, in send order, applying the `Utf8View`/`BinaryView` → `Large*`
+/// cast when the advertised schema was expanded.
+///
+/// A batch over [`FLIGHT_TARGET_MESSAGE_BYTES`] is split into zero-copy row
+/// slices first, each its own record-batch message, so one large batch (an
+/// accelerator scan, a coalesced sort, an engine that returns its whole
+/// result at once) never becomes a message over a client's gRPC receive
+/// limit — 4 MiB by default in tonic, grpc-go and grpc-java.
 ///
 /// [`ServedFlightBatch::Owned`] is moved into the cast so a non-cache Flight
 /// query does not pay `RecordBatch::clone` before `cast_view_columns`.
@@ -774,7 +776,7 @@ fn encode_flight_batch(
     dict_tracker: &mut DictionaryTracker,
     options: &IpcWriteOptions,
     compression_context: &mut IpcWriteContext,
-) -> Result<(Vec<FlightData>, FlightData), Status> {
+) -> Result<Vec<FlightData>, Status> {
     let cast;
     let batch = if needs_view_cast {
         let owned = match batch {
@@ -788,14 +790,18 @@ fn encode_flight_batch(
         batch.as_record_batch()
     };
 
-    let (dicts, batch_data) = encoder
-        .encode(batch, dict_tracker, options, compression_context)
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    Ok((
-        dicts.into_iter().map(Into::into).collect(),
-        batch_data.into(),
-    ))
+    // `RecordBatch::clone` is a handful of `Arc` bumps; the slices share the
+    // batch's buffers.
+    let slices = split_batch_for_flight(batch.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+    let mut messages = Vec::with_capacity(slices.len());
+    for slice in &slices {
+        let (dicts, batch_data) = encoder
+            .encode(slice, dict_tracker, options, compression_context)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        messages.extend(dicts.into_iter().map(Into::into));
+        messages.push(batch_data.into());
+    }
+    Ok(messages)
 }
 
 /// Heap/wire bytes a single [`FlightData`] message occupies while buffered for
@@ -1412,7 +1418,7 @@ impl Default for RateLimits {
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray, StructArray,
+        Array, ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray, StructArray,
     };
     use arrow::datatypes::{Field, Fields, Int32Type, SchemaRef};
     use datafusion::execution::SendableRecordBatchStream;
@@ -1495,6 +1501,80 @@ mod tests {
 
     fn batch(schema: &SchemaRef, columns: Vec<ArrayRef>) -> RecordBatch {
         RecordBatch::try_new(Arc::clone(schema), columns).expect("record batch")
+    }
+
+    /// One batch whose single message would be over a gRPC client's default 4 MiB
+    /// receive limit — the ~7.6 MB message an accelerated `SELECT *` sent — must go
+    /// out as several messages under it, on the inline, encode-task and cached-raw
+    /// paths alike, with every row arriving in order.
+    #[tokio::test]
+    async fn a_large_batch_is_sent_as_messages_under_the_client_receive_limit() {
+        const CLIENT_DEFAULT_DECODE_LIMIT: usize = 4 * 1024 * 1024;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("js", DataType::Utf8View, false),
+        ]));
+        let rows = 32_768_i64;
+        let pad = "x".repeat(231);
+        let ids: Vec<i64> = (0..rows).collect();
+        let large = batch(
+            &schema,
+            vec![
+                Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
+                Arc::new(StringViewArray::from_iter_values(
+                    ids.iter().map(|i| format!("{i:09}{pad}")),
+                )) as ArrayRef,
+            ],
+        );
+        assert!(large.get_array_memory_size() > CLIENT_DEFAULT_DECODE_LIMIT);
+
+        for (path, response) in [
+            ("inline", respond(&schema, vec![Ok(large.clone())], true)),
+            (
+                "encode task",
+                respond(&schema, vec![Ok(large.clone())], false),
+            ),
+            (
+                "cached raw",
+                respond_cached_raw(&schema, vec![large.clone()]),
+            ),
+        ] {
+            let (messages, failure) = sent(response).await;
+            assert_eq!(failure, None, "{path}");
+            for message in &messages {
+                let bytes = message.data_header.len() + message.data_body.len();
+                assert!(
+                    bytes <= CLIENT_DEFAULT_DECODE_LIMIT,
+                    "{path}: a {bytes}-byte message exceeds the client limit"
+                );
+            }
+            let decoded =
+                arrow_flight::utils::flight_data_to_batches(&messages).expect("decode messages");
+            assert!(decoded.len() > 1, "{path}: the batch was not split");
+            let decoded_ids: Vec<i64> = decoded
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id column")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(decoded_ids, ids, "{path}");
+            let last = decoded.last().expect("a batch");
+            let js = arrow::compute::cast(last.column(1), &DataType::Utf8).expect("cast js");
+            let js = js
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("js column");
+            assert_eq!(
+                js.value(js.len() - 1),
+                format!("{:09}{pad}", rows - 1),
+                "{path}"
+            );
+        }
     }
 
     /// A result encoded on the request's task must send exactly the messages the

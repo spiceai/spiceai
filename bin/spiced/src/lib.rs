@@ -35,7 +35,7 @@ use tokio::sync::SetOnce;
 
 use app::spicepod::component::runtime::{
     ClientAuthMode as SpicepodClientAuthMode, OtelExporterConfig, OtelSignal,
-    Runtime as SpicepodRuntime, RuntimeMode, TelemetryConfig, validate_metric_prefix,
+    Runtime as SpicepodRuntime, TelemetryConfig, validate_metric_prefix,
 };
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -58,7 +58,7 @@ use connector_databricks as _;
 use connector_delta_lake as _;
 #[cfg(feature = "dremio")]
 use connector_dremio as _;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 use connector_duckdb as _;
 use connector_ducklake as _;
 #[cfg(feature = "dynamodb")]
@@ -109,8 +109,6 @@ use connector_spark as _;
 // Same force-linkage for accelerator engines, which self-register via
 // `register_data_accelerator!` into a linkme slice of their own.
 use accelerator_cayenne as _;
-#[cfg(feature = "duckdb")]
-use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
@@ -127,8 +125,8 @@ use otel_arrow::OtelArrowExporter;
 use podswatcher::PodsWatcher;
 use repl::ReplConfig;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
+use runtime::config::{ClusterRole, Role};
 use runtime::datafusion::DataFusion;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
@@ -637,11 +635,14 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
         .and_then(|cpu| cpu.cores.as_ref())
         .map(ToString::to_string);
     let env_cores = cpu_budget::CpuConfig::env_cores();
-    let config = cpu_budget::CpuConfig::from_sources(
+    let mut config = cpu_budget::CpuConfig::from_sources(
         args.cpu_cores.as_deref(),
         env_cores.as_deref(),
         spicepod_cores.as_deref(),
     );
+    if args.runtime.cluster.effective_role() == Role::Sidecar {
+        config = config.for_sidecar();
+    }
 
     let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
     if let Err(err) = budget.install() {
@@ -714,19 +715,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         extension_factories.push(Box::new(tpc_extension_factory));
     }
 
-    // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)
-    let is_cluster_mode =
-        args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
+    // A scheduler or executor: an explicit `--role`, or an executor implied by `--scheduler-address`.
+    let is_cluster_mode = args.runtime.cluster.cluster_role().is_some();
 
     let runtime_config = app.as_ref().map(|app| &app.runtime);
-    if is_cluster_mode && runtime_config.is_some_and(|runtime| runtime.mode == RuntimeMode::Sidecar)
-    {
-        return Err(Error::InvalidClusterConfig {
-            source: std::io::Error::other(
-                "runtime.mode: sidecar cannot run as a cluster scheduler or executor. Remove --role and --scheduler-address, or set runtime.mode: server.",
-            ),
-        });
-    }
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
@@ -739,9 +731,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // A `SetOnce` lets `start_anonymous_telemetry` wait for the value.
     let telemetry_config: Arc<SetOnce<TelemetryConfig>> = Arc::new(SetOnce::new());
 
-    let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
-        || (args.runtime.cluster.role.is_none()
-            && args.runtime.cluster.scheduler_address.is_some());
+    let is_executor = args.runtime.cluster.effective_role() == Role::Executor;
 
     if !is_executor {
         // Resolve immediately from the local spicepod (or use default).
@@ -1564,10 +1554,8 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
     let cloud_connect_config_dir = cloud_connect_startup.config_dir().to_path_buf();
     let cloud_managed_state = cloud_connect_startup.identity_observed();
     let cloud_connect_identity = cloud_connect_startup.into_identity();
-    // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
-    let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
-        || (args.runtime.cluster.role.is_none()
-            && args.runtime.cluster.scheduler_address.is_some());
+    // An explicit `--role executor`, or one implied by `--scheduler-address`.
+    let is_executor = args.runtime.cluster.effective_role() == Role::Executor;
 
     if is_executor {
         // If a spicepod is explicitly provided, load just the runtime config (e.g. flight rate
@@ -1577,11 +1565,10 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
             && let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await
         {
             let mut app = App::default();
-            // Retain mode for role validation, plus local Flight, telemetry,
-            // and CPU config. An executor is the deployment shape most likely to be
-            // running under a CPU request, so `runtime.cpu` must come across
-            // too — everything else it needs arrives from the scheduler.
-            app.runtime.mode = built_app.runtime.mode;
+            // Retain local Flight, telemetry, and CPU config. An executor is the
+            // deployment shape most likely to be running under a CPU request, so
+            // `runtime.cpu` must come across too — everything else it needs
+            // arrives from the scheduler.
             app.runtime.flight = built_app.runtime.flight;
             app.runtime.telemetry = built_app.runtime.telemetry;
             app.runtime.cpu = built_app.runtime.cpu;

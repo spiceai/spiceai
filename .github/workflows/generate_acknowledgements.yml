@@ -3,6 +3,9 @@ name: Generate Acknowledgements
 on:
   workflow_dispatch:
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   generate:
     environment: secret-free

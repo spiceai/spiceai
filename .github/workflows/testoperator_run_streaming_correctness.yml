@@ -53,6 +53,9 @@ on:
         type: string
         default: '42'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-streaming-correctness:
     environment: ci

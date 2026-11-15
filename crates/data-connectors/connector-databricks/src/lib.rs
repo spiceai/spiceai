@@ -194,10 +194,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .help_link(DATABRICKS_DOCS),
 
     // Databricks M2M Service Principal credentials
-    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_id").secret().description("The client ID of the Databricks service principal. Defaults to `DATABRICKS_CLIENT_ID` for workload identity federation or beside a client secret."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
-    ParameterSpec::component("oidc_token_filepath").description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation."),
-    ParameterSpec::component("token_audience").description("The audience of the identity token Spice requests from a GitHub Actions job, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation."),
+    ParameterSpec::component("oidc_token_filepath").secret().description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_OIDC_TOKEN_FILEPATH`."),
+    ParameterSpec::component("token_audience").secret().description("The audience of the identity token Spice requests from a GitHub Actions job or the workload's cloud identity, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation. Defaults to `DATABRICKS_TOKEN_AUDIENCE`."),
 
     // S3 storage options
     ParameterSpec::component("aws_region")
@@ -752,7 +752,9 @@ impl Databricks {
         )
         .await
         .map_err(|error| match error {
-            DatabricksAuthError::InvalidWorkloadIdentity { message, .. } => {
+            // Both read as what to set, and a dataset load is retried after either.
+            DatabricksAuthError::InvalidWorkloadIdentity { message, .. }
+            | DatabricksAuthError::NoIdentityToken { message } => {
                 InvalidConfigurationSnafu { message }.build()
             }
             other => Error::UnableToGetToken {
@@ -2080,7 +2082,12 @@ mod tests {
             "Databricks::build_auth_credentials should return an error"
         );
         if let Err(error) = result {
-            assert!(error.to_string().contains("Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters"));
+            assert!(
+                error
+                    .to_string()
+                    .contains(runtime::token_providers::databricks::NO_CREDENTIAL_MESSAGE),
+                "{error}"
+            );
         }
     }
 
@@ -2090,7 +2097,10 @@ mod tests {
         let params_vec = vec![("client_id".to_string(), SecretString::from(client_id))];
         let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
 
-        let result = Databricks::build_auth_credentials(&parameters);
+        // Outside a GitHub Actions job, whatever the job running the test: in one, a client ID
+        // alone is workload identity federation.
+        let result =
+            runtime::token_providers::databricks::build_auth_credentials_in(&parameters, false);
 
         assert!(
             result.is_ok(),

@@ -46,8 +46,6 @@ use std::time::{Duration, Instant};
 
 use app::AppBuilder;
 use axum::{Router, routing::get};
-#[cfg(feature = "duckdb")]
-use datafusion::common::TableReference;
 use datafusion::prelude::*;
 use runtime::Runtime;
 use spicepod::{
@@ -287,56 +285,10 @@ async fn wait_for_rows_driving_lookups(
     ))
 }
 
-/// Waits until `dataset` reports a component error, which a caching accelerator
-/// does once a run of cache writes has been refused.
-///
-/// This is the completion signal for a refused write. Waiting a fixed time
-/// instead would let an assertion that nothing was cached pass simply because no
-/// write had been attempted yet.
-#[cfg(feature = "duckdb")]
-async fn wait_for_dataset_error(
-    rt: &Runtime,
-    dataset: &str,
-    timeout: Duration,
-) -> Result<(), String> {
-    let table = TableReference::bare(dataset.to_string());
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(status) = rt.status().get_dataset_status(&table)
-            && status.error_message().is_some()
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    Err(format!(
-        "dataset '{dataset}' never reported a cache-write failure within {}s",
-        timeout.as_secs()
-    ))
-}
-
 fn cayenne_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String, String)> {
     let mut params = vec![(
         "cayenne_file_path".to_string(),
-        dir.join("cache.duckdb").to_string_lossy().to_string(),
-    )];
-    params.extend(
-        extra
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string())),
-    );
-    params
-}
-
-/// Cayenne caches one row of a multi-row response under a request-derived key
-/// instead of refusing the write (#15548, guarded on Cayenne by
-/// `test/spicescript/known-failing/caching-http/http-caching-request-key.yaml`).
-/// Only the `DuckDB` case of that contract uses this, and it goes with the engine.
-#[cfg(feature = "duckdb")]
-fn duckdb_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String, String)> {
-    let mut params = vec![(
-        "duckdb_file".to_string(),
-        dir.join("cache.duckdb").to_string_lossy().to_string(),
+        dir.join("cache").to_string_lossy().to_string(),
     )];
     params.extend(
         extra
@@ -524,66 +476,6 @@ async fn a_multi_row_response_is_cached_with_a_body_derived_primary_key()
         before,
         fetches.load(Ordering::SeqCst),
         "the second query refetched from the origin, so nothing was served from cache"
-    );
-
-    shutdown.send(()).ok();
-    Ok(())
-}
-
-/// A key over the request columns says one row per request. An array response
-/// contradicts it, and the write is refused rather than truncated.
-///
-/// The assertion that matters is the *absence of a partial entry*: `on_conflict`
-/// has variants (`upsert_dedup_by_row_id`) that would resolve the conflict by
-/// keeping the last row, which would silently discard the rest of a search
-/// result. Caching nothing is recoverable and visible in the logs; caching one
-/// row of three is neither.
-#[cfg(feature = "duckdb")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_derived_primary_key_refuses_a_multi_row_response() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
-    register_test_connectors().await;
-
-    let (shutdown, addr, fetches) = start_mock(3).await;
-    let temp = tempfile::tempdir()?;
-    let dataset = caching_dataset(
-        addr,
-        "duckdb",
-        Some("(request_query,request_path)"),
-        duckdb_params(temp.path(), vec![("caching_ttl", "1h")]),
-    );
-    let rt = build_runtime(dataset, "caching_multi_row_request_key").await;
-
-    // A run of refused writes is what makes the dataset report an error, and
-    // that report is the signal the writes were attempted at all. Cache writes
-    // are batched and flushed on an interval, and the run counts flushes rather
-    // than requests, so the lookups are spaced past that interval instead of
-    // issued back to back -- four in one flush is one refusal, not four.
-    for key in ["key=a", "key=b", "key=c", "key=d"] {
-        fetch_key(&rt, key).await;
-        tokio::time::sleep(Duration::from_millis(900)).await;
-    }
-    wait_for_dataset_error(&rt, "http_data", Duration::from_mins(1))
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "the cache writes were never refused, so this test would \
-             have asserted an empty accelerator that nothing had tried to fill: {e}"
-            )
-        })?;
-
-    assert_eq!(
-        cached_rows(&rt).await,
-        0,
-        "a response that violates the declared key must not be partially cached"
-    );
-
-    // And the entry is not served: a repeat lookup still reaches the origin.
-    let before = fetches.load(Ordering::SeqCst);
-    fetch_key(&rt, "key=a").await;
-    assert!(
-        fetches.load(Ordering::SeqCst) > before,
-        "the lookup was served from cache, so something was cached after all"
     );
 
     shutdown.send(()).ok();

@@ -43,7 +43,6 @@ ALLOWED: dict[str, str] = {
     "UpsertDedupTableProvider": "rewrites writes (dedup/last-write-wins); routing past it drops those semantics",
     "EnsureSchema": "casts the accelerator's schema; carries no walkable semantics",
     "SwappableTableProvider": "swaps the accelerator underneath; not a dataset layer",
-    "DuckDBUniqueIndexGuardTableProvider": "guards DuckDB unique-index DDL; not a dataset layer",
     # Write-side adaptors, reached through a connector rather than a dataset stack.
     "FlightTableWriter": "connector write adaptor",
     "SnowflakeTableProvider": "connector write adaptor",

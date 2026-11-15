@@ -1,0 +1,78 @@
+name: snapshot-source-projected-publisher
+description: >
+  A file_format snapshot dataset over snapshots whose publisher's refresh_sql
+  stores only some of its source's columns is refused by name. The publisher
+  records every column in its newer snapshots' metadata, so a reader that
+  registers the stored columns rejects every newer snapshot and keeps serving
+  the first one.
+
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+
+variants:
+  writer: {}
+  reader:
+    spicepod:
+      runtime: { state: null }
+      datasets:
+        - from: s3://${sources.lake.shared_bucket}/state/snapshots/
+          name: t
+          params:
+            file_format: snapshot
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+          acceleration: { refresh_check_interval: 1s }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshot-source-projected-publisher
+  runtime:
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_sql: SELECT id FROM t
+        snapshots: create_only
+
+defaults:
+  run-variants: side-by-side
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 3) i" }
+  - start: {}
+    only: writer
+  - query: SELECT * FROM t ORDER BY id
+    expect: { rows: [['1'], ['2'], ['3']] }
+    only: writer
+  - assert-log: { contains: 'Snapshot created dataset=t' }
+    eventually: 30s
+    only: writer
+  - start: { ready: false }
+    only: reader
+  - assert-status:
+      dataset: t
+      status: Error
+      message-contains: "stores only some of its source's columns (SELECT id FROM t)"
+    eventually: 30s
+    only: reader

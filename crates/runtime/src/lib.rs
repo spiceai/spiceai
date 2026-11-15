@@ -659,6 +659,14 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
+    #[snafu(display(
+        "Dataset '{dataset_name}' sets `{setting}`, which keeps its data on object storage, but a sidecar serves data only from memory and local disk; the cluster it reads from serves object-storage tiers. Remove `{setting}` from the sidecar's Spicepod, or start Spice without `--role sidecar`."
+    ))]
+    SidecarColdTier {
+        dataset_name: String,
+        setting: &'static str,
+    },
+
     #[snafu(display("{reason}"))]
     StateLocationRefused { reason: String },
 
@@ -727,8 +735,6 @@ impl Default for InitialLoad {
 #[derive(Clone)]
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
-    /// Fixed at startup, including across app reloads and connector recreation.
-    mode: spicepod::component::runtime::RuntimeMode,
     app: Arc<RwLock<Option<Arc<App>>>>,
     /// Serializes [`Runtime::apply_app`] so that concurrent callers cannot
     /// interleave their diff-and-swap. `apply_app` computes diffs under a read
@@ -848,6 +854,12 @@ impl Runtime {
         Arc::clone(&self.df)
     }
 
+    /// The `--role` this runtime started with. A Spicepod reload cannot change it.
+    #[must_use]
+    pub fn role(&self) -> config::Role {
+        self.df.role()
+    }
+
     #[must_use]
     pub fn config(&self) -> Arc<Config> {
         Arc::clone(&self.config)
@@ -964,6 +976,12 @@ impl Runtime {
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         self.llm_runtime_stores.rate_controllers()
+    }
+
+    /// This node's rank in each loaded model split across several nodes, by model name.
+    #[must_use]
+    pub fn model_node_ranks(&self) -> Arc<RwLock<HashMap<String, usize>>> {
+        self.llm_runtime_stores.node_ranks()
     }
 
     #[must_use]

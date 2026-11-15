@@ -99,7 +99,6 @@ The project docs for contributors and community. For user documentation of the S
 ## Feature Notes
 
 - [Databricks Resilience](features/databricks-resilience.md)
-- [DuckDB Index Scan Settings](features/duckdb_index_scan_settings.md)
 - [GCS Connector](features/gcs-connector.md)
 - [Git Connector](features/git-connector.md)
 - [MongoDB Change Streams](features/mongodb-change-streams.md)

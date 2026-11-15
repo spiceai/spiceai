@@ -77,6 +77,7 @@ mod elasticsearch;
 pub mod megascience;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;
+mod sidecar;
 mod tables;
 
 #[derive(Clone, Serialize, Debug, Deserialize)]

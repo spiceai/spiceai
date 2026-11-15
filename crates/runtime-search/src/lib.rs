@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod candidate;
+pub mod delegated;
 pub mod embeddings;
 pub mod error;
 pub mod full_text;

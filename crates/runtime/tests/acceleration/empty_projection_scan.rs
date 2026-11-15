@@ -14,17 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A `DuckDB` or `SQLite` acceleration that a statement only filters must still
-//! contribute its matching rows.
+//! A `SQLite` acceleration that a statement only filters must still contribute
+//! its matching rows.
 //!
 //! When the select list is a scalar subquery over an Arrow acceleration, as in
 //! TPC-DS q9, the outer table is read for nothing but its filter, so it is
 //! federated on its own as a scan with an empty projection. The unparser renders that as `SELECT 1 FROM … WHERE …`, because
-//! neither engine has an empty select list, and the engine answers with that one
+//! `SQLite` has no empty select list, and it answers with that one
 //! placeholder column. `datafusion-federation` has to ask the executor for the
 //! placeholder and reduce it to the row count (spiceai/datafusion-federation#91):
-//! told to expect no column instead, `DuckDB` fails with "Unexpected number of
-//! columns. Expected: 0, Found: 1" and the `SQLite` row decoder panics.
+//! told to expect no column instead, the `SQLite` row decoder panics.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -128,12 +127,6 @@ async fn check_engine(engine: &str) -> anyhow::Result<()> {
             Ok(())
         })
         .await
-}
-
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn duckdb_filter_only_scan_keeps_its_rows() -> anyhow::Result<()> {
-    check_engine("duckdb").await
 }
 
 #[cfg(feature = "sqlite")]

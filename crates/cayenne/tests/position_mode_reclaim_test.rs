@@ -41,8 +41,7 @@ use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::provider::CayenneContext;
 use cayenne::{
-    CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
-    MetadataCatalog,
+    CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath, MetadataCatalog,
 };
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -224,7 +223,7 @@ async fn empty_table_reclaim_clears_tombstones_and_survives_reopen(
         drop(table);
 
         let catalog: Arc<dyn MetadataCatalog> =
-            Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+            common::fixture_catalog(fixture.connection_string()).await?;
         catalog.init().await?;
         let reopened = Arc::new(
             CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())

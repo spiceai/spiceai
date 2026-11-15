@@ -15,7 +15,6 @@ arrow = { workspace = true }
 arrow-schema = { workspace = true, features = ["serde"] }
 arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true
-aws-config.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 data-connector-types = { path = "../data-connector-types" }
 data-http-rate-control = { path = "../data-http-rate-control" }

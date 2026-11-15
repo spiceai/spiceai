@@ -15,6 +15,10 @@ on:
         required: false
         default: ''
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   resolve-upgrade-version:
     environment: secret-free

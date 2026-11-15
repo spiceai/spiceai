@@ -121,6 +121,11 @@ pub trait Source: Send + Sync {
         anyhow::bail!("this source has no objects to list under '{prefix}'")
     }
 
+    /// The objects (or files) under `prefix` in this namespace, with their sizes.
+    async fn sizes(&self, _namespace: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
+        anyhow::bail!("this source has no objects to list under '{prefix}'")
+    }
+
     /// Writes a generated table: by default creates it (unless appending) and
     /// loads the rows.
     async fn generate(&self, namespace: &str, spec: &crate::generate::TableSpec) -> Result<u64> {
@@ -159,6 +164,19 @@ pub trait Source: Send + Sync {
     }
 }
 
+/// How many containers [`start`] runs for a source of `kind`, which is what it
+/// needs of the kernel key quota a rootless Docker daemon's containers share
+/// (see [`crate::keyquota`]). Kept beside `start` so the two change together.
+pub fn containers(kind: &str) -> u64 {
+    match kind {
+        "files" | "mock-http" | "duckdb" => 0,
+        "iceberg" => 2,
+        // `ducklake` runs a PostgreSQL catalog; the rest run one container each,
+        // and an unknown kind fails in `start` before it starts any.
+        _ => 1,
+    }
+}
+
 /// Starts a source of `kind`; `files`, `rustfs`, `iceberg`, `duckdb` and `ducklake`
 /// sources keep their directories under `work`.
 pub async fn start(
@@ -170,6 +188,10 @@ pub async fn start(
     spec: &crate::script::SourceSpec,
 ) -> Result<Box<dyn Source>> {
     let dir = work.join(name);
+    anyhow::ensure!(
+        spec.latency.is_none() || kind == "rustfs",
+        "source '{name}': `latency` is for `rustfs` sources, not '{kind}'"
+    );
     let source: Box<dyn Source> = match kind {
         "kafka" | "mongodb" | "dynamodb" => {
             Box::new(document::Document::start(name, run_id, kind, version).await?)
@@ -178,7 +200,9 @@ pub async fn start(
         "postgres" => Box::new(postgres::Postgres::start(name, run_id, version).await?),
         "mysql" => Box::new(mysql::Mysql::start(name, run_id, version).await?),
         "files" => Box::new(files::Files::new(dir)?),
-        "rustfs" => Box::new(object_store::ObjectStore::start(name, run_id, dir).await?),
+        "rustfs" => {
+            Box::new(object_store::ObjectStore::start(name, run_id, dir, spec.latency).await?)
+        }
         "iceberg" => Box::new(iceberg::Iceberg::start(name, run_id, dir).await?),
         "clickhouse" => Box::new(clickhouse::ClickHouse::start(name, run_id, version).await?),
         "mock-http" => Box::new(mock_http::MockHttp::start().await?),

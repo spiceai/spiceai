@@ -1,0 +1,90 @@
+name: cayenne-snapshot-reader-path-change
+description: >
+  A Cayenne reader that bootstrapped from snapshots keeps serving its rows
+  when its `cayenne_file_path` changes while the snapshot store is down, and
+  restores into the new path once the store is back. Its own source holds one
+  row the snapshots do not, so the 200 rows it serves come from a snapshot.
+
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+
+variants:
+  writer:
+    datasets: { t: { acceleration: { refresh_mode: full, snapshots: create_only } } }
+  reader:
+    datasets:
+      t:
+        acceleration: { refresh_mode: snapshot, snapshots: bootstrap_only, refresh_check_interval: 1s }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-snapshot-reader-path-change
+  runtime:
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        params: { cayenne_file_path: '${instance.dir}/first' }
+
+defaults:
+  # The writer publishes what the reader restores, so they run side by side.
+  run-variants: side-by-side
+  compare-variants: false
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 200) i;
+    only: writer
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (999, 'source-only')" }
+    only: reader
+  - start: {}
+    only: writer
+  - assert-log: { contains: 'Snapshot created dataset=t' }
+    eventually: 30s
+    only: writer
+  - start: { ready: false }
+    only: reader
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    eventually: 60s
+    only: reader
+
+  # The snapshot store goes down, then the reader's acceleration moves.
+  - stop-source: lake
+    only: reader
+  - edit-spicepod:
+      datasets:
+        t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/second' } } }
+    only: reader
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    consistently: 10s
+    only: reader
+
+  # Once the store is back, the reader restores into the new path.
+  - start-source: lake
+    only: reader
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    eventually: 60s
+    only: reader
+  - assert-files: { contains: [second/metadata/cayenne.db] }
+    only: reader

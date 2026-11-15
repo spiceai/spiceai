@@ -275,64 +275,6 @@ async fn mysql_cayenne_block_keeps_the_registered_type() -> Result<(), anyhow::E
         .await
 }
 
-/// `DuckDB` cannot evolve mid-stream, so under `sync_all_columns` a change is
-/// cast to the table's current `Int32` type until a restart applies the
-/// evolution. A value the cast holds exactly is applied; one it would round is
-/// refused, never stored rounded.
-#[cfg(feature = "duckdb")]
-#[tokio::test(flavor = "multi_thread")]
-async fn mysql_duckdb_sync_all_columns_never_stores_a_rounded_value() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-    test_request_context()
-        .scope(async {
-            let container = common::start_mysql_docker_container().await?;
-            let port = container.host_port(3306)?;
-            let dir = tempfile::tempdir()?;
-            let table = "type_change_duckdb_sync";
-            let (pool, rt) = start(
-                port,
-                table,
-                "INT",
-                "duckdb",
-                OnSchemaChange::SyncAllColumns,
-                dir.path(),
-            )
-            .await?;
-            exec(&pool, &format!("ALTER TABLE {table} MODIFY k DOUBLE")).await?;
-            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 2.0)")).await?;
-            wait_for(
-                &rt,
-                &format!("SELECT id, k FROM {table} WHERE id = 4"),
-                "+----+---+\n\
-                 | id | k |\n\
-                 +----+---+\n\
-                 | 4  | 2 |\n\
-                 +----+---+",
-            )
-            .await?;
-
-            exec(&pool, &format!("INSERT INTO {table} VALUES (5, 2.5)")).await?;
-            // The refusal leaves nothing to poll for, so watch for the bound the
-            // other changes in this file arrive within.
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                let rows = run_query(
-                    &rt,
-                    &format!("SELECT count(*) AS c FROM {table} WHERE id = 5"),
-                )
-                .await?;
-                assert_eq!(
-                    rows, "+---+\n| c |\n+---+\n| 0 |\n+---+",
-                    "2.5 must not be stored as an Int32"
-                );
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Ok(())
-        })
-        .await
-}
-
 /// Wait for `table`'s dataset to report the error its change stream stopped
 /// with, and return the message. Called right after the `ALTER`, before any row
 /// change follows it, so the error can only come from the `ALTER` itself.

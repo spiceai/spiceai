@@ -72,11 +72,6 @@ datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 spice-table = { path = "../spice-table" }
 document_parse = { path = "../document_parse" }
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "extensions-full",
-], optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
@@ -164,7 +159,6 @@ runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
-runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = true }
 runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
 runtime-component = { path = "../runtime-component" }
 runtime-metrics = { path = "../runtime-metrics" }
@@ -288,6 +282,7 @@ connector-databricks = { path = "../data-connectors/connector-databricks" }
 connector-delta-lake = { path = "../data-connectors/connector-delta-lake" }
 connector-dremio = { path = "../data-connectors/connector-dremio" }
 connector-duckdb = { path = "../data-connectors/connector-duckdb" }
+duckdb-oracle = { path = "../duckdb-oracle" }
 connector-ducklake = { path = "../data-connectors/connector-ducklake" }
 connector-flightsql = { path = "../data-connectors/connector-flightsql" }
 connector-ftp = { path = "../data-connectors/connector-ftp" }
@@ -305,7 +300,6 @@ connector-oracle = { path = "../data-connectors/connector-oracle" }
 accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
 runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres" }
 accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
-accelerator-duckdb = { path = "../accelerators/accelerator-duckdb" }
 accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
@@ -359,16 +353,6 @@ elasticsearch = [
     "dep:duration-parse",
     "search/elasticsearch",
     "runtime-search/elasticsearch",
-]
-duckdb = [
-    "dep:adbc_core",
-    "dep:adbc_driver_manager",
-    "dep:duckdb",
-    "dep:runtime-checkpoint-duckdb",
-    "db_connection_pool/duckdb",
-    "data_components/duckdb",
-    "datafusion-optimizer-rules/duckdb",
-    "runtime-acceleration/duckdb",
 ]
 # Test-only marker: the DynamoDB connector now lives in `connector-dynamodb` (a
 # dev-dependency, registered unconditionally by `do_register_test_connectors`).

@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'crates/object_store_occ/**'
+      # headlog_replay links the model crate.
+      - 'crates/cayenne-metastore-model/**'
       - 'test/object_store_occ/**'
       - '.github/workflows/object_store_wal.yml'
       - 'Cargo.toml'
@@ -30,7 +32,7 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: spiceai-dev-runners
-    environment: ci-build
+    environment: ci
     # A merge group's checkout takes the full history, sized for a cold runner
     # cloning from scratch.
     timeout-minutes: 45
@@ -54,6 +56,7 @@ jobs:
           filters: |
             code_changes:
               - 'crates/object_store_occ/**'
+              - 'crates/cayenne-metastore-model/**'
               - 'test/object_store_occ/**'
               - '.github/workflows/object_store_wal.yml'
               - 'Cargo.toml'
@@ -126,7 +129,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.legs) }}
     runs-on: ${{ matrix.runner }}
-    environment: ci-build
+    environment: ci
     timeout-minutes: 45
     services:
       redis:
@@ -187,9 +190,15 @@ jobs:
           "$python" -m venv "$RUNNER_TEMP/wal-oracle"
           "$RUNNER_TEMP/wal-oracle/bin/python" -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
           echo "$RUNNER_TEMP/wal-oracle/bin" >> "$GITHUB_PATH"
-      - name: Test state protocol and cancellation
+      # Every store-independent test binary; s3_integration runs on the service legs.
+      - name: Test state protocol, cancellation, faults and model replays
         if: matrix.store == 'disk'
-        run: cargo test --locked --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation -- --nocapture
+        # The test-name filters select integration modules; the library's own
+        # tests run unfiltered in the first command.
+        run: |
+          set -euo pipefail
+          cargo test --locked --profile dev -p object_store_occ --lib -- --nocapture
+          cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture state_store:: transactional_wal:: local_cancellation:: fault:: headlog:: headlog_replay:: data_file_replay:: prefix_listing:: local_root_overlap::
       - name: Build the process worker
         run: cargo build --locked --profile dev -p object_store_occ --example wal_test_driver
 
@@ -376,7 +385,9 @@ jobs:
         env:
           AWS_S3_BUCKET: ${{ env.WAL_BUCKET }}
           AWS_S3_PREFIX: ${{ env.WAL_PREFIX }}/s3_integration
-        run: cargo test --locked --profile dev -p object_store_occ --test s3_integration -- --nocapture
+        # A block scalar: YAML reads a plain value ending in `:` as a mapping key.
+        run: |
+          cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture s3_integration::
       - name: Run process histories against ${{ matrix.store }}
         timeout-minutes: 30
         env:

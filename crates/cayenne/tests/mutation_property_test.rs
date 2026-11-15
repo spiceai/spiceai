@@ -58,7 +58,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
+use cayenne::{CayenneTableProvider, MetadataCatalog, SlotAdvancer};
 use common::{BackendType, TestFixture};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -314,15 +314,19 @@ async fn create_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: config(mode, durability, pk_keyset_cache_mb, cold_url),
     };
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), opts)
+            .await?,
+    );
     if durability == Durability::Memory {
         // Arm mem-mode deferral (the runtime does this on the first replayable
         // committer); without it mem-mode CDC writes take the durable path.
@@ -345,8 +349,9 @@ async fn reopen_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let provider = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .open(name)
+        fixture
+            .data_store
+            .open(catalog, ctx.runtime_env(), name)
             .await?,
     );
     ctx.register_table(name, Arc::clone(&provider) as Arc<dyn TableProvider>)?;
@@ -829,7 +834,12 @@ fn apply_model(model: &mut Model, op: &Op) {
 
 /// Returns whether the table was seen on key deletes after it opened on position
 /// deletes (see [`Mode::Auto`]).
-async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
+async fn run_sequential(
+    fixture: &TestFixture,
+    w: &Workload,
+    seed: u64,
+    history: &mut Vec<Op>,
+) -> TestResult<bool> {
     let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (mut table, mut ctx) = create_table(
         fixture,
@@ -850,7 +860,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     let mut left_positions = false;
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
-    let mut history: Vec<Op> = Vec::with_capacity(w.ops);
+    history.reserve(w.ops);
     for step in 0..w.ops {
         let live_value = sample_live_value(&model, &mut rng);
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
@@ -939,7 +949,12 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 
 /// Returns whether the table was seen on key deletes after it opened on position
 /// deletes (see [`Mode::Auto`]).
-async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
+async fn run_concurrent(
+    fixture: &TestFixture,
+    w: &Workload,
+    seed: u64,
+    history: &mut Vec<Op>,
+) -> TestResult<bool> {
     let name = format!("conc_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (table0, ctx0) = create_table(
         fixture,
@@ -1010,7 +1025,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 
     // Foreground stream. `compact` is driven by the background loop (a foreground
     // Compact op is a no-op here); `restart` reopens under the write lock.
-    let mut history: Vec<Op> = Vec::with_capacity(w.ops);
+    history.reserve(w.ops);
     for _ in 0..w.ops {
         let live_value = sample_live_value(&model, &mut rng);
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
@@ -1101,12 +1116,37 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 }
 
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
+    // `auto` adapts only a table on a local directory: a table whose data files
+    // are in an object store, a local-directory location included, stays on key
+    // deletes (`resolve_pk_deletion_mode`), so the crossing from position deletes
+    // exists only on the SQLite metastore's local files. The runtime never places
+    // a dataset with a datalake tier in the object-native location, so a cold walk
+    // runs on local data files too. Those tests run on SQLite only.
+    assert!(
+        matches!(fixture.backend_type, BackendType::Sqlite)
+            || !(matches!(w.mode, Mode::AutoCrossing) || w.cold),
+        "AutoCrossing and cold walks need local data files: register the test on SQLite"
+    );
     let mut seeds_that_left_positions = 0usize;
     for seed in 0..w.seeds {
-        let left_positions = match w.concurrency {
-            Concurrency::Sequential => run_sequential(&fixture, &w, seed).await?,
-            Concurrency::ConcurrentWithCompaction => run_concurrent(&fixture, &w, seed).await?,
+        let mut history = Vec::new();
+        let outcome = match w.concurrency {
+            Concurrency::Sequential => run_sequential(&fixture, &w, seed, &mut history).await,
+            Concurrency::ConcurrentWithCompaction => {
+                run_concurrent(&fixture, &w, seed, &mut history).await
+            }
         };
+        // A divergence panics with the seed and history; an error from an
+        // operation or a read carries them here, so either replays from the seed.
+        let left_positions = outcome.map_err(|error| {
+            format!(
+                "walk failed mode={:?} durability={:?} concurrency={:?} seed={seed} after {} op(s): {error}\nhistory={history:?}",
+                w.mode,
+                w.durability,
+                w.concurrency,
+                history.len(),
+            )
+        })?;
         seeds_that_left_positions += usize::from(left_positions);
     }
     match w.mode {
@@ -1416,7 +1456,7 @@ async fn prop_harness_stack_headroom_impl(_f: TestFixture) -> TestResult<()> {
     descend(63);
     Ok(())
 }
-test_with_backends!(prop_harness_stack_headroom_impl);
+test_on_data_store!(prop_harness_stack_headroom_impl);
 
 // --- AutoCrossing non-vacuity (mode transition, not only model convergence) ---
 //
@@ -1500,6 +1540,8 @@ async fn prop_auto_crossing_observes_position_then_key_switch_impl(
     );
     Ok(())
 }
+// SQLite only: only a table on a local directory starts on position deletes; see
+// `run_workload`.
 test_with_backends!(prop_auto_crossing_observes_position_then_key_switch_impl);
 
 // --- Sequential convergence (GREEN) ---
@@ -1515,9 +1557,9 @@ async fn prop_sequential_auto_impl(f: TestFixture) -> TestResult<()> {
 async fn prop_sequential_auto_crossing_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::AutoCrossing)).await
 }
-test_with_backends!(prop_sequential_key_impl);
-test_with_backends!(prop_sequential_position_impl);
-test_with_backends!(prop_sequential_auto_impl);
+test_on_data_store!(prop_sequential_key_impl);
+test_on_data_store!(prop_sequential_position_impl);
+test_on_data_store!(prop_sequential_auto_impl);
 test_with_backends!(prop_sequential_auto_crossing_impl);
 
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
@@ -1531,7 +1573,7 @@ test_with_backends!(prop_sequential_auto_crossing_impl);
 async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_memory()).await
 }
-test_with_backends!(prop_sequential_memory_impl);
+test_on_data_store!(prop_sequential_memory_impl);
 
 /// [`assert_converged`] plus a physical row count, which catches a duplicate
 /// row that `read_rows` would fold into the key/value map.
@@ -1576,7 +1618,7 @@ async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResul
     }
     Ok(())
 }
-test_with_backends!(prop_mixed_memory_and_durable_upserts_impl);
+test_on_data_store!(prop_mixed_memory_and_durable_upserts_impl);
 
 // A durable upsert of keys first written through the mem tier must hide the
 // old rows whether a checkpoint moves them into a file before the upsert or
@@ -1613,12 +1655,12 @@ async fn durable_upsert_after_mem_tier_checkpoint_impl(f: TestFixture) -> TestRe
 async fn mem_tier_checkpoint_after_durable_upsert_impl(f: TestFixture) -> TestResult<()> {
     durable_upsert_of_mem_tier_keys(f, "mem_tier_checkpoint_after_durable_upsert", false).await
 }
-test_with_backends!(durable_upsert_after_mem_tier_checkpoint_impl);
-test_with_backends!(mem_tier_checkpoint_after_durable_upsert_impl);
+test_on_data_store!(durable_upsert_after_mem_tier_checkpoint_impl);
+test_on_data_store!(mem_tier_checkpoint_after_durable_upsert_impl);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_memory() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_memory())
     })
     .await
@@ -1674,20 +1716,20 @@ async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> Test
     }
     Ok(())
 }
-test_with_backends!(reupsert_after_overwrite_delete_is_visible_impl);
+test_on_data_store!(reupsert_after_overwrite_delete_is_visible_impl);
 
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_upsert_only_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_upsert_only_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Key))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_upsert_only_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_upsert_only_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Position))
     })
     .await
@@ -1706,16 +1748,16 @@ async fn prop_concurrent_upsert_only_position_sqlite() -> TestResult<()> {
 // by publishing every deletion-index update through `ArcSwap::rcu` (no lost
 // updates), so these now converge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Key))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Position))
     })
     .await
@@ -1728,16 +1770,16 @@ async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
 // over-budget bloom existence filter (`pk_keyset_cache_mb = Some(0)`), since the
 // re-insert-over-tombstone handling differs between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Key, None))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Position, None))
     })
     .await
@@ -1745,16 +1787,16 @@ async fn prop_concurrent_mixed_dense_position_sqlite() -> TestResult<()> {
 }
 // Same dense stress, but forcing the bloom existence-filter conflict path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_bloom_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_bloom_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Key, Some(0)))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_bloom_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Position, Some(0)))
     })
     .await
@@ -1765,16 +1807,16 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
 // reclaims that run alongside the writers, and (crossing) the switch to key
 // deletes under them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_upsert_only_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Auto))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Auto))
     })
     .await
@@ -1789,8 +1831,8 @@ async fn prop_concurrent_mixed_auto_crossing_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Auto, None))
     })
     .await
@@ -1805,8 +1847,8 @@ async fn prop_concurrent_mixed_dense_auto_crossing_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_bloom_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_bloom_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Auto, Some(0)))
     })
     .await
@@ -1899,26 +1941,228 @@ async fn run_concurrent_reads_mode(fixture: &TestFixture, mode: Mode) -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| async move {
+async fn prop_concurrent_reads_observe_consistent_snapshot_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Key).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| async move {
+async fn prop_concurrent_reads_observe_consistent_snapshot_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Position).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_reads_observe_consistent_snapshot_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| async move {
+async fn prop_concurrent_reads_observe_consistent_snapshot_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Auto).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
+// --- Negative control: the walk notices a lost write ---
+
+/// An in-memory store that answers one data-file (`.vortex`) write as done and
+/// keeps nothing: the `nth` such write, counting from 0, single-part or multipart.
+#[derive(Debug)]
+struct DropsOneDataPut {
+    inner: object_store::memory::InMemory,
+    /// Data-file writes still to pass through before the dropped one.
+    remaining: std::sync::atomic::AtomicI64,
+    dropped: AtomicBool,
+}
+
+impl DropsOneDataPut {
+    fn new(nth: i64) -> Self {
+        Self {
+            inner: object_store::memory::InMemory::new(),
+            remaining: std::sync::atomic::AtomicI64::new(nth),
+            dropped: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether this write to `location` is the one to drop.
+    fn drop_this(&self, location: &object_store::path::Path) -> bool {
+        location.as_ref().ends_with(".vortex")
+            && self.remaining.fetch_sub(1, Ordering::SeqCst) == 0
+            && !self.dropped.swap(true, Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for DropsOneDataPut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DropsOneDataPut")
+    }
+}
+
+/// A multipart upload whose parts and completion succeed and store nothing.
+#[derive(Debug)]
+struct DiscardedUpload;
+
+#[async_trait::async_trait]
+impl object_store::MultipartUpload for DiscardedUpload {
+    fn put_part(&mut self, _data: object_store::PutPayload) -> object_store::UploadPart {
+        Box::pin(async { Ok(()) })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+        Ok(object_store::PutResult {
+            e_tag: None,
+            version: None,
+        })
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for DropsOneDataPut {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if self.drop_this(location) {
+            return Ok(object_store::PutResult {
+                e_tag: None,
+                version: None,
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        if self.drop_this(location) {
+            return Ok(Box::new(DiscardedUpload));
+        }
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, options).await
+    }
+}
+
+/// The fuzz lane turns red when the store loses one acknowledged data-file write,
+/// and its failure names the seed and the history to replay. A lane that stays
+/// green here would also stay green over a store that drops writes.
+#[test]
+fn a_dropped_data_file_put_turns_the_fuzz_walk_red() {
+    let outcome = std::thread::Builder::new()
+        .stack_size(common::TEST_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(common::TEST_STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("build the test runtime");
+            runtime.block_on(async {
+                let store: Arc<dyn object_store::ObjectStore> = Arc::new(DropsOneDataPut::new(2));
+                let fixture = TestFixture::with_data_store(BackendType::ObjectNative, Some(store))
+                    .await
+                    .expect("fixture");
+                let walk = Workload {
+                    seeds: 1,
+                    ..sequential(Mode::Key)
+                };
+                // A divergence panics; a failed operation or read is an error.
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run_workload(
+                    fixture, walk,
+                )))
+                .await
+                {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(panic) => Some(
+                        panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(ToString::to_string))
+                            .unwrap_or_default(),
+                    ),
+                }
+            })
+        })
+        .expect("spawn the test thread")
+        .join()
+        .expect("join the test thread");
+    let failure = outcome.expect("the walk must fail when the store drops a data-file write");
+    assert!(
+        failure.contains("seed=0") && failure.contains("history=["),
+        "the failure names the seed and the history: {failure}"
+    );
 }

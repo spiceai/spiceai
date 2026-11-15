@@ -183,10 +183,9 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Set up wget
-        if: matrix.target.target_os == 'linux'
-        run: sudo apt-get update && sudo apt-get install wget -y
-
+      # setup-make runs configure-apt, which gives apt its mirror failover.
+      # Keep every bare apt-get step after it, so security.ubuntu.com being
+      # down cannot fail the build here.
       - name: Set up make
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-make
@@ -194,6 +193,10 @@ jobs:
       - name: Set up cc
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-cc
+
+      - name: Set up wget
+        if: matrix.target.target_os == 'linux'
+        run: sudo apt-get update && sudo apt-get install wget -y
 
       - name: Install protoc
         uses: ./.github/actions/install-protoc

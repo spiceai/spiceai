@@ -18,8 +18,6 @@ limitations under the License.
 //! These optimizations should be unrelated to the `runtime` or `spiced`. Ideally they could be contributed
 //! upstream to `datafusion` directly.
 
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 pub mod first_record_probe;
 pub mod flightsql;
 pub mod hash_join_optimization;

@@ -3,6 +3,10 @@ name: Test types support
 on:
   workflow_dispatch:
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   build:
     environment: secret-free

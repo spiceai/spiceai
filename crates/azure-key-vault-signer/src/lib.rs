@@ -27,39 +27,23 @@ limitations under the License.
 //!    when `AZURE_CLIENT_ID` names one.
 //! 3. The Azure CLI's signed-in account, for local development.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{fmt, time::Duration};
 
 use async_trait::async_trait;
-use azure_core::credentials::TokenCredential;
-use azure_identity::{
-    AzureCliCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions, UserAssignedId,
-};
+pub use azure_credential::AzureIdentityEnvironment;
+use azure_credential::{AzureIdentity as Identity, EntraTarget, ResolveError, clause};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use snafu::prelude::*;
-use token_provider::TokenProvider;
 use token_provider::jwt_signer::{JwtSigner, SignError};
-use token_provider::workload_identity::{
-    ENTRA_AUDIENCE, Exchange, SubjectTokenSource, WorkloadIdentityError,
-    WorkloadIdentityTokenProvider,
-};
+use token_provider::workload_identity::{Exchange, SubjectTokenSource, WorkloadIdentityError};
 
 /// The Key Vault REST API version the signer calls.
 const API_VERSION: &str = "7.4";
 
 const KEY_VAULT_RBAC_DOCS: &str = "https://learn.microsoft.com/azure/key-vault/general/rbac-guide";
-
-/// How long the managed identity endpoint has to answer. Outside Azure there is none, and the
-/// wait is the cost of looking for one.
-const MANAGED_IDENTITY_BUDGET: Duration = Duration::from_secs(3);
-
-/// How long the Azure CLI has to answer: it is a process that may refresh its own token.
-const AZURE_CLI_BUDGET: Duration = Duration::from_secs(20);
-
-/// Bounds the reason quoted from an error response or a credential's error.
-const MAX_REASON_LEN: usize = 300;
 
 /// How much of an error response is read for its reason.
 const MAX_ERROR_BODY_BYTES: usize = 4096;
@@ -129,7 +113,7 @@ pub enum KeyVaultError {
     },
 
     #[snafu(display(
-        "Found no Microsoft Entra identity to sign with the Azure Key Vault key '{key}'. Tried a workload identity (`AZURE_FEDERATED_TOKEN_FILE` is not set, and this is not a GitHub Actions job with `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `permissions: id-token: write`), {tried}. On AKS, label the pod `azure.workload.identity/use: \"true\"`; on an Azure VM, App Service or Container Apps, assign the workload a managed identity; locally, run `az login`."
+        "Found no Microsoft Entra identity to sign with the Azure Key Vault key '{key}'. Tried {tried}. On AKS, label the pod `azure.workload.identity/use: \"true\"`; on an Azure VM, App Service or Container Apps, assign the workload a managed identity; locally, run `az login`."
     ))]
     NoIdentity { key: String, tried: String },
 
@@ -243,42 +227,34 @@ impl fmt::Display for KeyVaultKey {
     }
 }
 
-/// The workload identity the environment gives the process, in the variables the Azure SDKs
-/// read, and the GitHub Actions job it runs in, if any. An empty variable counts as unset.
-#[derive(Clone, Debug, Default)]
-pub struct AzureIdentityEnvironment {
-    /// `AZURE_TENANT_ID`.
-    pub tenant_id: Option<String>,
-    /// `AZURE_CLIENT_ID`: the workload identity's application, or a user-assigned managed
-    /// identity.
-    pub client_id: Option<String>,
-    /// `AZURE_FEDERATED_TOKEN_FILE`.
-    pub federated_token_file: Option<String>,
-    /// `AZURE_AUTHORITY_HOST`, which replaces the authority of the vault's cloud.
-    pub authority_host: Option<String>,
-    /// `ACTIONS_ID_TOKEN_REQUEST_URL`.
-    pub github_actions_request_url: Option<String>,
-    /// `ACTIONS_ID_TOKEN_REQUEST_TOKEN`.
-    pub github_actions_request_token: Option<String>,
+impl KeyVaultKey {
+    /// The Microsoft Entra authority of the key's cloud and the scope of an access token for it.
+    fn target(&self) -> EntraTarget {
+        EntraTarget {
+            authority: self.authority.to_string(),
+            scope: self.scope.to_string(),
+        }
+    }
 }
 
-impl AzureIdentityEnvironment {
-    /// The variables of this process.
-    #[must_use]
-    pub fn from_process() -> Self {
-        let var = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        };
-        Self {
-            tenant_id: var("AZURE_TENANT_ID"),
-            client_id: var("AZURE_CLIENT_ID"),
-            federated_token_file: var("AZURE_FEDERATED_TOKEN_FILE"),
-            authority_host: var("AZURE_AUTHORITY_HOST"),
-            github_actions_request_url: var("ACTIONS_ID_TOKEN_REQUEST_URL"),
-            github_actions_request_token: var("ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
+/// `error`, resolving the identity that signs with `key`, as the error that names the key.
+fn key_vault_error(key: &KeyVaultKey, error: ResolveError) -> KeyVaultError {
+    match error {
+        ResolveError::IncompleteWorkloadIdentity { missing } => {
+            KeyVaultError::IncompleteWorkloadIdentity {
+                key: key.url.clone(),
+                missing: missing.to_string(),
+            }
         }
+        ResolveError::InvalidIdentity { source } => KeyVaultError::InvalidIdentity { source },
+        ResolveError::AccessToken { source } => KeyVaultError::AccessToken {
+            key: key.url.clone(),
+            source,
+        },
+        ResolveError::NoIdentity { tried } => KeyVaultError::NoIdentity {
+            key: key.url.clone(),
+            tried,
+        },
     }
 }
 
@@ -294,117 +270,15 @@ pub fn workload_identity(
     key: &KeyVaultKey,
     env: &AzureIdentityEnvironment,
 ) -> Result<Option<(SubjectTokenSource, Exchange, &'static str)>, KeyVaultError> {
-    let (source, origin) = match &env.federated_token_file {
-        Some(path) => (
-            SubjectTokenSource::File(path.into()),
-            "`AZURE_FEDERATED_TOKEN_FILE`",
-        ),
-        None if env.tenant_id.is_some() && env.client_id.is_some() => {
-            match SubjectTokenSource::github_actions(
-                env.github_actions_request_url.clone(),
-                env.github_actions_request_token.clone(),
-                ENTRA_AUDIENCE,
-            ) {
-                Ok(source) => (source, "this GitHub Actions job"),
-                Err(_) => return Ok(None),
-            }
-        }
-        None => return Ok(None),
-    };
-    let (tenant_id, client_id) = match (&env.tenant_id, &env.client_id) {
-        (Some(tenant_id), Some(client_id)) => (tenant_id, client_id),
-        (tenant_id, _) => {
-            let missing = if tenant_id.is_none() {
-                "`AZURE_TENANT_ID` is"
-            } else {
-                "`AZURE_CLIENT_ID` is"
-            };
-            return IncompleteWorkloadIdentitySnafu {
-                key: key.url.clone(),
-                missing,
-            }
-            .fail();
-        }
-    };
-    let exchange = Exchange::entra(
-        Some(env.authority_host.as_deref().unwrap_or(key.authority)),
-        tenant_id,
-        client_id.clone(),
-        key.scope,
-    )
-    .context(InvalidIdentitySnafu)?;
-    Ok(Some((source, exchange, origin)))
+    azure_credential::workload_identity(&key.target(), env)
+        .map_err(|error| key_vault_error(key, error))
 }
 
-/// `text` as a clause of a longer message: on one line, without a trailing period, and bounded.
-fn clause(text: &str) -> String {
-    let text = util::single_line(text);
-    let text = text.trim().trim_end_matches('.');
-    match text.char_indices().nth(MAX_REASON_LEN) {
-        Some((end, _)) => format!("{}…", &text[..end]),
-        None => text.to_string(),
-    }
-}
-
-/// An Azure SDK credential to try, as a message names it, and how long it has to answer.
-type Candidate = (
-    &'static str,
-    azure_core::Result<Arc<dyn TokenCredential>>,
-    Duration,
-);
-
-/// The first of `candidates` that gets an access token for `scope` within its budget, and its
-/// name; or, when none does, what each said, as a message lists them.
-async fn first_answering(
-    candidates: Vec<Candidate>,
-    scope: &str,
-) -> Result<(Arc<dyn TokenCredential>, &'static str), String> {
-    let mut tried = Vec::new();
-    for (name, credential, budget) in candidates {
-        let credential = match credential {
-            Ok(credential) => credential,
-            Err(error) => {
-                tried.push(format!("{name} ({})", clause(&error.to_string())));
-                continue;
-            }
-        };
-        match tokio::time::timeout(budget, credential.get_token(&[scope], None)).await {
-            Ok(Ok(_)) => return Ok((credential, name)),
-            Ok(Err(error)) => tried.push(format!("{name} ({})", clause(&error.to_string()))),
-            Err(_) => tried.push(format!("{name} (no answer within {}s)", budget.as_secs())),
-        }
-    }
-    Err(match tried.as_slice() {
-        [] => String::new(),
-        [only] => only.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-    })
-}
-
-/// How Spice gets access tokens for the vault.
-enum Identity {
-    /// A workload identity, exchanged by Spice and refreshed in the background.
-    Workload(Arc<dyn TokenProvider>),
-    /// An Azure SDK credential: a managed identity or the Azure CLI.
-    Credential {
-        credential: Arc<dyn TokenCredential>,
-        scope: &'static str,
-    },
-}
-
-impl Identity {
-    async fn access_token(&self) -> Result<String, KeyVaultError> {
-        match self {
-            Self::Workload(provider) => Ok(provider.get_token()),
-            Self::Credential { credential, scope } => credential
-                .get_token(&[scope], None)
-                .await
-                .map(|token| token.token.secret().to_string())
-                .map_err(|error| KeyVaultError::CredentialToken {
-                    reason: clause(&error.to_string()),
-                }),
-        }
-    }
+async fn access_token(identity: &Identity) -> Result<String, KeyVaultError> {
+    identity
+        .access_token()
+        .await
+        .map_err(|reason| KeyVaultError::CredentialToken { reason })
 }
 
 /// Key Vault's answer to a sign request.
@@ -444,53 +318,10 @@ impl KeyVaultSigner {
         key: KeyVaultKey,
         env: AzureIdentityEnvironment,
     ) -> Result<(Self, String), KeyVaultError> {
-        if let Some((source, exchange, origin)) = workload_identity(&key, &env)? {
-            let provider = WorkloadIdentityTokenProvider::try_new(component, source, exchange)
-                .await
-                .context(AccessTokenSnafu {
-                    key: key.url.clone(),
-                })?;
-            return Ok((
-                Self::new(key, Identity::Workload(Arc::new(provider)))?,
-                format!(
-                    "the Microsoft Entra workload identity in `AZURE_TENANT_ID` and `AZURE_CLIENT_ID`, with the identity token from {origin}"
-                ),
-            ));
-        }
-
-        let managed_identity =
-            ManagedIdentityCredential::new(Some(ManagedIdentityCredentialOptions {
-                user_assigned_id: env.client_id.clone().map(UserAssignedId::ClientId),
-                ..ManagedIdentityCredentialOptions::default()
-            }))
-            .map(|credential| credential as Arc<dyn TokenCredential>);
-        let azure_cli =
-            AzureCliCredential::new(None).map(|credential| credential as Arc<dyn TokenCredential>);
-        let candidates = vec![
-            (
-                "a managed identity",
-                managed_identity,
-                MANAGED_IDENTITY_BUDGET,
-            ),
-            ("the Azure CLI", azure_cli, AZURE_CLI_BUDGET),
-        ];
-        match first_answering(candidates, key.scope).await {
-            Ok((credential, name)) => {
-                let scope = key.scope;
-                Ok((
-                    Self::new(key, Identity::Credential { credential, scope })?,
-                    match name {
-                        "the Azure CLI" => "the Azure CLI's signed-in account".to_string(),
-                        _ => "the workload's managed identity".to_string(),
-                    },
-                ))
-            }
-            Err(tried) => NoIdentitySnafu {
-                key: key.url.clone(),
-                tried,
-            }
-            .fail(),
-        }
+        let resolved = azure_credential::resolve(component, &key.target(), &env)
+            .await
+            .map_err(|error| key_vault_error(&key, error))?;
+        Ok((Self::new(key, resolved.identity)?, resolved.description))
     }
 
     fn new(key: KeyVaultKey, identity: Identity) -> Result<Self, KeyVaultError> {
@@ -511,7 +342,7 @@ impl KeyVaultSigner {
     }
 
     async fn sign(&self, digest: &[u8; 32]) -> Result<Vec<u8>, KeyVaultError> {
-        let access_token = self.identity.access_token().await?;
+        let access_token = access_token(&self.identity).await?;
         let response = self
             .http
             .post(format!("{}/sign?api-version={API_VERSION}", self.key.url))
@@ -584,7 +415,7 @@ fn refusal_hint(status: reqwest::StatusCode) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use aws_lc_rs::digest::{Digest as LcDigest, SHA256};
     use aws_lc_rs::rsa::{KeyPair, KeySize};
@@ -596,7 +427,7 @@ mod tests {
         response::{IntoResponse, Response},
         routing::post,
     };
-    use azure_core::credentials::{AccessToken, TokenRequestOptions};
+    use azure_core::credentials::{AccessToken, TokenCredential, TokenRequestOptions};
     use azure_core::time::OffsetDateTime;
     use token_provider::StaticTokenProvider;
 
@@ -830,7 +661,7 @@ mod tests {
         );
         let answering = FakeCredential::new(Ok("vault-token"), Duration::ZERO);
         let candidates = |answering: Option<Arc<FakeCredential>>| {
-            let mut candidates: Vec<Candidate> = vec![
+            let mut candidates: Vec<azure_credential::Candidate> = vec![
                 (
                     "a managed identity",
                     Ok(Arc::clone(&hanging) as Arc<dyn TokenCredential>),
@@ -860,30 +691,34 @@ mod tests {
             candidates
         };
 
-        let (credential, name) =
-            first_answering(candidates(Some(Arc::clone(&answering))), key().scope)
-                .await
-                .expect("the last candidate answers");
-        assert_eq!(name, "the last resort");
-        let token = credential
-            .get_token(&[key().scope], None)
-            .await
-            .expect("a token");
-        assert_eq!(token.token.secret(), "vault-token");
+        let resolved = azure_credential::resolve_with(
+            "dataset 'issues' (github)",
+            &key().target(),
+            &AzureIdentityEnvironment::default(),
+            candidates(Some(Arc::clone(&answering))),
+        )
+        .await
+        .expect("the last candidate answers");
+        assert_eq!(resolved.description, "the workload's managed identity");
+        assert_eq!(
+            access_token(&resolved.identity).await.expect("a token"),
+            "vault-token"
+        );
         assert_eq!(
             *answering.scopes.lock().expect("lock"),
             vec!["https://vault.azure.net/.default".to_string(); 2]
         );
 
-        let tried = first_answering(candidates(None), key().scope)
-            .await
-            .expect_err("no candidate answers");
+        let error = azure_credential::resolve_with(
+            "dataset 'issues' (github)",
+            &key().target(),
+            &AzureIdentityEnvironment::default(),
+            candidates(None),
+        )
+        .await
+        .expect_err("no candidate answers");
         assert_eq!(
-            KeyVaultError::NoIdentity {
-                key: key().url,
-                tried
-            }
-            .to_string(),
+            key_vault_error(&key(), error).to_string(),
             "Found no Microsoft Entra identity to sign with the Azure Key Vault key 'https://spice-ci.vault.azure.net/keys/github-app'. Tried a workload identity (`AZURE_FEDERATED_TOKEN_FILE` is not set, and this is not a GitHub Actions job with `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `permissions: id-token: write`), a managed identity (no answer within 0s), a broken credential (Azure Arc managed identity isn't supported) and the Azure CLI (ERROR: Please run 'az login' to setup account). On AKS, label the pod `azure.workload.identity/use: \"true\"`; on an Azure VM, App Service or Container Apps, assign the workload a managed identity; locally, run `az login`."
         );
     }
@@ -965,7 +800,7 @@ mod tests {
             (
                 Identity::Credential {
                     credential: FakeCredential::new(Ok("managed-access-token"), Duration::ZERO),
-                    scope: "https://vault.azure.net/.default",
+                    scope: "https://vault.azure.net/.default".to_string(),
                 },
                 "Bearer managed-access-token",
             ),

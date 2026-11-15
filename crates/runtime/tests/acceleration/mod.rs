@@ -31,24 +31,15 @@ mod cayenne_append_timestamptz;
 mod cayenne_maintained_aggregates;
 mod cayenne_memory;
 mod cayenne_on_conflict_batches;
-#[cfg(feature = "duckdb")]
-mod checkpoint_duckdb;
 #[cfg(feature = "postgres-accel")]
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
-#[cfg(feature = "duckdb")]
 mod cron;
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+#[cfg(feature = "sqlite")]
 mod decimal_division;
-#[cfg(feature = "duckdb")]
-mod duckdb_builtin_pushdown;
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+#[cfg(feature = "sqlite")]
 mod empty_projection_scan;
-#[cfg(feature = "duckdb")]
-mod file_create_duckdb;
-#[cfg(feature = "duckdb")]
-mod file_swap_duckdb;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
 mod hash_index;
@@ -77,8 +68,6 @@ mod reload_file_accelerated;
 mod retention_arrow;
 mod retention_cayenne;
 mod settings_change_cayenne;
-#[cfg(feature = "duckdb")]
-mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
