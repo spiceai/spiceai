@@ -207,6 +207,31 @@ mod tests {
         );
     }
 
+    /// The HTTP `/v1/sql` repro shape: one positional `$1` shared by
+    /// `text_search`, `vector_search`, and `rrf` over both.
+    #[test]
+    fn binds_positional_placeholder_in_each_search_function() {
+        let params = ParamValues::from(vec![ScalarValue::Utf8(Some("almond".to_string()))]);
+        for (sql, expected) in [
+            (
+                "SELECT count(*) FROM text_search(part, $1, p_name, 1000000)",
+                "SELECT count(*) FROM text_search(part, 'almond', p_name, 1000000)",
+            ),
+            (
+                "SELECT count(*) FROM vector_search(part, $1, p_name, 10)",
+                "SELECT count(*) FROM vector_search(part, 'almond', p_name, 10)",
+            ),
+            (
+                "SELECT * FROM rrf(text_search(part, $1, p_name), vector_search(part, $1, p_name))",
+                "SELECT * FROM rrf(text_search(part, 'almond', p_name), vector_search(part, 'almond', p_name))",
+            ),
+        ] {
+            let (bound, found) = bind(sql, Some(&params));
+            assert_eq!(found, TableFunctionPlaceholders::Present, "{sql}");
+            assert_eq!(bound, expected);
+        }
+    }
+
     #[test]
     fn leaves_placeholders_outside_table_function_args() {
         let params = ParamValues::from(vec![
