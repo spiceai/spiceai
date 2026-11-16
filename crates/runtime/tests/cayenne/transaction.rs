@@ -146,7 +146,7 @@ pub(crate) async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>,
     );
     let df = rt.datafusion();
     context
-        .scope(async move { run_transaction(&df, &statements, None, false).await })
+        .scope(async move { run_transaction(&df, &statements, None, false, |_| 0).await })
         .await
         .map(|outcome| {
             outcome
