@@ -695,6 +695,43 @@ mod tests {
         assert!(matches!(update.update_type, UpdateType::Append));
     }
 
+    /// A subscription opened while a fenced commit runs waits for its publish,
+    /// and reads that commit's sequence number as its snapshot's.
+    #[tokio::test]
+    async fn a_snapshot_subscription_waits_for_a_running_commit() {
+        let broadcaster = DataUpdateBroadcaster::new();
+        let table_reference = TableReference::bare("cdc_table");
+        let mut earlier = broadcaster.subscribe(&table_reference).await;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let update = DataUpdate {
+            schema: Arc::clone(&schema),
+            data: vec![one_column_batch(&schema, vec![1])],
+            update_type: UpdateType::Append,
+        };
+
+        let guard = broadcaster.begin_commit(&table_reference).await;
+        let subscribing = tokio::spawn({
+            let broadcaster = broadcaster.clone();
+            let table_reference = table_reference.clone();
+            async move { broadcaster.subscribe_at_snapshot(&table_reference).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !subscribing.is_finished(),
+            "the subscription waits for the commit"
+        );
+        broadcaster
+            .publish_committed(&table_reference, guard, update.clone())
+            .await;
+        let (_later, fence) = subscribing.await.expect("subscribes");
+        assert_eq!(fence.sequence, 1);
+        assert_eq!(earlier.recv_sequenced().await.expect("update").sequence, 1);
+        drop(fence);
+
+        broadcaster.publish(&table_reference, update).await;
+        assert_eq!(earlier.recv_sequenced().await.expect("update").sequence, 2);
+    }
+
     #[tokio::test]
     async fn data_update_broadcaster_prunes_channels_without_subscribers() {
         let broadcaster = DataUpdateBroadcaster::new();
