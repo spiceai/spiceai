@@ -57,6 +57,9 @@ inputs:
   minio_secret_key:
     description: 'MinIO secret key for sccache'
     required: false
+  minio_session_token:
+    description: 'Session token of temporary MinIO credentials.'
+    required: false
   spiceio_endpoint:
     description: 'Spiceio S3-compatible endpoint for sccache (macOS)'
     required: false
@@ -187,12 +190,13 @@ runs:
 
     - name: Set up sccache
       if: steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
-      uses: ./.github/actions/setup-sccache
+      uses: $/.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
         spiceio_endpoint: ${{ inputs.spiceio_endpoint }}
         minio_access_key: ${{ inputs.minio_access_key }}
         minio_secret_key: ${{ inputs.minio_secret_key }}
+        minio_session_token: ${{ inputs.minio_session_token }}
 
     - name: Resolve build paths
       id: resolve-build-paths
@@ -223,6 +227,7 @@ runs:
         CARGO_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        AWS_SESSION_TOKEN: ${{ inputs.minio_session_token }}
         CARGO_INCREMENTAL: 0
         CARGO_NET_GIT_FETCH_WITH_CLI: true
         # Skip Metal kernel precompilation on macOS to avoid requiring Xcode Metal Toolchain
@@ -240,6 +245,7 @@ runs:
       env:
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        AWS_SESSION_TOKEN: ${{ inputs.minio_session_token }}
         CARGO_INCREMENTAL: 0
         CARGO_NET_GIT_FETCH_WITH_CLI: true
         MISTRALRS_METAL_PRECOMPILE: 0
@@ -259,6 +265,7 @@ runs:
         CARGO_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        AWS_SESSION_TOKEN: ${{ inputs.minio_session_token }}
         CARGO_INCREMENTAL: 0
         CARGO_NET_GIT_FETCH_WITH_CLI: true
       run: |
@@ -316,7 +323,7 @@ runs:
 
     - name: Upload spiced artifact
       if: inputs.upload_artifact == 'true' && inputs.build_cli != 'true'
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: ${{ inputs.artifact_name }}
         path: spiced${{ steps.detect-os.outputs.ext }}
@@ -324,7 +331,7 @@ runs:
 
     - name: Upload spiced and spice CLI artifacts
       if: inputs.upload_artifact == 'true' && inputs.build_cli == 'true'
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: ${{ inputs.artifact_name }}
         path: |

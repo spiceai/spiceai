@@ -101,6 +101,7 @@ pub fn create_stream_choice(
     ChatChoiceStream {
         index,
         delta: ChatCompletionStreamResponseDelta {
+            reasoning_content: None,
             content,
             role,
             #[expect(deprecated)]

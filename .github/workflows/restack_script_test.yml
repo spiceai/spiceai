@@ -34,8 +34,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   test-restack-script:
+    environment: secret-free
     name: Unit tests for the restack helper (${{ matrix.os }})
     # Both platforms, because the helper has to tell GNU tools from BSD ones:
     # stat's format flag differs, BSD chmod has no --, and a check that reads the

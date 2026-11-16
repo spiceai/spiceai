@@ -104,8 +104,8 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
     writeln!(
         md,
         "Engine roles: **standalone-*** = out-of-Spice oracle crates \
-         (`duckdb`, `rusqlite`, `chdb-rust`); **spice-*** = Spice accelerators \
-         (Cayenne, DuckDB accel, SQLite accel)."
+         (`duckdb-oracle`, `rusqlite`, `chdb-rust`); **spice-*** = Spice accelerators \
+         (Cayenne, SQLite accel)."
     )
     .ok();
     writeln!(md).ok();

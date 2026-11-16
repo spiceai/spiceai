@@ -14,13 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Decimal `/` on a `DuckDB` acceleration must match local `DataFusion`
-//! evaluation, not the `DOUBLE` that `DuckDB` answers for `//`.
-//!
-//! A `DECIMAL(38, 10)` whose magnitude is past `2^53` is the witness: the
-//! integer digits of `amt/3` change when the divide is pushed down as `//`
-//! and the double is cast back to a decimal. Integer `/` must still be
-//! integer division (`n/2` of 7 is 3) and still federate as `//`.
+//! Decimal `/` on a `SQLite` acceleration stays out of the pushed-down SQL and
+//! matches local `DataFusion` evaluation, and integer `/` stays integer
+//! division (`n/2` of 7 is 3).
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -121,12 +117,6 @@ const DECIMAL_SQL: &str =
     "SELECT id, amt/3 AS a3, price/7 AS p7 FROM {table} WHERE id IN (1, 5, 8) ORDER BY id";
 const INTEGER_SQL: &str = "SELECT n/2 AS half FROM {table} WHERE id = 1";
 
-/// Digits `DuckDB` returns when `amt/3` for id=5 is evaluated as a `DOUBLE`
-/// and cast back to a decimal. The exact answer's integer digits are
-/// `33333333333333333333`.
-const DOUBLE_GARBAGE_ID5: &str = "33333333333333333440";
-const EXACT_ID5: &str = "33333333333333333333";
-const EXACT_ID8: &str = "4115226300411522630";
 const TRUNCATING_PRICE: &str = "0.014285";
 const ROUNDED_PRICE: &str = "0.014286";
 
@@ -146,93 +136,6 @@ fn first_i64(batches: &[RecordBatch]) -> anyhow::Result<i64> {
         values.len()
     );
     Ok(values.value(0))
-}
-
-async fn check_duckdb(mode: &Mode) -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let parquet = dir.path().join("tricky.parquet");
-    write_tricky_parquet(&parquet)?;
-
-    let app = AppBuilder::new("decimal_division")
-        .with_dataset(parquet_dataset(&parquet, "t_fed", None, mode))
-        .with_dataset(parquet_dataset(&parquet, "t_duckdb", Some("duckdb"), mode))
-        .build();
-    configure_test_datafusion();
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-    let result: anyhow::Result<()> = async {
-        load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
-
-        let decimal_sql_fed = DECIMAL_SQL.replace("{table}", "t_fed");
-        let decimal_sql_duck = DECIMAL_SQL.replace("{table}", "t_duckdb");
-        let fed = run_query(&rt, &decimal_sql_fed).await?;
-        let duck = run_query(&rt, &decimal_sql_duck).await?;
-        let fed_pretty = to_pretty_display(&fed)?.to_string();
-        let duck_pretty = to_pretty_display(&duck)?.to_string();
-        anyhow::ensure!(
-            duck_pretty == fed_pretty,
-            "DuckDB {mode:?}: decimal / must match the unaccelerated table\nfed:\n{fed_pretty}\nduckdb:\n{duck_pretty}"
-        );
-        anyhow::ensure!(
-            duck_pretty.contains(EXACT_ID5) && duck_pretty.contains(EXACT_ID8),
-            "DuckDB {mode:?}: expected exact digits of amt/3 past 2^53, got:\n{duck_pretty}"
-        );
-        anyhow::ensure!(
-            !duck_pretty.contains(DOUBLE_GARBAGE_ID5),
-            "DuckDB {mode:?}: amt/3 came back through f64:\n{duck_pretty}"
-        );
-        anyhow::ensure!(
-            duck_pretty.contains(TRUNCATING_PRICE) && !duck_pretty.contains(ROUNDED_PRICE),
-            "DuckDB {mode:?}: price/7 must truncate the way DataFusion does, got:\n{duck_pretty}"
-        );
-
-        let decimal_plan = run_query(&rt, &format!("EXPLAIN {decimal_sql_duck}")).await?;
-        let decimal_pushed = pushed_down_sql(&decimal_plan)?;
-        anyhow::ensure!(
-            !decimal_pushed.contains("//"),
-            "DuckDB {mode:?}: decimal / must not be pushed as `//`; pushed down: {decimal_pushed}"
-        );
-        anyhow::ensure!(
-            decimal_pushed.contains("amt"),
-            "DuckDB {mode:?}: the scan must still federate the decimal column; pushed down: {decimal_pushed}"
-        );
-
-        let integer_sql = INTEGER_SQL.replace("{table}", "t_duckdb");
-        let integer = run_query(&rt, &integer_sql).await?;
-        let half = first_i64(&integer)?;
-        anyhow::ensure!(
-            half == 3,
-            "DuckDB {mode:?}: integer / must stay integer division (7/2 = 3), got {half}"
-        );
-        let integer_plan = run_query(&rt, &format!("EXPLAIN {integer_sql}")).await?;
-        let integer_pushed = pushed_down_sql(&integer_plan)?;
-        anyhow::ensure!(
-            integer_pushed.contains("//"),
-            "DuckDB {mode:?}: integer / must still federate as `//`; pushed down: {integer_pushed}"
-        );
-        Ok(())
-    }
-    .await;
-    rt.shutdown().await;
-    result
-}
-
-#[cfg(feature = "duckdb")]
-#[tokio::test]
-async fn duckdb_decimal_division_matches_federated() -> anyhow::Result<()> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-    test_request_context()
-        .scope(async {
-            let mut failures = Vec::new();
-            for mode in [Mode::Memory, Mode::File] {
-                if let Err(error) = check_duckdb(&mode).await {
-                    failures.push(format!("{error:#}"));
-                }
-            }
-            anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
-            Ok(())
-        })
-        .await
 }
 
 /// `SQLite` stores a wide decimal through a double (#14662), so `amt/3` on

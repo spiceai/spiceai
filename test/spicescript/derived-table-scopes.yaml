@@ -1,0 +1,135 @@
+name: derived-table-scopes
+description: >
+  Joins of aliased derived tables, whose subqueries repeat an expression over an
+  aliased LEFT JOIN, answer the way PostgreSQL does. Federated PostgreSQL, MySQL
+  and DuckDB and a Cayenne acceleration agree on the query from
+  apache/datafusion#22961, on outputs whose names collide inside a derived table,
+  and on aggregates, filters, a CTE read twice and a window over those tables,
+  with NULLs, a zero divisor and a product with no category in the data.
+  String comparisons avoid values whose match depends on case, which MySQL
+  ignores (#15545).
+
+sources:
+  pg: { kind: postgres }
+  my: { kind: mysql }
+  duck: { kind: duckdb }
+
+variants:
+  postgres: {}
+  mysql:
+    datasets:
+      order_items: { from: 'mysql:order_items', params: '${sources.my.params}' }
+      orders: { from: 'mysql:orders', params: '${sources.my.params}' }
+      products: { from: 'mysql:products', params: '${sources.my.params}' }
+      categories: { from: 'mysql:categories', params: '${sources.my.params}' }
+  duckdb:
+    datasets:
+      order_items: { from: 'duckdb:order_items', params: '${sources.duck.params}' }
+      orders: { from: 'duckdb:orders', params: '${sources.duck.params}' }
+      products: { from: 'duckdb:products', params: '${sources.duck.params}' }
+      categories: { from: 'duckdb:categories', params: '${sources.duck.params}' }
+  cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: derived-table-scopes
+  datasets:
+    - { from: 'postgres:public.order_items', name: order_items, params: '${sources.pg.params}' }
+    - { from: 'postgres:public.orders', name: orders, params: '${sources.pg.params}' }
+    - { from: 'postgres:public.products', name: products, params: '${sources.pg.params}' }
+    - { from: 'postgres:public.categories', name: categories, params: '${sources.pg.params}' }
+
+defaults:
+  expect: { oracle: pg }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      pg: &schema |
+        CREATE TABLE categories (category_id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(32), parent_id INTEGER, display_rank INTEGER);
+        CREATE TABLE products (product_id INTEGER NOT NULL PRIMARY KEY, category_id INTEGER, sku VARCHAR(16), name VARCHAR(32), price DECIMAL(10,2), cost DECIMAL(10,2), weight_kg DECIMAL(6,3), is_active BOOLEAN, stock_qty INTEGER);
+        CREATE TABLE orders (order_id INTEGER NOT NULL PRIMARY KEY, customer_id INTEGER, order_date DATE, status VARCHAR(16), channel VARCHAR(16), discount_pct DECIMAL(5,2), shipping_cost DECIMAL(8,2));
+        CREATE TABLE order_items (item_id INTEGER NOT NULL PRIMARY KEY, order_id INTEGER, product_id INTEGER, quantity INTEGER, unit_price DECIMAL(10,2));
+        INSERT INTO categories VALUES (1, 'tools', NULL, 1), (2, 'toys', NULL, 2), (3, 'garden', 1, 3);
+        INSERT INTO products VALUES
+          (10, 1, 's10', 'hammer', 20.00, 12.50, 1.200, true, 5),
+          (11, 2, 's11', 'kite', 0.00, 3.00, 0.300, true, 9),
+          (12, NULL, 's12', 'misc', 7.50, 7.50, 0.100, false, 0),
+          (13, 3, 's13', 'rake', 15.25, NULL, 2.000, true, 3),
+          (14, 2, 's14', 'tools', 9.99, 4.00, 0.500, NULL, NULL);
+        INSERT INTO orders VALUES
+          (100, 7, DATE '2026-01-02', 'completed', 'Web', NULL, 4.99),
+          (101, 8, DATE '2026-01-03', 'Pending', 'Store', 0.10, NULL),
+          (102, 7, DATE '2026-01-05', 'shipped', NULL, 0.05, 0.00),
+          (103, 9, NULL, NULL, 'web', NULL, NULL);
+        INSERT INTO order_items VALUES
+          (1, 100, 10, 2, 19.99), (2, 100, 11, 1, 2.50), (3, 101, 12, 4, 7.50),
+          (4, 102, 13, NULL, 15.25), (5, 102, 14, 3, NULL), (6, 103, 10, 1, 20.00),
+          (7, 103, 99, 2, 1.00), (8, NULL, 11, 5, 0.00);
+  - source-exec: { my: *schema }
+  - source-exec: { duck: *schema }
+  - start: {}
+
+  # The query from apache/datafusion#22961: common-subexpression elimination pulls
+  # `p.price - p.cost` out of the `p` subquery, which reads an aliased LEFT JOIN.
+  # The columns are listed instead of `*`, whose order after USING differs between
+  # engines. `status` is compared as stored: MySQL compares strings without regard
+  # to case (#15545), so the data holds no value that only a case-insensitive
+  # comparison would match.
+  - query: >-
+      SELECT order_id, product_id, item_id, quantity, unit_price, line_total, customer_id, order_date,
+             status, channel, discount_pct, shipping_cost, is_fulfilled, category_id, sku, product_name,
+             price, cost, weight_kg, is_active, stock_qty, gross_margin, margin_pct, category_name FROM
+      (SELECT item_id, order_id, product_id, quantity, unit_price, quantity * unit_price AS line_total FROM order_items) oi
+      JOIN (SELECT order_id, customer_id, order_date, lower(status) AS status, lower(channel) AS channel,
+            coalesce(discount_pct, 0) AS discount_pct, coalesce(shipping_cost, 0) AS shipping_cost,
+            status IN ('completed', 'shipped') AS is_fulfilled FROM orders) o USING (order_id)
+      JOIN (SELECT p.product_id, p.category_id, p.sku, p.name AS product_name, p.price, p.cost, p.weight_kg,
+            p.is_active, p.stock_qty, round(p.price - p.cost, 2) AS gross_margin,
+            round((p.price - p.cost) / nullif(p.price, 0), 4) AS margin_pct, c.name AS category_name
+            FROM products p LEFT JOIN categories c USING (category_id)) p USING (product_id)
+
+  # Two outputs named `name` inside the derived table, read back under new names,
+  # beside a repeated expression.
+  - query: >-
+      SELECT product_name, category_name, m, m2 FROM
+      (SELECT p.name AS product_name, c.name AS category_name, p.price - p.cost AS m, (p.price - p.cost) * 2 AS m2
+       FROM products p LEFT JOIN categories c USING (category_id)) x
+  - query: >-
+      SELECT x.product_id, x.pname, x.cname, x.d FROM
+      (SELECT p.product_id, p.name AS pname, c.name AS cname, p.price - p.cost AS d FROM products p LEFT JOIN categories c ON p.category_id = c.category_id) x
+      WHERE x.pname = x.cname OR x.cname IS NULL
+
+  # Aggregates and filters over the derived join.
+  - query: >-
+      SELECT category_name, count(*) AS n, sum(line_total) AS revenue, max(gross_margin) AS best FROM
+      (SELECT item_id, product_id, quantity * unit_price AS line_total FROM order_items) oi
+      JOIN (SELECT p.product_id, round(p.price - p.cost, 2) AS gross_margin, c.name AS category_name
+            FROM products p LEFT JOIN categories c USING (category_id)) p USING (product_id)
+      GROUP BY category_name
+  - query: >-
+      SELECT p.product_id, p.gross_margin FROM
+      (SELECT p.product_id, round(p.price - p.cost, 2) AS gross_margin, round((p.price - p.cost) / nullif(p.price, 0), 4) AS margin_pct
+       FROM products p LEFT JOIN categories c USING (category_id)) p
+      WHERE p.gross_margin > 0 AND p.margin_pct IS NOT NULL
+  - query: >-
+      SELECT o.status, count(*) AS n FROM
+      (SELECT order_id, lower(status) AS status, status IN ('completed', 'shipped') AS is_fulfilled FROM orders) o
+      JOIN order_items oi USING (order_id)
+      WHERE NOT o.is_fulfilled OR o.is_fulfilled IS NULL
+      GROUP BY o.status
+
+  # A CTE read twice, and a window over a derived table.
+  - query: >-
+      WITH margins AS (SELECT p.product_id, p.price - p.cost AS d, c.name AS category_name
+                       FROM products p LEFT JOIN categories c USING (category_id))
+      SELECT a.product_id, a.d, b.product_id AS peer FROM margins a JOIN margins b
+        ON a.category_name = b.category_name AND a.product_id < b.product_id
+  - query: >-
+      SELECT order_id, item_id, line_total,
+             row_number() OVER (PARTITION BY order_id ORDER BY item_id) AS rn
+      FROM (SELECT item_id, order_id, quantity * unit_price AS line_total FROM order_items) oi
+      WHERE order_id IS NOT NULL

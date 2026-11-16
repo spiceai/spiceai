@@ -53,6 +53,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'schedule' && (github.event.schedule == '0 0 * * 0' && 'weekly' || 'daily')) || ((github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly') && github.event.inputs.schedule) || github.run_id }}
   cancel-in-progress: false
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # Resolves which schedule this run dispatches (the cron that fired, or the manual `schedule`
   # input) and for which branches. trunk dispatches the configs on that schedule. A release
@@ -61,6 +65,7 @@ jobs:
   # release branch is the newest `release/<major>.<minor>`; `release/<version>-rc.<n>` branches are
   # not planned.
   plan-scheduled:
+    environment: secret-free
     name: Plan scheduled dispatch
     runs-on: ubuntu-24.04
     if: ${{ github.event_name == 'schedule' || github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly' }}
@@ -103,10 +108,15 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   dispatch-scheduled:
+    environment: ci
     name: Dispatch tests - Scheduled (${{ matrix.branch }})
     needs: plan-scheduled
     if: ${{ needs.plan-scheduled.outputs.matrix != '[]' }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      actions: write  # dispatches the benchmark workflows and re-runs failed ones
+      id-token: write  # RustFS credentials
     # dispatches the bench suite (including the chbench bench run) and returns once all child workflows are dispatched
     timeout-minutes: 720
     strategy:
@@ -123,15 +133,24 @@ jobs:
           persist-credentials: false
           ref: ${{ matrix.branch }}
 
-      - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: $/.github/actions/rustfs-credentials
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '43200'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: $/.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           ref: refs/heads/${{ matrix.branch }}
@@ -293,7 +312,7 @@ jobs:
 
       - name: Upload the record of the re-run
         if: ${{ steps.retry.outputs.record == 'true' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.retry.outputs.marker }}
           path: retried-commit.txt
@@ -301,20 +320,22 @@ jobs:
 
       - name: Build Testoperator
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         id: build-spicepod-validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Set spicepod validator path
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
@@ -346,6 +367,32 @@ jobs:
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
           done
+
+      # This workflow is trunk's, but the release job checks out the release branch, which can predate
+      # the SF10 memory-mode config (release/2.4 does). Trunk must carry it; a release branch without
+      # it skips only this config and still runs the rest of its suite.
+      - name: Check for the TPCH SF10 memory-mode config
+        id: sf10-memory
+        if: ${{ steps.benchmarked.outputs.skip != 'true' }}
+        env:
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          spicepod='./test/spicepods/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml'
+          dispatch='./tools/testoperator/dispatch/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml'
+          if [ -f "$spicepod" ] && [ -f "$dispatch" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          elif [ "$BRANCH" = trunk ]; then
+            echo "::error::trunk is missing $spicepod or $dispatch, which the SF10 memory-mode steps run"
+            exit 1
+          else
+            echo "::notice::$BRANCH has no SF10 memory-mode config ($spicepod, $dispatch); skipping it"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate spicepods - TPCH - SF10 memory mode
+        if: ${{ steps.benchmarked.outputs.skip != 'true' && steps.sf10-memory.outputs.present == 'true' }}
+        run: |
+          "$SPICEPOD_VALIDATOR" "./test/spicepods/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml"
 
       - name: Validate spicepods - TPCH - SF100
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
@@ -434,6 +481,18 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
+      # Cayenne memory mode holds every table as Arrow in RAM, so TPC-H SF100 (about 145 GiB) does
+      # not fit a large runner; SF10 is the largest scale it runs at. Only this config is dispatched
+      # from tpch/sf10.
+      - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF10 memory mode
+        if: ${{ steps.benchmarked.outputs.skip != 'true' && steps.sf10-memory.outputs.present == 'true' }}
+        run: |
+          testoperator dispatch "./tools/testoperator/dispatch/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml" --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF100
         if: ${{ steps.benchmarked.outputs.skip != 'true' }}
         run: |
@@ -501,15 +560,20 @@ jobs:
 
       - name: Upload the benchmarked release commit
         if: ${{ matrix.schedule == '' && steps.benchmarked.outputs.skip != 'true' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.benchmarked.outputs.marker }}
           path: benchmarked-commit.txt
           retention-days: 60
 
   dispatch-input:
+    environment: ci
     name: Dispatch tests - Input
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      actions: write  # dispatches the benchmark workflows
+      id-token: write  # RustFS credentials
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'daily' && github.event.inputs.schedule != 'weekly' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.ref }}
@@ -519,15 +583,24 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: $/.github/actions/rustfs-credentials
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '21600'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: $/.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
@@ -537,19 +610,21 @@ jobs:
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         id: build-spicepod-validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Set spicepod validator path
         run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
@@ -577,6 +652,10 @@ jobs:
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
           done
+
+      - name: Validate spicepods - TPCH - SF10 memory mode
+        run: |
+          "$SPICEPOD_VALIDATOR" "./test/spicepods/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml"
 
       - name: Validate spicepods - TPCH - SF100
         run: |
@@ -617,6 +696,16 @@ jobs:
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - ClickBench
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF10 memory mode
+        run: |
+          testoperator dispatch "./tools/testoperator/dispatch/tpch/sf10/accelerated/s3[parquet]-cayenne[memory].yaml" \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:

@@ -55,7 +55,7 @@ use rcgen::{
 };
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use runtime_auth::IdentitySource;
-use runtime_tls::TlsConfig;
+use runtime_tls::{ClientTrustPem, TlsConfig};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -154,7 +154,7 @@ async fn start_runtime_with_mtls(
     let tls_config = TlsConfig::try_new_with_client_auth_mode(
         pki.server_cert_pem.as_bytes(),
         pki.server_key_pem.as_bytes(),
-        Some(pki.ca_pem.as_bytes()),
+        Some(ClientTrustPem::ca_only(pki.ca_pem.as_bytes())),
         enforcement,
     )
     .expect("valid TlsConfig with client auth");

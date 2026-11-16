@@ -118,13 +118,17 @@ pub async fn to_pretty(agg: AggregationResult) -> Result<impl Display, ArrowErro
     Ok(doc_sets.join("\n"))
 }
 
+/// Merges every dataset's matches by score, keeping at most `limit` from each dataset.
 pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Result<Vec<Match>> {
     let mut matches: Vec<Match> = Vec::new();
     for (a, b) in result {
         let mut o = to_matches(&a, b).await.context(SearchAggregationSnafu)?;
         matches.append(&mut o);
     }
+    Ok(sort_matches(matches, limit))
+}
 
+fn sort_matches(matches: Vec<Match>, limit: usize) -> Vec<Match> {
     // Sort by score descending, then by dataset + primary key ascending for deterministic ordering on ties.
     // Serialize each primary key once (via BTreeMap, so the JSON key order is
     // deterministic despite HashMap hash randomization) rather than re-serializing
@@ -146,9 +150,16 @@ pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Resu
             .then_with(|| a_pk.cmp(b_pk))
     });
 
-    let mut matches: Vec<Match> = decorated.into_iter().map(|(_, m)| m).collect();
-    matches.truncate(limit);
-    Ok(matches)
+    let mut per_dataset: HashMap<String, usize> = HashMap::new();
+    decorated
+        .into_iter()
+        .map(|(_, m)| m)
+        .filter(|m| {
+            let kept = per_dataset.entry(m.dataset.clone()).or_default();
+            *kept += 1;
+            *kept <= limit
+        })
+        .collect()
 }
 
 /// Consumes [`AggregationResult`] and converts all results to [`Match`] format.
@@ -303,6 +314,40 @@ mod tests {
         );
 
         assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
+    }
+
+    #[test]
+    fn the_limit_applies_to_each_dataset() {
+        let make_match = |score: f64, dataset: &str| Match {
+            score,
+            dataset: dataset.to_string(),
+            primary_key: HashMap::new(),
+            matches: HashMap::new(),
+            data: HashMap::new(),
+            metadata: HashMap::new(),
+        };
+        let matches = vec![
+            make_match(0.9, "high"),
+            make_match(0.8, "high"),
+            make_match(0.7, "high"),
+            make_match(0.1, "low"),
+            make_match(0.05, "low"),
+        ];
+
+        let kept = sort_matches(matches, 2)
+            .into_iter()
+            .map(|m| (m.dataset, m.score))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kept,
+            vec![
+                ("high".to_string(), 0.9),
+                ("high".to_string(), 0.8),
+                ("low".to_string(), 0.1),
+                ("low".to_string(), 0.05),
+            ]
+        );
     }
 
     /// Regression test: sorting matches with composite primary keys must produce

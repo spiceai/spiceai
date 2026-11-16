@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use aws_config::ConfigLoader;
 use aws_sdk_credential_bridge::{
-    initiate_config_auth_iam_env, initiate_config_auth_iam_metadata, initiate_config_auth_key,
-    initiate_config_default_auth,
+    AwsConfigLoader, initiate_config_auth_iam_env, initiate_config_auth_iam_metadata,
+    initiate_config_auth_key, initiate_config_default_auth,
 };
 use runtime_parameters::{ParamLookup, Parameters};
 use snafu::prelude::*;
@@ -221,9 +220,9 @@ impl Validator for AuthValidator {
     }
 }
 
-/// Initiate a [`ConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
+/// Initiate a [`AwsConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
 ///
-/// Return [`ConfigLoader`] to allow further customisation.
+/// Return [`AwsConfigLoader`] to allow further customisation.
 ///
 /// # Errors
 ///
@@ -237,7 +236,7 @@ pub async fn initiate_config_with_credentials(
     token_name: &'static str,
     params: &Parameters,
     iam_role_source: Option<&str>,
-) -> Result<ConfigLoader, Error> {
+) -> Result<AwsConfigLoader, Error> {
     let region = params
         .get(region_name)
         .expose()
@@ -270,13 +269,13 @@ pub async fn initiate_config_with_credentials(
     .await)
 }
 
-/// Initiate a [`ConfigLoader`] with AWS credentials using an explicit authentication method from [`Parameters`].
+/// Initiate a [`AwsConfigLoader`] with AWS credentials using an explicit authentication method from [`Parameters`].
 ///
 /// Supports two authentication methods:
 /// - `iam_role`: IAM role-based authentication with configurable source (`auto`, `metadata`, `env`)
 /// - `key`: Explicit access key credentials
 ///
-/// Return [`ConfigLoader`] to allow further customisation.
+/// Return [`AwsConfigLoader`] to allow further customisation.
 ///
 /// A generic AWS auth helper (parameterized by `provider_name`), used by AWS
 /// connector crates such as `connector-dynamodb` as well as the runtime's own
@@ -297,7 +296,7 @@ pub async fn initiate_config_with_auth_method(
     secret_name: &'static str,
     token_name: &'static str,
     params: &Parameters,
-) -> Result<ConfigLoader, Error> {
+) -> Result<AwsConfigLoader, Error> {
     let region = params
         .get(region_name)
         .expose()

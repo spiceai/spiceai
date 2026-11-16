@@ -12,6 +12,8 @@ sources:
 variants:
   limited: {}
   unlimited: { spicepod: { runtime: { flight: { do_put_rate_limit_enabled: false } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 # DoPut requires an API key.
 
@@ -38,7 +40,7 @@ steps:
   # however busy the machine.
   - flight-put: { dataset: items, rows: [[1, one]], times: 150 }
     expect-error: Too many requests
-    only: limited
+    only: [limited, object-native]
   - flight-put: { dataset: items, rows: [[1, one]], times: 150 }
     only: unlimited
   - query: SELECT id, name FROM items

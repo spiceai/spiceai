@@ -36,7 +36,7 @@
         "--concurrency",
         "10",
         "-p",
-        "./test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml"
+        "./test/spicepods/search/mteb/quora/full_text_search-cayenne[file].yaml"
       ],
       "env": {},
       "cwd": "${workspaceFolder}",
@@ -63,7 +63,7 @@
         "--with-conflict-data",
         "--with-retention-data",
         "-p",
-        "./test/spicepods/tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_retention_period.yaml"
+        "./test/spicepods/tpch/sf1/accelerated/append/file[parquet]-cayenne[file]-append_retention_period.yaml"
       ],
       "env": {},
       "cwd": "${workspaceFolder}",

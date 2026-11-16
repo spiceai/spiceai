@@ -15,6 +15,7 @@ datasets:
         AuthenticationType=IAM Credentials;
         UID=${ env:AWS_ACCESS_KEY_ID };
         PWD=${ env:AWS_SECRET_ACCESS_KEY };
+        SessionToken=${ env:AWS_SESSION_TOKEN };
   - from: odbc:tpch.lineitem
     name: lineitem
     params: *odbc_params

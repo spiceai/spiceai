@@ -42,6 +42,7 @@ use tokio::sync::oneshot;
 use crate::{TEST_ARGS, init_tracing};
 
 mod create;
+mod evaluate;
 mod responses;
 mod streaming_tests;
 
@@ -170,6 +171,17 @@ static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
                     create::create_google("gemini-2.0-flash")
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to create google model: {e}"))
+                })
+            }),
+        },
+        TestModel {
+            name: "azure",
+            fetch_repo: None,
+            create: Box::new(|| {
+                Box::pin(async {
+                    create::create_azure()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to create azure model: {e}"))
                 })
             }),
         },
@@ -614,6 +626,7 @@ async fn test_basic(
     #[values(
         "anthropic",
         "openai",
+        "azure",
         "xai",
         "local_phi3",
         "hf_phi3",
@@ -667,6 +680,7 @@ async fn test_usage(
     #[values(
         "anthropic",
         "openai",
+        "azure",
         "xai",
         "local_phi3",
         "hf_phi3",
@@ -771,7 +785,16 @@ async fn test_reasoning_usage(
 #[rstest]
 #[tokio::test]
 async fn test_system_prompt(
-    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3", "google")] model_name: &str,
+    #[values(
+        "anthropic",
+        "openai",
+        "azure",
+        "xai",
+        "local_phi3",
+        "hf_phi3",
+        "google"
+    )]
+    model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -818,6 +841,7 @@ async fn test_supports_basic_message_roles(
     #[values(
         "anthropic",
         "openai",
+        "azure",
         "xai",
         "local_phi3",
         "hf_phi3",
@@ -864,7 +888,7 @@ async fn test_supports_basic_message_roles(
 #[rstest]
 #[tokio::test]
 async fn test_supports_all_message_roles(
-    #[values("anthropic", "openai", "xai", "bedrock", "google")] model_name: &str,
+    #[values("anthropic", "openai", "azure", "xai", "bedrock", "google")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -927,7 +951,7 @@ async fn test_supports_all_message_roles(
 #[rstest]
 #[tokio::test]
 async fn test_tool_use(
-    #[values("anthropic", "openai", "google", "xai", "bedrock")] model_name: &str,
+    #[values("anthropic", "openai", "azure", "google", "xai", "bedrock")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     // serde_json::from_value(

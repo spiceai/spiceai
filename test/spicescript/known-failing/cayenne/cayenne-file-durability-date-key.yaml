@@ -11,6 +11,8 @@ sources:
 variants:
   memory: {}
   file: { datasets: { '*': { acceleration: { params: { cayenne_cdc_durability: file } } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 spicepod:
   version: v1
   kind: Spicepod

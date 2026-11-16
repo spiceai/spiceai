@@ -410,7 +410,7 @@ datasets:
         index: articles_index
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file # memory, file, file_create
       refresh_on_startup: auto # always, auto
       refresh_mode: full # full, append, changes, caching
@@ -436,11 +436,7 @@ datasets:
         id: upsert # drop, upsert, upsert_dedup, upsert_dedup_by_row_id
       snapshots: enabled # disabled, enabled, bootstrap_only, create_only
       params:
-        duckdb_file: ./data/postgres.duckdb
-        file_watcher: 'true'
-        connection_pool_size: '5'
-        on_refresh_recompute_statistics: 'true'
-        optimizer_duckdb_aggregate_pushdown: 'true'
+        cayenne_file_path: ./data/postgres.cayenne
       metrics:
         metrics:
           - name: acceleration.refresh_duration_ms
@@ -808,6 +804,13 @@ datasets:
       max_concurrent_requests: '6'
       include: '*.md'
 
+  - name: github_pulls_key_service
+    from: github:github.com/spiceai/spiceai/pulls
+    params:
+      github_client_id: client-id
+      github_installation_id: '123456'
+      github_private_key_kms: https://spice-vault.vault.azure.net/keys/github-app # or arn:aws:kms:<region>:<account>:alias/<name>
+
   # ---------------------------------------------------------------------------
   # Git connector
   # ---------------------------------------------------------------------------
@@ -1137,7 +1140,7 @@ views:
       GROUP BY 1
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: memory
       refresh_mode: full
       refresh_check_interval: 5m

@@ -127,14 +127,14 @@ pub fn policy_recreates_on_incompatible(policy: OnSchemaChange) -> bool {
 /// and Postgres rely on the trait default and degrade to block-equivalent.
 #[must_use]
 pub fn engine_supports_in_place_evolution(engine: Engine) -> bool {
-    matches!(engine, Engine::DuckDB | Engine::Sqlite | Engine::Cayenne)
+    matches!(engine, Engine::Sqlite | Engine::Cayenne)
 }
 
 /// Engines whose [`data_accelerator_api::DataAccelerator::drop_table`] actually drops the
 /// stored table, so the accelerated table can be dropped and recreated with a new schema (the
 /// `on_schema_change: drop_and_recreate` path). Today this is exactly the in-place-evolution
-/// set: the three engines with a real `drop_table` (DuckDB/SQLite/Cayenne) are the same
-/// three with `evolve_table_schema`; Arrow is memory-only (a full refresh rebuilds it) and
+/// set: the two engines with a real `drop_table` (SQLite/Cayenne) are the same
+/// two with `evolve_table_schema`; Arrow is memory-only (a full refresh rebuilds it) and
 /// Postgres / partitioned engines have a no-op `drop_table`. Delegate to keep the two in sync;
 /// if a future engine gains one capability but not the other, split this back into its own match.
 #[must_use]
@@ -237,8 +237,8 @@ pub fn dataset_constraint_columns(
 /// relative order. Returns `None` when the order already matches.
 ///
 /// Registration must use checkpoint order whenever a checkpoint exists so that
-/// positional engine paths (`verify_schema`, `DuckDB`'s positional
-/// `INSERT … SELECT *`) stay aligned with the stored table across restarts.
+/// positional engine paths (`verify_schema`, a positional `INSERT … SELECT *`)
+/// stay aligned with the stored table across restarts.
 /// Field definitions are taken from `schema` — only the order changes.
 #[must_use]
 pub fn reorder_to_checkpoint_order(checkpoint: &Schema, schema: &SchemaRef) -> Option<SchemaRef> {
@@ -378,7 +378,6 @@ mod tests {
 
     #[test]
     fn engine_support_matrix() {
-        assert!(engine_supports_in_place_evolution(Engine::DuckDB));
         assert!(engine_supports_in_place_evolution(Engine::Sqlite));
         assert!(engine_supports_in_place_evolution(Engine::Cayenne));
         assert!(!engine_supports_in_place_evolution(Engine::Arrow));
@@ -391,7 +390,6 @@ mod tests {
     #[test]
     fn recreate_engine_matrix() {
         // Recreate requires a real `drop_table`: same engine set as in-place evolution.
-        assert!(engine_supports_recreate(Engine::DuckDB));
         assert!(engine_supports_recreate(Engine::Sqlite));
         assert!(engine_supports_recreate(Engine::Cayenne));
         assert!(!engine_supports_recreate(Engine::Arrow));

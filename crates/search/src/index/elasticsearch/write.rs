@@ -803,7 +803,7 @@ pub(super) fn categorical_token(value: &str) -> &str {
 /// `status`, the exception class names from `error.type` / `error.caused_by.type` (each
 /// through [`categorical_token`]), and the item's position within the request — never
 /// `reason`, never `_id`, never the item itself.
-fn describe_bulk_failure(position: usize, op: &Value) -> String {
+pub(super) fn describe_bulk_failure(position: usize, op: &Value) -> String {
     let mut parts = Vec::with_capacity(3);
 
     if let Some(status) = op.get("status").and_then(Value::as_u64) {

@@ -10,7 +10,6 @@ version.workspace = true
 
 [dependencies]
 accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
-accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb" }
 accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres" }
 accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite" }
 data-connector-api = { path = "../../crates/data-connector-api" }
@@ -24,11 +23,11 @@ spicepod = { path = "../../crates/spicepod", features = ["schemars"] }
 # Enable all data connector features for complete schema generation
 runtime = { path = "../../crates/runtime", features = [
     # All data connectors
+    "adbc",
     "databricks",
     "debezium",
     "delta_lake",
     "dremio",
-    "duckdb",
     "flightsql",
     "ftp",
     "imap",

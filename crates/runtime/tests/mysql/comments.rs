@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Integration tests verifying that `MySQL` table and column comments are
 //! accessible via `obj_description` and `col_description` UDFs when the dataset
-//! is loaded with `DuckDB` acceleration.
+//! is loaded with `Cayenne` acceleration.
 
 use std::{sync::Arc, time::Duration};
 
@@ -40,7 +40,7 @@ fn commented_dataset(port: u16) -> Dataset {
     let mut ds = make_mysql_dataset("orders", "orders", port, false);
     ds.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
     });
@@ -141,9 +141,9 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
 
 /// `obj_description('orders')` returns the `MySQL` table comment and
 /// `col_description('orders', N)` returns `MySQL` column comments by 1-based
-/// position when the dataset is accelerated with `DuckDB`.
+/// position when the dataset is accelerated with `Cayenne`.
 #[tokio::test]
-async fn test_mysql_comments_with_duckdb_acceleration() -> Result<(), anyhow::Error> {
+async fn test_mysql_comments_with_cayenne_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()

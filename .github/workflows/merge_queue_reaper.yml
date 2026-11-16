@@ -40,6 +40,7 @@ permissions: {}
 
 jobs:
   test:
+    environment: secret-free
     name: Unit tests for reap_superseded_merge_queue_runs.py
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -60,6 +61,7 @@ jobs:
         run: python .github/scripts/test_reap_superseded_merge_queue_runs.py -v
 
   reap:
+    environment: secret-free
     name: Cancel superseded merge-queue runs
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     # A GitHub-hosted runner on purpose: the pool this reclaims capacity in is
