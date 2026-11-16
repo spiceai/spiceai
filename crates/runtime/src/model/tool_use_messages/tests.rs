@@ -841,6 +841,7 @@ async fn the_dataset_list_is_added_after_the_requests_system() {
         "Datasets (use these names in sql, search, and table_schema):\n- spice.public.taxi_trips";
     let tools = SpiceTools {
         tools: vec![Arc::new(OneDataset) as Arc<dyn SpiceModelTool>],
+        result_budget: ResultBudget::default(),
     };
     let with_catalog = |body: Value| {
         let tools = &tools;
