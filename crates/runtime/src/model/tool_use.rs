@@ -44,6 +44,7 @@ use pin_project::pin_project;
 use serde_json::Value;
 
 use runtime_tools::builtin::list_datasets::catalog_prompt_from_tool;
+use runtime_tools::result::{ResultBudget, tool_result_text, with_budget};
 use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
@@ -126,6 +127,11 @@ impl ToolUsingChat {
         }
     }
 
+    /// The budget for one tool result, sized from the model's context window.
+    async fn result_budget(&self) -> ResultBudget {
+        ResultBudget::for_context_window(self.inner_chat.token_limits().await.context_window)
+    }
+
     /// The tools that this model sends the provider with a request.
     #[must_use]
     pub fn tool_offer(&self) -> ToolOffer {
@@ -178,7 +184,12 @@ impl ToolUsingChat {
     /// Return the result as a JSON value.
     async fn call_tool(&self, tool_call: &ChatCompletionMessageToolCall) -> Value {
         match self.as_spiced_tool(tool_call) {
-            Some(t) => match t.call(&tool_call.function.arguments).await {
+            Some(t) => match with_budget(
+                self.result_budget().await,
+                t.call(&tool_call.function.arguments),
+            )
+            .await
+            {
                 Ok(v) => {
                     tracing::info!(
                         target: "task_history",
@@ -310,7 +321,7 @@ impl ToolUsingChat {
             .iter()
             .map(|(tool_call, response_content)| {
                 Ok(ChatCompletionRequestToolMessageArgs::default()
-                    .content(response_content.to_string())
+                    .content(tool_result_text(response_content).into_owned())
                     .tool_call_id(tool_call.id.clone())
                     .build()?
                     .into())
@@ -666,11 +677,13 @@ fn next_round_tool_choice(
     }
 }
 
-/// `req` without its `tool_choice` when it offers no tools: a request with `tool_choice: none`
-/// that gets no runtime tools would otherwise carry a tool choice and no tools.
+/// `req` without its `tool_choice` and `parallel_tool_calls` when it offers no tools: a request
+/// with `tool_choice: none` that gets no runtime tools would otherwise carry tool settings and no
+/// tools, which a provider may reject (issue #14821).
 fn without_orphan_tool_choice(mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
     if req.tools.as_ref().is_none_or(Vec::is_empty) {
         req.tool_choice = None;
+        req.parallel_tool_calls = None;
     }
     req
 }
@@ -2401,7 +2414,8 @@ mod tests {
         let tool_result = |choice: u32, index: usize, content: &str| {
             format!("tool call_{choice}_{index}: {content}")
         };
-        let not_run = |requested: usize| json!(tool_call_not_run_message(requested)).to_string();
+        // A string result reaches the model as it is, not as an escaped JSON string literal.
+        let not_run = |requested: usize| tool_call_not_run_message(requested);
 
         let mut choice_0 = vec!["user: A".to_string(), assistant(0)];
         choice_0.extend((0..MAX_SPICE_TOOL_CALLS_PER_RESPONSE).map(|i| tool_result(0, i, &ran)));
@@ -2847,5 +2861,38 @@ mod tests {
         let requests = provider.requests.lock();
         assert_eq!(requests[0].tools, None);
         assert_eq!(requests[0].tool_choice, None);
+    }
+
+    /// `parallel_tool_calls` is a tool setting too, so a `tool_choice: none` that turns the
+    /// runtime tools off also drops the client's `parallel_tool_calls`, streamed or not.
+    #[tokio::test]
+    async fn test_a_none_tool_choice_sends_no_parallel_tool_calls_without_tools() {
+        let provider = ScriptedChat::new(vec![Reply::Answer("D"), Reply::Answer("F")]);
+        let model = with_defaults(sql_model(&provider), &[("tool_choice", json!("none"))]);
+        let with_parallel_tool_calls = |text| {
+            let mut req = request(vec![user(text)]);
+            req.parallel_tool_calls = Some(false);
+            req
+        };
+
+        model
+            .chat_request(with_parallel_tool_calls("A"))
+            .await
+            .expect("turn 1");
+        let chunks: Vec<_> = model
+            .chat_stream(with_parallel_tool_calls("E"))
+            .await
+            .expect("turn 2")
+            .collect()
+            .await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+
+        let requests = provider.requests.lock();
+        assert_eq!(requests.len(), 2);
+        for sent in requests.iter() {
+            assert_eq!(sent.tools, None);
+            assert_eq!(sent.tool_choice, None);
+            assert_eq!(sent.parallel_tool_calls, None);
+        }
     }
 }
