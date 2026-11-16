@@ -119,6 +119,11 @@ impl Subscription {
         self.epoch.is_some() && self.snapshot_sequence.is_none()
     }
 
+    /// The last commit the snapshot holds, once its `end` is seen.
+    pub(crate) fn snapshot_sequence(&self) -> Option<u64> {
+        self.snapshot_sequence
+    }
+
     /// Whether the producer marks its snapshot.
     pub(crate) fn epoch(&self) -> Option<&str> {
         self.epoch.as_deref()

@@ -24,6 +24,7 @@ limitations under the License.
 
 use std::fmt::Display;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
@@ -35,7 +36,7 @@ use data_components::cdc::{self, ChangeBatch, ChangeEnvelope};
 use futures::{Stream, StreamExt};
 
 use super::SpiceAIChangeCommiter;
-use crate::flight::append_stream::{Step, StreamMetadata, Subscription};
+use crate::flight::append_stream::{Step, StreamMarker, StreamMetadata, Subscription};
 
 /// Most times an append stream resubscribes in a row before it gives up.
 const MAX_APPEND_STREAM_RESUBSCRIBES: u32 = 10;
@@ -64,6 +65,62 @@ fn resubscribe_backoff(attempt: u32) -> Duration {
         .min(MAX_APPEND_STREAM_RESUBSCRIBE_BACKOFF)
 }
 
+/// A reload of a dataset that is already ready: the new subscription's
+/// snapshot, and any update that arrives before its end, are staged here rather
+/// than applied, and are swapped in at the snapshot's end as one atomic
+/// overwrite. Queries keep seeing the previous data until then, and a reload
+/// that does not reach its end is discarded.
+#[derive(Default)]
+struct Reload {
+    /// Each staged batch with the commit sequence number its update carried;
+    /// `None` for a snapshot batch.
+    staged: Vec<(Option<u64>, ChangeBatch)>,
+}
+
+impl Reload {
+    fn stage(&mut self, sequence: Option<u64>, batch: ChangeBatch) {
+        self.staged.push((sequence, batch));
+    }
+
+    /// The overwrite that replaces the dataset with the staged rows. An update
+    /// whose commit the snapshot holds (`sequence <= snapshot_sequence`) does
+    /// not survive, and a truncate drops what was staged before it.
+    fn into_replacement(
+        self,
+        snapshot_sequence: u64,
+        data_schema: &SchemaRef,
+    ) -> Result<ChangeEnvelope, String> {
+        let mut rows: Vec<arrow::array::RecordBatch> = Vec::new();
+        for (sequence, batch) in self.staged {
+            if sequence.is_some_and(|sequence| sequence <= snapshot_sequence) {
+                continue;
+            }
+            if batch.is_heartbeat() {
+                continue;
+            }
+            if matches!(batch.op(0), cdc::ChangeOperation::Truncate) {
+                rows.clear();
+                continue;
+            }
+            rows.push(batch.data_batch());
+        }
+        let schema = rows.first().map_or_else(
+            || Arc::clone(data_schema),
+            arrow::array::RecordBatch::schema,
+        );
+        let data = arrow::compute::concat_batches(&schema, &rows).map_err(|e| e.to_string())?;
+        let batch = cdc::wrap_data_as_change_batch(&schema, &data)
+            .map_err(|e| e.to_string())?
+            .with_rebuild_from_this_batch(true);
+        Ok(ChangeEnvelope::from_parts(
+            Box::new(SpiceAIChangeCommiter {}),
+            batch,
+            true,
+            true,
+        ))
+    }
+}
+
 /// Why a subscription ended.
 enum Ended {
     /// The stream ended or failed in a way that does not call for another
@@ -88,6 +145,11 @@ where
     stream! {
         let mut resubscribes = 0_u32;
         let mut last_epoch: Option<String> = None;
+        // Whether a snapshot of this stream has made the dataset ready, so a
+        // later snapshot is a reload to stage and swap in.
+        let mut been_ready = false;
+        // When the dataset last took a change, to report how stale it is.
+        let mut last_applied_at: Option<tokio::time::Instant> = None;
         'subscription: loop {
             // The subscription carries one schema per stream, so the normalizer is resolved from the
             // first batch and reused for the rest. Without it an accelerated dataset that started on
@@ -95,6 +157,7 @@ where
             let mut normalizer = StreamNormalizer::new();
             let mut subscription = Subscription::default();
             let mut data_schema: Option<SchemaRef> = None;
+            let mut reload: Option<Reload> = None;
             let subscribed_at = tokio::time::Instant::now();
             let mut stream = match subscribe().await {
                 Ok(stream) => stream,
@@ -120,6 +183,12 @@ where
                         next = stream.next() => next,
                         () = tokio::time::sleep_until(snapshot_end_error_at) => {
                             snapshot_end_error_logged = true;
+                            if reload.is_some() {
+                                break Ended::Resubscribe(format!(
+                                    "the end of its snapshot did not arrive within {}s",
+                                    SNAPSHOT_END_ERROR_AFTER.as_secs()
+                                ));
+                            }
                             tracing::error!(
                                 dataset = %table_reference,
                                 "The append stream for dataset '{table_reference}' has not received the end of its initial snapshot after {}s, so the dataset stays not ready. Check that the source runtime is healthy and can read the dataset.",
@@ -163,9 +232,18 @@ where
                                 let Some(schema) = data_schema.as_ref() else {
                                     continue;
                                 };
-                                match cdc::build_ready_signal_envelope(schema) {
-                                    Ok(envelope) => yield Ok(envelope),
-                                    Err(e) => yield Err(cdc::StreamError::SerdeJsonError(e.to_string())),
+                                let snapshot_sequence = subscription.snapshot_sequence().unwrap_or(0);
+                                let envelope = match reload.take() {
+                                    Some(reload) => reload.into_replacement(snapshot_sequence, schema),
+                                    None => cdc::build_ready_signal_envelope(schema).map_err(|e| e.to_string()),
+                                };
+                                match envelope {
+                                    Ok(envelope) => {
+                                        been_ready = true;
+                                        last_applied_at = Some(tokio::time::Instant::now());
+                                        yield Ok(envelope);
+                                    }
+                                    Err(e) => yield Err(cdc::StreamError::SerdeJsonError(e)),
                                 }
                             }
                             Step::Resnapshot(reason) => break Ended::Resubscribe(reason),
@@ -175,6 +253,14 @@ where
                     }
                     DecodedPayload::RecordBatch(batch) => batch,
                 };
+                let sequence = metadata.as_ref().and_then(|metadata| metadata.sequence);
+                if been_ready
+                    && metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.marker == StreamMarker::Begin)
+                {
+                    reload = Some(Reload::default());
+                }
                 let ready = match subscription.on_batch(metadata) {
                     Step::Apply { ready } => ready,
                     Step::Resnapshot(reason) => break Ended::Resubscribe(reason),
@@ -207,6 +293,14 @@ where
                 match ChangeBatch::try_new(batch) {
                     Ok(change_batch) => {
                         data_schema.get_or_insert_with(|| change_batch.data_schema());
+                        if let Some(reload) = reload.as_mut() {
+                            reload.stage(sequence, change_batch);
+                            continue;
+                        }
+                        if ready {
+                            been_ready = true;
+                        }
+                        last_applied_at = Some(tokio::time::Instant::now());
                         yield Ok(ChangeEnvelope::new(
                             Box::new(SpiceAIChangeCommiter {}),
                             change_batch,
@@ -221,7 +315,16 @@ where
                 Ended::Done => break 'subscription,
                 Ended::Resubscribe(reason) => reason,
             };
-            if subscription.awaiting_end() {
+            if reload.take().is_some() {
+                let stale_for = last_applied_at.map_or_else(
+                    || "an unknown time".to_string(),
+                    |at| format!("{}s", at.elapsed().as_secs()),
+                );
+                tracing::error!(
+                    dataset = %table_reference,
+                    "The append stream for dataset '{table_reference}' could not finish reloading from its source ({reason}), so the reload was discarded and the dataset keeps serving its previous data, which last changed {stale_for} ago."
+                );
+            } else if subscription.awaiting_end() {
                 tracing::error!(
                     dataset = %table_reference,
                     "The append stream for dataset '{table_reference}' ended before its initial snapshot was complete ({reason}), so the dataset stays not ready while it resubscribes."
