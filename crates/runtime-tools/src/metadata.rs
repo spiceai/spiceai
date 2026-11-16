@@ -17,9 +17,23 @@ limitations under the License.
 //! Compact descriptions of datasets for a model: SQL type names, the `table_schema` listing, and
 //! the relevance of a dataset to a search.
 
-use std::fmt::Write;
+use std::{borrow::Cow, fmt::Write};
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use datafusion::common::utils::quote_identifier;
+
+/// `name` as a SQL query writes it: as it is when it is a lowercase identifier, which SQL
+/// leaves unchanged, and otherwise in double quotes, with each `"` doubled. A name with
+/// capitals, spaces, commas or `--` is therefore one unambiguous token in a listing, and the
+/// text a model copies into a query resolves to the column it read.
+#[must_use]
+pub fn sql_identifier(name: &str) -> Cow<'_, str> {
+    if name.is_empty() {
+        Cow::Borrowed("\"\"")
+    } else {
+        quote_identifier(name)
+    }
+}
 
 /// The SQL type a model writes for `data_type`, as `DataFusion` names it, with a decimal's
 /// precision and scale and a list's element type.
@@ -70,7 +84,11 @@ pub fn sql_type_name(data_type: &DataType) -> String {
             "STRUCT<{}>",
             fields
                 .iter()
-                .map(|f| format!("{} {}", f.name(), sql_type_name(f.data_type())))
+                .map(|f| format!(
+                    "{} {}",
+                    sql_identifier(f.name()),
+                    sql_type_name(f.data_type())
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -189,6 +207,15 @@ pub struct TableListing<'a> {
     pub unique: Vec<Vec<String>>,
 }
 
+/// The columns of a key, each as [`sql_identifier`] writes it, separated by `, `.
+fn key_columns(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|column| sql_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// One line of text: newlines and runs of whitespace become single spaces.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -202,6 +229,9 @@ fn one_line(text: &str) -> String {
 ///   ss_net_paid DECIMAL(7,2) -- Net paid
 ///   primary key (ss_item_sk, ss_ticket_number)
 /// ```
+///
+/// Column names, in the column lines, a struct's fields and the keys, are written as
+/// [`sql_identifier`] writes them.
 ///
 /// With `columns`, only the columns it names are listed, and a last line says how many others
 /// the table has, so that a model never takes a filtered listing for the whole table.
@@ -232,7 +262,7 @@ pub fn write_table_listing(
         let _ = write!(
             out,
             "  {} {}",
-            field.name(),
+            sql_identifier(field.name()),
             sql_type_name(field.data_type())
         );
         if !field.is_nullable() {
@@ -256,10 +286,10 @@ pub fn write_table_listing(
     }
     if detail == ListingDetail::Full {
         if !listing.primary_key.is_empty() {
-            let _ = writeln!(out, "  primary key ({})", listing.primary_key.join(", "));
+            let _ = writeln!(out, "  primary key ({})", key_columns(&listing.primary_key));
         }
         for unique in &listing.unique {
-            let _ = writeln!(out, "  unique ({})", unique.join(", "));
+            let _ = writeln!(out, "  unique ({})", key_columns(unique));
         }
     }
 }
@@ -293,6 +323,13 @@ mod tests {
                     Field::new("b", DataType::Utf8, true),
                 ])),
                 "STRUCT<a INT, b VARCHAR>",
+            ),
+            (
+                DataType::Struct(Fields::from(vec![
+                    Field::new("Zip Code", DataType::Utf8, true),
+                    Field::new("zip", DataType::Utf8, true),
+                ])),
+                "STRUCT<\"Zip Code\" VARCHAR, zip VARCHAR>",
             ),
             (
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
@@ -380,6 +417,60 @@ mod tests {
             out,
             "spice.tpcds.store_sales: TPC-DS store_sales table\n  ss_item_sk BIGINT NOT NULL\n  ss_ticket_number BIGINT NOT NULL\n  ss_net_paid DECIMAL(7,2) -- Net paid\n  primary key (ss_item_sk, ss_ticket_number)\n  unique (ss_ticket_number)\n"
         );
+    }
+
+    #[test]
+    fn identifiers_are_written_as_sql_writes_them() {
+        assert_eq!(sql_identifier("ss_item_sk"), "ss_item_sk");
+        assert_eq!(sql_identifier("_c0"), "_c0");
+        assert_eq!(sql_identifier("Price"), "\"Price\"");
+        assert_eq!(sql_identifier("2024_total"), "\"2024_total\"");
+        assert_eq!(sql_identifier("a, b"), "\"a, b\"");
+        assert_eq!(sql_identifier("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(sql_identifier(""), "\"\"");
+    }
+
+    /// Unquoted, the key over the one column `a, b` read `primary key (a, b)`, the same as a
+    /// key over the columns `a` and `b`, and the column `x -- y` read as the column `x` with
+    /// the description `y`.
+    #[test]
+    fn names_that_need_quotes_are_listed_unambiguously() {
+        let schema = Schema::new(vec![
+            Field::new("a, b", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("x -- y", DataType::Utf8, true),
+            Field::new("Price", DataType::Float64, true).with_metadata(HashMap::from([(
+                "description".to_string(),
+                "List price".to_string(),
+            )])),
+            Field::new("say \"hi\"", DataType::Utf8, true),
+            Field::new("", DataType::Int32, true),
+        ]);
+        let listing = |primary_key: Vec<&str>| {
+            let mut out = String::new();
+            write_table_listing(
+                &mut out,
+                &TableListing {
+                    table: "spice.public.t",
+                    description: None,
+                    schema: &schema,
+                    primary_key: primary_key.into_iter().map(str::to_string).collect(),
+                    unique: vec![vec!["Price".to_string(), "a".to_string()]],
+                },
+                ListingDetail::Full,
+                None,
+            );
+            out
+        };
+        let one_column_key = listing(vec!["a, b"]);
+        assert_eq!(
+            one_column_key,
+            "spice.public.t\n  \"a, b\" INT NOT NULL\n  a INT NOT NULL\n  b INT NOT NULL\n  \"x -- y\" VARCHAR\n  \"Price\" DOUBLE -- List price\n  \"say \"\"hi\"\"\" VARCHAR\n  \"\" INT\n  primary key (\"a, b\")\n  unique (\"Price\", a)\n"
+        );
+        let two_column_key = listing(vec!["a", "b"]);
+        assert!(two_column_key.ends_with("  primary key (a, b)\n  unique (\"Price\", a)\n"));
+        assert_ne!(one_column_key, two_column_key);
     }
 
     #[test]
