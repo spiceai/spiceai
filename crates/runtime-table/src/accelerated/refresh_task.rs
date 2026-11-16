@@ -1313,7 +1313,13 @@ impl RefreshTask {
         // holding it, and every refresh queued behind it, for ever.
         let source =
             super::source_stall::with_stall_timeout(data_update.data, dataset_name.to_string());
-        let published_append = self.published_append_for(&data_update.update_type).await;
+        // Fence the commit before deciding whether to keep its rows, so no
+        // subscriber can arrive between that decision and the publish.
+        let commit_guard = self.begin_forwarded_commit(&data_update.update_type).await;
+        let published_append = match &commit_guard {
+            Some(_) => self.published_append_for(&data_update.update_type).await,
+            None => None,
+        };
         let source = match &published_append {
             Some(published) => published.keep(source),
             None => source,
@@ -1492,7 +1498,7 @@ impl RefreshTask {
 
         // The rows are committed: forward them to the dataset's append-stream
         // subscribers.
-        self.publish_written_append(&data_update.update_type, published_append, schema, num_rows)
+        self.publish_written_append(commit_guard, published_append, schema)
             .await;
 
         if let Some(error) = retention_error {
@@ -1539,6 +1545,20 @@ impl RefreshTask {
                 .is_none_or(|constraints| constraints.is_empty())
     }
 
+    /// Fences an append write that is forwarded to the dataset's append-stream
+    /// subscribers; see [`DataUpdatePublisher::begin_commit`]. A subscriber that
+    /// arrives while the write runs waits for it, then reads a snapshot that
+    /// holds its rows, so it neither misses them nor receives them twice.
+    async fn begin_forwarded_commit(
+        &self,
+        update_type: &UpdateType,
+    ) -> Option<runtime_acceleration::dataupdate::CommitGuard> {
+        if !self.forwards_appends(update_type) {
+            return None;
+        }
+        Some(self.data_update_publisher.as_ref()?.begin_commit().await)
+    }
+
     /// Keeps the rows of an append write for the dataset's `DoExchange`
     /// subscribers, when it has any. `None` when nothing is to be forwarded.
     async fn published_append_for(
@@ -1555,42 +1575,31 @@ impl RefreshTask {
             .then(published_append::PublishedAppend::new)
     }
 
-    /// Sends a committed append write to the dataset's `DoExchange` subscribers.
+    /// Sends a committed append write to the dataset's `DoExchange`
+    /// subscribers, and ends its fenced commit.
     async fn publish_written_append(
         &self,
-        update_type: &UpdateType,
+        commit_guard: Option<runtime_acceleration::dataupdate::CommitGuard>,
         published_append: Option<published_append::PublishedAppend>,
         schema: SchemaRef,
-        rows_written: usize,
     ) {
-        if !self.forwards_appends(update_type) {
-            return;
-        }
-        let Some(publisher) = self.data_update_publisher.as_ref() else {
+        let (Some(commit_guard), Some(publisher)) =
+            (commit_guard, self.data_update_publisher.as_ref())
+        else {
             return;
         };
-        match published_append {
-            Some(kept_rows) => {
-                published_append::publish_committed_append(
-                    publisher,
-                    &self.dataset_name,
-                    schema,
-                    kept_rows.take(),
-                )
-                .await;
-            }
-            // The rows were not kept because no one was subscribed when the
-            // write started. One who subscribed while it ran read its snapshot
-            // before the rows committed, so it would miss them for good: end its
-            // subscription, so it resubscribes from a snapshot that has them.
-            None => {
-                if rows_written > 0 && publisher.close_subscribers().await {
-                    tracing::info!(
-                        "Dataset {}: an append-stream subscriber joined while an append refresh was writing {rows_written} row(s), so its subscription was ended for it to resubscribe from a fresh snapshot.",
-                        self.dataset_name
-                    );
-                }
-            }
+        // Without kept rows, no one was subscribed when the write started, and
+        // the fence kept anyone from subscribing since: dropping the guard ends
+        // the commit with nothing to send.
+        if let Some(kept_rows) = published_append {
+            published_append::publish_committed_append(
+                publisher,
+                commit_guard,
+                &self.dataset_name,
+                schema,
+                kept_rows.take(),
+            )
+            .await;
         }
     }
 
@@ -5753,20 +5762,38 @@ mod tests {
     /// would miss them for good. Its subscription is ended instead, for it to
     /// resubscribe from a snapshot that has them.
     #[tokio::test]
-    async fn a_subscriber_joining_mid_append_is_sent_to_resubscribe() {
+    async fn a_subscriber_arriving_mid_commit_reads_the_rows_once() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let table = TableReference::bare("events");
         let broadcaster = runtime_acceleration::dataupdate::DataUpdateBroadcaster::new();
         let task = publishing_task(&schema, &table, &broadcaster);
+        let accelerator = Arc::clone(&task.accelerator);
+        // An earlier subscriber, so the refresh keeps and publishes its rows.
+        let (mut earlier, _) = broadcaster.subscribe_at_snapshot(&table).await;
 
-        let (send_subscriber, mut take_subscriber) = tokio::sync::oneshot::channel();
+        let (send_later, take_later) = tokio::sync::oneshot::channel();
         let join_broadcaster = broadcaster.clone();
         let join_table = table.clone();
+        let join_accelerator = Arc::clone(&accelerator);
         let batch_schema = Arc::clone(&schema);
         let source = futures::stream::once(async move {
-            // The subscriber joins once the write has started reading rows.
-            let receiver = join_broadcaster.subscribe(&join_table).await;
-            let _ = send_subscriber.send(receiver);
+            // A later subscriber arrives once the write has started reading
+            // rows, and opens its snapshot as `DoExchange` does.
+            tokio::spawn(async move {
+                let (receiver, fence) = join_broadcaster.subscribe_at_snapshot(&join_table).await;
+                let ctx = datafusion::prelude::SessionContext::new();
+                let snapshot = ctx
+                    .read_table(join_accelerator)
+                    .expect("read the snapshot")
+                    .collect()
+                    .await
+                    .expect("collect the snapshot");
+                let rows: usize = snapshot.iter().map(RecordBatch::num_rows).sum();
+                let sequence = fence.sequence;
+                drop(fence);
+                let _ = send_later.send((receiver, sequence, rows));
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
             RecordBatch::try_new(batch_schema, vec![Arc::new(Int32Array::from(vec![5, 6]))])
                 .map_err(DataFusionError::from)
         });
@@ -5782,15 +5809,23 @@ mod tests {
         .await
         .expect("append refresh should write");
 
-        let mut subscriber = take_subscriber
-            .try_recv()
-            .expect("the subscriber joined mid-write");
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(5), subscriber.recv())
+        let published = tokio::time::timeout(Duration::from_secs(5), earlier.recv_sequenced())
+            .await
+            .expect("the earlier subscriber gets the append")
+            .expect("an update");
+        let (mut later, later_snapshot_sequence, later_snapshot_rows) =
+            tokio::time::timeout(Duration::from_secs(5), take_later)
                 .await
-                .expect("the subscription should end"),
-            Err(tokio::sync::broadcast::error::RecvError::Closed)
-        ));
+                .expect("the later subscriber subscribes once the commit is published")
+                .expect("the later subscriber reports");
+        assert_eq!(later_snapshot_rows, 2, "its snapshot holds the commit");
+        assert_eq!(later_snapshot_sequence, published.sequence);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), later.recv())
+                .await
+                .is_err(),
+            "the later subscriber is not sent the rows again"
+        );
     }
 
     /// An acceleration with a primary key resolves conflicts as it writes, so
