@@ -54,8 +54,6 @@ pub mod debezium;
 pub mod debezium_kafka;
 #[cfg(feature = "delta_lake")]
 pub mod delta_lake;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "adbc")]
 pub mod ducklake;
 #[cfg(feature = "elasticsearch")]
@@ -103,8 +101,6 @@ pub mod spark_connect;
 pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-#[cfg(feature = "turso")]
-pub mod turso;
 pub mod unity_catalog;
 
 pub mod catalog_filter;

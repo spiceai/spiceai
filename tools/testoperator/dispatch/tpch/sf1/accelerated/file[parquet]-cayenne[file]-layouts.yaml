@@ -20,4 +20,5 @@ tests:
       - primary_key,indexes
       - primary_key,sort,time_column
       - primary_key,indexes,cluster,partition
+      - primary_key,indexes,sort,time_column
       - primary_key,indexes,sort,time_column,partition

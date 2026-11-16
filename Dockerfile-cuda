@@ -1,7 +1,7 @@
-#syntax=docker/dockerfile:1.2
+#syntax=docker/dockerfile:1.2@sha256:e2a8561e419ab1ba6b2fe6cbdf49fd92b95912df1cf7d313c3e2230a333fdbcc
 ARG RUST_VERSION=1.98.1
 
-FROM nvidia/cuda:13.4.3-cudnn-devel-ubuntu24.04 AS build
+FROM nvidia/cuda:13.4.3-cudnn-devel-ubuntu24.04@sha256:f2d23b75391766a02175908d3fa1c2afee9849aa13d09326d71649de2b33cfe9 AS build
 
 # cache mounts below may already exist and owned by root
 USER root
@@ -62,7 +62,7 @@ RUN set -eux; \
     tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so; \
     rm -f /tmp/libduckdb.tar.gz
 
-FROM nvidia/cuda:13.4.3-cudnn-runtime-ubuntu24.04 AS runtime
+FROM nvidia/cuda:13.4.3-cudnn-runtime-ubuntu24.04@sha256:534ea2e94fd17f053b4422d094f50a43a7e75a03240c4b89cbe9ad42085ec1c3 AS runtime
 ENV CUDA_NVCC_FLAGS=-fPIE
 ARG CARGO_FEATURES
 

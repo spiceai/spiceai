@@ -1049,9 +1049,12 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
         EnrollmentAuthority::Token { .. } => OrganizationBinding::Assertion,
         EnrollmentAuthority::AuthenticatedSession { .. } => OrganizationBinding::Fixed,
     };
+    // Spice Cloud parses the version as semver, which the `(<commit>)` the CLI and
+    // runtime print after it is not.
     let runtime_version = ctx
         .runtime_version()
         .unwrap_or_else(|_| crate::commands::version::cli_version());
+    let runtime_version = crate::commands::version::without_commit(&runtime_version).to_string();
     let mut config =
         CloudConnectConfig::from_env_at(runtime_version.clone(), config_dir.to_path_buf());
     config.enroll_endpoint.clone_from(&endpoint.value);

@@ -1,0 +1,14 @@
+version: v1
+kind: Spicepod
+name: ai-test-spicepod
+
+models:
+  - from: xai:grok-4.20-non-reasoning
+    name: model1
+    params:
+      xai_api_key: ${ secrets:SPICE_XAI_API_KEY }
+
+  - from: xai:grok-4.20-non-reasoning
+    name: model2
+    params:
+      xai_api_key: ${ secrets:SPICE_XAI_API_KEY }

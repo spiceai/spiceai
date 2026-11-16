@@ -442,8 +442,11 @@ impl RefreshTask {
                         },
                         delete_batch_size: config.delete_subbatch_max.max(1),
                     };
-                    match permit.submit(ChangeBatch::cdc_rows(rows, Arc::clone(&ingress)), options)
-                    {
+                    match permit.submit_with_position(
+                        ChangeBatch::cdc_rows(rows, Arc::clone(&ingress)),
+                        options,
+                        position_write(committer.as_ref()),
+                    ) {
                         Ok(submission) => {
                             pending.push_back(PendingSource {
                                 submission,
@@ -740,9 +743,10 @@ impl RefreshTask {
                 return false;
             }
         };
-        let submission = match permit.submit(
+        let submission = match permit.submit_with_position(
             ChangeBatch::cdc_rows(cdc::LazyChangeBatch::ready(batch), Arc::clone(ingress)),
             options,
+            position_write(committer.as_ref()),
         ) {
             Ok(submission) => submission,
             Err(error) => {
@@ -772,4 +776,17 @@ impl RefreshTask {
             }
         }
     }
+}
+
+/// The committer's source position as the sink takes it, for a storage engine
+/// that commits the position in the same record as the write.
+fn position_write(
+    committer: &(dyn cdc::CommitChange + Send + Sync),
+) -> Option<runtime_acceleration::change_sink::PositionWrite> {
+    let record = committer.record_position()?;
+    Some(Box::pin(async move {
+        record
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }))
 }

@@ -459,8 +459,38 @@ impl ThinkingConfig {
     /// Whether the response carries thinking blocks with text in them.
     #[must_use]
     pub fn shows_thinking(&self) -> bool {
-        matches!(self.thinking_type.as_str(), "enabled" | "adaptive")
-            && self.display.as_deref() != Some("omitted")
+        self.thinking_display() == ThinkingDisplay::Shown
+    }
+
+    /// What the response carries of the model's thinking.
+    #[must_use]
+    pub fn thinking_display(&self) -> ThinkingDisplay {
+        match (self.thinking_type.as_str(), self.display.as_deref()) {
+            ("enabled" | "adaptive", Some("omitted")) => ThinkingDisplay::Omitted,
+            ("enabled" | "adaptive", _) => ThinkingDisplay::Shown,
+            _ => ThinkingDisplay::Off,
+        }
+    }
+}
+
+/// What a response carries of the model's thinking, as the request's `thinking` asks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThinkingDisplay {
+    /// No thinking blocks: the request turned thinking off or did not ask for it.
+    #[default]
+    Off,
+    /// Thinking blocks with their text left empty (`display: omitted`): the client sees that the
+    /// model thought, and where, without the text.
+    Omitted,
+    /// Thinking blocks with the model's reasoning in them.
+    Shown,
+}
+
+impl ThinkingDisplay {
+    /// The display `thinking` asks for; no `thinking` is `Off`.
+    #[must_use]
+    pub fn of(thinking: Option<&ThinkingConfig>) -> Self {
+        thinking.map_or(Self::Off, ThinkingConfig::thinking_display)
     }
 }
 

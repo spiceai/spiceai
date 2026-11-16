@@ -45,7 +45,7 @@ EXAMPLES
 Docs: https://spiceai.org/docs"#
 )]
 pub struct SearchArgs {
-    /// Maximum number of results to return per query.
+    /// Maximum number of results to return from each dataset.
     #[arg(long, short, default_value = "10")]
     pub limit: u32,
 

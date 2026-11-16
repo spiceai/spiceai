@@ -11,12 +11,14 @@ sources:
   src: { kind: postgres }
 
 matrix:
-  engine: [duckdb, cayenne]
+  engine: [cayenne]
 
 variants:
   on-load: {}
   on-schema-resolved:
     datasets: { items: { ready_state: on_schema_resolved } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
@@ -62,7 +64,7 @@ steps:
     eventually: 30s
   - assert-status: { dataset: items, ready: true }
     eventually: 30s
-    only: on-load
+    only: [on-load, object-native]
   - assert-status: { dataset: items, ready: false }
     consistently: 5s
     only: on-schema-resolved
@@ -95,7 +97,7 @@ steps:
     eventually: 15s
   - assert-status: { dataset: items, ready: true }
     eventually: 30s
-    only: on-load
+    only: [on-load, object-native]
   - unpause-source: src
   - assert-status: { dataset: items, status: Ready, ready: true }
     eventually: 60s
@@ -112,4 +114,4 @@ steps:
     eventually: 30s
   - assert-status: { dataset: items, ready: true }
     eventually: 30s
-    only: on-load
+    only: [on-load, object-native]

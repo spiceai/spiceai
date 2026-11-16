@@ -104,6 +104,7 @@ pub(crate) mod mem_tier_index;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod on_conflict;
+pub mod orphan_sweep;
 pub(crate) mod overwrite;
 pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
@@ -118,6 +119,8 @@ pub(crate) mod retention;
 pub(crate) mod runtime_restricted_scan;
 pub(crate) mod scan;
 pub(crate) mod scan_file_statistics;
+#[cfg(test)]
+mod seq_shift_bench;
 pub(crate) mod sink;
 pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
@@ -128,6 +131,7 @@ pub(crate) mod transaction;
 pub(crate) mod tuning;
 #[cfg(test)]
 mod tuning_sim;
+pub(crate) mod uncommitted_files;
 pub(crate) mod update_exec;
 pub(crate) mod update_keys;
 pub(crate) mod utils;

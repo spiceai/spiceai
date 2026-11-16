@@ -1,0 +1,231 @@
+name: object-native-data
+description: >
+  A dataset whose data files are in `runtime.state.location` (#16131), appended
+  from PostgreSQL without a primary key: every acknowledged append is counted
+  exactly right after it; scans send no LIST; a kill during an append leaves no
+  partial write; an instance that loses its directory serves every row with the
+  source down, three times; a copy of the location at another prefix serves the
+  same rows; a data file that is truncated, then deleted, fails the query with
+  its error each time, and `mode: file_create` reloads the dataset. The
+  `today` variant (no flag, local data) gives the same answers where it takes
+  part; the steps that need the location are for object-native-s3 only.
+
+sources:
+  src: { kind: postgres }
+  # The state location of object-native-s3.
+  lake: { kind: rustfs }
+
+variants:
+  object-native-s3: object-native-s3
+  today: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: object-native-data
+  runtime:
+    # Every query reads the dataset, so a lost file is seen by the query that needs it.
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: postgres:public.facts
+      name: facts
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: append
+        params:
+          # No background compaction: the scans below are the only reads, and
+          # the only requests between `mark-metrics` and `wait-metric`.
+          cayenne_compaction_trigger_files: '100000'
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE facts (id int NOT NULL, ts timestamptz NOT NULL, v int NOT NULL);
+        INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(1, 2000) i;
+  - start: {}
+  - query: SELECT * FROM facts
+    eventually: 30s
+
+  # Placement: the data files are in the dataset's folder in the location,
+  # nothing is at a local `s3:` path, and no local data directory exists.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
+    only: &in-location object-native-s3
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$'], lacks-dirs: ['^\.spice/data/facts/'] }
+    only: *in-location
+
+  # An exact count right after each acknowledged append: the refresh returns
+  # once its files are committed, and the query that follows is not retried.
+  - source-exec: { src: "INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(2001, 2500) i" }
+  - refresh: facts
+  - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+  - source-exec: { src: "INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(2501, 3000) i" }
+  - refresh: facts
+  - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+  - source-exec: { src: "INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(3001, 3500) i" }
+  - refresh: facts
+  - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+
+  # No LIST on the scan path: the location's data-file requests counted as
+  # `operation="list"` do not move while only scans run.
+  - mark-metrics: scans
+    only: *in-location
+  - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+  - query: SELECT * FROM facts WHERE id % 7 = 0
+  - query: SELECT max(id) AS m, min(v) AS lo FROM facts
+  - wait-metric:
+      name: state_store_request_duration_ms_count
+      labels: { feature: cayenne_data, operation: list }
+      increased-by: 0
+      since: scans
+      timeout: 2s
+    only: *in-location
+
+  # A kill during an append: after the restart the table holds the rows from
+  # before the append or all of them, never part of it, and then catches up.
+  - source-exec: { src: "INSERT INTO facts SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 second', i * 10 FROM generate_series(3501, 6000) i" }
+  - refresh: { dataset: facts, wait: false }
+  - kill-spiced: {}
+  - start: {}
+  - query: SELECT count(*) IN (3500, 6000) AS whole FROM facts
+    expect: { rows: [['true']] }
+  - query: SELECT * FROM facts
+    eventually: 60s
+
+  # Lose the working directory and restart with the source down, three times:
+  # every row comes back from the location, with no reload.
+  - query: SELECT * FROM facts
+    id: before-wipe
+  - &wipe-and-restart
+    kill-spiced: {}
+    only: *in-location
+  - &wipe
+    wipe-instance-dir: {}
+    only: *in-location
+  - &no-local-state
+    assert-files: { lacks: '^\.spice/' }
+    only: *in-location
+  - &source-down
+    stop-source: src
+    only: *in-location
+  - &start-without-source
+    start: { ready: false }
+    only: *in-location
+  - &same-rows
+    query: SELECT * FROM facts
+    expect: { same-as: before-wipe }
+    eventually: 60s
+    only: *in-location
+  - &source-up
+    start-source: src
+    only: *in-location
+  - *wipe-and-restart
+  - *wipe
+  - *no-local-state
+  - *source-down
+  - *start-without-source
+  - *same-rows
+  - *source-up
+  - *wipe-and-restart
+  - *wipe
+  - *no-local-state
+  - *source-down
+  - *start-without-source
+  - *same-rows
+  - *source-up
+  - wait-ready: { timeout: 60s }
+    only: *in-location
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
+    only: *in-location
+
+  # A copy of the location at another prefix, with the source down and the
+  # original deleted: the dataset serves the same rows from the copy, so its
+  # placement is recorded relative to the location.
+  - stop: {}
+    only: *in-location
+  - stop-source: src
+    only: *in-location
+  - source-exec:
+      lake: |
+        copy state/ moved/
+        delete-prefix state/
+    only: *in-location
+  - assert-objects: { source: lake, prefix: state/, max: 0 }
+    only: *in-location
+  - start:
+      ready: false
+      patch: { spicepod: { runtime: { state: { location: 's3://${sources.lake.bucket}/moved/' } } } }
+    only: *in-location
+  - query: SELECT * FROM facts
+    expect: { same-as: before-wipe }
+    eventually: 60s
+    only: *in-location
+  - start-source: src
+    only: *in-location
+  - wait-ready: { timeout: 60s }
+    only: *in-location
+  - query: SELECT * FROM facts
+    eventually: 60s
+  - assert-objects: { source: lake, prefix: moved/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
+    only: *in-location
+  - assert-objects: { source: lake, prefix: state/, max: 0 }
+    only: *in-location
+
+  # A data file truncated, then deleted: each query fails with its error and
+  # returns no rows, rather than fewer. `mode: file_create` reloads the dataset
+  # from its source. Each change is followed by a restart, so the queries read
+  # the file from the store rather than the segments this process already
+  # holds, and each query reads rows, since `count(*)` and `sum` are answered
+  # from maintained aggregates without the data files.
+  - source-exec: { lake: 'truncate-first moved/cayenne/v1/datasets/facts- .vortex' }
+    only: *in-location
+  - restart: {}
+    only: *in-location
+  - query: SELECT * FROM facts
+    expect-error: "Failed to query dataset 'facts' (cayenne): data file '"
+    only: *in-location
+  - query: SELECT id, v FROM facts WHERE id % 7 = 0
+    expect-error: "is unreadable (it has "
+    only: *in-location
+  - query: SELECT id, ts FROM facts WHERE v > 0
+    expect-error: "so the query fails rather than return partial results. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    only: *in-location
+  - source-exec: { lake: 'delete-first moved/cayenne/v1/datasets/facts- .vortex' }
+    only: *in-location
+  - restart: {}
+    only: *in-location
+  - query: SELECT * FROM facts
+    expect-error: "Failed to query dataset 'facts' (cayenne): data file '"
+    only: *in-location
+  - query: SELECT id, v FROM facts WHERE id % 7 = 0
+    expect-error: "' is missing from 's3://"
+    only: *in-location
+  - query: SELECT id, ts FROM facts WHERE v > 0
+    expect-error: "so the query fails rather than return partial results. To reload the dataset from its source, start it once with `acceleration.mode: file_create`. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    only: *in-location
+  - restart:
+      patch: { datasets: { facts: { acceleration: { mode: file_create } } } }
+    only: *in-location
+  - query: SELECT * FROM facts
+    eventually: 60s
+  - assert-log:
+      contains: ["Dataset 'facts' \\(cayenne\\) dropped its acceleration for `mode: file_create` and reloads from its source into a new folder in the state location\\. Its previous folder 's3://[^']+/moved/cayenne/v1/datasets/facts-[^']+' is deleted once the data-file retention has passed and no query reads it; if Spice stops first, it is deleted at a later start\\."]
+      lacks: ['Deleted the acceleration data directory', 'were not removed from the object store']
+    only: *in-location
+  - restart:
+      patch: { datasets: { facts: { acceleration: { mode: file } } } }
+    only: *in-location
+  - query: SELECT * FROM facts
+    eventually: 60s
+  - query: SELECT count(*) AS n, sum(v) AS s FROM facts
+  - assert-objects: { source: lake, prefix: moved/cayenne/v1/datasets/facts-, contains: .vortex, min: 1 }
+    only: *in-location
+  - assert-files: { lacks: ['(^|/)s3:', '\.vortex$'], lacks-dirs: ['^\.spice/data/facts/'] }
+    only: *in-location

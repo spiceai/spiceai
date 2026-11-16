@@ -79,6 +79,7 @@ impl Generic {
                 },
                 healthcheck: spec.ready.as_deref().map(healthcheck),
                 network: shares_host.then(|| "host".to_string()),
+                alias: None,
             },
             if shares_host {
                 HashMap::new()

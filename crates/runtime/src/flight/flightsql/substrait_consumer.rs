@@ -19,11 +19,14 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::catalog::TableProvider;
+use data_components::flight::{SEARCH_CALL_TYPE_URL, SEARCH_SCORE_COLUMN};
+use datafusion::catalog::{TableFunctionArgs, TableProvider};
 use datafusion::common::{DFSchema, Result, ScalarValue, TableReference, substrait_err};
+use datafusion::datasource::provider_as_source;
+use datafusion::error::DataFusionError;
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::expr::{Cast, Like, ScalarFunction as ScalarFunctionExpr, TryCast};
-use datafusion::logical_expr::{Expr, Extension, LogicalPlan};
+use datafusion::logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder, ident};
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
     DefaultSubstraitLambdaConsumer, SubstraitConsumer, from_scalar_function,
@@ -34,6 +37,12 @@ use datafusion_substrait::substrait::proto::{
     ExtensionLeafRel, ExtensionMultiRel, ExtensionSingleRel, Type,
 };
 use parking_lot::RwLock;
+use prost::Message;
+use runtime_proto::{UdtfArgs, udtf_args::Args};
+use runtime_search::udtf::{
+    DistanceMetric, TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs, VECTOR_SEARCH_UDTF_NAME,
+    VectorSearchTableFuncArgs,
+};
 
 /// Lowers Substrait plans the way `datafusion-substrait`'s
 /// `DefaultSubstraitConsumer` does. Spice operator declarations bind to SQL
@@ -54,6 +63,92 @@ pub(crate) struct SpiceSubstraitConsumer<'a> {
     state: &'a SessionState,
     outer_schemas: RwLock<Vec<Arc<DFSchema>>>,
     lambda_consumer: DefaultSubstraitLambdaConsumer,
+}
+
+impl SpiceSubstraitConsumer<'_> {
+    /// A search a sidecar delegated: one `vector_search` or `text_search` call
+    /// against this runtime's table. Returns the table's columns in table order,
+    /// then the score column when the call includes scores, so the sidecar knows
+    /// the result schema without asking.
+    async fn consume_search_call(&self, call: &[u8]) -> Result<LogicalPlan> {
+        let call = UdtfArgs::decode(call).map_err(|error| {
+            DataFusionError::Plan(format!(
+                "The delegated search could not be decoded: {error}"
+            ))
+        })?;
+        let limit = |limit: Option<u64>| {
+            limit
+                .map(|limit| {
+                    usize::try_from(limit).map_err(|_| {
+                        DataFusionError::Plan(format!("Search limit {limit} is out of range."))
+                    })
+                })
+                .transpose()
+        };
+        let (function, table, include_score, exprs) = match call.args {
+            Some(Args::VectorSearch(args)) => {
+                let table = TableReference::parse_str(&args.table);
+                let include_score = args.include_score.unwrap_or(true);
+                let exprs = VectorSearchTableFuncArgs {
+                    tbl: table.clone(),
+                    queries: vec![args.query.clone()],
+                    query: args.query,
+                    column: args.column,
+                    limit: limit(args.limit)?,
+                    include_score: args.include_score,
+                    distance_metric: args
+                        .distance_metric
+                        .as_deref()
+                        .map(DistanceMetric::parse)
+                        .transpose()?,
+                }
+                .to_expr()?;
+                (VECTOR_SEARCH_UDTF_NAME, table, include_score, exprs)
+            }
+            Some(Args::TextSearch(args)) => {
+                let table = TableReference::parse_str(&args.table);
+                let include_score = args.include_score.unwrap_or(true);
+                let exprs = TextSearchTableFuncArgs {
+                    tbl: table.clone(),
+                    query: args.query,
+                    column: args.column,
+                    limit: limit(args.limit)?,
+                    include_score: args.include_score,
+                }
+                .to_expr();
+                (TEXT_SEARCH_UDTF_NAME, table, include_score, exprs)
+            }
+            _ => {
+                return Err(DataFusionError::NotImplemented(
+                    "A delegated search must be one vector_search or text_search call.".into(),
+                ));
+            }
+        };
+        let Some(search) = self.state.table_functions().get(function) else {
+            return Err(DataFusionError::Plan(format!(
+                "Search function '{function}' is not available on this runtime."
+            )));
+        };
+        let provider =
+            search.create_table_provider_with_args(TableFunctionArgs::new(&exprs, self.state))?;
+        let Some(searched) = self.resolve_table_ref(&table).await? else {
+            return Err(DataFusionError::Plan(format!(
+                "Table '{table}' does not exist."
+            )));
+        };
+        let mut columns: Vec<Expr> = searched
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| ident(field.name()))
+            .collect();
+        if include_score {
+            columns.push(ident(SEARCH_SCORE_COLUMN));
+        }
+        LogicalPlanBuilder::scan(function, provider_as_source(provider), None)?
+            .project(columns)?
+            .build()
+    }
 }
 
 impl<'a> SpiceSubstraitConsumer<'a> {
@@ -290,6 +385,9 @@ impl SubstraitConsumer for SpiceSubstraitConsumer<'_> {
         let Some(detail) = &rel.detail else {
             return substrait_err!("Unexpected empty detail in ExtensionLeafRel");
         };
+        if detail.type_url == SEARCH_CALL_TYPE_URL {
+            return self.consume_search_call(&detail.value).await;
+        }
         let node = self
             .state
             .serializer_registry()

@@ -17,6 +17,8 @@ limitations under the License.
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
+use crate::token_providers::databricks::FederationParams;
+
 /// Parameters for `from: databricks` embedding models.
 #[derive(TypedParams)]
 #[params(prefix = "databricks")]
@@ -27,8 +29,41 @@ pub struct DatabricksEmbeddingParams {
     #[param(autoload_secret)]
     pub token: Option<SecretString>,
     /// The Databricks Service Principal Client ID. Cannot be used with `databricks_token`.
-    pub client_id: Option<String>,
+    /// Defaults to `DATABRICKS_CLIENT_ID` for workload identity federation or beside a client
+    /// secret.
+    #[param(autoload_secret)]
+    pub client_id: Option<SecretString>,
     /// The Databricks Service Principal Client Secret. Cannot be used with `databricks_token`.
     #[param(autoload_secret)]
     pub client_secret: Option<SecretString>,
+    /// A file that holds the workload's identity token, read again for every exchange, such as a
+    /// Kubernetes projected service account token. With `databricks_client_id`, the model
+    /// authenticates with workload identity federation. Defaults to `DATABRICKS_OIDC_TOKEN_FILEPATH`.
+    #[param(autoload_secret)]
+    pub oidc_token_filepath: Option<SecretString>,
+    /// The audience of the identity token Spice requests from a GitHub Actions job or the
+    /// workload's cloud identity, such as the Databricks account ID. With `databricks_client_id`,
+    /// the model authenticates with workload identity federation. Defaults to
+    /// `DATABRICKS_TOKEN_AUDIENCE`.
+    #[param(autoload_secret)]
+    pub token_audience: Option<SecretString>,
+}
+
+impl DatabricksEmbeddingParams {
+    /// The workload identity federation params; `raw_params` are the ones the Spicepod sets.
+    pub(crate) fn federation<S: std::hash::BuildHasher>(
+        &self,
+        raw_params: &std::collections::HashMap<String, SecretString, S>,
+        github_actions: bool,
+    ) -> FederationParams<'_> {
+        crate::token_providers::databricks::component_federation(
+            raw_params,
+            [
+                self.client_id.as_ref(),
+                self.oidc_token_filepath.as_ref(),
+                self.token_audience.as_ref(),
+            ],
+            github_actions,
+        )
+    }
 }

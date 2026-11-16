@@ -44,7 +44,7 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{
     BigQueryDialect, CharacterLengthStyle, DateFieldExtractStyle, Dialect, DistinctFromStyle,
-    IntervalStyle, ScalarFnToSqlHandler,
+    FloatLiteralStyle, IntervalStyle, ScalarFnToSqlHandler,
 };
 
 pub(crate) const JSON_GET_INT_NAME: &str = "json_get_int";
@@ -1634,6 +1634,10 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.float64_ast_dtype()
     }
 
+    fn float_literal_style(&self) -> FloatLiteralStyle {
+        self.inner.float_literal_style()
+    }
+
     fn utf8_cast_dtype(&self) -> ast::DataType {
         self.inner.utf8_cast_dtype()
     }
@@ -1714,6 +1718,10 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.integer_division_to_sql(lhs, rhs)
     }
 
+    fn string_concat_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
+        self.inner.string_concat_to_sql(lhs, rhs)
+    }
+
     fn requires_explicit_comparison_coercion(&self) -> bool {
         self.inner.requires_explicit_comparison_coercion()
     }
@@ -1736,6 +1744,10 @@ impl Dialect for SpiceBigQueryDialect {
 
     fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
         self.inner.derived_table_evaluates_volatile_outputs_once()
+    }
+
+    fn identifier_max_length(&self) -> Option<usize> {
+        self.inner.identifier_max_length()
     }
 
     fn requires_derived_table_alias(&self) -> bool {

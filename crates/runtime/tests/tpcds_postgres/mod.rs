@@ -28,6 +28,7 @@ limitations under the License.
 //! - `MINIO_ENDPOINT`: The `MinIO`/S3 endpoint URL
 //! - `MINIO_ACCESS_KEY_ID`: The `MinIO`/S3 access key
 //! - `MINIO_SECRET_ACCESS_KEY`: The `MinIO`/S3 secret key
+//! - `MINIO_SESSION_TOKEN`: The session token of temporary credentials, when set
 //!
 //! # Running Tests Locally
 //!
@@ -188,6 +189,9 @@ fn get_tpcds_spicepod_yaml(pg_port: usize, pg_db: &str) -> String {
         .expect("MINIO_ACCESS_KEY_ID environment variable must be set");
     let minio_secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY")
         .expect("MINIO_SECRET_ACCESS_KEY environment variable must be set");
+    let minio_session_token = std::env::var("MINIO_SESSION_TOKEN")
+        .map(|token| format!("\n      s3_session_token: {token}"))
+        .unwrap_or_default();
 
     let pg_password = PG_PASSWORD;
 
@@ -205,7 +209,7 @@ datasets:
       s3_auth: key
       s3_endpoint: {minio_endpoint}
       s3_key: {minio_access_key}
-      s3_secret: {minio_secret_key}
+      s3_secret: {minio_secret_key}{minio_session_token}
     acceleration:
       enabled: true
       engine: postgres

@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::model::try_to_evaluate_model;
 use crate::{
@@ -28,6 +31,7 @@ use model_capabilities::{Capability, DecisionsBackend, ModelCapabilities};
 use opentelemetry::KeyValue;
 use runtime_metrics as metrics;
 use runtime_secrets::get_params_with_secrets;
+use runtime_tools::options::SpiceToolsOptions;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
@@ -143,7 +147,9 @@ impl Runtime {
 
         // A node other than the first of a distributed model never reads the weights: the first
         // reads them and sends each node its share, so the files need exist only there.
-        if matches!(source, Some(ModelSource::File)) && !is_distributed_worker(&params) {
+        if matches!(source, Some(ModelSource::File))
+            && distributed_node_rank(&params).is_none_or(|rank| rank == 0)
+        {
             // Verify all referenced local files exist before attempting to load the model and determine its type.
             // Otherwise, we will fail to determine the model type and the error will be confusing.
             if let Err(err) = verify_local_files_exist(m) {
@@ -287,6 +293,13 @@ impl Runtime {
             .write()
             .await
             .insert(m.name.clone(), rate_controller);
+        let node_ranks = self.model_node_ranks();
+        let mut node_ranks = node_ranks.write().await;
+        match distributed_node_rank(params) {
+            Some(rank) => node_ranks.insert(m.name.clone(), rank),
+            None => node_ranks.remove(&m.name),
+        };
+        drop(node_ranks);
         // Last, so a request never finds the capabilities without the handlers.
         let model_capabilities = self.model_capabilities();
         model_capabilities
@@ -326,6 +339,8 @@ impl Runtime {
         rc_map.remove(&m.name);
         drop(rc_map);
 
+        self.model_node_ranks().write().await.remove(&m.name);
+
         tracing::info!("Model [{}] has been unloaded", m.name);
         let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();
         metrics::models::COUNT.add(
@@ -346,20 +361,24 @@ impl Runtime {
         self.load_model(m).await;
     }
 
+    /// Returns the names of the models it loaded or reloaded.
     pub(crate) async fn apply_model_diff(
         self: &Arc<Self>,
         current_app: &Arc<App>,
         new_app: &Arc<App>,
-    ) {
+    ) -> HashSet<String> {
+        let mut loaded = HashSet::new();
         for model in &new_app.models {
             if let Some(current_model) = current_app.models.iter().find(|m| m.name == model.name) {
                 if current_model != model {
                     self.update_model(model).await;
+                    loaded.insert(model.name.clone());
                 }
             } else {
                 self.status
                     .update_model(&model.name, status::ComponentStatus::Initializing);
                 self.load_model(model).await;
+                loaded.insert(model.name.clone());
             }
         }
 
@@ -372,29 +391,108 @@ impl Runtime {
                 self.remove_model(model).await;
             }
         }
+        loaded
+    }
+
+    /// Reloads each model of `app` that can use one of the changed Spicepod `tools` or
+    /// `function_tools`, because a model gets its tools when it loads. Skips the models in
+    /// `loaded`, except on a change to `tools` for those that use the installed app's `tools:`
+    /// (`auto`, `all`, `search_registry`), which `loaded` got from the app before this change.
+    /// That grouping never includes function tools.
+    pub(crate) async fn reload_models_using_tools(
+        self: &Arc<Self>,
+        app: &App,
+        tools: &HashSet<String>,
+        function_tools: &HashSet<String>,
+        loaded: &HashSet<String>,
+    ) {
+        if tools.is_empty() && function_tools.is_empty() {
+            return;
+        }
+        for model in &app.models {
+            let names_changed = |names: &[String]| {
+                !loaded.contains(&model.name)
+                    && names.iter().any(|name| {
+                        function_tools.contains(name)
+                            || tools
+                                .contains(name.split_once(':').map_or(name.as_str(), |(c, _)| c))
+                    })
+            };
+            let reload = match model_tool_use(model) {
+                ToolUse::None => false,
+                ToolUse::Configured(names) => !tools.is_empty() || names_changed(&names),
+                ToolUse::Named(names) => names_changed(&names),
+            };
+            if reload {
+                tracing::info!(
+                    "Reloading model [{}] to apply a change to its tools",
+                    model.name
+                );
+                self.update_model(model).await;
+            }
+        }
     }
 }
 
-/// The model loads in progress, from the first attempt through its retries, so a Spicepod
-/// change can stop the load of a configuration it replaces or removes.
+/// Which tools a model's `tools` param selects.
+enum ToolUse {
+    None,
+    /// The installed app's `tools:` and the built-in tools, plus any tools named beside them.
+    Configured(Vec<String>),
+    /// Tools and tool catalogs by name; `catalog:tool` names one tool of a catalog.
+    Named(Vec<String>),
+}
+
+fn model_tool_use(model: &SpicepodModel) -> ToolUse {
+    let Some(value) = model
+        .params
+        .get("tools")
+        .or_else(|| model.params.get("spice_tools"))
+    else {
+        return ToolUse::None;
+    };
+    let spec = value
+        .as_str()
+        .map_or_else(|| value.to_string(), ToString::to_string);
+    match spec.parse::<SpiceToolsOptions>() {
+        Ok(
+            SpiceToolsOptions::Auto | SpiceToolsOptions::All | SpiceToolsOptions::SearchRegistry,
+        ) => ToolUse::Configured(vec![]),
+        // A list can include a grouping, e.g. `auto, my_other_tool`.
+        Ok(SpiceToolsOptions::Specific(names))
+            if names.iter().any(|name| {
+                name.parse::<SpiceToolsOptions>()
+                    .is_ok_and(|o| o.includes_all_available_tools())
+            }) =>
+        {
+            ToolUse::Configured(names)
+        }
+        Ok(SpiceToolsOptions::Specific(names)) => ToolUse::Named(names),
+        Ok(SpiceToolsOptions::Nsql | SpiceToolsOptions::Disabled) | Err(_) => ToolUse::None,
+    }
+}
+
+/// The loads in progress of one kind of component, keyed by name, from the first attempt
+/// through its retries, so a Spicepod change can stop the load of a configuration it replaces
+/// or removes.
 #[derive(Default)]
-pub(crate) struct ModelLoads {
+pub(crate) struct LoadTasks {
     tasks: parking_lot::Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
-impl ModelLoads {
-    /// Runs `load` as the load of model `name`. The task is tracked before it starts, so
+impl LoadTasks {
+    /// Runs `load` as the load of `name`. The task is tracked before it starts, so
     /// [`Self::stop`] cannot miss it.
-    fn start(&self, name: &str, load: impl Future<Output = ()> + Send + 'static) {
+    pub(crate) fn start(&self, name: &str, load: impl Future<Output = ()> + Send + 'static) {
         let mut tasks = self.tasks.lock();
         if let Some(previous) = tasks.insert(name.to_string(), tokio::spawn(load)) {
             previous.abort();
         }
     }
 
-    /// Stops the load of model `name`. When this returns, no attempt to load it is
+    /// Stops the load of `name`. When this returns, no attempt to load it is
     /// running and none will start.
-    async fn stop(&self, name: &str) {
+    pub(crate) async fn stop(&self, name: &str) {
         let task = self.tasks.lock().remove(name);
         if let Some(task) = task {
             task.abort();
@@ -431,17 +529,26 @@ fn model_error<'a>(
     }
 }
 
-/// Whether this node holds a share of a distributed model for another node, which serves it.
-/// It reads the params with their secrets and environment variables resolved, and parses them
-/// as the model's loader does, so both agree on which node this is.
-fn is_distributed_worker(params: &HashMap<String, SecretString>) -> bool {
-    params.get("distributed_backend").is_some_and(|backend| {
+/// This node's rank in a model split across several nodes (`distributed_backend: ring`), or
+/// `None` for a model that runs on one node. Rank 0 serves the model; every other rank holds a
+/// share of it for rank 0. It reads the params with their secrets and environment variables
+/// resolved, and parses them as the model's loader does, so both agree on which node this is: a
+/// missing or empty `node_rank` is rank 0, and one the loader refuses is `None`.
+fn distributed_node_rank(params: &HashMap<String, SecretString>) -> Option<usize> {
+    let ring = params.get("distributed_backend").is_some_and(|backend| {
         backend.expose_secret().parse::<DistributedBackendSetting>()
             == Ok(DistributedBackendSetting::Ring)
-    }) && params
+    });
+    if !ring {
+        return None;
+    }
+    match params
         .get("node_rank")
-        .and_then(|rank| rank.expose_secret().trim().parse::<usize>().ok())
-        .is_some_and(|rank| rank > 0)
+        .map(|rank| rank.expose_secret().trim())
+    {
+        None | Some("") => Some(0),
+        Some(rank) => rank.parse::<usize>().ok(),
+    }
 }
 
 fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
@@ -573,6 +680,104 @@ mod tests {
         assert!(rt.completion_llms().read().await.contains_key("flaky"));
     }
 
+    /// Loads a model with `tools` set to `tools` beside the tools `lookup` and `other`, applies
+    /// a change to their versions, and returns whether the model was reloaded.
+    async fn reloaded_by(tools: &str, lookup: &str, other: &str) -> bool {
+        use crate::init::tool::tests::{register_versioned_tools, versioned_tool};
+
+        let provider = Arc::new(Provider::default());
+        provider.accepting.store(true, Ordering::SeqCst);
+        let mut model = model_served_by(&provider).await;
+        model
+            .params
+            .insert("tools".to_string(), Value::String(tools.to_string()));
+        let app = |lookup: &str, other: &str| {
+            Arc::new(
+                AppBuilder::new("tool_reload")
+                    .with_tool(versioned_tool("lookup", lookup))
+                    .with_tool(versioned_tool("other", other))
+                    .with_model(model.clone())
+                    .build(),
+            )
+        };
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app(app("1", "1").as_ref().clone())
+                .build()
+                .await,
+        );
+        register_versioned_tools(&rt).await;
+        Arc::clone(&rt).load_models().await;
+        let loads = provider.requests.load(Ordering::SeqCst);
+        assert!(loads > 0, "the model never reached the provider");
+
+        assert!(Arc::clone(&rt).apply_app(app(lookup, other)).await);
+        provider.requests.load(Ordering::SeqCst) > loads
+    }
+
+    /// A model gets its tools when it loads, so a change to a tool it names reloads it, and a
+    /// change to another tool does not.
+    #[tokio::test]
+    async fn a_model_reloads_when_a_tool_it_names_changes() {
+        assert!(
+            !reloaded_by("lookup", "1", "2").await,
+            "a change to a tool the model does not use reloaded it"
+        );
+        assert!(
+            reloaded_by("lookup", "2", "1").await,
+            "a change to a tool the model names did not reload it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_with_auto_in_its_tool_list_reloads_when_any_tool_changes() {
+        assert!(reloaded_by("auto, lookup", "1", "2").await);
+    }
+
+    /// `auto` never includes function tools, so one named beside it reaches the model by name.
+    #[tokio::test]
+    async fn a_model_reloads_when_a_function_tool_it_names_beside_auto_changes() {
+        let provider = Arc::new(Provider::default());
+        provider.accepting.store(true, Ordering::SeqCst);
+        let mut model = model_served_by(&provider).await;
+        model.params.insert(
+            "tools".to_string(),
+            Value::String("auto, add_one".to_string()),
+        );
+        let mut runtime = spicepod::component::runtime::Runtime::default();
+        runtime.functions.enabled = true;
+        let app = |description: &str| {
+            let function = serde_json::from_value(json!({
+                "name": "add_one",
+                "from": "sql",
+                "description": description,
+                "signature": {"args": [{"name": "x", "type": "int64"}], "returns": "int64"},
+                "body": "x + 1",
+                "as_tool": true,
+            }))
+            .expect("a valid function");
+            Arc::new(
+                AppBuilder::new("function_tool_reload")
+                    .with_runtime(runtime.clone())
+                    .with_function(function)
+                    .with_model(model.clone())
+                    .build(),
+            )
+        };
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app(app("1").as_ref().clone())
+                .build()
+                .await,
+        );
+        Arc::clone(&rt).load_models().await;
+        let loads = provider.requests.load(Ordering::SeqCst);
+        assert!(loads > 0, "the model never reached the provider");
+
+        assert!(Arc::clone(&rt).apply_app(app("2")).await);
+        assert!(provider.requests.load(Ordering::SeqCst) > loads);
+    }
+
     /// A model removed from the Spicepod while its first attempt waits on the provider is
     /// not retried, and does not register when the provider recovers.
     #[tokio::test]
@@ -658,5 +863,46 @@ mod tests {
             "{rejected}"
         );
         assert!(is_permanent_model_failure(&rejected), "{rejected}");
+    }
+
+    /// The rank `/v1/models` reports, which also decides whether this node reads the weights,
+    /// is the one the loader reads: `parse_distributed_config` takes a missing or empty
+    /// `node_rank` as rank 0 and refuses one that is not a number, and a model without
+    /// `distributed_backend: ring` runs on one node.
+    #[test]
+    fn a_models_node_rank_is_read_as_its_loader_reads_it() {
+        let params = |pairs: &[(&str, &str)]| -> HashMap<String, SecretString> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), SecretString::from((*value).to_string())))
+                .collect()
+        };
+        for (pairs, expected) in [
+            (
+                &[("distributed_backend", "ring"), ("node_rank", "2")][..],
+                Some(2),
+            ),
+            (
+                &[("distributed_backend", "Ring"), ("node_rank", " 1 ")][..],
+                Some(1),
+            ),
+            (&[("distributed_backend", "ring")][..], Some(0)),
+            (
+                &[("distributed_backend", "ring"), ("node_rank", "")][..],
+                Some(0),
+            ),
+            (
+                &[("distributed_backend", "ring"), ("node_rank", "first")][..],
+                None,
+            ),
+            (
+                &[("distributed_backend", "none"), ("node_rank", "1")][..],
+                None,
+            ),
+            (&[("node_rank", "1")][..], None),
+            (&[][..], None),
+        ] {
+            assert_eq!(distributed_node_rank(&params(pairs)), expected, "{pairs:?}");
+        }
     }
 }

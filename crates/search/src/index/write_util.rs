@@ -387,9 +387,9 @@ impl VectorRejection {
 /// nothing (#13872). `Inf` is neither `== 0.0` nor `is_nan()`, so it does not merely escape
 /// the narrow limb, it actively prevents it from matching.
 ///
-/// **Not every vector write reaches this.** The DuckDB vector index applies no criterion at
-/// all, and `PutVectors`' DataFusion sink spells its own — see #13901. Do not read a call to
-/// this as a guarantee that some other path enforced it.
+/// **Not every vector write reaches this.** `PutVectors`' DataFusion sink spells its own
+/// criterion — see #13901. Do not read a call to this as a guarantee that some other path
+/// enforced it.
 ///
 /// `NoDirection` is tested first so that a vector which is both — `[NaN, NaN]` — is
 /// reported under the more specific of the two, which is what the paths counting the

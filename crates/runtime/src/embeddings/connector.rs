@@ -17,10 +17,6 @@ use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::DatasetSpec;
-#[cfg(feature = "duckdb")]
-use crate::component::dataset::acceleration::Engine;
-#[cfg(feature = "duckdb")]
-use crate::component::view::View;
 use crate::dataconnector::ConnectorContext;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::embeddings::execution_plan::{
@@ -48,8 +44,6 @@ use search::index::compound::CompoundSearchIndex;
 use spice_table::{IndexLayer, LayerWalk, find_layer, peel_to};
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::semantic::Column;
-#[cfg(feature = "duckdb")]
-use spicepod::semantic::ColumnLevelEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
 use std::sync::Arc;
@@ -109,21 +103,6 @@ impl EmbeddingConnector {
         if let Some(vector_engine) = &dataset.vectors
             && vector_engine.enabled
         {
-            #[cfg(feature = "duckdb")]
-            if vector_engine.engine.as_deref() == Some("duckdb")
-                && !dataset.acceleration.as_ref().is_some_and(|acceleration| {
-                    acceleration.engine.to_unpartitioned() == Engine::DuckDB
-                })
-            {
-                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                    dataconnector: dataset.source().to_string(),
-                    connector_component: dataset.into(),
-                    source: Box::<dyn std::error::Error + Send + Sync>::from(
-                        duckdb_vector_engine_without_duckdb_message(),
-                    ),
-                });
-            }
-
             let on_zero_results = warm_index_on_zero_results(dataset.acceleration.as_ref());
 
             let session_context = context.datafusion_session_context();
@@ -309,36 +288,7 @@ impl DataConnector for EmbeddingConnector {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerator_setup(dataset, accelerator)
-            .await?;
-
-        #[cfg(feature = "duckdb")]
-        if let Some(vector_engine) = duckdb_vector_store_for_accelerated_table(dataset) {
-            let embedding_columns = duckdb_embedding_columns(dataset);
-            if embedding_columns.is_empty() {
-                return Ok(());
-            }
-
-            tracing::debug!(
-                dataset = %dataset.name,
-                columns = ?embedding_columns.iter().map(|(col, _)| col.as_str()).collect::<Vec<_>>(),
-                "Wrapping accelerator with DuckDB HNSW vector indexes"
-            );
-
-            let indexed_accelerator =
-                crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
-                    &dataset.name,
-                    embedding_columns,
-                    &vector_engine,
-                    accelerator.accelerator(),
-                    Arc::clone(&self.embedding_models),
-                    Arc::clone(&self.secrets),
-                )
-                .await?;
-            accelerator.set_accelerator(indexed_accelerator);
-            return Ok(());
-        }
-
-        Ok(())
+            .await
     }
 
     async fn on_accelerated_table_registration(
@@ -530,40 +480,6 @@ impl DataConnector for EmbeddingConnector {
     }
 }
 
-/// The cause reported when a dataset or view sets `vectors.engine: duckdb` on an
-/// acceleration that is not `duckdb`. It points at Cayenne rather than at
-/// `acceleration.engine: duckdb`: the `DuckDB` accelerator and vector engine are both
-/// deprecated, and Cayenne indexes embedding columns without a `vectors` block.
-#[cfg(feature = "duckdb")]
-pub(crate) fn duckdb_vector_engine_without_duckdb_message() -> String {
-    format!(
-        "`vectors.engine: duckdb` requires `acceleration.engine: duckdb`, and both are deprecated and will be removed in v2.5. Remove the `vectors` block and use `acceleration.engine: cayenne`, which indexes embedding columns for `vector_search` itself. See: {}#migrating-the-duckdb-vector-engine",
-        crate::component::CAYENNE_MIGRATION_DOCS
-    )
-}
-
-#[cfg(feature = "duckdb")]
-fn duckdb_vector_store_for_accelerated_table(dataset: &DatasetSpec) -> Option<VectorStore> {
-    if let Some(vector_engine) = &dataset.vectors
-        && vector_engine.enabled
-        && vector_engine.engine.as_deref() == Some("duckdb")
-    {
-        return Some(vector_engine.clone());
-    }
-
-    if !dataset.has_embeddings()
-        || !dataset
-            .acceleration
-            .as_ref()
-            .is_some_and(|acceleration| acceleration.engine.to_unpartitioned() == Engine::DuckDB)
-    {
-        return None;
-    }
-
-    let acceleration = dataset.acceleration.as_ref()?;
-    crate::embeddings::index::duckdb::vector_store_from_embedding_params(&acceleration.params)
-}
-
 fn vector_index_groups(
     vector_store: &VectorStore,
     dataset: &DatasetSpec,
@@ -639,133 +555,6 @@ fn vector_store_for_embedding(
     }
 
     effective
-}
-
-#[cfg(feature = "duckdb")]
-fn duckdb_embedding_columns(dataset: &DatasetSpec) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
-    let mut embedding_columns = dataset
-        .embeddings
-        .iter()
-        .map(|embedding| {
-            (
-                embedding.column.clone(),
-                ColumnLevelEmbeddingConfig {
-                    model: embedding.model.clone(),
-                    chunking: embedding.chunking.clone(),
-                    row_ids: embedding.primary_keys.clone(),
-                    vector_size: embedding.vector_size,
-                    engine: None,
-                    params: None,
-                    aggregation: embedding.aggregation,
-                    max_elements_per_row: embedding.max_elements_per_row,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-
-    for column in &dataset.columns {
-        // Must be `last()` to mimic what model `EmbeddingTable`'s HashMap ends up with.
-        let Some(embedding) = column.embeddings.last() else {
-            continue;
-        };
-
-        if let Some((_, existing)) = embedding_columns
-            .iter_mut()
-            .find(|(column_name, _)| column_name == &column.name)
-        {
-            *existing = embedding.clone();
-        } else {
-            embedding_columns.push((column.name.clone(), embedding.clone()));
-        }
-    }
-
-    embedding_columns
-}
-
-#[cfg(feature = "duckdb")]
-pub(crate) fn duckdb_vector_store_for_view(view: &View) -> Option<VectorStore> {
-    if let Some(vector_engine) = &view.vectors
-        && vector_engine.enabled
-        && vector_engine.engine.as_deref() == Some("duckdb")
-    {
-        return Some(vector_engine.clone());
-    }
-
-    if !view.has_embeddings()
-        || !view
-            .acceleration
-            .as_ref()
-            .is_some_and(|acceleration| acceleration.engine.to_unpartitioned() == Engine::DuckDB)
-    {
-        return None;
-    }
-
-    let acceleration = view.acceleration.as_ref()?;
-    crate::embeddings::index::duckdb::vector_store_from_embedding_params(&acceleration.params)
-}
-
-#[cfg(feature = "duckdb")]
-pub(crate) fn duckdb_embedding_columns_from_view(
-    view: &View,
-) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
-    let mut embedding_columns = Vec::new();
-
-    for column in &view.columns {
-        let Some(embedding) = column.embeddings.last() else {
-            continue;
-        };
-
-        if let Some((_, existing)) = embedding_columns
-            .iter_mut()
-            .find(|(column_name, _): &&mut (String, _)| column_name == &column.name)
-        {
-            *existing = embedding.clone();
-        } else {
-            embedding_columns.push((column.name.clone(), embedding.clone()));
-        }
-    }
-
-    embedding_columns
-}
-
-/// Wraps the accelerator in `builder` with `DuckDB` HNSW vector indexes if the view
-/// has both a `DuckDB` vector engine configured and at least one embedding column.
-/// Returns `true` if the accelerator was wrapped, `false` otherwise.
-#[cfg(feature = "duckdb")]
-pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
-    view: &View,
-    table: &datafusion::common::TableReference,
-    builder: &mut crate::accelerated::Builder,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(vector_engine) = duckdb_vector_store_for_view(view) else {
-        return Ok(false);
-    };
-
-    let embedding_columns = duckdb_embedding_columns_from_view(view);
-    if embedding_columns.is_empty() {
-        return Ok(false);
-    }
-
-    tracing::debug!(
-        view = %table,
-        columns = ?embedding_columns.iter().map(|(col, _)| col.as_str()).collect::<Vec<_>>(),
-        "Wrapping view accelerator with DuckDB HNSW vector indexes"
-    );
-
-    let accelerator = builder.get_accelerator();
-    let indexed_accelerator =
-        crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
-            table,
-            embedding_columns,
-            &vector_engine,
-            accelerator,
-            view.runtime.embeds(),
-            view.runtime.secrets(),
-        )
-        .await?;
-    builder.set_accelerator(indexed_accelerator);
-
-    Ok(true)
 }
 
 /// Peel an [`IndexLayer`]'s index and enrichment layers down to the raw
@@ -1001,14 +790,5 @@ mod tests {
 
         source.assert_handed_only(&table);
         assert_yields_only_the_marker(&mut stream).await;
-    }
-
-    #[cfg(feature = "duckdb")]
-    #[test]
-    fn the_duckdb_vector_engine_error_points_to_cayenne_not_back_to_duckdb() {
-        assert_eq!(
-            super::duckdb_vector_engine_without_duckdb_message(),
-            "`vectors.engine: duckdb` requires `acceleration.engine: duckdb`, and both are deprecated and will be removed in v2.5. Remove the `vectors` block and use `acceleration.engine: cayenne`, which indexes embedding columns for `vector_search` itself. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine"
-        );
     }
 }

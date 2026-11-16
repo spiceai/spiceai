@@ -1,0 +1,43 @@
+name: openai-static-key
+description: >
+  An OpenAI model and embedding authenticate with a static `openai_api_key`
+  read through `${secrets:…}`: a chat completion answers and an embedding has
+  the model's 1536 dimensions. Needs SPICE_OPENAI_API_KEY, a real key or token.
+  CI mints a short-lived one from its GitHub OIDC token
+  (.github/actions/openai-token) right before this script.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: openai-static-key
+  models:
+    - from: openai:gpt-4o-mini
+      name: chat
+      params:
+        openai_api_key: ${secrets:SPICE_OPENAI_API_KEY}
+  embeddings:
+    - from: openai:text-embedding-3-small
+      name: embed
+      params:
+        openai_api_key: ${secrets:SPICE_OPENAI_API_KEY}
+
+steps:
+  - start: {}
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "chat", "messages": [{"role": "user", "content": "Reply with the single word pong and nothing else."}]}'
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, matches: '(?i)pong' }
+  - http:
+      method: POST
+      path: /v1/embeddings
+      headers: { content-type: application/json }
+      body: '{"model": "embed", "input": "spice"}'
+    expect:
+      status: 200
+      json:
+        - { pointer: /data/0/embedding, type: array, length: 1536 }

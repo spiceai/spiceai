@@ -37,6 +37,11 @@ limitations under the License.
 //!       Filter: status = 'open'
 //!         TableScan: tickets
 //! ```
+//!
+//! A typed call with a constant known only when the query runs, such as `labels` from
+//! an uncorrelated scalar subquery, cannot share a request: the question it asks is not
+//! known while the query is planned. It is placed below the node the same way, but on
+//! its own, and asks its question when it runs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -48,7 +53,7 @@ use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::logical_plan::{
-    Aggregate, Filter, Join, JoinType, LogicalPlan, Projection, Sort, Window,
+    Aggregate, Filter, Join, JoinType, Limit, LogicalPlan, Projection, Sort, Window,
 };
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
 use datafusion::logical_expr::{Expr, Operator, SortExpr, binary_expr, lit};
@@ -56,7 +61,10 @@ use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use evaluate_api::Question;
 
 use crate::FunctionSet;
-use crate::args::{canonical_args, canonical_constants, typed_question};
+use crate::args::{
+    canonical_args, canonical_constants, is_query_constant, known_constants,
+    runs_with_deferred_constants, typed_question,
+};
 use crate::functions::Kind;
 use crate::output::{CHOICE, IF_THRESHOLD, PROBABILITY, SCORE};
 
@@ -132,28 +140,73 @@ impl DecisionPlacement {
         }
     }
 
-    /// A projection whose only decision calls are whole, distinct `ai_decide`
-    /// expressions over call-free arguments is already in its final form. Identical
-    /// calls are not: `DataFusion` would run each of them and read only the first, so
-    /// they are placed below as one call.
+    /// A projection whose only decision calls are whole, distinct calls over call-free
+    /// arguments, each an `ai_decide` or a typed call with a deferred constant, is
+    /// already in its final form. Identical calls are not: `DataFusion` would run each
+    /// of them and read only the first, so they are placed below as one call.
     fn is_placed(&self, projection: &Projection) -> bool {
-        let mut decides: Vec<&Expr> = Vec::new();
+        let mut whole: Vec<&Expr> = Vec::new();
         projection.expr.iter().all(|expr| {
             let inner = match expr {
                 Expr::Alias(alias) => alias.expr.as_ref(),
                 other => other,
             };
-            match inner {
-                Expr::ScalarFunction(function)
-                    if call_kind(&self.functions, inner) == Some(Kind::Decide) =>
+            match (inner, call_kind(&self.functions, inner)) {
+                (Expr::ScalarFunction(function), Some(kind))
+                    if kind == Kind::Decide
+                        || runs_with_deferred_constants(kind, &function.args) =>
                 {
-                    let distinct = !decides.contains(&inner);
-                    decides.push(inner);
+                    let distinct = !whole.contains(&inner);
+                    whole.push(inner);
                     distinct && !function.args.iter().any(|arg| self.has_call(arg))
                 }
-                other => !self.has_call(other),
+                (other, _) => !self.has_call(other),
             }
         })
+    }
+
+    /// Puts back the deferred constants that `CommonSubexprEliminate` moved out of the
+    /// projection's decision calls; see [`inline_query_constants`].
+    fn inline_projection(&self, projection: Projection) -> Result<Transformed<Projection>> {
+        let names = NamePreserver::new_for_projection();
+        let mut inlined = false;
+        let mut expr = Vec::with_capacity(projection.expr.len());
+        for e in &projection.expr {
+            let rewritten = e.clone().transform_down(|node| {
+                let Some(kind) = call_kind(&self.functions, &node) else {
+                    return Ok(Transformed::no(node));
+                };
+                let Expr::ScalarFunction(mut function) = node else {
+                    return Ok(Transformed::no(node));
+                };
+                let changed = match inline_query_constants(kind, &function.args, &projection.input)
+                {
+                    Some(args) => {
+                        function.args = args;
+                        true
+                    }
+                    None => false,
+                };
+                Ok(Transformed::new(
+                    Expr::ScalarFunction(function),
+                    changed,
+                    TreeNodeRecursion::Jump,
+                ))
+            })?;
+            if rewritten.transformed {
+                inlined = true;
+                expr.push(names.save(e).restore(rewritten.data));
+            } else {
+                expr.push(rewritten.data);
+            }
+        }
+        if !inlined {
+            return Ok(Transformed::no(projection));
+        }
+        Ok(Transformed::yes(Projection::try_new(
+            expr,
+            projection.input,
+        )?))
     }
 
     fn place_projection(
@@ -161,8 +214,16 @@ impl DecisionPlacement {
         projection: Projection,
         aliases: &AliasGenerator,
     ) -> Result<Transformed<LogicalPlan>> {
+        let Transformed {
+            data: projection,
+            transformed: inlined,
+            ..
+        } = self.inline_projection(projection)?;
         if self.is_placed(&projection) {
-            return Ok(Transformed::no(LogicalPlan::Projection(projection)));
+            return Ok(Transformed::new_transformed(
+                LogicalPlan::Projection(projection),
+                inlined,
+            ));
         }
         let Projection { expr, input, .. } = projection;
         let placed = self.decide_below(expr.iter(), input, aliases)?;
@@ -409,8 +470,9 @@ impl DecisionPlacement {
                     kind.name()
                 );
             }
-            let args =
-                canonical_args(kind, &function.args)?.unwrap_or_else(|| function.args.clone());
+            let args = inline_query_constants(kind, &function.args, &input)
+                .unwrap_or_else(|| function.args.clone());
+            let args = canonical_args(kind, &args)?.unwrap_or(args);
             let model_position = args.len() - 2;
             let key = (
                 args[0].clone(),
@@ -418,11 +480,18 @@ impl DecisionPlacement {
                 args[model_position + 1].clone(),
             );
             if kind == Kind::Decide {
-                groups.push(Group::Decide(call.clone()));
+                groups.push(Group::Whole(call.clone()));
                 targets.push((call, groups.len() - 1, Target::Whole));
                 continue;
             }
-            let constants = canonical_constants(kind, &args)?;
+            let Some(constants) = known_constants(canonical_constants(kind, &args)?) else {
+                // The question is known only when the query runs, so this call asks it
+                // on its own, and checks its deferred constants then.
+                let whole = ScalarFunction::new_udf(Arc::clone(&function.func), args);
+                groups.push(Group::Whole(Expr::ScalarFunction(whole)));
+                targets.push((call, groups.len() - 1, Target::Whole));
+                continue;
+            };
             let question = typed_question(kind, &constants)?;
             let group = if let Some(index) = groups.iter().position(|g| g.is_typed_for(&key)) {
                 index
@@ -447,7 +516,7 @@ impl DecisionPlacement {
         for group in groups {
             let alias = aliases.next(DECISION_COLUMN_PREFIX);
             let decision = match group {
-                Group::Decide(call) => call,
+                Group::Whole(call) => call,
                 Group::Typed { key, questions } => {
                     let (input_expr, model, on_error) = *key;
                     let questions: BTreeMap<String, Question> = questions.into_iter().collect();
@@ -513,8 +582,9 @@ impl Placed {
 
 /// The calls of one node that become one `ai_decide` call.
 enum Group {
-    /// A user's own `ai_decide` call, computed as written.
-    Decide(Expr),
+    /// A call computed on its own: a user's own `ai_decide` call as written, or a typed
+    /// call with a deferred constant.
+    Whole(Expr),
     /// Typed calls on the same input, model and error handling, with the distinct
     /// questions they ask.
     Typed {
@@ -545,10 +615,55 @@ impl Group {
 
 /// What a replaced call reads from its decision column.
 enum Target {
-    /// The whole struct (`ai_decide`).
+    /// The whole value (`ai_decide`'s struct, or a typed call computed on its own).
     Whole,
     /// One question's answer field (the typed functions).
     Field { kind: Kind, id: String },
+}
+
+/// `args` with every column that holds a per-query constant replaced by that constant,
+/// or `None` when no column does. `CommonSubexprEliminate` moves a subquery that a node
+/// uses twice into a projection below it, so a deferred constant can arrive as a column.
+/// The input, in position 0, is per row and is left as written.
+fn inline_query_constants(kind: Kind, args: &[Expr], input: &LogicalPlan) -> Option<Vec<Expr>> {
+    if kind == Kind::Decide {
+        return None;
+    }
+    let mut inlined = false;
+    let args: Vec<Expr> = args
+        .iter()
+        .enumerate()
+        .map(|(index, arg)| match arg {
+            Expr::Column(column) if index > 0 => match query_constant_of(input, column) {
+                Some(constant) => {
+                    inlined = true;
+                    constant
+                }
+                None => arg.clone(),
+            },
+            other => other.clone(),
+        })
+        .collect();
+    inlined.then_some(args)
+}
+
+/// The expression `plan` computes `column` from, when it has one value for the whole
+/// query. Looks through the nodes that pass their input's columns on unchanged.
+fn query_constant_of(plan: &LogicalPlan, column: &Column) -> Option<Expr> {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            let index = projection.schema.index_of_column(column).ok()?;
+            match projection.expr.get(index)?.clone().unalias() {
+                Expr::Column(inner) => query_constant_of(&projection.input, &inner),
+                expr if is_query_constant(&expr) => Some(expr),
+                _ => None,
+            }
+        }
+        LogicalPlan::Filter(Filter { input, .. })
+        | LogicalPlan::Sort(Sort { input, .. })
+        | LogicalPlan::Limit(Limit { input, .. }) => query_constant_of(input, column),
+        _ => None,
+    }
 }
 
 /// Projects `plan` to the columns of `schema`, dropping the decision columns.

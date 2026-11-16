@@ -34,7 +34,7 @@ use arrow::array::{Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{ColdTierFile, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use datafusion_table_providers::util::{
@@ -206,7 +206,7 @@ async fn assert_matches_oracle(
 }
 
 async fn manifest(
-    catalog: &CayenneCatalog,
+    catalog: &Arc<dyn MetadataCatalog>,
     table: &CayenneTableProvider,
 ) -> TestResult<Vec<ColdTierFile>> {
     Ok(catalog.list_cold_tier_files(table.table_id()).await?)
@@ -374,7 +374,7 @@ async fn test_promotion_never_rewrites_existing_datalake_files_impl(
     table.drain_in_flight_maintenance().await?;
     drop(ctx);
     drop(table);
-    let catalog_2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog_2 = common::fixture_catalog(fixture.connection_string()).await?;
     catalog_2.init().await?;
     let ctx_2 = SessionContext::new();
     let reopened = Arc::new(
@@ -535,7 +535,7 @@ async fn test_cold_compaction_merges_generations_impl(
     table.drain_in_flight_maintenance().await?;
     drop(ctx);
     drop(table);
-    let catalog_2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog_2 = common::fixture_catalog(fixture.connection_string()).await?;
     catalog_2.init().await?;
     let ctx_2 = SessionContext::new();
     let reopened = Arc::new(
@@ -560,11 +560,11 @@ async fn test_cold_compaction_merges_generations_impl(
 async fn reopen(
     fixture: &common::TestFixture,
 ) -> TestResult<(
-    Arc<CayenneCatalog>,
+    Arc<common::FixtureCatalog>,
     Arc<CayenneTableProvider>,
     SessionContext,
 )> {
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let ctx = SessionContext::new();
     let table = Arc::new(
@@ -580,7 +580,7 @@ async fn reopen(
 }
 
 async fn delete_file_count(
-    catalog: &CayenneCatalog,
+    catalog: &Arc<dyn MetadataCatalog>,
     table: &CayenneTableProvider,
 ) -> TestResult<usize> {
     Ok(catalog
@@ -1098,7 +1098,7 @@ async fn test_composite_key_datalake_promotion_and_merge_impl(
     table.drain_in_flight_maintenance().await?;
     drop(ctx);
     drop(table);
-    let catalog_2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog_2 = common::fixture_catalog(fixture.connection_string()).await?;
     catalog_2.init().await?;
     let ctx_2 = SessionContext::new();
     let reopened = Arc::new(
@@ -1114,5 +1114,276 @@ async fn test_composite_key_datalake_promotion_and_merge_impl(
         Arc::clone(&reopened) as Arc<dyn TableProvider>,
     )?;
     assert_composite_matches(&ctx_2, &oracle, "after reopen").await?;
+    Ok(())
+}
+
+/// A key-based (`source: None`) or position-based deletion vector of
+/// `table_id` at `sequence_number`.
+fn deletion_vector(
+    table_id: &str,
+    path: &str,
+    sequence_number: i64,
+    source: Option<&str>,
+) -> cayenne::metadata::DeleteFile {
+    cayenne::metadata::DeleteFile {
+        delete_file_id: String::new(),
+        table_id: table_id.to_string(),
+        source_data_file_path: source.map(str::to_string),
+        path: path.to_string(),
+        path_is_relative: false,
+        format: "arrow_ipc".to_string(),
+        delete_count: 1,
+        file_size_bytes: 64,
+        deletion_type: cayenne::metadata::DeletionType::default(),
+        sequence_number,
+        reinsert_sequence: None,
+    }
+}
+
+async fn deletion_vectors(
+    catalog: &Arc<dyn MetadataCatalog>,
+    table_id: &str,
+) -> TestResult<Vec<(String, i64)>> {
+    let mut kept: Vec<(String, i64)> = catalog
+        .get_table_delete_files(table_id)
+        .await?
+        .into_iter()
+        .map(|file| (file.path, file.sequence_number))
+        .collect();
+    kept.sort();
+    Ok(kept)
+}
+
+async fn insert_records(
+    catalog: &Arc<dyn MetadataCatalog>,
+    table_id: &str,
+) -> TestResult<Vec<(Vec<u8>, i64)>> {
+    let mut records: Vec<(Vec<u8>, i64)> = catalog
+        .get_insert_records(table_id)
+        .await?
+        .into_iter()
+        .map(|(key, sequence)| (key.to_vec(), sequence))
+        .collect();
+    records.sort();
+    Ok(records)
+}
+
+async fn manifest_urls(
+    catalog: &Arc<dyn MetadataCatalog>,
+    table_id: &str,
+) -> TestResult<Vec<String>> {
+    let mut urls: Vec<String> = catalog
+        .list_cold_tier_files(table_id)
+        .await?
+        .into_iter()
+        .map(|file| file.file_url)
+        .collect();
+    urls.sort();
+    Ok(urls)
+}
+
+/// The datalake catalog contracts a promotion and a merge commit through, with
+/// exact expected state after each call, on `catalog`.
+async fn datalake_catalog_contracts(
+    catalog: Arc<dyn MetadataCatalog>,
+    base_path: String,
+) -> TestResult<()> {
+    let table_id = catalog
+        .create_table(CreateTableOptions {
+            table_name: "datalake_contracts_t".to_string(),
+            schema: schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path,
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        })
+        .await?;
+    let cold = |url: &str, max_sequence: i64| ColdTierFile {
+        table_id: table_id.clone(),
+        file_url: url.to_string(),
+        row_count: 10,
+        file_size_bytes: 100,
+        min_sequence: 0,
+        max_sequence,
+        statistics_blob: Vec::new(),
+        pk_bloom: None,
+    };
+
+    // A promotion keeping the tombstones above 10: only the key-based vector
+    // above the cutoff and the insert record above it survive, in the commit
+    // that registers the manifest. The position-based vector goes regardless.
+    for (path, sequence, source) in [
+        ("/tmp/contracts_k5.arrow", 5, None),
+        ("/tmp/contracts_k10.arrow", 10, None),
+        ("/tmp/contracts_k11.arrow", 11, None),
+        (
+            "/tmp/contracts_p20.arrow",
+            20,
+            Some("/tmp/contracts_warm.vortex"),
+        ),
+    ] {
+        catalog
+            .add_delete_file(deletion_vector(&table_id, path, sequence, source))
+            .await?;
+    }
+    catalog
+        .add_insert_records_batch(&table_id, vec![vec![1_u8; 8]], 10)
+        .await?;
+    catalog
+        .add_insert_records_batch(&table_id, vec![vec![2_u8; 8]], 12)
+        .await?;
+    catalog
+        .commit_overwrite_to_cold(
+            &table_id,
+            &uuid::Uuid::now_v7().to_string(),
+            &[cold("s3://b/a.vortex", 1), cold("s3://b/b.vortex", 2)],
+            Some(10),
+        )
+        .await?;
+    assert_eq!(
+        deletion_vectors(&catalog, &table_id).await?,
+        vec![("/tmp/contracts_k11.arrow".to_string(), 11)],
+        "only the key-based deletion vector above the cutoff survives the promotion"
+    );
+    assert_eq!(
+        insert_records(&catalog, &table_id).await?,
+        vec![(vec![2_u8; 8], 12)],
+        "only the insert record above the cutoff survives the promotion"
+    );
+    assert_eq!(
+        manifest_urls(&catalog, &table_id).await?,
+        vec!["s3://b/a.vortex".to_string(), "s3://b/b.vortex".to_string()]
+    );
+
+    // The merge's tombstone clear removes key-based vectors and insert records
+    // at or below its cutoff and leaves every position-based vector.
+    catalog
+        .add_delete_file(deletion_vector(
+            &table_id,
+            "/tmp/contracts_p9.arrow",
+            9,
+            Some("/tmp/contracts_warm.vortex"),
+        ))
+        .await?;
+    catalog
+        .add_delete_file(deletion_vector(
+            &table_id,
+            "/tmp/contracts_k13.arrow",
+            13,
+            None,
+        ))
+        .await?;
+    catalog
+        .add_insert_records_batch(&table_id, vec![vec![3_u8; 8]], 13)
+        .await?;
+    catalog
+        .clear_key_tombstones_at_or_below(&table_id, 12)
+        .await?;
+    assert_eq!(
+        deletion_vectors(&catalog, &table_id).await?,
+        vec![
+            ("/tmp/contracts_k13.arrow".to_string(), 13),
+            ("/tmp/contracts_p9.arrow".to_string(), 9),
+        ],
+        "the clear keeps key-based vectors above 12 and every position-based one"
+    );
+    assert_eq!(
+        insert_records(&catalog, &table_id).await?,
+        vec![(vec![3_u8; 8], 13)],
+        "the clear keeps only the insert records above 12"
+    );
+
+    // A promotion with no cutoff clears every vector and insert record.
+    catalog
+        .commit_overwrite_to_cold(
+            &table_id,
+            &uuid::Uuid::now_v7().to_string(),
+            &[
+                cold("s3://b/a.vortex", 1),
+                cold("s3://b/b.vortex", 2),
+                cold("s3://b/c.vortex", 3),
+            ],
+            None,
+        )
+        .await?;
+    assert_eq!(deletion_vectors(&catalog, &table_id).await?, vec![]);
+    assert_eq!(insert_records(&catalog, &table_id).await?, vec![]);
+
+    // A merge's swap applies only while every input is registered.
+    assert!(
+        catalog
+            .swap_cold_tier_files(
+                &table_id,
+                &["s3://b/a.vortex".to_string(), "s3://b/b.vortex".to_string()],
+                &[cold("s3://b/m.vortex", 2)],
+            )
+            .await?,
+        "every input is registered, so the swap applies"
+    );
+    assert_eq!(
+        manifest_urls(&catalog, &table_id).await?,
+        vec!["s3://b/c.vortex".to_string(), "s3://b/m.vortex".to_string()]
+    );
+    for removed in [
+        vec!["s3://b/a.vortex".to_string(), "s3://b/c.vortex".to_string()],
+        Vec::new(),
+    ] {
+        assert!(
+            !catalog
+                .swap_cold_tier_files(&table_id, &removed, &[cold("s3://b/n.vortex", 3)])
+                .await?,
+            "a swap with an input already gone, or with no input, declines: {removed:?}"
+        );
+        assert_eq!(
+            manifest_urls(&catalog, &table_id).await?,
+            vec!["s3://b/c.vortex".to_string(), "s3://b/m.vortex".to_string()],
+            "a declined swap changes nothing"
+        );
+    }
+    let merged = catalog
+        .list_cold_tier_files(&table_id)
+        .await?
+        .into_iter()
+        .find(|file| file.file_url == "s3://b/m.vortex")
+        .ok_or("the merge output is registered")?;
+    assert_eq!(
+        (merged.row_count, merged.max_sequence),
+        (10, 2),
+        "the merge output is registered as written"
+    );
+    Ok(())
+}
+
+/// The datalake contracts give the same state on the SQLite metastore and on
+/// the object-native one (`runtime.params.cayenne_vnext`), whose tables keep
+/// their data in the state location.
+#[tokio::test]
+async fn datalake_catalog_contracts_hold_on_both_metastores() -> TestResult<()> {
+    let root = tempfile::tempdir()?;
+    let local_data = root
+        .path()
+        .join("data")
+        .to_str()
+        .ok_or("the temporary directory is a UTF-8 path")?
+        .to_string();
+
+    let sqlite = Arc::new(cayenne::CayenneCatalog::new(format!(
+        "sqlite://{}",
+        root.path().join("metastore.db").display()
+    ))?);
+    sqlite.init().await?;
+    datalake_catalog_contracts(sqlite, local_data).await?;
+
+    let native = cayenne::metastore::object_native::ObjectNativeCatalog::create(
+        Arc::new(object_store::memory::InMemory::new()),
+        object_store::path::Path::from("catalog"),
+    )
+    .await?;
+    datalake_catalog_contracts(
+        Arc::new(native),
+        "s3://bucket/v1/datasets/datalake_contracts_t/data".to_string(),
+    )
+    .await?;
     Ok(())
 }

@@ -24,10 +24,10 @@ limitations under the License.
 //! checkpoint and schedules nothing, while readiness — decided from the path —
 //! never arrives.
 //!
-//! The `DuckDB` `mode: file` and `SQLite` arms reach the reload with a usable
-//! file either way, and are here to keep the assertions honest: an on-disk read
-//! that cannot pass for an unaffected engine proves nothing about an affected
-//! one.
+//! The `DuckDB` `mode: file` and `SQLite` `mode: file_create` arms check that
+//! their engines reach the reload with a usable file. Cayenne's `file_create`
+//! arm is `test/spicescript/cron-and-reload.yaml`, which drives the reload
+//! through a watched Spicepod.
 
 use anyhow::anyhow;
 use app::{App, AppBuilder};
@@ -75,7 +75,11 @@ fn file_accelerated_dataset(
     let mut dataset = Dataset::new(from, name);
     dataset.acceleration = Some(Acceleration {
         params: Some(Params::from_string_map(HashMap::from([(
-            format!("{engine}_file"),
+            if engine == "cayenne" {
+                "cayenne_file_path".to_string()
+            } else {
+                format!("{engine}_file")
+            },
             db_path.to_string(),
         )]))),
         enabled: true,
@@ -184,59 +188,18 @@ async fn reload_changed_file_accelerated_dataset(
     Ok((dir, db_file))
 }
 
-/// Counts the rows a `DuckDB` database file holds, opening it directly rather
-/// than through the runtime, so the assertion observes what is on disk at the
-/// configured path — a table served out of a file that was replaced at that path
-/// answers queries normally while the path holds something else entirely.
-#[cfg(feature = "duckdb")]
 async fn rows_on_disk(db_file: &Path, table: &str) -> Result<i64, anyhow::Error> {
-    use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
-    use futures::TryStreamExt;
-
-    // A retired `DuckDB` instance releases its file only once the last pooled
-    // connection drains, and it is that close which checkpoints the write-ahead
-    // log into the database file. Reading before then reads a half-written file.
-    let wal = db_file.with_extension("db.wal");
-    if !wait_until_true(LOAD_TIMEOUT, || async { !wal.exists() }).await {
-        return Err(anyhow!(
-            "{} still had a write-ahead log after the runtime was dropped",
-            db_file.display()
-        ));
-    }
-
-    let db_path = db_file.to_string_lossy().to_string();
-    // `ReadWrite`, not `ReadOnly`: a database whose last writes are still in its
-    // WAL only shows them once the WAL is replayed, which a read-only open
-    // cannot do.
-    let pool = datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool::new_file(
-        &db_path,
-        &duckdb::AccessMode::ReadWrite,
-    )
-    .map_err(|e| anyhow!("failed to open {db_path}: {e}"))?;
-    let conn_dyn = pool
-        .connect()
-        .await
-        .map_err(|e| anyhow!("failed to connect to {db_path}: {e}"))?;
-    let conn = conn_dyn
-        .as_sync()
-        .ok_or_else(|| anyhow!("expected a sync DuckDB connection"))?;
-
-    let batches: Vec<RecordBatch> = conn
-        .query_arrow(&format!("select count(*) from \"{table}\""), &[], None)
-        .map_err(|e| anyhow!("count query failed: {e}"))?
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .map_err(|e| anyhow!("collecting the count failed: {e}"))?;
-
+    let batches =
+        super::query_cayenne_file(db_file, table, &format!("SELECT count(*) FROM \"{table}\""))
+            .await?;
     row_count(&batches)
 }
 
 /// `mode: file` keeps its acceleration file across the reload, so its checkpoint
 /// survives and the dataset is ready immediately, serving the rows it already
 /// holds until its next refresh. What it must not do is wedge.
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_reload_changed_duckdb_file_dataset() -> Result<(), anyhow::Error> {
+async fn test_reload_changed_cayenne_file_dataset() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -244,8 +207,8 @@ async fn test_reload_changed_duckdb_file_dataset() -> Result<(), anyhow::Error> 
         .scope_retry(3, || async {
             let expected = i64::try_from(ROWS_BEFORE)?;
             let (_dir, db_file) = reload_changed_file_accelerated_dataset(
-                "test_reload_changed_duckdb_file",
-                "duckdb",
+                "test_reload_changed_cayenne_file",
+                "cayenne",
                 &Mode::File,
                 expected,
             )
@@ -281,66 +244,6 @@ async fn test_reload_changed_sqlite_file_create_dataset() -> Result<(), anyhow::
             )
             .await
             .map(|_| ())
-        })
-        .await
-}
-
-/// The Turso counterpart of [`rows_on_disk`].
-#[cfg(feature = "turso")]
-async fn turso_rows_on_disk(db_file: &Path, table: &str) -> Result<i64, anyhow::Error> {
-    let db_path = db_file.to_string_lossy().to_string();
-    let pool = data_components::turso::TursoConnectionPool::new(&db_path)
-        .await
-        .map_err(|e| anyhow!("failed to open {db_path}: {e}"))?;
-    let conn = pool
-        .connect()
-        .await
-        .map_err(|e| anyhow!("failed to connect to {db_path}: {e}"))?;
-
-    let mut rows = conn
-        .query(&format!("select count(*) from \"{table}\""), ())
-        .await
-        .map_err(|e| anyhow!("count query failed: {e}"))?;
-    let row = rows
-        .next()
-        .await
-        .map_err(|e| anyhow!("reading the count failed: {e}"))?
-        .ok_or_else(|| anyhow!("count query returned no rows"))?;
-
-    match row
-        .get_value(0)
-        .map_err(|e| anyhow!("reading the count column failed: {e}"))?
-    {
-        turso::Value::Integer(count) => Ok(count),
-        other => Err(anyhow!("count column is not an integer: {other:?}")),
-    }
-}
-
-#[cfg(feature = "turso")]
-#[tokio::test]
-async fn test_reload_changed_turso_file_create_dataset() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope_retry(3, || async {
-            let expected = i64::try_from(ROWS_AFTER)?;
-            let (_dir, db_file) = reload_changed_file_accelerated_dataset(
-                "test_reload_changed_turso_file_create",
-                "turso",
-                &Mode::FileCreate,
-                expected,
-            )
-            .await?;
-
-            let on_disk = turso_rows_on_disk(&db_file, "reloaded").await?;
-            if on_disk != expected {
-                return Err(anyhow!(
-                    "the acceleration file at {} holds {on_disk} rows, expected {expected}: the reloaded data went somewhere else",
-                    db_file.display()
-                ));
-            }
-            Ok(())
         })
         .await
 }

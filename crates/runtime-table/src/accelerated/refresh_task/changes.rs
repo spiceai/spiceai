@@ -223,6 +223,27 @@ impl SourceDurabilityObserver {
 
 #[async_trait::async_trait]
 impl DurabilityObserver for SourceDurabilityObserver {
+    async fn record_position(
+        &self,
+        fence: u64,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // The newest committer at or below the fence holds the furthest position
+        // it covers. Only its owned write is taken under the lock.
+        let record = {
+            let queue = self.queue.lock().await;
+            queue
+                .iter()
+                .take_while(|(epoch, _)| *epoch <= fence)
+                .filter_map(|(_, committers)| committers.last())
+                .last()
+                .and_then(|committer| committer.record_position())
+        };
+        match record {
+            Some(record) => record.await.map_err(Into::into),
+            None => Ok(()),
+        }
+    }
+
     async fn on_durable(&self, fence: u64) {
         self.durable_fence.fetch_max(fence, Ordering::AcqRel);
         self.durability_known.store(true, Ordering::Release);
@@ -5087,8 +5108,12 @@ mod tests {
 
         // The write must land far inside the 60s linger window. A 5s deadline is
         // generous for the immediate write yet nowhere near the buggy 60s wait.
+        // Wait for the envelope's commit, not the write counter: `CountingExec`
+        // counts when the insert plan starts executing, and the commit follows
+        // only once that write has finished, so asserting the commit log as soon
+        // as the counter moves races the write.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while insert_execution_calls.load(AtomicOrdering::SeqCst) == 0 {
+        while log.ids().await.is_empty() {
             assert!(
                 std::time::Instant::now() <= deadline,
                 "over-budget burst was held by the linger window instead of writing immediately",

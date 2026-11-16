@@ -37,6 +37,10 @@ env:
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # Required check, so it runs on every merge-queue entry (merge_group can't
   # path-filter). Feature-combination breakage can come from any code change, so
@@ -48,8 +52,9 @@ jobs:
     # feature matrix; the real check runs on the merge-group commit.
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-macos-large
+    environment: ci
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,15 +63,15 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -78,14 +83,14 @@ jobs:
           machine: ${{ runner.name }}
 
       - name: Set up make
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Check if sccache can be set up
         run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+          if [ -z "${{ vars.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           else
@@ -95,12 +100,9 @@ jobs:
 
       - name: Set up sccache
         if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != ''
-        uses: ./.github/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Cache cargo-hack binary
         id: cache-cargo-hack
@@ -124,15 +126,11 @@ jobs:
             --exclude-features default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock,nfs
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Check runtime/openapi feature
         run: cargo check --no-default-features --features runtime/openapi --profile lint
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       # `mcp` is excluded from the powerset above, so nothing else compiles
       # `runtime-tools` under its own `mcp` feature: it is otherwise only ever built as
@@ -147,15 +145,11 @@ jobs:
         run: cargo check -p runtime-tools --features mcp --profile lint
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Check snapshots feature
         run: cargo check --no-default-features --features snapshots --profile lint
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Show sccache stats
         if: always() && (runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != '')
@@ -173,7 +167,7 @@ jobs:
       # Merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
         if: always() && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiceio-features-logs
           path: ${{ runner.temp }}/spiceio.log

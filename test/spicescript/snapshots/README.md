@@ -10,6 +10,17 @@ target/lint/spicescript test/spicescript/snapshots \
   --spiced target/lint/spiced --record-durations
 ```
 
+`known-failing/snapshot-readers/` holds scenarios that reproduce open snapshot
+reader bugs. Run that directory with `--max-wait 30s`; each script must keep
+failing as `recordings/expected-failures.json` records (`--record-failures`
+rewrites it). A script moves up to this directory once its bug is fixed.
+
+| Scenario | Bug |
+| --- | --- |
+| `cayenne-snapshot-reader-path-change` | A reader whose `cayenne_file_path` changes while the snapshot store is down stops answering until the store is back. |
+| `snapshot-source-moved-location` | A `file_format: snapshot` dataset moved to a location whose snapshot it cannot restore serves the previous location's rows (#16098). |
+| `snapshot-source-projected-publisher` | Snapshots of a publisher whose `refresh_sql` drops columns are served instead of refused, and newer snapshots are then rejected (#16099). |
+
 Docker and the AWS CLI are required for the PostgreSQL and RustFS sources.
 The publication-failure scenario also uses a Python container; its fault
 fixture uses the standard library to sign S3 requests and changes only the
@@ -25,6 +36,7 @@ invocation restores the original metadata bytes.
 | `snapshots-cross-bucket-replication` | A customer-style full-refresh writer publishes through `runtime.state`; a source-free reader consumes byte-identical metadata from a second bucket. Two sorted tables share a metastore directory, with explicit primary keys, single-column and composite indexes, the `ebs` storage profile, and SQL caching (3m TTL / 1m stale-while-revalidate). Checks paused replication, archive-first and metadata-first arrival, TTL-based cache convergence, joins after both tables converge, concurrent whole-table generations, and cold restore after the source, writer, and original archives are unavailable. |
 | `snapshots-source-replication` | Source-free `file_format: snapshot` reader starts before publication, discovers the engine, and follows multiple replacements including empty and repopulated tables; full PostgreSQL oracle comparisons; concurrent queries require whole generations; writes are rejected; store outage metrics and recovery; fresh reader starts with both writer and original source offline. |
 | `snapshots-reader-publication-failures` | Metadata rollback, a newer snapshot with a bad checksum, and a newer snapshot whose archive is missing (#15310, #15472). Checks reason-labeled refresh errors, every loaded row remaining unchanged, and progress after repair. The missing-file case waits through the 90-second replication grace period. |
+| `snapshots-reader-removed-engine` | Run each `engine` with `--from` a build from before that engine's removal that has `postgres`, `snapshots` and the engine (`--matrix engine=turso` or `--matrix engine=duckdb`): it publishes a snapshot with that engine, and the build under test refuses a `file_format: snapshot` dataset over it with the removal error (status and exactly one log line) while a federated dataset in the same Spicepod serves. No OSS release can publish snapshots, so `from: 2.4.x` alone cannot run it. |
 | `snapshots-writer-lease` | A single publisher, standby behavior, graceful handoff (#15256), expiry after SIGKILL, and restore of the new publisher's data. The graceful holder has a two-hour lease; publication within 20 seconds of shutdown must therefore use release rather than expiry. |
 | `snapshots-kill-during-upload` | SIGKILL at different delays after refresh completion, then cold restore without the source. Requires a whole generation, the original key count and sum, a generation that could have been published, and each row's deterministic payload. |
 | `snapshots-object-store` | S3-compatible runtime state and per-dataset snapshot locations, cold restore, and source recovery. |

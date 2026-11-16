@@ -1,7 +1,7 @@
 # Hadoop Test Data
 
-* Install Spark 3.5.6 with Hadoop 3.3
-* Run `./setup_spark.sh` with the `SPARK_HOME` variable defined, like `/opt/spark`. This downloads the required JARs from Maven to setup Hadoop catalogs on `file://` and `s3a://` (MinIO).
+* Install Spark 4.1.4 with Hadoop 3.4
+* Run `./setup_spark.sh` with the `SPARK_HOME` variable defined, like `/opt/spark`. This downloads the required JARs from Maven to setup Hadoop catalogs on `file://` and `s3a://` (an S3-compatible store; `docker-compose.yml` runs RustFS).
 
 The configured warehouse for each source is the same, with 2 namespaces:
 
