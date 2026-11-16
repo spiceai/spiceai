@@ -140,6 +140,7 @@ impl ChangeFlightEncoder {
         Some(flight)
     }
 
+    #[cfg(test)]
     fn encode(&mut self, record_batch: &RecordBatch) -> Result<Vec<FlightData>, Status> {
         self.encode_with_metadata(record_batch, None)
     }
@@ -586,6 +587,7 @@ fn get_primary_keys_array(primary_keys: &[&str], row_count: usize) -> ListArray 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataupdate::DataUpdate;
     use arrow::array::{Array, BooleanArray, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
