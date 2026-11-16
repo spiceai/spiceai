@@ -11,6 +11,8 @@ variants:
   federated: {}
   cayenne-full:
     datasets: { facts: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  # `cayenne-full` with the prototype object-native Cayenne metastore.
+  cayenne-full-object-native: { datasets: { facts: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
   cayenne-append:
     datasets:
       facts:
@@ -63,6 +65,6 @@ steps:
           - { name: label, choice: [alpha, beta, gamma, delta] }
           - { name: note, text: [3, 20], nulls: 0.2 }
   - refresh: facts
-    only: [cayenne-full, cayenne-append]
+    only: [cayenne-full, cayenne-full-object-native, cayenne-append]
   - corpus: corpus/layout.sql
     eventually: 30s

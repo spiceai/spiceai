@@ -1,6 +1,6 @@
-#syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.98.1
-FROM rust:${RUST_VERSION}-slim-trixie as build
+#syntax=docker/dockerfile:1.2@sha256:e2a8561e419ab1ba6b2fe6cbdf49fd92b95912df1cf7d313c3e2230a333fdbcc
+# Keep the rust tag on the channel in rust-toolchain.toml.
+FROM rust:1.98.1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 as build
 
 # cache mounts below may already exist and owned by root
 USER root
@@ -58,7 +58,7 @@ RUN set -eux; \
     tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so; \
     rm -f /tmp/libduckdb.tar.gz
 
-FROM debian:trixie-slim as sandbox-setup
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 as sandbox-setup
 
 ARG CARGO_FEATURES
 

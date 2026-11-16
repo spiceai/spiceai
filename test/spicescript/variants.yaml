@@ -8,20 +8,57 @@
 # The spicepod as written.
 federated: {}
 
-arrow:
-  datasets: { '*': { acceleration: { enabled: true, engine: arrow } } }
-arrow-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: arrow, mode: memory } } }
-
 cayenne-file:
   datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }
 cayenne-memory:
   datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: memory } } }
 
-sqlite:
-  datasets: { '*': { acceleration: { enabled: true, engine: sqlite } } }
-sqlite-file:
-  datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: file } } }
-sqlite-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: memory } } }
+# The prototype object-native Cayenne metastore, for every Cayenne dataset as written.
+object-native:
+  spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+# `cayenne-file` with the prototype object-native Cayenne metastore.
+cayenne-file-object-native:
+  datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }
+  spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
 
+# `object-native` with the state location named. With the flag on, a Cayenne
+# file acceleration keeps its data files in `runtime.state.location`, so an
+# instance that loses its directory (`wipe-instance-dir`) serves the dataset
+# again from the location alone. This location is a directory inside the
+# instance's own, standing for storage the instance does not lose:
+# `wipe-instance-dir: { keep: [state] }`.
+object-native-local:
+  spicepod:
+    runtime:
+      params: { cayenne_vnext: enabled }
+      state: { location: 'file://${instance.dir}/state/' }
+# The state location in an S3-compatible store; the script declares a `rustfs`
+# source named `lake`.
+object-native-s3:
+  spicepod:
+    runtime:
+      params: { cayenne_vnext: enabled }
+      state:
+        location: s3://${sources.lake.bucket}/state/
+        params:
+          s3_endpoint: ${sources.lake.endpoint}
+          s3_region: us-east-1
+          s3_auth: key
+          s3_key: ${sources.lake.key}
+          s3_secret: ${sources.lake.secret}
+          allow_http: 'true'
+# The same with every response of the store 20 ms late, as from a remote
+# region; the script declares `slow-lake: { kind: rustfs, latency: 20ms }`.
+object-native-s3-latency:
+  spicepod:
+    runtime:
+      params: { cayenne_vnext: enabled }
+      state:
+        location: s3://${sources.slow-lake.bucket}/state/
+        params:
+          s3_endpoint: ${sources.slow-lake.endpoint}
+          s3_region: us-east-1
+          s3_auth: key
+          s3_key: ${sources.slow-lake.key}
+          s3_secret: ${sources.slow-lake.secret}
+          allow_http: 'true'

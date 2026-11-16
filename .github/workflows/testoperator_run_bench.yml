@@ -123,6 +123,9 @@ on:
         type: string
         default: ''
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-bench:
     # The Databricks service principal's federation policy trusts this environment's subject.
@@ -151,16 +154,12 @@ jobs:
       # factors (SF100+) target benchmarking-postgres directly instead. Either
       # way the target starts empty and is seeded by the "Seed postgres..."
       # step below (a plain postgres image with no pre-baked data, unlike the
-      # earlier iteration of this fix). Also serves clickbench's
-      # s3[parquet]-postgres run, whose postgres is purely an acceleration
-      # target (source data comes from s3) and so needs only the empty
-      # *_accelerated database the "Create postgres acceleration databases"
-      # step provides. Excludes ducklake[postgres+s3], which provisions its own
+      # earlier iteration of this fix). Excludes ducklake[postgres+s3], which provisions its own
       # local postgres catalog DB on the same port, and clickbench's
       # postgres-source configs, which read the pre-loaded hits data on the
       # hosted cluster (too large to seed inline).
       postgres_tpch:
-        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && format('postgres:{0}', github.event.inputs.postgres_version || '16') || '' }}
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')))) && format('postgres:{0}', github.event.inputs.postgres_version || '16') || '' }}
         ports:
           - 5432:5432
         env:
@@ -184,10 +183,10 @@ jobs:
       # git, unzip); without this they fetch from one archive and one security
       # host with no fallback.
       - name: Configure apt mirrors
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Set up Rust toolchain
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Determine snapshot update mode
         id: determine_update_snapshots
@@ -245,14 +244,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '36000'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -260,7 +259,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -287,7 +286,7 @@ jobs:
 
       - name: Setup spiced
         if: steps.spiced_source.outputs.release != 'true'
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
@@ -297,7 +296,7 @@ jobs:
       - name: Install the released spiced
         if: steps.spiced_source.outputs.release == 'true'
         id: release-spiced
-        uses: ./.github/actions/setup-released-spiced
+        uses: $/.github/actions/setup-released-spiced
         with:
           release: ${{ github.event.inputs.spiced_ref }}
           spicepod_file: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
@@ -308,7 +307,7 @@ jobs:
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -316,7 +315,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
+        uses: $/.github/actions/setup-testoperator-data
         with:
           query_set: ${{ github.event.inputs.query_set }}
 
@@ -429,49 +428,21 @@ jobs:
           fi
           echo "Seed complete: $DB_NAME on $PGHOST."
 
-      # Postgres-accelerator spicepods need a *_accelerated database that the
-      # empty postgres_tpch container doesn't have yet - create it before spiced
-      # starts (idempotent), matching the PGHOST the spicepod will connect to.
-      - name: Create postgres acceleration databases
-        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        env:
-          PGHOST: ${{ (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres'))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
-          PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
-        run: |
-          set -e
-          SPICEPOD="${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
-          ACCEL_DBS="$(grep -oE 'pg_db: *[A-Za-z0-9_]+_accelerated' "$SPICEPOD" | awk '{print $2}' | sort -u)"
-          if [ -z "$ACCEL_DBS" ]; then
-            echo "No *_accelerated pg_db in $SPICEPOD - nothing to create."
-            exit 0
-          fi
-          if ! command -v psql >/dev/null; then
-            sudo apt-get update -y && sudo apt-get install -y postgresql-client
-          fi
-          for db in $ACCEL_DBS; do
-            if psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1; then
-              echo "$db already exists on $PGHOST."
-            else
-              createdb -U postgres "$db"
-              echo "Created $db on $PGHOST."
-            fi
-          done
-
       - name: Setup ODBC
         if: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
-        uses: ./.github/actions/setup-odbc
+        uses: $/.github/actions/setup-odbc
 
       - name: Install Oracle ODPI-C
         if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
-        uses: ./.github/actions/setup-oracle-odpi
+        uses: $/.github/actions/setup-oracle-odpi
 
       - name: Install ADBC BigQuery Driver
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/setup-adbc-bigquery
+        uses: $/.github/actions/setup-adbc-bigquery
 
       - name: Set up BigQuery credentials (workload identity federation)
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/bigquery-credentials
+        uses: $/.github/actions/bigquery-credentials
         with:
           workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
           service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
@@ -479,7 +450,7 @@ jobs:
       # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
       - name: Install libduckdb
         if: ${{ contains(github.event.inputs.spicepod_path, 'duckdb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: ./.github/actions/setup-libduckdb
+        uses: $/.github/actions/setup-libduckdb
 
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
@@ -489,19 +460,19 @@ jobs:
 
       - name: Setup ScyllaDB
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
-        uses: ./.github/actions/setup-scylladb
+        uses: $/.github/actions/setup-scylladb
         with:
           keyspace: tpch_sf1
 
       - name: Install PostgreSQL for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: ./.github/actions/install-postgres
+        uses: $/.github/actions/install-postgres
         with:
           pg-db: ducklake_catalog
 
       - name: Setup CH-benCH PostgreSQL
         if: ${{ github.event.inputs.query_set == 'chbench' }}
-        uses: ./.github/actions/setup-chbench-postgres
+        uses: $/.github/actions/setup-chbench-postgres
         with:
           version: ${{ github.event.inputs.postgres_version || '16' }}
 
@@ -759,7 +730,7 @@ jobs:
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
           POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
@@ -923,7 +894,7 @@ jobs:
         # save_unpushable_snapshots.sh leaves the snapshot commit here when
         # GitHub will not let GITHUB_TOKEN create the snapshot branch.
         if: ${{ failure() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unpushed-snapshots
           path: ${{ runner.temp }}/unpushed-snapshots/

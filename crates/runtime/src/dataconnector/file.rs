@@ -634,7 +634,7 @@ mod tests {
     fn accepts_an_event(
         rx: &std::sync::mpsc::Receiver<notify::Event>,
         names: &Mutex<Vec<OsString>>,
-        kind: fn(&notify::EventKind) -> bool,
+        kind: fn(notify::EventKind) -> bool,
     ) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
@@ -644,7 +644,7 @@ mod tests {
             let names = names
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if kind(&event.kind) && file_watch_event_is_relevant(&event, Some(names.as_slice())) {
+            if kind(event.kind) && file_watch_event_is_relevant(&event, Some(names.as_slice())) {
                 return true;
             }
         }
@@ -653,7 +653,7 @@ mod tests {
 
     /// A write to file contents.
     #[cfg(target_os = "linux")]
-    fn is_data_modify(kind: &notify::EventKind) -> bool {
+    fn is_data_modify(kind: notify::EventKind) -> bool {
         matches!(
             kind,
             notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
@@ -662,7 +662,7 @@ mod tests {
 
     /// A rename onto or away from a watched name.
     #[cfg(target_os = "linux")]
-    fn is_rename(kind: &notify::EventKind) -> bool {
+    fn is_rename(kind: notify::EventKind) -> bool {
         matches!(
             kind,
             notify::EventKind::Modify(notify::event::ModifyKind::Name(_))

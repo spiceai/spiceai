@@ -223,6 +223,27 @@ impl SourceDurabilityObserver {
 
 #[async_trait::async_trait]
 impl DurabilityObserver for SourceDurabilityObserver {
+    async fn record_position(
+        &self,
+        fence: u64,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // The newest committer at or below the fence holds the furthest position
+        // it covers. Only its owned write is taken under the lock.
+        let record = {
+            let queue = self.queue.lock().await;
+            queue
+                .iter()
+                .take_while(|(epoch, _)| *epoch <= fence)
+                .filter_map(|(_, committers)| committers.last())
+                .last()
+                .and_then(|committer| committer.record_position())
+        };
+        match record {
+            Some(record) => record.await.map_err(Into::into),
+            None => Ok(()),
+        }
+    }
+
     async fn on_durable(&self, fence: u64) {
         self.durable_fence.fetch_max(fence, Ordering::AcqRel);
         self.durability_known.store(true, Ordering::Release);

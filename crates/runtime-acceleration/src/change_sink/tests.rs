@@ -97,6 +97,7 @@ async fn validate_scopes(columns: Vec<usize>, inputs: Vec<(Expr, RecordBatch)>) 
             merged.expect("test needs at least one scope"),
             WriteOptions::default(),
             &SessionContext::new(),
+            Vec::new(),
         )
         .await
         .map(|_| ())
@@ -414,7 +415,12 @@ async fn mixed_primary_key_lists_preserve_deletes() {
             table,
         ));
         backend
-            .apply(ChangeBatch::cdc(changes), WriteOptions::default(), &context)
+            .apply(
+                ChangeBatch::cdc(changes),
+                WriteOptions::default(),
+                &context,
+                Vec::new(),
+            )
             .await
             .expect("mixed-key deletes must execute");
         let rows = context
@@ -491,6 +497,7 @@ async fn assert_float_primary_key_delete_rejected(values: ArrayRef) {
             ChangeBatch::cdc(changes),
             WriteOptions::default(),
             &SessionContext::new(),
+            Vec::new(),
         )
         .await;
     let Err(DataFusionError::External(error)) = result else {
@@ -547,6 +554,7 @@ impl ChangeSinkBackend for GatedBackend {
         _batch: ChangeBatch,
         _options: WriteOptions,
         _context: &SessionContext,
+        _positions: Vec<super::PositionWrite>,
     ) -> Result<BackendWrite> {
         let started = Arc::clone(&self.started);
         let release = Arc::clone(&self.release);
@@ -809,11 +817,12 @@ impl ChangeSinkBackend for CountingBackend {
         batch: ChangeBatch,
         options: WriteOptions,
         context: &SessionContext,
+        positions: Vec<super::PositionWrite>,
     ) -> Result<BackendWrite> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         self.most_replaced
             .fetch_max(batch.replaced_scopes().count(), Ordering::SeqCst);
-        self.inner.apply(batch, options, context).await
+        self.inner.apply(batch, options, context, positions).await
     }
 
     fn set_durability_observer(&self, observer: Arc<dyn DurabilityObserver>) {
@@ -999,6 +1008,7 @@ async fn coalesced_probe_exempts_only_keys_in_replaced_scopes() {
             scoped_write(&schema, &ingress, ("B", "west"), &[1], false),
             options,
             &SessionContext::new(),
+            Vec::new(),
         )
         .await
     else {
@@ -1031,7 +1041,7 @@ async fn coalesced_probe_exempts_only_keys_in_replaced_scopes() {
     );
     let (batch, options) = burst.finish();
     backend
-        .apply(batch, options, &SessionContext::new())
+        .apply(batch, options, &SessionContext::new(), Vec::new())
         .await
         .expect("the held row is deleted before the append");
     assert_eq!(

@@ -95,6 +95,9 @@ pub struct CayenneRuntimeConfig {
     /// Vortex footer-metadata cache. `None` when the operator set none, which is distinct
     /// from `Some(0)` — no footer cache at all.
     pub footer_cache_mb: Option<usize>,
+    /// The cluster membership of the `spiced` process, from `--role`: `None` for a
+    /// server or sidecar.
+    pub cluster_role: Option<runtime_component::ClusterRole>,
 }
 
 /// Runtime-level (not per-dataset) settings for one engine, at construction.

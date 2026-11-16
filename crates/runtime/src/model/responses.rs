@@ -20,7 +20,7 @@ use crate::model::params::azure::AzureModelParams;
 use crate::model::params::openai::OpenAiModelParams;
 use crate::model::params::xai::XaiModelParams;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
-use crate::model::wrapper::responses::ResponsesWrapper;
+use crate::model::wrapper::responses::{ResponsesRequestDefaults, ResponsesWrapper};
 use crate::tools::registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools};
 use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
@@ -53,10 +53,14 @@ macro_rules! extract_secret {
 
 /// Attempt to derive a runnable Responses model from a given component from the Spicepod definition.
 #[expect(clippy::implicit_hasher)]
+///
+/// `context_window` is the model's, in tokens, when known: each of Spice's tool results is sized
+/// to a share of it.
 pub async fn try_to_responses_model(
     component: &Model,
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
+    context_window: Option<u64>,
 ) -> Result<Arc<dyn Responses>, LlmError> {
     let model = construct_model(component, params, &rt.secrets()).await?;
 
@@ -104,17 +108,29 @@ pub async fn try_to_responses_model(
             let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
                 .await
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-            Arc::new(ToolUsingResponses::new(
-                model,
-                openai_responses_tools.unwrap_or_default(),
-                tools,
-                spice_recursion_limit,
-            ))
+            Arc::new(
+                ToolUsingResponses::new(
+                    model,
+                    openai_responses_tools.unwrap_or_default(),
+                    tools,
+                    spice_recursion_limit,
+                )
+                .with_context_window(context_window),
+            )
         }
         Some(_) | None => model,
     };
 
-    Ok(tool_model)
+    // The Spicepod's request defaults go above the tool loop, so they apply once to each client
+    // request rather than again to each round of the loop.
+    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
+        from: component.from.clone(),
+    })?;
+    Ok(Arc::new(ResponsesRequestDefaults::new(
+        tool_model,
+        component.name.as_str(),
+        get_openai_responses_request_overrides(component, source.short_name()),
+    )))
 }
 
 async fn typed_params<P: TypedParams>(
@@ -177,7 +193,6 @@ async fn construct_model(
         model,
         component.name.as_str(),
         system_prompt,
-        get_openai_responses_request_overrides(component, source.short_name()),
     )))
 }
 
@@ -333,7 +348,7 @@ mod tests {
         let params: HashMap<String, SecretString> = HashMap::new();
 
         assert!(matches!(
-            try_to_responses_model(&model, &params, Arc::new(runtime)).await,
+            try_to_responses_model(&model, &params, Arc::new(runtime), None).await,
             Err(LlmError::ResponsesNotSupported { .. })
         ));
     }

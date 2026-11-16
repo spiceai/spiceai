@@ -38,13 +38,17 @@ limitations under the License.
 //!
 //! Copies, renames, and multipart uploads are delegated and publish without
 //! the lock, so write a key that conditional updates guard through `put_opts`
-//! alone.
+//! alone. A durable store syncs a multipart upload's file and directories when
+//! it completes, and the directories a copy or rename linked its target into.
 //!
 //! **Concurrency model**: each put takes an advisory lock for the object's
 //! directory. Two clients whose roots and keys name the same file
-//! therefore share one lock, including across processes. A dedicated filesystem
-//! worker retains that lock through publication after caller cancellation or
-//! Tokio shutdown. Accepted writes may finish after their caller stops waiting.
+//! therefore share one lock, including across processes. Puts are published by
+//! dedicated filesystem workers sharing one queue: a worker takes the oldest
+//! put whose directory no other worker is publishing, so puts to one directory
+//! publish in order and puts to different directories publish in parallel. A worker retains its lock through publication after caller
+//! cancellation or Tokio shutdown. Accepted writes may finish after their caller
+//! stops waiting.
 //! The lock file is not an object and is not removed: unlinking it would let
 //! the next writer lock a different inode.
 //!
@@ -89,9 +93,25 @@ use object_store::{
 /// [`UpdateVersion`]: object_store::UpdateVersion
 pub struct LocalConditionalPut {
     inner: Arc<LocalFileSystem>,
+    /// The directory object keys are relative to: the store's directory, or
+    /// `/` for a store keyed by absolute paths.
     root: PathBuf,
-    writes: tokio::sync::mpsc::Sender<Publication>,
+    /// The store's directory: it holds the root lock, and a put syncs the
+    /// directories it created up to it.
+    base: PathBuf,
+    durable: bool,
+    /// The queue the workers publish from.
+    writes: Arc<WriteQueue>,
 }
+
+/// Workers publishing in parallel, each taking any directory not being
+/// published by another.
+const WRITE_WORKERS: usize = 8;
+
+/// Puts to one directory accepted but not yet taken by a worker, which bounds
+/// the payloads queued for a directory whose publication is slow. The bound is
+/// per directory, so puts waiting on one directory never hold back another.
+const PENDING_PER_DIRECTORY: usize = WRITE_WORKERS;
 
 struct Publication {
     location: Path,
@@ -99,6 +119,100 @@ struct Publication {
     payload: PutPayload,
     options: PutOptions,
     reply: tokio::sync::oneshot::Sender<Result<PutResult, ObjectStoreError>>,
+}
+
+/// A publication waiting for a worker, with its directory's lock path and the
+/// permit that counts it as pending.
+struct Queued {
+    directory: PathBuf,
+    publication: Publication,
+    admitted: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Default)]
+struct WriteQueueState {
+    queued: std::collections::VecDeque<Queued>,
+    /// Directories a worker is publishing to now.
+    publishing: std::collections::HashSet<PathBuf>,
+    /// No more puts will be queued; workers exit once the queue is empty.
+    closed: bool,
+}
+
+#[derive(Default)]
+struct WriteQueue {
+    state: parking_lot::Mutex<WriteQueueState>,
+    changed: parking_lot::Condvar,
+    /// Each directory's admission bound, present while a put to it is queued
+    /// or waiting to be admitted.
+    admission: parking_lot::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Semaphore>>>,
+}
+
+impl WriteQueue {
+    /// Blocks until a publication whose directory is free can be taken, or
+    /// returns `None` once the queue is closed and empty. Taking the oldest
+    /// free entry keeps each directory's puts in the order they were queued.
+    fn take(&self) -> Option<(PathBuf, Publication)> {
+        let mut state = self.state.lock();
+        loop {
+            let free = state
+                .queued
+                .iter()
+                .position(|entry| !state.publishing.contains(&entry.directory));
+            if let Some(entry) = free.and_then(|index| state.queued.remove(index)) {
+                state.publishing.insert(entry.directory.clone());
+                let Queued {
+                    directory,
+                    publication,
+                    admitted,
+                } = entry;
+                // Taken by a worker: no longer pending, so the directory's
+                // bound admits the next put.
+                drop(admitted);
+                self.release_admission(&directory);
+                return Some((directory, publication));
+            }
+            if state.closed && state.queued.is_empty() {
+                return None;
+            }
+            self.changed.wait(&mut state);
+        }
+    }
+
+    /// The admission bound for `directory`, created on first use.
+    fn admission(&self, directory: &std::path::Path) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(
+            self.admission
+                .lock()
+                .entry(directory.to_path_buf())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(PENDING_PER_DIRECTORY))),
+        )
+    }
+
+    /// Forget a directory's bound once nothing holds or waits on it. A put
+    /// clones the bound under the same lock, so it is never forgotten in use.
+    fn release_admission(&self, directory: &std::path::Path) {
+        let mut admission = self.admission.lock();
+        if admission.get(directory).is_some_and(|bound| {
+            Arc::strong_count(bound) == 1 && bound.available_permits() == PENDING_PER_DIRECTORY
+        }) {
+            admission.remove(directory);
+        }
+    }
+
+    fn finish(&self, directory: &std::path::Path) {
+        self.state.lock().publishing.remove(directory);
+        self.changed.notify_all();
+    }
+
+    fn push(&self, entry: Queued) {
+        self.state.lock().queued.push_back(entry);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        self.state.lock().closed = true;
+        self.changed.notify_all();
+    }
 }
 
 fn worker_error(source: impl std::error::Error + Send + Sync + 'static) -> ObjectStoreError {
@@ -116,6 +230,12 @@ fn is_publication_lock(location: &Path) -> bool {
 }
 
 fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> {
+    let file = open_lock_file(path)?;
+    file.lock().map_err(worker_error)?;
+    Ok(file)
+}
+
+fn open_lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> {
     let open = || {
         OpenOptions::new()
             .read(true)
@@ -124,7 +244,7 @@ fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> 
             .truncate(false)
             .open(path)
     };
-    let file = match open() {
+    match open() {
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(worker_error)?;
@@ -133,9 +253,7 @@ fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> 
         }
         opened => opened,
     }
-    .map_err(worker_error)?;
-    file.lock().map_err(worker_error)?;
-    Ok(file)
+    .map_err(worker_error)
 }
 
 fn reserved_lock_error(location: &Path) -> ObjectStoreError {
@@ -158,17 +276,19 @@ fn publication_lock_path(root: &std::path::Path, location: &Path) -> PathBuf {
 
 /// Runs on its own thread with blocking filesystem calls. The lock and
 /// publication have one owner, even when the caller drops its future or shuts
-/// its runtime down. The bounded queue limits pending payloads; closing all
-/// senders drains accepted writes and exits.
-fn write_worker(root: &std::path::Path, mut receive: tokio::sync::mpsc::Receiver<Publication>) {
-    while let Some(request) = receive.blocking_recv() {
+/// its runtime down. Closing the queue drains accepted writes and exits.
+fn write_worker(root: &std::path::Path, base: &std::path::Path, durable: bool, queue: &WriteQueue) {
+    while let Some((directory, request)) = queue.take() {
         let result = publish(
             root,
+            base,
+            durable,
             &request.location,
             &request.path,
             &request.payload,
             &request.options,
         );
+        queue.finish(&directory);
         // A dropped receiver means an unknown outcome for the caller, not abort.
         let _ = request.reply.send(result);
     }
@@ -257,7 +377,7 @@ impl Drop for Staging {
 fn stage(
     path: &std::path::Path,
     payload: &PutPayload,
-) -> Result<(std::fs::File, Staging), ObjectStoreError> {
+) -> Result<(std::fs::File, Staging, bool), ObjectStoreError> {
     let mut suffix = 1_u64;
     let mut created_parent = false;
     let (mut file, staging) = loop {
@@ -292,7 +412,28 @@ fn stage(
         .iter()
         .try_for_each(|chunk| file.write_all(chunk))
         .map_err(worker_error)?;
-    Ok((file, staging))
+    Ok((file, staging, created_parent))
+}
+
+/// Makes a published name durable: syncs the directory holding `path`, and,
+/// when the put created directories, every ancestor up to `root`, because a new
+/// directory is durable only once the entry linking it into its parent is.
+fn sync_directories(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    created_parent: bool,
+) -> Result<(), ObjectStoreError> {
+    let mut directory = path.parent();
+    while let Some(current) = directory {
+        std::fs::File::open(current)
+            .and_then(|handle| handle.sync_all())
+            .map_err(worker_error)?;
+        if !created_parent || current == root || !current.starts_with(root) {
+            break;
+        }
+        directory = current.parent();
+    }
+    Ok(())
 }
 
 /// Moves the staged file's stored modification time, `written`, past `floor`
@@ -338,19 +479,23 @@ fn stamp(
 /// Port any change to that function, such as an fsync option, here too.
 fn publish(
     root: &std::path::Path,
+    base: &std::path::Path,
+    durable: bool,
     location: &Path,
     path: &std::path::Path,
     payload: &PutPayload,
     options: &PutOptions,
 ) -> Result<PutResult, ObjectStoreError> {
-    // Every writer in this root shares the legacy lock, so the payload is
-    // written before it is taken.
-    let (staged, mut staging) = stage(path, payload)?;
+    // An older process holds the legacy lock for its whole put, so the payload
+    // is written before it is taken.
+    let (staged, mut staging, created_parent) = stage(path, payload)?;
     let written = staged.metadata().map_err(worker_error)?;
     // Take the legacy root lock before the directory lock. An older process
-    // locks only the root file. Reversing this order can deadlock with a writer
-    // that still uses this order.
-    let _legacy_guard = lock_file(&root.join(".spice-object-store-occ.lock"))?;
+    // locks only the root file, exclusively; holding it shared excludes that
+    // process while writers to other directories publish in parallel.
+    // Reversing this order can deadlock with a writer that still uses it.
+    let legacy_guard = open_lock_file(&base.join(".spice-object-store-occ.lock"))?;
+    legacy_guard.lock_shared().map_err(worker_error)?;
     let directory_guard = lock_file(&publication_lock_path(root, location))?;
     // `LocalFileSystem` reports a directory at an object's path as no object.
     let current = match std::fs::metadata(path) {
@@ -407,6 +552,11 @@ fn publish(
     directory_guard
         .set_modified(modified)
         .map_err(worker_error)?;
+    // The stamp is the version's ETag, so the sync comes after it: a version
+    // must not come back from a crash with a different ETag than it reported.
+    if durable {
+        staged.sync_all().map_err(worker_error)?;
+    }
     // Some FUSE filesystems, such as Blobfuse, upload a file only once it is
     // closed.
     drop(staged);
@@ -425,16 +575,95 @@ fn publish(
             worker_error(source)
         }
     })?;
+    if durable {
+        sync_directories(base, path, created_parent)?;
+    }
     Ok(PutResult {
         e_tag: Some(local_etag(&written, modified)),
         version: None,
     })
 }
 
+/// The nearest ancestor of `path` that exists now, or `base`: the directories
+/// below it that a write creates are synced into their parents afterwards.
+async fn existing_ancestor(
+    path: PathBuf,
+    base: PathBuf,
+) -> Result<(PathBuf, Option<PathBuf>), ObjectStoreError> {
+    tokio::task::spawn_blocking(move || {
+        let existing = path
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| ancestor.is_dir() || *ancestor == base)
+            .map(std::path::Path::to_path_buf);
+        (path, existing)
+    })
+    .await
+    .map_err(worker_error)
+}
+
+/// Makes the entry naming `path` durable: syncs `path`'s contents first when
+/// `contents`, then its directory and each directory up to `existing` (the
+/// nearest that existed before the write created any), so a directory the write
+/// created is durable in its parent.
+async fn sync_linked(
+    path: PathBuf,
+    existing: Option<PathBuf>,
+    contents: bool,
+) -> Result<(), ObjectStoreError> {
+    tokio::task::spawn_blocking(move || -> Result<(), ObjectStoreError> {
+        if contents {
+            std::fs::File::open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(worker_error)?;
+        }
+        for directory in path.ancestors().skip(1) {
+            std::fs::File::open(directory)
+                .and_then(|handle| handle.sync_all())
+                .map_err(worker_error)?;
+            if existing.as_deref().is_none_or(|stop| directory == stop) {
+                break;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(worker_error)?
+}
+
+/// A multipart upload of a durable store: the upload is `LocalFileSystem`'s,
+/// which writes a staged `{path}#{n}` file and renames it into place on
+/// completion without syncing, so completion then syncs the file, its
+/// directory, and each directory the upload created into its parent, up to the
+/// nearest directory that existed when it started.
+#[derive(Debug)]
+struct DurableUpload {
+    inner: Box<dyn MultipartUpload>,
+    path: PathBuf,
+    existing: Option<PathBuf>,
+}
+
+#[async_trait]
+impl MultipartUpload for DurableUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> Result<PutResult, ObjectStoreError> {
+        let result = self.inner.complete().await?;
+        sync_linked(self.path.clone(), self.existing.clone(), true).await?;
+        Ok(result)
+    }
+
+    async fn abort(&mut self) -> Result<(), ObjectStoreError> {
+        self.inner.abort().await
+    }
+}
+
 impl std::fmt::Debug for LocalConditionalPut {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalConditionalPut")
-            .field("root", &self.root)
+            .field("root", &self.base)
             .finish_non_exhaustive()
     }
 }
@@ -451,24 +680,86 @@ impl LocalConditionalPut {
     /// (e.g. `root` does not exist or is not a directory).
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
         let root = root.into();
-        let inner = Arc::new(LocalFileSystem::new_with_prefix(&root)?);
-        let (writes, receive) = tokio::sync::mpsc::channel(1);
-        let worker_root = root.clone();
-        std::thread::Builder::new()
-            .name("local-state-writer".to_owned())
-            .spawn(move || write_worker(&worker_root, receive))
-            .map_err(worker_error)?;
+        let inner = LocalFileSystem::new_with_prefix(&root)?;
+        Self::with_layout(inner, root.clone(), root, false)
+    }
+
+    /// Creates a `LocalConditionalPut` whose puts survive power loss: each
+    /// staged file is synced before it is linked into place, and the directory
+    /// entries that publish it are synced before the put returns.
+    ///
+    /// # Errors
+    ///
+    /// As [`LocalConditionalPut::new`].
+    pub fn new_durable(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
+        let root = root.into();
+        let inner = LocalFileSystem::new_with_prefix(&root)?;
+        Self::with_layout(inner, root.clone(), root, true)
+    }
+
+    /// A durable store over directory `directory` whose object keys are
+    /// absolute paths without the leading `/`, as the paths of `file://` URLs
+    /// are: `var/spice/state/cayenne/v1/head` for `/var/spice/state/cayenne/v1/head`.
+    /// A local location is then keyed as an S3 store is keyed from its bucket's
+    /// root, so a `file://` URL under it names the same object an `s3://` URL
+    /// under a bucket names. `directory` holds the store's root lock, and a put
+    /// syncs the directories it created up to `directory`. Keep the keys under
+    /// `directory`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store's writers cannot be started.
+    pub fn new_durable_keyed_by_absolute_path(
+        directory: impl Into<PathBuf>,
+    ) -> Result<Self, ObjectStoreError> {
+        Self::with_layout(
+            LocalFileSystem::new(),
+            PathBuf::from("/"),
+            directory.into(),
+            true,
+        )
+    }
+
+    fn with_layout(
+        inner: LocalFileSystem,
+        root: PathBuf,
+        base: PathBuf,
+        durable: bool,
+    ) -> Result<Self, ObjectStoreError> {
+        let inner = Arc::new(inner);
+        let writes = Arc::new(WriteQueue::default());
+        for worker in 0..WRITE_WORKERS {
+            let worker_root = root.clone();
+            let worker_base = base.clone();
+            let queue = Arc::clone(&writes);
+            let spawned = std::thread::Builder::new()
+                .name(format!("local-state-writer-{worker}"))
+                .spawn(move || write_worker(&worker_root, &worker_base, durable, &queue));
+            if let Err(source) = spawned {
+                writes.close();
+                return Err(worker_error(source));
+            }
+        }
         Ok(Self {
             inner,
             root,
+            base,
+            durable,
             writes,
         })
     }
 }
 
+impl Drop for LocalConditionalPut {
+    fn drop(&mut self) {
+        self.writes.close();
+    }
+}
+
 impl Display for LocalConditionalPut {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "LocalConditionalPut({})", self.root.display())
+        let mode = if self.durable { ", durable" } else { "" };
+        write!(f, "LocalConditionalPut({}{mode})", self.base.display())
     }
 }
 
@@ -492,17 +783,32 @@ impl ObjectStore for LocalConditionalPut {
         }
         let path = self.inner.path_to_filesystem(location)?;
         let (reply, result) = tokio::sync::oneshot::channel();
-        self.writes
-            .send(Publication {
+        // Equivalent roots and keys name the same directory lock, so they are
+        // never published by two workers at once and publish in order.
+        let directory = publication_lock_path(&self.root, location);
+        let admission = self.writes.admission(&directory);
+        let pending = admission.acquire_owned().await;
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.writes.release_admission(&directory);
+                return Err(worker_error(error));
+            }
+        };
+        self.writes.push(Queued {
+            directory,
+            publication: Publication {
                 location: location.clone(),
                 path,
                 payload,
                 options: opts,
                 reply,
-            })
+            },
+            admitted: pending,
+        });
+        result
             .await
-            .map_err(|_| worker_error(io::Error::other("local state writer stopped")))?;
-        result.await.map_err(worker_error)?
+            .map_err(|_| worker_error(io::Error::other("local state writer stopped")))?
     }
 
     async fn put_multipart_opts(
@@ -513,7 +819,20 @@ impl ObjectStore for LocalConditionalPut {
         if is_publication_lock(location) {
             return Err(reserved_lock_error(location));
         }
-        self.inner.put_multipart_opts(location, opts).await
+        if !self.durable {
+            return self.inner.put_multipart_opts(location, opts).await;
+        }
+        // The upload creates the directories it needs when it starts; the ones
+        // below the nearest that exists now are synced into their parents when
+        // it completes.
+        let (path, existing) =
+            existing_ancestor(self.inner.path_to_filesystem(location)?, self.base.clone()).await?;
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(DurableUpload {
+            inner,
+            path,
+            existing,
+        }))
     }
 
     async fn get_opts(
@@ -607,7 +926,15 @@ impl ObjectStore for LocalConditionalPut {
                 from
             }));
         }
-        self.inner.copy_opts(from, to, options).await
+        if !self.durable {
+            return self.inner.copy_opts(from, to, options).await;
+        }
+        // A local copy is a hard link to the source's synced contents; the
+        // entries that name it, and the directories it created, are synced.
+        let (path, existing) =
+            existing_ancestor(self.inner.path_to_filesystem(to)?, self.base.clone()).await?;
+        self.inner.copy_opts(from, to, options).await?;
+        sync_linked(path, existing, false).await
     }
 
     async fn rename_opts(
@@ -623,7 +950,15 @@ impl ObjectStore for LocalConditionalPut {
                 from
             }));
         }
-        self.inner.rename_opts(from, to, options).await
+        if !self.durable {
+            return self.inner.rename_opts(from, to, options).await;
+        }
+        // The contents were synced when written; the entry that names them at
+        // `to`, and the directories the rename created, are synced.
+        let (path, existing) =
+            existing_ancestor(self.inner.path_to_filesystem(to)?, self.base.clone()).await?;
+        self.inner.rename_opts(from, to, options).await?;
+        sync_linked(path, existing, false).await
     }
 }
 
@@ -1304,6 +1639,68 @@ mod tests {
             stored <= SystemTime::now(),
             "stored {stored:?} is ahead of the clock"
         );
+    }
+
+    /// A store keyed by absolute paths writes the file the key names, keeps its
+    /// root lock in its directory rather than at `/`, and refuses a stale
+    /// conditional update as a store keyed from its directory does.
+    #[tokio::test]
+    async fn a_store_keyed_by_absolute_path_writes_where_the_key_names() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new_durable_keyed_by_absolute_path(dir.path())
+            .expect("create store");
+        let file = dir.path().join("cayenne/v1/head");
+        let key = Path::from_absolute_path(&file).expect("absolute key");
+        assert_eq!(
+            format!("/{key}"),
+            file.to_string_lossy(),
+            "the key is the absolute path without its leading slash"
+        );
+        let created = store
+            .put_opts(
+                &key,
+                b"v1".as_slice().into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create");
+        assert_eq!(std::fs::read(&file).expect("read the file"), b"v1");
+        assert!(
+            dir.path().join(".spice-object-store-occ.lock").is_file(),
+            "the root lock is in the store's directory"
+        );
+        store
+            .put_opts(
+                &key,
+                b"v2".as_slice().into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: created.e_tag.clone(),
+                    version: None,
+                })),
+            )
+            .await
+            .expect("update on the current version");
+        let stale = store
+            .put_opts(
+                &key,
+                b"v3".as_slice().into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: created.e_tag,
+                    version: None,
+                })),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(ObjectStoreError::Precondition { .. })),
+            "got {stale:?}"
+        );
+        let listed: Vec<_> = store
+            .list(Some(&Path::from_absolute_path(dir.path()).expect("prefix")))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .expect("list");
+        assert_eq!(listed, vec![key]);
     }
 
     /// A directory at an object's path is no object, as `LocalFileSystem`

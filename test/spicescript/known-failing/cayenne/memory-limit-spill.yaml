@@ -15,6 +15,8 @@ sources:
 variants:
   cayenne-64mib: {}
   cayenne-256mib: { spicepod: { runtime: { query: { memory_limit: 256MiB } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

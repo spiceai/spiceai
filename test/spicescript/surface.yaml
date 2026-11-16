@@ -11,9 +11,10 @@ sources:
 
 variants:
   federated: {}
-  arrow: arrow
+  cayenne-memory: cayenne-memory
   cayenne: cayenne-file
-  sqlite: sqlite-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
 
 spicepod:
   version: v1
@@ -35,9 +36,8 @@ steps:
       src: { file: seed/surface-postgres.sql }
   - start: {}
   - corpus: corpus/surface.sql
-  # SQLite has no UNNEST, so a plan with one runs the UNNEST and the joins above
-  # it locally there: a cross join keeps every pair and a join can read the
-  # unnested column.
+  # A plan with an UNNEST: a cross join keeps every pair and a join can read
+  # the unnested column.
   - query: SELECT count(*) AS n FROM ev a CROSS JOIN (SELECT * FROM unnest(range(0, 100))) b
     oracle-sql: SELECT count(*) AS n FROM ev a CROSS JOIN generate_series(0, 99) b
   - query: SELECT a.id, b.x FROM ev a JOIN (SELECT unnest([1, 2, 3]) AS x) b ON a.id = b.x

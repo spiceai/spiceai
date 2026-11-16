@@ -16,6 +16,8 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: cayenne-file-object-native
 
 spicepod:
   version: v1
@@ -100,7 +102,7 @@ steps:
   # keeps the rule from firing.
   - explain: SELECT count(id) FROM t WHERE s NOT IN (SELECT s FROM t WHERE s IS NULL)
     contains: __eager_p0_0
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - query: SELECT count(*) FROM t WHERE s NOT IN (SELECT s FROM t WHERE s IS NULL)
     expect: { rows: [['0']] }
   - query: SELECT count(id) FROM t WHERE s NOT IN (SELECT s FROM t WHERE s IS NULL)
