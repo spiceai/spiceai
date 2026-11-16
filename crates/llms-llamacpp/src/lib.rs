@@ -146,14 +146,15 @@ fn load_weights<'a>(
 const PROMPT_BATCH: usize = 512;
 
 /// The most requests one model decodes together, as llama-server's default slot count is a few:
-/// a model serves this many unless its memory holds fewer ([`concurrent_context`]). A step's
+/// a model serves this many unless its memory holds fewer ([`fitting`]). A step's
 /// batch holds each one's next token and draft, which stays well within the context's batch
 /// size (`PROMPT_BATCH`).
 const MAX_CONCURRENT: u32 = 8;
 
 /// The memory a model leaves free on its GPUs (the machine's, on a unified-memory GPU) once its
-/// context is created with room for its open requests: a ceiling that leaves less is halved,
-/// so the requests' state never takes what the machine needs to keep running.
+/// contexts are created with room for its open requests, its draft's included: a ceiling that
+/// leaves less is halved, so the requests' state never takes what the machine needs to keep
+/// running.
 const MIN_FREE_AFTER_CONTEXT: u64 = 2 << 30;
 
 /// The most host memory a model's idle prompts take, as llama.cpp's server bounds its prompt cache
@@ -1111,33 +1112,40 @@ fn serve(
         .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
         .with_n_rs_seq(snapshots);
     let ceiling = concurrent;
-    let (context, concurrent) = match concurrent_context(&model, backend, params, ceiling) {
+    // The draft's context is created with the target's, before the memory they leave is
+    // checked: it holds a cache as long as the target's for as many requests.
+    let created = fitting(
+        ceiling,
+        |concurrent| {
+            let context = model
+                .new_context(backend, &shared_cache(params, concurrent))
+                .map_err(|e| format!("llama.cpp could not create a context: {e}"))?;
+            match head {
+                None => Ok(Decoder::Plain(context)),
+                Some((head, kind)) => mtp(head, kind, context, (mtp_len, concurrent))
+                    .map(|spec| Decoder::Mtp(Box::new(spec))),
+            }
+        },
+        free_memory,
+    );
+    let (mut decoder, concurrent) = match created {
         Ok(created) => created,
-        Err(e) => {
-            let _ = ready.send(Err(failed(format!(
-                "llama.cpp could not create a context: {e}"
-            ))));
+        Err(message) => {
+            let _ = ready.send(Err(failed(message)));
             return;
         }
+    };
+    let context_window = match &decoder {
+        Decoder::Plain(context) => context.n_ctx(),
+        Decoder::Mtp(spec) => spec.target().n_ctx(),
     };
     let layout = cache_layout(model.architecture().as_deref());
     if ceiling > 1 {
         tracing::info!(
             "{}",
-            concurrency_note(name, (concurrent, ceiling), context.n_ctx(), layout)
+            concurrency_note(name, (concurrent, ceiling), context_window, layout)
         );
     }
-    let context_window = context.n_ctx();
-    let mut decoder = match head {
-        None => Decoder::Plain(context),
-        Some((head, kind)) => match mtp(head, kind, context, (mtp_len, concurrent)) {
-            Ok(spec) => Decoder::Mtp(Box::new(spec)),
-            Err(message) => {
-                let _ = ready.send(Err(failed(message)));
-                return;
-            }
-        },
-    };
     let vocab = model.vocab();
     let special = SpecialTokens {
         bos: piece(&model, vocab.bos()),
@@ -1413,27 +1421,26 @@ fn mtp<'m>(
     .map_err(|e| format!("llama.cpp could not start drafting: {e}"))
 }
 
-/// A context for up to `ceiling` requests at once, and how many it holds: the ceiling, halved
-/// while llama.cpp cannot create the context, or creates it leaving less than
-/// [`MIN_FREE_AFTER_CONTEXT`] free, down to one request, whose context is created as it stands.
-fn concurrent_context<'m>(
-    model: &'m Model,
-    backend: &Backend,
-    params: ContextParams,
+/// What `create` makes for up to `ceiling` requests at once, and how many it holds: the
+/// ceiling, halved while `create` fails, or makes it leaving less than
+/// [`MIN_FREE_AFTER_CONTEXT`] free as `free` reads it then, down to one request, whose decoder
+/// is kept as it is made.
+fn fitting<T>(
     ceiling: u32,
-) -> llama_cpp::Result<(Context<'m>, u32)> {
+    mut create: impl FnMut(u32) -> std::result::Result<T, String>,
+    free: impl Fn() -> Option<u64>,
+) -> std::result::Result<(T, u32), String> {
     let mut concurrent = ceiling.max(1);
     loop {
-        match model.new_context(backend, &shared_cache(params, concurrent)) {
-            Ok(context)
-                if concurrent == 1
-                    || free_memory().is_none_or(|free| free >= MIN_FREE_AFTER_CONTEXT) =>
+        match create(concurrent) {
+            Ok(made)
+                if concurrent == 1 || free().is_none_or(|free| free >= MIN_FREE_AFTER_CONTEXT) =>
             {
-                return Ok((context, concurrent));
+                return Ok((made, concurrent));
             }
             Err(e) if concurrent == 1 => return Err(e),
-            // a context that leaves too little free is dropped here, so its memory is free for
-            // the smaller one
+            // what leaves too little free is dropped here, so its memory is free for the
+            // smaller one
             Ok(_) | Err(_) => concurrent /= 2,
         }
     }
@@ -3271,6 +3278,70 @@ fn api_error(message: &str) -> OpenAIError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Memory taken from a machine of `total` MiB while it lives, as a context takes its cache.
+    struct Taken<'a> {
+        used: &'a std::cell::Cell<u64>,
+        mib: u64,
+    }
+
+    impl Drop for Taken<'_> {
+        fn drop(&mut self) {
+            self.used.set(self.used.get() - self.mib);
+        }
+    }
+
+    /// The memory a model leaves free is read once everything it makes for its requests is made:
+    /// a decoder whose target context leaves enough free but whose draft context then leaves too
+    /// little is halved, and the larger one's memory is free again before the smaller is made.
+    /// The sizes are near DeepSeek-V4.1's head at 131072 tokens, a 126141 MiB machine on which
+    /// 4 requests' draft context took 1206 MiB.
+    #[test]
+    fn requests_are_halved_while_their_target_and_draft_leave_too_little_free() {
+        const TOTAL: u64 = 126_141;
+        const WEIGHTS: u64 = 75_641;
+        let used = std::cell::Cell::new(WEIGHTS);
+        let mut made = Vec::new();
+        let target = |n: u64| 6_000 * n;
+        let draft = |n: u64| 302 * n;
+        // With the target context alone, 8 requests leave 2500 MiB free, above the floor's
+        // 2048, and only their draft context takes them below it.
+        assert!(TOTAL - WEIGHTS - target(8) > MIN_FREE_AFTER_CONTEXT >> 20);
+        assert!(TOTAL - WEIGHTS - target(8) - draft(8) < MIN_FREE_AFTER_CONTEXT >> 20);
+        let (decoder, serves) = fitting(
+            8,
+            |concurrent| {
+                made.push(concurrent);
+                let mib = target(u64::from(concurrent)) + draft(u64::from(concurrent));
+                used.set(used.get() + mib);
+                Ok(Taken { used: &used, mib })
+            },
+            || Some((TOTAL - used.get()) << 20),
+        )
+        .expect("a decoder for some requests");
+        assert_eq!((serves, made), (4, vec![8, 4]));
+        assert_eq!(used.get(), WEIGHTS + target(4) + draft(4));
+        drop(decoder);
+        assert_eq!(used.get(), WEIGHTS);
+    }
+
+    /// One request's decoder is kept however little it leaves free, and its error is the load's.
+    #[test]
+    fn one_request_is_kept_as_made_and_its_error_is_the_load_s() {
+        let ((), serves) = fitting(4, |_| Ok(()), || Some(0)).expect("one request's decoder");
+        assert_eq!(serves, 1);
+        let mut tried = Vec::new();
+        let failed = fitting(
+            4,
+            |concurrent| -> std::result::Result<(), String> {
+                tried.push(concurrent);
+                Err(format!("no room for {concurrent}"))
+            },
+            || None,
+        );
+        assert_eq!(failed, Err("no room for 1".to_string()));
+        assert_eq!(tried, vec![4, 2, 1]);
+    }
 
     /// The load line for how many requests a model serves at once, in each of its forms.
     #[test]
