@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! The `arrow` data accelerator.
+//!
+//! Deprecated in v2.4 and scheduled for removal in v2.5: migrate accelerations to
+//! Cayenne (`engine: cayenne`, `mode: memory` for an in-memory acceleration).
+
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::execution::runtime_env::RuntimeEnv;

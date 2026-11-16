@@ -209,6 +209,21 @@ pub trait SnapshotEngine: Send + Sync {
         Ok(())
     }
 
+    /// Hook invoked by `SnapshotManager` right before a verified directory-layout
+    /// snapshot is extracted into `dirs`. Extraction keeps files already there,
+    /// so an engine whose live instance deletes files in `dirs` must stop it here.
+    /// The restore can still fail afterwards, leaving that instance serving.
+    ///
+    /// Default implementation is a no-op.
+    async fn prepare_directory_restore(
+        &self,
+        dirs: &[(PathBuf, String)],
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        let _ = (dirs, dataset_name);
+        Ok(())
+    }
+
     /// Hook invoked by `SnapshotManager` *after* extracting a directory-layout
     /// snapshot. Allows engines to perform engine-specific post-processing
     /// (e.g. import a metastore slice that was written into one of the

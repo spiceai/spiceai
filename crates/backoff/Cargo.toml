@@ -6,6 +6,7 @@ version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
+repository.workspace = true
 description = "Retry with exponential backoff for Spice.ai"
 
 [dependencies]

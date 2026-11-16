@@ -103,6 +103,12 @@ pub struct DatasetTestArgs {
     #[arg(long)]
     pub(crate) layout: Option<Layout>,
 
+    /// Whether `run bench` compares query results and explain plans with their recorded
+    /// snapshots. The snapshots record this branch's answers and plans, which another
+    /// `spiced` release does not reproduce, so a benchmark of another release turns this off.
+    #[arg(long, action = ArgAction::Set, default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub(crate) snapshots: bool,
+
     /// Whether to disable results caching, by supplying the cache control header through flight
     #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
     pub(crate) disable_caching: bool,
@@ -257,8 +263,6 @@ pub enum QueryOverridesArg {
     Postgresql,
     #[serde(rename = "mysql")]
     Mysql,
-    #[serde(rename = "dremio")]
-    Dremio,
     #[serde(rename = "spark")]
     Spark,
     #[serde(rename = "odbc-athena")]
@@ -469,7 +473,6 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Sqlite => QueryOverrides::SQLite,
             QueryOverridesArg::Postgresql => QueryOverrides::PostgreSQL,
             QueryOverridesArg::Mysql => QueryOverrides::MySQL,
-            QueryOverridesArg::Dremio => QueryOverrides::Dremio,
             QueryOverridesArg::Spark => QueryOverrides::Spark,
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
             QueryOverridesArg::ODBCDatabricks => QueryOverrides::ODBCDatabricks,

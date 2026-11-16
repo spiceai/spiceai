@@ -58,13 +58,18 @@ limitations under the License.
 //!   json-pointer) instead of per-index (`a[0]`, `a[1]`, …). Matches
 //!   `JSONPath` storage conventions.
 //!
+//! One document emits at most 32 times `max_bytes` of string data (256 MiB by
+//! default); a walk that reaches this cap stops and returns the rows emitted
+//! so far, like `max_rows`.
+//!
 //! Telemetry: OpenTelemetry counters `flatten_json_invocations_total`,
 //! `flatten_json_rows_emitted_total`, and
 //! `flatten_json_errors_total{kind}`. For the UDTF entry point, malformed
 //! input or a hit cap emits an error-kind metric and yields an empty /
 //! truncated batch instead of a query-level error. The scalar UDF entry
 //! point additionally returns `DataFusionError::Execution` if a single
-//! batch would exceed `SCALAR_BATCH_MAX_ROWS` flattened rows or if the
+//! batch would exceed `SCALAR_BATCH_MAX_ROWS` flattened rows or
+//! `SCALAR_BATCH_MAX_OUTPUT_BYTES` bytes of output, or if the
 //! resulting `LargeList` offsets would overflow `i64`; callers in those
 //! paths should reduce `max_rows` or split the input.
 
@@ -102,12 +107,19 @@ runtime_udfs_api::register_spice_function!(FLATTEN_JSON_SPICE_FUNCTION, FLATTEN_
 const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_MAX_ROWS: usize = 1_000_000;
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Every row repeats its ancestors' path, so the output can be far larger
+/// than the input. One document emits at most this many string bytes per byte
+/// of `max_bytes`.
+const OUTPUT_BYTES_PER_INPUT_BYTE: usize = 32;
 
 /// Scalar UDF ceiling across a single evaluated batch. Per-document caps
 /// already bound individual rows, but a wide input batch could still
 /// accumulate `number_rows * max_rows` entries in memory. Error out loudly
 /// past this watermark so operators see the condition rather than OOM.
 const SCALAR_BATCH_MAX_ROWS: usize = 10_000_000;
+/// Scalar UDF ceiling on the string bytes of one evaluated batch, kept well
+/// under the 2 GiB offset range of a `Utf8` column.
+const SCALAR_BATCH_MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 
 // -------- Metrics --------
 
@@ -132,7 +144,7 @@ static ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .u64_counter("flatten_json_errors_total")
         .with_description(
             "Errors inside flatten_json, labelled by kind \
-             (parse|depth_exceeded|row_cap_hit|input_too_large|batch_cap_hit).",
+             (parse|depth_exceeded|row_cap_hit|output_cap_hit|input_too_large|batch_cap_hit).",
         )
         .build()
 });
@@ -173,6 +185,17 @@ pub struct JsonRow {
     pub key: String,
     pub value: Option<String>,
     pub type_name: &'static str,
+}
+
+impl JsonRow {
+    fn output_bytes(&self) -> usize {
+        self.path.len()
+            + self.parent_path.len()
+            + self.key.len()
+            + self.value.as_ref().map_or(0, String::len)
+            + self.type_name.len()
+            + size_of::<Self>()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +268,7 @@ pub fn flatten_with_options(input: &str, opts: &FlattenOptions) -> Vec<JsonRow> 
     let mut walker = Walker {
         opts,
         rows: Vec::new(),
+        output_bytes: 0,
         row_cap_hit: false,
         depth_cap_hit: false,
     };
@@ -258,6 +282,7 @@ pub fn flatten_with_options(input: &str, opts: &FlattenOptions) -> Vec<JsonRow> 
 struct Walker<'a> {
     opts: &'a FlattenOptions,
     rows: Vec<JsonRow>,
+    output_bytes: usize,
     row_cap_hit: bool,
     depth_cap_hit: bool,
 }
@@ -379,13 +404,26 @@ impl Walker<'_> {
             }
             return;
         }
-        self.rows.push(JsonRow {
+        let row = JsonRow {
             path: path.to_owned(),
             parent_path,
             key: key.to_owned(),
             value: leaf_value_string(value),
             type_name,
-        });
+        };
+        let row_bytes = row.output_bytes();
+        if self.output_bytes + row_bytes
+            > self
+                .opts
+                .max_bytes
+                .saturating_mul(OUTPUT_BYTES_PER_INPUT_BYTE)
+        {
+            record_error("output_cap_hit");
+            self.row_cap_hit = true;
+            return;
+        }
+        self.output_bytes += row_bytes;
+        self.rows.push(row);
     }
 }
 
@@ -801,17 +839,25 @@ impl ScalarUDFImpl for FlattenJsonScalar {
         let strings = as_largestring_array(&normalized);
 
         let mut all_rows: Vec<JsonRow> = Vec::new();
+        let mut batch_bytes = 0usize;
         let mut offsets: Vec<i64> = Vec::with_capacity(strings.len() + 1);
         offsets.push(0);
 
         for idx in 0..strings.len() {
             if !strings.is_null(idx) {
                 let rows = flatten_with_options(strings.value(idx), &opts);
+                batch_bytes += rows.iter().map(JsonRow::output_bytes).sum::<usize>();
                 all_rows.extend(rows);
                 if all_rows.len() > SCALAR_BATCH_MAX_ROWS {
                     record_error("batch_cap_hit");
                     return Err(DataFusionError::Execution(format!(
                         "{FLATTEN_JSON_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_ROWS} flattened rows; split the input or use the UDTF form with `max_rows => N`."
+                    )));
+                }
+                if batch_bytes > SCALAR_BATCH_MAX_OUTPUT_BYTES {
+                    record_error("batch_cap_hit");
+                    return Err(DataFusionError::Execution(format!(
+                        "{FLATTEN_JSON_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_OUTPUT_BYTES} bytes of output; split the input."
                     )));
                 }
             }
@@ -1049,5 +1095,45 @@ mod tests {
             }
             other => panic!("expected LargeList<Struct<..>>, got {other:?}"),
         }
+    }
+
+    fn long_key_doc() -> String {
+        let children = vec!["0"; 1000].join(",");
+        format!(r#"{{"{}":[{children}]}}"#, "k".repeat(4096))
+    }
+
+    #[test]
+    fn output_bytes_are_capped_per_document() {
+        let opts = FlattenOptions {
+            max_bytes: 8 * 1024,
+            ..FlattenOptions::default()
+        };
+        let rows = flatten_with_options(&long_key_doc(), &opts);
+        let bytes: usize = rows.iter().map(JsonRow::output_bytes).sum();
+        assert!(bytes <= 32 * 8 * 1024, "emitted {bytes} bytes");
+        assert!(
+            !rows.is_empty() && rows.len() < 1000,
+            "rows: {}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn raising_max_bytes_raises_the_output_budget() {
+        let opts = FlattenOptions {
+            max_bytes: 1024 * 1024,
+            ..FlattenOptions::default()
+        };
+        assert_eq!(flatten_with_options(&long_key_doc(), &opts).len(), 1000);
+    }
+
+    #[test]
+    fn output_byte_cap_leaves_small_documents_unchanged() {
+        let opts = FlattenOptions {
+            max_bytes: 256,
+            ..FlattenOptions::default()
+        };
+        let doc = r#"{"a": {"b": [1, "x", null]}, "c": true}"#;
+        assert_eq!(flatten_with_options(doc, &opts), flatten(doc));
     }
 }

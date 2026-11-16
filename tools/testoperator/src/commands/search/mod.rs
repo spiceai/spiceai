@@ -20,7 +20,10 @@ mod mteb;
 mod per_query;
 use self::dataset::SearchDataset;
 use super::{duration_millis_between, get_app_and_start_request};
-use crate::{args::SearchTestArgs, health::HealthMonitor};
+use crate::{
+    args::{SearchTestArgs, SqlPipelineArg},
+    health::HealthMonitor,
+};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use test_framework::{
@@ -33,7 +36,7 @@ use test_framework::{
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
-        search::{NotStarted, RetrievalMetrics, SearchRunMetric},
+        search::{NotStarted, RetrievalMetrics, SearchMethod, SearchRunMetric, SqlPipeline},
     },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
@@ -42,6 +45,7 @@ use test_framework::{
 use tokio::time::sleep;
 
 pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
+    let search_method = load_search_method(args.sql_pipeline.as_ref())?;
     let dataset = SearchDataset::from(args.benchmark_dataset);
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
 
@@ -87,7 +91,11 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         KeyValue::new("branch_name", git::get_branch_name()),
         KeyValue::new("config_name", app.name.clone()),
         KeyValue::new("benchmark_dataset", dataset.name()),
+        KeyValue::new("search_method", search_method.name()),
     ];
+    if let Some(sql_pipeline) = &args.sql_pipeline {
+        search_attributes.push(KeyValue::new("sql_pipeline", sql_pipeline.name()));
+    }
     search_attributes.extend(search_dataset_attributes(&app));
 
     let search_resource = Resource::builder_empty()
@@ -104,11 +112,12 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     // Allow Spicepod traces to be fully printed before running the test
     sleep(Duration::from_millis(200)).await;
 
-    println!("Running search");
+    println!("Running search ({})", search_method.name());
 
     let config = dataset
         .init_search_config(&spiced_instance, Some(10))
-        .await?;
+        .await?
+        .with_method(search_method);
 
     // retrieve query relevance data
     let qrels = dataset.query_relevance_data(&spiced_instance).await?;
@@ -212,6 +221,29 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     println!("Benchmark completed successfully!");
 
     Ok(())
+}
+
+/// Gets the `--sql-pipeline` SQL, if set, before spiced starts so that an empty pipeline fails
+/// fast. Without the flag, the run uses `POST /v1/search`.
+fn load_search_method(sql_pipeline: Option<&SqlPipelineArg>) -> anyhow::Result<SearchMethod> {
+    let sql = match sql_pipeline {
+        None => return Ok(SearchMethod::SearchApi),
+        Some(SqlPipelineArg::Inline(sql)) => sql.clone(),
+        Some(SqlPipelineArg::File(path)) => {
+            let sql = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("Failed to read --sql-pipeline {}: {e}", path.display())
+            })?;
+            if sql.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "--sql-pipeline {} has no SQL",
+                    path.display()
+                ));
+            }
+            sql
+        }
+    };
+
+    Ok(SearchMethod::Sql(SqlPipeline::new(sql)))
 }
 
 /// Print the retrieval-quality metrics at every computed rank cutoff `k` as an aligned table.

@@ -1797,7 +1797,10 @@
       "properties": {
         "state_location": {
           "description": "Deprecated: set `runtime.state.location`, which keeps cluster state in its\n`cluster/` folder. Root URI for shared cluster state (see\n[`Runtime::scheduler_state`]).",
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "deprecated": true
         },
         "params": {
@@ -3187,7 +3190,7 @@
           "default": "auto"
         },
         "engine": {
-          "description": "The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where\nCayenne is not available.",
+          "description": "The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where\nCayenne is not available.\n\nEvery engine other than `cayenne` (`arrow`, `duckdb`, `sqlite`, `turso`, and\n`postgres`) is deprecated in v2.4 and will be removed in v2.5; a Spicepod that uses\none logs a warning at startup and on hot reload. Set `engine: cayenne`, or leave\n`engine` unset, then delete the old engine's acceleration files and snapshots. On\nWindows, run Spice in Docker or WSL to use Cayenne. See\n<https://spiceai.org/docs/components/data-accelerators/cayenne/migration>.",
           "type": [
             "string",
             "null"
@@ -4013,6 +4016,7 @@
           "default": true
         },
         "engine": {
+          "description": "The vector engine: `s3_vectors`, `elasticsearch`, or `duckdb`. The `duckdb` engine\nis deprecated in v2.4 and will be removed in v2.5; on a Cayenne acceleration, remove\nthe `vectors` block instead, since Cayenne indexes embedding columns itself. See\n<https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine>.",
           "type": [
             "string",
             "null"
@@ -8012,7 +8016,7 @@
       "type": "object",
       "properties": {
         "iceberg_metadata_path": {
-          "description": "The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead, and names the metadata file to read.",
+          "description": "The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead: it names the metadata file to read, or a version number from which the newest consecutive `v<N>.metadata.json` is read.",
           "type": "string"
         },
         "metadata_path": {
@@ -8348,7 +8352,7 @@
       "type": "object",
       "properties": {
         "mysql_connection_string": {
-          "description": "Full MySQL DSN. Overrides other connection params if set.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
+          "description": "Full MySQL DSN. Overrides `host`, `tcp_port`, `user`, `pass` and `db` if set. Its `pool_min`, `pool_max` and `abs_conn_ttl` query settings are used unless the matching Spicepod parameter is set; setting both to different values is an error.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
           "type": "string",
           "examples": [
             "mysql://app:secret@db.internal:3306/analytics"
@@ -8405,6 +8409,11 @@
           "description": "The maximum number of connections created in the connection pool.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
           "type": "string",
           "default": "5"
+        },
+        "mysql_connection_max_lifetime": {
+          "description": "How long a pooled connection is used before it is closed and replaced, such as '5m'. Replacing connections makes the pool resolve the host again, so it spreads across the servers behind a load-balanced hostname such as a reader endpoint. Each connection's lifetime is extended by a random amount of up to a fifth of it, so connections opened together are not replaced together. A connection is not closed while a query is using it. '0s' keeps connections open indefinitely. Default: 5m.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
+          "type": "string",
+          "default": "5m"
         },
         "mysql_time_zone": {
           "description": "The time zone to use for the connection. Default is '+00:00' (UTC).\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",

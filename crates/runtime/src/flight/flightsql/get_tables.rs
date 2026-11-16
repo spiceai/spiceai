@@ -17,7 +17,9 @@ limitations under the License.
 use crate::{
     datafusion::request_context_extension::get_current_datafusion,
     flight::{
-        Service, metrics, record_batches_to_flight_stream, to_tonic_err,
+        Service,
+        flightsql::{bounded_list, check_filter_pattern},
+        metrics, record_batches_to_flight_stream, to_tonic_err,
         util::set_flightsql_protocol,
     },
 };
@@ -52,10 +54,20 @@ pub(crate) async fn get_flight_info(
 }
 
 pub(crate) async fn do_get(
-    query: sql::CommandGetTables,
+    mut query: sql::CommandGetTables,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let start = metrics::track_flight_request("do_get", Some("get_tables")).await;
     set_flightsql_protocol().await;
+
+    check_filter_pattern(
+        "db_schema_filter_pattern",
+        query.db_schema_filter_pattern.as_deref(),
+    )?;
+    check_filter_pattern(
+        "table_name_filter_pattern",
+        query.table_name_filter_pattern.as_deref(),
+    )?;
+    query.table_types = bounded_list("GetTables table_types", query.table_types)?;
 
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);

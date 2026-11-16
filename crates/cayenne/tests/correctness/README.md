@@ -206,8 +206,8 @@ is not in its run, because a target whose `required-features` are unmet is dropp
 by cargo silently, which is how the lanes above once went unbuilt.
 
 The runtime accelerator lane stays out of the fast gate on purpose.
-`runtime/duckdb,runtime/sqlite` flow through the whole `--all --tests` build, so
-every runtime integration test binary relinks with them at hundreds of megabytes
+`runtime/duckdb,runtime/sqlite` flow through the whole `--all` build, so
+every runtime test binary the gate builds relinks with them at hundreds of megabytes
 each — a permanent cost on every sign-off for two micro-shape comparisons. It is
 a module of runtime's `integration` test binary, so the integration workflow,
 which already builds with `duckdb,sqlite`, runs it.

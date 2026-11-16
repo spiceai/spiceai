@@ -43,6 +43,7 @@ permissions:
 
 jobs:
   build_pdf:
+    environment: secret-free
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 

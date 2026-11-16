@@ -76,10 +76,11 @@ comment, not a test in the fork.
 that does not exist, which is worse than a **GAP** — a gap is at least on the
 list below. `kind(=lib)` sweeps up every unit test, so the exposure is the
 integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
-`--all --tests` compiles them either way, so an unnamed binary is built and then
-skipped. Guards were found running nowhere for that reason, in integration-test
-targets now named there: `adbc_cancellation` for the two `arrow-adbc`
-cancellation rows (fork PRs #4 and #65, which share one test), and `spiced`'s
+the gate builds only the targets it selects, so an unnamed binary is neither
+built nor run, and nothing fails. Guards were found running nowhere for that reason, in integration-test
+targets now named there: `adbc_cancellation` for the ADBC cancellation row
+(`datafusion-table-providers` fork PR #65; the same test guards the lock-free
+statement cancel that ADBC 25 took upstream from `arrow-adbc` fork PR #4), and `spiced`'s
 `integration` binary, whose `cpu_budget` module guards vortex's
 `set_available_parallelism`. (`json_semantics` is named there too; it
 guarded the `datafusion-functions-json` fork, which is now taken from crates.io.)
@@ -106,26 +107,27 @@ own section below — a count here would be one more thing to keep true by hand.
 
 | Fork | Pinned revision | Branch |
 |---|---|---|
-| [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
-| [arrow-rs](#arrow-rs) | `2e2cc330c64ac8a9e44d2a5f2da171b391f775b8` | `spiceai-59` |
-| [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
-| [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
+| [arrow-adbc](#arrow-adbc) | `7caad4ccc7050b0721778a426eef38f0f151fef9` | `spiceai-25` |
+| [arrow-rs](#arrow-rs) | `510ef234e1444f2c4aaf748d0c905787738afa7a` | `spiceai-59.3.2` |
+| [async-openai](#async-openai) | `c1bf4a090c50e18f27663b008dac4c108e49b994` | `spiceai` |
+| [candle](#candle-and-its-kernel-crates) | `5a67f5ecd62321b019c0daffd6613cfb9f71505e` | `spiceai-release-2.4` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `cf084aa85dfdc27b4736208f5c132828020774ea` | `spiceai-55` |
+| [datafusion](#datafusion) | `8511619b714ad672b782ccf8f5ba577cf22117ba` | `spiceai-55-release-2.4` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `54d90109c5db98d0420e0545a820f8bba8cc930c` | `spiceai-55` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `bc28b14282501d7c3bb9ee8ae7a941f86d707910` | `spiceai-55-release-2.4` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
-| [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
+| [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
+| [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `60d8e5b5ea5efdfa89c0d709428044b553d1b5b0` | `spiceai-release-2.4` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
+| [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
 | [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
@@ -198,8 +200,9 @@ row here. Its behaviour is covered where the code lives, by
 ## datafusion
 
 Upstream [apache/datafusion](https://github.com/apache/datafusion), branch
-`spiceai-55` (upstream `55.2.0-rc1` merged into the previous line in
-spiceai/datafusion#248) and spiceai/datafusion#249, which carries three
+`spiceai-55-release-2.4`, cut from `spiceai-55` at #260's merge commit (`cf084aa`, the
+revision v2.4.0 and v2.4.1 ship). That base carries upstream `55.2.0-rc1` (merged into the
+previous line in spiceai/datafusion#248) and spiceai/datafusion#249, which carries three
 `spiceai-54` patches onto 55. On top of #249 come #240, the metadata-column listing
 pruning that #229 carried on `spiceai-54`, #251, which gives a file that holds no
 rows no partition-column bounds, #252, #256, which reads a Substrait string or
@@ -210,7 +213,11 @@ fractional-second precision, and #257, which writes a join key that matches NULL
 as `IS NOT DISTINCT FROM`, #258, the `IoWaitHook` patch
 ([#15049](https://github.com/spiceai/spiceai/issues/15049)), #259, which keeps placeholder type
 inference linear in the depth of an expression, and #260, which carries an eliminated sort's
-fetch through a single-input repartition; the pin is #260's merge commit. None changes a
+fetch through a single-input repartition. On top of #260's merge commit, `spiceai-55-release-2.4` carries
+#287 (merged to `spiceai-55` separately), which stores a compacted copy of each nested `COUNT(DISTINCT …)` value,
+#275 (cherry-picked in #289), which limits the nesting depth of a SQL data type, and #288 (backported in #293), which
+keeps a struct column in a Parquet scan's projection and row filter when `get_field` keys into a map inside it, and
+makes `get_field` apply the parent's nulls to the field it extracts. On top of #293's merge commit, spiceai/datafusion#299 merges upstream `55.3.0` (apache/datafusion@7941823), with the conflict resolutions reviewed for `spiceai-55` in spiceai/datafusion#298: #251's empty-file rule and apache/datafusion#26310's NULL-partition rule are both kept in `PartitionedFile::with_statistics`, and the metadata-column code in `catalog-listing` keeps upstream's nullable partition columns. That merge drops no Spice patch: for every file the fork changes, its diff against the release is line for line the same before and after it, except those resolutions and `Cargo.lock`. The pin is #299's merge into `spiceai-55-release-2.4` (`8511619b`). None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
@@ -319,17 +326,26 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: a join whose keys match NULLs (`NullEquality::NullEqualsNull`) writes them as `IS NOT DISTINCT FROM` (`<=>` for MySQL), in an `EXISTS` correlation and in `ON`, and never as `USING`. `INTERSECT` and `EXCEPT` are always planned as such a semi or anti join, and the optimizer makes one from a join or `EXISTS` compared only with `IS NOT DISTINCT FROM` (spiceai/datafusion#257) | The keys are written as `=`, which is never true on NULL, so the remote engine drops every row with a NULL in a compared column from an `INTERSECT` and keeps it in an `EXCEPT`: on `DuckDB` file acceleration, TPC-DS q38 returns 0 rows instead of 111 and q87 46,704 instead of 46,449 ([#14941](https://github.com/spiceai/spiceai/issues/14941)) | silent (wrong data) | `crates/data_components/src/federation.rs::tests::intersect_and_except_unparse_keys_that_match_nulls`; real-engine guard `crates/runtime/tests/duckdb/mod.rs::duckdb_file_acceleration_set_operations_match_nulls` (`runtime::integration`, run by `integration.yml`) |
 | `IoWaitExt::io_wait` and the process-wide `IoWaitHook` in `common-runtime`, with `SpawnedTask` and `JoinSet` passing spawned work through the hook's `carry_future`/`carry_local_future`/`carry_block` (spiceai/datafusion#258, [#15049](https://github.com/spiceai/spiceai/issues/15049)) | Without the API, the HTTP connector's `io_wait()` calls and `RuntimeBuilder::build`'s `set_io_wait_hook` stop compiling. Without the carry, a wait inside a task DataFusion spawns (`RepartitionExec`, `CoalescePartitionsExec`) never reaches the hook, so a distributed task waiting there on a slow HTTP source holds its executor slot again | build; silent (throughput) for the carry | compile-guarded by `crates/data_components/src/http/provider.rs` and `crates/runtime/src/builder.rs`. The carry is **GAP**: with it disabled, `crates/runtime/tests/cluster/io_wait_lending.rs` still passes for a query whose single-node plan puts `RepartitionExec` over `HttpExec`, so no cluster query here polls a wait under a DataFusion spawn yet; the fork's `common-runtime` tests cover it |
 | `PushdownSort` passes the fetch of a sort it eliminates under a `SortPreservingMergeExec` that keeps that many rows, as a bound on the total output, through nodes that keep every row in order and through a `RepartitionExec` whose input is a single partition, to the node that takes it (fork PR #260, `physical-optimizer/src/pushdown_sort.rs`) | The fetch of an `ORDER BY … LIMIT` stopped above the round-robin repartition the planner puts above a single-partition scan, as a per-partition `LocalLimitExec`. A federated scan below a Spice-only function then received the `ORDER BY` without the `LIMIT`, and the remote sorted and returned every row | silent (perf) | `crates/data_components/src/federation.rs::tests::scan_pushdown::a_limit_above_a_refused_projection_reaches_the_source`, whose `ORDER BY … LIMIT` and `OFFSET` cases fail without it. In the fork, `core/tests/physical_optimizer/pushdown_sort.rs::test_sort_fetch_reaches_source_through_single_input_repartition` and `::test_sort_fetch_stays_above_a_multi_input_repartition`, and `limit_pushdown.rs::nested_limits_separated_by_a_repartition_keep_the_tighter_limit` and `::a_local_limit_over_a_round_robin_repartition_limits_each_partition` |
+| `COUNT(DISTINCT …)` over a list, struct, map or other nested value stores a compacted copy of each value it first inserts, in `DistinctCountAccumulator` and `SlidingDistinctCountAccumulator`, so a stored value no longer shares the buffers of the batch it was read from; `ScalarValue::compact` rebuilds a zero-width `FixedSizeList` with its row count, so compacting one keeps its row (`functions-aggregate/src/count.rs`, `common/src/scalar/mod.rs`; spiceai/datafusion#287) | With two or more `COUNT(DISTINCT …)` in a query (no single-distinct rewrite), every distinct nested value is a one-row slice that keeps its whole batch alive and is charged for it, so the reservation grows with rows × batch size: two `COUNT(DISTINCT)` over 50,000 three-element lists asked for 56.8 GB and failed with `ResourcesExhausted`, federated and accelerated alike, grouped or not | silent (query failure / memory) | `crates/runtime-datafusion/src/fork_backport_guards.rs::several_count_distinct_over_nested_values_charge_each_value_once` (lists, structs and a grouped variant under a 256 MiB pool with spilling disabled); in the fork, `count::tests::*_size_charges_each_value_once`, `count::tests::*zero_width_fixed_size_list*`, `scalar::tests::test_compact_zero_width_fixed_size_list_keeps_its_row` and `sqllogictest/test_files/count_distinct_nested_memory.slt` |
+| Parquet struct-field pruning stops at the first step that is not a struct, so `get_field(s, 'm', 'k')` over a map `m` inside struct `s` reads all of `s.m` and looks the key up on the decoded batch; when a file's `s` lacks a field the table's has, the schema adapter narrows `get_field(CAST(s), 'm', 'k')` to `get_field(s, 'm', 'k')` while the map type is unchanged, so the row filter still applies to that file; `get_field` applies the parent struct's or map's nulls to the field it extracts, for every child layout including `Null`, sparse and dense `Union` and `RunEndEncoded`, without duplicating a dense union's shared slots or expanding runs (`datasource-parquet` projection and row filter, `physical-expr-adapter` schema rewriter, `functions` get_field; spiceai/datafusion#288, backported in #293) | The scan treats the map key as a nested Parquet field, matches no leaf, and drops `s` from its read schema, so `SELECT s['m']['k']` on a federated Parquet dataset fails with `Internal error: PhysicalExpr Column references column 's' …`, and the same lookup in `WHERE` fails in the row filter. Losing the cast narrowing can drop the predicate silently: a predicate `s['mm']['k'] = …` against a file whose struct gained a sibling field returns rows it should reject. Losing the parent-null masking returns a child's leftover value for a row whose parent struct is NULL | query failure; silent (wrong data) | **GAP** on release/2.4: trunk guards it with `test/spicescript/parquet-struct-map-key.yaml`, and release/2.4 has no `spicescript`. In the fork, `projection_read_plan.rs::build_projection_read_plan_keeps_map_under_struct_for_key_lookup`, `row_filter.rs::get_field_map_key_under_struct_filters_rows` and `get_field_map_key_under_evolved_struct_filters_rows`, `schema_rewriter.rs::test_narrow_struct_cast_map_key_under_evolved_struct` and `test_narrow_struct_cast_map_key_honours_null_parent`, `getfield.rs::test_get_field_applies_parent_struct_nulls` and the `test_get_field_*_with_nullable_parent`, `test_get_field_dense_union_shared_offset_no_value_duplication` and `test_get_field_ree_preserves_*` cases, and `parquet_nested_schema_pruning.slt` |
+| The SQL planner refuses a data type nested more than 64 array or struct levels deep (`check_data_type_nesting_depth` in `sql/src/planner.rs`; spiceai/datafusion#275) | A short statement such as `CAST(NULL AS INT[][]…[])` recurses once per level while planning, so a deep enough type exhausts the stack and aborts the process | silent (crash) | `crates/runtime-datafusion/src/fork_backport_guards.rs::a_cast_to_a_type_nested_past_the_limit_is_refused` |
 
 ## arrow-rs
 
 Upstream [apache/arrow-rs](https://github.com/apache/arrow-rs), branch
-`spiceai-59-patches` (upstream `59.3.0` merged into the previous line). Every row
+`spiceai-59.3.2` (upstream `59.3.2` merged into the previous `spiceai-59` line by [spiceai/arrow-rs#36](https://github.com/spiceai/arrow-rs/pull/36)). Every row
 below was re-confirmed present at the pinned revision. Upstream deprecates
 `ParquetObjectReader` in 59 (apache/arrow-rs#10354); the Spice patches to it
 merged cleanly and are kept. The pin lives in the object-store Parquet reader
 (`parquet/src/arrow/async_reader/store.rs`), in the push-decoder short-read
-path (`parquet/src/util/push_buffers.rs` and its callers), in
-`arrow-buffer/src/buffer/immutable.rs`, in the cast kernel
+path (`parquet/src/util/push_buffers.rs` and its callers), in the page decoder
+(`parquet/src/file/serialized_reader.rs`), in the footer schema conversion
+(`parquet/src/schema/types.rs`), in the Thrift metadata decoder
+(`parquet/src/parquet_thrift.rs`,
+`parquet/src/file/metadata/thrift/mod.rs`,
+`parquet/src/file/page_index/offset_index.rs`), in
+`arrow-buffer/src/buffer/immutable.rs`, in the type-string parser
+(`arrow-schema/src/datatype_parse.rs`), in the cast kernel
 (`arrow-cast/src/cast/mod.rs`), and in the Flight SQL client
 (`arrow-flight/src/sql/client.rs`).
 
@@ -338,10 +354,15 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in
 | `ParquetObjectReader::new_with_meta` — take `ObjectMeta` so the file size is known up front | The reader falls back to suffix range requests, which Azure Blob Storage does not support: Parquet reads over ABFS fail or take an extra round trip per file | build (constructor) | `crates/runtime/tests/abfs/mod.rs::test_azure_parquet_reading_with_object_meta` (needs Azurite) |
 | `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch; a `Version` pin with no version id falls back to `If-Match` on the listed ETag; `set_object_version` applies a `HEAD` version id to later page reads | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another. Losing the ETag fallback is quieter still: unversioned buckets never carry a version id, so the pin becomes a no-op | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id` |
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
+| `decode_page` rejects a page whose header declares more than `max(64 MiB, 1000 × its compressed bytes)` uncompressed, before it allocates ([spiceai/arrow-rs#31](https://github.com/spiceai/arrow-rs/pull/31), apache/arrow-rs#10734) | The reader allocates whatever size a page header declares, up to ~2 GiB per page. A Parquet file of a few KiB whose pages each declare hundreds of MiB makes every scan of it allocate that much per page, and concurrent scans of it can exhaust the runtime's memory | silent (memory) | `crates/data-connector-api/src/listing/connector.rs::tests::a_page_declaring_more_than_its_compressed_bytes_can_back_is_an_error` |
 | `Buffer::has_custom_allocation` — expose whether a buffer's memory is freed by its own owner rather than by the buffer ([spiceai/arrow-rs#25](https://github.com/spiceai/arrow-rs/pull/25)) | The results cache can no longer tell that a batch rests on memory it does not own, so it shares the producer's arrays instead of copying them. `capacity` reports the size the producer declared, so such an entry looks compact and is billed as if it were: a DuckDB- or ADBC-imported result pins the driver's chunk, a Flight-decoded one pins the whole IPC message body, and `max_size` bounds none of it. Measured at ~4.5 KB per entry unbilled on a one-row DuckDB result, flat as the result widened to 10 rows | build (the predicate) + silent (the accounting, if the call is dropped rather than the function) | `crates/arrow_tools/src/record_batch.rs::a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim` |
 | `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564). Upstream adopted it in `60.0.0`, not in any 59 release, so it is still carried on this line; drop the row at the move to 60 | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | `crates/data-connector-api/src/listing/connector.rs::a_short_range_body_is_a_parquet_error_and_not_a_panic`, driven through `ParquetMetaDataPushDecoder`, which is the public surface `push_range` sits behind. The listing/overwrite harness cannot reach it: it 412s a pinned `If-Match` before a short *successful* range body is ever decoded |
 | `Decimal` → floating-point cast rounds from the exact decimal digits instead of widening the coefficient to `f64` and dividing by `10^scale` ([spiceai/arrow-rs#26](https://github.com/spiceai/arrow-rs/pull/26)) | A coefficient past 2^53 loses precision before the divide, so a decimal read back as a float is off in the low digits. Measured: a pushed-down Postgres `avg` read as `Decimal128(38, 20)` returned `47.50000000000001` instead of `47.5` ([#13978](https://github.com/spiceai/spiceai/issues/13978)) | silent (wrong data) | `crates/arrow_tools/src/record_batch.rs::test::decimal_to_float_cast_is_correctly_rounded` |
 | `FlightSqlServiceClient::do_get_flight_data` — a `DoGet` that returns the raw `FlightData` stream with the client's headers and bearer token applied, as `do_get` applies them | The Flight SQL connector can no longer replace a schema message before arrow decodes it. A server that declares a `MAP`'s `entries` field nullable (which arrow 59 refuses at decode) fails every read of that table with `The nullable should be set to false for the map entries field`, naming no column. Going through `inner_mut()` instead would drop the `traceparent` and bearer token, which are private to the client | build (the method) | `crates/data_components/src/flightsql.rs::tests::query_to_stream_corrects_a_servers_nullable_map_entries_declaration` |
+| Thrift list lengths in Parquet metadata are bounded by the bytes left in the input: `list_capacity` refuses a declared count the remaining bytes cannot encode, and caps the reservation where the input length is unknown ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)) | Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and the offset index's `page_locations` decodes into a `Vec` sized from the element count in its Thrift list header. A file of a few bytes can declare `i32::MAX` elements, so the reader reserves room for all of them before reading one — during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (memory exhaustion takes the runtime down) | `crates/data-connector-api/src/listing/connector.rs::an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation` |
+| `schema_from_array_helper` refuses a footer schema nested more than 100 levels below its root ([spiceai/arrow-rs#33](https://github.com/spiceai/arrow-rs/pull/33)) | The footer's flat schema element list is rebuilt into a tree by recursing once per nesting level, with no bound. A Parquet file of a few KiB that declares a few hundred nested levels overflows the stack during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (stack overflow aborts the runtime) | `crates/data-connector-api/src/listing/connector.rs::a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error` |
+| The type-string parser (`DataType::from_str`) refuses a type nested more than 64 levels deep ([spiceai/arrow-rs#34](https://github.com/spiceai/arrow-rs/pull/34)) | The parser recurses once per nesting level with no bound. `arrow_cast` and `arrow_try_cast` parse their type argument at planning time, and the SQL text check bounds only a type string written as a literal in the query. A type string that reaches the parser any other way, such as a dataset's declared column type, is parsed unbounded, and a deep one overflows the stack | not silent (stack overflow aborts the runtime) | `crates/runtime-query-engine/src/sql_depth_guard.rs::tests::arrow_type_string_past_the_parser_depth_limit_is_a_parse_error` |
+| `check_run_ends` validates against the REE parent's `offset+len` (upstreamed in apache/arrow-rs#11668 / #11740, present in `59.3.2`; was [spiceai/arrow-rs#35](https://github.com/spiceai/arrow-rs/pull/35); RUSTSEC-2026-0442). Carried by the 59.3.2 merge in [spiceai/arrow-rs#36](https://github.com/spiceai/arrow-rs/pull/36) | A RunEndEncoded array whose last run_end is below `offset+len` was accepted; consumers then read past the values child (OOB) | not silent (OOB read) | `crates/arrow_tools/src/schema.rs::tests::run_end_encoded_past_last_run_is_rejected` |
 
 ## datafusion-ballista
 
@@ -422,7 +443,13 @@ previous one. Between `2fc4617` and `109661c` (spiceai/datafusion-federation#93 
 federated-scan rows below (`sql/executor.rs`, `sql/mod.rs`, `schema_cast/mod.rs`) and their
 tests. Between `ef2e590` and `54d9010` (spiceai/datafusion-table-providers#91 and #92,
 squash-merged), `datafusion-table-providers` adds only the `SqlTable` opt-in row below and
-its test, and moves its own federation pin:
+its test, and moves its own federation pin.
+Between `f0af9b6` and `bc28b14` (spiceai/datafusion-table-providers#122, a cherry-pick of
+spiceai/datafusion-table-providers#121 onto `spiceai-55-release-2.4`, merged), it moves its ADBC
+requirement and its own ADBC patch lines to 0.25 (`7caad4cc`, spiceai/arrow-adbc#9), and
+cancels an ADBC statement through `get_cancel_handle().try_cancel()`, which 0.25 issues without
+the statement lock (`core/src/sql/db_connection_pool/dbconnection/adbcconn.rs`). No row below
+changes.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
@@ -449,20 +476,37 @@ its test, and moves its own federation pin:
 | `VirtualExecutionPlan` takes a sort pushed down to it from an executor that opts in through `SQLExecutor::supports_sort_pushdown`, which defaults to `false`, and `SchemaCastScanExec` passes the sort through on the columns it keeps at their type (federation PR #93) | Once a source refuses the projection that calls a Spice-only function, the analyzer federates the scan beneath it, and an `ORDER BY` above stays a local `SortExec` over every row the remote returns ([#13770](https://github.com/spiceai/spiceai/issues/13770)). Measured on a debug build over `PostgreSQL`, a 50,000-row `ORDER BY` went from 97 ms to 128 ms p99. A default of `true` would drop `DataFusion`'s sort above an executor whose engine orders rows differently, and a sort passed through a column the cast changes would be declared in the remote's order rather than the cast values' | silent (perf); silent (wrong row order) for the default and the type check | `crates/data_components/src/federation.rs::tests::scan_pushdown::a_sort_above_a_refused_projection_reaches_the_source` fails without either node's `try_pushdown_sort`. `::an_executor_that_does_not_opt_in_keeps_the_sort_local` fails with the default flipped to `true`. `::a_schema_cast_passes_a_sort_only_on_columns_it_keeps_at_their_type` fails without the type check. In the fork, `sql/mod.rs::tests::virtual_execution_plan_takes_a_sort_only_from_a_sorting_executor` and `::schema_cast_passes_a_sort_through_only_on_columns_it_keeps_at_their_type` |
 | `SqlTable` opts in to that sort pushdown through the switch its own scan already honors: `supports_sort_pushdown` returns `allow_physical_sort_pushdown` (table-providers PR #91) | Without the opt-in, every `SqlTable`-backed source (`PostgreSQL`, ODBC, `ClickHouse`, Snowflake) keeps the sort local as the row above describes. If the switch is ignored, `ORDER BY` reaches `ScyllaDB`, which turns the switch off because CQL accepts `ORDER BY` only when the partition key is restricted | silent (perf); silent (query failure) | `crates/data_components/src/federation.rs::tests::scan_pushdown::a_sort_above_a_refused_projection_reaches_the_source`. Its `t` case fails without the opt-in, and its `s` case, whose switch is off, fails when the switch is ignored |
 | `VirtualExecutionPlan` takes a limit pushed down to it into its SQL (`with_fetch`), and `SchemaCastScanExec` passes it through. The scan declines a count past a signed 64-bit `LIMIT`, a plan the executor would not federate or its dialect cannot render, and a scan already holding pushed filters, and once it holds a `LIMIT` it declines filters pushed later (federation PR #94) | Once a source refuses the projection that calls a Spice-only function, a `LIMIT` above it stays local and the remote is asked for every row. Without both the bound and the check that the rendered SQL carries the requested count, `ORDER BY … LIMIT 9223372036854775807 OFFSET 9223372036854775807` reaches the source as `LIMIT -2`, the count of 2^64 − 2 wrapped into a signed 64-bit integer, and `PostgreSQL` rejects it with "LIMIT must not be negative". Without the filter decline, an executor that put a pushed filter into its SQL would apply it before the `LIMIT` rather than after | silent (perf); silent (query failure) for the bound; silent (wrong rows) for the filter decline | `crates/data_components/src/federation.rs::tests::scan_pushdown::a_limit_above_a_refused_projection_reaches_the_source` fails without either node's `with_fetch`. `::a_limit_stays_where_the_source_cannot_take_it` fails with both removed; either one alone keeps the count out of the SQL. The filter decline has no guard here because nothing here can reach it: no executor in this repository accepts a pushed filter (`SQLFilterPushDown::Exact` and `Inexact` appear only in the fork). The fork's `sql/mod.rs::tests::a_limited_virtual_execution_plan_declines_filters` covers it, with `::virtual_execution_plan_takes_a_limit_into_its_sql`, `::virtual_execution_plan_declines_a_limit_the_remote_cannot_take` and `::schema_cast_passes_a_limit_through` |
+| `MySQLConnectionPool::new_with_pool_opts` hands the caller the pool options read from the connection parameters, on the `connection_string` path as well as the individual-parameter one, and builds the pool with what it returns ([table-providers PR #107](https://github.com/spiceai/datafusion-table-providers/pull/107), on `spiceai-55-release-2.4` as `4a63f2b` (#112)) | The MySQL dataset connector and catalog set the pool size and connection lifetime through it. If the signature is kept and the options are dropped on the URL path, a dataset given `mysql_connection_string` goes back to `mysql_async`'s 10/100 pool and to keeping its connections for the life of the process, so it stays on the server its hostname first resolved to. If the function is removed, the build fails | build; silent if the signature survives | `test/spicescript/mysql-connection-pool.yaml` (pool maximum and minimum with a connection string, connections replaced under a 2s lifetime, and kept under `0s` and the default), against MySQL's own process list and per-user connection totals. In the fork, `test_mysql_pool_opts_apply_to_connection_string`, which fails with "a second connection opened while the pool's only one was held" when `configure_pool` is ignored |
+| `MySQLConnectionPool::with_new_connection_observer` asks each new pooled connection which server it reached (`@@hostname`, `@@port`, and `@@aurora_server_id` where the server has it) before its first use, and reports it once per connection ([table-providers PR #108](https://github.com/spiceai/datafusion-table-providers/pull/108), on `spiceai-55-release-2.4` as `f0af9b6` (#112)) | The MySQL connector and catalog log, at INFO once per server per 10 minutes, the server their new connections reached. If the method is kept and the reports stop, the line that names which server behind a load-balanced hostname a dataset is on disappears without an error. If the method is removed, the build fails | build; silent if the signature survives | `test/spicescript/mysql-connection-pool.yaml` (the INFO line for a dataset's connections, with the server MySQL itself reports). In the fork, `test_mysql_new_connection_observer`, which fails with no reports (`left: []`) when the observer does not report |
+
+Between `2890f5c` and `f0af9b6` (spiceai/datafusion-table-providers#112, a backport of #107 and #108), `spiceai-55-release-2.4` adds only the two MySQL connection-pool rows above and their tests (`core/src/sql/db_connection_pool/mysqlpool.rs`, `core/tests/mysql/`), and leaves its own dependency pins unchanged.
 
 ## arrow-adbc
 
 Upstream [apache/arrow-adbc](https://github.com/apache/arrow-adbc), branch
-`spiceai-24-patches`: upstream tag `apache-arrow-adbc-24` — the commit the
-`adbc_core` / `adbc_driver_manager` / `adbc_ffi` 0.24.0 crates were published from —
-merged into the previous line, so the only delta a build picks up is the patches
-below. Both were re-confirmed at the pinned revision. All three crates are replaced together through `[patch.crates-io]`: the patch changes an
-`adbc_ffi` signature that `adbc_driver_manager` calls.
+`spiceai-25`: upstream tag `apache-arrow-adbc-25` — the commit the
+`adbc_core` / `adbc_driver_manager` / `adbc_ffi` 0.25.0 crates were published from —
+merged into the previous line (`spiceai-24`), so the only delta a build picks up is the
+patch below, re-confirmed at the pinned revision. All three crates are replaced
+together through `[patch.crates-io]`: the arrow requirement below is declared once,
+in the fork's workspace, for all three.
+
+The statement-cancel patch the fork carried through ADBC 24 — `AdbcStatementCancel`
+issued without the statement lock, and statement release moved from the clonable
+handle to the shared inner (fork PR #4) — is upstream since ADBC 25:
+[apache/arrow-adbc#4858](https://github.com/apache/arrow-adbc/pull/4858), on the
+`CancelHandle` API of [#3905](https://github.com/apache/arrow-adbc/pull/3905), does the
+same for statements and connections. The merge of ADBC 25 took upstream's
+`rust/driver_manager` and `rust/ffi` verbatim, so the fork carries no source change
+there. `Statement::cancel` is deprecated in 0.25 in favour of
+`get_cancel_handle().try_cancel()`, which `datafusion-table-providers` calls. Losing it
+upstream would still be silent, so its guard stays:
+`crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection`
+(also the guard of the `datafusion-table-providers` row for fork PR #65).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| `AdbcStatementCancel` issued without the statement lock, and statement release moved from the clonable handle to the shared inner (fork PR #4) | `cancel` is serialized behind the `execute` it exists to interrupt, so it returns only once the query has finished on its own and cancels nothing. A Flight client that goes away then leaves the remote query running — billing, on BigQuery — and holds its pooled connection for the rest of that query's life, which exhausts a small pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection` |
-| Arrow requirement narrowed to the one major the workspace builds against, now `>=59.0.0, <60` (fork PR #4 set it to 58; moved to 59 in the merge of ADBC 24, where upstream's own range is `>=58, <60`) | A range spanning two majors lets a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — resolve the ADBC crates onto it while the rest of the workspace runs on 59. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the requirement is widened |
+| Arrow requirement narrowed to the one major the workspace builds against, `>=59.0.0, <60` (fork PR #4 set it to 58; moved to 59 in the merge of ADBC 24; upstream's own range is `>=58, <61` since ADBC 25) | A range spanning more than one major lets a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — resolve the ADBC crates onto it while the rest of the workspace runs on 59. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the requirement is widened |
 
 ## duckdb-rs
 
@@ -482,6 +526,7 @@ which #49 was squash-merged from), the only other source change is an equivalent
 | Bundled DuckDB version pinned to the release (fork PR #38) | Extension downloads resolve against a mismatched DuckDB version and fail | silent | covered by the two extension guards above |
 | Thrift `TEnumIterator::operator==` backport for macOS 27 / libc++ (fork PR #47; upstream [duckdb/duckdb@fccde6aa](https://github.com/duckdb/duckdb/commit/fccde6aa1932f48dfa6282a916ea2477b57aa44d)) | Bundled DuckDB with Parquet fails to compile against the macOS 27 SDK: newer libc++ constructs Thrift enum maps with `iterator == end`, and the vendored Thrift header only defined `operator!=` | build (macOS 27) | `scripts/check_fork_patches.py::duckdb_thrift_iterator_equality` — reads `operator==(const TEnumIterator` out of the pinned revision's `duckdb.tar.gz`. The fork's own `crates/libduckdb-sys/tests/test_bundled_thrift.py` covers the same property inside the fork and does not survive a re-cut of this pin |
 | Arrow bumped to 59 (fork PR #49, squash-merged into `spiceai-1.4.4`), with the fork's `test_fixed_array_roundtrip` rebuilt from a whole number of lists — arrow 58 silently dropped a trailing value that arrow 59 rejects | Upstream duckdb-rs is on arrow 58 on every line. Without the bump the workspace resolves two arrow majors, and every Arrow value that crosses into or out of DuckDB — the accelerator's appender and its query results, `register_arrow_scan_view` — is a type from the other copy, so the crates that call it stop compiling. The test fix is fork-internal and changes no behaviour here | build | compile-guarded by `crates/accelerators/accelerator-duckdb` and `crates/data_components/src/ducklake/writer.rs`, which pass arrow types across that boundary |
+| Brotli decoder rejects an invalid block switch with `BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH` instead of decoding on with stale block-type state (fork PR #53, from spiceai/duckdb#20; upstream [duckdb/duckdb#27791](https://github.com/duckdb/duckdb/pull/27791), a port of [google/brotli@0ed4268a](https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b)) | A malformed Brotli-compressed page in a Parquet file that DuckDB reads can write out of bounds in the decoder (CVE-2026-111497) | silent (memory corruption) | `scripts/check_fork_patches.py::duckdb_brotli_block_switch` — reads the `BLOCK_SWITCH, -17` error code and the decoder path that returns it out of the pinned revision's `duckdb.tar.gz` |
 | `ToSql for DateTime<Tz>` writes the UTC instant instead of the local wall-clock fields with a `+00:00` suffix (fork PR #50, backport of upstream duckdb-rs `2bf67df`) | A non-UTC `chrono::DateTime` bound as a parameter is stored shifted by its UTC offset | none in this workspace | Not reachable here: the impl is behind duckdb-rs's `chrono` feature, which no crate in this workspace enables (`cargo metadata` resolves `duckdb` without it), so nothing binds a `chrono::DateTime` through `ToSql`. A change that enables `chrono` turns this into a silent wrong-data row and needs a guard with it |
 
 ## iceberg-rust
@@ -525,6 +570,7 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 | Response `service_tier` keeps a tier the enum does not name (`ServiceTierResponse::Other`, fork PRs #42, #44) | A provider reply naming a new tier fails to deserialize, so every request answered on that tier errors | silent (request failure) | `crates/llms/src/openai/chat.rs::tests::a_reply_naming_an_unknown_service_tier_keeps_it_verbatim`, for both the reply and a streamed chunk, with a named tier as the control |
 | Chat Completions `allowed_tools` is one `{mode, tools}` object, not a list (fork PR #43) | A `tool_choice` in OpenAI's shape is refused with 422, and the list shape is forwarded to OpenAI, which rejects it with 400 | build + silent (request failure) | compile-guarded by `crates/runtime/src/model/tool_use.rs` and `crates/llms/src/openai/responses_adapter.rs`; `crates/llms/src/openai/mod.rs::allowed_tools_wire_tests::an_allowed_tools_choice_reaches_the_provider_as_one_object` reads a request in OpenAI's shape and asserts the body a local endpoint receives carries the same object; `crates/llms/src/chat/mistral.rs::tests::allowed_tools_keeps_its_mode_and_tools` deserializes OpenAI's shape |
 | A JSON request carries one `Content-Type` (fork commit `f63bb212`) | `HostedModelConfig` (Anthropic, Databricks, Spice.ai) carries `Content-Type` in its default headers and the client appends another, so every request carries two and a server can refuse it as an unsupported content type | silent (request failure) | `crates/llms/src/spiceai/chat.rs::tests::a_hosted_model_request_carries_one_content_type`, which reads the headers a one-shot local endpoint received |
+| Built with `utoipa` 6 (fork PR #46) | Spice builds its OpenAPI document with `utoipa` 6, so `ToSchema` impls from `utoipa` 5 on these request and response types do not satisfy its traits and the document does not compile | build | compile-guarded by `runtime`'s `openapi` feature, which references these types in its API schema |
 
 ## clickhouse-rs
 
@@ -607,6 +653,17 @@ Upstream [MinishLab/model2vec-rs](https://github.com/MinishLab/model2vec-rs).
 | IDs-only fast WordPiece tokenizer for the potion models | Static embedding throughput drops sharply | silent (perf) | **GAP** |
 | `config.json` made optional, and the embedding tensor read from `embedding.weight` or `0` as well as `embeddings`, for sentence-transformers compatibility (fork commit `f1190f1f`) | Loading a sentence-transformers static model fails. Two independent halves of the same use case: such an export ships no `config.json` **and** names its tensor `embedding.weight`, so losing either one leaves the model failing to load | silent (load failure) | `crates/llms/src/model2vec.rs::a_local_model_loads_without_a_config_json` and `…::a_local_model_loads_with_the_sentence_transformers_tensor_names`, against a model directory the test writes — a tokenizer and a hand-built `safetensors` tensor, no `config.json`, and the tensor name as a parameter so each test is the other's control |
 | HF cache directory read from the environment (fork commit `1259c0d3`) | Models are re-downloaded instead of reusing the shared cache | silent | `crates/llms/tests/model2vec_hf_cache.rs::a_cached_model_is_read_from_the_directory_hf_hub_cache_names`. It sets a process-wide environment variable, so it calls `require_process_per_test` first; it is a module of `llms`'s `integration` binary, selected in the Makefile's `NEXTEST_FILTER` alongside the other credential-free `llms` modules |
+
+## orc-rust
+
+Upstream [datafusion-contrib/orc-rust](https://github.com/datafusion-contrib/orc-rust),
+branch `spiceai-0.9` cut from upstream `v0.9.0`.
+
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| Metadata streams (file footer, file metadata, stripe footers, row indexes, bloom filters) fail once decoded output exceeds both 64 MiB and 100 times the encoded size; column data streams stay unbounded | A small ORC file with a highly compressible footer makes the runtime allocate until it runs out of memory | silent (memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_rejects_high_ratio_compressed_footer` |
+| Each codec stops decoding at the remaining allowance, with LZO decoded through `lzo` into a bounded buffer instead of `lzokay-native` | One compressed chunk is decoded in full before the bound rejects it, so a single chunk can still allocate up to its own expansion | silent (memory) | **GAP** — the bound above still rejects the stream after the chunk decodes, so only a memory measurement can tell the two apart |
+| The footer type tree is refused past 100 levels below the root, or when it uses one footer type more than once (`DataType::from_proto`) | A small ORC footer whose subtype indices nest very deep, point back at an ancestor or share a child makes schema building recurse until the stack overflows or build a tree far larger than the file | silent (crash / memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_bounds_the_footer_type_tree` |
 
 ## text-splitter
 
@@ -707,7 +764,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**28 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**30 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -725,6 +782,11 @@ They are not equal in consequence; this is the order to close them in.
    a minimal repro built here.
 2. `text-embeddings-inference` pooling and model-loading fixes — embeddings
    differ from the reference implementation.
+2b. `datafusion` `get_field` over a map inside a struct: Parquet projection and
+   row filter, cast narrowing, and parent-null masking (spiceai/datafusion#288,
+   backported in #293) — fork regressions cover it; trunk's guard is
+   `test/spicescript/parquet-struct-map-key.yaml`, and release/2.4 has no
+   `spicescript` to run it.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
@@ -742,6 +804,9 @@ They are not equal in consequence; this is the order to close them in.
    active cache. Every one needs a running cluster to exhibit, and three are
    races, so each row records what the fork measured rather than what a test
    here could assert.
+8. `orc-rust` in-codec decode allowance — losing it lets one compressed metadata
+   chunk decode in full before the stream is rejected. A guard needs a memory
+   measurement around one ORC open; the rejection itself is guarded.
 
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
@@ -757,7 +822,7 @@ writing a test; each says what would unblock it:
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-8. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+9. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -765,7 +830,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-9. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+10. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -776,7 +841,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-10. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+11. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
@@ -787,7 +852,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-11. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+12. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's

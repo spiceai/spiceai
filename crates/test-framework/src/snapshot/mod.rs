@@ -14,13 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{panic, sync::Arc};
+use std::{
+    panic,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::{flight::query_to_batches, queries::Query, utils::sanitize_record_batches};
 use arrow::{
     array::{ArrayRef, AsArray, Float32Array, Float64Array, RecordBatch},
     datatypes::{DataType, Float32Type, Float64Type},
 };
+use insta::{TextSnapshotKind, internals::TextSnapshotContents};
 use spiceai::Client as SpiceClient;
 
 pub const CAYENNE_PATH_FILTER_PATTERN: &str =
@@ -63,6 +68,14 @@ const CONNECTION_CONTEXT_FILTER_REPLACEMENT: &str = "compute_context=<CONNECTION
 const ENDPOINT_CONTEXT_FILTER_PATTERN: &str = r"compute_context=(?:url=|sc://)\S+";
 const ENDPOINT_CONTEXT_FILTER_REPLACEMENT: &str = CONNECTION_CONTEXT_FILTER_REPLACEMENT;
 
+/// ADBC renders its compute context as a SHA-256 of the connection settings, credentials
+/// included, so a plan never shows a secret. The hash therefore changes whenever the
+/// credential does — a rotated key, or the service account key CI creates for each run — so
+/// it is redacted like the plain-text contexts above. Anchored on `name=adbc` so the hashed
+/// contexts of other connectors are left to their own snapshots.
+const ADBC_CONTEXT_FILTER_PATTERN: &str = r"(name=adbc )compute_context=[0-9a-f]{64}\b";
+const ADBC_CONTEXT_FILTER_REPLACEMENT: &str = "${1}compute_context=<CONNECTION>";
+
 /// Redact the scan counters `CayenneAccelerationExec` surfaces in its plan display.
 /// `snapshots_scanned`/`files_scanned` report read amplification, which depends on
 /// ingestion batching and how far compaction has progressed when the query runs —
@@ -77,6 +90,58 @@ const CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT: &str =
 /// Queries temporarily excluded from explain-plan snapshot validation because their
 /// plans are not yet stable enough to snapshot deterministically.
 const EXPLAIN_SNAPSHOT_SKIP_LIST: &[&str] = &["chbench_q5"];
+
+/// Explain snapshots live in this directory, relative to this source file.
+const EXPLAIN_SNAPSHOT_PATH: &str = "snapshots/explain";
+
+/// The directory insta reads explain snapshots from, resolved against the same
+/// workspace root insta uses (`INSTA_WORKSPACE_ROOT` when set).
+fn explain_snapshot_dir() -> PathBuf {
+    let workspace = insta::_macro_support::get_cargo_workspace(
+        insta::_macro_support::Workspace::DetectWithCargo(env!("CARGO_MANIFEST_DIR")),
+    );
+    let source_dir = Path::new(file!()).parent().unwrap_or_else(|| Path::new(""));
+    workspace.join(source_dir).join(EXPLAIN_SNAPSHOT_PATH)
+}
+
+/// Returns the label of the approved alternate plan that `explain_plan` matches.
+///
+/// An approved alternate sits beside the snapshot as
+/// `<snapshot file stem>@<label>.snap`, in the same format. Add one only when the
+/// optimizer picks between equally valid plans at random, for example two CTEs
+/// that tie in the Cayenne CTE rule. A plan that matches neither the snapshot nor
+/// an alternate still fails.
+fn approved_alternate_plan(
+    dir: &Path,
+    snapshot_name: &str,
+    explain_plan: &str,
+) -> anyhow::Result<Option<String>> {
+    let prefix = format!("{}__{snapshot_name}@", module_path!().replace("::", "__"));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(None);
+    };
+    let plan = TextSnapshotContents::new(explain_plan.to_string(), TextSnapshotKind::File);
+    for entry in entries {
+        let path = entry?.path();
+        let Some(label) = path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .and_then(|file_name| file_name.strip_prefix(&prefix))
+            .and_then(|rest| rest.strip_suffix(".snap"))
+        else {
+            continue;
+        };
+        let alternate = insta::Snapshot::from_file(&path)
+            .map_err(|e| anyhow::anyhow!("read alternate plan {}: {e}", path.display()))?;
+        if alternate
+            .as_text()
+            .is_some_and(|text| text.matches_latest(&plan))
+        {
+            return Ok(Some(label.to_string()));
+        }
+    }
+    Ok(None)
+}
 
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
@@ -100,6 +165,10 @@ fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static st
         (
             ENDPOINT_CONTEXT_FILTER_PATTERN.to_string(),
             ENDPOINT_CONTEXT_FILTER_REPLACEMENT,
+        ),
+        (
+            ADBC_CONTEXT_FILTER_PATTERN.to_string(),
+            ADBC_CONTEXT_FILTER_REPLACEMENT,
         ),
         (
             CAYENNE_SCAN_COUNTERS_FILTER_PATTERN.to_string(),
@@ -265,19 +334,26 @@ pub async fn record_explain_plan(
     // Sort PartitionedUnionExec children for deterministic snapshot comparison
     let explain_plan = sort_partitioned_union_children(&explain_plan_raw.to_string());
 
+    let snapshot_name = if (scale_factor - 1.0).abs() < f64::EPSILON {
+        format!("{name}_{query_name}_explain")
+    } else {
+        format!("{name}_{query_name}_explain_sf{scale_factor}")
+    };
+
+    if let Some(label) =
+        approved_alternate_plan(&explain_snapshot_dir(), &snapshot_name, &explain_plan)?
+    {
+        println!("Explain plan for '{query_name}' matches approved alternate '{label}'");
+        return Ok(());
+    }
+
     let mut assertion_err: Option<String> = None;
 
     insta::with_settings!({
         description => format!("Query: {query_name}"),
         omit_expression => true,
-        snapshot_path => "snapshots/explain",
+        snapshot_path => EXPLAIN_SNAPSHOT_PATH,
     }, {
-        let snapshot_name = if (scale_factor - 1.0).abs() < f64::EPSILON {
-            format!("{name}_{query_name}_explain")
-        } else {
-            format!("{name}_{query_name}_explain_sf{scale_factor}")
-        };
-
         let result = panic::catch_unwind(|| {
             insta::assert_snapshot!(snapshot_name, explain_plan);
         });
@@ -405,7 +481,31 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
 
-    use super::{round_float_columns, round_to_significant_digits};
+    use super::{approved_alternate_plan, round_float_columns, round_to_significant_digits};
+
+    #[test]
+    fn approved_alternate_matches_only_its_snapshot_and_plan() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path()
+                .join("test_framework__snapshot__s_q31_explain@materialize_ws.snap"),
+            "---\nsource: crates/test-framework/src/snapshot/mod.rs\ndescription: \"Query: q31\"\n---\n| plan | ws |\n",
+        )?;
+
+        assert_eq!(
+            approved_alternate_plan(dir.path(), "s_q31_explain", "| plan | ws |")?,
+            Some("materialize_ws".to_string())
+        );
+        assert_eq!(
+            approved_alternate_plan(dir.path(), "s_q31_explain", "| plan | ss |")?,
+            None
+        );
+        assert_eq!(
+            approved_alternate_plan(dir.path(), "s_q31_explain_sf100", "| plan | ws |")?,
+            None
+        );
+        Ok(())
+    }
 
     /// The property the rounding exists for: the same aggregate computed with a
     /// different partial-sum combine order must render identically. Inputs are
@@ -743,7 +843,7 @@ mod tests {
         let replacement = super::ENDPOINT_CONTEXT_FILTER_REPLACEMENT;
 
         // Dremio: grpc URL plus a username, comma-separated.
-        let input = "VirtualExecutionPlan name=dremio compute_context=url=grpc://dremio-client.example.internal:32010,username=bench base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
+        let input = "VirtualExecutionPlan name=dremio compute_context=url=grpc://dremio.example.internal:32010,username=bench base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
         let expected = "VirtualExecutionPlan name=dremio compute_context=<CONNECTION> base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
         assert_eq!(regex.replace_all(input, replacement), expected);
 
@@ -776,6 +876,34 @@ mod tests {
         // The `host=` form stays the other pattern's job; this one must not half-match
         // it and leave a partially-redacted context behind.
         let input = "VirtualExecutionPlan name=mysql compute_context=host=db,port=3306,db=tpch,user=root base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_adbc_context_filter() -> Result<(), String> {
+        let regex =
+            regex::Regex::new(super::ADBC_CONTEXT_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+        let replacement = super::ADBC_CONTEXT_FILTER_REPLACEMENT;
+
+        // Two credentials for the same BigQuery dataset hash differently and must redact to
+        // the same token.
+        let expected = "VirtualExecutionPlan name=adbc compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        let input = "VirtualExecutionPlan name=adbc compute_context=2ccce95fe2d4be687104db4fa81b90e6f680f2d2a8a2b7739b83e7164907678e base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+        let input = "VirtualExecutionPlan name=adbc compute_context=331039639bda0f4eac6001824ee914bd9186bdd24241554179e6d6397161e435 base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Idempotent: an already-redacted snapshot is left unchanged.
+        assert_eq!(regex.replace_all(expected, replacement), expected);
+
+        // Other connectors' hashed contexts are left to their own snapshots.
+        let input = "VirtualExecutionPlan name=odbc compute_context=30213f5dd5458a0b9c41e5f7a3c1d2b4e6f8091a2b3c4d5e6f708192a3b4c5d6 base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // A context that is not a full SHA-256 is not an ADBC hash and stays as it is.
+        let input = "VirtualExecutionPlan name=adbc compute_context=2ccce95fe2d4 base_sql=SELECT 1";
         assert_eq!(regex.replace_all(input, replacement), input);
 
         Ok(())

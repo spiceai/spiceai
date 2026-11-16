@@ -54,7 +54,8 @@ use crate::catalog::SpiceToolCatalog;
 use tools::SpiceModelTool;
 
 use super::{
-    Error, MCPConfig, Result, UnderlyingTransportSnafu,
+    Error, MAX_TOOL_RESULT_SIZE, MCPConfig, Result, UnderlyingTransportSnafu,
+    http_client::BoundedHttpClient,
     server::{McpSchemaSnapshot, apply_listed_catalog_cache},
     tool::McpToolWrapper,
 };
@@ -646,13 +647,21 @@ impl McpToolCatalog {
                     );
                 }
 
+                let http_client = BoundedHttpClient::new(tool_name).map_err(|e| {
+                    Error::CouldNotConstructTool {
+                        name: "mcp_streamable_http".to_string(),
+                        e: format!("Failed to create the HTTP client for '{url}': {e}"),
+                    }
+                })?;
                 let mut transport_config =
                     StreamableHttpClientTransportConfig::with_uri(url.to_string())
-                        .custom_headers(headers.clone());
+                        .custom_headers(headers.clone())
+                        .max_sse_event_size(MAX_TOOL_RESULT_SIZE);
                 if let Some(auth_token) = auth_token {
                     transport_config = transport_config.auth_header(auth_token.expose_secret());
                 }
-                let transport = StreamableHttpClientTransport::from_config(transport_config);
+                let transport =
+                    StreamableHttpClientTransport::with_client(http_client, transport_config);
 
                 let client_info = InitializeRequestParams::new(
                     ClientCapabilities::default(),

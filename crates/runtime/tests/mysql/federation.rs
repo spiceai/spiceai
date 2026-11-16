@@ -182,10 +182,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
                 .await?;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -274,10 +271,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             .await?;
         }
 
-        running_container.remove().await.map_err(|e| {
-            tracing::error!("running_container.remove: {e}");
-            e.to_string()
-        })?;
+        running_container.cleanup().await;
 
         Ok(())
     }).await
@@ -418,10 +412,7 @@ async fn mysql_btrim_evaluates_locally_on_both_registration_paths() -> Result<()
                 );
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -540,10 +531,7 @@ async fn mysql_fractional_second_filters_select_their_rows_on_both_registration_
                 );
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })

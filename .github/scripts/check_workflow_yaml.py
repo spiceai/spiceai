@@ -140,6 +140,13 @@ COMMENT_LINE = re.compile(r"^[ \t]*#[^\n]*$", re.MULTILINE)
 # whose result the run exists to report.
 SUITE_COMMANDS = ("cargo nextest run", "cargo test")
 
+# A suite command with this flag only compiles the tests. A build failure that
+# skips the later steps hides no suite result, because no suite could run.
+BUILD_ONLY_FLAG = re.compile(r"(?<![\w-])--no-run\b")
+
+# A backslash at the end of a line continues the command on the next line.
+LINE_CONTINUATION = re.compile(r"\\[ \t]*\n")
+
 # The action that publishes a nightly's refreshed snapshots. It is the last step
 # of the jobs below, so a suite that skips it costs the run its whole output.
 SNAPSHOT_ACTION = "push-snap-changes"
@@ -348,7 +355,12 @@ def is_scheduled(document: dict) -> bool:
 def _runs_a_suite(step: dict) -> bool:
     """Report whether the step's `run:` invokes a test suite."""
     command = step.get("run")
-    return isinstance(command, str) and any(c in command for c in SUITE_COMMANDS)
+    if not isinstance(command, str):
+        return False
+    for line in LINE_CONTINUATION.sub(" ", command).splitlines():
+        if any(c in line for c in SUITE_COMMANDS) and not BUILD_ONLY_FLAG.search(line):
+            return True
+    return False
 
 
 def _publishes_snapshots(step: dict) -> bool:

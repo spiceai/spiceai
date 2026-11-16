@@ -35,7 +35,7 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{
     Acceleration, Engine, Mode, RefreshMode, ZeroResultsAction,
 };
-use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
+use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState, ResolvedTimeColumns};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
@@ -98,7 +98,7 @@ use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey}
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
-use datafusion::common::{Constraint, Constraints, ToDFSchema};
+use datafusion::common::{Constraint, Constraints, ParamValues, ToDFSchema};
 use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
@@ -128,6 +128,9 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exists};
+use runtime_datafusion::table_function_params::{
+    TableFunctionPlaceholders, bind_table_function_args,
+};
 use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
@@ -154,6 +157,7 @@ use change_generations::{
 };
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
+pub(crate) mod output_reservation;
 pub(crate) mod query_memory_pool;
 pub use runtime_datafusion::composed_catalog;
 // `error` and `refresh_sql` below are named throughout the runtime through these
@@ -178,6 +182,9 @@ pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
+pub(crate) use runtime_query_engine::sql_depth_guard;
+#[cfg(test)]
+mod sql_depth_guard_tests;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
@@ -503,7 +510,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
     ))]
     UnsupportedDistributedAccelerationEngine {
         dataset_name: String,
@@ -782,16 +789,16 @@ async fn read_one_row(
     Ok(())
 }
 
-/// The line an operator reads when an acceleration is rebuilt for changed settings.
-/// `cause` is the engine's account of the settings its stored table cannot adopt, worded
-/// as a clause.
+/// The line an operator reads when an acceleration is rebuilt: for changed settings its
+/// stored table cannot adopt, or for stored data that no longer matches the engine's
+/// metadata. `cause` is the engine's account of why, worded as a clause.
 fn acceleration_rebuilt_message(cause: &str) -> String {
     let mut chars = cause.chars();
     let cause: String = chars
         .next()
         .map(|first| first.to_uppercase().chain(chars).collect())
         .unwrap_or_default();
-    format!("{cause}, so it is dropped and reloaded from the source with the new settings.")
+    format!("{cause}, so it is dropped and reloaded from the source.")
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -1260,6 +1267,23 @@ struct AccelerationSetup {
     refresh_schema: SchemaRef,
     refresh_mode: RefreshMode,
     constraint_columns: Vec<String>,
+    resolved_time: ResolvedTimeColumns,
+}
+
+fn refresh_with_resolved_time(mut refresh: Refresh, time: &ResolvedTimeColumns) -> Refresh {
+    if let Some(format) = time.time_format {
+        refresh = refresh.time_format(format);
+    }
+    if let Some(column) = &time.time_column {
+        refresh = refresh.time_column(column.clone());
+    }
+    if let Some(column) = &time.time_partition_column {
+        refresh = refresh.time_partition_column(column.clone());
+    }
+    if let Some(format) = time.time_partition_format {
+        refresh = refresh.time_partition_format(format);
+    }
+    refresh
 }
 
 struct SchemaRebind {
@@ -1497,6 +1521,8 @@ pub struct DataFusion {
     // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    // Permits in `query_admission_semaphore`; `None` when admission is unbounded.
+    query_admission_limit: Option<usize>,
     pub(crate) task_history_enabled: bool,
     /// Which failed queries are logged; `runtime.query.log_errors`.
     pub(crate) query_error_logging: QueryErrorLogging,
@@ -1739,6 +1765,12 @@ impl DataFusion {
     /// `acceleration_refresh_semaphore` for the read/query side.
     pub(crate) fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
         self.query_admission_semaphore.clone()
+    }
+
+    /// The number of permits in the query-admission semaphore; `None` when
+    /// admission is unbounded.
+    pub(crate) fn query_admission_limit(&self) -> Option<usize> {
+        self.query_admission_limit
     }
 
     #[must_use]
@@ -3913,19 +3945,9 @@ impl DataFusion {
                 from: dataset.from.clone(),
             });
         }
-        let mut validation_refresh = Refresh::new(refresh_mode);
-        if let Some(format) = dataset.time_format {
-            validation_refresh = validation_refresh.time_format(format);
-        }
-        if let Some(column) = &dataset.time_column {
-            validation_refresh = validation_refresh.time_column(column.clone());
-        }
-        if let Some(column) = &dataset.time_partition_column {
-            validation_refresh = validation_refresh.time_partition_column(column.clone());
-        }
-        if let Some(format) = dataset.time_partition_format {
-            validation_refresh = validation_refresh.time_partition_format(format);
-        }
+        let resolved_time = dataset.resolve_time_columns(source_schema.as_ref());
+        let validation_refresh =
+            refresh_with_resolved_time(Refresh::new(refresh_mode), &resolved_time);
         validation_refresh
             .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
@@ -3941,6 +3963,7 @@ impl DataFusion {
             refresh_schema,
             refresh_mode,
             constraint_columns,
+            resolved_time,
         })
     }
 
@@ -3961,7 +3984,20 @@ impl DataFusion {
             refresh_schema,
             refresh_mode,
             constraint_columns,
+            resolved_time,
         } = setup;
+        // Retention and later builders read `dataset.time_column`; keep them on the
+        // resolved names so a legacy `last_modified` alias is visible everywhere.
+        let mut resolved_dataset = dataset.clone();
+        resolved_dataset
+            .time_column
+            .clone_from(&resolved_time.time_column);
+        resolved_dataset.time_format = resolved_time.time_format;
+        resolved_dataset
+            .time_partition_column
+            .clone_from(&resolved_time.time_partition_column);
+        resolved_dataset.time_partition_format = resolved_time.time_partition_format;
+        let dataset = &resolved_dataset;
         // A deferred provider reports the primary key the checkpoint recorded, so an
         // acceleration registered while its source is down keeps its existing key.
         let source_constraints = source_table_provider.constraints();
@@ -4108,7 +4144,14 @@ impl DataFusion {
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         // For caching mode, we always start ready since it fetches data on-demand.
-        let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching);
+        // A `sink` has nothing to load either: its rows arrive only by write, so its
+        // acceleration — empty on a first start — already holds the whole dataset, and a scan
+        // must not fail while a refresh that reads no rows runs. A snapshot refresh is the
+        // exception, since its rows do arrive by refresh.
+        let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
+            || (source.as_any().is::<SinkConnector>()
+                && !matches!(refresh_mode, RefreshMode::Snapshot));
+        let mut initial_status = None;
         if !initial_load_complete
             && let Ok(checkpoint) = dataset_checkpointer(
                 dataset,
@@ -4140,35 +4183,29 @@ impl DataFusion {
                 // `Refreshing` itself when it starts.
                 let awaits_source = effective_ready_state == ReadyState::OnSchemaResolved
                     && source_table_provider.awaits_source();
-                let initial_status = if awaits_source {
+                //
+                // Reported when the refresher starts rather than here: the dataset's search
+                // indexes are rebuilt from the acceleration first, and it is not registered
+                // until they are, so reporting it ready now would let `/v1/ready` answer while
+                // queries against it still fail.
+                initial_status = Some(if awaits_source {
                     status::ComponentStatus::Initializing
                 } else {
                     status::ComponentStatus::Ready
-                };
-                self.runtime_status
-                    .update_dataset(&dataset.name, initial_status);
+                });
                 initial_load_complete = true;
             }
         }
 
-        let mut refresh = Refresh::new(refresh_mode).with_retry(
-            dataset.refresh_retry_enabled(),
-            dataset.refresh_retry_max_attempts(),
+        let mut refresh = refresh_with_resolved_time(
+            Refresh::new(refresh_mode).with_retry(
+                dataset.refresh_retry_enabled(),
+                dataset.refresh_retry_max_attempts(),
+            ),
+            &resolved_time,
         );
         if let Some(sql) = parsed_refresh_sql {
             refresh = refresh.refresh_sql(sql);
-        }
-        if let Some(format) = dataset.time_format {
-            refresh = refresh.time_format(format);
-        }
-        if let Some(time_col) = &dataset.time_column {
-            refresh = refresh.time_column(time_col.clone());
-        }
-        if let Some(time_partition_column) = &dataset.time_partition_column {
-            refresh = refresh.time_partition_column(time_partition_column.clone());
-        }
-        if let Some(time_partition_format) = dataset.time_partition_format {
-            refresh = refresh.time_partition_format(time_partition_format);
         }
         if let Some(check_interval) = dataset.refresh_check_interval() {
             refresh = refresh.check_interval(check_interval);
@@ -4191,7 +4228,7 @@ impl DataFusion {
         }
         refresh = refresh.versions_by_time(
             acceleration_settings
-                .orders_versions_by_time(dataset.time_column.as_deref(), refresh_mode)
+                .orders_versions_by_time(resolved_time.time_column.as_deref(), refresh_mode)
                 .then(|| VersionsByTime {
                     // An unpartitioned Cayenne table resolves a full refresh's repeated
                     // keys as it writes them, ordered by the row versions the refresh
@@ -4540,6 +4577,9 @@ impl DataFusion {
         }
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
+        if let Some(initial_status) = initial_status {
+            accelerated_table_builder.initial_status(initial_status);
+        }
 
         // Caching mode requires federation to be disabled so that queries go through
         // AcceleratedTable::scan to trigger the cache miss/hit logic
@@ -6376,12 +6416,33 @@ impl DataFusion {
         let register_task: JoinHandle<Option<ViewRegistration>> = spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
-            // the tables are created. To handle this, wait until all tables are created.
+            // the tables are created. To handle this, wait until all tables are created,
+            // including tables only a subquery reads: a Spicepod change that replaces a
+            // dataset registers the views reading it again before the dataset is.
+            // A table function and `information_schema` are not catalog tables, and never
+            // exist.
+            let tables_read = {
+                let state = ctx.state();
+                let mut tables_read = dependent_table_names.clone();
+                for table in state
+                    .resolve_table_references(&statements[0])
+                    .unwrap_or_default()
+                {
+                    let is_table_function = table.schema().is_none()
+                        && state.table_functions().contains_key(table.table());
+                    let is_information_schema = table.schema() == Some("information_schema");
+                    if !is_table_function && !is_information_schema && !tables_read.contains(&table)
+                    {
+                        tables_read.push(table);
+                    }
+                }
+                tables_read
+            };
 
             let deadline = Instant::now() + Duration::from_mins(1);
             let mut unresolved_dependent_table: Option<TableReference> = None;
 
-            for dependent_table_name in &dependent_table_names {
+            for dependent_table_name in &tables_read {
                 let mut attempts = 0;
                 if unresolved_dependent_table.is_some() {
                     break;
@@ -6770,12 +6831,17 @@ impl DataFusion {
         self.ctx.deregister_udtf(TEXT_SEARCH_UDTF_NAME);
     }
 
-    /// Create or get a logical plan from the query
+    /// Create or get a logical plan from the query.
+    ///
+    /// Only table-function arguments receive `parameters` here; the caller binds
+    /// the rest with [`LogicalPlan::with_param_values`]. Plans with substituted
+    /// values are not cached, so a cache hit never needs `parameters`.
     pub(crate) async fn get_or_create_logical_plan(
         &self,
         session: &SessionState,
         cache_key_opt: Option<&RawCacheKey>,
         sql: &str,
+        parameters: Option<&ParamValues>,
     ) -> Result<LogicalPlan, DataFusionError> {
         let plans_cache = if let Some(cache_key) = cache_key_opt {
             let plans_cache = self.plans_cache_provider();
@@ -6791,9 +6857,11 @@ impl DataFusion {
             None
         };
 
-        let plan = self.create_logical_plan(session, sql).await?;
+        let (plan, placeholders) = self.create_logical_plan(session, sql, parameters).await?;
 
-        if let Some(cache) = plans_cache
+        // A plan is not cached when it holds substituted table-function parameters.
+        if placeholders == TableFunctionPlaceholders::Absent
+            && let Some(cache) = plans_cache
             && let Some(cache_key) = cache_key_opt
         {
             tracing::trace!("caching plan for {sql}");
@@ -6806,13 +6874,19 @@ impl DataFusion {
     /// Route SQL through the planner, which intercepts DDL extensions and
     /// Cayenne DML at the statement level, or falls back to `DataFusion`'s
     /// standard planner.
+    ///
+    /// `parameters` are substituted into table-function arguments first; see
+    /// [`runtime_datafusion::table_function_params`].
     #[cfg(not(windows))]
     pub(crate) async fn create_logical_plan(
         &self,
         session: &SessionState,
         sql: &str,
-    ) -> Result<LogicalPlan, DataFusionError> {
-        let statement = planner::parse_sql_statement(sql, session)?;
+        parameters: Option<&ParamValues>,
+    ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
+        let mut statement = planner::parse_sql_statement(sql, session)?;
+        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
+        let placeholders = bind_table_function_args(&mut statement, parameters)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
 
@@ -6829,7 +6903,9 @@ impl DataFusion {
             io_runtime: self.io_runtime.clone(),
         };
 
-        planner::create_logical_plan_from_statement(sql, statement, session, &ctx).await
+        let plan =
+            planner::create_logical_plan_from_statement(sql, statement, session, &ctx).await?;
+        Ok((plan, placeholders))
     }
 
     /// On Windows the `planner` module is not available, so delegate
@@ -6839,16 +6915,37 @@ impl DataFusion {
         &self,
         session: &SessionState,
         sql: &str,
-    ) -> Result<LogicalPlan, DataFusionError> {
+        parameters: Option<&ParamValues>,
+    ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
         let dialect = session.config().options().sql_parser.dialect;
-        let statement = session.sql_to_statement(sql, &dialect)?;
+        let mut statement = sql_depth_guard::sql_to_statement(session, sql, &dialect)?;
+        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
+        let placeholders = bind_table_function_args(&mut statement, parameters)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
         let spellings =
             runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings::collect(
                 &statement,
             );
-        spellings.retain(session.statement_to_plan(statement).await?)
+        let plan = spellings.retain(session.statement_to_plan(statement).await?)?;
+        Ok((plan, placeholders))
+    }
+
+    /// Whether `sql` has a placeholder in a table-function argument, which
+    /// means it cannot be planned until its parameters are known.
+    ///
+    /// Returns `false` if `sql` fails to parse; planning reports the error.
+    pub(crate) fn has_table_function_placeholders(&self, sql: &str) -> bool {
+        // Borrow the state; `ctx.state()` clones every registered function.
+        let state = self.ctx.state_ref();
+        let state = state.read();
+        // The plain parser suffices: only `CREATE TABLE ... CLUSTER BY` needs
+        // `planner::parse_sql_statement`, and it has no table functions.
+        let dialect = state.config().options().sql_parser.dialect;
+        state
+            .sql_to_statement(sql, &dialect)
+            .and_then(|mut statement| bind_table_function_args(&mut statement, None))
+            .is_ok_and(|placeholders| placeholders == TableFunctionPlaceholders::Present)
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
@@ -6867,7 +6964,7 @@ impl DataFusion {
         let key = cache::key::CacheKey::Query(sql, None)
             .as_raw_key(Box::new(std::hash::DefaultHasher::new()));
         let session = self.ctx.state();
-        self.get_or_create_logical_plan(&session, Some(&key), sql)
+        self.get_or_create_logical_plan(&session, Some(&key), sql, None)
             .await?;
         Ok(())
     }
@@ -7658,8 +7755,9 @@ async fn build_snapshot_refresh_state(
     let swappable_provider = SwappableTableProvider::new(initial_provider);
     let current_snapshot_id = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_loaded_id));
     let source: Arc<dyn crate::dataaccelerator::AccelerationSource> = Arc::new(dataset.clone());
-    // The initial provider serves the restored snapshot; the engine may reclaim
-    // what an earlier process left that this snapshot no longer references.
+    // The initial provider serves the local snapshot, which may be older than the
+    // one the first refresh restores; the engine may reclaim what an earlier
+    // process left that this snapshot no longer references.
     accelerator
         .maintain_after_snapshot_restore(source.as_ref(), &swappable_provider.current())
         .await;
@@ -7695,7 +7793,7 @@ mod tests {
         let cause = "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id'])";
         assert_eq!(
             acceleration_rebuilt_message(cause),
-            "The existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id']), so it is dropped and reloaded from the source with the new settings."
+            "The existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id']), so it is dropped and reloaded from the source."
         );
         let checkpoint = Error::AccelerationRebuildCheckpoint {
             dataset_name: "trips".to_string(),
@@ -8128,7 +8226,7 @@ mod tests {
 
         let session = df.ctx.state();
 
-        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
             .await
             .expect("logical plan");
 
@@ -8141,7 +8239,7 @@ mod tests {
         drop(cache_provider);
 
         // Reusing the same query should no longer at to the cache
-        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
             .await
             .expect("logical plan");
 
@@ -8150,6 +8248,104 @@ mod tests {
         };
         cache_provider.checkpoint().await; // Ensure entry gets logged
         assert_eq!(cache_provider.item_count().await, 1);
+    }
+
+    /// Returns its string argument as a single row. Like the search UDTFs, it
+    /// rejects anything but a literal.
+    #[derive(Debug)]
+    struct EchoTableFunc;
+
+    impl datafusion::catalog::TableFunctionImpl for EchoTableFunc {
+        fn call(&self, args: &[Expr]) -> datafusion::error::Result<Arc<dyn TableProvider>> {
+            let [Expr::Literal(datafusion::scalar::ScalarValue::Utf8(Some(value)), _)] = args
+            else {
+                return datafusion::common::plan_err!(
+                    "echo takes one string literal, got {args:?}"
+                );
+            };
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::StringArray::from(vec![
+                    value.clone(),
+                ]))],
+            )?;
+            Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+        }
+    }
+
+    /// Placeholders in table-function arguments are substituted before
+    /// planning, and the resulting plans are not cached.
+    #[tokio::test]
+    async fn table_function_args_accept_parameters() {
+        use datafusion::scalar::ScalarValue;
+
+        static SQL: &str = "SELECT value FROM echo($1) WHERE value <> $2";
+        let raw_cache_key =
+            CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_plans_cache(plan_cache_provider),
+            ))
+            .build(),
+        );
+        df.ctx.register_udtf("echo", Arc::new(EchoTableFunc));
+        let session = df.ctx.state();
+
+        for value in ["fox", "dog"] {
+            let params = ParamValues::from(vec![ScalarValue::from(value), ScalarValue::from("")]);
+            let plan = df
+                .get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, Some(&params))
+                .await
+                .expect("plan with parameters")
+                .with_param_values(params)
+                .expect("bind the remaining parameters");
+            let batches = df
+                .ctx
+                .execute_logical_plan(plan)
+                .await
+                .expect("execute")
+                .collect()
+                .await
+                .expect("collect");
+            let column = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("string column");
+            assert_eq!(column.value(0), value);
+        }
+
+        let Some(cache_provider) = df.plans_cache_provider() else {
+            unreachable!("Cache provider should be available");
+        };
+        cache_provider.checkpoint().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            0,
+            "a plan that holds parameter values must not be cached"
+        );
+
+        assert!(df.has_table_function_placeholders(SQL));
+        assert!(
+            !df.has_table_function_placeholders("SELECT value FROM echo('fox') WHERE value <> $1")
+        );
     }
 
     #[cfg(all(feature = "duckdb", feature = "snapshots",))]
@@ -8714,6 +8910,12 @@ mod tests {
                     Err(Error::UnsupportedDistributedAccelerationEngine { .. })
                 ),
                 "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+            // The fix it names is the engine that stays: `arrow` is deprecated, and
+            // Cayenne partitions only in file mode.
+            assert_eq!(
+                result.expect_err("duckdb is rejected").to_string(),
+                "Failed to create an accelerated table for dataset my_dataset: the 'duckdb' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
             );
         }
 

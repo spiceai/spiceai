@@ -101,9 +101,10 @@ impl EnvSecretStore {
 /// Iterates parsed entries from a [`dotenv`] iterator, setting each valid
 /// key-value pair into the environment. Variables already present in the
 /// environment are preserved, so earlier-loaded files take priority over later
-/// ones. Malformed lines are logged with their line number and content so users
-/// can fix them. I/O-level errors (e.g. missing file) are reported at debug
-/// level because the file is optional.
+/// ones. Malformed lines are logged by line number only: any part of the line,
+/// including text that looks like a key, can be secret. I/O-level errors
+/// (e.g. missing file) are reported at debug level because the file is
+/// optional.
 ///
 /// # Safety
 ///
@@ -125,10 +126,8 @@ where
                     }
                 }
             }
-            Err(dotenv::Error::LineParse(line_num, content)) => {
-                tracing::warn!(
-                    "{label}: line {line_num} is malformed and was skipped: `{content}`"
-                );
+            Err(dotenv::Error::LineParse(line_num, _)) => {
+                tracing::warn!("{label}: line {line_num} is malformed and was skipped");
             }
             Err(err) => {
                 tracing::debug!("{label}: {err}");
@@ -182,9 +181,13 @@ impl SecretStore for EnvSecretStore {
         .find_map(|variant| match std::env::var(variant) {
             Ok(value) => Some(Ok(SecretString::from(value))),
             Err(std::env::VarError::NotPresent) => None,
-            Err(err) => Some(Err(
-                Box::new(err) as Box<dyn std::error::Error + Send + Sync>
-            )),
+            // `VarError::NotUnicode` displays the raw value, so report the
+            // failure without it: this error is logged and can reach dataset
+            // status and the cluster `ExpandSecret` response.
+            Err(std::env::VarError::NotUnicode(_)) => Some(Err(format!(
+                "environment variable `{variant}` is not valid Unicode (value not shown)"
+            )
+            .into())),
         })
         .transpose()
     }

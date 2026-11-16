@@ -121,9 +121,25 @@ STUB
 # answers 503 *with a body* saying so. This stub reproduces curl's `-f`
 # behaviour of suppressing that body, which is why passing `-f` would blind the
 # diagnostics — the reason the subject must not use it.
+#
+# /v1/datasets answers STUB_DATASETS_BODY, or STUB_DATASETS_EARLY on its first
+# STUB_DATASETS_AFTER - 1 calls: a dataset that a running runtime picks up
+# partway through the wait.
 cat >"$stub_dir/curl" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
+if [[ "$*" == */v1/datasets* ]]; then
+  d=0
+  [[ -f "${STATE_DIR}/datasets_calls" ]] && d="$(cat "${STATE_DIR}/datasets_calls")"
+  d=$((d + 1))
+  echo "$d" > "${STATE_DIR}/datasets_calls"
+  if [[ -n "${STUB_DATASETS_AFTER:-}" && "$d" -lt "${STUB_DATASETS_AFTER}" ]]; then
+    printf '%s' "${STUB_DATASETS_EARLY:-}"
+  else
+    printf '%s' "${STUB_DATASETS_BODY:-}"
+  fi
+  exit 0
+fi
 n=0
 [[ -f "${STATE_DIR}/curl_calls" ]] && n="$(cat "${STATE_DIR}/curl_calls")"
 n=$((n + 1))
@@ -148,7 +164,7 @@ chmod +x "$stub_dir"/*
 reset_state() {
   : > "$stub_dir/procs"
   : > "$stub_dir/signals"
-  rm -f "$stub_dir/curl_calls"
+  rm -f "$stub_dir/curl_calls" "$stub_dir/datasets_calls"
   local row
   for row in "$@"; do echo "$row" >> "$stub_dir/procs"; done
 }
@@ -449,6 +465,85 @@ printf 'INFO runtime: all good here\n' > "$work_dir/spice.log"
 result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5)"
 assert_eq "still accepts a genuine ready" "${result%%|*}" "0"
 rm -f "$work_dir/spice.log"
+
+# ---------------------------------------------------------------------------
+echo "wait_for_ready — datasets added to a running runtime"
+# ---------------------------------------------------------------------------
+
+# The Dremio quickstart race: `spice add` edits the Spicepod of a runtime that
+# is already ready, and /v1/ready keeps answering "ready" until the new dataset
+# starts initializing. /v1/datasets?status=true lists it as `Error` in that
+# window, since nothing has registered the table yet.
+not_registered='[{"name":"taxi_trips","status":"Error"}]'
+registered='[{"name":"taxi_trips","status":"Ready"}]'
+
+# Without `datasets`, the wait passes on that first "ready" without ever asking
+# about the dataset: the behaviour the Dremio quickstart failed on.
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5 \
+  STUB_DATASETS_EARLY="$not_registered" STUB_DATASETS_BODY="$registered" STUB_DATASETS_AFTER=3)"
+assert_eq "without datasets, a ready runtime passes at once" "${result%%|*}" "0"
+assert_eq "without datasets, /v1/datasets is never read" "$(cat "$stub_dir/datasets_calls" 2>/dev/null || echo 0)" "0"
+
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=20 SPICE_READY_INTERVAL=1 \
+  SPICE_READY_DATASETS=taxi_trips \
+  STUB_DATASETS_EARLY="$not_registered" STUB_DATASETS_BODY="$registered" STUB_DATASETS_AFTER=3)"
+assert_eq "waits for an added dataset, then succeeds" "${result%%|*}" "0"
+assert_eq "kept polling until the dataset was Ready" "$(cat "$stub_dir/datasets_calls")" "3"
+assert_contains "says the dataset is Ready" "${result#*|}" "with 'taxi_trips' Ready"
+
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=3 SPICE_READY_INTERVAL=1 \
+  SPICE_READY_DATASETS=taxi_trips STUB_DATASETS_BODY='[{"name":"taxi_trips","status":"Initializing"}]')"
+out="${result#*|}"
+assert_eq "fails when the dataset never becomes Ready" "${result%%|*}" "1"
+assert_contains "names the dataset and its status" "$out" "taxi_trips=Initializing"
+assert_contains "blames the dataset, not the runtime" "$out" "Runtime ready, but taxi_trips=Initializing did not report Ready"
+assert_contains "dumps the last /v1/datasets response" "$out" '"status":"Initializing"'
+
+# A sibling that is Ready must not stand in for the dataset being waited on.
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=3 SPICE_READY_INTERVAL=1 \
+  SPICE_READY_DATASETS=taxi_trips \
+  STUB_DATASETS_BODY='[{"name":"other","status":"Ready"},{"name":"taxi_trips","status":"Refreshing"}]')"
+assert_eq "another dataset's Ready does not count" "${result%%|*}" "1"
+assert_contains "reports the dataset still pending" "${result#*|}" "taxi_trips=Refreshing"
+
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=3 SPICE_READY_INTERVAL=1 \
+  SPICE_READY_DATASETS=taxi_trips STUB_DATASETS_BODY='[{"name":"other","status":"Ready"}]')"
+assert_eq "a dataset missing from the list does not count" "${result%%|*}" "1"
+assert_contains "reports the dataset as absent" "${result#*|}" "taxi_trips=absent"
+
+# A response jq cannot read as a list is "cannot evaluate", never "Ready".
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=3 SPICE_READY_INTERVAL=1 \
+  SPICE_READY_DATASETS=taxi_trips STUB_DATASETS_BODY='<html>bad gateway</html>')"
+assert_eq "an unreadable response does not pass" "${result%%|*}" "1"
+assert_contains "reports it as unreadable" "${result#*|}" "taxi_trips=unreadable"
+
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=3 SPICE_READY_INTERVAL=1 \
+  SPICE_READY_DATASETS="taxi_trips trips" \
+  STUB_DATASETS_BODY='[{"name":"taxi_trips","status":"Ready"},{"name":"trips","status":"Initializing"}]')"
+assert_eq "every listed dataset must be Ready" "${result%%|*}" "1"
+assert_contains "names only the dataset still pending" "${result#*|}" "trips=Initializing"
+assert_not_contains "does not list the Ready one as pending" "${result#*|}" "taxi_trips=Ready"
+
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5 \
+  SPICE_READY_DATASETS="taxi_trips trips" \
+  STUB_DATASETS_BODY='[{"name":"trips","status":"Ready"},{"name":"taxi_trips","status":"Ready"}]')"
+assert_eq "passes once every listed dataset is Ready" "${result%%|*}" "0"
+
+# A runtime that never reports ready leaves the datasets unchecked, and the
+# diagnosis must say so rather than print a stale or empty list.
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=initializing SPICE_READY_TIMEOUT=2 SPICE_READY_INTERVAL=1 \
+  SPICE_READY_DATASETS=taxi_trips STUB_DATASETS_BODY="$registered")"
+assert_eq "datasets do not rescue a runtime that is not ready" "${result%%|*}" "1"
+assert_contains "says the datasets were never checked" "${result#*|}" "not checked: the runtime never reported ready"
 
 echo
 if [ "$failures" -eq 0 ]; then

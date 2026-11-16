@@ -832,7 +832,7 @@ pub(crate) async fn glue_metadata_location(namespace: &str, table: &str) -> anyh
         .credentials_provider(aws_sdk_glue::config::Credentials::new(
             env("AWS_ICEBERG_ACCESS_KEY_ID")?,
             env("AWS_ICEBERG_SECRET_ACCESS_KEY")?,
-            None,
+            crate::utils::nonempty_env("AWS_ICEBERG_SESSION_TOKEN"),
             None,
             "iceberg-test",
         ))

@@ -76,7 +76,7 @@ async fn test_acceleration_refresh_postgres_append() -> Result<(), anyhow::Error
                 2
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -134,7 +134,7 @@ async fn test_acceleration_refresh_postgres_full() -> Result<(), anyhow::Error> 
                 2
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await

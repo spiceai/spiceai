@@ -225,7 +225,7 @@ async fn clickhouse_reads_every_mapped_type_federated_and_accelerated() -> Resul
                 "{past_2262}"
             );
 
-            container.remove().await.map_err(|e| e.to_string())?;
+            container.cleanup().await;
             Ok(())
         })
         .await

@@ -327,6 +327,23 @@ pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), St
     Ok(())
 }
 
+/// The value of `env_var`, or `None` when it is unset or empty.
+pub(crate) fn nonempty_env(env_var: &str) -> Option<String> {
+    std::env::var(env_var)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// A `(param, "${ env:<env_var> }")` pair for an AWS session token, or `None`
+/// when `env_var` is unset or empty.
+///
+/// CI uses short-lived AWS credentials, which need the token. Local runs use
+/// static keys without one, and there the parameter is left out so an
+/// unresolved `${ env:... }` does not log a missing-secret error.
+pub(crate) fn aws_session_token_param(param: &str, env_var: &str) -> Option<(String, String)> {
+    nonempty_env(env_var).map(|_| (param.to_string(), format!("${{ env:{env_var} }}")))
+}
+
 pub(crate) fn test_request_context() -> Arc<RequestContext> {
     Arc::clone(&TEST_REQUEST_CONTEXT)
 }
@@ -605,11 +622,32 @@ pub(crate) async fn verify_openai_model_available(model_id: &str) -> Result<(), 
     }
 }
 
+/// The secret holding a short-lived Anthropic access token: in CI, the token GitHub's OIDC token
+/// is exchanged for through Anthropic workload identity federation
+/// (`.github/actions/anthropic-token`). Anthropic accepts it only as a bearer token, so a model
+/// sends it as `anthropic_auth_token`.
+pub(crate) const ANTHROPIC_AUTH_TOKEN_SECRET: &str = "SPICE_ANTHROPIC_AUTH_TOKEN";
+
+/// The secret holding an Anthropic API key, sent as `anthropic_api_key`.
+pub(crate) const ANTHROPIC_API_KEY_SECRET: &str = "SPICE_ANTHROPIC_API_KEY";
+
+/// The secret holding the credential the Anthropic models in these tests authenticate with:
+/// [`ANTHROPIC_AUTH_TOKEN_SECRET`] when it is set and not empty in the environment, as CI sets it,
+/// and otherwise [`ANTHROPIC_API_KEY_SECRET`], for a local run with an API key.
+pub(crate) fn anthropic_credential_secret() -> &'static str {
+    if std::env::var_os(ANTHROPIC_AUTH_TOKEN_SECRET).is_some_and(|token| !token.is_empty()) {
+        ANTHROPIC_AUTH_TOKEN_SECRET
+    } else {
+        ANTHROPIC_API_KEY_SECRET
+    }
+}
+
 /// Anthropic doesn't have a models list API, so we validate using a minimal messages request.
 /// This sends a minimal request to check if the model is accessible.
 pub(crate) async fn verify_anthropic_model_available(model_id: &str) -> Result<(), String> {
-    let api_key = std::env::var("SPICE_ANTHROPIC_API_KEY")
-        .map_err(|_| "SPICE_ANTHROPIC_API_KEY environment variable not set".to_string())?;
+    let secret = anthropic_credential_secret();
+    let credential =
+        std::env::var(secret).map_err(|_| format!("{secret} environment variable not set"))?;
 
     let client = reqwest::Client::new();
 
@@ -620,9 +658,13 @@ pub(crate) async fn verify_anthropic_model_available(model_id: &str) -> Result<(
         "messages": [{"role": "user", "content": "hi"}]
     });
 
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
+    let request = client.post("https://api.anthropic.com/v1/messages");
+    let request = if secret == ANTHROPIC_AUTH_TOKEN_SECRET {
+        request.bearer_auth(&credential)
+    } else {
+        request.header("x-api-key", &credential)
+    };
+    let response = request
         .header("anthropic-version", "2023-06-01")
         .header(CONTENT_TYPE, "application/json")
         .body(body.to_string())

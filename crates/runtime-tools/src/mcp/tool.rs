@@ -21,7 +21,7 @@ use rmcp::{
 };
 use serde_json::Value;
 use snafu::ResultExt;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, io, sync::Arc};
 use tokio::sync::RwLock;
 use tools::McpProxy;
 use tracing::Span;
@@ -32,7 +32,7 @@ use tools::SpiceModelTool;
 use tools::naming::encode_tool_name;
 
 use super::{
-    Result,
+    MAX_TOOL_RESULT_SIZE, Result,
     catalog::{McpClient, Reconnector},
     task_name_for_exposed_tool,
 };
@@ -160,7 +160,20 @@ impl SpiceModelTool for McpToolWrapper {
             if self.reconnected_after_close(&result).await {
                 result = self.client.read().await.call_tool(params).await;
             }
-            let response = result.boxed()?;
+            // The transport error names the HTTP client type. Keep the
+            // sentence that says what happened to the call.
+            let response = match result {
+                Ok(response) => response,
+                Err(e) => return Err(tool_facing_error_text(&e.to_string()).into()),
+            };
+
+            // The transport already bounds each response body; this also
+            // covers results from a stdio server.
+            if result_exceeds_limit(&response, MAX_TOOL_RESULT_SIZE) {
+                let message = tool_result_too_large_message(&exposed_name);
+                tracing::warn!("{message}");
+                return Err(message.into());
+            }
 
             if response.is_error == Some(true) {
                 let text = response
@@ -235,6 +248,58 @@ impl McpProxy for McpToolWrapper {
         }
         result
     }
+}
+
+/// The text of a transport failure, without the client-type prefix the
+/// transport puts in front of an over-limit response.
+fn tool_facing_error_text(text: &str) -> String {
+    text.find("MCP server '")
+        .map_or_else(|| text.to_string(), |start| text[start..].to_string())
+}
+
+/// The single-line message for a tool result larger than [`MAX_TOOL_RESULT_SIZE`].
+/// It is both the `WARN` log line and the tool error, so it never includes the result.
+fn tool_result_too_large_message(exposed_name: &str) -> String {
+    format!(
+        "MCP tool '{exposed_name}' returned a result larger than the {} MiB limit, so the call failed and the result was discarded. Make the tool return a smaller result, for example by paginating it. See https://spiceai.org/docs/components/tools/mcp",
+        MAX_TOOL_RESULT_SIZE / (1024 * 1024)
+    )
+}
+
+/// An [`io::Write`] sink that only counts, and fails once the count passes `limit`
+/// so serialization stops there instead of walking the rest of the value.
+struct SizeLimitedSink {
+    written: usize,
+    limit: usize,
+}
+
+impl io::Write for SizeLimitedSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.written = self.written.saturating_add(buf.len());
+        if self.written > self.limit {
+            return Err(io::Error::other("size limit exceeded"));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Whether the JSON the caller would receive — `content` plus
+/// `structuredContent` — is larger than `limit` bytes, measured without
+/// allocating it.
+fn result_exceeds_limit(result: &CallToolResult, limit: usize) -> bool {
+    let mut sink = SizeLimitedSink { written: 0, limit };
+    // A serialization error other than the limit surfaces from `to_value` later.
+    let _ = serde_json::to_writer(&mut sink, &result.content);
+    if let Some(structured) = &result.structured_content
+        && sink.written <= limit
+    {
+        let _ = serde_json::to_writer(&mut sink, structured);
+    }
+    sink.written > limit
 }
 
 /// Rewrite the gateway-exposed name to the upstream tool name.
@@ -313,6 +378,58 @@ mod tests {
             serde_json::from_value(json!({"com.example/traceId": "trace-42"}))
                 .expect("request _meta object");
         assert_eq!(forwarded.meta, Some(expected));
+    }
+
+    fn serialized_len(result: &CallToolResult) -> usize {
+        let content = serde_json::to_vec(&result.content).expect("content serializes");
+        let structured = result.structured_content.as_ref().map_or(0, |s| {
+            serde_json::to_vec(s)
+                .expect("structured content serializes")
+                .len()
+        });
+        content.len() + structured
+    }
+
+    /// The limit applies to `content` and `structuredContent` together, and a
+    /// result of exactly the limit passes.
+    #[test]
+    fn result_size_limit_is_exact_and_counts_structured_content() {
+        let text_only =
+            CallToolResult::success(vec![rmcp::model::ContentBlock::text("X".repeat(1000))]);
+        let len = serialized_len(&text_only);
+        assert!(!result_exceeds_limit(&text_only, len));
+        assert!(result_exceeds_limit(&text_only, len - 1));
+
+        let mut with_structured = text_only.clone();
+        with_structured.structured_content = Some(json!({"result": "X".repeat(1000)}));
+        let len = serialized_len(&with_structured);
+        assert!(len > serialized_len(&text_only) + 1000);
+        assert!(!result_exceeds_limit(&with_structured, len));
+        assert!(
+            result_exceeds_limit(&with_structured, len - 1),
+            "structuredContent must count toward the limit"
+        );
+    }
+
+    #[test]
+    fn transport_size_error_drops_the_client_type_path() {
+        let raw = "Transport send error: Transport [rmcp::transport::worker::WorkerTransport<runtime_tools::mcp::http_client::BoundedHttpClient>] error: unexpected server response: MCP server 'hostile' sent a response larger than the 16 MiB limit, so the request failed and the response was discarded. Make the MCP tool return a smaller result, for example by paginating it. See https://spiceai.org/docs/components/tools/mcp";
+        assert_eq!(
+            tool_facing_error_text(raw),
+            "MCP server 'hostile' sent a response larger than the 16 MiB limit, so the request failed and the response was discarded. Make the MCP tool return a smaller result, for example by paginating it. See https://spiceai.org/docs/components/tools/mcp"
+        );
+        assert_eq!(
+            tool_facing_error_text("connection reset by peer"),
+            "connection reset by peer"
+        );
+    }
+
+    #[test]
+    fn tool_result_too_large_message_names_the_tool_the_limit_and_the_fix() {
+        assert_eq!(
+            tool_result_too_large_message("github__search_code"),
+            "MCP tool 'github__search_code' returned a result larger than the 16 MiB limit, so the call failed and the result was discarded. Make the tool return a smaller result, for example by paginating it. See https://spiceai.org/docs/components/tools/mcp"
+        );
     }
 
     fn spec(name: &'static str) -> Tool {

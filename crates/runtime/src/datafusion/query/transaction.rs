@@ -46,9 +46,11 @@ use cache::result::CacheStatus;
 use cayenne::{CayenneTableProvider, CayenneTransaction};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, ParamValues, TableReference};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::{ast::Statement as SqlStatement, dialect::PostgreSqlDialect};
+use runtime_datafusion::table_function_params::bind_table_function_args;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Error as QueryError, QueryBuilder, ResultsCacheMode};
@@ -57,11 +59,14 @@ use crate::accelerated::{
     write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target},
 };
 use crate::datafusion::DataFusion;
+use crate::egress::collect_reserved;
 
 /// The result of a committed transaction: the final statement's batches and
 /// cache status, or `None` for a body that produced no result (bare COMMIT).
 pub struct TransactionOutcome {
     pub result: Option<(Vec<RecordBatch>, CacheStatus)>,
+    /// The query memory pool's reservation for `result`'s batches.
+    pub reservation: MemoryReservation,
 }
 
 /// A transaction failure, carrying enough to let each transport pick its own
@@ -128,6 +133,11 @@ pub fn transaction_statements(sql: &str) -> Option<Vec<String>> {
 /// [`transaction_statements`] without the leading-word check: parses `sql` in
 /// full to find out.
 fn parse_transaction_statements(sql: &str) -> Option<Vec<String>> {
+    crate::datafusion::sql_depth_guard::ensure_data_types_within_depth_limit(
+        sql,
+        &PostgreSqlDialect {},
+    )
+    .ok()?;
     let statements: Vec<DFStatement> = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {})
         .ok()?
         .into_iter()
@@ -179,22 +189,27 @@ pub fn schema_statement(sql: &str) -> String {
 /// # Errors
 ///
 /// Returns a [`TransactionError`] if the body is not a valid v1 transaction, a
-/// statement fails to plan or execute, the optimistic-concurrency re-check
-/// loses (retryable [`TransactionError::Conflict`]), or the staged writes fail
-/// to publish.
+/// statement fails to plan or execute, the final result (plus the
+/// `render_bytes` the caller needs to encode it) cannot be reserved from the
+/// query memory pool, the optimistic-concurrency re-check loses (retryable
+/// [`TransactionError::Conflict`]), or the staged writes fail to publish. Every
+/// one of these is raised before anything is published.
 pub async fn run_transaction(
     df: &Arc<DataFusion>,
     statements: &[String],
     parameters: Option<ParamValues>,
     read_only: bool,
+    render_bytes: impl Fn(&[RecordBatch]) -> usize + Send,
 ) -> Result<TransactionOutcome, TransactionError> {
     // Prepare the transaction: identify every participant table, validate the
     // write targets, capture their begin tokens, and install the transaction on
     // the request context. A body with no write is a plain read-only transaction.
-    let handle = prepare_transaction(df, statements).await?;
-
     let parameters = normalize_transaction_parameters(parameters);
+    let handle = prepare_transaction(df, statements, parameters.as_ref()).await?;
+
     let mut last: Option<(Vec<RecordBatch>, CacheStatus)> = None;
+    let reservation =
+        MemoryConsumer::new("transaction_result").register(&df.ctx.runtime_env().memory_pool);
     let statement_count = statements.len();
     for (index, statement) in statements.iter().enumerate() {
         let query_res =
@@ -215,9 +230,12 @@ pub async fn run_transaction(
         // here and returned after commit. Intermediate statements (the gate,
         // earlier writes) are drained without keeping their batches.
         let consume = if index + 1 == statement_count {
-            query_res.collect_batches().await.map(|batches| {
-                last = Some((batches, cache_status));
-            })
+            match collect_reserved(query_res.into_record_batch_stream(), &reservation).await {
+                Ok(batches) => reservation
+                    .try_grow(render_bytes(&batches))
+                    .map(|()| last = Some((batches, cache_status))),
+                Err(e) => Err(e),
+            }
         } else {
             query_res.drain().await
         };
@@ -251,7 +269,10 @@ pub async fn run_transaction(
         }
     }
 
-    Ok(TransactionOutcome { result: last })
+    Ok(TransactionOutcome {
+        result: last,
+        reservation,
+    })
 }
 
 /// Makes positional parameters reusable across transaction statements.
@@ -310,13 +331,23 @@ struct TransactionHandle {
 async fn prepare_transaction(
     df: &Arc<DataFusion>,
     inner_sqls: &[String],
+    parameters: Option<&ParamValues>,
 ) -> Result<Option<TransactionHandle>, TransactionError> {
     let session = df.ctx.state();
     let mut write_refs: Vec<TableReference> = Vec::new();
     let mut read_refs: Vec<TableReference> = Vec::new();
+    let dialect = session.config().options().sql_parser.dialect;
     for stmt_sql in inner_sqls {
+        // Table functions run during planning, so substitute their parameters first.
+        let mut statement = session
+            .sql_to_statement(stmt_sql, &dialect)
+            .map_err(TransactionError::Plan)?;
+        crate::datafusion::sql_depth_guard::ensure_statement_within_depth_limits(&statement)
+            .map_err(TransactionError::Plan)?;
+        let _ =
+            bind_table_function_args(&mut statement, parameters).map_err(TransactionError::Plan)?;
         let plan = session
-            .create_logical_plan(stmt_sql)
+            .statement_to_plan(statement)
             .await
             .map_err(TransactionError::Plan)?;
         // A read-only body (`None`) contributes no write ref; a write target

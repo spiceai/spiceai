@@ -763,7 +763,6 @@ pub enum QueryOverrides {
     SQLite,
     PostgreSQL,
     MySQL,
-    Dremio,
     Spark,
     ODBCAthena,
     ODBCDatabricks,
@@ -798,7 +797,6 @@ impl QueryOverrides {
             "sqlite" => Some(Self::SQLite),
             "postgres" => Some(Self::PostgreSQL),
             "mysql" => Some(Self::MySQL),
-            "dremio" => Some(Self::Dremio),
             "spark" => Some(Self::Spark),
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
@@ -1293,10 +1291,6 @@ pub fn get_tpcds_test_queries(
                 92
             )
         }
-        Some(QueryOverrides::Dremio) => remove_tpcds_query!(
-            queries, 8, 38, 87, // LEFT SEMI, and LEFT ANTI
-            64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
-        ),
         Some(QueryOverrides::Arrow) => remove_tpcds_query!(
             queries, 72 // 'offset overflow' https://github.com/spiceai/spiceai/issues/4216
         ),
@@ -1330,13 +1324,6 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
             // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
             // expressions can appear with other expressions, so re-write the query to fit
             Some(generate_clickbench_query_overrides!("postgres", 43))
-        }
-        Some(QueryOverrides::Dremio) => {
-            // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
-            // expressions can appear with other expressions, so re-write the query to fit
-            Some(generate_clickbench_query_overrides!(
-                "dremio", 21, 22, 23, 24
-            ))
         }
         Some(QueryOverrides::DuckDB) => {
             // specific to the DuckDB accelerator when used with on_zero_results: use_source

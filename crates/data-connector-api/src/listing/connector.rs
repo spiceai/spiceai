@@ -17,6 +17,8 @@ limitations under the License.
 use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
+use data_components::csv_header_projection::HeaderProjectedCsvFormat;
+use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -55,6 +57,7 @@ use futures::TryStreamExt;
 use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use url::Url;
 #[cfg(not(windows))]
 use {
@@ -109,6 +112,12 @@ pub struct ListingTableTemplate {
     object_store: Arc<dyn ObjectStore>,
     /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
     extension: String,
+    /// The dataset name, for schema-drift messages.
+    dataset_name: String,
+    /// Whether scans are checked for registered columns missing from every scanned file
+    /// (see [`data_components::file_schema_drift`]). Off when `schema_source_path` names the
+    /// schema: its columns need not appear in the data files.
+    check_schema_drift: bool,
 }
 
 impl ListingTableTemplate {
@@ -163,20 +172,188 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        if has_location_metadata(table.options()) {
+        let pruning = has_location_metadata(table.options()).then(|| {
             Arc::new(LocationPruningListingTable::new(
-                table,
+                Arc::clone(&table),
                 Arc::clone(&self.object_store),
-                table_path,
+                table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
-        } else {
-            table
+        });
+        // A missing or emptied source lists as success with zero rows today, so a
+        // full refresh can persist an empty acceleration. Reject that listing
+        // (dataset and path named in the error and a warn log). An existing
+        // header-only or zero-row file still matches and scans as zero rows.
+        let table = reject_empty_listing(
+            table,
+            pruning,
+            table_path,
+            self.dataset_name.clone(),
+            self.extension.clone(),
+        );
+        match self.schema_drift_guard() {
+            Some(guard) => FileSchemaDriftLayer::over(table, guard),
+            None => table,
         }
+    }
+
+    /// The guard that checks this dataset's scans for registered columns missing from every
+    /// scanned file, or `None` when the check is off or the file format cannot be checked.
+    fn schema_drift_guard(&self) -> Option<FileSchemaDriftGuard> {
+        (self.check_schema_drift
+            && FileSchemaDriftGuard::supports_format(self.options.format.as_ref()))
+        .then(|| {
+            FileSchemaDriftGuard::new(
+                self.dataset_name.clone(),
+                Arc::clone(&self.schema),
+                Arc::clone(&self.options.format),
+            )
+        })
     }
 }
 
+/// Fails a scan whose listing has no data file, so a full refresh cannot persist
+/// an empty result over a deleted or emptied source.
+#[derive(Debug)]
+struct RejectEmptyListingLayer {
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+    /// The `_location` pruning table beneath, when there is one. A scan it answers by
+    /// `head()`ing the named objects skips the listing here, so it needs no list call
+    /// (or list permission) it did not need before.
+    pruning: Option<Arc<LocationPruningListingTable>>,
+}
+
+/// Stacks the empty-listing guard over `table`, or over `pruning` when the dataset
+/// has `_location` metadata.
+fn reject_empty_listing(
+    table: Arc<ListingTable>,
+    pruning: Option<Arc<LocationPruningListingTable>>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    let below: Arc<dyn TableProvider> = match &pruning {
+        Some(pruning) => Arc::clone(pruning) as Arc<dyn TableProvider>,
+        None => table,
+    };
+    SpiceTable::over(
+        Arc::new(RejectEmptyListingLayer {
+            table_path,
+            dataset_name,
+            extension,
+            pruning,
+        }),
+        below,
+    )
+}
+
+/// Stacks the empty-listing guard over a single-object table that does not go
+/// through [`ListingTableTemplate::wrap`] (the S3 single-file version cache). A
+/// deleted object (`404 NoSuchKey`) lists nothing, so the scan fails rather than
+/// refreshing the acceleration to zero rows.
+fn reject_empty_single_object(
+    below: Arc<dyn TableProvider>,
+    table_path: ListingTableUrl,
+    dataset_name: String,
+    extension: String,
+) -> Arc<dyn TableProvider> {
+    SpiceTable::over(
+        Arc::new(RejectEmptyListingLayer {
+            table_path,
+            dataset_name,
+            extension,
+            pruning: None,
+        }),
+        below,
+    )
+}
+
+impl RejectEmptyListingLayer {
+    fn forget_listing(&self, state: &dyn Session) {
+        let Some(cache) = state.runtime_env().cache_manager.get_list_files_cache() else {
+            return;
+        };
+        // `ListingTable` caches under the path prefix; drop it so a later restore
+        // is visible to the inner scan (not only to this emptiness check).
+        let _ = cache.remove(&TableScopedPath {
+            table: None,
+            path: self.table_path.prefix().clone(),
+        });
+    }
+
+    async fn ensure_data_files(&self, state: &dyn Session) -> DFResult<()> {
+        self.forget_listing(state);
+        let store = state.runtime_env().object_store(&self.table_path)?;
+        let files = list_matching_listing_files(
+            state,
+            &self.table_path,
+            store.as_ref(),
+            &self.extension,
+            1,
+        )
+        .await?;
+        if !files.is_empty() {
+            return Ok(());
+        }
+        let display_path =
+            sanitize_url(<ListingTableUrl as AsRef<url::Url>>::as_ref(&self.table_path).clone());
+        tracing::warn!(
+            dataset = %self.dataset_name,
+            path = %display_path,
+            "No data files are yet available for dataset {} at {}. The source path is missing or has no matching files.",
+            self.dataset_name,
+            display_path
+        );
+        Err(DataFusionError::External(Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "No data files are yet available for dataset {} at {}. The source path is missing or has no matching files.",
+                self.dataset_name, display_path
+            ),
+        ))))
+    }
+}
+
+#[async_trait]
+impl TableLayer for RejectEmptyListingLayer {
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind for this
+        // layer without anyone deciding what it should say.
+        match walk {
+            // Rejecting an empty listing changes no row, column, or type a scan of
+            // the same files returns, so every walk sees past this layer.
+            LayerWalk::Read
+            | LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => Some(below),
+        }
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        below: &Arc<dyn TableProvider>,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DFResult<datafusion::catalog::ScanResult> {
+        let skips_listing = self.pruning.as_ref().is_some_and(|pruning| {
+            pruning.answers_without_listing(args.filters().unwrap_or_default())
+        });
+        if !skips_listing {
+            self.ensure_data_files(state).await?;
+        }
+        below.scan_with_args(state, args).await
+    }
+}
 #[derive(Clone, Debug)]
 /// Wraps a `ListingTable` to short-circuit broad object-store listings when
 /// queries include `location` predicates.
@@ -222,6 +399,17 @@ impl LocationPruningListingTable {
     /// through to `inner`.
     fn has_location_column(&self) -> bool {
         self.inner.schema().field_with_name("_location").is_ok()
+    }
+
+    /// Whether [`TableProvider::scan`] answers `filters` without listing the prefix:
+    /// an unsatisfiable pushed-down filter, or `_location` predicates it `head()`s.
+    fn answers_without_listing(&self, filters: &[datafusion_expr::Expr]) -> bool {
+        filters.iter().any(|filter| {
+            matches!(
+                filter,
+                datafusion_expr::Expr::Literal(ScalarValue::Boolean(None | Some(false)), _)
+            )
+        }) || (self.has_location_column() && extract_location_predicates(filters).is_some())
     }
 
     fn partition_column_types(&self) -> &[(String, datafusion::arrow::datatypes::DataType)] {
@@ -967,6 +1155,25 @@ pub trait ListingTableConnector: DataConnector {
             detected_extension.and_then(|ext| ext.compression),
         )?;
 
+        // An explicitly empty `file_format` (for example `""`, or a secret
+        // reference that resolved to nothing) is a configuration error. It
+        // used to fall through to the text-table path and load a CSV as a
+        // one-row document table while the dataset reported Ready.
+        if file_format_param
+            .as_deref()
+            .is_some_and(|format| format.trim().is_empty())
+        {
+            return Err(crate::DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: format!(
+                    "The `file_format` parameter for dataset '{}' is empty. Set it to a supported format (for example csv, tsv, json, parquet), or remove it to infer the format from the file extension. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats",
+                    dataset.name
+                ),
+                connector_component: ConnectorComponent::from(dataset),
+                source: "Empty file format".into(),
+            });
+        }
+
         // Annotate before `?` so rustc unifies each arm as `Arc<dyn FileFormat>`
         // instead of pinning the match to the first (`CsvFormat`) arm.
         let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)> =
@@ -1572,7 +1779,18 @@ pub trait ListingTableConnector: DataConnector {
                 "Enabled single-file ETag/Version caching for {}",
                 dataset.name
             );
-            return Ok(Arc::new(cached_table));
+            let cached_table = match template.schema_drift_guard() {
+                Some(guard) => cached_table.with_schema_drift_guard(guard),
+                None => cached_table,
+            };
+            // This table skips `template.wrap`, so it needs the same guard: a deleted
+            // object must fail the refresh, not replace the acceleration with zero rows.
+            return Ok(reject_empty_single_object(
+                Arc::new(cached_table),
+                table_path,
+                dataset.name.to_string(),
+                template.extension.clone(),
+            ));
         }
 
         Ok(template.wrap(table_arc, table_path))
@@ -1677,6 +1895,11 @@ pub trait ListingTableConnector: DataConnector {
             name = dataset.name,
             sanitized_url = schema_infer_url.sanitized_url(),
         );
+
+        // Headered CSV is read by column name. Wrap here, not in
+        // `get_file_format_and_extension`, so Hugging Face can still downcast
+        // the unwrapped `CsvFormat` for its positional commit check.
+        let file_format = HeaderProjectedCsvFormat::wrap(file_format);
 
         // `target_partitions` and `collect_statistics` are read from the scanning
         // session's config at scan time, so they are no longer copied onto the options.
@@ -1788,6 +2011,10 @@ pub trait ListingTableConnector: DataConnector {
             schema: final_schema,
             object_store,
             extension: extension.to_string(),
+            dataset_name: dataset.name.to_string(),
+            // An `ORC` collection infers from the scan path and ignores `schema_source_path`.
+            check_schema_drift: (table_path.is_collection() && listing_extension_is_orc(extension))
+                || !dataset.params.contains_key("schema_source_path"),
         })
     }
 
@@ -2772,6 +2999,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_empty_file_format_is_rejected_not_loaded_as_text() {
+        // An empty `file_format` used to fall through to the text-table path,
+        // so a CSV loaded as a one-row `location`/`content` table.
+        for format in ["", "  "] {
+            let (connector, dataset) = setup_connector(
+                "test:nation.csv".to_string(),
+                HashMap::from([("file_format".to_string(), format.to_string())]),
+            );
+            let err = connector
+                .get_file_format_and_extension(&dataset)
+                .await
+                .expect_err("an empty file_format must fail dataset setup");
+            let message = err.to_string();
+            assert!(
+                message.contains("The `file_format` parameter for dataset 'test' is empty"),
+                "{message}"
+            );
+        }
+
+        // The same CSV with an explicit `csv` format is unchanged.
+        let (connector, dataset) = setup_connector(
+            "test:nation.csv".to_string(),
+            HashMap::from([("file_format".to_string(), "csv".to_string())]),
+        );
+        let (file_format, _) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv resolves");
+        assert!(file_format.is_some(), "csv uses the structured reader");
+    }
+
+    #[tokio::test]
     async fn test_get_file_format_and_extension_detect_csv_extension() {
         let (connector, dataset) = setup_connector("test:test.csv".to_string(), HashMap::new());
 
@@ -2935,6 +3194,659 @@ mod tests {
         } else {
             panic!("Unexpected error");
         }
+    }
+
+    #[tokio::test]
+    async fn get_file_format_and_extension_keeps_unwrapped_csv_format() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
+        let (Some(file_format), _) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv format")
+        else {
+            panic!("expected a CSV file format");
+        };
+        assert!(
+            file_format.as_ref().downcast_ref::<CsvFormat>().is_some(),
+            "Hugging Face downcasts CsvFormat from get_file_format_and_extension"
+        );
+        assert!(
+            file_format
+                .as_ref()
+                .downcast_ref::<HeaderProjectedCsvFormat>()
+                .is_none()
+        );
+    }
+
+    fn write_events_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+        let mut text = String::from(header);
+        text.push('\n');
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write csv");
+    }
+
+    async fn csv_listing_sums(
+        provider: Arc<dyn TableProvider>,
+        refresh: bool,
+    ) -> (Option<i64>, Option<i64>) {
+        let mut config = datafusion::prelude::SessionConfig::new();
+        if refresh {
+            data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        }
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let batches = ctx
+            .sql("SELECT sum(amount_cents), sum(user_id) FROM events")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+        let batch = &batches[0];
+        let amounts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("amount_cents");
+        let users = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("user_id");
+        (
+            (!amounts.is_null(0)).then(|| amounts.value(0)),
+            (!users.is_null(0)).then(|| users.value(0)),
+        )
+    }
+
+    /// `(event_id, "user.name")` for every row of a flattened JSON listing,
+    /// ordered by `event_id`.
+    async fn json_user_names(
+        provider: Arc<dyn TableProvider>,
+        refresh: bool,
+    ) -> Vec<(i64, Option<String>)> {
+        let mut config = datafusion::prelude::SessionConfig::new();
+        if refresh {
+            data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        }
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let batches = ctx
+            .sql(r#"SELECT event_id, "user.name" FROM events ORDER BY event_id"#)
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = arrow::compute::cast(batch.column(0), &DataType::Int64).expect("event_id");
+            let ids = ids
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("event_id as Int64");
+            let names = arrow::compute::cast(batch.column(1), &DataType::Utf8).expect("user.name");
+            let names = names
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("user.name as Utf8");
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    ids.value(row),
+                    (!names.is_null(row)).then(|| names.value(row).to_string()),
+                ));
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_binds_csv_columns_by_header_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.csv");
+        write_events_csv(
+            &path,
+            "event_id,user_id,region,amount_cents,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv format")
+        else {
+            panic!("expected a CSV file format");
+        };
+
+        let template = connector
+            .listing_table_template(&dataset, &url, &extension, Arc::clone(&file_format))
+            .await
+            .expect("template");
+        assert!(
+            template
+                .options
+                .format
+                .as_ref()
+                .downcast_ref::<HeaderProjectedCsvFormat>()
+                .is_some(),
+            "listing options must wrap a headered CSV so columns bind by name"
+        );
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30))
+        );
+
+        write_events_csv(
+            &path,
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "values must follow the header names after a column reorder"
+        );
+
+        write_events_csv(
+            &path,
+            "event_id,user_id,region,amt,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "a renamed column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not load NULLs for a renamed column")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'test'"), "{message}");
+    }
+
+    fn write_events_ndjson(path: &std::path::Path, lines: &[&str]) {
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write ndjson");
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"amount_cents":100,"region":"us","user_id":10,"ts":"t0"}"#,
+                r#"{"event_id":2,"amount_cents":200,"region":"eu","user_id":20,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "JSON object keys bind by name after a reorder"
+        );
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amt":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amt":200,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "a renamed JSON column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not overwrite accelerated JSON with NULLs")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'test'"), "{message}");
+    }
+
+    const EVENTS_JSON_BASELINE: &[&str] = &[
+        r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}"#,
+        r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}"#,
+    ];
+    const EVENTS_JSON_RENAMED: &[&str] = &[
+        r#"{"event_id":1,"user_id":10,"region":"us","amt":100,"ts":"t0"}"#,
+        r#"{"event_id":2,"user_id":20,"region":"eu","amt":200,"ts":"t1"}"#,
+    ];
+
+    fn write_events_json_array(path: &std::path::Path, objects: &[&str]) {
+        std::fs::write(path, format!("[{}]", objects.join(","))).expect("write json array");
+    }
+
+    fn write_events_json_pointer(path: &std::path::Path, objects: &[&str]) {
+        std::fs::write(path, format!(r#"{{"data":[{}]}}"#, objects.join(",")))
+            .expect("write json pointer");
+    }
+
+    async fn assert_listing_json_rename_fails_refresh(
+        label: &str,
+        from: String,
+        params: HashMap<String, String>,
+        file_path: &std::path::Path,
+        write: fn(&std::path::Path, &[&str]),
+    ) {
+        write(file_path, EVENTS_JSON_BASELINE);
+        let (connector, dataset) = setup_connector(from.clone(), params);
+        let url = Url::parse(&from).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: format: {e}"))
+        else {
+            panic!("{label}: expected a JSON file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (Some(300), Some(30)),
+            "{label}: last good accelerated read before rename"
+        );
+
+        write(file_path, EVENTS_JSON_RENAMED);
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "{label}: a renamed JSON column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not overwrite accelerated JSON with NULLs")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{label}: {message}");
+        assert!(message.contains("Dataset 'test'"), "{label}: {message}");
+        let file_name = file_path.file_name().expect("file name").to_string_lossy();
+        assert!(
+            message.contains(&format!(
+                "'{}/{}'",
+                file_path.parent().expect("parent").display(),
+                file_name
+            )) || message.contains(&format!("'{file_name}'")),
+            "{label}: example file path: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_array_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        assert_listing_json_rename_fails_refresh(
+            "file_format json",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_auto_json_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        assert_listing_json_rename_fails_refresh(
+            "auto-detected json",
+            format!("file://{}", path.display()),
+            HashMap::new(),
+            &path,
+            write_events_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_pointer_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        params.insert("json_pointer".to_string(), "/data".to_string());
+        assert_listing_json_rename_fails_refresh(
+            "jsonl json_pointer",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_pointer,
+        )
+        .await;
+    }
+
+    async fn assert_listing_json_empty_refresh_clears(
+        label: &str,
+        from: String,
+        params: HashMap<String, String>,
+        file_path: &std::path::Path,
+        write: fn(&std::path::Path, &[&str]),
+        write_empty: impl Fn(&std::path::Path),
+    ) {
+        write(file_path, EVENTS_JSON_BASELINE);
+        let (connector, dataset) = setup_connector(from.clone(), params);
+        let url = Url::parse(&from).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: format: {e}"))
+        else {
+            panic!("{label}: expected a JSON file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (Some(300), Some(30)),
+            "{label}: last good accelerated read before empty"
+        );
+
+        write_empty(file_path);
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, None),
+            "{label}: federated empty source has no values"
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (None, None),
+            "{label}: empty source must clear on refresh, not fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_clears_jsonl_on_empty_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        assert_listing_json_empty_refresh_clears(
+            "jsonl empty",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_ndjson,
+            |p| std::fs::write(p, "\n\n").expect("blank jsonl"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_clears_json_array_on_empty_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        assert_listing_json_empty_refresh_clears(
+            "file_format json empty",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_array,
+            |p| write_events_json_array(p, &[]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_clears_json_pointer_on_empty_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        params.insert("json_pointer".to_string(), "/data".to_string());
+        assert_listing_json_empty_refresh_clears(
+            "jsonl json_pointer empty",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_pointer,
+            |p| write_events_json_pointer(p, &[]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_allows_json_sparse_nullable_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(&path, EVENTS_JSON_BASELINE);
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "omitted amount_cents is NULL on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (None, Some(30)),
+            "a sparse nullable key must not fail refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_allows_json_unregistered_field_type_change_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(&path, EVENTS_JSON_BASELINE);
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0","extra":1}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1","extra":{}}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "unregistered extra is ignored on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (Some(300), Some(30)),
+            "an unregistered field that changes type must not fail refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_allows_json_flatten_null_parent_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"user":{"name":"a"},"amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"user":{"name":"b"},"amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        params.insert("flatten_json".to_string(), "true".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("flattened json format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        assert!(
+            file_format
+                .as_ref()
+                .downcast_ref::<SpiceJsonFormat>()
+                .is_some_and(|json| json.options().flatten_json.as_deref() == Some(".")),
+            "listing must enable flatten_json so user.name is a registered column"
+        );
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), false).await,
+            vec![(1, Some("a".to_string())), (2, Some("b".to_string()))],
+            "user.name reads the flattened child while the parent is an object"
+        );
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"user":null,"amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"user":null,"amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), false).await,
+            vec![(1, None), (2, None)],
+            "a flattened null parent is NULL for user.name on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "registered columns keep their values on a federated read"
+        );
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), true).await,
+            vec![(1, None), (2, None)],
+            "user becoming null in every record is NULL for user.name on refresh"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (Some(300), Some(30)),
+            "user becoming null in every record must not fail refresh"
+        );
     }
 
     #[tokio::test]
@@ -4459,17 +5371,27 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = LocationPruningListingTable::new(
-            Arc::new(listing),
+        let listing = Arc::new(listing);
+        let pruning = Arc::new(LocationPruningListingTable::new(
+            Arc::clone(&listing),
             ctx.runtime_env()
                 .object_store(&table_path)
                 .expect("object store"),
             table_path.clone(),
             file_schema,
             ".parquet",
+        ));
+        // The stack `wrap` registers: the empty-listing guard over the pruning table
+        // must not list for a `_location`-pruned scan either.
+        let provider = reject_empty_listing(
+            listing,
+            Some(pruning),
+            table_path.clone(),
+            "test_table".to_string(),
+            ".parquet".to_string(),
         );
 
-        ctx.register_table("test_table", Arc::new(provider))
+        ctx.register_table("test_table", provider)
             .expect("register table");
 
         let df = ctx
@@ -4501,6 +5423,200 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "Listing should not be invoked when location predicates are present"
         );
+    }
+
+    fn write_id_file(path: &std::path::Path, ids: &[i64]) {
+        if path.extension().is_some_and(|ext| ext == "csv") {
+            let body = ids.iter().fold(String::new(), |mut body, id| {
+                use std::fmt::Write as _;
+                let _ = writeln!(body, "{id}");
+                body
+            });
+            std::fs::write(path, format!("id\n{body}")).expect("write csv");
+            return;
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(
+                ids.to_vec(),
+            ))],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(path).expect("create parquet file");
+        let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(file, schema, None)
+            .expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet file");
+    }
+
+    async fn id_rows(ctx: &SessionContext) -> DFResult<usize> {
+        let batches = ctx.sql("SELECT id FROM facts").await?.collect().await?;
+        Ok(batches
+            .iter()
+            .map(datafusion::arrow::record_batch::RecordBatch::num_rows)
+            .sum())
+    }
+
+    /// The guard `wrap` stacks over a file listing, for CSV and Parquet: removing
+    /// every matching file fails the scan with the missing-source error instead of
+    /// answering zero rows, an existing zero-row file still scans as zero rows, and
+    /// restored files are read again.
+    #[tokio::test]
+    async fn reject_empty_listing_errors_on_a_removed_source_and_reads_restored_files() {
+        for extension in [".csv", ".parquet"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file = dir.path().join(format!("part-0{extension}"));
+            write_id_file(&file, &[1, 2, 3]);
+
+            let table_path = ListingTableUrl::parse(format!("{}/", dir.path().display()))
+                .expect("listing table url");
+            let format: Arc<dyn FileFormat> = if extension == ".csv" {
+                Arc::new(CsvFormat::default().with_has_header(true))
+            } else {
+                Arc::new(ParquetFormat::default())
+            };
+            let options = ListingOptions::new(format).with_file_extension(extension);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )]));
+            let listing = Arc::new(
+                ListingTable::try_new(
+                    ListingTableConfig::new(table_path.clone())
+                        .with_listing_options(options)
+                        .with_schema(schema),
+                )
+                .expect("create listing table"),
+            );
+            let provider = reject_empty_listing(
+                listing,
+                None,
+                table_path,
+                "facts".to_string(),
+                extension.to_string(),
+            );
+            let ctx = SessionContext::new();
+            ctx.register_table("facts", provider)
+                .expect("register table");
+
+            assert_eq!(id_rows(&ctx).await.expect("initial scan"), 3, "{extension}");
+
+            std::fs::remove_file(&file).expect("remove the only data file");
+            let err = id_rows(&ctx)
+                .await
+                .expect_err("a removed source is an error, not zero rows")
+                .to_string();
+            assert!(
+                err.contains("No data files are yet available for dataset facts"),
+                "{extension}: {err}"
+            );
+
+            write_id_file(&file, &[]);
+            assert_eq!(
+                id_rows(&ctx)
+                    .await
+                    .expect("an existing zero-row file scans"),
+                0,
+                "{extension}"
+            );
+
+            write_id_file(&file, &[1, 2, 3, 4]);
+            assert_eq!(
+                id_rows(&ctx).await.expect("a restored file is read"),
+                4,
+                "{extension}"
+            );
+        }
+    }
+
+    /// The S3 single-object table (`S3SingleFileCached`) does not go through `wrap`,
+    /// so it gets the guard from `reject_empty_single_object`: a deleted key
+    /// (`404 NoSuchKey`, which lists nothing) fails the scan instead of answering
+    /// zero rows, and the refresh-skip check still reaches the cached table beneath.
+    #[tokio::test]
+    async fn reject_empty_single_object_errors_on_a_deleted_s3_key() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(
+            &Url::parse("s3://bucket").expect("store url"),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        );
+        let key = Path::from("one/orders.parquet");
+        let parquet = |ids: &[i64]| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file = dir.path().join("part.parquet");
+            write_id_file(&file, ids);
+            object_store::PutPayload::from(std::fs::read(&file).expect("read parquet"))
+        };
+        store
+            .put(&key, parquet(&[1, 2, 3]))
+            .await
+            .expect("put object");
+
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/one/orders.parquet").expect("listing table url");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let listing = Arc::new(
+            ListingTable::try_new(
+                ListingTableConfig::new(table_path.clone())
+                    .with_listing_options(
+                        ListingOptions::new(Arc::new(ParquetFormat::default()))
+                            .with_file_extension(".parquet"),
+                    )
+                    .with_schema(schema),
+            )
+            .expect("create listing table"),
+        );
+        let cached = data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+            listing,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            "facts".to_string(),
+        )
+        .expect("a single object is cached");
+        let provider = reject_empty_single_object(
+            Arc::new(cached),
+            table_path,
+            "facts".to_string(),
+            ".parquet".to_string(),
+        );
+        assert!(
+            data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                provider.as_ref()
+            )
+            .await
+            .expect("skip check")
+            .is_some(),
+            "the refresh-skip check must still reach the cached table under the guard"
+        );
+        ctx.register_table("facts", provider)
+            .expect("register table");
+        assert_eq!(id_rows(&ctx).await.expect("initial scan"), 3);
+
+        store.delete(&key).await.expect("delete object");
+        let err = id_rows(&ctx)
+            .await
+            .expect_err("a deleted key is an error, not zero rows")
+            .to_string();
+        assert!(
+            err.contains("No data files are yet available for dataset facts"),
+            "{err}"
+        );
+
+        store
+            .put(&key, parquet(&[1, 2, 3, 4]))
+            .await
+            .expect("restore object");
+        assert_eq!(id_rows(&ctx).await.expect("a restored key is read"), 4);
     }
 
     #[tokio::test]
@@ -5831,6 +6947,180 @@ mod tests {
         decoder
             .push_range(0..3, bytes::Bytes::from_static(b"abc"))
             .expect("a well-formed range is still accepted after a rejected one");
+    }
+
+    /// A footer whose Thrift list header declares more elements than the file could hold is
+    /// refused before anything is reserved for that count.
+    ///
+    /// Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and
+    /// the offset index's `page_locations` decodes into a `Vec` sized from the element count
+    /// in that header, so an unreadable file of a few bytes can ask for room for `i32::MAX`
+    /// elements before a single one is read. That happens during schema inference at dataset
+    /// initialization, and again on every refresh of the dataset, and the process is killed
+    /// for it. A Spice patch to the `spiceai/arrow-rs` fork bounds the count by the bytes left
+    /// in the input ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)).
+    ///
+    /// Driven through `ParquetMetaDataReader::decode_metadata`, the public surface the footer
+    /// decode sits behind. The error has to name the declared count: an oversized footer is a
+    /// malformed file, and an error that does not say so reads like a truncated download.
+    #[test]
+    fn an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation() {
+        use datafusion::parquet::file::metadata::ParquetMetaDataReader;
+
+        // Struct header, then field 2 (`schema`): a `list<SchemaElement>` declaring
+        // i32::MAX elements, with no element following it.
+        const FOOTER: &[u8] = &[0x29, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00];
+
+        let error = ParquetMetaDataReader::decode_metadata(FOOTER)
+            .expect_err("no file holds as many schema elements as this footer declares");
+        let message = error.to_string();
+        assert!(
+            message.contains("Thrift list declares 2147483647 elements"),
+            "the error has to name the declared count, or an oversized footer is \
+             indistinguishable from a truncated one: {message}"
+        );
+    }
+
+    /// A Parquet footer whose schema nests deeper than 100 levels is refused, and one
+    /// at exactly 100 levels still opens.
+    ///
+    /// The footer's schema is a flat element list that the reader rebuilds into a tree by
+    /// recursing once per nesting level, so a file of a few KiB can declare enough levels to
+    /// exhaust the stack during schema inference at dataset initialization. A Spice patch to
+    /// the `spiceai/arrow-rs` fork bounds that depth.
+    #[test]
+    fn a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+
+        const MAX_DEPTH: usize = 100;
+
+        // A column whose leaf sits `depth` levels below the schema root.
+        fn file_with_leaf_at(depth: usize) -> bytes::Bytes {
+            let mut field =
+                arrow::datatypes::Field::new("leaf", arrow::datatypes::DataType::Int64, true);
+            for _ in 1..depth {
+                field = arrow::datatypes::Field::new_struct("s", vec![field], true);
+            }
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+            let mut buffer = Vec::new();
+            ArrowWriter::try_new_with_options(
+                &mut buffer,
+                schema,
+                ArrowWriterOptions::new().with_skip_arrow_metadata(true),
+            )
+            .expect("parquet writer")
+            .close()
+            .expect("writes the footer");
+            bytes::Bytes::from(buffer)
+        }
+
+        let reader =
+            SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH)).expect("reads the footer");
+        assert_eq!(
+            reader
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .path()
+                .parts()
+                .len(),
+            MAX_DEPTH,
+            "the accepted file has to sit exactly at the limit"
+        );
+
+        let Err(error) = SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH + 1)) else {
+            panic!(
+                "a footer schema nested {} levels deep was accepted",
+                MAX_DEPTH + 1
+            );
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Parquet schema nesting depth exceeds the maximum of 100"),
+            "the footer was refused, but not on the depth limit: {error}"
+        );
+    }
+
+    /// A Parquet page whose header declares more uncompressed bytes than its
+    /// compressed body can back is a scan error, raised before the reader allocates
+    /// the declared size.
+    ///
+    /// A Spice patch to `decode_page` in the `spiceai/arrow-rs` fork requires a page
+    /// above 64 MiB to carry at least 1/1000 of its declared size in compressed bytes
+    /// ([apache/arrow-rs#10734](https://github.com/apache/arrow-rs/issues/10734)).
+    /// Without it, a file of a few KiB whose pages each declare hundreds of MiB makes
+    /// every scan of it allocate that much per page, and concurrent scans of it can
+    /// exhaust memory. Driven through a `DataFusion` Parquet scan, the reader path a
+    /// file or object-store dataset takes.
+    #[tokio::test]
+    async fn a_page_declaring_more_than_its_compressed_bytes_can_back_is_an_error() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::basic::{Compression, ZstdLevel};
+        use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+        use datafusion::prelude::ParquetReadOptions;
+
+        // One value just past the 64 MiB that any page is allowed; zero bytes
+        // compress to a few KiB.
+        const VALUE_LEN: usize = 65 * 1024 * 1024;
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Binary, false),
+        ]));
+        let value = vec![0u8; VALUE_LEN];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::BinaryArray::from_vec(vec![
+                value.as_slice(),
+            ]))],
+        )
+        .expect("builds a batch");
+        let properties = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build();
+        let dir = tempfile::tempdir().expect("creates a temporary directory");
+        let path = dir.path().join("page.parquet");
+        let file = std::fs::File::create(&path).expect("creates the file");
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
+            .expect("parquet writer");
+        writer.write(&batch).expect("writes the batch");
+        writer.close().expect("closes the file");
+
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).expect("opens the file"))
+            .expect("reads the footer");
+        let column = reader.metadata().row_group(0).column(0);
+        assert!(
+            column.uncompressed_size() > 64 * 1024 * 1024
+                && column.compressed_size() * 1000 < column.uncompressed_size(),
+            "the page has to be past the bound for this guard to assert anything: \
+             {} compressed bytes for {} uncompressed",
+            column.compressed_size(),
+            column.uncompressed_size()
+        );
+
+        let scan = SessionContext::new()
+            .read_parquet(
+                path.to_str().expect("a UTF-8 path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("plans the scan")
+            .collect()
+            .await;
+        let Err(error) = scan else {
+            panic!("a page declaring {VALUE_LEN} bytes behind a few KiB of ZSTD was decoded");
+        };
+        assert!(
+            error.to_string().contains("exceeds the maximum allowed"),
+            "the scan failed, but not on the page-size bound: {error}"
+        );
     }
 
     /// A second reader built for the *same* file has to stay on the generation the

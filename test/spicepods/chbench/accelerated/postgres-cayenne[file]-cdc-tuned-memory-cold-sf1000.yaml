@@ -13,7 +13,8 @@ name: postgres-cayenne[file]-cdc-tuned-memory-cold-sf1000
 # The cold store is the shared local MinIO (`s3://benchmarks`, the same bucket the analytical
 # bench configs use), reached via the dedicated `cayenne_datalake_s3_*` credentials on the
 # datasets — the engine registers the store on the promotion, scan, and delete paths itself.
-# The HTAP run workflow provides S3_ENDPOINT/S3_KEY/S3_SECRET (from the TEST_MINIO_* secrets).
+# The HTAP run workflow provides S3_ENDPOINT/S3_KEY/S3_SECRET/S3_SESSION_TOKEN (temporary RustFS
+# credentials).
 # Sized for a 64 vCPU / 256 GiB host (m7a.16xlarge-class) with EBS gp3.
 runtime:
   flight:
@@ -107,6 +108,7 @@ datasets:
         cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
         cayenne_datalake_s3_key: ${secrets:S3_KEY}
         cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_session_token: ${secrets:S3_SESSION_TOKEN}
         cayenne_datalake_s3_allow_http: 'true'
         # Read-optimized cold files, larger than the 512 MB warm target so cold scans open fewer
         # footers.

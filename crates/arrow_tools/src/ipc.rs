@@ -76,6 +76,73 @@ pub fn declares_ipc_data(data_header: &[u8]) -> Result<bool, String> {
     ))
 }
 
+/// Total decompressed size a compressed IPC message may declare regardless of its body length.
+pub const DECOMPRESSED_SIZE_FLOOR: u64 = 64 * 1024 * 1024;
+
+/// Largest ratio of declared decompressed size to body length accepted above
+/// [`DECOMPRESSED_SIZE_FLOOR`].
+pub const MAX_DECOMPRESSION_RATIO: u64 = 100;
+
+/// Refuses a compressed IPC message whose buffers declare more decompressed bytes than
+/// [`DECOMPRESSED_SIZE_FLOOR`] and more than [`MAX_DECOMPRESSION_RATIO`] times `data_body.len()`.
+///
+/// The Arrow IPC reader allocates each buffer's declared decompressed length before it
+/// decompresses, so this has to run before the message reaches a decoder. Messages that are not
+/// compressed record or dictionary batches, or whose header does not parse, are left to the
+/// decoder.
+///
+/// # Errors
+///
+/// Returns a message naming the declared and received sizes when the bound is exceeded.
+pub fn check_declared_decompressed_size(
+    data_header: &[u8],
+    data_body: &[u8],
+) -> Result<(), String> {
+    let Ok(message) = arrow_ipc::root_as_message(data_header) else {
+        return Ok(());
+    };
+    let batch = match message.header_type() {
+        arrow_ipc::MessageHeader::RecordBatch => message.header_as_record_batch(),
+        arrow_ipc::MessageHeader::DictionaryBatch => message
+            .header_as_dictionary_batch()
+            .and_then(|dictionary| dictionary.data()),
+        _ => None,
+    };
+    let Some(batch) = batch else {
+        return Ok(());
+    };
+    if batch.compression().is_none() {
+        return Ok(());
+    }
+
+    let declared = batch
+        .buffers()
+        .into_iter()
+        .flatten()
+        .filter(|buffer| buffer.length() >= 8)
+        .filter_map(|buffer| {
+            let start = usize::try_from(buffer.offset()).ok()?;
+            let prefix = data_body.get(start..start.checked_add(8)?)?;
+            u64::try_from(i64::from_le_bytes(prefix.try_into().ok()?)).ok()
+        })
+        .fold(0_u64, u64::saturating_add);
+
+    if exceeds_decompression_bound(declared, data_body.len()) {
+        return Err(format!(
+            "compressed Arrow IPC message declares {declared} decompressed bytes from a {}-byte \
+             body, more than {MAX_DECOMPRESSION_RATIO} times its size",
+            data_body.len()
+        ));
+    }
+    Ok(())
+}
+
+fn exceeds_decompression_bound(declared: u64, body_len: usize) -> bool {
+    let body_len = u64::try_from(body_len).unwrap_or(u64::MAX);
+    declared > DECOMPRESSED_SIZE_FLOOR
+        && declared > body_len.saturating_mul(MAX_DECOMPRESSION_RATIO)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -86,7 +153,11 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::{declared_message_header, declares_ipc_data, declares_record_batch};
+    use super::{
+        DECOMPRESSED_SIZE_FLOOR, MAX_DECOMPRESSION_RATIO, check_declared_decompressed_size,
+        declared_message_header, declares_ipc_data, declares_record_batch,
+        exceeds_decompression_bound,
+    };
 
     /// Encodes `batch` the way an IPC writer does and returns `(schema_header, batch_header,
     /// batch_body)`. Building the headers by hand would let the test agree with the code about a
@@ -212,5 +283,120 @@ mod tests {
         assert_eq!(declared_message_header(&truncated), Err(refused.clone()));
         assert_eq!(declares_record_batch(&truncated), Err(refused.clone()));
         assert_eq!(declares_ipc_data(&truncated), Err(refused));
+    }
+
+    /// Encodes `batch` with `compression` and returns `(batch_header, batch_body)`.
+    fn encode_compressed(
+        batch: &RecordBatch,
+        compression: arrow_ipc::CompressionType,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let options = IpcWriteOptions::default()
+            .try_with_compression(Some(compression))
+            .expect("compression options");
+        let (_, encoded) = IpcDataGenerator::default()
+            .encode(
+                batch,
+                &mut DictionaryTracker::new(false),
+                &options,
+                &mut IpcWriteContext::default(),
+            )
+            .expect("encoding a compressed batch");
+        (encoded.ipc_message, encoded.arrow_data)
+    }
+
+    /// A single-column batch large enough that zstd compresses its values buffer.
+    fn compressible_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![7; 4096])) as ArrayRef],
+        )
+        .expect("building a compressible batch")
+    }
+
+    /// Rewrites the declared-length prefixes in `body` so the message declares `declared`
+    /// decompressed bytes in total: the values buffer carries all of it, the others none.
+    fn with_declared_length(header: &[u8], body: &[u8], declared: u64) -> Vec<u8> {
+        let message = arrow_ipc::root_as_message(header).expect("batch header");
+        let batch = message.header_as_record_batch().expect("record batch");
+        let mut body = body.to_vec();
+        for (index, buffer) in batch.buffers().expect("buffers").iter().enumerate() {
+            if buffer.length() < 8 {
+                continue;
+            }
+            let offset = usize::try_from(buffer.offset()).expect("offset");
+            let length: u64 = if index == 1 { declared } else { 0 };
+            body[offset..offset + 8].copy_from_slice(&length.to_le_bytes());
+        }
+        body
+    }
+
+    #[test]
+    fn compressed_batches_pass_the_guard_and_decode() {
+        let batch = compressible_batch();
+        for compression in [
+            arrow_ipc::CompressionType::ZSTD,
+            arrow_ipc::CompressionType::LZ4_FRAME,
+        ] {
+            let (header, body) = encode_compressed(&batch, compression);
+            assert!(
+                body.len() < 4096 * 4,
+                "{compression:?} is expected to compress the values buffer"
+            );
+            assert_eq!(check_declared_decompressed_size(&header, &body), Ok(()));
+
+            let message = arrow_ipc::root_as_message(&header).expect("batch header");
+            let decoded = arrow_ipc::reader::read_record_batch(
+                &arrow::buffer::Buffer::from(body),
+                message.header_as_record_batch().expect("record batch"),
+                batch.schema(),
+                &std::collections::HashMap::new(),
+                None,
+                &message.version(),
+            )
+            .expect("decoding a compressed batch");
+            assert_eq!(decoded, batch);
+        }
+    }
+
+    #[test]
+    fn uncompressed_batches_are_not_checked() {
+        let (_, header, body) = encode(&int_batch());
+        assert_eq!(check_declared_decompressed_size(&header, &body), Ok(()));
+        assert_eq!(check_declared_decompressed_size(&[], &[]), Ok(()));
+    }
+
+    #[test]
+    fn a_declared_length_at_the_floor_is_accepted() {
+        let (header, body) =
+            encode_compressed(&compressible_batch(), arrow_ipc::CompressionType::ZSTD);
+        let body = with_declared_length(&header, &body, DECOMPRESSED_SIZE_FLOOR);
+        assert_eq!(check_declared_decompressed_size(&header, &body), Ok(()));
+    }
+
+    #[test]
+    fn a_declared_length_over_the_floor_and_ratio_is_refused() {
+        let (header, body) =
+            encode_compressed(&compressible_batch(), arrow_ipc::CompressionType::ZSTD);
+        let body = with_declared_length(&header, &body, DECOMPRESSED_SIZE_FLOOR + 1);
+        let error = check_declared_decompressed_size(&header, &body)
+            .expect_err("a declared length over the bound is refused");
+        assert!(
+            error.contains(&format!(
+                "declares {} decompressed bytes",
+                DECOMPRESSED_SIZE_FLOOR + 1
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_ratio_bound_applies_above_the_floor() {
+        let body_len = 1024 * 1024;
+        let at_ratio = u64::try_from(body_len).expect("len") * MAX_DECOMPRESSION_RATIO;
+        assert!(!exceeds_decompression_bound(at_ratio, body_len));
+        assert!(exceeds_decompression_bound(at_ratio + 1, body_len));
+        assert!(!exceeds_decompression_bound(DECOMPRESSED_SIZE_FLOOR, 0));
+        assert!(exceeds_decompression_bound(DECOMPRESSED_SIZE_FLOOR + 1, 0));
     }
 }

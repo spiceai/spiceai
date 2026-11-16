@@ -17,6 +17,7 @@ on:
 
 jobs:
   resolve-upgrade-version:
+    environment: secret-free
     name: Resolve upgrade-from version
     runs-on: ubuntu-latest
     outputs:
@@ -47,6 +48,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
     outputs:
@@ -81,6 +83,7 @@ jobs:
             return matrix;
 
   build:
+    environment: secret-free
     name: Build ${{ matrix.target.name }} CLI
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
@@ -145,6 +148,7 @@ jobs:
             spice.exe
 
   test_spice_upgrade_with_runtime:
+    environment: secret-free
     name: 'Test spice upgrade (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     env:
@@ -258,6 +262,7 @@ jobs:
           fi
 
   test_spice_upgrade_without_runtime:
+    environment: secret-free
     name: 'Test spice upgrade without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     env:
@@ -370,6 +375,7 @@ jobs:
           fi
 
   test_spice_install_without_runtime:
+    environment: secret-free
     name: 'Test spice install without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     env:
@@ -470,6 +476,7 @@ jobs:
           spice version
 
   test_spice_run_without_runtime:
+    environment: secret-free
     name: 'Test spice run without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     env:
@@ -559,6 +566,7 @@ jobs:
           spice version
 
   test_spice_upgrade_from_brew:
+    environment: secret-free
     name: 'Test spice upgrade from a homebrew spice cli'
     if: github.event.inputs.build_cli == 'true'
     runs-on: ${{ matrix.target.runner }}
@@ -607,6 +615,7 @@ jobs:
           spice upgrade
 
   test_spice_chat:
+    environment: ci
     name: 'Test spice chat'
     if: github.event.inputs.build_cli == 'true'
     runs-on: ${{ matrix.target.runner }}
@@ -644,13 +653,13 @@ jobs:
 
       - name: Init spice app
         run: |
-          cp ./test/cli/spicepod_openai.yml ./spicepod.yaml
+          cp ./test/cli/spicepod_xai.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           spice run &> spice.log &
 

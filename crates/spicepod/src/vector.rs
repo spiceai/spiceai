@@ -30,6 +30,10 @@ pub struct VectorStore {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// The vector engine: `s3_vectors`, `elasticsearch`, or `duckdb`. The `duckdb` engine
+    /// is deprecated in v2.4 and will be removed in v2.5; on a Cayenne acceleration, remove
+    /// the `vectors` block instead, since Cayenne indexes embedding columns itself. See
+    /// <https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine>.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
 

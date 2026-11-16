@@ -39,6 +39,7 @@ jobs:
   # for (#13841); the merge-group commit is what runs the lane, as the other
   # engine lanes do.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 45
@@ -55,11 +56,15 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   test:
+    environment: ci
     name: chDB Result Correctness
     needs: check_changes
     timeout-minutes: 90
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -98,13 +103,24 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/install-protoc
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '5400'
+          export-env: 'false'
+
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       # `chdb-rust`'s build script fetches libchdb into OUT_DIR and pins the
       # version it expects, so installing a copy here would be a second place to

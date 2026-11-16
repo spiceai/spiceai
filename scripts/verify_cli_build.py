@@ -3,9 +3,9 @@
 #
 # Assert that the unit-test gate's build produced an up-to-date `spice` CLI.
 #
-# The gate does not build the CLI separately: `make nextest`'s `--tests` build
-# already emits it, because cargo builds a package's bins alongside that package's
-# integration tests, and `spice` has three. That is an assumption about cargo's
+# The gate does not build the CLI separately: `make nextest`'s build already
+# emits it, because cargo builds a package's bins alongside that package's
+# integration tests, and the gate selects two of `spice`'s. That is an assumption about cargo's
 # target selection which nothing else would notice breaking — remove `spice`'s
 # `tests/` targets and its bin silently stops being built.
 #
@@ -32,7 +32,7 @@ def main() -> None:
 
     executable = None
     fresh = None
-    # Stream it: `--message-format json --tests --all` emits a message per unit,
+    # Stream it: `--message-format json --all` emits a message per unit,
     # which is megabytes of JSON for this workspace, and only one line matters.
     with stream.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -45,7 +45,7 @@ def main() -> None:
             target = msg.get("target") or {}
             if target.get("name") != "spice" or target.get("kind") != ["bin"]:
                 continue
-            # `--tests` builds the bin twice: once for real, once as a `--cfg test`
+            # The gate builds the bin twice: once for real, once as a `--cfg test`
             # harness. Both are reported with name `spice` and kind `["bin"]`, and
             # only `profile.test` tells them apart — the harness answers `--version`
             # with a libtest error, so matching it would fail for the wrong reason.

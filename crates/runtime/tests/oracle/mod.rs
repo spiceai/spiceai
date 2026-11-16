@@ -288,10 +288,7 @@ async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                 e
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })

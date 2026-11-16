@@ -173,10 +173,7 @@ async fn dynamodb_fallback_applies_a_retention_predicate_the_source_cannot_evalu
             );
 
             rt.shutdown().await;
-            container
-                .remove()
-                .await
-                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            container.cleanup().await;
             Ok(())
         })
         .await

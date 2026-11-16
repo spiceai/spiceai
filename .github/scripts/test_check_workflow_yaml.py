@@ -304,6 +304,42 @@ class CheckSuiteVisibilityTest(unittest.TestCase):
         )
         self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
 
+    def test_a_build_only_step_is_not_a_suite(self):
+        """`cargo test --no-run` only compiles. If it fails, no later suite can run."""
+        workflow = (
+            "---\non:\n  schedule:\n    - cron: '0 0 * * *'\n\njobs:\n  nightly:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - name: Build A\n        run: cargo test -p a --no-run\n"
+            "      - name: Run A\n        run: cargo test -p a -- suite\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
+
+    def test_a_build_only_command_beside_a_suite_is_still_a_suite(self):
+        """The flag on one command must not hide a real run in the same step."""
+        workflow = (
+            "---\non:\n  schedule:\n    - cron: '0 0 * * *'\n\njobs:\n  nightly:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - name: Run A\n        run: |\n"
+            "          cargo test -p a --no-run\n"
+            "          cargo test -p a -- suite\n"
+            "      - name: Run B\n        run: cargo nextest run -- suite\n"
+        )
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(workflow), [_hidden("Run B")]
+        )
+
+    def test_a_continued_build_only_command_is_not_a_suite(self):
+        """The flag can sit on a continuation line of the command."""
+        workflow = (
+            "---\non:\n  schedule:\n    - cron: '0 0 * * *'\n\njobs:\n  nightly:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - name: Build A\n        run: |\n"
+            "          cargo test -p a \\\n"
+            "            --no-run\n"
+            "      - name: Run A\n        run: cargo test -p a -- suite\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
+
     def test_a_snapshot_push_behind_a_suite_is_reported(self):
         """The refresh is what a nightly exists to produce, so a red suite must not skip it."""
         workflow = (

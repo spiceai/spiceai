@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! The `duckdb` data accelerator.
+//!
+//! Deprecated in v2.4 and scheduled for removal in v2.5: migrate accelerations to
+//! Cayenne (`engine: cayenne`).
+
 use data_accelerator_api::make_spice_data_directory;
 use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
 use data_accelerator_api::storage::{

@@ -60,7 +60,7 @@ async fn test_acceleration_refresh_sqlite_append() -> Result<(), anyhow::Error> 
                 2
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -116,7 +116,7 @@ async fn test_acceleration_refresh_sqlite_full() -> Result<(), anyhow::Error> {
                 2
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await

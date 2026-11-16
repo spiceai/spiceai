@@ -338,10 +338,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -423,10 +420,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -900,10 +894,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 runtime_ready_check(&rt).await;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -970,10 +961,7 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
                 "Dataset should be in error state when fresh checkpoint has ShardNotFound"
             );
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -1092,10 +1080,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 runtime_ready_check(&rt).await;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -1217,10 +1202,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 runtime_ready_check(&rt).await;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -1346,10 +1328,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -1430,10 +1409,7 @@ async fn dynamodb_streams_declared_schema_empty_table() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })

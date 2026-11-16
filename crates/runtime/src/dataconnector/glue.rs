@@ -109,6 +109,14 @@ pub enum Error {
         "No storage location specified for table '{table}'. Ensure the table has a valid S3 location in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingStorageLocation { table: String },
+    #[snafu(display(
+        "Dataset '{dataset}' cannot read Glue table '{table}' from location {location:?}, which is not an s3:// URL, so no request is sent and the table cannot be read. Set the table location in AWS Glue to an s3:// URL. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+    ))]
+    UnsupportedStorageLocation {
+        dataset: String,
+        table: String,
+        location: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -622,7 +630,15 @@ async fn create_s3_provider(
         });
     };
 
-    let from = ensure_s3_trailing_slash(&from);
+    let dataset_name = dataset.name.to_string();
+    let from = s3_storage_location(&dataset_name, table.name(), &from).map_err(|e| {
+        super::DataConnectorError::InvalidConfiguration {
+            dataconnector: PREFIX.to_string(),
+            connector_component: (&dataset).into(),
+            message: e.to_string(),
+            source: Box::new(e),
+        }
+    })?;
 
     match input_format {
         InputFormat::Csv => {
@@ -660,6 +676,23 @@ async fn create_s3_provider(
     dataset.from = from;
 
     s3.read_provider(context, &dataset).await
+}
+
+/// `s3://` location Glue may hand to the S3 listing connector.
+///
+/// Anything else (`http://`, `https://`, `file://`, a bare path) is refused
+/// before the object-store registry, which selects a store from the scheme
+/// alone. A trailing slash is added for directory-style `s3://` locations.
+fn s3_storage_location(dataset: &str, table: &str, location: &str) -> Result<String, Error> {
+    let location = ensure_s3_trailing_slash(location);
+    if location.starts_with("s3://") {
+        return Ok(location);
+    }
+    Err(Error::UnsupportedStorageLocation {
+        dataset: dataset.to_string(),
+        table: table.to_string(),
+        location,
+    })
 }
 
 fn ensure_s3_trailing_slash(s3_location: &str) -> String {
@@ -720,6 +753,34 @@ mod tests {
         );
         assert_eq!(ensure_s3_trailing_slash(""), "");
         assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
+    }
+
+    #[test]
+    fn glue_storage_location_must_be_s3() {
+        assert_eq!(
+            s3_storage_location("orders", "t", "s3://bucket/orders")
+                .expect("an s3 location is accepted"),
+            "s3://bucket/orders/"
+        );
+        for location in [
+            "http://127.0.0.1:8099/data/",
+            "https://example.com/data/",
+            "http://169.254.169.254/latest/meta-data/",
+            "file:///tmp/secret",
+            "s3a://bucket/orders",
+            "/local/path",
+            "",
+        ] {
+            let err = s3_storage_location("orders", "t", location)
+                .expect_err("a non-s3 location is refused");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Dataset 'orders' cannot read Glue table 't' from location {location:?}, which is not an s3:// URL, so no request is sent and the table cannot be read. Set the table location in AWS Glue to an s3:// URL. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+                ),
+                "{location}"
+            );
+        }
     }
 
     fn orc_glue_table(name: &str, transactional: Option<&str>) -> Table {

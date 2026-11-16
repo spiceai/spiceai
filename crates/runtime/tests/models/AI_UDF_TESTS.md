@@ -16,6 +16,8 @@ export SPICE_HUGGINGFACE_API_KEY="your-huggingface-api-key"  # Required for loca
 export SPICE_GOOGLE_API_KEY="your-google-api-key"           # Required for Gemini tests
 ```
 
+For Anthropic, `SPICE_ANTHROPIC_AUTH_TOKEN` takes the place of `SPICE_ANTHROPIC_API_KEY` when it is set: the models then send it as `anthropic_auth_token` (`Authorization: Bearer`). CI sets it to a short-lived access token minted through Anthropic workload identity federation (`.github/actions/anthropic-token`) and has no Anthropic API key.
+
 ### Models Used
 
 The tests use the following models:

@@ -36,6 +36,7 @@ concurrency:
 
 jobs:
   test-signoff-cancelled-correction:
+    environment: secret-free
     name: Unit tests for the sign-off cancelled-correction
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the self-hosted pool that runs sign-off itself.

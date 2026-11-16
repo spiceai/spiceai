@@ -1,4 +1,5 @@
 [package]
+autotests = false
 description = "object_store HTTP connector that runs request I/O on a dedicated Tokio runtime"
 edition.workspace = true
 homepage.workspace = true
@@ -12,12 +13,21 @@ version.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 http-body = "1.0.1"
+humantime.workspace = true
 object_store.workspace = true
+# `object_store`'s `HttpClient` accepts a `reqwest` 0.12 client; the workspace `reqwest` is 0.13.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 snafu.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["net", "rt", "sync"] }
+url.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true

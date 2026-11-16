@@ -64,7 +64,7 @@ models:
     from: anthropic:claude-haiku-3-5
     params:
       tools: auto
-      anthropic_api_key: ${ secrets:SPICE_ANTHROPIC_API_KEY }
+      anthropic_auth_token: ${ secrets:SPICE_ANTHROPIC_AUTH_TOKEN }
       system_prompt: *system_prompt
   - name: grok4
     from: xai:grok-4

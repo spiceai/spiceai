@@ -22,4 +22,8 @@ runs:
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
           sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
         fi
+        # The archive mirrors configure-apt lists for apt's mirror method
+        if [ -f /etc/apt/spice-ubuntu-mirrors.txt ]; then
+          sudo sed -i 's|http://|https://|g' /etc/apt/spice-ubuntu-mirrors.txt
+        fi
         sudo apt-get update

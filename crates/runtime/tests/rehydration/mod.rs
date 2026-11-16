@@ -91,10 +91,7 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
             .await?;
         }
 
-        running_container
-            .remove()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        running_container.cleanup().await;
 
         tracing::info!("Spill-to-disk and rehydration tests passed!");
 

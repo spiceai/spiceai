@@ -43,6 +43,7 @@ concurrency:
 
 jobs:
   test-e2e-lifecycle-scripts:
+    environment: secret-free
     name: Unit tests for the E2E runtime lifecycle scripts (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     strategy:

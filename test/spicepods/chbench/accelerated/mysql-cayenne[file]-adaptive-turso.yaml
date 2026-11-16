@@ -29,8 +29,8 @@ name: mysql-cayenne[file]-adaptive-turso
 # are the high-level targets the closed loop converges toward (it still moves the un-pinned
 # actuators freely to hit them).
 #
-# sql_results / task_history stay off to match the baseline, so a
-# comparison isolates the effect of adaptive tuning, not caching/history overhead.
+# The SQL results cache is left unset, so these scheduled SF-1000 runs use its
+# defaults (enabled). task_history stays off.
 #
 # DATALAKE (COLD) TIER: the six high-volume CDC tables (district, customer, new_order, oorder,
 # order_line, stock) also carry the datalake tier, so this config runs all three storage tiers:
@@ -61,9 +61,6 @@ runtime:
     cte_materialization: auto
   flight:
     ipc_compression: lz4_frame
-  caching:
-    sql_results:
-      enabled: false
   task_history:
     enabled: false
   # `runtime.adaptive_tuning: enabled` and the `runtime.params.target_*` SLOs are runtime-wide: they apply to every Cayenne

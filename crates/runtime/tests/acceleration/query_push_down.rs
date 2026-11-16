@@ -250,7 +250,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             ];
             assert_batches_eq!(expected_plan, &plan_results);
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         }).await
 }

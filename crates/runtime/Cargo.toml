@@ -11,6 +11,7 @@ autotests = false
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
+http-body-limit = { path = "../http-body-limit" }
 podswatcher = { path = "../podswatcher" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 adbc_core = { workspace = true, optional = true }
@@ -42,6 +43,7 @@ ballista-scheduler = { workspace = true }
 base64.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
+ctor.workspace = true
 cache = { path = "../cache" }
 chrono.workspace = true
 chunking = { path = "../chunking" }
@@ -95,6 +97,7 @@ indexmap.workspace = true
 itertools.workspace = true
 logos.workspace = true
 opendal.workspace = true
+opendal-http-transport-reqwest = "0.58.2"
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
@@ -185,8 +188,9 @@ search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
 secrecy.workspace = true
-serde = { workspace = true, features = ["derive"] }
-blake3 = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_bytes.workspace = true
+blake3.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
@@ -214,10 +218,11 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 turso-shared = { workspace = true }
 twox-hash.workspace = true
+typetag = "0.2.22"
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { workspace = true, features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "9", features = [
+utoipa-swagger-ui = { version = "10", features = [
     "axum",
     "vendored",
 ], optional = true }
@@ -232,6 +237,8 @@ yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
+# Gzip-encodes response bodies in the HTTP connector decompression tests.
+flate2 = "1.1"
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
@@ -319,7 +326,7 @@ tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 
 [features]
-adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 azure-keyvault = ["runtime-secrets/azure-keyvault"]
 hashicorp_vault = ["runtime-secrets/hashicorp_vault"]

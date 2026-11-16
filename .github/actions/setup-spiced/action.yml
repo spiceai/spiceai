@@ -53,9 +53,11 @@ runs:
     - name: Find the latest built spiced commit (Linux/macOS)
       if: ${{ !inputs.spiced_commit && runner.os != 'Windows' }}
       shell: bash
+      env:
+        REF: ${{ inputs.ref }}
       run: |
-        git fetch --depth=10 origin ${{ inputs.ref }}
-        echo "Fetching latest 10 commits from ${{ inputs.ref }}"
+        git fetch --depth=10 origin -- "$REF"
+        echo "Fetching latest 10 commits from $REF"
 
         commit_hashes=($(git log FETCH_HEAD --pretty=format:"%H" -n 10))
 
@@ -83,10 +85,12 @@ runs:
     - name: Find the latest built spiced commit (Windows)
       if: ${{ !inputs.spiced_commit && runner.os == 'Windows' }}
       shell: pwsh
+      env:
+        REF: ${{ inputs.ref }}
       run: |
         $ErrorActionPreference = 'Stop'
-        git fetch --depth=10 origin ${{ inputs.ref }}
-        Write-Host "Fetching latest 10 commits from ${{ inputs.ref }}"
+        git fetch --depth=10 origin -- "$env:REF"
+        Write-Host "Fetching latest 10 commits from $env:REF"
 
         $commitHashes = git log FETCH_HEAD --pretty=format:"%H" -n 10 | ForEach-Object { $_.Trim() }
 

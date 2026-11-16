@@ -850,11 +850,7 @@ pub(crate) mod search {
                 rt.shutdown().await;
                 drop(rt);
 
-                // Clean up container after test
-                running_container.remove().await.map_err(|e| {
-                    tracing::error!("running_container.remove: {e}");
-                    anyhow::Error::msg(e.to_string())
-                })?;
+                running_container.cleanup().await;
 
                 Ok(())
             })
@@ -923,12 +919,10 @@ pub(crate) mod search {
                 "${env:AWS_S3_VECTORS_SECRET}".to_string(),
             ),
         ];
-        if std::env::var("AWS_SESSION_TOKEN").is_ok() {
-            param_map.push((
-                "s3_vectors_aws_session_token".to_string(),
-                "${env:AWS_SESSION_TOKEN}".to_string(),
-            ));
-        }
+        param_map.extend(crate::utils::aws_session_token_param(
+            "s3_vectors_aws_session_token",
+            "AWS_S3_VECTORS_SESSION_TOKEN",
+        ));
         let params = spicepod::param::Params::from_string_map(param_map.into_iter().collect());
 
         let store = VectorStore {
@@ -1052,7 +1046,7 @@ async fn delete_index(
             std::env::var("AWS_S3_VECTORS_SECRET")
                 .ok()
                 .unwrap_or_default(),
-            std::env::var("AWS_SESSION_TOKEN").ok(),
+            crate::utils::nonempty_env("AWS_S3_VECTORS_SESSION_TOKEN"),
             None,
             "S3Vectors",
         ))

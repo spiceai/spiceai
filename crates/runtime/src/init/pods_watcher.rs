@@ -25,6 +25,8 @@ use spicepod::component::{
 };
 
 use crate::Runtime;
+use crate::component::{component_accelerations, deprecated_acceleration_engines_warning};
+use crate::config::ClusterRole;
 
 /// What a reload leaves behind when a start-time-only section changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +232,20 @@ fn start_time_query(query: Option<&Query>) -> Query {
     query
 }
 
+/// The deprecated-engine warning for a reload from `current` to `new`: it names only the
+/// datasets and views the reload adds or changes, since startup (or an earlier reload)
+/// already named the rest.
+fn reload_deprecated_engines_warning(current: &App, new: &App) -> Option<String> {
+    deprecated_acceleration_engines_warning(component_accelerations(
+        new.datasets
+            .iter()
+            .filter(|ds| !current.datasets.contains(ds)),
+        new.views
+            .iter()
+            .filter(|view| !current.views.contains(view)),
+    ))
+}
+
 fn warn_on_start_time_only_changes(current: &SpicepodRuntime, new: &SpicepodRuntime) {
     for (section, scope) in start_time_only_changes(current, new) {
         match scope {
@@ -325,14 +341,23 @@ impl Runtime {
             // running. Say so rather than silently ignoring the edit.
             warn_on_start_time_only_changes(&current_app.runtime, &new_app.runtime);
 
+            // Startup warned about the components already loaded, so name only the ones
+            // this reload adds or changes. An executor runs the scheduler's spicepod,
+            // whose own log carries the warning.
+            if self.df.cluster_config.effective_role() != Some(ClusterRole::Executor)
+                && let Some(warning) = reload_deprecated_engines_warning(current_app, &new_app)
+            {
+                tracing::warn!("{warning}");
+            }
+
             Arc::clone(&self)
                 .apply_catalog_diff(current_app, &new_app)
                 .await;
-            Arc::clone(&self)
+            let reloaded_datasets = Arc::clone(&self)
                 .apply_dataset_diff(current_app, &new_app)
                 .await;
             Arc::clone(&self)
-                .apply_view_diff(current_app, &new_app)
+                .apply_view_diff(current_app, &new_app, &reloaded_datasets)
                 .await;
             self.apply_model_diff(current_app, &new_app).await;
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
@@ -375,7 +400,8 @@ mod tests {
 
     use super::{
         Arc, CacheKeyType, Query, SpicepodRuntime, StartTimeScope, UserAgentCollection,
-        start_time_only_changes, warn_on_start_time_only_changes,
+        reload_deprecated_engines_warning, start_time_only_changes,
+        warn_on_start_time_only_changes,
     };
 
     /// An edit to one setting of a spicepod `runtime:` section.
@@ -921,5 +947,59 @@ mod tests {
         });
         let captured = logs.0.lock().clone();
         String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    fn accelerated_dataset(name: &str, engine: &str) -> spicepod::component::dataset::Dataset {
+        let mut dataset = spicepod::component::dataset::Dataset::new("file:data.csv", name);
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            engine: Some(engine.to_string()),
+            ..Default::default()
+        });
+        dataset
+    }
+
+    #[test]
+    fn a_reload_warns_only_about_the_deprecated_engines_it_adds_or_changes() {
+        let current = app::AppBuilder::new("pod")
+            .with_dataset(accelerated_dataset("orders", "duckdb"))
+            .with_dataset(accelerated_dataset("events", "cayenne"))
+            .build();
+
+        let unchanged = current.clone();
+        assert_eq!(
+            reload_deprecated_engines_warning(&current, &unchanged),
+            None
+        );
+
+        let added = app::AppBuilder::new("pod")
+            .with_dataset(accelerated_dataset("orders", "duckdb"))
+            .with_dataset(accelerated_dataset("events", "cayenne"))
+            .with_dataset(accelerated_dataset("customers", "sqlite"))
+            .build();
+        let warning = reload_deprecated_engines_warning(&current, &added)
+            .expect("the reload adds a sqlite dataset");
+        assert!(
+            warning.contains("`sqlite` (dataset 'customers')"),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("orders"),
+            "startup already named the unchanged dataset: {warning}"
+        );
+
+        let switched = app::AppBuilder::new("pod")
+            .with_dataset(accelerated_dataset("orders", "duckdb"))
+            .with_dataset(accelerated_dataset("events", "arrow"))
+            .build();
+        let warning = reload_deprecated_engines_warning(&current, &switched)
+            .expect("the reload moves a dataset to arrow");
+        assert!(warning.contains("`arrow` (dataset 'events')"), "{warning}");
+        assert!(!warning.contains("orders"), "{warning}");
+
+        let migrated = app::AppBuilder::new("pod")
+            .with_dataset(accelerated_dataset("orders", "cayenne"))
+            .with_dataset(accelerated_dataset("events", "cayenne"))
+            .build();
+        assert_eq!(reload_deprecated_engines_warning(&current, &migrated), None);
     }
 }

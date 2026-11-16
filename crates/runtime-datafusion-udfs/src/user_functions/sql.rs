@@ -381,7 +381,11 @@ impl ScalarUDFImpl for SqlScalarUdf {
             .iter()
             .map(|cv| cv.to_array(n))
             .collect::<Result<Vec<_>, _>>()?;
-        let batch = RecordBatch::try_new(Arc::clone(&self.arrow_schema), arrays)?;
+        let batch = RecordBatch::try_new_with_options(
+            Arc::clone(&self.arrow_schema),
+            arrays,
+            &RecordBatchOptions::new().with_row_count(Some(n)),
+        )?;
         self.physical_expr.evaluate(&batch)
     }
 }
@@ -1587,6 +1591,29 @@ mod tests {
             .await
             .expect("projected query runs");
         assert_eq!(projected[0].num_columns(), 1);
+    }
+
+    #[tokio::test]
+    async fn sql_scalar_udf_without_arguments_returns_its_body() {
+        let d = decl("0.0825", vec![], "float64");
+        let udf = build_scalar_udf(&d, d.body.as_deref().expect("test")).expect("builds");
+
+        let ctx = SessionContext::new();
+        ctx.register_udf(udf.as_ref().clone());
+        let results = ctx
+            .sql("SELECT f() AS rate")
+            .await
+            .expect("sql compiles")
+            .collect()
+            .await
+            .expect("query runs");
+        let values = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float64 values");
+        assert_eq!(values.len(), 1);
+        assert!((values.value(0) - 0.0825).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

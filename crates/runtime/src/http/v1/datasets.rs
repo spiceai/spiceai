@@ -24,6 +24,7 @@ use crate::{
         DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
         request_context_extension::get_current_datafusion,
     },
+    http::optional_json::OptionalJson,
 };
 use app::App;
 use axum::{
@@ -39,7 +40,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use super::{Format, convert_entry_to_csv, dataset_status, require_write_access};
+use super::{
+    Format, convert_entry_to_csv, dataset_status, redact_message_credentials,
+    redact_source_credentials,
+};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]
@@ -230,14 +234,14 @@ fn dataset_infos(
             });
             let error_message = status
                 .as_ref()
-                .and_then(|s| s.error_message().map(String::from));
+                .and_then(|s| s.error_message().map(redact_message_credentials));
             let (last_refresh, next_refresh) = if include_status {
                 dataset_freshness(df, d, &datasets_by_name)
             } else {
                 (None, None)
             };
             DatasetResponseItem {
-                from: d.from.clone(),
+                from: redact_source_credentials(&d.from),
                 name: d.name.to_quoted_string(),
                 replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
@@ -327,7 +331,7 @@ pub struct AccelerationRequest {
         ("name" = String, Path, description = "The name of the dataset to refresh.")
     ),
     request_body(
-        description = "On-demand refresh request for a specific dataset.",
+        description = "Optional overrides for this refresh. An empty body, with or without `Content-Type: application/json`, is the same as `{}`.",
         content((
             RefreshOverrides = "application/json",
             example = json!({
@@ -367,15 +371,12 @@ pub struct AccelerationRequest {
 pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Path(dataset_name): Path<String>,
-    overrides_opt: Option<Json<RefreshOverrides>>,
-    // When this is an Option<Json>, Json rejections are silenced
-    // This means malformed Json, etc, will simply return None
-    // To get around this, we would need to implement a custom extractor
+    // An empty or whitespace-only body is `None` whatever the `Content-Type`, the same as
+    // `{}`. A JSON body is rejected before the handler runs: 400 for malformed JSON, 422
+    // for an unknown field value such as an unknown `refresh_mode`. A non-empty body
+    // under a non-JSON `Content-Type` is 415. See `OptionalJson`.
+    OptionalJson(overrides): OptionalJson<RefreshOverrides>,
 ) -> Response {
-    if let Some(response) = require_write_access().await {
-        return response;
-    }
-
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
@@ -443,10 +444,7 @@ pub(crate) async fn refresh(
 
     let table_ref = TableReference::parse_str(name);
 
-    match df
-        .refresh_table(&table_ref, overrides_opt.map(|Json(overrides)| overrides))
-        .await
-    {
+    match df.refresh_table(&table_ref, overrides).await {
         Ok(_) => (
             status::StatusCode::CREATED,
             Json(MessageResponse {
@@ -508,10 +506,6 @@ pub(crate) async fn acceleration(
     Path(dataset_name): Path<String>,
     Json(payload): Json<AccelerationRequest>,
 ) -> Response {
-    if let Some(response) = require_write_access().await {
-        return response;
-    }
-
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {

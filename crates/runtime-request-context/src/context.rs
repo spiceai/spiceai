@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use super::{CacheControl, CacheKeyType, CacheNamespace, Protocol, UserAgent, baggage};
+use super::{CacheControl, CacheKeyType, CacheNamespace, Protocol, UserAgent};
 use crate::TraceParent;
 use app::App;
 use futures::{Stream, StreamExt};
@@ -582,8 +582,6 @@ impl RequestContextBuilder {
             _ => None,
         };
 
-        self.baggage.extend(baggage::from_headers(headers));
-
         self.authorization_header = headers
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -699,41 +697,14 @@ impl RequestContextBuilder {
     pub fn build(self) -> RequestContext {
         let mut dimensions = self.baggage;
 
-        let add_runtime_dimensions = |dimensions: &mut Vec<KeyValue>| {
+        if let Some(client) = self.user_agent.metric_client() {
+            dimensions.push(KeyValue::new("client", client));
             dimensions.push(KeyValue::new("runtime", super::RUNTIME_NAME));
             dimensions.push(KeyValue::new("runtime_version", super::RUNTIME_VERSION));
             dimensions.push(KeyValue::new(
                 "runtime_system",
                 Arc::clone(&*super::RUNTIME_SYSTEM),
             ));
-        };
-
-        match self.user_agent {
-            UserAgent::Absent => (),
-            UserAgent::Raw(raw) => {
-                // Display appends runtime identity; keep that combined value for metric
-                // continuity (runtime is also recorded separately below).
-                dimensions.push(KeyValue::new("user_agent", UserAgent::Raw(raw).to_string()));
-                add_runtime_dimensions(&mut dimensions);
-            }
-            UserAgent::Parsed(parsed) => {
-                dimensions.push(KeyValue::new("client", Arc::clone(&parsed.client_name)));
-                dimensions.push(KeyValue::new(
-                    "client_version",
-                    Arc::clone(&parsed.client_version),
-                ));
-
-                if let Some(client_system) = &parsed.client_system {
-                    dimensions.push(KeyValue::new("client_system", Arc::clone(client_system)));
-                }
-                // Display appends runtime identity; keep that combined value for metric
-                // continuity (runtime is also recorded separately below).
-                dimensions.push(KeyValue::new(
-                    "user_agent",
-                    UserAgent::Parsed(parsed).to_string(),
-                ));
-                add_runtime_dimensions(&mut dimensions);
-            }
         }
 
         let user_cache_key = self

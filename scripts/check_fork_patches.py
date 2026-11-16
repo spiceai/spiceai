@@ -192,6 +192,12 @@ def drift(pinned: dict[str, set[str]], recorded: dict[str, list[str]]) -> list[s
 # not count, and so a re-cut that drops only this method fails the guard.
 DUCKDB_THRIFT_EQUALITY_MARKER = "bool operator==(const TEnumIterator& end)"
 DUCKDB_THRIFT_HEADER_SUFFIX = "third_party/thrift/thrift/Thrift.h"
+# The Brotli CVE-2026-111497 fix adds an error code to the bundled decoder header
+# and the decoder returns it on an invalid block switch; both must be present.
+DUCKDB_BROTLI_BLOCK_SWITCH_MARKER = "BROTLI_ERROR_CODE(_ERROR_FORMAT_, BLOCK_SWITCH, -17)"
+DUCKDB_BROTLI_HEADER_SUFFIX = "third_party/brotli/include/brotli/decode.h"
+DUCKDB_BROTLI_DECODER_MARKER = "return BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH;"
+DUCKDB_BROTLI_DECODER_SUFFIX = "third_party/brotli/dec/decode.cpp"
 DUCKDB_RS_REPO = "duckdb-rs"
 
 
@@ -262,16 +268,21 @@ def resolve_duckdb_tarball(rev: str) -> Path | None:
     return duckdb_tarball_from_checkouts(rev) or duckdb_tarball_from_cargo_metadata(rev)
 
 
-def thrift_header_from_tarball(tarball: Path) -> str | None:
-    """Return the bundled Thrift.h text from duckdb.tar.gz, or None if absent."""
+def bundled_file_from_tarball(tarball: Path, suffix: str) -> str | None:
+    """Return the text of the duckdb.tar.gz member ending in `suffix`, or None if absent."""
     with tarfile.open(tarball, "r:gz") as archive:
         for member in archive.getmembers():
-            if member.isfile() and member.name.endswith(DUCKDB_THRIFT_HEADER_SUFFIX):
+            if member.isfile() and member.name.endswith(suffix):
                 extracted = archive.extractfile(member)
                 if extracted is None:
                     return None
                 return extracted.read().decode("utf-8", errors="replace")
     return None
+
+
+def thrift_header_from_tarball(tarball: Path) -> str | None:
+    """Return the bundled Thrift.h text from duckdb.tar.gz, or None if absent."""
+    return bundled_file_from_tarball(tarball, DUCKDB_THRIFT_HEADER_SUFFIX)
 
 
 def duckdb_thrift_iterator_equality(pinned: dict[str, set[str]]) -> list[str]:
@@ -306,6 +317,46 @@ def duckdb_thrift_iterator_equality(pinned: dict[str, set[str]]) -> list[str]:
             f"(or the upstream duckdb Thrift equality fix) before moving this pin"
         ]
     return []
+
+
+def duckdb_brotli_block_switch(pinned: dict[str, set[str]]) -> list[str]:
+    """Repo-side guard: the pinned duckdb-rs tarball still carries the Brotli CVE-2026-111497 fix.
+
+    A re-cut that drops it still builds and decodes valid Brotli, so no behaviour
+    test here notices; the error code and the decoder path that returns it do.
+    """
+    rev = duckdb_rs_rev(pinned)
+    if rev is None:
+        return []
+    tarball = resolve_duckdb_tarball(rev)
+    if tarball is None:
+        return [
+            f"{DUCKDB_RS_REPO}: could not locate crates/libduckdb-sys/duckdb.tar.gz for "
+            f"pinned revision {rev[:12]}. Run `cargo metadata --locked` (or any build that "
+            f"fetches git deps) so the checkout exists, then re-run this guard"
+        ]
+    return brotli_fix_problems(tarball, rev)
+
+
+def brotli_fix_problems(tarball: Path, rev: str) -> list[str]:
+    """Problems with the Brotli CVE-2026-111497 fix in `tarball`; empty when it is intact."""
+    problems = []
+    for suffix, marker in (
+        (DUCKDB_BROTLI_HEADER_SUFFIX, DUCKDB_BROTLI_BLOCK_SWITCH_MARKER),
+        (DUCKDB_BROTLI_DECODER_SUFFIX, DUCKDB_BROTLI_DECODER_MARKER),
+    ):
+        text = bundled_file_from_tarball(tarball, suffix)
+        if text is None:
+            problems.append(
+                f"{DUCKDB_RS_REPO}: {tarball} has no {suffix}; the bundled Brotli sources are missing"
+            )
+        elif marker not in text:
+            problems.append(
+                f"{DUCKDB_RS_REPO}: pinned revision {rev[:12]} lost the Brotli decoder fix for "
+                f"CVE-2026-111497. Expected `{marker}` in the bundled {suffix}. Re-carry fork "
+                f"PR #53 (or upstream duckdb/duckdb#27791) before moving this pin"
+            )
+    return problems
 
 
 def main() -> int:
@@ -346,6 +397,7 @@ def main() -> int:
         drift(pinned, recorded)
         + gap_accounting(ledger_text)
         + duckdb_thrift_iterator_equality(pinned)
+        + duckdb_brotli_block_switch(pinned)
     )
     if errors:
         print(
@@ -364,7 +416,7 @@ def main() -> int:
     if not args.list:
         extra = ""
         if duckdb_rs_rev(pinned) is not None:
-            extra = "; duckdb-rs Thrift iterator equality present"
+            extra = "; duckdb-rs Thrift iterator equality and Brotli fix present"
         print(f"fork-patch ledger: {len(pinned)} pinned forks, all recorded{extra}")
     return 0
 

@@ -31,8 +31,9 @@ use arrow::{
     datatypes::DataType,
     error::ArrowError,
 };
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::record_batch::{slice_memory_size, try_cast_to};
+use arrow_tools::schema::schema_meta_get_computed_columns;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use arrow_tools::type_rewrite::rewrite_data_type;
 use async_stream::stream;
@@ -50,7 +51,7 @@ use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
-    common::TableReference,
+    common::{Column, TableReference},
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
@@ -116,6 +117,7 @@ pub mod changes;
 #[cfg(test)]
 mod deletion;
 mod latest_by_time;
+mod slow_refresh;
 
 /// The largest UTC offset a time may carry (+14:00), in nanoseconds.
 const MAX_UTC_OFFSET_NANOS: u128 = 14 * 3_600 * 1_000_000_000;
@@ -511,6 +513,7 @@ impl RefreshTaskBuilder {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
             dataset_metric_labels,
+            refresh_durations: slow_refresh::RefreshDurations::default(),
             federated: self.federated,
             federated_source: self.federated_source,
             accelerator: self.accelerator,
@@ -594,6 +597,9 @@ pub struct RefreshTask {
     /// Prebuilt per-dataset metric labels (see [`DatasetMetricLabels`]), reused
     /// by the hot metric-record sites instead of re-allocating the label.
     dataset_metric_labels: DatasetMetricLabels,
+    /// How long recent successful refreshes took, which a running refresh is compared
+    /// with to report one that is far slower.
+    refresh_durations: slow_refresh::RefreshDurations,
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
@@ -943,6 +949,10 @@ impl RefreshTask {
         );
 
         let start_time = SystemTime::now();
+        let started = Instant::now();
+        // Warns if this refresh runs far longer than the dataset's recent ones did. Dropped,
+        // and so cancelled, when the refresh returns.
+        let _slow_refresh_watch = self.watch_for_slow_refresh(refresh.mode);
 
         // The source commit an append refresh loads, saved only once its rows are
         // written: a refresh that fails or is cancelled must be read again.
@@ -1067,6 +1077,9 @@ impl RefreshTask {
             return Err(e);
         }
 
+        self.refresh_durations
+            .record(refresh.mode, started.elapsed());
+
         // Only record metrics if a refresh was successful
         self.handle_metrics(
             &dataset_metrics_label_sets,
@@ -1080,6 +1093,24 @@ impl RefreshTask {
         }
 
         Ok(RefreshOutcome::Refreshed)
+    }
+
+    /// Starts the watch that reports this refresh if it runs far longer than the dataset's
+    /// recent refreshes in `mode` did; `None` until there are enough of them.
+    fn watch_for_slow_refresh(
+        &self,
+        mode: RefreshMode,
+    ) -> Option<tokio_util::task::AbortOnDropHandle<()>> {
+        if is_spice_internal_dataset(&self.dataset_name) {
+            return None;
+        }
+        let slow = self.refresh_durations.slow_after(mode)?;
+        Some(slow_refresh::watch(
+            self.component_type(),
+            self.dataset_name.clone(),
+            mode,
+            slow,
+        ))
     }
 
     /// Ends a refresh that found nothing to fetch: the skip is counted, the dataset is
@@ -2174,6 +2205,25 @@ impl RefreshTask {
                     .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
                     .await);
             }
+            Ok(SnapshotPoll {
+                outcome:
+                    SnapshotPollOutcome::DownloadFailed {
+                        published_id,
+                        loaded_id,
+                        cause,
+                        ..
+                    },
+                ..
+            }) => {
+                let error = super::Error::SnapshotDownloadFailed {
+                    location: state.manager.snapshot_location().to_string(),
+                    published_id,
+                    cause,
+                };
+                return Ok(self
+                    .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
+                    .await);
+            }
             Err(e) => {
                 let schema_mismatch = mismatch_detail
                     .lock()
@@ -2706,6 +2756,9 @@ impl RefreshTask {
         state
             .config_mut()
             .set_extension(RequestContext::current(AsyncMarker::new().await));
+        // A file dataset whose source files lost a registered column fails this scan
+        // instead of loading NULLs over the accelerated data.
+        data_components::file_schema_drift::mark_acceleration_refresh(state.config_mut());
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             tracing::error!("Unable to register JSON functions: {e}");
@@ -2779,8 +2832,11 @@ impl RefreshTask {
             return Ok(update);
         };
 
+        // Computed columns, such as embeddings, are not compared: a model can return
+        // different vectors for the same text, so a re-read row would not match its stored copy.
+        let computed_columns = computed_columns(&self.federated.table_provider().await.schema());
         let existing_records = self
-            .stored_rows_to_compare(refresh, &filter_converter, stored_from)
+            .stored_rows_to_compare(refresh, &filter_converter, stored_from, &computed_columns)
             .await?;
 
         // Use the update stream's schema for dedup comparison, not the full federated
@@ -2800,6 +2856,7 @@ impl RefreshTask {
         let filter_fields: Vec<std::sync::Arc<arrow::datatypes::Field>> = output_schema
             .fields()
             .iter()
+            .filter(|field| !computed_columns.contains(field.name()))
             .map(|field| {
                 if let Some((_, acc_field)) = accelerator_schema.fields().find(field.name()) {
                     if field.data_type() == acc_field.data_type() {
@@ -2867,14 +2924,16 @@ impl RefreshTask {
     }
 
     /// The stored rows an append compares its incoming rows with: those `stored_from`
-    /// selects, plus every stored row whose time column is NULL.
+    /// selects, plus every stored row whose time column is NULL, without the `skipped` columns.
     async fn stored_rows_to_compare(
         &self,
         refresh: &Refresh,
         filter_converter: &TimestampFilterConvert,
         stored_from: StoredRowsFrom,
+        skipped: &[String],
     ) -> Result<Vec<RecordBatch>, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
+        let skipped: Vec<Column> = skipped.iter().map(Column::new_unqualified).collect();
 
         // The high-water filter below must widen in step with the source-side filter in
         // `get_full_or_incremental_append_update`: on a day-granular time column, if the
@@ -2891,6 +2950,7 @@ impl RefreshTask {
             )
             .await,
         )
+        .and_then(|df| df.drop_columns(&skipped))
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?;
         if let Some(filter) = stored_from.filter(filter_converter) {
@@ -2957,6 +3017,7 @@ impl RefreshTask {
                 )
                 .await,
             )
+            .and_then(|df| df.drop_columns(&skipped))
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(ident(tc).is_null())
@@ -3813,6 +3874,17 @@ fn filter_records(
     filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
 }
 
+/// The columns computed from another column of `schema`, such as its embeddings.
+fn computed_columns(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|field| schema_meta_get_computed_columns(schema, field.name()))
+        .flatten()
+        .map(|field| field.name().clone())
+        .collect()
+}
+
 /// Produces the rows in `update_data` that are absent from `existing_records`, while consuming
 /// each matching existing row at most once across the append overlap stream.
 fn dedup_predicates(
@@ -4026,6 +4098,9 @@ pub fn refresh_error_reason(error: &super::Error) -> &'static str {
         }
         super::Error::SnapshotOlderThanLoaded { .. } => {
             metrics::REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED
+        }
+        super::Error::SnapshotDownloadFailed { .. } => {
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_DOWNLOAD_FAILED
         }
         _ if error_chain_matches(error, looks_like_generation_change) => {
             metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
@@ -4885,6 +4960,21 @@ mod tests {
             older.to_string(),
             "The snapshot published at 's3://bucket/snapshots/' (id 0) is older than the loaded snapshot (id 3), so it was not loaded. Publish a newer snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
         );
+
+        let download_failed = super::super::Error::SnapshotDownloadFailed {
+            location: "s3://bucket/snapshots/".to_string(),
+            published_id: 4,
+            cause: "Snapshot s3://bucket/snapshots/a.db checksum mismatch. expected=00 actual=ff"
+                .to_string(),
+        };
+        assert_eq!(
+            refresh_error_reason(&download_failed),
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_DOWNLOAD_FAILED
+        );
+        assert_eq!(
+            download_failed.to_string(),
+            "The snapshot published at 's3://bucket/snapshots/' (id 4) could not be loaded, so it is tried again at the next poll. Cause: Snapshot s3://bucket/snapshots/a.db checksum mismatch. expected=00 actual=ff. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        );
     }
 
     /// Snapshot refreshes carry `mode="snapshot"`, as source refreshes carry `mode="full"`.
@@ -4987,6 +5077,54 @@ mod tests {
         )
         .await;
         assert_eq!(refresh.state().config().target_partitions(), cores);
+    }
+
+    /// File datasets fail a refresh scan, rather than loading NULLs, when their source
+    /// files lost a registered column; they tell a refresh scan apart by this marker.
+    #[tokio::test]
+    async fn refresh_session_is_marked_as_acceleration_refresh() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = RefreshTask::create_refresh_df_context(
+            source,
+            &TableReference::bare("drift_marked_refresh"),
+            &accelerator,
+            false,
+            Handle::current(),
+        )
+        .await;
+        assert!(data_components::file_schema_drift::is_acceleration_refresh(
+            &refresh.state()
+        ));
+        assert!(
+            !data_components::file_schema_drift::is_acceleration_refresh(
+                &SessionContext::new().state()
+            ),
+            "an ordinary query session must not be treated as a refresh"
+        );
+    }
+
+    /// The missing-column refresh error is permanent: retrying cannot bring the column back,
+    /// and the refresh must not write NULLs over the loaded data.
+    #[test]
+    fn missing_column_refresh_error_is_permanent() {
+        let err = retry_from_df_error(DataFusionError::Plan(
+            "Dataset 'base': registered column 'amount_cents' missing from every source file scanned".to_string(),
+        ));
+        assert!(
+            matches!(
+                err,
+                RetryError::Permanent(super::super::Error::FailedToRefreshDataset { .. })
+            ),
+            "{err:?}"
+        );
     }
 
     #[derive(Debug)]
@@ -6419,7 +6557,7 @@ mod tests {
         let converter = task
             .get_accelerator_filter_converter(refresh)
             .expect("the time column has a filter converter");
-        task.stored_rows_to_compare(refresh, &converter, stored_from)
+        task.stored_rows_to_compare(refresh, &converter, stored_from, &[])
             .await
             .expect("the comparison set is read")
             .iter()

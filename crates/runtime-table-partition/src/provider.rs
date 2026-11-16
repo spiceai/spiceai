@@ -727,11 +727,12 @@ impl DeletionSink for PartitionedUpdateSink {
             );
         }
         // Check every partition's updated rows before writing any, so an UPDATE a
-        // partition refuses changes no partition.
+        // partition refuses changes no partition. Engine-specific UPDATE plans
+        // (Cayenne's rematerializing exec) wrap themselves so this finds them
+        // without this crate depending on the engine.
         for plan in &plans {
-            if let Some(update) = plan.downcast_ref::<data_components::update::UpdateExec>() {
-                update.prepare(Arc::clone(&self.task_ctx)).await?;
-            }
+            data_components::update::prepare_update_plan(plan.as_ref(), Arc::clone(&self.task_ctx))
+                .await?;
         }
 
         let mut total_updated = 0u64;

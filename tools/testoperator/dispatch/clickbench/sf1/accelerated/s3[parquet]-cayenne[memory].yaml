@@ -6,4 +6,6 @@ tests:
     query_set: clickbench
     runner_type: spiceai-dev-large-runners
     ready_wait: 1800
-    validate_results: true
+    # As for `s3[parquet]-arrow`: the acceleration holds only the `refresh_sql` subset,
+    # while the `__test_reference.*` clone reads every row, so their answers differ.
+    validate_results: false

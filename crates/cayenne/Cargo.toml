@@ -522,6 +522,10 @@ name = "hll_ndv_hashing"
 
 [[bench]]
 harness = false
+name = "segment_null_count"
+
+[[bench]]
+harness = false
 name = "pk_keyset_present_path"
 
 [[bench]]

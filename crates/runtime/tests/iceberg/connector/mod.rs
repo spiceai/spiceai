@@ -17,7 +17,7 @@ limitations under the License.
 use crate::{
     acceleration::get_params,
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{aws_session_token_param, runtime_ready_check, test_request_context},
 };
 use anyhow::Context;
 use app::AppBuilder;
@@ -199,7 +199,7 @@ pub(crate) fn make_iceberg_dataset(
 /// The S3 parameters that read the shared Glue fixture's data, from the
 /// `AWS_ICEBERG_*` environment.
 pub(crate) fn glue_s3_params() -> HashMap<String, String> {
-    HashMap::from([
+    let mut params = HashMap::from([
         (
             "iceberg_s3_region".to_string(),
             "${ env:AWS_ICEBERG_REGION }".to_string(),
@@ -212,5 +212,10 @@ pub(crate) fn glue_s3_params() -> HashMap<String, String> {
             "iceberg_s3_secret_access_key".to_string(),
             "${ env:AWS_ICEBERG_SECRET_ACCESS_KEY }".to_string(),
         ),
-    ])
+    ]);
+    params.extend(aws_session_token_param(
+        "iceberg_s3_session_token",
+        "AWS_ICEBERG_SESSION_TOKEN",
+    ));
+    params
 }

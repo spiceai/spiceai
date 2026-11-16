@@ -22,6 +22,7 @@ limitations under the License.
 
 pub mod catalog;
 pub mod factory;
+mod http_client;
 pub mod server;
 pub mod tool;
 
@@ -84,6 +85,22 @@ const TOOL_USE_PREFIX: &str = "tool_use::";
 pub(crate) fn task_name_for_exposed_tool(exposed_name: &str) -> String {
     format!("{TOOL_USE_PREFIX}{exposed_name}")
 }
+
+/// Largest MCP response, in bytes, Spice accepts from an MCP server over
+/// Streamable HTTP, and the largest serialized tool result it passes on.
+///
+/// A JSON body is capped as a whole. A POST that comes back as SSE is capped
+/// as a whole too: progress notifications and the final result count together,
+/// so that stream is rejected even when every individual event is under the
+/// limit. A GET SSE stream keeps rmcp's per-event cap, set to this same value.
+/// 16 MiB is rmcp's own default event limit, and it is far above real tool
+/// output: a whole 1M-token model context is about 4 MiB of text.
+///
+/// The bound exists because one tool result is copied several times on its
+/// way to the caller (decoded, re-serialized, captured to task history, and
+/// written to the HTTP response or model context), so its size multiplies
+/// into peak memory.
+const MAX_TOOL_RESULT_SIZE: usize = 16 * 1024 * 1024;
 
 const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
 /// Custom HTTP headers, formatted `Name: Value` and delimited like the HTTP

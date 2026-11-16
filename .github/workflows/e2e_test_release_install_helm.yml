@@ -24,6 +24,7 @@ on:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup matrix
     runs-on: ubuntu-24.04
     outputs:
@@ -54,6 +55,7 @@ jobs:
             return filtered;
 
   test-helm-install:
+    environment: secret-free
     name: ${{ matrix.target.name }}
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix

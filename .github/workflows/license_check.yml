@@ -47,6 +47,7 @@ jobs:
   # path-filter). Dependency licenses are the gate here; running
   # unconditionally is intentional.
   license-check-rust:
+    environment: secret-free
     name: Check Rust Licenses
     # Emit the required context on pull requests without running cargo-deny;
     # the real check runs on the merge-group commit.

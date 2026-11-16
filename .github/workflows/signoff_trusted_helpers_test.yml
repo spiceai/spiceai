@@ -35,6 +35,7 @@ concurrency:
 
 jobs:
   test-signoff-trusted-helpers:
+    environment: secret-free
     name: Unit tests for the sign-off trusted-helper materialisation
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the saturated self-hosted pool the sign-off job runs on.

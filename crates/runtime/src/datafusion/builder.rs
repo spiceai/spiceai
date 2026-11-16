@@ -358,6 +358,7 @@ pub struct DataFusionBuilder {
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    query_admission_limit: Option<usize>,
     task_history_enabled: bool,
     query_error_logging: QueryErrorLogging,
     output_preview: OutputPreview,
@@ -491,6 +492,7 @@ impl DataFusionBuilder {
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
+            query_admission_limit: None,
             task_history_enabled: true,
             query_error_logging: QueryErrorLogging::default(),
             output_preview: OutputPreview::Build,
@@ -684,6 +686,7 @@ impl DataFusionBuilder {
             }
         };
         self.query_admission_semaphore = permits.map(|n| Arc::new(Semaphore::new(n)));
+        self.query_admission_limit = permits;
         self
     }
 
@@ -891,8 +894,10 @@ impl DataFusionBuilder {
             compaction_bytes
         });
 
-        let object_store_registry: Arc<dyn ObjectStoreRegistry> =
+        let spice_object_store_registry =
             Arc::new(SpiceObjectStoreRegistry::new(self.io_runtime.clone()));
+        let object_store_registry: Arc<dyn ObjectStoreRegistry> =
+            Arc::clone(&spice_object_store_registry) as Arc<dyn ObjectStoreRegistry>;
         // Build the dedicated compaction environment from the requested carved
         // budget, sharing the query environment's object-store registry so
         // compaction reads/writes the same stores while accounting memory
@@ -1291,6 +1296,10 @@ impl DataFusionBuilder {
                 panic!("Unable to register Spark window function `{name}`: {e}");
             }
         }
+        super::output_reservation::reserve_argument_sized_outputs(
+            &mut state,
+            &query_runtime_env.memory_pool,
+        );
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
@@ -1340,6 +1349,7 @@ impl DataFusionBuilder {
         // This is opt-in via `runtime.params.url_tables=enabled`
         if self.url_tables_enabled {
             let url_table_factory = Arc::new(SpiceUrlTableFactory::new());
+            url_table_factory.with_registry(Arc::clone(&spice_object_store_registry));
             let current_catalog_list = Arc::clone(ctx.state().catalog_list());
             let dynamic_catalog_list = Arc::new(DynamicUrlCatalogList::new(
                 current_catalog_list,
@@ -1475,6 +1485,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
+            query_admission_limit: self.query_admission_limit,
             task_history_enabled: self.task_history_enabled,
             query_error_logging: self.query_error_logging,
             task_history_captured_output: self.output_preview == OutputPreview::Build,

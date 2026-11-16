@@ -284,10 +284,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
                 .await?;
             }
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -437,7 +434,7 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
             );
             assert!(data1.get("name").is_none());
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -505,10 +502,7 @@ async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Erro
                 &results
             );
 
-            running_container
-                .remove()
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to remove container: {e}"))?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -626,7 +620,7 @@ async fn assert_change_streams_apply_insert_update_delete(
             );
 
             rt.shutdown().await;
-            running_container.remove().await?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -721,7 +715,7 @@ async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error>
             );
 
             rt.shutdown().await;
-            running_container.remove().await?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -852,7 +846,7 @@ async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::E
             rt.shutdown().await;
             drop(rt);
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await

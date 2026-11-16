@@ -7,6 +7,7 @@ edition = "2024"
 rust-version = "1.98.1"
 description = "Safe Rust bindings to libnfs C library for NFS client operations"
 license = "Apache-2.0"
+repository.workspace = true
 
 [dependencies]
 nix = { version = "0.30", features = ["fs"] }

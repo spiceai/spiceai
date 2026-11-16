@@ -22,8 +22,10 @@ use crate::common;
 
 use std::sync::Arc;
 
-use arrow::array::{Decimal128Array, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    ArrayRef, Decimal128Array, DictionaryArray, Int32Array, Int64Array, NullArray, StringArray,
+};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::{CayenneTableProvider, SlotAdvancer};
@@ -38,6 +40,7 @@ use datafusion_table_providers::util::{
 test_with_backends!(test_listing_file_pruning_disjoint_id_ranges_impl);
 test_with_backends!(test_listing_file_pruning_disjoint_decimal_ranges_impl);
 test_with_backends!(test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl);
+test_with_backends!(test_is_null_keeps_rows_whose_nulls_carry_no_null_bit_impl);
 
 fn files_scanned_from_plan(plan: &str) -> Option<usize> {
     plan.lines().find_map(|line| {
@@ -358,6 +361,216 @@ async fn test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl(
         rows,
         vec![(42, 2)],
         "full scan must hide the old row and keep the RAM-tier replacement"
+    );
+
+    Ok(())
+}
+
+/// Two rows whose nulls carry no null bit of their own: `tag` is null in row 1 through a valid
+/// dictionary key that names a null value, and `nothing` is a `Null`-typed column, null in every
+/// row.
+fn rows_with_unmarked_nulls(schema: &SchemaRef) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    let tags = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![0, 1]),
+        Arc::new(StringArray::from(vec![None, Some("x")])) as ArrayRef,
+    )?;
+    Ok(RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(tags),
+            Arc::new(NullArray::new(2)),
+        ],
+    )?)
+}
+
+async fn sorted_ids(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let mut ids = Vec::new();
+    for batch in ctx.sql(sql).await?.collect().await? {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column should be Int64");
+        ids.extend(column.iter().flatten());
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// `IS NULL` keeps rows whose only nulls carry no null bit of their own, from an inline
+/// write, from a RAM-tier segment and from a file. The inline and RAM tiers prune with
+/// statistics computed over their batches, so statistics that count null bits report no
+/// nulls in these rows, and `IS NULL` then drops them from the scan.
+async fn test_is_null_keeps_rows_whose_nulls_carry_no_null_bit_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    struct TestAdvancer;
+    #[async_trait::async_trait]
+    impl SlotAdvancer for TestAdvancer {
+        async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+    }
+
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "tag",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        ),
+        Field::new("nothing", DataType::Null, true),
+    ]));
+    let ctx = SessionContext::new();
+
+    // A small append to a default table is published inline.
+    let inline_catalog = Arc::clone(&fixture.catalog);
+    let inline = Arc::new(
+        CayenneTableProvider::create_table(
+            inline_catalog,
+            CreateTableOptions {
+                table_name: "unmarked_nulls_inline".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture
+                    .data_path
+                    .join("unmarked_nulls_inline")
+                    .to_string_lossy()
+                    .to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(
+        "unmarked_nulls_inline",
+        Arc::clone(&inline) as Arc<dyn TableProvider>,
+    )?;
+    let generation = inline.inlined_generation();
+    common::insert_batch(inline.as_ref(), rows_with_unmarked_nulls(&schema)?).await?;
+    assert!(
+        inline.inlined_generation() > generation,
+        "precondition: the append must be published inline"
+    );
+
+    // A change-stream write to a memory-durability table is published through the RAM tier.
+    let ram_catalog = Arc::clone(&fixture.catalog);
+    let ram = Arc::new(
+        CayenneTableProvider::create_table(
+            ram_catalog,
+            CreateTableOptions {
+                table_name: "unmarked_nulls_ram".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: fixture
+                    .data_path
+                    .join("unmarked_nulls_ram")
+                    .to_string_lossy()
+                    .to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    cdc_durability: CdcDurability::Memory,
+                    deletion_mode: DeletionMode::Key,
+                    ..VortexConfig::default()
+                },
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(
+        "unmarked_nulls_ram",
+        Arc::clone(&ram) as Arc<dyn TableProvider>,
+    )?;
+    ram.install_slot_advancer(Arc::new(TestAdvancer));
+    let write = ram
+        .write_cdc_append_stream(
+            batch_to_stream(rows_with_unmarked_nulls(&schema)?),
+            &ctx.task_ctx(),
+        )
+        .await?;
+    assert_eq!(
+        write.in_memory_epoch(),
+        Some(1),
+        "precondition: the rows must be published through the RAM tier"
+    );
+
+    // With inline writes off, the same append is written to a Vortex file.
+    let file_catalog = Arc::clone(&fixture.catalog);
+    let file = Arc::new(
+        CayenneTableProvider::create_table(
+            file_catalog,
+            CreateTableOptions {
+                table_name: "unmarked_nulls_file".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture
+                    .data_path
+                    .join("unmarked_nulls_file")
+                    .to_string_lossy()
+                    .to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    ..VortexConfig::default()
+                },
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(
+        "unmarked_nulls_file",
+        Arc::clone(&file) as Arc<dyn TableProvider>,
+    )?;
+    common::insert_batch(file.as_ref(), rows_with_unmarked_nulls(&schema)?).await?;
+    let file_scan = ctx
+        .sql("SELECT id FROM unmarked_nulls_file")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let file_plan = datafusion::physical_plan::displayable(file_scan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        files_scanned_from_plan(&file_plan).is_some_and(|files| files >= 1),
+        "precondition: the append must be written to a file:\n{file_plan}"
+    );
+
+    // Every case is evaluated before any is asserted, so a failure shows each table and
+    // predicate that lost rows, not only the first.
+    let mut cases = Vec::new();
+    for table in [
+        "unmarked_nulls_inline",
+        "unmarked_nulls_ram",
+        "unmarked_nulls_file",
+    ] {
+        for (predicate, expected) in [
+            ("TRUE", vec![1_i64, 2]),
+            ("tag IS NULL", vec![1_i64]),
+            ("nothing IS NULL", vec![1_i64, 2]),
+        ] {
+            let sql = format!("SELECT id FROM {table} WHERE {predicate}");
+            let actual = sorted_ids(&ctx, &sql).await?;
+            cases.push((sql, expected, actual));
+        }
+    }
+    let wrong: Vec<_> = cases
+        .iter()
+        .filter(|(_, expected, actual)| expected != actual)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "queries returned the wrong rows (sql, expected, actual): {wrong:#?}"
     );
 
     Ok(())
