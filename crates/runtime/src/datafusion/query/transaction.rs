@@ -50,6 +50,7 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::{ast::Statement as SqlStatement, dialect::PostgreSqlDialect};
+use runtime_datafusion::table_function_params::bind_table_function_args;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Error as QueryError, QueryBuilder, ResultsCacheMode};
@@ -203,9 +204,9 @@ pub async fn run_transaction(
     // Prepare the transaction: identify every participant table, validate the
     // write targets, capture their begin tokens, and install the transaction on
     // the request context. A body with no write is a plain read-only transaction.
-    let handle = prepare_transaction(df, statements).await?;
-
     let parameters = normalize_transaction_parameters(parameters);
+    let handle = prepare_transaction(df, statements, parameters.as_ref()).await?;
+
     let mut last: Option<(Vec<RecordBatch>, CacheStatus)> = None;
     let reservation =
         MemoryConsumer::new("transaction_result").register(&df.ctx.runtime_env().memory_pool);
@@ -330,16 +331,21 @@ struct TransactionHandle {
 async fn prepare_transaction(
     df: &Arc<DataFusion>,
     inner_sqls: &[String],
+    parameters: Option<&ParamValues>,
 ) -> Result<Option<TransactionHandle>, TransactionError> {
     let session = df.ctx.state();
     let mut write_refs: Vec<TableReference> = Vec::new();
     let mut read_refs: Vec<TableReference> = Vec::new();
+    let dialect = session.config().options().sql_parser.dialect;
     for stmt_sql in inner_sqls {
-        let statement = session
-            .sql_to_statement(stmt_sql, &session.config().options().sql_parser.dialect)
+        // Table functions run during planning, so substitute their parameters first.
+        let mut statement = session
+            .sql_to_statement(stmt_sql, &dialect)
             .map_err(TransactionError::Plan)?;
         crate::datafusion::sql_depth_guard::ensure_statement_within_depth_limits(&statement)
             .map_err(TransactionError::Plan)?;
+        let _ =
+            bind_table_function_args(&mut statement, parameters).map_err(TransactionError::Plan)?;
         let plan = session
             .statement_to_plan(statement)
             .await

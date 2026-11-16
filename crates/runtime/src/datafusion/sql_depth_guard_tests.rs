@@ -46,7 +46,9 @@ async fn plan_on_default_worker_stack(sql: String) -> DFResult<()> {
     let result = workers
         .spawn(async move {
             let session = df.ctx.state();
-            df.create_logical_plan(&session, &sql).await.map(|_| ())
+            df.create_logical_plan(&session, &sql, None)
+                .await
+                .map(|_| ())
         })
         .await
         .expect("planning task completes");
