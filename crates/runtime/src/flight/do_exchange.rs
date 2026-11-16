@@ -265,7 +265,18 @@ pub(crate) async fn open_subscription(
     // snapshot holds exactly the commits up to the sequence number read, and
     // every later commit reaches the subscription.
     let (rx, snapshot_fence) = broadcaster.subscribe_at_snapshot(&data_path).await;
-    let snapshot = initial_snapshot_stream(datafusion, Arc::clone(&table_provider)).await?;
+    let mut snapshot = initial_snapshot_stream(datafusion, Arc::clone(&table_provider)).await?;
+    // A provider may defer its query to the first poll (DuckDB does), so the
+    // snapshot is pinned only once its first batch is read: read it under the
+    // fence too.
+    let first_batch = snapshot.next().await;
+    let snapshot_schema = snapshot.schema();
+    let snapshot: SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            snapshot_schema,
+            futures::stream::iter(first_batch).chain(snapshot),
+        ),
+    );
     let snapshot_position = SnapshotPosition {
         epoch: broadcaster.epoch().to_string(),
         sequence: snapshot_fence.sequence,
