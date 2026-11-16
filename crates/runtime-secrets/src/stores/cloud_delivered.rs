@@ -84,9 +84,7 @@ impl CloudDeliveredSecretStore {
         Self::default()
     }
 
-    /// Replace the delivered set. Called on every deployment that carries
-    /// secrets, including one that carries none — an app whose secrets were all
-    /// removed must stop resolving them.
+    /// Replace the delivered set. A name not in `values` stops resolving.
     pub fn replace(&self, values: BTreeMap<String, Zeroizing<Vec<u8>>>) {
         *self.values.write() = Arc::new(values);
     }

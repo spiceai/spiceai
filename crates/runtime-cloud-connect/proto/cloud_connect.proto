@@ -329,8 +329,8 @@ message Restart {
 // standalone instance has no Kubernetes namespace or Secret to name, so both
 // halves of the AAD are pinned literals every party must hold identically and
 // none of them sends — see `cloud-connect-crypto`, which is the single source
-// for them. Absent means "no secrets with this deploy" and is backward
-// compatible with peers that predate the field.
+// for them. Absent means the app has no secrets: the runtime withdraws the
+// secrets an earlier deployment delivered.
 //
 // Redelivering a spicepod the instance is already serving is a no-op, not
 // another apply: applying restarts the instance, so an apply-on-redelivery is a
