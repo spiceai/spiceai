@@ -238,6 +238,99 @@ async fn a_sequence_restores_its_own_checkpoint_beside_another() {
     assert_eq!(reused.1, fresh.1, "turn 2's reply in sequence 1");
 }
 
+/// A sequence saved whole to host memory, emptied, and restored into another sequence after
+/// other prompts moved through the cache drafts and replies exactly as the same prompt read in
+/// place: a prompt cache can hold a conversation in host memory while other requests use the
+/// shared cache, and give it back when the conversation resumes. The prompt is read short of its
+/// last token, as spiced's prompt cache always reads the last one again; the restore lands its
+/// cells where another prompt's were, so a layout the sequence never had in place is covered.
+#[tokio::test]
+async fn a_sequence_saved_whole_restores_into_another_and_replies_as_if_it_never_left() {
+    let gguf = qwen35_gguf().await;
+    let backend = Backend::get();
+    let model = Model::load(backend, &gguf, &ModelParams::default().with_load_mtp(true))
+        .expect("Qwen3.5-0.8B loads with its MTP layer");
+    let chat = |text: &str| {
+        model
+            .vocab()
+            .tokenize(
+                &format!("<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+                false,
+                true,
+            )
+            .expect("the prompt tokenizes")
+    };
+    let prompt = chat("Name the planets of the solar system in order, one per line.");
+    let other = chat("Explain how a refrigerator keeps food cold, step by step.");
+    let third = chat("Write a short paragraph about the history of the bicycle.");
+    let last = prompt.len() - 1;
+
+    let in_place = {
+        let mut spec = drafting(&model, backend, 2);
+        read_seq(&mut spec, 0, &other, 0..other.len());
+        read_seq(&mut spec, 1, &prompt, 0..last);
+        read_seq(&mut spec, 1, &prompt, last..prompt.len());
+        generate_seq(&mut spec, 1, &prompt, 48)
+    };
+    let restored = {
+        let mut spec = drafting(&model, backend, 2);
+        read_seq(&mut spec, 0, &other, 0..other.len());
+        read_seq(&mut spec, 1, &prompt, 0..last);
+        let saved = std::time::Instant::now();
+        let target = spec
+            .target()
+            .state_seq(1)
+            .expect("sequence 1's whole state saves");
+        let head_cache = spec
+            .draft_mut()
+            .state_seq(1)
+            .expect("the head's cache for sequence 1 saves");
+        let head = spec.state(1).expect("sequence 1's head state");
+        let saved = saved.elapsed();
+        assert!(
+            spec.target_mut().truncate_seq(1, 0) && spec.draft_mut().truncate_seq(1, 0),
+            "sequence 1 empties"
+        );
+        // another request uses sequence 1, and the prompt that sat in front of the saved one
+        // leaves, so the restore lands where `other` was
+        read_seq(&mut spec, 1, &third, 0..third.len());
+        let _ = generate_seq(&mut spec, 1, &third, 8);
+        assert!(
+            spec.target_mut().truncate_seq(0, 0) && spec.draft_mut().truncate_seq(0, 0),
+            "sequence 0 empties"
+        );
+        let restore = std::time::Instant::now();
+        assert!(
+            spec.target_mut().restore_state_seq(0, &target),
+            "the saved state restores into sequence 0"
+        );
+        assert!(
+            spec.draft_mut().restore_state_seq(0, &head_cache),
+            "the head's saved cache restores into sequence 0"
+        );
+        if let Some(head) = &head {
+            spec.restore_state(0, head)
+                .expect("the head state restores into sequence 0");
+        }
+        let restore = restore.elapsed();
+        eprintln!(
+            "saved {} + {} + {} bytes in {saved:?}, restored in {restore:?}",
+            target.len(),
+            head_cache.len(),
+            head.as_ref().map_or(0, Vec::len)
+        );
+        read_seq(&mut spec, 0, &prompt, last..prompt.len());
+        generate_seq(&mut spec, 0, &prompt, 48)
+    };
+
+    assert!(
+        restored.0.iter().any(|draft| !draft.is_empty()),
+        "the restored sequence drafted, so the head's restored state is exercised"
+    );
+    assert_eq!(restored.0, in_place.0, "the drafts");
+    assert_eq!(restored.1, in_place.1, "the reply");
+}
+
 fn position(n: usize) -> i32 {
     i32::try_from(n).expect("a position")
 }

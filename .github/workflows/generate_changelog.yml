@@ -14,8 +14,14 @@ on:
         required: true
         default: 'release/1.8'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   generate:
+    permissions:
+      contents: read
+      pull-requests: read  # scripts/generate_changelog.py: gh pr list/view
     environment: secret-free
     name: Generate Changelog
     runs-on: self-hosted

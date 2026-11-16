@@ -14,6 +14,9 @@ sources:
 variants:
   memory: {}
   file: { catalogs: { '*': { acceleration: { mode: file } } } }
+  # `file` with the prototype object-native Cayenne metastore.
+  # Named with underscores: the variant names the catalog, which queries use unquoted.
+  file_object_native: { catalogs: { '*': { acceleration: { mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
 
 spicepod:
   version: v1
@@ -110,7 +113,7 @@ steps:
     only: memory
   - source-query: { src: "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()" }
     expect: { rows: [["1"]] }
-    only: file
+    only: [file, file_object_native]
   - source-exec:
       src: |
         INSERT INTO orders VALUES (400, 1, 1, 'while down');
@@ -126,16 +129,16 @@ steps:
   # The slot of a file acceleration disappears while Spice is down: the next
   # start rebuilds from the source and serves its rows, not the stale ones.
   - stop: {}
-    only: file
+    only: [file, file_object_native]
   - source-exec:
       src: >
         SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
         WHERE database = current_database();
         UPDATE orders SET qty = 99 WHERE id <= 10;
         DELETE FROM orders WHERE id BETWEEN 200 AND 210
-    only: file
+    only: [file, file_object_native]
   - start: {}
-    only: file
+    only: [file, file_object_native]
   - query: SELECT * FROM pg_${variant.name}.public.orders
     oracle-sql: SELECT * FROM orders
     eventually: 60s

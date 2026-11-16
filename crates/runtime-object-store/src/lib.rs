@@ -28,8 +28,7 @@ pub use builder::{build_azure_object_store, build_gcs_object_store};
 /// from a standard S3 path. The convention is checked against the **bucket** alone: the
 /// suffix is legal inside an object key, so a standard bucket with a
 /// `prefix--x-s3/` folder must not be taken for a directory bucket — it would be sent
-/// down the S3-Express write path and past the standard-S3 rejection in
-/// `validate_file_path`.
+/// down the S3-Express write path.
 ///
 /// Lives here rather than with a single caller because both the Cayenne engine and the
 /// runtime's query planner branch on it, and a second copy of the convention could drift

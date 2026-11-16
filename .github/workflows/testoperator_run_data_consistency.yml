@@ -59,6 +59,9 @@ on:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-data-consistency:
     # The service principal's federation policy trusts this environment's subject.
@@ -90,14 +93,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '36000'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -105,7 +108,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -118,12 +121,12 @@ jobs:
           spicepod-validator "${{ github.event.inputs.compare_spicepod_path }}"
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -131,7 +134,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
+        uses: $/.github/actions/setup-testoperator-data
         with:
           query_set: ${{ github.event.inputs.query_set }}
 

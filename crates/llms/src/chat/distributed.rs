@@ -61,6 +61,10 @@ pub struct DistributedConfig {
     /// Whether spiced runs with `--allow-insecure-connections`. An engine that connects the
     /// nodes without authentication serves the model only when this is set.
     pub allow_insecure_connections: bool,
+    /// Where clients reach the head, as the `head_url` param gives it. `nodes` holds the addresses
+    /// the nodes reach each other at, which a client may not reach, so a node other than the head
+    /// names this one when it refuses a request.
+    pub head_url: Option<String>,
 }
 
 impl DistributedConfig {
@@ -216,6 +220,7 @@ mod tests {
             node_rank,
             nodes: (0..n).map(|i| format!("10.0.0.{i}")).collect(),
             allow_insecure_connections: false,
+            head_url: None,
         }
     }
 

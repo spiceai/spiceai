@@ -118,6 +118,12 @@ pub struct CayenneContext {
     /// Rows the deletion index's last reclaim removed per tombstone, which scales
     /// both deletion-index triggers (see [`super::deletion_yield`]).
     deletion_index_yield: super::deletion_yield::DeletionIndexYield,
+    /// Key deletion vectors the table's metastore holds, as the last compaction
+    /// trigger counted them; `0` until the first count. Read by the whole-table
+    /// reclaim of a key-delete table (see `deletion_vector_reclaim_decision`).
+    key_deletion_vector_files: std::sync::atomic::AtomicUsize,
+    /// Paces the whole-table reclaims of a table that is not `auto`.
+    whole_table_reclaim_pace: super::pk_deletion_mode::WholeTableReclaimPace,
     /// Consecutive eligible control ticks on which a goal stayed violated while the
     /// controller had no move left — no eligible adjustment, whether because every
     /// relevant lever is clamped at its bound OR the helpful lever is blocked by a
@@ -326,6 +332,8 @@ impl CayenneContext {
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             reclaim_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             deletion_index_yield: super::deletion_yield::DeletionIndexYield::default(),
+            key_deletion_vector_files: std::sync::atomic::AtomicUsize::new(0),
+            whole_table_reclaim_pace: super::pk_deletion_mode::WholeTableReclaimPace::default(),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
             coupled_writer: std::sync::atomic::AtomicBool::new(false),
@@ -682,6 +690,26 @@ impl CayenneContext {
     pub(crate) fn effective_reclaim_deletion_index_trigger(&self) -> usize {
         self.deletion_index_yield
             .scale_trigger(self.configured_deletion_index_trigger())
+    }
+
+    /// Key deletion vectors the metastore held at the last count.
+    #[must_use]
+    pub(crate) fn key_deletion_vector_files(&self) -> usize {
+        self.key_deletion_vector_files
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record how many key deletion vectors the metastore holds.
+    pub(crate) fn set_key_deletion_vector_files(&self, files: usize) {
+        self.key_deletion_vector_files
+            .store(files, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The pace of this table's whole-table reclaims when it is not `auto`.
+    pub(crate) fn whole_table_reclaim_pace(
+        &self,
+    ) -> &super::pk_deletion_mode::WholeTableReclaimPace {
+        &self.whole_table_reclaim_pace
     }
 
     /// Record a deletion-index reclaim (a bake or a whole-table rewrite) that

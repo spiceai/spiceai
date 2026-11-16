@@ -57,4 +57,7 @@ pub struct HuggingFaceModelParams {
     /// Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.
     #[param(runtime)]
     pub nodes: Option<String>,
+    /// Where clients reach the head (rank 0) for a model in `nodes`, such as `http://192.168.1.100:8090`. A node other than the head names it when it refuses a request: `nodes` holds the addresses the nodes reach each other at, which a client may not reach. When unset, the refusal names the head's address in `nodes`.
+    #[param(runtime)]
+    pub head_url: Option<String>,
 }

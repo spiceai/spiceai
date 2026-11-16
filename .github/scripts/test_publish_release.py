@@ -375,6 +375,68 @@ class TagTests(unittest.TestCase):
         self.assertIn(f"already points at {'d' * 40}, not at {self.SHA}", str(ctx.exception))
 
 
+class ReleaseFilesTests(unittest.TestCase):
+    """The files a release publishes: those SHA256SUMS lists, and SHA256SUMS itself."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.sums = os.path.join(self.dir.name, "SHA256SUMS")
+        self.lines = []
+        for name in ("spice_linux_x86_64.tar.gz", "install.sh", "Install.ps1"):
+            data = name.encode()
+            with open(os.path.join(self.dir.name, name), "wb") as f:
+                f.write(data)
+            self.lines.append(f"{sha(data)}  {name}\n")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_sums(self, lines):
+        with open(self.sums, "w") as f:
+            f.writelines(lines)
+        with open(self.sums, "rb") as f:
+            return sha(f.read())
+
+    def test_publishes_every_listed_file_and_the_manifest(self):
+        manifest = self.write_sums(self.lines)
+        files = publish_release.release_files(self.dir.name, self.sums)
+        self.assertEqual(sorted(files), ["Install.ps1", "SHA256SUMS", "install.sh", "spice_linux_x86_64.tar.gz"])
+        self.assertEqual(files["SHA256SUMS"], (self.sums, manifest))
+        self.assertEqual(files["install.sh"], (os.path.join(self.dir.name, "install.sh"), sha(b"install.sh")))
+
+    def test_refuses_a_manifest_that_lists_its_own_name(self):
+        self.write_sums(self.lines + [f"{'1' * 64}  SHA256SUMS\n"])
+        with self.assertRaises(publish_release.PublishError) as ctx:
+            publish_release.release_files(self.dir.name, self.sums)
+        self.assertIn("lists SHA256SUMS, its own asset name", str(ctx.exception))
+
+    def test_refuses_a_listed_file_that_is_missing_or_differs(self):
+        self.write_sums(self.lines + [f"{'1' * 64}  install-spiced.sh\n"])
+        with self.assertRaises(publish_release.PublishError) as ctx:
+            publish_release.release_files(self.dir.name, self.sums)
+        self.assertIn("install-spiced.sh is listed", str(ctx.exception))
+        with open(os.path.join(self.dir.name, "install-spiced.sh"), "wb") as f:
+            f.write(b"changed")
+        with self.assertRaises(publish_release.PublishError) as ctx:
+            publish_release.release_files(self.dir.name, self.sums)
+        self.assertIn(f"install-spiced.sh has sha256 {sha(b'changed')}, but the build recorded {'1' * 64}", str(ctx.exception))
+
+    def test_publish_uploads_the_manifest_with_the_files(self):
+        self.write_sums(self.lines)
+        api = FakeApi()
+        env = {"GITHUB_TOKEN": "t"}
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(publish_release, "Api", lambda token: api):
+            code = publish_release.main([
+                "--repo", REPO, "--tag", "v2.4.2", "publish", "--dir", self.dir.name, "--sums", self.sums,
+                "--prerelease", "false", "--sha", SHA,
+            ])
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(api.uploads), ["Install.ps1", "SHA256SUMS", "install.sh", "spice_linux_x86_64.tar.gz"])
+        release = api.releases[0]
+        self.assertFalse(release["draft"])
+        self.assertEqual({a["name"] for a in release["assets"]}, set(api.uploads))
+
+
 class ReadSumsTests(unittest.TestCase):
     def read(self, text):
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
