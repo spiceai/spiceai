@@ -181,9 +181,13 @@ impl SecretStore for EnvSecretStore {
         .find_map(|variant| match std::env::var(variant) {
             Ok(value) => Some(Ok(SecretString::from(value))),
             Err(std::env::VarError::NotPresent) => None,
-            Err(err) => Some(Err(
-                Box::new(err) as Box<dyn std::error::Error + Send + Sync>
-            )),
+            // `VarError::NotUnicode` displays the raw value, so report the
+            // failure without it: this error is logged and can reach dataset
+            // status and the cluster `ExpandSecret` response.
+            Err(std::env::VarError::NotUnicode(_)) => Some(Err(format!(
+                "environment variable `{variant}` is not valid Unicode (value not shown)"
+            )
+            .into())),
         })
         .transpose()
     }
