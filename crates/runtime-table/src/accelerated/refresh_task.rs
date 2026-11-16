@@ -1397,11 +1397,6 @@ impl RefreshTask {
             return Err(e);
         }
 
-        // The rows are committed: forward them to the dataset's append-stream
-        // subscribers.
-        self.publish_written_append(&data_update.update_type, published_append, schema)
-            .await;
-
         let retention_error = if let Some(retention_sql_delete_expr) = retention_sql_delete_expr {
             retention::apply_retention_filters_once(
                 &self.dataset_name,
@@ -1436,6 +1431,11 @@ impl RefreshTask {
         }
 
         let num_rows = refresh_stat.as_ref().map_or(0, |s| s.num_rows);
+
+        // The rows are committed: forward them to the dataset's append-stream
+        // subscribers.
+        self.publish_written_append(&data_update.update_type, published_append, schema, num_rows)
+            .await;
 
         if let Some(error) = retention_error {
             self.maybe_update_last_updated_at(&data_update.update_type, num_rows);
@@ -1489,6 +1489,7 @@ impl RefreshTask {
         update_type: &UpdateType,
         published_append: Option<published_append::PublishedAppend>,
         schema: SchemaRef,
+        rows_written: usize,
     ) {
         if *update_type != UpdateType::Append {
             return;
@@ -1508,11 +1509,12 @@ impl RefreshTask {
             }
             // The rows were not kept because no one was subscribed when the
             // write started. One who subscribed while it ran read its snapshot
-            // before the rows committed, so it would miss them.
+            // before the rows committed, so it would miss them for good: end its
+            // subscription, so it resubscribes from a snapshot that has them.
             None => {
-                if publisher.has_subscribers().await {
-                    tracing::warn!(
-                        "Dataset {}: an append-stream subscriber joined while an append refresh was writing, so it may not receive the rows that refresh wrote. If its row count falls behind, restart it to resubscribe from a fresh snapshot.",
+                if rows_written > 0 && publisher.close_subscribers().await {
+                    tracing::info!(
+                        "Dataset {}: an append-stream subscriber joined while an append refresh was writing {rows_written} row(s), so its subscription was ended for it to resubscribe from a fresh snapshot.",
                         self.dataset_name
                     );
                 }
@@ -5565,6 +5567,49 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec![1001, 1002, 1003]);
+    }
+
+    /// A subscriber that joins while an append refresh writes read its snapshot
+    /// before the rows committed and was not there to have them kept, so it
+    /// would miss them for good. Its subscription is ended instead, for it to
+    /// resubscribe from a snapshot that has them.
+    #[tokio::test]
+    async fn a_subscriber_joining_mid_append_is_sent_to_resubscribe() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = TableReference::bare("events");
+        let broadcaster = runtime_acceleration::dataupdate::DataUpdateBroadcaster::new();
+        let task = publishing_task(&schema, &table, &broadcaster);
+
+        let (joined, mut joiner) = tokio::sync::oneshot::channel();
+        let join_broadcaster = broadcaster.clone();
+        let join_table = table.clone();
+        let batch_schema = Arc::clone(&schema);
+        let source = futures::stream::once(async move {
+            // The subscriber joins once the write has started reading rows.
+            let receiver = join_broadcaster.subscribe(&join_table).await;
+            let _ = joined.send(receiver);
+            RecordBatch::try_new(batch_schema, vec![Arc::new(Int32Array::from(vec![5, 6]))])
+                .map_err(DataFusionError::from)
+        });
+        let source: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), source));
+
+        task.write_streaming_data_update(
+            None,
+            StreamingDataUpdate::new(source, UpdateType::Append),
+            None,
+            None,
+        )
+        .await
+        .expect("append refresh should write");
+
+        let mut subscriber = joiner.try_recv().expect("the subscriber joined mid-write");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), subscriber.recv())
+                .await
+                .expect("the subscription should end"),
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
     }
 
     /// A full refresh is not forwarded as an append, and a failed write
