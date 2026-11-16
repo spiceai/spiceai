@@ -6,13 +6,13 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Rust Crates
 
-- adbc_core 0.24.0, Apache-2.0 
+- adbc_core 0.25.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-adbc
 
-- adbc_driver_manager 0.24.0, Apache-2.0 
+- adbc_driver_manager 0.25.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-adbc
 
-- adbc_ffi 0.24.0, Apache-2.0 
+- adbc_ffi 0.25.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-adbc
 
 - adobe-cmap-parser 0.4.1, MIT 
@@ -78,9 +78,6 @@ Spice.ai acknowledges the following open source projects for making this project
 - assert_cmd 2.2.2, Apache-2.0 OR MIT 
   <br/>https://github.com/assert-rs/assert_cmd.git
 
-- async-channel 1.9.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/smol-rs/async-channel
-
 - async-channel 2.5.0, Apache-2.0 OR MIT 
   <br/>https://github.com/smol-rs/async-channel
 
@@ -105,7 +102,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - aws-config 1.8.18, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-credential-types 1.3.0, Apache-2.0 
+- aws-credential-types 1.3.1, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - aws-lc-rs 1.18.2, (Apache-2.0 OR ISC) AND ISC 
@@ -144,16 +141,16 @@ Spice.ai acknowledges the following open source projects for making this project
 - aws-sdk-sts 1.107.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-smithy-async 1.3.0, Apache-2.0 
+- aws-smithy-async 1.3.1, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - aws-smithy-runtime 1.16.0, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-smithy-runtime-api 1.19.0, Apache-2.0 
+- aws-smithy-runtime-api 1.20.0, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-smithy-types 1.8.1, Apache-2.0 
+- aws-smithy-types 1.9.4, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - axum 0.8.9, MIT 
@@ -249,7 +246,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - calamine 0.28.0, MIT 
   <br/>https://github.com/tafia/calamine
 
-- calamine 0.37.0, MIT 
+- calamine 0.38.0, MIT 
   <br/>https://github.com/tafia/calamine
 
 - cbc 0.1.2, Apache-2.0 OR MIT 
@@ -339,70 +336,73 @@ Spice.ai acknowledges the following open source projects for making this project
 - dashmap 6.2.1, MIT 
   <br/>https://github.com/xacrimon/dashmap
 
-- datafusion 55.2.0, Apache-2.0 
+- datafusion 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-catalog 55.2.0, Apache-2.0 
+- datafusion-catalog 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-common 55.2.0, Apache-2.0 
+- datafusion-common 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-common-runtime 55.2.0, Apache-2.0 
+- datafusion-common-runtime 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-datasource 55.2.0, Apache-2.0 
+- datafusion-datasource 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-execution 55.2.0, Apache-2.0 
+- datafusion-datasource-csv 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-expr 55.2.0, Apache-2.0 
+- datafusion-execution 55.3.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-expr 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-federation 0.4.2, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-federation
 
-- datafusion-functions 55.2.0, Apache-2.0 
+- datafusion-functions 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-functions-aggregate 55.2.0, Apache-2.0 
+- datafusion-functions-aggregate 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-functions-aggregate-common 55.2.0, Apache-2.0 
+- datafusion-functions-aggregate-common 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-functions-json 0.55.6, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-functions-json/
 
-- datafusion-functions-nested 55.2.0, Apache-2.0 
+- datafusion-functions-nested 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-physical-expr 55.2.0, Apache-2.0 
+- datafusion-physical-expr 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-physical-expr-adapter 55.2.0, Apache-2.0 
+- datafusion-physical-expr-adapter 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-physical-expr-common 55.2.0, Apache-2.0 
+- datafusion-physical-expr-common 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-physical-plan 55.2.0, Apache-2.0 
+- datafusion-physical-plan 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-proto 55.2.0, Apache-2.0 
+- datafusion-proto 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-proto-common 55.2.0, Apache-2.0 
+- datafusion-proto-common 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-pruning 55.2.0, Apache-2.0 
+- datafusion-pruning 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-spark 55.2.0, Apache-2.0 
+- datafusion-spark 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-substrait 55.2.0, Apache-2.0 
+- datafusion-substrait 55.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-table-providers 0.1.0, Apache-2.0 
@@ -825,6 +825,9 @@ Spice.ai acknowledges the following open source projects for making this project
 - pkcs8 0.10.2, Apache-2.0 OR MIT 
   <br/>https://github.com/RustCrypto/formats/tree/master/pkcs8
 
+- pkcs8 0.11.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/formats
+
 - postcard 1.1.3, Apache-2.0 OR MIT 
   <br/>https://github.com/jamesmunns/postcard
 
@@ -924,7 +927,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - reqwest-eventsource 0.6.0, Apache-2.0 OR MIT 
   <br/>https://github.com/jpopesculian/reqwest-eventsource
 
-- rmcp 3.3.0, Apache-2.0 
+- rmcp 3.10.0, Apache-2.0 
   <br/>https://github.com/modelcontextprotocol/rust-sdk/
 
 - roaring 0.11.4, Apache-2.0 OR MIT 
@@ -981,7 +984,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - semver 1.0.28, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/semver
 
-- serde 1.0.228, Apache-2.0 OR MIT 
+- serde 1.0.229, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
 - serde-value 0.7.0, MIT 
@@ -1041,7 +1044,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - subtle 2.6.1, BSD-3-Clause 
   <br/>https://github.com/dalek-cryptography/subtle
 
-- suppaftp 6.3.0, Apache-2.0 OR MIT 
+- suppaftp 12.2.1, Apache-2.0 OR MIT 
   <br/>https://github.com/veeso/suppaftp
 
 - syn 1.0.109, Apache-2.0 OR MIT 
@@ -1119,7 +1122,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - tokenizers 0.22.2, Apache-2.0 
   <br/>https://github.com/huggingface/tokenizers
 
-- tokio 1.52.3, MIT 
+- tokio 1.54.1, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
 - tokio-postgres 0.7.18, Apache-2.0 OR MIT 
@@ -1188,9 +1191,6 @@ Spice.ai acknowledges the following open source projects for making this project
 - ttf-parser 0.25.1, Apache-2.0 OR MIT 
   <br/>https://github.com/harfbuzz/ttf-parser
 
-- ttf-parser 0.25.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/harfbuzz/ttf-parser
-
 - turso 0.8.2, MIT 
   <br/>https://github.com/tursodatabase/turso
 
@@ -1224,7 +1224,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - utoipa 6.0.0, Apache-2.0 OR MIT 
   <br/>https://github.com/juhaku/utoipa
 
-- utoipa-swagger-ui 9.0.2, Apache-2.0 OR MIT 
+- utoipa-swagger-ui 10.0.2, Apache-2.0 OR MIT 
   <br/>https://github.com/juhaku/utoipa
 
 - uuid 0.8.2, Apache-2.0 OR MIT 
@@ -1260,7 +1260,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - wasm-bindgen-test 0.3.72, Apache-2.0 OR MIT 
   <br/>https://github.com/wasm-bindgen/wasm-bindgen
 
-- wasmtime 48.0.7, Apache-2.0 WITH LLVM-exception 
+- wasmtime 48.0.8, Apache-2.0 WITH LLVM-exception 
   <br/>https://github.com/bytecodealliance/wasmtime
 
 - wat 1.251.0, Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT 
@@ -1305,9 +1305,6 @@ Spice.ai acknowledges the following open source projects for making this project
 - zeroize 1.8.2, Apache-2.0 OR MIT 
   <br/>https://github.com/RustCrypto/utils
 
-- zip 3.0.0, MIT 
-  <br/>https://github.com/zip-rs/zip2.git
-
 - zip 4.6.1, MIT 
   <br/>https://github.com/zip-rs/zip2.git
 
@@ -1317,7 +1314,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - zip 9.1.2, MIT 
   <br/>https://github.com/zip-rs/zip2
 
-- zstd 0.13.3, MIT 
+- zstd 0.13.5, BSD-3-Clause 
   <br/>https://github.com/gyscos/zstd-rs
 
 - zstd 0.14.3, BSD-3-Clause 
