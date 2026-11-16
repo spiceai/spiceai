@@ -2,8 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q55"
 ---
-+----------+---------------------+-----------+
-| brand_id | brand               | ext_price |
-+----------+---------------------+-----------+
-| 9015008  | scholarunivamalg #8 | 25131.36  |
-+----------+---------------------+-----------+
++----------+-----------------------+-----------+
+| brand_id | brand                 | ext_price |
++----------+-----------------------+-----------+
+| 9010011  | univunivamalg #11     | 21542.67  |
+| 6004008  | edu packcorp #8       | 20857.78  |
+| 1002001  | importoamalg #1       | 17431.18  |
+| 5001001  | amalgscholar #1       | 12373.57  |
+| 9012005  | importounivamalg #5   | 8506.15   |
+| 6009001  | maxicorp #1           | 8299.82   |
+| 5002001  | importoscholar #1     | 7486.42   |
+| 7005007  | scholarbrand #7       | 6774.67   |
+| 10015016 | scholaramalgamalg #16 | 6364.55   |
+| 10013006 | exportiamalgamalg #6  | 6022.20   |
++----------+-----------------------+-----------+

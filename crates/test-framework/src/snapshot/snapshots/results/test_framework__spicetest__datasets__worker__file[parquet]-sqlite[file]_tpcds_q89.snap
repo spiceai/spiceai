@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q89"
 ---
-+-------------+-----------+-----------------------+--------------+----------------+-------+-----------+-------------------+
-| i_category  | i_class   | i_brand               | s_store_name | s_company_name | d_moy | sum_sales | avg_monthly_sales |
-+-------------+-----------+-----------------------+--------------+----------------+-------+-----------+-------------------+
-| Music       | classical | edu packscholar #2    | ought        | Unknown        | 4     | 97.34     | 609.269166        |
-| Music       | classical | edu packscholar #2    | ought        | Unknown        | 2     | 114.65    | 609.269166        |
-| Music       | classical | edu packscholar #2    | ought        | Unknown        | 6     | 226.78    | 609.269166        |
-| Music       | classical | edu packscholar #2    | ought        | Unknown        | 7     | 312.28    | 609.269166        |
-| Electronics | audio     | edu packunivamalg #11 | ought        | Unknown        | 6     | 21.66     | 198.143333        |
-| Music       | classical | edu packscholar #2    | ought        | Unknown        | 5     | 461.09    | 609.269166        |
-| Electronics | audio     | edu packunivamalg #11 | ought        | Unknown        | 4     | 67.19     | 198.143333        |
-| Electronics | audio     | edu packunivamalg #11 | ought        | Unknown        | 3     | 78.57     | 198.143333        |
-| Music       | classical | edu packscholar #2    | ought        | Unknown        | 3     | 491.89    | 609.269166        |
-| Electronics | audio     | edu packunivamalg #11 | ought        | Unknown        | 5     | 81.22     | 198.143333        |
-+-------------+-----------+-----------------------+--------------+----------------+-------+-----------+-------------------+
++------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
+| i_category | i_class   | i_brand            | s_store_name | s_company_name | d_moy | sum_sales | avg_monthly_sales |
++------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
+| Music      | classical | edu packscholar #2 | able         | Unknown        | 6     | 229.08    | 929.835833        |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 5     | 217.31    | 787.450000        |
+| Music      | classical | edu packscholar #2 | able         | Unknown        | 3     | 377.99    | 929.835833        |
+| Children   | infants   | importoexporti #2  | able         | Unknown        | 4     | 204.76    | 691.160833        |
+| Music      | classical | edu packscholar #2 | able         | Unknown        | 4     | 451.46    | 929.835833        |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 1     | 334.84    | 787.450000        |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 3     | 355.30    | 787.450000        |
+| Music      | classical | edu packscholar #2 | able         | Unknown        | 7     | 505.58    | 929.835833        |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 2     | 416.64    | 787.450000        |
+| Children   | infants   | importoexporti #2  | able         | Unknown        | 7     | 338.25    | 691.160833        |
++------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+

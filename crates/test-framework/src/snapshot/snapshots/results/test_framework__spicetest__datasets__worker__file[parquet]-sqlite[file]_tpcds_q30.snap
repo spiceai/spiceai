@@ -2,5 +2,11 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q30"
 ---
-++
-++
++------------------+--------------+--------------+-------------+-----------------------+-------------+---------------+--------------+-----------------+---------+-------------------------------+-----------------------+------------------+
+| c_customer_id    | c_salutation | c_first_name | c_last_name | c_preferred_cust_flag | c_birth_day | c_birth_month | c_birth_year | c_birth_country | c_login | c_email_address               | c_last_review_date_sk | ctr_total_return |
++------------------+--------------+--------------+-------------+-----------------------+-------------+---------------+--------------+-----------------+---------+-------------------------------+-----------------------+------------------+
+| AAAAAAAAFJAAAAAA | Miss         | Anthony      | Bell        | N                     | 30          | 11            | 1992         | GRENADA         |         | Anthony.Bell@EK1UOvs.com      | 2452607               | 901.60           |
+| AAAAAAAAHKBAAAAA | Sir          | Craig        | Sylvester   | Y                     | 26          | 3             | 1979         | GRENADA         |         | Craig.Sylvester@xuOcg3jA3.com | 2452339               | 514.80           |
+| AAAAAAAAMHCAAAAA | Mrs.         | Wanda        | Munoz       | Y                     | 26          | 7             | 1924         | BAHRAIN         |         | Wanda.Munoz@J.edu             | 2452330               | 4783.68          |
+| AAAAAAAANMAAAAAA | Dr.          | Heriberto    | Putnam      | Y                     | 8           | 10            | 1941         | MALAYSIA        |         | Heriberto.Putnam@8qZ5ecY.org  | 2452353               | 1178.88          |
++------------------+--------------+--------------+-------------+-----------------------+-------------+---------------+--------------+-----------------+---------+-------------------------------+-----------------------+------------------+

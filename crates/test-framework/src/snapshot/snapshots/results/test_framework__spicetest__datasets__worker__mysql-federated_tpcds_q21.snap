@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q21"
 ---
-+------------------+------------------+------------+-----------+
-| w_warehouse_name | i_item_id        | inv_before | inv_after |
-+------------------+------------------+------------+-----------+
-|                  | AAAAAAAAAABDAAAA | 1696       | 1891      |
-|                  | AAAAAAAAAACDAAAA | 2208       | 2222      |
-|                  | AAAAAAAAAAHDAAAA | 2196       | 2495      |
-|                  | AAAAAAAAACHCAAAA | 1419       | 1635      |
-|                  | AAAAAAAAACLDAAAA | 2091       | 2700      |
-|                  | AAAAAAAAADKBAAAA | 1724       | 1870      |
-|                  | AAAAAAAAAEADAAAA | 2499       | 2105      |
-|                  | AAAAAAAAAFACAAAA | 2419       | 2083      |
-|                  | AAAAAAAAAFADAAAA | 2668       | 2691      |
-|                  | AAAAAAAAAHDEAAAA | 2100       | 1792      |
-+------------------+------------------+------------+-----------+
++----------------------+------------------+------------+-----------+
+| w_warehouse_name     | i_item_id        | inv_before | inv_after |
++----------------------+------------------+------------+-----------+
+| Bad cards must make. | AAAAAAAAAABDAAAA | 2535       | 2048      |
+| Bad cards must make. | AAAAAAAAAALAAAAA | 1971       | 1642      |
+| Bad cards must make. | AAAAAAAAACGCAAAA | 1766       | 1221      |
+| Bad cards must make. | AAAAAAAAACHCAAAA | 3100       | 2071      |
+| Bad cards must make. | AAAAAAAAACKCAAAA | 2548       | 1767      |
+| Bad cards must make. | AAAAAAAAACLDAAAA | 1663       | 2144      |
+| Bad cards must make. | AAAAAAAAACOBAAAA | 1202       | 1558      |
+| Bad cards must make. | AAAAAAAAADGBAAAA | 2119       | 2044      |
+| Bad cards must make. | AAAAAAAAADKBAAAA | 2404       | 2414      |
+| Bad cards must make. | AAAAAAAAAEADAAAA | 2589       | 2544      |
++----------------------+------------------+------------+-----------+

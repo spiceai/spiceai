@@ -5,7 +5,14 @@ description: "Query: tpcds_q21"
 +---------------------+------------------+------------+-----------+
 | w_warehouse_name    | i_item_id        | inv_before | inv_after |
 +---------------------+------------------+------------+-----------+
-| Conventional childr | AAAAAAAAHDAAAAAA | 2171       | 2759      |
-| Conventional childr | AAAAAAAAMBAAAAAA | 2427       | 2495      |
-| Conventional childr | AAAAAAAAPKAAAAAA | 2319       | 2866      |
+| Conventional childr | AAAAAAAABKFAAAAA | 2227       | 2500      |
+| Conventional childr | AAAAAAAACBFAAAAA | 2811       | 2824      |
+| Conventional childr | AAAAAAAACEEAAAAA | 1910       | 1919      |
+| Conventional childr | AAAAAAAACKHAAAAA | 1753       | 2021      |
+| Conventional childr | AAAAAAAACLGAAAAA | 2371       | 2464      |
+| Conventional childr | AAAAAAAACNFAAAAA | 1897       | 2848      |
+| Conventional childr | AAAAAAAADMBAAAAA | 1979       | 2507      |
+| Conventional childr | AAAAAAAAEKCAAAAA | 1712       | 2213      |
+| Conventional childr | AAAAAAAAEPDAAAAA | 2158       | 2854      |
+| Conventional childr | AAAAAAAAFKEAAAAA | 2379       | 2623      |
 +---------------------+------------------+------------+-----------+

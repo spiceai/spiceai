@@ -5,14 +5,14 @@ description: "Query: tpcds_q79"
 +-------------+--------------+--------------------------------------+------------------+---------+-----------+
 | c_last_name | c_first_name | substr(ms.s_city,Int64(1),Int64(30)) | ss_ticket_number | amt     | profit    |
 +-------------+--------------+--------------------------------------+------------------+---------+-----------+
-| Adams       | Donald       | Midway                               | 791              | 2998.05 | -14582.72 |
-| Austin      | Isela        | Midway                               | 2338             | 7797.18 | -18347.59 |
-| Austin      | Isela        | Midway                               | 2338             | 0.00    |           |
-| Buchanan    | Alvin        | Midway                               | 2216             | 138.30  | -7505.52  |
-| Byrd        | Craig        | Midway                               | 859              | 724.38  | -21096.53 |
-| Davis       | Wanda        | Midway                               | 1545             | 701.86  | -20047.83 |
-| Douglas     | Ashley       | Midway                               | 1428             | 7199.42 | -10955.13 |
-| Eller       | Christopher  | Midway                               | 1114             | 685.19  | -4589.30  |
-| Flynn       | Clifford     | Midway                               | 75               | 446.84  | -11522.64 |
-| Foster      |              | Midway                               | 1167             | 250.90  | -6909.18  |
+| Adams       | Donald       | Midway                               | 791              | 626.47  | -6186.51  |
+| Adams       | Matilde      | Midway                               | 3209             | 442.35  | -33527.90 |
+| Alger       | Jennifer     | Midway                               | 7327             | 11.24   | 2872.28   |
+| Amundson    | Gary         | Midway                               | 5950             | 1381.21 | -3450.06  |
+| Austin      | Isela        | Midway                               | 2338             | 3675.00 | -19262.55 |
+| Bailey      | Robert       | Midway                               | 5869             | 703.85  | -8812.00  |
+| Baker       | Monique      | Midway                               | 8999             | 1774.41 | -9862.71  |
+| Baldwin     | Michele      | Midway                               | 9548             | 890.37  | -7300.98  |
+| Bartley     | Mark         | Midway                               | 5202             | 621.29  | -6284.40  |
+| Bearden     | Alecia       | Midway                               | 3858             | 1706.20 | 1784.54   |
 +-------------+--------------+--------------------------------------+------------------+---------+-----------+

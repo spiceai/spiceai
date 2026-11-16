@@ -2,8 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q11"
 ---
-+------------------+---------------------+--------------------+--------------------------------+
-| customer_id      | customer_first_name | customer_last_name | customer_email_address         |
-+------------------+---------------------+--------------------+--------------------------------+
-| AAAAAAAAJIBAAAAA | Bruce               | Olvera             | Bruce.Olvera@x4L7yzc2I65OB.org |
-+------------------+---------------------+--------------------+--------------------------------+
++------------------+---------------------+--------------------+----------------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address                 |
++------------------+---------------------+--------------------+----------------------------------------+
+| AAAAAAAAAACAAAAA | Kevin               | Burns              | Kevin.Burns@2X.edu                     |
+| AAAAAAAACECAAAAA | Michael             | Hernandez          | Michael.Hernandez@Y3HoyrQiUdF7T5l1.org |
+| AAAAAAAAGCCAAAAA | Leonard             | Simmons            | Leonard.Simmons@tQSIIoRarBC.org        |
+| AAAAAAAAJHBAAAAA | Gloria              | Davis              | Gloria.Davis@x7p.com                   |
+| AAAAAAAAJIBAAAAA | Bruce               | Olvera             | Bruce.Olvera@x4L7yzc2I65OB.org         |
+| AAAAAAAAJKDAAAAA | Jason               | Haley              | Jason.Haley@Aldc2ni2IbRYDbxOqcpq.org   |
+| AAAAAAAAKKDAAAAA | Emerson             | Martin             | Emerson.Martin@rh9uuoru.com            |
+| AAAAAAAAMMBAAAAA | Veronica            | Werner             | Veronica.Werner@uqmEal6Vur.org         |
+| AAAAAAAANNAAAAAA | Kenny               | Johnson            | Kenny.Johnson@pcbnkVHQtUA7.org         |
+| AAAAAAAAOOBAAAAA | Jason               | Martin             | Jason.Martin@Rl4IggVJgCqV6.edu         |
++------------------+---------------------+--------------------+----------------------------------------+

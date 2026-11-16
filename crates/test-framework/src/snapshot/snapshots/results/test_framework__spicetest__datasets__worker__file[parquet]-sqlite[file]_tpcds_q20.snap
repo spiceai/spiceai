@@ -2,5 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q20"
 ---
-++
-++
++------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------+---------+-----------------+-------------+--------------+
+| i_item_id        | i_item_desc                                                                                                                                                                | i_category | i_class | i_current_price | itemrevenue | revenueratio |
++------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------+---------+-----------------+-------------+--------------+
+| AAAAAAAAAFCAAAAA | Mental, nice projects go enough for the bonds. Good lessons happen free paym                                                                                               | Children   | infants | 2.12            | 82.36       | 0.161272     |
+| AAAAAAAACBCAAAAA | Pleasant, furious weapons obtain yet for the poems. Radically federal activities should receive parts. Relations repair. European                                          | Children   | infants | 98.30           | 13476.66    | 26.389182    |
+| AAAAAAAADDHAAAAA | Other, present styles think obviously beforehand advanced characteristics. Entirely civil pp. keep with a schools. Angrily outstanding pa                                  | Children   | infants | 1.48            | 4234.43     | 8.291605     |
+| AAAAAAAAEFEAAAAA | Sure,                                                                                                                                                                      | Children   | infants | 7.17            | 1127.98     | 2.208742     |
+| AAAAAAAAEGHAAAAA | American, comparative buildings return separate enemies. Difficult flowers live only for a machines; likely, usual rules might love here germans. Agents encourage high at | Children   | infants | 9.72            | 4404.12     | 8.623882     |
+| AAAAAAAAENGAAAAA | Enough ltd. colleagues cannot hold as sanctions. Over beneficial views lobby just in a skills. Years enable now increasing, increasing paramete                            | Children   | infants | 2.89            | 634.20      | 1.241852     |
+| AAAAAAAAGFDAAAAA | Western, different stages will help sharp documents. Royal, serious classes develop sometimes high windows. Lips thi                                                       | Children   | infants | 8.03            | 433.78      | 0.849401     |
+| AAAAAAAAILGAAAAA | Tomorrow british groups feel chief problems. Public clothes would not modify policemen. Genera                                                                             | Children   | infants | 46.81           | 2104.96     | 4.121805     |
+| AAAAAAAAJNDAAAAA | Questions would complete alone police; rounds would seem acceptable, valuable activities. Colleges shall fight special, royal properties. Stron                            | Children   | infants | 6.10            | 2091.94     | 4.096310     |
+| AAAAAAAAKIEAAAAA | Essential, honest years pick english reasons. Ago personal bags solve often changes. Likely details ought to happen indee                                                  | Children   | infants | 0.38            | 2918.32     | 5.714478     |
++------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------+---------+-----------------+-------------+--------------+

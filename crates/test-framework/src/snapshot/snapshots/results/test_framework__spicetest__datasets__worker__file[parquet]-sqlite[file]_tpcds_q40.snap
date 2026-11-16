@@ -2,5 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q40"
 ---
-++
-++
++---------+------------------+--------------+-------------+
+| w_state | i_item_id        | sales_before | sales_after |
++---------+------------------+--------------+-------------+
+| TN      | AAAAAAAAABBAAAAA | 13.65        | 17.25       |
+| TN      | AAAAAAAAAEHAAAAA | 2.32         | 61.33       |
+| TN      | AAAAAAAAAIFAAAAA | 0.00         | 26.95       |
+| TN      | AAAAAAAAAJCAAAAA | 182.29       | 67.07       |
+| TN      | AAAAAAAABKFAAAAA | -36.71       | 198.39      |
+| TN      | AAAAAAAACFAAAAAA | 62.76        | 46.17       |
+| TN      | AAAAAAAACHFAAAAA | 103.64       | 0.00        |
+| TN      | AAAAAAAACIAAAAAA | 15.02        | 0.76        |
+| TN      | AAAAAAAACKCAAAAA | -629.62      | 0.00        |
+| TN      | AAAAAAAACNCAAAAA | 0.00         | 45.44       |
++---------+------------------+--------------+-------------+
