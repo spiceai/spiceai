@@ -138,6 +138,31 @@ impl DataUpdateBroadcaster {
         }
     }
 
+    /// The subscribed channel `table_reference` names: the one keyed by it, or
+    /// else the only one it names partially. A subscriber is keyed by the
+    /// fully qualified name its dataset resolves to once registered, while a
+    /// dataset's publisher may hold the name it was configured with.
+    pub async fn resolve_subscribed(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<TableReference> {
+        let channels = self.channels.read().await;
+        if channels.contains_key(table_reference) {
+            return Some(table_reference.clone());
+        }
+        let mut matching = channels.keys().filter(|key| {
+            key.table() == table_reference.table()
+                && table_reference
+                    .schema()
+                    .is_none_or(|schema| key.schema() == Some(schema))
+                && table_reference
+                    .catalog()
+                    .is_none_or(|catalog| key.catalog() == Some(catalog))
+        });
+        let found = matching.next()?.clone();
+        matching.next().is_none().then_some(found)
+    }
+
     pub async fn close_subscribers(&self, table_reference: &TableReference) -> bool {
         self.channels
             .write()
@@ -206,10 +231,17 @@ impl DataUpdatePublisher {
         &self.table_reference
     }
 
-    pub async fn has_subscribers(&self) -> bool {
+    async fn subscribed_reference(&self) -> Option<TableReference> {
         self.broadcaster
-            .has_subscribers(&self.table_reference)
+            .resolve_subscribed(&self.table_reference)
             .await
+    }
+
+    pub async fn has_subscribers(&self) -> bool {
+        match self.subscribed_reference().await {
+            Some(table_reference) => self.broadcaster.has_subscribers(&table_reference).await,
+            None => false,
+        }
     }
 
     /// Sends appended rows to every current subscriber. Call it only once the
@@ -223,9 +255,12 @@ impl DataUpdatePublisher {
         if data.is_empty() {
             return;
         }
+        let Some(table_reference) = self.subscribed_reference().await else {
+            return;
+        };
         self.broadcaster
             .publish(
-                &self.table_reference,
+                &table_reference,
                 DataUpdate {
                     schema,
                     data,
@@ -239,9 +274,10 @@ impl DataUpdatePublisher {
     /// too large to forward. A subscriber then resubscribes and takes a fresh
     /// snapshot instead of silently missing the rows.
     pub async fn close_subscribers(&self) -> bool {
-        self.broadcaster
-            .close_subscribers(&self.table_reference)
-            .await
+        match self.subscribed_reference().await {
+            Some(table_reference) => self.broadcaster.close_subscribers(&table_reference).await,
+            None => false,
+        }
     }
 }
 
@@ -561,6 +597,36 @@ mod tests {
             .expect("published update should be received");
         assert_eq!(update.schema, schema);
         assert!(matches!(update.update_type, UpdateType::Append));
+    }
+
+    /// A publisher configured with a dataset's bare name reaches a subscriber
+    /// keyed by the fully qualified name the dataset registered under.
+    #[tokio::test]
+    async fn publisher_reaches_a_subscriber_of_the_qualified_name() {
+        let broadcaster = DataUpdateBroadcaster::new();
+        let qualified = TableReference::full("spice", "public", "events");
+        let mut receiver = broadcaster.subscribe(&qualified).await;
+        let publisher =
+            DataUpdatePublisher::new(broadcaster.clone(), TableReference::bare("events"));
+        assert!(publisher.has_subscribers().await);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .expect("batch");
+        publisher.publish_append(schema, vec![batch]).await;
+        let update = receiver.recv().await.expect("an update");
+        assert_eq!(update.data.len(), 1);
+
+        let _other = broadcaster
+            .subscribe(&TableReference::full("other", "public", "events"))
+            .await;
+        assert!(
+            !publisher.has_subscribers().await,
+            "an ambiguous bare name reaches no one"
+        );
     }
 
     #[tokio::test]
