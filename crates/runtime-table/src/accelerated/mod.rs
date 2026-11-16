@@ -545,6 +545,9 @@ pub struct Builder {
     fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
+    /// Forwards committed append refreshes to the dataset's `DoExchange`
+    /// subscribers.
+    data_update_publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
 }
 
 impl Builder {
@@ -604,6 +607,7 @@ impl Builder {
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
+            data_update_publisher: None,
             fallback_retention_keep: None,
             append_cursor_store: None,
         }
@@ -949,6 +953,17 @@ impl Builder {
         self
     }
 
+    /// Forward each committed append refresh to the dataset's `DoExchange`
+    /// subscribers, so an append stream from this dataset delivers the rows
+    /// its refreshes append.
+    pub fn data_update_publisher(
+        &mut self,
+        publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
+    ) -> &mut Self {
+        self.data_update_publisher = publisher;
+        self
+    }
+
     /// Provide per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`. These layer on top of the runtime-global
     /// CDC config only for this dataset's changes stream;
@@ -1218,6 +1233,7 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
+        refresher.with_data_update_publisher(self.data_update_publisher);
 
         // Durable federated write-back (#11838): a WriteBack Cayenne table whose
         // commit path marks dirty keys gets a per-table delivery worker that

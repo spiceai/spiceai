@@ -4309,6 +4309,12 @@ impl DataFusion {
         accelerated_table_builder.cdc_apply_runtime(self.cdc_apply_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        accelerated_table_builder.data_update_publisher(Some(
+            crate::dataupdate::DataUpdatePublisher::new(
+                self.data_update_broadcaster.clone(),
+                self.normalize_table_reference(dataset.name.clone()),
+            ),
+        ));
         accelerated_table_builder.cdc_param_overrides(
             crate::accelerated::refresh_task::changes::extract_cdc_param_overrides(
                 &acceleration_settings.params,
