@@ -279,7 +279,7 @@ jobs:
           docker run --rm localhost:5000/spiceai:dev-arm64 --version
 
       - name: Upload ARM64 artifact
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-arm64
           path: /tmp/image-arm64.tar
@@ -355,7 +355,7 @@ jobs:
           docker run --rm localhost:5000/spiceai:dev-amd64 --version
 
       - name: Upload AMD64 artifact
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-amd64
           path: /tmp/image-amd64.tar
@@ -371,7 +371,7 @@ jobs:
       id-token: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp
           pattern: image-*

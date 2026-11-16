@@ -148,14 +148,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '36000'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -163,7 +163,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -175,12 +175,12 @@ jobs:
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -188,7 +188,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
+        uses: $/.github/actions/setup-testoperator-data
         with:
           query_set: ${{ github.event.inputs.query_set }}
           scale_factor: ${{ github.event.inputs.scale_factor }}
@@ -209,11 +209,11 @@ jobs:
 
       - name: Install ADBC BigQuery Driver
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/setup-adbc-bigquery
+        uses: $/.github/actions/setup-adbc-bigquery
 
       - name: Set up BigQuery credentials (workload identity federation)
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/bigquery-credentials
+        uses: $/.github/actions/bigquery-credentials
         with:
           workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
           service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}

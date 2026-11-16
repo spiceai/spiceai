@@ -94,12 +94,12 @@ jobs:
 
       - name: Check for code changes
         id: check
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
 
       - name: Check for federated source changes
         id: check_sources
         if: github.event_name == 'push'
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           # The connectors, the test helpers that start the source containers, and
           # the version list itself. Dependency bumps (database drivers, and the
@@ -208,24 +208,24 @@ jobs:
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Install protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Get RustFS credentials
         id: rustfs
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '12000'
@@ -233,7 +233,7 @@ jobs:
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-sccache
+        uses: $/.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -242,7 +242,7 @@ jobs:
 
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       # Build the test binaries without running tests
       - name: Build integration test archives
@@ -329,7 +329,7 @@ jobs:
 
       - name: Set up MinIO client
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -347,7 +347,7 @@ jobs:
 
       - name: Upload test archive (artifact fallback)
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: integration-tests-archive
           path: ./integration_tests.tar.zst
@@ -403,16 +403,16 @@ jobs:
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Install Oracle ODPI-C
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-oracle-odpi
+        uses: $/.github/actions/setup-oracle-odpi
 
       - name: Get RustFS credentials
         id: rustfs
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '5400'
@@ -420,7 +420,7 @@ jobs:
 
       - name: Set up MinIO client
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -439,19 +439,19 @@ jobs:
 
       - name: Download test archive
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: integration-tests-archive
           path: ./integration_tests
 
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
       - name: Install libduckdb
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-libduckdb
+        uses: $/.github/actions/setup-libduckdb
 
       # Tests also pull images, so the login has to last the whole job.
       - name: Login to DockerHub
@@ -614,7 +614,7 @@ jobs:
 
       - name: Configure apt mirrors for the retention OOM test
         if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       # The retention OOM test packages its own debug test binary as the Docker build context
       # and runs `strip --strip-debug` on it first. This job installs no C toolchain, so without
@@ -661,7 +661,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz
@@ -697,16 +697,16 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       # The archive links the Oracle client library, as in the partitions.
       - name: Install Oracle ODPI-C
-        uses: ./.github/actions/setup-oracle-odpi
+        uses: $/.github/actions/setup-oracle-odpi
 
       - name: Get RustFS credentials
         id: rustfs
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '3600'
@@ -714,7 +714,7 @@ jobs:
 
       - name: Set up MinIO client
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -733,17 +733,17 @@ jobs:
 
       - name: Download test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: integration-tests-archive
           path: ./integration_tests
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
       - name: Install libduckdb
-        uses: ./.github/actions/setup-libduckdb
+        uses: $/.github/actions/setup-libduckdb
 
       # Tests also pull images, so the login has to last the whole job.
       - name: Login to DockerHub
@@ -1001,7 +1001,7 @@ jobs:
       - name: Download integration snapshots artifacts
         id: download_snapshots
         continue-on-error: true
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: integration-snapshots-part-*
           merge-multiple: true
@@ -1023,7 +1023,7 @@ jobs:
       - name: Push snapshots to branch
         if: steps.download_snapshots.outcome == 'success'
         timeout-minutes: 10
-        uses: ./.github/actions/push-snap-changes
+        uses: $/.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -1068,12 +1068,12 @@ jobs:
         run: python3 test/github/check_permissions.py --artifacts github-api-results
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Get RustFS credentials
         id: rustfs
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '2400'
@@ -1081,7 +1081,7 @@ jobs:
 
       - name: Set up MinIO client
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -1100,17 +1100,17 @@ jobs:
 
       - name: Download GitHub test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: integration-tests-archive
           path: ./integration_tests
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       - name: Set up Github Token
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/key-vault-app-token
+        uses: $/.github/actions/key-vault-app-token
         id: github-app-token
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
@@ -1144,7 +1144,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload GitHub permission diagnostics
         if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: github-api-permissions
           path: github-api-results/
@@ -1167,7 +1167,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: integration-snapshots-part-github
           path: integration-snapshots-part-github.tar.gz
@@ -1192,12 +1192,12 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Get RustFS credentials
         id: rustfs
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '3600'
@@ -1205,7 +1205,7 @@ jobs:
 
       - name: Set up MinIO client
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -1224,13 +1224,13 @@ jobs:
 
       - name: Download AWS SDK test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: integration-tests-archive
           path: ./integration_tests
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       - name: Assume the Databricks Delta role
         id: aws-databricks-delta
@@ -1272,12 +1272,12 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Get RustFS credentials
         id: rustfs
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '3600'
@@ -1285,7 +1285,7 @@ jobs:
 
       - name: Set up MinIO client
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -1304,13 +1304,13 @@ jobs:
 
       - name: Download AWS SDK credential bridge test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: integration-tests-archive
           path: ./integration_tests
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       - name: Run AWS SDK credential bridge integration test
         env:
@@ -1349,12 +1349,12 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Get RustFS credentials
         id: rustfs
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '3600'
@@ -1362,7 +1362,7 @@ jobs:
 
       - name: Set up MinIO client
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -1381,13 +1381,13 @@ jobs:
 
       - name: Download snapshot refresh test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: integration-tests-archive
           path: ./integration_tests
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       - name: Assume the Iceberg role
         id: aws-iceberg
@@ -1428,12 +1428,12 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Get RustFS credentials
         id: rustfs
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '3600'
@@ -1441,7 +1441,7 @@ jobs:
 
       - name: Set up MinIO client
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -1460,13 +1460,13 @@ jobs:
 
       - name: Download data components test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: integration-tests-archive
           path: ./integration_tests
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       - name: Run data components integration test
         env:
@@ -1498,12 +1498,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Get RustFS credentials
         id: rustfs
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '3600'
@@ -1511,7 +1511,7 @@ jobs:
 
       - name: Set up MinIO client
         if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -1530,13 +1530,13 @@ jobs:
 
       - name: Download partition table test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: integration-tests-archive
           path: ./integration_tests
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: $/.github/actions/setup-nextest
 
       - name: Run partition table integration test
         env:
@@ -1561,7 +1561,7 @@ jobs:
 
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: integration-snapshots-part-runtime-partition
           path: integration-snapshots-part-runtime-partition.tar.gz

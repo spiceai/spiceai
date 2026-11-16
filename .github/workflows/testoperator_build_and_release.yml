@@ -41,14 +41,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '21600'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -56,7 +56,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           install_to_system_path: 'false'
           upload_artifact: 'true'
@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download binary
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: testoperator-linux
           path: ./build
