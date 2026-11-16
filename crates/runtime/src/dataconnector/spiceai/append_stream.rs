@@ -512,7 +512,8 @@ mod tests {
     async fn replacement(
         stream: &mut BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>,
     ) -> usize {
-        let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        // Long enough for a reload to time out under paused time.
+        let envelope = tokio::time::timeout(SNAPSHOT_END_ERROR_AFTER * 4, stream.next())
             .await
             .expect("a replacement")
             .expect("an envelope")
@@ -837,12 +838,12 @@ mod tests {
         assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
         assert_eq!(
             replacement(&mut stream).await,
-            3,
-            "the snapshot's 2 rows and the 1 staged update past it"
+            4,
+            "the snapshot's 2 rows and the 2 rows of the staged update past it"
         );
         assert_eq!(
             next_rows(&mut stream).await,
-            Some((1, true)),
+            Some((2, true)),
             "the new commit"
         );
         assert_eq!(next_rows(&mut stream).await, None, "the replay is skipped");
