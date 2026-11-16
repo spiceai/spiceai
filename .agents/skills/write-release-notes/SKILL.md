@@ -253,7 +253,7 @@ Use the thematic order below to group the remaining subsections and to break tie
   | Apache DataFusion      | v55.2.0 | v55.3.0 |
   | ADBC                   | v0.24.0 | v0.25.0 |
   | `rmcp`                 | v3.3.0  | v3.10.0 |
-  | `zip`                  | v3.0.0  | Removed |
+  | `zip` 3                | v3.0.0  | Removed |
   ```
 
   DataFusion is the first row. Use the product name for a major dependency and the backticked crate name for a crate. Read every version from `Cargo.lock` at the previous tag and at the release ref, never from a PR title:
@@ -263,7 +263,7 @@ Use the thematic order below to group the remaining subsections and to break tie
   for c in datafusion adbc_core rmcp; do echo "$c | $(lockver v2.4.2 $c)| $(lockver origin/release/2.4 $c)"; done
   ```
 
-  When a crate has several locked versions, show the one that changed. Write `Removed` for a crate that the release drops. After the table, one sentence links to the dependency subsections and to the advisory list.
+  When a crate has several locked versions, show the one that changed. Write `Removed` only for what the release drops. When other major versions of the crate remain, name the dropped major in the row (`` `zip` 3 ``), so the row does not claim that the whole crate is gone. After the table, one sentence links to the dependency subsections and to the advisory list.
 
 ## Breaking changes in a patch release
 
