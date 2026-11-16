@@ -13,12 +13,14 @@ name: publish_release
 #      build_release run attested each of them;
 #   2. `images` builds the Docker images from the published binaries, and its
 #      two push jobs (the multi-arch image and the CUDA image) push them.
-# After `publish`, `install-site` checks install.spiceai.org and needs no
-# approval. The site serves the scripts of a release pinned in the
+# After `publish`, two jobs run with no approval. `install-site` checks
+# install.spiceai.org. The site serves the scripts of a release pinned in the
 # install.spiceai.org Worker's repository, which cannot be this release yet,
 # so the job fails only when what the site serves is not exactly a published
 # release's scripts at that release's tagged commit, and warns with the pin to
-# make when that release is earlier than the latest.
+# make when that release is earlier than the latest. `install-tests` starts
+# install_scripts_test.yml on trunk, which installs the new release with the
+# install scripts.
 # Only publishing creates a release tag. Nothing already published is
 # replaced. To retry a failed step, re-run the failed jobs of the same run.
 on:
@@ -174,6 +176,24 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 ./.github/scripts/verify_install_site.py --allow-earlier-release
+
+  # A release published with this run's token starts no workflow by itself, but a
+  # dispatch does. A failed install_scripts_test.yml run it starts opens an issue.
+  install-tests:
+    environment: secret-free
+    name: Start the install scripts test
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch install_scripts_test.yml on trunk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run install_scripts_test.yml --repo "$GITHUB_REPOSITORY" --ref trunk \
+            -f published_release="$RELEASE_VERSION"
 
   images:
     name: Docker images

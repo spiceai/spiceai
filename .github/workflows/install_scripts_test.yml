@@ -13,6 +13,8 @@ on:
       - 'test/scripts/install-ps1-test.ps1'
       - 'test/scripts/install-ps1-path-test.ps1'
       - 'test/scripts/install-download-test.py'
+      - 'test/scripts/install-fake-github.py'
+      - 'test/scripts/install-release-check.sh'
       - '.github/workflows/install_scripts_test.yml'
   push:
     branches:
@@ -23,14 +25,26 @@ on:
       - 'test/scripts/install-ps1-test.ps1'
       - 'test/scripts/install-ps1-path-test.ps1'
       - 'test/scripts/install-download-test.py'
+      - 'test/scripts/install-fake-github.py'
+      - 'test/scripts/install-release-check.sh'
       - '.github/workflows/install_scripts_test.yml'
+  # Daily, so a change on GitHub's side (rate limits, the API, release assets) is caught without a PR.
+  schedule:
+    - cron: '17 6 * * *'
+  # publish_release.yml dispatches this after it publishes a release, with the release's version.
   workflow_dispatch:
+    inputs:
+      published_release:
+        description: 'The version publish_release.yml just published. A failed run opens an issue, as a scheduled one does.'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -81,12 +95,14 @@ jobs:
         shell: bash
         run: sudo apt-get update && sudo apt-get install -y zsh
 
+      # Linux images ship wget, so the wget tests must run there, not skip.
       - name: Run install script tests
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUIRE_WGET: ${{ contains(matrix.os, 'linux') && '--require-wget' || '' }}
         run: |
           chmod +x test/scripts/install-scripts-test.sh
-          bash test/scripts/install-scripts-test.sh --live
+          bash test/scripts/install-scripts-test.sh --live $REQUIRE_WGET
 
   # Test shell detection and PATH configuration
   test-shell-detection:
@@ -285,10 +301,88 @@ jobs:
           unset GITHUB_TOKEN
           "$SPICED_INSTALL_DIR/spiced" --version
 
-  # Test specific version installation
+  # Install specific releases, and check each download was verified against what its release
+  # records: its SHA256SUMS and build attestation when it publishes them, otherwise the sha256
+  # GitHub recorded for the asset.
   test-specific-version:
     environment: secret-free
-    name: Specific Version Install (${{ matrix.os }})
+    name: Specific Version Install (${{ matrix.platform.os }}, ${{ matrix.version }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: linux-x64
+            runner: ubuntu-24.04
+          - os: linux-arm64
+            runner: ubuntu-24.04-arm
+          - os: macos-arm64
+            runner: macos-latest
+        # A release with SHA256SUMS joins this list once one is published.
+        version: [latest, 2.4.1, 1.11.6]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Look up release ${{ matrix.version }}
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash test/scripts/install-release-check.sh release "${{ matrix.version }}"
+
+      - name: Test install.sh with a specific version
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_CLI_INSTALL_DIR: ${{ github.workspace }}/bin-cli
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SUMS: ${{ steps.release.outputs.sums }}
+          ASSET: ${{ steps.release.outputs.cli_asset }}
+        run: |
+          mkdir -p "$SPICE_CLI_INSTALL_DIR"
+          ./install/install.sh "$RELEASE_VERSION" 2>&1 | tee "$RUNNER_TEMP/install-cli.log"
+          expect() { grep -qF -- "$1" "$RUNNER_TEMP/install-cli.log" || { echo "::error::The install output lacks: $1"; exit 1; }; }
+          if [ "$RELEASE_SUMS" = yes ]; then
+            expect "Verified the sha256 of $ASSET against the SHA256SUMS of release $RELEASE_TAG."
+            expect "Verified the build attestation of $ASSET."
+          else
+            expect "Verified the sha256 of $ASSET against the sha256 GitHub recorded for $ASSET in release $RELEASE_TAG."
+          fi
+          unset GITHUB_TOKEN
+          "$SPICE_CLI_INSTALL_DIR/spice" version
+
+      - name: Test install-spiced.sh with a specific version
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_INSTALL_DIR: ${{ github.workspace }}/bin-spiced
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SUMS: ${{ steps.release.outputs.sums }}
+          ASSET: ${{ steps.release.outputs.runtime_asset }}
+        run: |
+          mkdir -p "$SPICED_INSTALL_DIR"
+          ./install/install-spiced.sh "$RELEASE_VERSION" 2>&1 | tee "$RUNNER_TEMP/install-spiced.log"
+          expect() { grep -qF -- "$1" "$RUNNER_TEMP/install-spiced.log" || { echo "::error::The install output lacks: $1"; exit 1; }; }
+          if [ "$RELEASE_SUMS" = yes ]; then
+            expect "Verified the sha256 of $ASSET against the SHA256SUMS of release $RELEASE_TAG."
+            expect "Verified the build attestation of $ASSET."
+          else
+            expect "Verified the sha256 of $ASSET against the sha256 GitHub recorded for $ASSET in release $RELEASE_TAG."
+          fi
+          unset GITHUB_TOKEN
+          "$SPICED_INSTALL_DIR/spiced" --version
+
+  # Install the latest release as someone with no GitHub account does: no token, and a GitHub CLI
+  # that is not logged in. A runner shares its address's 60 unauthenticated API requests an hour
+  # with other users, so the installs run only when enough are left, and the job says so when not.
+  test-no-account:
+    environment: secret-free
+    name: No GitHub Account (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -296,8 +390,6 @@ jobs:
         include:
           - os: linux-x64
             runner: ubuntu-24.04
-          - os: linux-arm64
-            runner: ubuntu-24.04-arm
           - os: macos-arm64
             runner: macos-latest
     steps:
@@ -306,41 +398,60 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Get a known release version
-        id: get_version
+      - name: Look up the latest release
+        id: release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Get the latest release tag and strip the 'v' prefix (scripts add it back)
-          VERSION=$(gh api repos/spiceai/spiceai/releases/latest --jq '.tag_name')
-          VERSION=${VERSION#v}
-          test -n "$VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Testing with version: $VERSION"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash test/scripts/install-release-check.sh release latest
 
-      - name: Test install.sh with specific version
+      - name: Check the unauthenticated API rate limit
+        id: budget
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_CLI_INSTALL_DIR: ${{ github.workspace }}/bin-cli
-          RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
+          PER_INSTALL: ${{ steps.release.outputs.api_requests }}
+        # Two installs, of the CLI and of the runtime.
+        run: bash test/scripts/install-release-check.sh budget "$((2 * PER_INSTALL))"
+
+      - name: Install the CLI and the runtime with no token
+        if: steps.budget.outputs.run == 'true'
+        shell: bash
+        env:
+          GH_CONFIG_DIR: ${{ runner.temp }}/gh-no-account
+          SPICE_CLI_INSTALL_DIR: ${{ runner.temp }}/no-account-cli
+          SPICED_INSTALL_DIR: ${{ runner.temp }}/no-account-spiced
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SUMS: ${{ steps.release.outputs.sums }}
+          CLI_ASSET: ${{ steps.release.outputs.cli_asset }}
+          RUNTIME_ASSET: ${{ steps.release.outputs.runtime_asset }}
         run: |
-          mkdir -p "$SPICE_CLI_INSTALL_DIR"
-          chmod +x install/install.sh
-          ./install/install.sh "$RELEASE_VERSION"
-          unset GITHUB_TOKEN
+          unset GITHUB_TOKEN GH_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+          mkdir -p "$GH_CONFIG_DIR" "$SPICE_CLI_INSTALL_DIR" "$SPICED_INSTALL_DIR"
+          if gh auth status > /dev/null 2>&1; then
+            echo "::error::gh is logged in, so this would not test an install with no account"
+            exit 1
+          fi
+          check() {
+            local log="$1" asset="$2"
+            expect() { grep -qF -- "$1" "$log" || { echo "::error::The install output lacks: $1"; exit 1; }; }
+            if [ "$RELEASE_SUMS" = yes ]; then
+              expect "Verified the sha256 of $asset against the SHA256SUMS of release $RELEASE_TAG."
+              expect "Skipped the build attestation check of $asset: the GitHub CLI (gh) is not installed or not logged in."
+            else
+              expect "Verified the sha256 of $asset against the sha256 GitHub recorded for $asset in release $RELEASE_TAG."
+            fi
+          }
+          ./install/install.sh 2>&1 | tee "$RUNNER_TEMP/no-account-cli.log"
+          check "$RUNNER_TEMP/no-account-cli.log" "$CLI_ASSET"
           "$SPICE_CLI_INSTALL_DIR/spice" version
-
-      - name: Test install-spiced.sh with specific version
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICED_INSTALL_DIR: ${{ github.workspace }}/bin-spiced
-          RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
-        run: |
-          mkdir -p "$SPICED_INSTALL_DIR"
-          chmod +x install/install-spiced.sh
-          ./install/install-spiced.sh "$RELEASE_VERSION"
-          unset GITHUB_TOKEN
+          ./install/install-spiced.sh 2>&1 | tee "$RUNNER_TEMP/no-account-spiced.log"
+          check "$RUNNER_TEMP/no-account-spiced.log" "$RUNTIME_ASSET"
           "$SPICED_INSTALL_DIR/spiced" --version
+
+      - name: Show the rate limit after a failed install
+        if: failure() && steps.budget.outputs.run == 'true'
+        shell: bash
+        run: curl -fsS https://api.github.com/rate_limit | jq '.resources.core'
 
   # Test HTTP client fallback (curl vs wget)
   test-http-clients:
@@ -509,7 +620,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x test/scripts/install-scripts-test.sh
-          ./test/scripts/install-scripts-test.sh --live
+          ./test/scripts/install-scripts-test.sh --live --require-wget
 
       - name: Test install.sh in WSL
         shell: wsl-bash {0}
@@ -589,6 +700,59 @@ jobs:
             Write-Host "Current User PATH: $userPath"
           }
 
+  # Install.ps1 as someone with no GitHub account runs it: no token. The rate limit gate works as
+  # in test-no-account.
+  test-windows-no-token:
+    environment: secret-free
+    name: Windows No GitHub Account (PowerShell)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Look up the latest release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash test/scripts/install-release-check.sh release latest
+
+      - name: Check the unauthenticated API rate limit
+        id: budget
+        shell: bash
+        env:
+          NEEDED: ${{ steps.release.outputs.api_requests }}
+        run: bash test/scripts/install-release-check.sh budget "$NEEDED"
+
+      - name: Install the CLI with no token
+        if: steps.budget.outputs.run == 'true'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SUMS: ${{ steps.release.outputs.sums }}
+          ASSET: ${{ steps.release.outputs.cli_asset }}
+        run: |
+          Remove-Item Env:GITHUB_TOKEN, Env:GH_TOKEN -ErrorAction SilentlyContinue
+          $output = (.\install\Install.ps1 | Out-String)
+          Write-Output $output
+          $expected = if ($env:RELEASE_SUMS -eq "yes") {
+            "Verified the sha256 of $env:ASSET against the SHA256SUMS of release $env:RELEASE_TAG."
+          } else {
+            "Verified the sha256 of $env:ASSET against the sha256 GitHub recorded for $env:ASSET in release $env:RELEASE_TAG."
+          }
+          if (-not $output.Contains($expected)) {
+            Write-Output "::error::The install output lacks: $expected"
+            exit 1
+          }
+          & (Join-Path $HOME ".spice\bin\spice.exe") version
+
+      - name: Show the rate limit after a failed install
+        if: failure() && steps.budget.outputs.run == 'true'
+        shell: bash
+        run: curl -fsS https://api.github.com/rate_limit | jq '.resources.core'
+
   # Test Windows PowerShell with custom directory
   test-windows-custom-dir:
     environment: secret-free
@@ -631,6 +795,7 @@ jobs:
 
   # Test Windows PowerShell error handling
   test-windows-errors:
+    if: github.event_name != 'schedule'
     environment: secret-free
     name: Windows Error Handling (PowerShell)
     runs-on: windows-latest
@@ -688,6 +853,7 @@ jobs:
 
   # Validate scripts with shellcheck
   shellcheck:
+    if: github.event_name != 'schedule'
     environment: secret-free
     name: Shellcheck
     runs-on: ubuntu-latest
@@ -712,3 +878,76 @@ jobs:
       - name: Run shellcheck on test script
         run: |
           shellcheck -e SC2034,SC2086,SC2155 test/scripts/install-scripts-test.sh
+
+      - name: Run shellcheck on the live job helper
+        run: |
+          shellcheck test/scripts/install-release-check.sh
+
+  # A failed scheduled run, or a failed run that publish_release.yml started for a release it
+  # published, opens an issue, or updates the open one: nobody watches those runs.
+  report-failure:
+    if: failure() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.published_release != ''))
+    needs:
+      - test-install-scripts
+      - test-shell-detection
+      - test-custom-install-dir
+      - test-spiced-variants
+      - test-specific-version
+      - test-no-account
+      - test-http-clients
+      - test-error-handling
+      - test-windows-wsl
+      - test-windows-native
+      - test-windows-no-token
+      - test-windows-custom-dir
+    environment: secret-free
+    name: Report the failure
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the install scripts issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PUBLISHED_RELEASE: ${{ inputs.published_release }}
+        with:
+          script: |
+            const marker = '<!-- install-scripts-test-failure -->';
+            const title = 'Install scripts fail against GitHub';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const release = process.env.PUBLISHED_RELEASE;
+            const trigger = release ? `the publication of v${release}` : 'the daily schedule';
+            const body = [
+              marker,
+              `The install scripts test, run by ${trigger}, failed: a user installing Spice the documented way may be failing too.`,
+              '',
+              `Run: ${runUrl}`,
+              `Commit: ${context.sha}`,
+            ].join('\n');
+
+            // Paginate: the marker issue falls off the first page of open issues within days.
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = issues.find((issue) =>
+              !issue.pull_request && issue.title === title && issue.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+              core.info(`Updated #${existing.number}`);
+            } else {
+              const { data: created } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+              core.info(`Opened #${created.number}`);
+            }
