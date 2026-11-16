@@ -77,6 +77,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{Instrument, Span};
 
 mod actions;
+pub(crate) mod append_stream;
 mod async_actions;
 mod do_exchange;
 mod do_get;
