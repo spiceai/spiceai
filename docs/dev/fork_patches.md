@@ -924,7 +924,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**63 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**64 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
