@@ -241,25 +241,43 @@ pub(crate) async fn handle(
         )));
     };
 
+    Ok(Response::new(
+        open_subscription(
+            &flight_svc.data_update_broadcaster,
+            &datafusion,
+            table_provider,
+            data_path,
+        )
+        .await?,
+    ))
+}
+
+/// Opens an append-stream subscription to `data_path`: its truncate, snapshot,
+/// end marker, and then the updates committed after the snapshot.
+pub(crate) async fn open_subscription(
+    broadcaster: &crate::dataupdate::DataUpdateBroadcaster,
+    datafusion: &Arc<crate::datafusion::DataFusion>,
+    table_provider: Arc<dyn TableProvider>,
+    data_path: TableReference,
+) -> Result<futures::stream::BoxStream<'static, Result<FlightData, Status>>, Status> {
     // Subscribe and open the snapshot while no fenced commit runs, so the
     // snapshot holds exactly the commits up to the sequence number read, and
     // every later commit reaches the subscription.
-    let broadcaster = &flight_svc.data_update_broadcaster;
     let (rx, snapshot_fence) = broadcaster.subscribe_at_snapshot(&data_path).await;
-    let snapshot = initial_snapshot_stream(&datafusion, Arc::clone(&table_provider)).await?;
+    let snapshot = initial_snapshot_stream(datafusion, Arc::clone(&table_provider)).await?;
     let snapshot_position = SnapshotPosition {
         epoch: broadcaster.epoch().to_string(),
         sequence: snapshot_fence.sequence,
     };
     drop(snapshot_fence);
 
-    Ok(Response::new(do_exchange_response_stream(
+    Ok(do_exchange_response_stream(
         rx,
         snapshot,
         snapshot_position,
         table_provider,
         data_path,
-    )))
+    ))
 }
 
 /// Where a subscription's snapshot stands in the producer's commits.

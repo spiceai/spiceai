@@ -246,3 +246,392 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_flight::FlightData;
+    use arrow_flight::decode::FlightDataDecoder;
+    use datafusion::common::TableReference;
+    use datafusion::datasource::{MemTable, TableProvider};
+    use datafusion::prelude::SessionContext;
+    use futures::stream::BoxStream;
+    use futures::{StreamExt, TryStreamExt};
+
+    use super::*;
+    use crate::datafusion::DataFusion;
+    use crate::dataupdate::{DataUpdate, DataUpdateBroadcaster, UpdateType};
+    use crate::flight::append_stream::StreamMarker;
+    use crate::flight::do_exchange::open_subscription;
+
+    const DATASET: &str = "orders";
+
+    type Messages = BoxStream<'static, Result<FlightData, FlightError>>;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    fn batch(ids: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(ids))]).expect("batch")
+    }
+
+    fn table(ids: Vec<i32>) -> Arc<MemTable> {
+        Arc::new(MemTable::try_new(schema(), vec![vec![batch(ids)]]).expect("mem table"))
+    }
+
+    fn update(ids: Vec<i32>) -> DataUpdate {
+        DataUpdate {
+            schema: schema(),
+            data: vec![batch(ids)],
+            update_type: UpdateType::Append,
+        }
+    }
+
+    /// The messages of a real `DoExchange` subscription to `table`.
+    async fn producer(
+        datafusion: &Arc<DataFusion>,
+        broadcaster: &DataUpdateBroadcaster,
+        table: Arc<MemTable>,
+    ) -> Messages {
+        open_subscription(
+            broadcaster,
+            datafusion,
+            table as Arc<dyn TableProvider>,
+            TableReference::bare(DATASET),
+        )
+        .await
+        .expect("subscription opens")
+        .map_err(|status| FlightError::Tonic(Box::new(status)))
+        .boxed()
+    }
+
+    /// The messages up to and including the snapshot's end marker.
+    async fn through_end(mut messages: Messages) -> (Vec<FlightData>, Messages) {
+        let mut taken = Vec::new();
+        while let Some(message) = messages.next().await {
+            let message = message.expect("message");
+            let end = StreamMetadata::parse(&message.app_metadata)
+                .is_some_and(|metadata| metadata.marker == StreamMarker::End);
+            taken.push(message);
+            if end {
+                return (taken, messages);
+            }
+        }
+        panic!("the producer sent no end marker");
+    }
+
+    /// `messages`, then a stream that stays open.
+    fn held_open(messages: Vec<FlightData>) -> Messages {
+        futures::stream::iter(messages.into_iter().map(Ok))
+            .chain(futures::stream::pending())
+            .boxed()
+    }
+
+    /// The last record batch message of a snapshot: a snapshot row batch.
+    fn row_message(snapshot: &[FlightData]) -> FlightData {
+        snapshot[snapshot.len() - 2].clone()
+    }
+
+    /// The consumer, reading each subscription from the next of `subscriptions`.
+    fn consumer(
+        subscriptions: Vec<Messages>,
+    ) -> BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>> {
+        let mut subscriptions: VecDeque<Messages> = subscriptions.into();
+        append_stream(
+            move || {
+                let next = subscriptions.pop_front();
+                async move {
+                    next.map(FlightDataDecoder::new)
+                        .ok_or("no more subscriptions")
+                }
+            },
+            DATASET.to_string(),
+        )
+        .boxed()
+    }
+
+    /// One subscription's envelopes as the consumer yields them.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Snapshot {
+        /// Rows applied before the dataset is ready, the truncate included.
+        rows_before_ready: usize,
+        /// Whether any of them was marked ready.
+        any_ready_before: bool,
+    }
+
+    /// Reads envelopes until a ready envelope, for `snapshots` snapshots.
+    async fn snapshots(
+        stream: &mut BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>,
+        snapshots: usize,
+    ) -> Vec<Snapshot> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut read = Vec::new();
+            let mut current = Snapshot::default();
+            while read.len() < snapshots {
+                let envelope = stream
+                    .next()
+                    .await
+                    .expect("an envelope")
+                    .expect("not an error");
+                if envelope.is_heartbeat() && envelope.is_dataset_ready() {
+                    read.push(std::mem::take(&mut current));
+                    continue;
+                }
+                current.rows_before_ready += envelope.num_rows_hint();
+                current.any_ready_before |= envelope.is_dataset_ready();
+            }
+            read
+        })
+        .await
+        .expect("the snapshots are read")
+    }
+
+    /// The rows of the next envelope, once the snapshot is read.
+    async fn next_rows(
+        stream: &mut BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>,
+    ) -> Option<(usize, bool)> {
+        tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .ok()
+            .flatten()
+            .map(|envelope| {
+                let envelope = envelope.expect("not an error");
+                (envelope.num_rows_hint(), envelope.is_dataset_ready())
+            })
+    }
+
+    fn snapshot_of(rows: usize) -> Snapshot {
+        // One row for the truncate.
+        Snapshot {
+            rows_before_ready: rows + 1,
+            any_ready_before: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_waits_for_the_end_of_the_snapshot() {
+        let runtime = crate::Runtime::builder().build().await;
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (snapshot, _) =
+            through_end(producer(&runtime.datafusion(), &broadcaster, table(vec![1, 2, 3])).await)
+                .await;
+        let mut stream = consumer(vec![held_open(snapshot)]);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(3)]);
+    }
+
+    #[tokio::test]
+    async fn a_producer_without_markers_is_ready_on_every_batch() {
+        let runtime = crate::Runtime::builder().build().await;
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (mut snapshot, _) =
+            through_end(producer(&runtime.datafusion(), &broadcaster, table(vec![1, 2, 3])).await)
+                .await;
+        for message in &mut snapshot {
+            message.app_metadata = bytes::Bytes::new();
+        }
+        let mut stream = consumer(vec![held_open(snapshot)]);
+        assert_eq!(
+            next_rows(&mut stream).await,
+            Some((1, true)),
+            "the truncate"
+        );
+        assert_eq!(next_rows(&mut stream).await, Some((3, true)), "the rows");
+        assert_eq!(next_rows(&mut stream).await, None, "no ready marker");
+    }
+
+    /// A subscriber that arrives while a commit is between its write and its
+    /// publish waits for the publish, then reads the rows once, in its
+    /// snapshot.
+    #[tokio::test]
+    async fn a_subscriber_arriving_between_commit_and_publish_reads_the_rows_once() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let path = TableReference::bare(DATASET);
+        let accelerated = table(vec![1]);
+        let _earlier = broadcaster.subscribe(&path).await;
+
+        // The commit: its rows are written, not yet published.
+        let guard = broadcaster.begin_commit(&path).await;
+        let ctx = SessionContext::new();
+        ctx.register_table(DATASET, Arc::clone(&accelerated) as Arc<dyn TableProvider>)
+            .expect("register");
+        ctx.sql("INSERT INTO orders VALUES (2)")
+            .await
+            .expect("plan insert")
+            .collect()
+            .await
+            .expect("insert");
+
+        let subscribing = tokio::spawn({
+            let broadcaster = broadcaster.clone();
+            let accelerated = Arc::clone(&accelerated);
+            let datafusion = Arc::clone(&datafusion);
+            async move { producer(&datafusion, &broadcaster, accelerated).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !subscribing.is_finished(),
+            "the subscriber waits for the publish"
+        );
+        broadcaster
+            .publish_committed(&path, guard, update(vec![2]))
+            .await;
+        let (snapshot, mut messages) = through_end(subscribing.await.expect("subscriber")).await;
+
+        // A later commit, which the subscriber is sent.
+        broadcaster.publish(&path, update(vec![3])).await;
+        let live = messages.next().await.expect("an update").expect("message");
+        let mut replay = snapshot;
+        replay.push(live);
+        let mut stream = consumer(vec![held_open(replay)]);
+        assert_eq!(
+            snapshots(&mut stream, 1).await,
+            vec![snapshot_of(2)],
+            "the snapshot holds the commit"
+        );
+        assert_eq!(
+            next_rows(&mut stream).await,
+            Some((1, true)),
+            "only the later commit follows"
+        );
+        assert_eq!(next_rows(&mut stream).await, None);
+    }
+
+    /// An update the snapshot already holds is skipped by its sequence number.
+    #[tokio::test]
+    async fn an_update_the_snapshot_holds_is_skipped() {
+        let runtime = crate::Runtime::builder().build().await;
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (mut snapshot, _) =
+            through_end(producer(&runtime.datafusion(), &broadcaster, table(vec![1])).await).await;
+        let row = row_message(&snapshot);
+        let epoch = broadcaster.epoch().to_string();
+        let with = |sequence| {
+            let mut message = row.clone();
+            message.app_metadata = StreamMetadata::update(&epoch, sequence).to_bytes();
+            message
+        };
+        // The snapshot holds commit 0: a replay of it, then commit 1.
+        snapshot.push(with(0));
+        snapshot.push(with(1));
+        let mut stream = consumer(vec![held_open(snapshot)]);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(next_rows(&mut stream).await, Some((1, true)), "commit 1");
+        assert_eq!(next_rows(&mut stream).await, None, "commit 0 is skipped");
+    }
+
+    /// A producer that restarts has a new epoch: the consumer reloads from the
+    /// new producer's snapshot, and does not compare sequence numbers across.
+    #[tokio::test]
+    async fn a_restarted_producer_is_reloaded_from_its_new_snapshot() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let before = DataUpdateBroadcaster::new();
+        let (first, _) = through_end(producer(&datafusion, &before, table(vec![1, 2])).await).await;
+        let after = DataUpdateBroadcaster::new();
+        assert_ne!(before.epoch(), after.epoch());
+        let (second, _) =
+            through_end(producer(&datafusion, &after, table(vec![1, 2, 3])).await).await;
+        // The first stream fails as its producer goes away.
+        let failed: Messages = futures::stream::iter(first.into_iter().map(Ok))
+            .chain(futures::stream::once(async {
+                Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                    "connection reset",
+                ))))
+            }))
+            .boxed();
+        let mut stream = consumer(vec![failed, held_open(second)]);
+        assert_eq!(
+            snapshots(&mut stream, 2).await,
+            vec![snapshot_of(2), snapshot_of(3)]
+        );
+    }
+
+    /// An update from another epoch on a subscription sends it back for a
+    /// fresh snapshot.
+    #[tokio::test]
+    async fn an_update_from_another_epoch_reloads_the_snapshot() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (mut first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let mut stray = row_message(&first);
+        stray.app_metadata = StreamMetadata::update("another-epoch", 1).to_bytes();
+        first.push(stray);
+        let (again, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+        let mut stream = consumer(vec![held_open(first), held_open(again)]);
+        assert_eq!(
+            snapshots(&mut stream, 2).await,
+            vec![snapshot_of(1), snapshot_of(2)],
+            "the stray update is not applied; the snapshot is reloaded"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Without its end marker, a snapshot never makes the dataset ready, and
+    /// the wait is logged as an error naming the dataset.
+    #[tokio::test]
+    async fn a_snapshot_without_its_end_logs_an_error_and_stays_not_ready() {
+        let runtime = crate::Runtime::builder().build().await;
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (mut snapshot, _) =
+            through_end(producer(&runtime.datafusion(), &broadcaster, table(vec![1, 2])).await)
+                .await;
+        snapshot.pop();
+
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        tokio::time::pause();
+        let mut stream = consumer(vec![held_open(snapshot)]);
+        assert_eq!(
+            next_rows(&mut stream).await,
+            Some((1, false)),
+            "the truncate"
+        );
+        assert_eq!(next_rows(&mut stream).await, Some((2, false)), "the rows");
+        assert!(
+            tokio::time::timeout(SNAPSHOT_END_ERROR_AFTER * 3, stream.next())
+                .await
+                .is_err(),
+            "nothing makes the dataset ready"
+        );
+        let logs = String::from_utf8(logs.0.lock().clone()).expect("utf8");
+        assert!(
+            logs.contains("ERROR")
+                && logs.contains("'orders' has not received the end of its initial snapshot"),
+            "{logs}"
+        );
+    }
+}
