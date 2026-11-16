@@ -107,14 +107,14 @@ jobs:
       # creates. stop-spice must succeed there; check-spice-log must still fail
       # closed, since a missing spice.log is never a pass.
       - name: Stop spice from a directory that was never created
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: never-created-by-this-job
 
       - name: Check spice.log in a directory that was never created
         id: check_missing_dir
         continue-on-error: true
-        uses: ./.github/actions/check-spice-log
+        uses: $/.github/actions/check-spice-log
         with:
           working-directory: never-created-by-this-job
 

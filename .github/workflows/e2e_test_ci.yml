@@ -90,7 +90,7 @@ jobs:
           fetch-depth: 0
       - name: Check for code changes
         id: check
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
 
   setup-matrix:
     environment: secret-free
@@ -160,7 +160,7 @@ jobs:
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       # Not on the macOS leg. Its self-hosted runner instances share one user, so one
       # `~/.cargo`, and rust-cache's save step deletes every file it found in
@@ -171,26 +171,26 @@ jobs:
       # skipping it there: `~/.cargo` and `target/` persist on those hosts and sccache
       # serves the compile, while the restore of this multi-GB cache spends up to ten
       # minutes before it lands or gives up.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: matrix.target.target_os != 'darwin'
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Set up make
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Install Protoc
-        uses: ./.github/actions/install-protoc
+        uses: $/.github/actions/install-protoc
 
       - name: Set up spiceio
         if: matrix.target.target_os == 'darwin' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.SMB_PASSWORD }}
@@ -226,7 +226,7 @@ jobs:
         # being cancelled. It buys no diagnostics on this leg: the `always()` steps below
         # are all gated to macOS, so a Linux build has none to run.
         timeout-minutes: 150
-        uses: ./.github/actions/build-spiced
+        uses: $/.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel'
           build_cli: 'true'
@@ -245,7 +245,7 @@ jobs:
         # on one host, which is where that factor-of-two spread comes from, so the bound
         # sits well clear of it rather than close to the median.
         timeout-minutes: 180
-        uses: ./.github/actions/build-spiced
+        uses: $/.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel,metal'
           build_cli: 'true'
@@ -270,7 +270,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
         if: always() && matrix.target.target_os == 'darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiceio-e2e-build-logs
           path: ${{ runner.temp }}/spiceio.log
@@ -312,13 +312,13 @@ jobs:
           fetch-depth: 1
 
       - name: Set up BigQuery credentials (workload identity federation)
-        uses: ./.github/actions/bigquery-credentials
+        uses: $/.github/actions/bigquery-credentials
         with:
           workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
           service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       - name: Download Linux runtime artifact
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_linux_x86_64
           path: ./build
@@ -329,7 +329,7 @@ jobs:
           "$SPICED_BIN" --version
 
       - name: Set up ADBC BigQuery driver
-        uses: ./.github/actions/setup-adbc-bigquery
+        uses: $/.github/actions/setup-adbc-bigquery
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -363,7 +363,7 @@ jobs:
 
       - name: Upload BigQuery test evidence
         if: ${{ always() && steps.test_env.outcome == 'success' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bigquery-regression-evidence
           path: ${{ env.BIGQUERY_GATE_OUTPUT }}
@@ -452,13 +452,13 @@ jobs:
           fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -471,7 +471,7 @@ jobs:
       # share one host and therefore one network namespace, so spiced's default
       # 8090/50051 cannot be assumed free (#12419).
       - name: Allocate Spice runtime ports
-        uses: ./.github/actions/allocate-spice-ports
+        uses: $/.github/actions/allocate-spice-ports
 
       - name: Start spice runtime
         env:
@@ -480,14 +480,14 @@ jobs:
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: Wait for Spice runtime is ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '60'
 
       - name: Configure apt mirrors (Linux)
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -518,7 +518,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
 
   test_hf_model:
     permissions:
@@ -553,13 +553,13 @@ jobs:
           fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -569,7 +569,7 @@ jobs:
           cat ./spicepod.yaml
 
       - name: Authenticate the Hugging Face cache
-        uses: ./.github/actions/hf-cache-auth
+        uses: $/.github/actions/hf-cache-auth
         with:
           token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
@@ -658,7 +658,7 @@ jobs:
 
       # Same shared-host constraint as the OpenAI model job above (#12419).
       - name: Allocate Spice runtime ports
-        uses: ./.github/actions/allocate-spice-ports
+        uses: $/.github/actions/allocate-spice-ports
 
       - name: Start spice runtime
         env:
@@ -667,14 +667,14 @@ jobs:
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: Wait for Spice runtime is ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '300'
 
       - name: Configure apt mirrors (Linux)
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -711,7 +711,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
 
   test_quickstart_dremio:
     environment: secret-free
@@ -732,13 +732,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -773,20 +773,20 @@ jobs:
           cat spicepod.yaml
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
           datasets: taxi_trips
 
       - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: taxi_trips
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: test_app
 
@@ -809,13 +809,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -840,19 +840,19 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
 
       - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: taxi_trips
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: test_app
 
@@ -877,13 +877,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -935,19 +935,19 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
 
       - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: test_parquet_table
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: test_app
 
@@ -969,26 +969,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_linux_x86_64
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_linux_x86_64
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '1200'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -1015,7 +1015,7 @@ jobs:
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Wait for the dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: cold_start_app
           timeout: '600'
@@ -1033,7 +1033,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: cold_start_app
 
@@ -1061,7 +1061,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install PostgreSQL
-        uses: ./.github/actions/install-postgres
+        uses: $/.github/actions/install-postgres
         with:
           pg-db: testdb
 
@@ -1073,13 +1073,13 @@ jobs:
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM test_postgresql_table;'
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -1174,26 +1174,26 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
 
       - name: Verify dataset1
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: test_postgresql_table
           expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
 
       - name: Verify dataset2
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: test_postgresql_table2
           expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/check-spice-log
+        uses: $/.github/actions/check-spice-log
         with:
           working-directory: test_app
 
@@ -1222,7 +1222,7 @@ jobs:
 
       - name: Configure apt mirrors (Linux)
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Install MySQL (Linux)
         if: matrix.target.target_os == 'linux'
@@ -1289,13 +1289,13 @@ jobs:
           mysql -h localhost -utest_user -ppassword testdb -e "SELECT * FROM test_mysql_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -1396,26 +1396,26 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
 
       - name: Verify dataset1
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: test_mysql_table
           expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
 
       - name: Verify dataset2
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: test_mysql_table2
           expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/check-spice-log
+        uses: $/.github/actions/check-spice-log
         with:
           working-directory: test_app
 
@@ -1437,7 +1437,7 @@ jobs:
 
       - name: Configure apt mirrors (Linux)
         if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
@@ -1492,13 +1492,13 @@ jobs:
           clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -1526,19 +1526,19 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
 
       - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: test_clickhouse_table
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: test_app
 
@@ -1579,17 +1579,17 @@ jobs:
           ./duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       # duckdb: datasets load the DuckDB library installed on the host.
       - name: Set up libduckdb
-        uses: ./.github/actions/setup-libduckdb
+        uses: $/.github/actions/setup-libduckdb
 
       - name: Install Spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -1615,19 +1615,19 @@ jobs:
           sleep 5
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: duckdb-app
           timeout: '60'
 
       - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: tpch_customer
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: duckdb-app
 
@@ -1654,7 +1654,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install PostgreSQL
-        uses: ./.github/actions/install-postgres
+        uses: $/.github/actions/install-postgres
         with:
           pg-db: testdb
 
@@ -1675,13 +1675,13 @@ jobs:
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth.recent_blocks;'
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -1724,7 +1724,7 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
@@ -1743,7 +1743,7 @@ jobs:
           fi
 
       - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: eth.recent_blocks
           expected-rows-count: 1
@@ -1762,14 +1762,14 @@ jobs:
           fi
 
       - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: eth.recent_blocks
           expected-rows-count: 2
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: test_app
 
@@ -1790,13 +1790,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -1834,7 +1834,7 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
@@ -1963,7 +1963,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: test_app
 
@@ -1981,13 +1981,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_linux_x86_64
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_linux_x86_64
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -2019,7 +2019,7 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
@@ -2126,7 +2126,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: test_app
 
@@ -2166,13 +2166,13 @@ jobs:
         run: python3 test/github/check_permissions.py --artifacts github-api-results
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -2187,7 +2187,7 @@ jobs:
           cp test/github/github-arrow-smoke.yaml test_app/spicepod.yaml
 
       - name: Allocate runtime ports
-        uses: ./.github/actions/allocate-spice-ports
+        uses: $/.github/actions/allocate-spice-ports
 
       - name: Start spice runtime
         working-directory: test_app
@@ -2197,7 +2197,7 @@ jobs:
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: Wait for all accelerated datasets
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
@@ -2211,7 +2211,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload GitHub test evidence
         if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: github-connector-results-${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}
           path: |
@@ -2222,7 +2222,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: test_app
 
@@ -2245,13 +2245,13 @@ jobs:
           persist-credentials: false
 
       - name: download artifacts - build_linux_x86_64
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_linux_x86_64
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -2267,7 +2267,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload Hugging Face test evidence
         if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: huggingface-connector-results
           path: hf-live-results/
@@ -2304,7 +2304,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure apt mirrors
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Install mssql-tools
         run: |
@@ -2322,13 +2322,13 @@ jobs:
           /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -2367,27 +2367,27 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
 
       - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: test_mssql_table
 
       - name: Run test query (issues)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
+        uses: $/.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select * from test_mssql_table;'
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/check-spice-log
+        uses: $/.github/actions/check-spice-log
         with:
           working-directory: test_app
 
@@ -2411,13 +2411,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -2473,7 +2473,7 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
           timeout: '60'
@@ -2481,7 +2481,7 @@ jobs:
       - name: Run test query (tpch)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
+        uses: $/.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select * from db_uc.tpch.lineitem limit 1;'
@@ -2489,14 +2489,14 @@ jobs:
       - name: Run test query (tpcds)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
+        uses: $/.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select * from db_uc.tpcds.store limit 1;'
 
       - name: Stop spice and check logs
         if: always()
-        uses: ./.github/actions/stop-spice
+        uses: $/.github/actions/stop-spice
         with:
           working-directory: test_app
 
@@ -2545,17 +2545,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       # duckdb: datasets load the DuckDB library installed on the host.
       - name: Set up libduckdb
-        uses: ./.github/actions/setup-libduckdb
+        uses: $/.github/actions/setup-libduckdb
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -2626,18 +2626,18 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for Spice runtime to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
           timeout: '60'
 
       - name: Verify data_upsert dataset is queryable
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: data_upsert
 
       - name: Verify data_drop dataset is queryable
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: data_drop
 
@@ -2720,7 +2720,7 @@ jobs:
 
       - name: Check logs
         if: always()
-        uses: ./.github/actions/check-spice-log
+        uses: $/.github/actions/check-spice-log
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
           allow: ${{ env.PARQUET_RENAME_RACE_ALLOW }}
@@ -2733,24 +2733,24 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
           timeout: '60'
 
       - name: Verify data_upsert dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: data_upsert
 
       - name: Verify data_drop dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: data_drop
 
       - name: Check logs
         if: always()
-        uses: ./.github/actions/check-spice-log
+        uses: $/.github/actions/check-spice-log
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
           allow: ${{ env.PARQUET_RENAME_RACE_ALLOW }}
@@ -2783,17 +2783,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       # duckdb: datasets load the DuckDB library installed on the host.
       - name: Set up libduckdb
-        uses: ./.github/actions/setup-libduckdb
+        uses: $/.github/actions/setup-libduckdb
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
@@ -2833,7 +2833,7 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
           timeout: '180'
@@ -2891,7 +2891,7 @@ jobs:
 
       - name: Check logs
         if: always()
-        uses: ./.github/actions/check-spice-log
+        uses: $/.github/actions/check-spice-log
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
 
@@ -2904,19 +2904,19 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        uses: ./.github/actions/wait-for-spice-ready
+        uses: $/.github/actions/wait-for-spice-ready
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
           timeout: '180'
 
       - name: Verify dataset
-        uses: ./.github/actions/verify-dataset
+        uses: $/.github/actions/verify-dataset
         with:
           name: customer
 
       - name: Check logs
         if: always()
-        uses: ./.github/actions/check-spice-log
+        uses: $/.github/actions/check-spice-log
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
 
@@ -2937,14 +2937,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '1800'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -2957,7 +2957,7 @@ jobs:
           python3 test/spicescript/corpus/sql_surface.py --check
 
       - name: Build spicescript
-        uses: ./.github/actions/build-tool
+        uses: $/.github/actions/build-tool
         with:
           package: spicescript
 
@@ -3001,26 +3001,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_linux_x86_64
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build_linux_x86_64
           path: ./build
 
       - name: Install spice
-        uses: ./.github/actions/install-spice
+        uses: $/.github/actions/install-spice
         with:
           build-path: ./build
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '3600'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -3029,7 +3029,7 @@ jobs:
 
       - name: Download spicescript
         id: spicescript
-        uses: ./.github/actions/build-tool
+        uses: $/.github/actions/build-tool
         with:
           package: spicescript
 
@@ -3067,7 +3067,7 @@ jobs:
       # a token they share the pool's anonymous per-IP quota, and a rate limit fails
       # every one of them at once as "model 'potion' … failed to load".
       - name: Authenticate the Hugging Face cache
-        uses: ./.github/actions/hf-cache-auth
+        uses: $/.github/actions/hf-cache-auth
         with:
           token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
@@ -3101,7 +3101,7 @@ jobs:
       # one run, which runs the scripts side by side.
       - name: Mint an OpenAI access token
         if: ${{ matrix.live && env.HAS_OPENAI_WIF == 'true' }}
-        uses: ./.github/actions/openai-token
+        uses: $/.github/actions/openai-token
         with:
           identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
           service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
@@ -3109,7 +3109,7 @@ jobs:
 
       - name: Mint an Anthropic access token
         if: ${{ matrix.live && env.HAS_ANTHROPIC_WIF == 'true' }}
-        uses: ./.github/actions/anthropic-token
+        uses: $/.github/actions/anthropic-token
         with:
           federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
           organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
@@ -3180,7 +3180,7 @@ jobs:
       # failure rate across runs is read off these rather than off job logs.
       - name: Upload script results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spicescript-results-${{ strategy.job-index }}
           path: ${{ runner.temp }}/spicescript-results*.json
@@ -3191,7 +3191,7 @@ jobs:
       # printed for it, its source containers' output and its instances' logs.
       - name: Upload captured logs
         if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spicescript-logs-${{ strategy.job-index }}
           path: |

@@ -42,7 +42,7 @@ runs:
       id: query
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      uses: ./.github/actions/run-query
+      uses: $/.github/actions/run-query
       with:
         working-directory: app_${{ inputs.table-name }}
         query: 'select * from ${{ inputs.table-name }} limit 10;'
@@ -62,7 +62,7 @@ runs:
       id: query-accelerated
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      uses: ./.github/actions/run-query
+      uses: $/.github/actions/run-query
       with:
         working-directory: app_${{ inputs.table-name }}
         query: 'select * from ${{ inputs.table-name }} limit 10;'
