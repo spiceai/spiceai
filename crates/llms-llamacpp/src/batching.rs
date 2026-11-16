@@ -1147,11 +1147,17 @@ fn start<'m, S: Shared<'m>>(
             fail(shared, slot, &events, &stopping, message);
             return;
         }
-        picker.sample(
+        match picker.sample(
             shared.context(),
             read.batch.n_tokens() - 1,
             out.in_content(),
-        )
+        ) {
+            Ok(id) => id,
+            Err(message) => {
+                fail(shared, slot, &events, &stopping, message);
+                return;
+            }
+        }
     };
     *tick += 1;
     let running = Running {
@@ -1487,9 +1493,14 @@ fn step<'m, S: Shared<'m>>(
                 continue;
             }
             let index = row.offset + i32::try_from(row.reads - 1).unwrap_or(i32::MAX);
-            running.id = running
-                .picker
-                .sample(shared.context(), index, running.out.in_content());
+            let in_content = running.out.in_content();
+            running.id = match running.picker.sample(shared.context(), index, in_content) {
+                Ok(id) => id,
+                Err(message) => {
+                    fail(shared, slot, &running.events, &running.stopping, message);
+                    continue;
+                }
+            };
             running.unread = 0;
             slot.cache.ends_in_steps.fetch_add(1, Ordering::Relaxed);
             sent(model, shared, slot, running, tick);
@@ -1500,14 +1511,17 @@ fn step<'m, S: Shared<'m>>(
         let next = loop {
             let index = row.offset + i32::try_from(accepted).unwrap_or(i32::MAX);
             let in_content = running.out.in_content();
-            let token = running.picker.sample(shared.context(), index, in_content);
+            let token = match running.picker.sample(shared.context(), index, in_content) {
+                Ok(token) => token,
+                Err(message) => break Err(Stopped::Failed(message)),
+            };
             if accepted < row.real && token == row.draft[accepted] {
                 accepted += 1;
                 // an accepted draft was decoded in the verify batch, so the cache holds it
                 // whether or not it ends the reply, and the next request may reuse it
                 running.history.push(token);
                 if let Some(finish) = running.out.token(model, token) {
-                    break Err(finish);
+                    break Err(Stopped::Finished(finish));
                 }
             } else {
                 break Ok(token);
@@ -1515,8 +1529,13 @@ fn step<'m, S: Shared<'m>>(
         };
         let next = match next {
             Ok(next) => next,
-            Err(finish) => {
+            Err(Stopped::Finished(finish)) => {
                 end(shared, slot, running, finish, tick);
+                continue;
+            }
+            // the context failed computing the batch: every request in it fails the same way
+            Err(Stopped::Failed(message)) => {
+                fail(shared, slot, &running.events, &running.stopping, message);
                 continue;
             }
         };
@@ -1538,6 +1557,14 @@ fn step<'m, S: Shared<'m>>(
         sent(model, shared, slot, running, tick);
     }
     true
+}
+
+/// Why a request's turn in a verify batch ended before its next token.
+enum Stopped {
+    /// Its reply is done.
+    Finished(FinishReason),
+    /// A backend failed computing the batch, so there is no token to pick.
+    Failed(String),
 }
 
 /// Fails every request in `stepping`, after a step they shared could not decode.

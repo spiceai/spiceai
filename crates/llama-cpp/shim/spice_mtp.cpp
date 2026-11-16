@@ -47,16 +47,29 @@ spice_mtp_status invalid(spice_mtp * mtp, const char * message) {
     return SPICE_MTP_INVALID;
 }
 
-// Runs `f`, turning a C++ exception into SPICE_MTP_FAILED with its message.
+// Runs `f`, turning a C++ exception into SPICE_MTP_FAILED with its message. A call that failed
+// because a backend failed computing the model's or the head's work (llama_get_compute_status)
+// says so instead: that context decodes nothing more, whatever step noticed it.
 template <typename F> spice_mtp_status guarded(spice_mtp * mtp, F && f) {
+    spice_mtp_status status = SPICE_MTP_FAILED;
     try {
-        return f();
+        status = f();
     } catch (const std::exception & e) {
         mtp->error = e.what();
     } catch (...) {
         mtp->error = "llama.cpp threw a non-standard exception";
     }
-    return SPICE_MTP_FAILED;
+    if (status == SPICE_MTP_FAILED) {
+        const bool target = llama_get_compute_status(mtp->params.draft.ctx_tgt) != 0;
+        const bool head   = llama_get_compute_status(mtp->params.draft.ctx_dft) != 0;
+        if (target || head) {
+            mtp->error = std::string("the GPU or another backend failed computing work the ") +
+                         (target ? "model's" : "draft head's") +
+                         " context queued, so its results are discarded and it decodes nothing more; "
+                         "reload the model";
+        }
+    }
+    return status;
 }
 
 // Whether `seq` is one of the sequences `mtp` drafts for. llama.cpp asserts, ending the
