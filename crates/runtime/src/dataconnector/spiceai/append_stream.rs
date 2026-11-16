@@ -508,6 +508,33 @@ mod tests {
             })
     }
 
+    /// The next envelope as a staged reload's replacement: its row count.
+    async fn replacement(
+        stream: &mut BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>,
+    ) -> usize {
+        let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
+            .await
+            .expect("a replacement")
+            .expect("an envelope")
+            .expect("not an error");
+        assert!(
+            envelope.history_unavailable() && envelope.is_dataset_ready(),
+            "a reload is swapped in as one atomic replacement"
+        );
+        let batch = envelope.change_batch().expect("built");
+        assert!(batch.rebuild_from_this_batch());
+        batch.data_batch().num_rows()
+    }
+
+    /// The snapshot's sequence number, from its end marker.
+    fn snapshot_sequence(snapshot: &[FlightData]) -> u64 {
+        snapshot
+            .last()
+            .and_then(|message| StreamMetadata::parse(&message.app_metadata))
+            .and_then(|metadata| metadata.sequence)
+            .expect("an end marker with a sequence")
+    }
+
     fn snapshot_of(rows: usize) -> Snapshot {
         // One row for the truncate.
         Snapshot {
@@ -650,10 +677,9 @@ mod tests {
             }))
             .boxed();
         let mut stream = consumer(vec![failed, held_open(second)]);
-        assert_eq!(
-            snapshots(&mut stream, 2).await,
-            vec![snapshot_of(2), snapshot_of(3)]
-        );
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(2)]);
+        assert_eq!(replacement(&mut stream).await, 3, "the new producer's rows");
+        assert_eq!(next_rows(&mut stream).await, None);
     }
 
     /// An update from another epoch on a subscription sends it back for a
@@ -671,11 +697,155 @@ mod tests {
         let (again, _) =
             through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
         let mut stream = consumer(vec![held_open(first), held_open(again)]);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
         assert_eq!(
-            snapshots(&mut stream, 2).await,
-            vec![snapshot_of(1), snapshot_of(2)],
+            replacement(&mut stream).await,
+            2,
             "the stray update is not applied; the snapshot is reloaded"
         );
+    }
+
+    /// A reload that never reaches its end is discarded: nothing of it is
+    /// applied, the dataset keeps its previous data, and the next complete
+    /// reload is swapped in.
+    #[tokio::test]
+    async fn a_reload_without_its_end_is_discarded() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let failed_after_ready: Messages = futures::stream::iter(first.into_iter().map(Ok))
+            .chain(futures::stream::once(async {
+                Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                    "connection reset",
+                ))))
+            }))
+            .boxed();
+        // The producer dies mid-snapshot: the end never comes.
+        let (mut partial, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2, 3, 4])).await).await;
+        partial.pop();
+        let partial: Messages = futures::stream::iter(partial.into_iter().map(Ok))
+            .chain(futures::stream::once(async {
+                Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                    "connection reset",
+                ))))
+            }))
+            .boxed();
+        let (complete, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let mut stream = consumer(vec![failed_after_ready, partial, held_open(complete)]);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(
+            replacement(&mut stream).await,
+            2,
+            "the partial reload is never swapped in; the complete one is"
+        );
+        let logs = String::from_utf8(logs.0.lock().clone()).expect("utf8");
+        assert!(
+            logs.contains("ERROR")
+                && logs.contains("'orders' could not finish reloading")
+                && logs.contains("keeps serving its previous data, which last changed"),
+            "{logs}"
+        );
+    }
+
+    /// A reload whose end does not arrive in time is discarded too.
+    #[tokio::test]
+    async fn a_reload_whose_end_times_out_is_discarded() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let failed_after_ready: Messages = futures::stream::iter(first.into_iter().map(Ok))
+            .chain(futures::stream::once(async {
+                Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                    "connection reset",
+                ))))
+            }))
+            .boxed();
+        let (mut stalled, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2, 3, 4])).await).await;
+        stalled.pop();
+        let (complete, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+
+        tokio::time::pause();
+        let mut stream = consumer(vec![
+            failed_after_ready,
+            held_open(stalled),
+            held_open(complete),
+        ]);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(replacement(&mut stream).await, 2);
+    }
+
+    /// Updates that arrive during a reload are staged with it, and their
+    /// sequence numbers decide what survives the swap: one the snapshot holds
+    /// is dropped, a later one is kept, and after the swap only commits past
+    /// the snapshot are applied.
+    #[tokio::test]
+    async fn updates_during_a_reload_are_staged_and_deduplicated() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let path = TableReference::bare(DATASET);
+        let _earlier = broadcaster.subscribe(&path).await;
+        let (first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let failed_after_ready: Messages = futures::stream::iter(first.into_iter().map(Ok))
+            .chain(futures::stream::once(async {
+                Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                    "connection reset",
+                ))))
+            }))
+            .boxed();
+        // Two commits before the reload's snapshot: it holds them.
+        broadcaster.publish(&path, update(vec![10])).await;
+        broadcaster.publish(&path, update(vec![11])).await;
+        let (mut reload, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+        let snapshot_sequence = snapshot_sequence(&reload);
+        assert_eq!(snapshot_sequence, 2);
+        let epoch = broadcaster.epoch().to_string();
+        let row = row_message(&reload);
+        let with = |sequence| {
+            let mut message = row.clone();
+            message.app_metadata = StreamMetadata::update(&epoch, sequence).to_bytes();
+            message
+        };
+        let end = reload.pop().expect("end marker");
+        // During the reload: a commit the snapshot holds, and a later one.
+        reload.push(with(snapshot_sequence));
+        reload.push(with(snapshot_sequence + 1));
+        reload.push(end);
+        // After the swap: a replay of a held commit, and a new one.
+        reload.push(with(snapshot_sequence));
+        reload.push(with(snapshot_sequence + 2));
+
+        let mut stream = consumer(vec![failed_after_ready, held_open(reload)]);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(
+            replacement(&mut stream).await,
+            3,
+            "the snapshot's 2 rows and the 1 staged update past it"
+        );
+        assert_eq!(
+            next_rows(&mut stream).await,
+            Some((1, true)),
+            "the new commit"
+        );
+        assert_eq!(next_rows(&mut stream).await, None, "the replay is skipped");
     }
 
     #[derive(Clone, Default)]
