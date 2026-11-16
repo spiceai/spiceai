@@ -116,7 +116,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `88db5b10de44c41ba8cf8331316c5d2a1fc17f8a` | `spiceai-55` |
+| [datafusion](#datafusion) | `b076da4bdecc4897fa6dc48a2530923486f6d6c3` | `spiceai-55` (TEMPORARY: spiceai/datafusion#300) |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `daa91fe928174edb95473e644059aee9958dca06` | `spiceai-55` |
@@ -242,8 +242,9 @@ rows of an `Unnest` under an empty projection, and #295 writes MySQL's concatena
 division and float literals in forms MySQL reads as DataFusion does, and writes sample standard
 deviation and variance under their standard names. On top of #295, #296 backports apache/datafusion#24989, which
 computes a grouped `bit_xor(DISTINCT …)` with its distinct accumulator. On top of #296, spiceai/datafusion#298
-merges upstream `55.3.0` (apache/datafusion@7941823cf077678fef337a29f8307e5d721d1fc8); the pin is the merge
-commit of #298. Outside the six files it resolved by hand, every Spice patch's diff against `55.3.0` is line for line
+merges upstream `55.3.0` (apache/datafusion@7941823cf077678fef337a29f8307e5d721d1fc8), and on top of #298,
+#300 refuses a `levenshtein` batch too long to compare in bounded time; the pin is the merge commit of #300.
+Outside the six files #298 resolved by hand, every Spice patch's diff against `55.3.0` is line for line
 its diff against `55.2.0`. Of those six, #251 keeps its empty-file rule beside upstream's null-partition
 statistics (apache/datafusion#26310), and #277's ordered *partial* path is replaced by upstream's
 apache/datafusion#25312 (row below). These commits descend
@@ -388,6 +389,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Grouped top-k preallocation is bounded by a constant instead of `LIMIT` (`TopKHashTable`/`TopKHeap`/`PriorityMap` in the aggregates path; spiceai/datafusion#283) | `TopKHashTable`/`TopKHeap`/`PriorityMap` preallocate proportional to `LIMIT` (unchecked multiply), so a huge `LIMIT` over a small input OOMs outside the memory pool | silent (query failure / memory) | `crates/runtime-datafusion/src/fork_backport_guards.rs::topk_aggregation_with_a_limit_far_above_its_groups_answers` |
 | `COUNT(DISTINCT …)` over a list, struct, map or other nested value stores a compacted copy of each value it first inserts, in `DistinctCountAccumulator` and `SlidingDistinctCountAccumulator`, so a stored value no longer shares the buffers of the batch it was read from (`functions-aggregate/src/count.rs`; spiceai/datafusion#287) | With two or more `COUNT(DISTINCT …)` in a query (no single-distinct rewrite), every distinct nested value is a one-row slice that keeps its whole batch alive and is charged for it, so the reservation grows with rows × batch size: two `COUNT(DISTINCT)` over 50,000 three-element lists asked for 56.8 GB and failed with `ResourcesExhausted`, federated and accelerated alike, grouped or not | silent (query failure / memory) | `crates/runtime-datafusion/src/fork_backport_guards.rs::several_count_distinct_over_nested_values_charge_each_value_once` (lists, structs and a grouped variant under a 256 MiB pool with spilling disabled); in the fork, `count::tests::*_size_charges_each_value_once` and `sqllogictest/test_files/count_distinct_nested_memory.slt` |
 | `AsyncFuncExec` coalesces its input to the smallest `ideal_batch_size` its async UDFs declare (or `execution.batch_size` when none declares one) and slices larger input batches, so it emits output after each UDF-sized batch (`physical-plan/src/async_func.rs`; spiceai/datafusion#286) | An async UDF that declares a smaller `ideal_batch_size`, such as `ai` and the `ai_*` decision functions, is called on every chunk of an 8,192-row batch before any row comes out, so a `LIMIT` above it cannot stop early and every row of the batch costs a model call | silent (cost / latency) | **GAP** — no test here drives an async UDF under a `LIMIT` and counts its calls; in the fork, `core/tests/user_defined/user_defined_async_scalar_functions.rs::test_async_udf_limit_stops_early` |
+| `levenshtein` returns an execution error for a call (one batch) whose rows have more than 1,000,000,000 character pairs in total (`chars(str1) * chars(str2)` summed over its non-null rows), checked before any distance is computed, for `Utf8`, `LargeUtf8` and `Utf8View` (`functions/src/string/levenshtein.rs` `check_levenshtein_size`; spiceai/datafusion#300) | The distances take that many steps with no cancellation point, during execution or while the planner folds literal arguments, so one batch of long strings holds its thread far past `runtime.query.timeout` | silent (CPU / hang) | `crates/runtime-datafusion/src/fork_backport_guards.rs::levenshtein_refuses_a_batch_past_its_size_limit`; in the fork, the tests in `functions/src/string/levenshtein.rs` |
 
 ## arrow-rs
 

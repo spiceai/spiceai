@@ -1159,3 +1159,52 @@ async fn topk_aggregation_with_a_limit_far_above_its_groups_answers() {
         assert_eq!(answer(&ctx, &sql).await, Ok(expected), "{sql}");
     }
 }
+
+/// spiceai/datafusion#300. `levenshtein` refuses a batch whose rows have more
+/// than 1,000,000,000 character pairs in total (`chars(str1) * chars(str2)`
+/// summed) before it computes any distance, since the distances take that many
+/// steps with no cancellation point, and still answers within the limit. Each
+/// string type is checked with one long row of literal arguments, which the
+/// planner folds, and with many shorter rows of column arguments.
+#[tokio::test(flavor = "multi_thread")]
+async fn levenshtein_refuses_a_batch_past_its_size_limit() {
+    let ctx = spice_session(|_| {});
+    for string_type in ["Utf8", "LargeUtf8", "Utf8View"] {
+        assert_eq!(
+            sorted_answer(
+                &ctx,
+                &format!(
+                    "SELECT levenshtein(arrow_cast(s, '{string_type}'), arrow_cast(t, '{string_type}')) \
+                     FROM (VALUES ('kitten', 'sitting'), ('naïve', 'naive'), ('', 'abc')) v(s, t)"
+                )
+            )
+            .await,
+            Ok(sorted(&["3", "1", "3"])),
+            "{string_type}"
+        );
+        for sql in [
+            // One row of 40,001 x 25,000 characters.
+            format!(
+                "SELECT levenshtein(arrow_cast(repeat('a', 40001), '{string_type}'), \
+                 arrow_cast(repeat('b', 25000), '{string_type}'))"
+            ),
+            // One batch of 1,001 rows of 1,000 x 1,000 characters.
+            format!(
+                "SELECT levenshtein(arrow_cast(repeat('a', 1000 + v - v), '{string_type}'), \
+                 arrow_cast(repeat('b', 1000), '{string_type}')) \
+                 FROM (SELECT value AS v FROM generate_series(1, 1001)) t"
+            ),
+        ] {
+            let error = answer(&ctx, &sql)
+                .await
+                .expect_err("the batch exceeds the limit");
+            assert!(
+                error.contains(
+                    "levenshtein input is too long: the strings in one batch have more than \
+                     1000000000 character pairs"
+                ),
+                "{sql}: {error}"
+            );
+        }
+    }
+}
