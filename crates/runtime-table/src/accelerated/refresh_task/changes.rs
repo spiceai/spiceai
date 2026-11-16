@@ -6929,6 +6929,108 @@ mod tests {
         );
     }
 
+    /// A reload of a ready dataset arrives as one replacement envelope (the
+    /// `spice.ai` append stream stages it until its snapshot ends). A query
+    /// that runs while it is applied sees the old rows or the new ones, never
+    /// anything in between; applying the same reload as a truncate and then its
+    /// rows would expose the empty table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_reload_is_seen_whole_or_not_at_all() {
+        let dataset = "staged_reload_swaps_atomically";
+        let schema = Arc::new(create_test_data_schema());
+        let old_ids = [1, 2, 3];
+        let new_ids = [1, 2, 3, 4, 5];
+        let old_names = ["old"; 3];
+        let new_names = ["new"; 5];
+        let federated = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&old_ids, &old_names)]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+        );
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = tokio::spawn({
+            let accelerator = Arc::clone(&accelerator);
+            let done = Arc::clone(&done);
+            async move {
+                let ctx = SessionContext::new();
+                let mut counts = std::collections::BTreeSet::new();
+                while !done.load(Ordering::SeqCst) {
+                    let batches = ctx
+                        .read_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>)
+                        .expect("read accelerator")
+                        .collect()
+                        .await
+                        .expect("collect accelerator");
+                    counts.insert(batches.iter().map(RecordBatch::num_rows).sum::<usize>());
+                    tokio::task::yield_now().await;
+                }
+                counts
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let reload = cdc::ChangeEnvelope::from_parts(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&schema, &id_name_batch(&new_ids, &new_names))
+                .expect("reload wraps")
+                .with_rebuild_from_this_batch(true),
+            true,
+            true,
+        );
+        assert!(task.apply_envelope_run(&mut context, vec![reload]).await);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        done.store(true, Ordering::SeqCst);
+        let counts = reader.await.expect("reader");
+        assert!(
+            counts
+                .iter()
+                .all(|count| *count == old_ids.len() || *count == new_ids.len()),
+            "a query saw a partly reloaded table: {counts:?}"
+        );
+        assert!(counts.contains(&new_ids.len()), "{counts:?}");
+        assert_eq!(
+            names_in_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>).await,
+            vec!["new".to_string(); new_ids.len()]
+        );
+    }
+
     /// Copilot: after a listing rebuild overwrite succeeds, its committer must
     /// finalize independently of later envelopes. Otherwise a later write failure
     /// drops the rebuild committer unacked and `AppliedKeysCommitter::drop`
