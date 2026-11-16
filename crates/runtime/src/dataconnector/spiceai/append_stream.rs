@@ -174,8 +174,15 @@ where
                     break 'subscription;
                 }
             };
-            let snapshot_end_error_at = subscribed_at + SNAPSHOT_END_ERROR_AFTER;
+            // A reload is discarded only when it stops making progress, so the
+            // deadline moves with every message it receives; a large reload that
+            // keeps delivering batches is never cut off.
+            let mut snapshot_end_error_at = subscribed_at + SNAPSHOT_END_ERROR_AFTER;
             let mut snapshot_end_error_logged = false;
+            // Whether this subscription completed a snapshot, the only thing that
+            // makes it healthy enough to reset the retry budget for a marked
+            // producer.
+            let mut completed_snapshot = false;
 
             let ended = loop {
                 let next = if subscription.awaiting_end() && !snapshot_end_error_logged {
@@ -185,7 +192,7 @@ where
                             snapshot_end_error_logged = true;
                             if reload.is_some() {
                                 break Ended::Resubscribe(format!(
-                                    "the end of its snapshot did not arrive within {}s",
+                                    "its snapshot made no progress for {}s",
                                     SNAPSHOT_END_ERROR_AFTER.as_secs()
                                 ));
                             }
@@ -200,6 +207,9 @@ where
                 } else {
                     stream.next().await
                 };
+                if reload.is_some() {
+                    snapshot_end_error_at = tokio::time::Instant::now() + SNAPSHOT_END_ERROR_AFTER;
+                }
 
                 let Some(decoded_data) = next else {
                     break if subscription.epoch().is_some() {
@@ -240,6 +250,7 @@ where
                                 match envelope {
                                     Ok(envelope) => {
                                         been_ready = true;
+                                        completed_snapshot = true;
                                         last_applied_at = Some(tokio::time::Instant::now());
                                         yield Ok(envelope);
                                     }
@@ -260,6 +271,7 @@ where
                         .is_some_and(|metadata| metadata.marker == StreamMarker::Begin)
                 {
                     reload = Some(Reload::default());
+                    snapshot_end_error_at = tokio::time::Instant::now() + SNAPSHOT_END_ERROR_AFTER;
                 }
                 let ready = match subscription.on_batch(metadata) {
                     Step::Apply { ready } => ready,
@@ -330,7 +342,12 @@ where
                     "The append stream for dataset '{table_reference}' ended before its initial snapshot was complete ({reason}), so the dataset stays not ready while it resubscribes."
                 );
             }
-            if subscribed_at.elapsed() >= APPEND_STREAM_HEALTHY_SUBSCRIPTION {
+            // A marked producer's subscription counts as healthy only once it
+            // completed its snapshot, so one that keeps failing to finish a
+            // snapshot still exhausts the retry budget.
+            if subscribed_at.elapsed() >= APPEND_STREAM_HEALTHY_SUBSCRIPTION
+                && (completed_snapshot || subscription.epoch().is_none())
+            {
                 resubscribes = 0;
             }
             if resubscribes >= MAX_APPEND_STREAM_RESUBSCRIBES {
@@ -789,6 +806,40 @@ mod tests {
         ]);
         assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
         assert_eq!(replacement(&mut stream).await, 2);
+    }
+
+    /// A reload that keeps making progress is not cut off, however long it
+    /// takes in total.
+    #[tokio::test]
+    async fn a_slow_reload_that_keeps_progressing_is_swapped_in() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let failed_after_ready: Messages = futures::stream::iter(first.into_iter().map(Ok))
+            .chain(futures::stream::once(async {
+                Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                    "connection reset",
+                ))))
+            }))
+            .boxed();
+        let (slow, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2, 3])).await).await;
+        let gap = SNAPSHOT_END_ERROR_AFTER * 2 / 3;
+        assert!(gap * u32::try_from(slow.len()).expect("few messages") > SNAPSHOT_END_ERROR_AFTER);
+        let slow: Messages = futures::stream::iter(slow)
+            .then(move |message| async move {
+                tokio::time::sleep(gap).await;
+                Ok(message)
+            })
+            .chain(futures::stream::pending())
+            .boxed();
+
+        tokio::time::pause();
+        let mut stream = consumer(vec![failed_after_ready, slow]);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(replacement(&mut stream).await, 3);
     }
 
     /// Updates that arrive during a reload are staged with it, and their
