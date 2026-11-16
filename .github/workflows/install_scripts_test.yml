@@ -28,14 +28,11 @@ on:
       - 'test/scripts/install-fake-github.py'
       - 'test/scripts/install-release-check.sh'
       - '.github/workflows/install_scripts_test.yml'
-  # Daily, so a change on GitHub's side (rate limits, the API, release assets) is caught without a PR.
-  schedule:
-    - cron: '17 6 * * *'
   # publish_release.yml dispatches this after it publishes a release, with the release's version.
   workflow_dispatch:
     inputs:
       published_release:
-        description: 'The version publish_release.yml just published. A failed run opens an issue, as a scheduled one does.'
+        description: 'The version publish_release.yml just published. A failed run opens an issue.'
         required: false
         type: string
         default: ''
@@ -795,7 +792,6 @@ jobs:
 
   # Test Windows PowerShell error handling
   test-windows-errors:
-    if: github.event_name != 'schedule'
     environment: secret-free
     name: Windows Error Handling (PowerShell)
     runs-on: windows-latest
@@ -853,7 +849,6 @@ jobs:
 
   # Validate scripts with shellcheck
   shellcheck:
-    if: github.event_name != 'schedule'
     environment: secret-free
     name: Shellcheck
     runs-on: ubuntu-latest
@@ -883,10 +878,10 @@ jobs:
         run: |
           shellcheck test/scripts/install-release-check.sh
 
-  # A failed scheduled run, or a failed run that publish_release.yml started for a release it
-  # published, opens an issue, or updates the open one: nobody watches those runs.
+  # A failed run that publish_release.yml started for a release it published opens an issue, or
+  # updates the open one: nobody watches those runs.
   report-failure:
-    if: failure() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.published_release != ''))
+    if: failure() && github.event_name == 'workflow_dispatch' && inputs.published_release != ''
     needs:
       - test-install-scripts
       - test-shell-detection
@@ -916,10 +911,9 @@ jobs:
             const title = 'Install scripts fail against GitHub';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const release = process.env.PUBLISHED_RELEASE;
-            const trigger = release ? `the publication of v${release}` : 'the daily schedule';
             const body = [
               marker,
-              `The install scripts test, run by ${trigger}, failed: a user installing Spice the documented way may be failing too.`,
+              `The install scripts test, run after the publication of v${release}, failed: a user installing Spice the documented way may be failing too.`,
               '',
               `Run: ${runUrl}`,
               `Commit: ${context.sha}`,
