@@ -28,20 +28,13 @@ on:
       - 'test/scripts/install-fake-github.py'
       - 'test/scripts/install-release-check.sh'
       - '.github/workflows/install_scripts_test.yml'
-  # publish_release.yml dispatches this after it publishes a release, with the release's version.
   workflow_dispatch:
-    inputs:
-      published_release:
-        description: 'The version publish_release.yml just published. A failed run opens an issue.'
-        required: false
-        type: string
-        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -877,71 +870,3 @@ jobs:
       - name: Run shellcheck on the live job helper
         run: |
           shellcheck test/scripts/install-release-check.sh
-
-  # A failed run that publish_release.yml started for a release it published opens an issue, or
-  # updates the open one: nobody watches those runs.
-  report-failure:
-    if: failure() && github.event_name == 'workflow_dispatch' && inputs.published_release != ''
-    needs:
-      - test-install-scripts
-      - test-shell-detection
-      - test-custom-install-dir
-      - test-spiced-variants
-      - test-specific-version
-      - test-no-account
-      - test-http-clients
-      - test-error-handling
-      - test-windows-wsl
-      - test-windows-native
-      - test-windows-no-token
-      - test-windows-custom-dir
-    environment: secret-free
-    name: Report the failure
-    runs-on: ubuntu-24.04
-    permissions:
-      issues: write
-    steps:
-      - name: Open or update the install scripts issue
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          PUBLISHED_RELEASE: ${{ inputs.published_release }}
-        with:
-          script: |
-            const marker = '<!-- install-scripts-test-failure -->';
-            const title = 'Install scripts fail against GitHub';
-            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const release = process.env.PUBLISHED_RELEASE;
-            const body = [
-              marker,
-              `The install scripts test, run after the publication of v${release}, failed: a user installing Spice the documented way may be failing too.`,
-              '',
-              `Run: ${runUrl}`,
-              `Commit: ${context.sha}`,
-            ].join('\n');
-
-            // Paginate: the marker issue falls off the first page of open issues within days.
-            const issues = await github.paginate(github.rest.issues.listForRepo, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              per_page: 100,
-            });
-            const existing = issues.find((issue) =>
-              !issue.pull_request && issue.title === title && issue.body?.includes(marker));
-            if (existing) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existing.number,
-                body,
-              });
-              core.info(`Updated #${existing.number}`);
-            } else {
-              const { data: created } = await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body,
-              });
-              core.info(`Opened #${created.number}`);
-            }
