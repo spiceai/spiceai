@@ -18,6 +18,9 @@ limitations under the License.
 
 pub mod nightly;
 mod release;
+mod verify;
+
+use verify::{ALLOW_UNVERIFIED_ENV, SHA256SUMS};
 
 pub use release::{
     Arch, ReleaseAsset, RepoRelease, SystemType, download_release_asset,
@@ -311,6 +314,34 @@ pub enum GitHubError {
     Io {
         message: String,
     },
+    /// The release's `SHA256SUMS` does not list the asset.
+    ChecksumNotListed {
+        asset: String,
+        tag: String,
+    },
+    /// The release lists `SHA256SUMS`, but it could not be downloaded.
+    ChecksumsUnavailable {
+        asset: String,
+        tag: String,
+        cause: String,
+    },
+    /// The release records no sha256 for the asset.
+    Unverifiable {
+        asset: String,
+        reason: String,
+    },
+    /// The download's sha256 is not the one the release records.
+    ChecksumMismatch {
+        asset: String,
+        expected: String,
+        actual: String,
+        source: String,
+    },
+    /// `gh attestation verify` rejected the download.
+    AttestationFailed {
+        asset: String,
+        log: String,
+    },
 }
 
 impl std::fmt::Display for GitHubError {
@@ -338,6 +369,31 @@ impl std::fmt::Display for GitHubError {
                 "Download of {name} did not complete: expected {expected} bytes but received {received}. Check the network connection and any proxy between this machine and GitHub, then run the command again."
             ),
             Self::Io { message } => write!(f, "IO error: {message}"),
+            Self::ChecksumNotListed { asset, tag } => write!(
+                f,
+                "Cannot verify {asset}: the {SHA256SUMS} of release {tag} does not list it, so it was not installed."
+            ),
+            Self::ChecksumsUnavailable { asset, tag, cause } => write!(
+                f,
+                "Cannot verify {asset}: release {tag} publishes {SHA256SUMS}, but downloading it failed ({cause}), so it was not installed. Run the command again later."
+            ),
+            Self::Unverifiable { asset, reason } => write!(
+                f,
+                "Cannot verify {asset}: {reason}, so it was not installed. To install it without verification, set {ALLOW_UNVERIFIED_ENV}=1 and run the command again."
+            ),
+            Self::ChecksumMismatch {
+                asset,
+                expected,
+                actual,
+                source,
+            } => write!(
+                f,
+                "Checksum mismatch for {asset}: expected sha256 {expected} ({source}), downloaded {actual}. The download is corrupt or was altered, so it was not installed."
+            ),
+            Self::AttestationFailed { asset, log } => write!(
+                f,
+                "The build attestation of {asset} did not verify, so it was not installed: {log}"
+            ),
         }
     }
 }
