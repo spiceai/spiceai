@@ -16,11 +16,13 @@ limitations under the License.
 
 //! GitHub API client for downloading releases.
 
+pub mod nightly;
 mod release;
 
 pub use release::{
     Arch, ReleaseAsset, RepoRelease, SystemType, download_release_asset,
-    download_release_asset_with_fallback, get_latest_release, get_release, upgrade_cli_in_place,
+    download_release_asset_with_fallback, get_latest_release, get_release, replace_current_exe,
+    upgrade_cli_in_place,
 };
 
 use reqwest::Client;
@@ -36,6 +38,8 @@ const RUNTIME_REPO: &str = "spiceai";
 pub struct GitHubClient {
     client: Client,
     token: Option<String>,
+    /// Root of the REST API that the release URLs are built on.
+    api_base: String,
     pub owner: String,
     pub repo: String,
 }
@@ -70,9 +74,84 @@ impl GitHubClient {
         Self {
             client,
             token,
+            api_base: GITHUB_API_BASE.to_string(),
             owner: owner.to_string(),
             repo: repo.to_string(),
         }
+    }
+
+    /// The same client, building its release URLs on `api_base` instead of the public API.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_api_base(mut self, api_base: &str) -> Self {
+        self.api_base = api_base.to_string();
+        self
+    }
+
+    /// Whether requests carry a GitHub token.
+    #[must_use]
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// The same client, sending `token` with its requests.
+    #[must_use]
+    pub fn with_token(mut self, token: String) -> Self {
+        self.token = Some(token);
+        self
+    }
+
+    /// Download a workflow run's artifact, a zip archive, checking that the body is as long as
+    /// GitHub published. GitHub serves artifacts only to signed-in users, so the request carries
+    /// the token; the API answers with a redirect to GitHub's storage, and reqwest drops the
+    /// `Authorization` header on a redirect to another host.
+    pub async fn download_artifact<F>(
+        &self,
+        artifact: &nightly::Artifact,
+        mut on_progress: F,
+    ) -> Result<Vec<u8>, GitHubError>
+    where
+        F: FnMut(u64),
+    {
+        use futures::StreamExt;
+
+        let mut request = self.client.get(&artifact.archive_download_url);
+        if let Some(token) = &self.token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request.send().await.map_err(|e| GitHubError::Request {
+            message: e.to_string(),
+        })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(GitHubError::Unauthorized);
+        }
+        if !status.is_success() {
+            return Err(GitHubError::Api {
+                status: status.as_u16(),
+                message: format!("Failed to download {}", artifact.name),
+            });
+        }
+
+        let mut downloaded: u64 = 0;
+        let mut data = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| GitHubError::Request {
+                message: e.to_string(),
+            })?;
+            downloaded += chunk.len() as u64;
+            data.extend_from_slice(&chunk);
+            on_progress(downloaded);
+        }
+        if downloaded != artifact.size_in_bytes {
+            return Err(GitHubError::IncompleteDownload {
+                name: artifact.name.clone(),
+                expected: artifact.size_in_bytes,
+                received: downloaded,
+            });
+        }
+        Ok(data)
     }
 
     /// Make a GET request to the GitHub API.
@@ -186,8 +265,8 @@ impl GitHubClient {
     #[must_use]
     pub fn releases_url(&self) -> String {
         format!(
-            "{GITHUB_API_BASE}/repos/{}/{}/releases",
-            self.owner, self.repo
+            "{}/repos/{}/{}/releases",
+            self.api_base, self.owner, self.repo
         )
     }
 
@@ -195,6 +274,12 @@ impl GitHubClient {
     #[must_use]
     pub fn latest_release_url(&self) -> String {
         format!("{}/latest", self.releases_url())
+    }
+
+    /// Get the API URL of the release tagged `tag`.
+    #[must_use]
+    pub fn release_by_tag_url(&self, tag: &str) -> String {
+        format!("{}/tags/{}", self.releases_url(), urlencoding::encode(tag))
     }
 }
 

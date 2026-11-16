@@ -6,13 +6,30 @@ description: >
   compaction commits again. Each run kills at the first moment a compaction
   holds a permit, after a different amount of change. Waits for compaction
   keep writing new data rather than waiting for time, since compaction needs
-  new data to trigger.
+  new data to trigger. A full refresh killed while it overwrites a table,
+  timed from the moment the overwrite starts writing and at a different
+  offset into it each run, leaves it with every row from before or every row
+  from after, never part of either or a mix, and it then matches the source.
+  With object-native data (#16133), the files the compactions and the
+  overwrite retired stay in the state location for the data-file retention.
 
 sources:
   src: { kind: postgres }
+  # The state locations of the object-native-data variants.
+  lake: { kind: rustfs }
+  slow-lake: { kind: rustfs, latency: 20ms }
 
 matrix:
   run: [1, 2, 3, 4, 5]
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite, and
+# with object-native data in an S3-compatible state location.
+variants:
+  as-written: federated
+  object-native: object-native
+  object-native-s3: object-native-s3
+  object-native-s3-latency: object-native-s3-latency
 
 spicepod:
   version: v1
@@ -34,15 +51,30 @@ spicepod:
           cayenne_cdc_mem_tier_max_age_ms: '200'
           cayenne_compaction_trigger_files: '2'
           cayenne_compaction_background_interval_ms: '200'
+    # Refreshed in full only when asked: each refresh overwrites the table.
+    - from: postgres:public.snap
+      name: snap_full
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        params: { cayenne_inline_max_rows: '0' }
 
 defaults:
   expect: { oracle: src }
+  # Each variant drives its own source until its own compaction starts, so
+  # their rows differ by design; each is checked against its own source instead.
+  compare-variants: false
 
 steps:
   - source-exec:
       src: |
         CREATE TABLE orders (o_id bigint PRIMARY KEY, v integer NOT NULL, grp integer NOT NULL, note text);
         INSERT INTO orders SELECT i, i % 1000, i % 97, 'note ' || i FROM generate_series(1, 1000000) AS i;
+        CREATE TABLE snap (id bigint PRIMARY KEY, batch integer NOT NULL, payload text NOT NULL);
+        INSERT INTO snap SELECT i, 1, repeat('a', 64) FROM generate_series(1, 300000) AS i;
   - start: {}
   - query: SELECT count(*), sum(v), sum(grp) FROM orders
     eventually: 120s
@@ -80,3 +112,75 @@ steps:
       drive: { src: "UPDATE orders SET v = v + 1 WHERE o_id % 50 = ${round} % 50", every: 2s, rounds: 60 }
   - query: SELECT count(*), sum(v), sum(grp) FROM orders
     eventually: 60s
+
+  # A full refresh killed while it overwrites the table: after the restart the
+  # dataset holds one whole batch, the one from before or the one from after,
+  # never a mix, and the source's rows once it refreshes again. Batch 2 differs
+  # from batch 1 in size, ids and payload, so one query tells a whole old
+  # batch, a whole new batch and a mix apart.
+  #
+  # The kill is timed from `cayenne_write_phase_duration_ms{phase="encode_permit_wait"}`,
+  # which an overwrite records once, after it takes its encode permits and
+  # before it writes its first data file, so when recorded the overwrite has
+  # started and not committed (the harness polls `/metrics` every 50 ms). Each of the five matrix runs
+  # then waits a different time before the kill (none, then 100 ms to 1.5 s),
+  # so the kills land at different points of the write. Nothing marks the
+  # commit, so a run whose wait outlasts the overwrite kills after it; it then
+  # must hold the whole new batch. The waits are `sleep`s because the offset
+  # into the write is what varies.
+  #
+  # Known-failing: this script's entries in `recordings/expected-failures.json`
+  # do not cover these steps yet; they are recorded (`--record-failures`) on
+  # the first run against `spiced`.
+  - source-exec:
+      src: |
+        BEGIN;
+        DELETE FROM snap;
+        INSERT INTO snap SELECT i, 2, repeat('b', 64) FROM generate_series(100001, 350000) AS i;
+        COMMIT;
+  - mark-metrics: before-overwrite
+  - refresh: { dataset: snap_full, wait: false }
+  - wait-metric:
+      name: cayenne_write_phase_duration_ms_count
+      labels: { table: snap_full, phase: encode_permit_wait }
+      increased-by: 1
+      since: before-overwrite
+      timeout: 60s
+  - sleep: 100ms
+    when: { run: 2 }
+  - sleep: 300ms
+    when: { run: 3 }
+  - sleep: 700ms
+    when: { run: 4 }
+  - sleep: 1500ms
+    when: { run: 5 }
+  - kill-spiced: {}
+  - start: {}
+  # Exactly one batch, no repeated id, one payload, and the batch whole: its
+  # row count and id range are batch 1's (1..300000) or batch 2's
+  # (100001..350000), and with no repeated id that is every id in the range.
+  - query: |
+      SELECT count(DISTINCT batch) AS batches,
+             count(*) - count(DISTINCT id) AS repeated_ids,
+             count(DISTINCT payload) AS payloads,
+             (min(batch) = 1 AND count(*) = 300000 AND min(id) = 1 AND max(id) = 300000)
+               OR (min(batch) = 2 AND count(*) = 250000 AND min(id) = 100001 AND max(id) = 350000) AS whole_batch
+      FROM snap_full
+    expect: { rows: [['1', '0', '1', 'true']] }
+  - refresh: snap_full
+  - query: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, min(id) AS lo, max(id) AS hi, min(payload) AS payload FROM snap_full GROUP BY batch
+    oracle-sql: SELECT batch, count(*) AS n, count(DISTINCT id) AS ids, min(id) AS lo, max(id) AS hi, min(payload) AS payload FROM snap GROUP BY batch
+  - query: SELECT id, batch, payload FROM snap_full WHERE id % 997 = 0
+    oracle-sql: SELECT id, batch, payload FROM snap WHERE id % 997 = 0
+
+  # What the compactions and the overwrite retired stays for the data-file
+  # retention (an hour), so a query on another instance still finds it: the
+  # overwritten table holds the files of the batch it replaced beside the
+  # current one, and none is deleted early. (Deletion once the retention has
+  # passed is covered by the engine's tests, which elapse it.)
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 2 }
+    eventually: 60s
+    only: object-native-s3
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/snap_full-, contains: .vortex, min: 2 }
+    eventually: 60s
+    only: object-native-s3-latency

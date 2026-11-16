@@ -136,6 +136,7 @@ where
                     prometheus_registry.clone(),
                     cluster_collector.clone(),
                     rate_limiter.clone(),
+                    runtime_tls::TLS_HANDSHAKE_TIMEOUT,
                 );
             }
             None => {
@@ -156,9 +157,10 @@ fn process_tls_tcp_stream(
     prometheus_registry: prometheus::Registry,
     cluster_collector: Option<Arc<ClusterMetricsCollector>>,
     rate_limiter: Option<Arc<DirectRateLimiter>>,
+    handshake_timeout: Duration,
 ) {
     tokio::spawn(async move {
-        let stream = acceptor.accept(stream).await;
+        let stream = runtime_tls::accept_within(&acceptor, stream, handshake_timeout).await;
         match stream {
             Ok(stream) => {
                 serve_connection(stream, prometheus_registry, cluster_collector, rate_limiter)
@@ -1769,6 +1771,38 @@ mod tests {
 
         let params = parse_query_string("");
         assert!(params.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_completes_the_tls_handshake_is_disconnected() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("to create listener");
+        let addr = listener.local_addr().expect("to get local addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("to accept connection");
+            process_tls_tcp_stream(
+                stream,
+                crate::http::test_tls_acceptor(),
+                prometheus::Registry::new(),
+                None,
+                None,
+                Duration::from_millis(200),
+            );
+        });
+
+        // Connects and never sends a `ClientHello`.
+        let mut silent = TcpStream::connect(addr).await.expect("to connect");
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut buf))
+            .await
+            .expect("the server closes the connection once its handshake deadline passes");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "the server closes the connection without sending anything: {read:?}"
+        );
     }
 
     #[tokio::test]

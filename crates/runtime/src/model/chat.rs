@@ -55,6 +55,7 @@ use super::params::openai::OpenAiModelParams;
 use super::params::spiceai::SpiceAiModelParams;
 use super::params::xai::XaiModelParams;
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
+use super::wrapper::defaults::{RequestDefaults, ToolOffer};
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
 use crate::token_providers::databricks::{
     DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, get_workload_identity_token_provider,
@@ -162,7 +163,7 @@ pub async fn try_to_chat_model(
 
     let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
 
-    let (tool_model, tools) = match spice_tool_opt {
+    let (tool_model, tool_offer, tools) = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => {
             let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
                 LlmError::ModelParameterFailed {
@@ -174,21 +175,36 @@ pub async fn try_to_chat_model(
             let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
                 .await
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-            let tool_model: Arc<dyn Chat> = Arc::new(ToolUsingChat::new(
-                Arc::clone(&model),
-                tools.clone(),
-                spice_recursion_limit,
-            ));
-            (tool_model, tools)
+            let tool_model =
+                ToolUsingChat::new(Arc::clone(&model), tools.clone(), spice_recursion_limit);
+            let tool_offer = tool_model.tool_offer();
+            (Arc::new(tool_model) as Arc<dyn Chat>, tool_offer, tools)
         }
-        Some(_) | None => (Arc::clone(&model), Vec::new()),
+        Some(_) | None => (Arc::clone(&model), ToolOffer::RequestOnly, Vec::new()),
     };
+
+    // The Spicepod's request defaults go above the tool loop, so they apply once to each client
+    // request rather than again to each round of the loop.
+    let without_tools = RequestDefaults::new(
+        model,
+        &component.name,
+        request_defaults(component)?,
+        ToolOffer::RequestOnly,
+    );
     Ok(LoadedChatModel {
-        chat: tool_model,
-        without_tools: model,
+        chat: Arc::new(without_tools.over(tool_model, tool_offer)),
+        without_tools: Arc::new(without_tools),
         tools,
         tool_recursion_limit: spice_recursion_limit.unwrap_or(DEFAULT_SPICE_TOOL_RECURSION_LIMIT),
     })
+}
+
+/// The request defaults that `component`'s params set, such as `temperature` or `tool_choice`.
+fn request_defaults(component: &Model) -> Result<Vec<(String, Value)>, LlmError> {
+    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
+        from: component.from.clone(),
+    })?;
+    Ok(get_openai_request_overrides(component, source.short_name()))
 }
 
 /// Deserializes the source's typed params from the (already secret-resolved)
@@ -325,12 +341,7 @@ pub async fn construct_model(
         }
         None => None,
     };
-    let mut wrapper = ChatWrapper::new(
-        model,
-        component.name.as_str(),
-        system_prompt,
-        get_openai_request_overrides(component, source.short_name()),
-    );
+    let mut wrapper = ChatWrapper::new(model, component.name.as_str(), system_prompt);
 
     if let Some(Value::String(s)) = component.params.get("parameterized_prompt")
         && matches!(s.as_str(), "enabled")
@@ -521,8 +532,11 @@ async fn huggingface(
     let chat_template_literal = params.chat_template.as_deref();
     let distributed = parse_distributed_config(
         params.distributed_backend,
-        params.node_rank.as_deref(),
-        params.nodes.as_deref(),
+        DistributedParams {
+            node_rank: params.node_rank.as_deref(),
+            nodes: params.nodes.as_deref(),
+            head_url: params.head_url.as_deref(),
+        },
         allow_insecure_connections,
     )?;
 
@@ -558,26 +572,39 @@ fn default_reasoning_effort(
         .and_then(|(_, value)| serde_json::from_value(value).ok())
 }
 
+/// The multi-node topology params of a local model, as the Spicepod gives them.
+#[cfg(feature = "models")]
+#[derive(Clone, Copy, Default)]
+struct DistributedParams<'a> {
+    node_rank: Option<&'a str>,
+    nodes: Option<&'a str>,
+    head_url: Option<&'a str>,
+}
+
 /// Parse the optional multi-node distributed-inference params (`distributed_backend`,
-/// `node_rank`, `nodes`) for a Huggingface model into a [`llms::chat::DistributedConfig`],
-/// with spiced's `--allow-insecure-connections`.
+/// `node_rank`, `nodes`, `head_url`) of a local model into a
+/// [`llms::chat::DistributedConfig`], with spiced's `--allow-insecure-connections`.
 /// Returns `Ok(None)` when distributed mode is not requested.
 #[cfg(feature = "models")]
 fn parse_distributed_config(
     distributed_backend: DistributedBackendSetting,
-    node_rank: Option<&str>,
-    nodes: Option<&str>,
+    params: DistributedParams<'_>,
     allow_insecure_connections: bool,
 ) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
+    let DistributedParams {
+        node_rank,
+        nodes,
+        head_url,
+    } = params;
     let backend = match distributed_backend {
         DistributedBackendSetting::None => {
             // Distributed is off: reject orphan topology params so forgetting (or
             // mistyping) `distributed_backend` doesn't silently run single-node
             // while `nodes`/`node_rank` look configured.
-            if nodes.is_some() || node_rank.is_some() {
+            if nodes.is_some() || node_rank.is_some() || head_url.is_some() {
                 return Err(LlmError::InvalidParamValueError {
                     param: "distributed_backend".to_string(),
-                    message: "`nodes`/`node_rank` are set but `distributed_backend` is not `ring`; set `distributed_backend: ring` to enable multi-node inference, or remove `nodes`/`node_rank`.".to_string(),
+                    message: "`nodes`/`node_rank`/`head_url` are set but `distributed_backend` is not `ring`; set `distributed_backend: ring` to enable multi-node inference, or remove `nodes`/`node_rank`/`head_url`.".to_string(),
                 });
             }
             return Ok(None);
@@ -613,11 +640,18 @@ fn parse_distributed_config(
         });
     }
 
+    let head_url = head_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(parse_head_url)
+        .transpose()?;
+
     let config = llms::chat::DistributedConfig {
         backend,
         node_rank,
         nodes,
         allow_insecure_connections,
+        head_url,
     };
     config
         .validate()
@@ -626,6 +660,23 @@ fn parse_distributed_config(
             message,
         })?;
     Ok(Some(config))
+}
+
+/// `head_url`, checked to be an `http` or `https` URL with a host, so a refusal never names
+/// something a client cannot request.
+#[cfg(feature = "models")]
+fn parse_head_url(raw: &str) -> Result<String, LlmError> {
+    match url::Url::parse(raw) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => {
+            Ok(raw.to_string())
+        }
+        _ => Err(LlmError::InvalidParamValueError {
+            param: "head_url".to_string(),
+            message: format!(
+                "Must be the http or https URL clients reach the head at, such as 'http://192.168.1.100:8090', got '{raw}'"
+            ),
+        }),
+    }
 }
 
 async fn databricks(
@@ -993,8 +1044,11 @@ async fn file(
     let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
     let distributed = parse_distributed_config(
         params.distributed_backend,
-        params.node_rank.as_deref(),
-        params.nodes.as_deref(),
+        DistributedParams {
+            node_rank: params.node_rank.as_deref(),
+            nodes: params.nodes.as_deref(),
+            head_url: params.head_url.as_deref(),
+        },
         allow_insecure_connections,
     )?;
     let context_length = parse_context_length(params)?;
@@ -1329,7 +1383,15 @@ mod test {
         pairs: &[(&str, &str)],
     ) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
         let get = |k: &str| pairs.iter().find(|(pk, _)| *pk == k).map(|(_, v)| *v);
-        parse_distributed_config(backend, get("node_rank"), get("nodes"), false)
+        parse_distributed_config(
+            backend,
+            DistributedParams {
+                node_rank: get("node_rank"),
+                nodes: get("nodes"),
+                head_url: get("head_url"),
+            },
+            false,
+        )
     }
 
     #[cfg(feature = "models")]
@@ -1381,6 +1443,65 @@ mod test {
         assert!(matches!(
             err,
             LlmError::InvalidParamValueError { ref param, .. } if param == "node_rank"
+        ));
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_ring_keeps_the_head_url_clients_reach() {
+        let cfg = parse_dist(
+            DistributedBackendSetting::Ring,
+            &[
+                ("nodes", "10.42.9.100,10.42.9.101"),
+                ("node_rank", "1"),
+                ("head_url", " http://192.168.1.100:8090 "),
+            ],
+        )
+        .expect("valid ring config")
+        .expect("ring config is Some");
+        assert_eq!(cfg.head_url.as_deref(), Some("http://192.168.1.100:8090"));
+        let unset = parse_dist(
+            DistributedBackendSetting::Ring,
+            &[("nodes", "10.42.9.100,10.42.9.101"), ("node_rank", "1")],
+        )
+        .expect("valid ring config")
+        .expect("ring config is Some");
+        assert_eq!(unset.head_url, None);
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_refuses_a_head_url_that_is_not_an_http_url() {
+        for raw in ["192.168.1.100:8090", "ftp://192.168.1.100", "http://"] {
+            let err = parse_dist(
+                DistributedBackendSetting::Ring,
+                &[("nodes", "10.0.0.1,10.0.0.2"), ("head_url", raw)],
+            )
+            .expect_err("not an http URL");
+            let LlmError::InvalidParamValueError { param, message } = err else {
+                panic!("expected an invalid param error for {raw}");
+            };
+            assert_eq!(param, "head_url");
+            assert_eq!(
+                message,
+                format!(
+                    "Must be the http or https URL clients reach the head at, such as 'http://192.168.1.100:8090', got '{raw}'"
+                )
+            );
+        }
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_rejects_an_orphan_head_url_without_backend() {
+        let err = parse_dist(
+            DistributedBackendSetting::None,
+            &[("head_url", "http://192.168.1.100:8090")],
+        )
+        .expect_err("head_url without the ring backend is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "distributed_backend"
         ));
     }
 

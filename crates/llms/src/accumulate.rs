@@ -107,8 +107,13 @@ pub fn fold_completion_stream(
         .for_each(|(c, s)| update_chat_choice(c, s));
 }
 
+#[expect(
+    deprecated,
+    reason = "`function_call` is named so that every delta field is accounted for"
+)]
 fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
-    // Destructure the update, borrowing fields from `update`.
+    // Destructure the update, borrowing fields from `update`. Every delta field is named, so a
+    // field the delta gains fails to compile here instead of being dropped from the accumulation.
     let ChatChoiceStream {
         index,
         finish_reason,
@@ -116,10 +121,11 @@ fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
         delta:
             ChatCompletionStreamResponseDelta {
                 content,
+                reasoning_content,
                 refusal,
                 tool_calls,
                 role,
-                ..
+                function_call: _,
             },
     } = update;
 
@@ -134,6 +140,13 @@ fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
     match (&mut acc.message.content, content) {
         (Some(a), Some(b)) => *a += b,
         (None, Some(b)) => acc.message.content = Some(b.clone()),
+        _ => (),
+    }
+    // Update `reasoning_content`, so that a folded stream carries the reasoning a non-streamed
+    // response would.
+    match (&mut acc.message.reasoning_content, reasoning_content) {
+        (Some(a), Some(b)) => *a += b,
+        (None, Some(b)) => acc.message.reasoning_content = Some(b.clone()),
         _ => (),
     }
     // Update `refusal`.
@@ -189,6 +202,46 @@ pub mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A folded stream carries the reasoning its chunks streamed, as a non-streamed reply would.
+    #[tokio::test]
+    async fn a_folded_stream_keeps_its_reasoning_apart_from_its_answer() {
+        let parts = [
+            json!({"index":0,"delta":{"role":"assistant","reasoning_content":"17 + 25"}}),
+            json!({"index":0,"delta":{"reasoning_content":" is 42."}}),
+            json!({"index":0,"delta":{"content":"42"}}),
+            json!({"index":0,"delta":{},"finish_reason":"stop"}),
+        ];
+        let stream: ChatCompletionResponseStream =
+            Box::pin(futures::stream::iter(parts.into_iter().map(|choice| {
+                serde_json::from_value::<CreateChatCompletionStreamResponse>(json!({
+                    "id": "chatcmpl-1", "created": 1, "model": "m",
+                    "object": "chat.completion.chunk", "choices": [choice],
+                }))
+                .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))
+            })));
+        let message = &accumulate(stream).await.expect("a valid stream").choices[0].message;
+        assert_eq!(message.reasoning_content.as_deref(), Some("17 + 25 is 42."));
+        assert_eq!(message.content.as_deref(), Some("42"));
+    }
+
+    /// A chunk without reasoning carries no `reasoning_content` at all, never a `null` a client
+    /// would have to filter (the `async-openai` fork skips it when `None`).
+    #[test]
+    fn a_chunk_without_reasoning_serializes_no_reasoning_field() {
+        let chunk: CreateChatCompletionStreamResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-1", "created": 1, "model": "m", "object": "chat.completion.chunk",
+            "choices": [{"index":0,"delta":{"content":"42"}}],
+        }))
+        .expect("a chunk");
+        let wire = serde_json::to_value(&chunk).expect("serializes");
+        assert_eq!(
+            wire["choices"][0]["delta"].get("reasoning_content"),
+            None,
+            "{wire}"
+        );
+        assert_eq!(wire["choices"][0]["delta"]["content"], json!("42"));
+    }
 
     #[expect(clippy::missing_panics_doc)]
     #[tokio::test]

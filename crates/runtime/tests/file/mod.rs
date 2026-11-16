@@ -1262,3 +1262,93 @@ async fn file_connector_secret_param_validation_does_not_echo_canary() -> Result
         })
         .await
 }
+
+/// An unresolved `${ secrets:... }` reference must fail that dataset, naming
+/// the reference, instead of substituting the empty string. Before the fix,
+/// `file_format: ${ secrets:MISSING }` became `""` and loaded the CSV as a
+/// one-row document table that reported Ready. A literal empty `file_format`
+/// is rejected too, and a sibling dataset with `file_format: csv` is unaffected.
+#[tokio::test]
+async fn file_connector_unresolved_secret_fails_the_dataset() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            const REFERENCE: &str = "${ secrets:SPICE_TEST_FILE_FORMAT_NEVER_SET_7f3a }";
+
+            let dir = tempfile::TempDir::new()?;
+            let csv = dir.path().join("orders.csv");
+            write_orders_csv(&csv)?;
+
+            let dataset_with = |name: &str, file_format: &str| {
+                let mut dataset = Dataset::new(format!("file:{}", csv.display()), name);
+                dataset.params = Some(Params {
+                    data: HashMap::from([(
+                        "file_format".to_string(),
+                        ParamValue::String(file_format.to_string()),
+                    )]),
+                });
+                dataset
+            };
+
+            let app = AppBuilder::new("unresolved_secret")
+                .with_dataset(dataset_with("missing_secret", REFERENCE))
+                .with_dataset(dataset_with("empty_format", ""))
+                .with_dataset(dataset_with("literal_csv", "csv"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let status_of = |name: &str| {
+                rt.status()
+                    .get_dataset_status(&datafusion::common::TableReference::bare(name))
+                    .expect("dataset status")
+            };
+
+            let missing = status_of("missing_secret");
+            assert!(
+                missing.is_error(),
+                "an unresolved secret must not go Ready, got {missing:?}"
+            );
+            let message = missing
+                .error_message()
+                .expect("the unresolved secret must be recorded on the dataset");
+            assert!(
+                message.contains(REFERENCE),
+                "error_message must name the secret reference: {message}"
+            );
+            assert!(
+                message.contains("file_format"),
+                "error_message must name the parameter: {message}"
+            );
+
+            let empty = status_of("empty_format");
+            assert!(
+                empty.is_error(),
+                "an empty file_format must not go Ready, got {empty:?}"
+            );
+            let message = empty.error_message().expect("empty file_format error");
+            assert!(message.contains("is empty"), "{message}");
+
+            let literal = status_of("literal_csv");
+            assert_eq!(
+                literal.to_string(),
+                "Ready",
+                "file_format csv is unchanged, got {literal:?}"
+            );
+            let (_, rows) = run_and_count(&rt, "SELECT * FROM literal_csv").await?;
+            assert_eq!(rows, 2, "the csv dataset reads every row");
+
+            Ok(())
+        })
+        .await
+}

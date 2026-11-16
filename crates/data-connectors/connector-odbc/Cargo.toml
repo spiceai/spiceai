@@ -54,6 +54,7 @@ default = []
 
 [dev-dependencies]
 runtime = { path = "../../runtime" }
+data-accelerator-api = { path = "../../data-accelerator-api" }
 
 [lints]
 workspace = true

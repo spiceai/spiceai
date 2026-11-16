@@ -86,8 +86,8 @@ use api::{http_step, refresh, source_query, spice_cli};
 use background::{start_background, stop_background};
 use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
 use cluster::{
-    cluster_args, make_cluster_ready, start_executors, undistributed_engine,
-    unpartitionable_acceleration,
+    bridge_address, check_bridged_sources, cluster_args, make_cluster_ready, published_to_bridge,
+    spicepod_for_bridge, start_executors, undistributed_engine, unpartitionable_acceleration,
 };
 use generators::{random_queries, run_slt, tlp};
 use query::{check_error_text, explain, run_query};
@@ -495,6 +495,10 @@ struct Instance {
     spicepod_yaml: String,
     /// The rendered spicepod, which `patch:` on a start changes.
     spicepod: Value,
+    /// Where its bridged executors reach this machine (see
+    /// [`crate::spiced::ContainerRun::bridge`]); every rendering of the
+    /// spicepod names sources there.
+    bridge: Option<std::net::IpAddr>,
     /// The namespace this instance owns in each source.
     namespaces: BTreeMap<String, String>,
     /// Set when a lifecycle step failed; later steps are skipped.
@@ -797,14 +801,27 @@ async fn run_combination(
         kinds: BTreeMap::new(),
     };
     let result = async {
+        // Bridged executors reach the sources at this address, not loopback.
+        let bridge = bridge_address(script, options).await?;
+        if bridge.is_some() {
+            check_bridged_sources(
+                script,
+                resolved
+                    .iter()
+                    .map(|(name, _, kind, _)| (name.as_str(), kind.as_str())),
+            )?;
+        }
         for (name, spec, kind, version) in resolved {
-            let src = source::start(
-                name,
-                run_id,
-                &kind,
-                version.as_deref(),
-                &options.work_dir.join(run_id).join("sources"),
-                spec,
+            let src = crate::docker::publishing_also_on(
+                bridge.filter(|_| published_to_bridge(&kind)),
+                source::start(
+                    name,
+                    run_id,
+                    &kind,
+                    version.as_deref(),
+                    &options.work_dir.join(run_id).join("sources"),
+                    spec,
+                ),
             )
             .await
             .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
@@ -1094,6 +1111,7 @@ async fn create_instances(
     let rootless_reach = cfg!(target_os = "linux")
         && script.sources.values().any(|s| s.host_network)
         && crate::docker::daemon_is_rootless().await;
+    let bridge = bridge_address(script, options).await?;
     let host_from_container = if rootless_reach {
         crate::docker::routable_address()?.to_string()
     } else {
@@ -1134,18 +1152,28 @@ async fn create_instances(
             }
             // `spiced` serves HTTP on every interface when `rootless_reach`
             // is set, so its port must be free on the wildcard address too.
-            let http_port = crate::docker::free_port_on(if rootless_reach {
-                std::net::Ipv4Addr::UNSPECIFIED.into()
+            // A port served beyond loopback must be free there too: a loopback
+            // probe misses a listener on another address. Bridged nodes serve
+            // the scheduler and executor ports at the routable address.
+            let wide_ip: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
+            let loopback_ip: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+            let http_port = crate::docker::free_port_on(if rootless_reach || bridge.is_some() {
+                wide_ip
             } else {
-                std::net::Ipv4Addr::LOCALHOST.into()
+                loopback_ip
             })?;
+            let node_ip = if bridge.is_some() {
+                wide_ip
+            } else {
+                loopback_ip
+            };
             let context = json!({
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
-                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
-                    "executor_port": crate::docker::free_port()?, "http_port": http_port,
-                    "flight_port": crate::docker::free_port()?,
+                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port_on(node_ip)?,
+                    "executor_port": crate::docker::free_port_on(node_ip)?, "http_port": http_port,
+                    "flight_port": crate::docker::free_port_on(node_ip)?,
                     "host_from_container": host_from_container },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
                 "pki": { "dir": options.pki.display().to_string() },
@@ -1186,6 +1214,9 @@ async fn create_instances(
                     continue;
                 }
                 make_cluster_ready(&mut spicepod, &dir, &script.defaults.cluster_partition_by);
+                if let Some(address) = bridge {
+                    spicepod_for_bridge(&mut spicepod, address);
+                }
             }
             let context_for_steps = context.clone();
             let spicepod_yaml = yaml::to_string(&spicepod)?;
@@ -1244,6 +1275,7 @@ async fn create_instances(
                     &options.pki,
                     &context,
                     executor_count + spare_count,
+                    bridge,
                 )?)
             } else {
                 None
@@ -1291,7 +1323,8 @@ async fn create_instances(
                             "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
                         ],
                         rootless: crate::docker::daemon_is_rootless().await,
-                    });
+                        bridge,
+                    })?;
                 }
                 executors.push(executor);
             }
@@ -1338,6 +1371,7 @@ async fn create_instances(
                 executors,
                 spicepod_yaml,
                 spicepod,
+                bridge,
                 namespaces,
                 broken: None,
                 answers: BTreeMap::new(),
@@ -1603,6 +1637,7 @@ async fn note_broken(instance: &mut Instance, step: &Step, outcome: &mut Result<
             | Action::Kill { .. }
             | Action::Restart { .. }
             | Action::WaitReady { .. }
+            | Action::WipeInstanceDir { .. }
     );
     if outcome.is_ok() && matches!(step.action, Action::Start { .. } | Action::Restart { .. }) {
         if let Err(error) = check_base_release_features(instance).await {
@@ -1826,6 +1861,10 @@ fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<(
         when: Map::new(),
     };
     template::apply_variant(&mut instance.spicepod, &resolved)?;
+    // A patch renders source parameters from the context, at loopback again.
+    if let Some(address) = instance.bridge {
+        spicepod_for_bridge(&mut instance.spicepod, address);
+    }
     instance.spicepod_yaml = yaml::to_string(&instance.spicepod)?;
     Ok(())
 }

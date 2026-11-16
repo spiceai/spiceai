@@ -448,15 +448,20 @@ impl ClusterService for ClusterServiceImpl {
         // other request is limited to the stores the app references the key
         // through.
         let store = request.store.as_str();
+        //
+        // The `_or_outage` lookups report a miss as an error when a consulted
+        // store failed, so the executor sees a retriable store error rather
+        // than a definitive "not found" (which would permanently fail a
+        // dataset whose secret lives in the store that is down).
         let lookup = if store != SECRETS && allowed_stores.contains(store) {
             secrets
-                .get_secret_from_stores(&request.key, &HashSet::from([store.to_string()]))
+                .get_secret_from_stores_or_outage(&request.key, &HashSet::from([store.to_string()]))
                 .await
         } else if allowed_stores.contains(SECRETS) {
-            secrets.get_secret(&request.key).await
+            secrets.get_secret_or_outage(&request.key).await
         } else {
             secrets
-                .get_secret_from_stores(&request.key, allowed_stores)
+                .get_secret_from_stores_or_outage(&request.key, allowed_stores)
                 .await
         };
         let Some(value) =

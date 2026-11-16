@@ -129,6 +129,9 @@ impl ContextParams {
 pub struct Context<'m> {
     raw: NonNull<sys::llama_context>,
     _model: PhantomData<&'m crate::Model>,
+    /// Whether the decodes that follow output each row's greedy pick instead of its logits
+    /// ([`Context::set_argmax_output`]).
+    argmax: bool,
 }
 
 // SAFETY: a context is used by one thread at a time, which `&mut self` on every call that
@@ -140,6 +143,7 @@ impl Context<'_> {
         Self {
             raw,
             _model: PhantomData,
+            argmax: false,
         }
     }
 
@@ -218,6 +222,38 @@ impl Context<'_> {
         Some(unsafe { std::slice::from_raw_parts(row.as_ptr(), n_vocab) })
     }
 
+    /// Turns the argmax output on or off for the decodes that follow. With it on, a model whose
+    /// output head a tensor split divides by rows (DeepSeek-V4.1) computes each output row's
+    /// greedy pick on the devices that hold the head and sends back only the picks, instead of
+    /// gathering every row's logits. Those decodes have no logits: [`Context::argmax`] gives the
+    /// pick. Any other model computes its logits as before, and [`Context::argmax`] takes their
+    /// first maximum. The pick ignores samplers, so only a request that samples greedily alone
+    /// may use it. Changing the mode rebuilds the model's graph, so this calls llama.cpp only
+    /// when the mode changes.
+    pub fn set_argmax_output(&mut self, on: bool) {
+        if on != self.argmax {
+            // SAFETY: the context is live.
+            unsafe { sys::llama_set_argmax_output(self.raw.as_ptr(), on) };
+            self.argmax = on;
+        }
+    }
+
+    /// Whether the argmax output is on ([`Context::set_argmax_output`]).
+    #[must_use]
+    pub fn argmax_output(&self) -> bool {
+        self.argmax
+    }
+
+    /// The greedy pick of output row `index` of the last decoded batch: the token with the
+    /// largest logit, the first on a tie, token 0 when the row's first logit is a NaN, as
+    /// llama.cpp's greedy sampler picks it. `None` when the last decode did not output that row,
+    /// or when a backend sampler sampled it.
+    pub(crate) fn argmax(&self, index: i32) -> Option<Token> {
+        // SAFETY: the context is live; the call waits for the last decode to finish.
+        let token = unsafe { sys::llama_get_argmax_ith(self.raw.as_ptr(), index) };
+        (token >= 0).then_some(Token(token))
+    }
+
     /// Waits for the computation queued by earlier decodes to finish: a decode returns once
     /// its computation is queued, and a time taken without waiting would leave it out.
     pub fn synchronize(&mut self) {
@@ -282,13 +318,38 @@ impl Context<'_> {
     /// `None` for a sequence the context does not hold.
     #[must_use]
     pub fn partial_state_seq(&self, seq: i32) -> Option<Vec<u8>> {
+        self.state_seq_with(seq, PARTIAL_ONLY)
+    }
+
+    /// Sequence `seq`'s whole state: its attention cache cells with their positions, and any
+    /// recurrent state, as llama.cpp's server saves a prompt to host memory. Restored with
+    /// [`Context::restore_state_seq`] into an empty sequence of a context like this one, it
+    /// decodes as the sequence it was saved from would have. `None` for a sequence the context
+    /// does not hold or that holds nothing.
+    #[must_use]
+    pub fn state_seq(&self, seq: i32) -> Option<Vec<u8>> {
+        self.state_seq_with(seq, 0)
+    }
+
+    /// How many bytes [`Context::state_seq`] would return for sequence `seq`, counted without
+    /// reading any cell's data; 0 for a sequence the context does not hold.
+    #[must_use]
+    pub fn state_seq_size(&self, seq: i32) -> usize {
+        if !self.holds(seq) {
+            return 0;
+        }
+        // SAFETY: `raw` is live while `self` is (see `Context`), `seq` is one of its sequences,
+        // and sizing a sequence's state reads the context without changing it.
+        unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, 0) }
+    }
+
+    fn state_seq_with(&self, seq: i32, flags: sys::llama_state_seq_flags) -> Option<Vec<u8>> {
         if !self.holds(seq) {
             return None;
         }
         // SAFETY: `raw` is live while `self` is (see `Context`), `seq` is one of its sequences,
         // and sizing a sequence's state reads the context without changing it.
-        let size =
-            unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, PARTIAL_ONLY) };
+        let size = unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, flags) };
         let mut state = vec![0u8; size];
         // SAFETY: `raw` is live (see `Context`), and llama.cpp writes at most `size` bytes into
         // `state`, which holds `size` writable bytes.
@@ -298,7 +359,7 @@ impl Context<'_> {
                 state.as_mut_ptr(),
                 size,
                 seq,
-                PARTIAL_ONLY,
+                flags,
             )
         };
         (size > 0 && written == size).then_some(state)
@@ -313,6 +374,23 @@ impl Context<'_> {
     /// Restores a state [`Context::partial_state_seq`] saved into sequence `seq`. Returns false
     /// for a sequence the context does not hold, or when llama.cpp does not read all of it.
     pub fn restore_partial_state_seq(&mut self, seq: i32, state: &[u8]) -> bool {
+        self.restore_state_seq_with(seq, state, PARTIAL_ONLY)
+    }
+
+    /// Restores a state [`Context::state_seq`] saved into sequence `seq`, which must hold
+    /// nothing. Returns false for a sequence the context does not hold, or when llama.cpp does
+    /// not read all of it, as when the cache has no room for its cells; llama.cpp then leaves
+    /// the sequence empty.
+    pub fn restore_state_seq(&mut self, seq: i32, state: &[u8]) -> bool {
+        self.restore_state_seq_with(seq, state, 0)
+    }
+
+    fn restore_state_seq_with(
+        &mut self,
+        seq: i32,
+        state: &[u8],
+        flags: sys::llama_state_seq_flags,
+    ) -> bool {
         if !self.holds(seq) {
             return false;
         }
@@ -325,7 +403,7 @@ impl Context<'_> {
                 state.as_ptr(),
                 state.len(),
                 seq,
-                PARTIAL_ONLY,
+                flags,
             )
         };
         !state.is_empty() && read == state.len()
