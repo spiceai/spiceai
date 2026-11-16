@@ -53,7 +53,7 @@ jobs:
     # merge_group checks out the queue merge commit, which contains the queued
     # pull request, so the job gets no object-store credentials.
     runs-on: spiceai-macos-large
-    environment: ci-build
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
     # Extraction takes 10-18 minutes on most runs and up to 75 on a loaded
