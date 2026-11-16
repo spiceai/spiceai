@@ -256,12 +256,14 @@ Use the thematic order below to group the remaining subsections and to break tie
   | `zip` 3                | v3.0.0  | Removed |
   ```
 
-  DataFusion is the first row. Use the product name for a major dependency and the backticked crate name for a crate. Read every version from `Cargo.lock` at the previous tag and at the release ref, never from a PR title:
+  DataFusion is the first row. Use the product name for a major dependency and the backticked crate name for a crate. Read every version from the previous tag and from the release ref, never from a PR title. A crates.io dependency's version comes from `Cargo.lock`:
 
   ```bash
   lockver(){ git show "$1":Cargo.lock | awk -v n="$2" '$0=="name = \""n"\""{getline; gsub(/version = |"/,""); print}' | sort -V | tr '\n' ' '; }
   for c in datafusion adbc_core rmcp; do echo "$c | $(lockver v2.4.2 $c)| $(lockver origin/release/2.4 $c)"; done
   ```
+
+  A git dependency, one whose `Cargo.lock` `source` starts with `git+`, can carry a placeholder version there. Vortex's tagged releases publish `0.1.0`, so `Cargo.lock` reads `vortex 0.1.0` for Vortex v0.86.1. For such a dependency, take the release from the comment on its pin in the root `Cargo.toml` at both refs (`# branch: spiceai-55 (vortex 0.86.1)`), and check it against the fork branch or the upstream tag. The lockfile still identifies the pinned revision.
 
   When a crate has several locked versions, show the one that changed. Write `Removed` only for what the release drops. When other major versions of the crate remain, name the dropped major in the row (`` `zip` 3 ``), so the row does not claim that the whole crate is gone. After the table, one sentence links to the dependency subsections and to the advisory list.
 
