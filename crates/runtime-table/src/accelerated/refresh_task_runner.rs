@@ -77,9 +77,6 @@ pub struct RefreshTaskRunnerBuilder {
     in_flight_revalidations: Option<crate::accelerated::caching::InFlightRevalidations>,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
-    /// Forwards committed append refreshes to the dataset's `DoExchange`
-    /// subscribers.
-    data_update_publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -119,19 +116,7 @@ impl RefreshTaskRunnerBuilder {
             snapshot_refresh_state: None,
             in_flight_revalidations: None,
             append_cursor_store: None,
-            data_update_publisher: None,
         }
-    }
-
-    /// Forward each committed append refresh to the dataset's `DoExchange`
-    /// subscribers.
-    #[must_use]
-    pub fn with_data_update_publisher(
-        mut self,
-        publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
-    ) -> Self {
-        self.data_update_publisher = publisher;
-        self
     }
 
     #[must_use]
@@ -264,8 +249,7 @@ impl RefreshTaskRunnerBuilder {
         .with_change_sink(self.change_sink)
         .with_cache_write_sender(self.cache_write_sender)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
-        .with_metrics(self.metrics)
-        .with_data_update_publisher(self.data_update_publisher);
+        .with_metrics(self.metrics);
 
         if let Some(semaphore) = self.semaphore {
             refresh_task_builder = refresh_task_builder.with_semaphore(semaphore);

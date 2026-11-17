@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
-use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -175,73 +174,6 @@ impl DataUpdateBroadcaster {
         {
             channels.remove(table_reference);
         }
-    }
-}
-
-/// Most bytes of appended rows a refresh holds to forward to `DoExchange`
-/// subscribers after its write commits. The same bound a subscriber applies to
-/// updates it buffers while streaming its initial snapshot.
-pub const MAX_PUBLISHED_REFRESH_APPEND_BYTES: usize = 128 * 1024 * 1024;
-
-/// Forwards the rows an accelerated refresh appends to the `DoExchange`
-/// subscribers of one dataset, so an append stream delivers refresh-driven
-/// appends as well as `DoPut` writes.
-#[derive(Clone, Debug)]
-pub struct DataUpdatePublisher {
-    broadcaster: DataUpdateBroadcaster,
-    table_reference: TableReference,
-}
-
-impl DataUpdatePublisher {
-    #[must_use]
-    pub fn new(broadcaster: DataUpdateBroadcaster, table_reference: TableReference) -> Self {
-        Self {
-            broadcaster,
-            table_reference,
-        }
-    }
-
-    #[must_use]
-    pub fn table_reference(&self) -> &TableReference {
-        &self.table_reference
-    }
-
-    pub async fn has_subscribers(&self) -> bool {
-        self.broadcaster
-            .has_subscribers(&self.table_reference)
-            .await
-    }
-
-    /// Sends appended rows to every current subscriber. Call it only once the
-    /// rows are committed, so a subscriber never receives rows a reader of the
-    /// dataset cannot see.
-    pub async fn publish_append(&self, schema: SchemaRef, data: Vec<RecordBatch>) {
-        let data: Vec<RecordBatch> = data
-            .into_iter()
-            .filter(|batch| batch.num_rows() > 0)
-            .collect();
-        if data.is_empty() {
-            return;
-        }
-        self.broadcaster
-            .publish(
-                &self.table_reference,
-                DataUpdate {
-                    schema,
-                    data,
-                    update_type: UpdateType::Append,
-                },
-            )
-            .await;
-    }
-
-    /// Ends every current subscription with a data-loss error, for an append
-    /// too large to forward. A subscriber then resubscribes and takes a fresh
-    /// snapshot instead of silently missing the rows.
-    pub async fn close_subscribers(&self) -> bool {
-        self.broadcaster
-            .close_subscribers(&self.table_reference)
-            .await
     }
 }
 

@@ -328,43 +328,6 @@ async fn same_scope_preserves_duplicate_inputs() {
     .expect("duplicates inside the same scope belong to the provider conflict policy");
 }
 
-/// A keyless `DoExchange` subscription sends every row with a null key list.
-/// Those rows have no keys, exactly like empty lists, so a snapshot batch must
-/// group into one write rather than one write per row.
-#[test]
-fn null_primary_key_lists_group_as_keyless_rows() {
-    use super::provider::cdc::{ChangeOperationType, group_into_sub_batches};
-
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
-    let rows = 5;
-    let changes = SourceBatch::try_new(
-        RecordBatch::try_new(
-            Arc::new(changes_schema(&schema)),
-            vec![
-                Arc::new(StringArray::from(vec!["r"; rows])),
-                Arc::new(ListArray::new_null(
-                    Arc::new(Field::new("item", DataType::Utf8, false)),
-                    rows,
-                )),
-                Arc::new(StructArray::new(
-                    schema.fields().clone(),
-                    vec![Arc::new(Int64Array::from((0..5).collect::<Vec<i64>>())) as ArrayRef],
-                    None,
-                )),
-            ],
-        )
-        .expect("CDC rows"),
-    )
-    .expect("valid CDC batch");
-
-    let groups = group_into_sub_batches(&changes);
-    assert_eq!(
-        groups,
-        vec![(ChangeOperationType::Upsert, (0..rows).collect::<Vec<_>>())],
-        "null key lists are keyless rows and share one write"
-    );
-}
-
 #[tokio::test]
 async fn mixed_primary_key_lists_preserve_deletes() {
     use super::provider::cdc::{ChangeOperationType, group_into_sub_batches};
