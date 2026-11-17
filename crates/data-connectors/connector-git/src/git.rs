@@ -1466,14 +1466,14 @@ impl CredentialOrigin {
                             hosts.push(host.clone());
                             hosts.push(format!("{host}:{default}"));
                         }
-                        (None, None) => hosts.push(host.clone()),
+                        (None, None) => hosts.push(host),
                     }
                     Some(Self {
                         protocol: url.scheme().to_string(),
                         hosts,
                     })
                 }
-                "ssh" | "git+ssh" | "ssh+git" => Some(Self::https(host)),
+                "ssh" | "git+ssh" | "ssh+git" => Some(Self::https(&host)),
                 _ => None,
             };
         }
@@ -1488,13 +1488,13 @@ impl CredentialOrigin {
             authority.rsplit('@').next()?.to_string()
         };
         let host = host.to_ascii_lowercase();
-        (!host.is_empty() && !host.contains('/')).then(|| Self::https(host))
+        (!host.is_empty() && !host.contains('/')).then(|| Self::https(&host))
     }
 
-    fn https(host: String) -> Self {
+    fn https(host: &str) -> Self {
         Self {
             protocol: "https".to_string(),
-            hosts: vec![host.clone(), format!("{host}:443")],
+            hosts: vec![host.to_string(), format!("{host}:443")],
         }
     }
 }

@@ -65,7 +65,6 @@ impl reqwest::dns::Resolve for Resolver {
 
 /// Configures `builder` for [`send`]: `reqwest` follows no redirect itself, and every host is
 /// resolved through `egress`.
-#[must_use]
 pub fn configure(builder: ClientBuilder, egress: &Egress) -> ClientBuilder {
     builder
         .redirect(Policy::none())

@@ -370,10 +370,11 @@ impl From<Error> for DataFusionError {
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
-            // `Plan`, so a refresh does not re-ask: the response will expand as far again.
-            err @ Error::CompressionRatio { .. } => DataFusionError::Plan(err.to_string()),
-            // `Plan`, so a refresh does not re-ask: the origin will redirect the same way.
-            err @ Error::RedirectRefused { .. } => DataFusionError::Plan(err.to_string()),
+            // `Plan`, so a refresh does not re-ask: the response will expand as far again, and
+            // the origin will redirect the same way.
+            err @ (Error::CompressionRatio { .. } | Error::RedirectRefused { .. }) => {
+                DataFusionError::Plan(err.to_string())
+            }
             err @ Error::ResponseDecode { .. } => {
                 DataFusionError::External(Box::new(std::io::Error::other(err.to_string())))
             }

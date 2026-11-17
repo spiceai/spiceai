@@ -224,9 +224,8 @@ impl Egress {
         };
         let trust = *self.hosts().entry(host_key(&host)).or_insert(first);
         match trust {
-            HostTrust::Internal => Ok(addresses),
             HostTrust::Checked if blocked => Err(Box::new(guard.refused(host))),
-            HostTrust::Checked => Ok(addresses),
+            HostTrust::Internal | HostTrust::Checked => Ok(addresses),
             HostTrust::Public => {
                 let public: Vec<SocketAddr> = addresses
                     .into_iter()
