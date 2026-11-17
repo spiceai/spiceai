@@ -28,6 +28,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::Credentials;
@@ -179,6 +180,9 @@ fn resolve_client_identity_params(
 #[derive(Clone, Debug)]
 pub struct SpiceAI {
     flight_factory: FlightFactory,
+    /// The runtime's query memory pool, which a reload of the append stream
+    /// stages its snapshot in.
+    reload_memory_pool: Arc<dyn MemoryPool>,
 }
 
 impl SpiceAI {
@@ -459,7 +463,16 @@ impl DataConnectorFactory for SpiceAIFactory {
                 Arc::new(SpiceCloudPlatformDialect {}),
             )
             .with_substrait(context.role() == Role::Sidecar);
-            Ok(Arc::new(SpiceAI { flight_factory }) as Arc<dyn DataConnector>)
+            let reload_memory_pool = Arc::clone(
+                &context
+                    .datafusion_session_context()
+                    .runtime_env()
+                    .memory_pool,
+            );
+            Ok(Arc::new(SpiceAI {
+                flight_factory,
+                reload_memory_pool,
+            }) as Arc<dyn DataConnector>)
         })
     }
 
@@ -586,6 +599,7 @@ impl DataConnector for SpiceAI {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
     ) -> Option<ChangesStream> {
+        let reload_memory_pool = Arc::clone(&self.reload_memory_pool);
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(federated_table_provider_adaptor) = table_provider
@@ -603,6 +617,7 @@ impl DataConnector for SpiceAI {
             let mut stream = Box::pin(subscribe_to_append_stream(
                 flight_table.get_flight_client(),
                 flight_table.get_table_reference(),
+                reload_memory_pool,
             ));
 
             while let Some(item) = stream.next().await {
@@ -660,10 +675,13 @@ impl SpiceAI {
 mod append_stream;
 
 /// Reads the append stream (`DoExchange`) of the upstream dataset
-/// `table_reference` into change envelopes.
+/// `table_reference` into change envelopes. A reload of the dataset stages its
+/// snapshot in memory reserved from `memory_pool`, and is refused (and retried
+/// later) when the pool cannot hold it.
 pub fn subscribe_to_append_stream(
     client: FlightClient,
     table_reference: String,
+    memory_pool: Arc<dyn MemoryPool>,
 ) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
     let subscribe_to = table_reference.clone();
     append_stream::append_stream(
@@ -673,6 +691,7 @@ pub fn subscribe_to_append_stream(
             async move { client.subscribe(&table_reference).await }
         },
         table_reference,
+        append_stream::ReloadBudget::new(memory_pool),
     )
 }
 

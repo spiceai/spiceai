@@ -22,9 +22,10 @@ limitations under the License.
 //! skipped when the snapshot already holds their commit. A producer that does
 //! not mark its snapshot is read as before: every batch is ready.
 
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
@@ -33,7 +34,10 @@ use arrow_flight::error::FlightError;
 use arrow_tools::map_entries::StreamNormalizer;
 use async_stream::stream;
 use data_components::cdc::{self, ChangeBatch, ChangeEnvelope};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use futures::{Stream, StreamExt};
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{ObservableCounter, ObservableGauge};
 
 use super::SpiceAIChangeCommiter;
 use crate::flight::append_stream::{Step, StreamMarker, StreamMetadata, Subscription};
@@ -51,6 +55,159 @@ const APPEND_STREAM_HEALTHY_SUBSCRIPTION: Duration = Duration::from_secs(60);
 /// How long a marked snapshot may load before its missing `end` is logged as
 /// an error. The dataset stays not-ready either way.
 const SNAPSHOT_END_ERROR_AFTER: Duration = Duration::from_secs(300);
+
+/// The first wait before retrying a reload that was refused for lack of memory.
+const REFUSED_RELOAD_FIRST_RETRY: Duration = Duration::from_secs(30);
+
+/// The longest wait before retrying a reload that was refused for lack of memory.
+const REFUSED_RELOAD_MAX_RETRY: Duration = Duration::from_secs(15 * 60);
+
+fn refused_reload_backoff(refusals: u32) -> Duration {
+    REFUSED_RELOAD_FIRST_RETRY
+        .saturating_mul(2_u32.saturating_pow(refusals.saturating_sub(1)))
+        .min(REFUSED_RELOAD_MAX_RETRY)
+}
+
+/// What a reload may use: memory reserved from the runtime's query memory
+/// pool, and where to report a dataset left serving stale data.
+#[derive(Clone)]
+pub(super) struct ReloadBudget {
+    memory_pool: Arc<dyn MemoryPool>,
+    stale: Arc<StaleDatasets>,
+}
+
+impl ReloadBudget {
+    /// A budget drawn from `memory_pool` that reports staleness through the
+    /// `dataset_append_stream_stale_seconds` and
+    /// `dataset_append_stream_reloads_refused` metrics.
+    pub(super) fn new(memory_pool: Arc<dyn MemoryPool>) -> Self {
+        Self {
+            memory_pool,
+            stale: StaleDatasets::published(),
+        }
+    }
+}
+
+/// The datasets whose append stream keeps serving data older than its source,
+/// because a reload was refused or discarded, and how often each reload was
+/// refused.
+#[derive(Default)]
+pub(super) struct StaleDatasets {
+    datasets: parking_lot::Mutex<HashMap<String, Staleness>>,
+}
+
+#[derive(Default)]
+struct Staleness {
+    /// When the dataset last changed, while a reload of it is outstanding.
+    stale_since: Option<tokio::time::Instant>,
+    /// Reloads refused because staging them needed more memory than the pool had.
+    refused: u64,
+}
+
+/// The process-wide [`StaleDatasets`] and the instruments that publish it.
+static PUBLISHED_STALE_DATASETS: LazyLock<(
+    Arc<StaleDatasets>,
+    ObservableGauge<u64>,
+    ObservableCounter<u64>,
+)> = LazyLock::new(|| {
+    let stale = Arc::new(StaleDatasets::default());
+    let meter = &runtime_metrics::datasets::DATASETS_METER;
+    let gauge = meter
+        .u64_observable_gauge("dataset_append_stream_stale_seconds")
+        .with_description(
+            "Seconds since a spice.ai append-stream dataset last changed, while a reload of it was refused or discarded and it keeps serving its previous data; 0 once a reload succeeds.",
+        )
+        .with_unit("s")
+        .with_callback({
+            let stale = Arc::clone(&stale);
+            move |observer| {
+                for (dataset, seconds) in stale.stale_seconds() {
+                    observer.observe(seconds, &[KeyValue::new("dataset", dataset)]);
+                }
+            }
+        })
+        .build();
+    let refused = meter
+        .u64_observable_counter("dataset_append_stream_reloads_refused")
+        .with_description(
+            "Reloads of a spice.ai append-stream dataset refused because staging them needed more memory than the query memory pool had free.",
+        )
+        .with_callback({
+            let stale = Arc::clone(&stale);
+            move |observer| {
+                for (dataset, refused) in stale.refusals() {
+                    observer.observe(refused, &[KeyValue::new("dataset", dataset)]);
+                }
+            }
+        })
+        .build();
+    (stale, gauge, refused)
+});
+
+impl StaleDatasets {
+    fn published() -> Arc<Self> {
+        Arc::clone(&PUBLISHED_STALE_DATASETS.0)
+    }
+
+    /// `dataset` keeps serving data that last changed at `last_changed`.
+    fn mark_stale(&self, dataset: &str, last_changed: Option<tokio::time::Instant>, refused: bool) {
+        let mut datasets = self.datasets.lock();
+        let entry = datasets.entry(dataset.to_string()).or_default();
+        if entry.stale_since.is_none() {
+            entry.stale_since = Some(last_changed.unwrap_or_else(tokio::time::Instant::now));
+        }
+        if refused {
+            entry.refused += 1;
+        }
+    }
+
+    /// `dataset` was reloaded and is current again.
+    fn mark_current(&self, dataset: &str) {
+        if let Some(entry) = self.datasets.lock().get_mut(dataset) {
+            entry.stale_since = None;
+        }
+    }
+
+    /// How long ago `dataset` last changed, while it is stale.
+    pub(super) fn stale_for(&self, dataset: &str) -> Option<Duration> {
+        self.datasets
+            .lock()
+            .get(dataset)
+            .and_then(|entry| entry.stale_since)
+            .map(|since| since.elapsed())
+    }
+
+    /// How many reloads of `dataset` were refused.
+    pub(super) fn refused(&self, dataset: &str) -> u64 {
+        self.datasets
+            .lock()
+            .get(dataset)
+            .map_or(0, |entry| entry.refused)
+    }
+
+    fn stale_seconds(&self) -> Vec<(String, u64)> {
+        self.datasets
+            .lock()
+            .iter()
+            .map(|(dataset, entry)| {
+                (
+                    dataset.clone(),
+                    entry
+                        .stale_since
+                        .map_or(0, |since| since.elapsed().as_secs()),
+                )
+            })
+            .collect()
+    }
+
+    fn refusals(&self) -> Vec<(String, u64)> {
+        self.datasets
+            .lock()
+            .iter()
+            .map(|(dataset, entry)| (dataset.clone(), entry.refused))
+            .collect()
+    }
+}
 
 /// Whether the upstream ended a subscription because the subscriber missed
 /// updates. A new subscription starts with a truncate and a full snapshot, so
@@ -70,16 +227,36 @@ fn resubscribe_backoff(attempt: u32) -> Duration {
 /// than applied, and are swapped in at the snapshot's end as one atomic
 /// overwrite. Queries keep seeing the previous data until then, and a reload
 /// that does not reach its end is discarded.
-#[derive(Default)]
+///
+/// The staged rows are reserved from the runtime's query memory pool, twice
+/// over: once as staged and once for the copy that concatenates them at the
+/// swap. A reload the pool cannot hold is refused.
 struct Reload {
     /// Each staged batch with the commit sequence number its update carried;
     /// `None` for a snapshot batch.
     staged: Vec<(Option<u64>, ChangeBatch)>,
+    reservation: MemoryReservation,
 }
 
 impl Reload {
-    fn stage(&mut self, sequence: Option<u64>, batch: ChangeBatch) {
+    fn new(memory_pool: &Arc<dyn MemoryPool>, dataset: &str) -> Self {
+        Self {
+            staged: Vec::new(),
+            reservation: MemoryConsumer::new(format!("append_stream_reload[{dataset}]"))
+                .register(memory_pool),
+        }
+    }
+
+    /// Stages `batch`, or refuses it when the pool cannot hold it and its copy.
+    fn stage(
+        &mut self,
+        sequence: Option<u64>,
+        batch: ChangeBatch,
+    ) -> Result<(), datafusion::error::DataFusionError> {
+        self.reservation
+            .try_grow(batch.record.get_array_memory_size().saturating_mul(2))?;
         self.staged.push((sequence, batch));
+        Ok(())
     }
 
     /// The overwrite that replaces the dataset with the staged rows. An update
@@ -128,6 +305,8 @@ enum Ended {
     Done,
     /// Take a fresh snapshot.
     Resubscribe(String),
+    /// A reload needed more memory than the pool had; retry it later.
+    Refused(String),
 }
 
 /// Reads the append stream of `table_reference`, opening each subscription with
@@ -135,6 +314,7 @@ enum Ended {
 pub(super) fn append_stream<F, Fut, S, E>(
     mut subscribe: F,
     table_reference: String,
+    budget: ReloadBudget,
 ) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>>
 where
     F: FnMut() -> Fut,
@@ -144,6 +324,8 @@ where
 {
     stream! {
         let mut resubscribes = 0_u32;
+        // Reloads refused in a row for lack of memory.
+        let mut refusals = 0_u32;
         let mut last_epoch: Option<String> = None;
         // Whether a snapshot of this stream has made the dataset ready, so a
         // later snapshot is a reload to stage and swap in.
@@ -244,7 +426,14 @@ where
                                 };
                                 let snapshot_sequence = subscription.snapshot_sequence().unwrap_or(0);
                                 let envelope = match reload.take() {
-                                    Some(reload) => reload.into_replacement(snapshot_sequence, schema),
+                                    Some(reload) => {
+                                        let replacement = reload.into_replacement(snapshot_sequence, schema);
+                                        if replacement.is_ok() {
+                                            refusals = 0;
+                                            budget.stale.mark_current(&table_reference);
+                                        }
+                                        replacement
+                                    }
                                     None => cdc::build_ready_signal_envelope(schema).map_err(|e| e.to_string()),
                                 };
                                 match envelope {
@@ -270,7 +459,7 @@ where
                         .as_ref()
                         .is_some_and(|metadata| metadata.marker == StreamMarker::Begin)
                 {
-                    reload = Some(Reload::default());
+                    reload = Some(Reload::new(&budget.memory_pool, &table_reference));
                     snapshot_end_error_at = tokio::time::Instant::now() + SNAPSHOT_END_ERROR_AFTER;
                 }
                 let ready = match subscription.on_batch(metadata) {
@@ -306,7 +495,9 @@ where
                     Ok(change_batch) => {
                         data_schema.get_or_insert_with(|| change_batch.data_schema());
                         if let Some(reload) = reload.as_mut() {
-                            reload.stage(sequence, change_batch);
+                            if let Err(e) = reload.stage(sequence, change_batch) {
+                                break Ended::Refused(e.to_string());
+                            }
                             continue;
                         }
                         if ready {
@@ -323,15 +514,31 @@ where
                 }
             };
 
+            let stale_for = last_applied_at.map_or_else(
+                || "an unknown time".to_string(),
+                |at| format!("{}s", at.elapsed().as_secs()),
+            );
             let reason = match ended {
                 Ended::Done => break 'subscription,
                 Ended::Resubscribe(reason) => reason,
+                Ended::Refused(reason) => {
+                    // Dropping the staged reload returns its reservation.
+                    drop(reload.take());
+                    drop(stream);
+                    budget.stale.mark_stale(&table_reference, last_applied_at, true);
+                    refusals += 1;
+                    let retry_in = refused_reload_backoff(refusals);
+                    tracing::error!(
+                        dataset = %table_reference,
+                        "The append stream for dataset '{table_reference}' refused to reload from its source, because staging the reload needs more memory than the runtime's query memory pool has free ({reason}). The dataset keeps serving its previous data, which last changed {stale_for} ago; the reload is retried in {}s.",
+                        retry_in.as_secs()
+                    );
+                    tokio::time::sleep(retry_in).await;
+                    continue 'subscription;
+                }
             };
             if reload.take().is_some() {
-                let stale_for = last_applied_at.map_or_else(
-                    || "an unknown time".to_string(),
-                    |at| format!("{}s", at.elapsed().as_secs()),
-                );
+                budget.stale.mark_stale(&table_reference, last_applied_at, false);
                 tracing::error!(
                     dataset = %table_reference,
                     "The append stream for dataset '{table_reference}' could not finish reloading from its source ({reason}), so the reload was discarded and the dataset keeps serving its previous data, which last changed {stale_for} ago."
@@ -378,6 +585,7 @@ mod tests {
     use arrow_flight::decode::FlightDataDecoder;
     use datafusion::common::TableReference;
     use datafusion::datasource::{MemTable, TableProvider};
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
     use datafusion::prelude::SessionContext;
     use futures::stream::BoxStream;
     use futures::{StreamExt, TryStreamExt};
@@ -471,8 +679,17 @@ mod tests {
                 }
             },
             DATASET.to_string(),
+            unbounded_budget(),
         )
         .boxed()
+    }
+
+    /// A reload budget with no memory limit and its own staleness record.
+    fn unbounded_budget() -> ReloadBudget {
+        ReloadBudget {
+            memory_pool: Arc::new(UnboundedMemoryPool::default()),
+            stale: Arc::new(StaleDatasets::default()),
+        }
     }
 
     /// One subscription's envelopes as the consumer yields them.
@@ -840,6 +1057,90 @@ mod tests {
         let mut stream = consumer(vec![failed_after_ready, slow]);
         assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
         assert_eq!(replacement(&mut stream).await, 3);
+    }
+
+    /// A reload the query memory pool cannot hold is refused: the dataset keeps
+    /// its data, an ERROR and the staleness metrics report it, its reservation
+    /// is returned, and the reload is retried until one fits.
+    #[tokio::test]
+    async fn a_reload_the_memory_pool_cannot_hold_is_refused_and_retried() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let failed_after_ready: Messages = futures::stream::iter(first.into_iter().map(Ok))
+            .chain(futures::stream::once(async {
+                Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                    "connection reset",
+                ))))
+            }))
+            .boxed();
+        let (too_large, _) =
+            through_end(producer(&datafusion, &broadcaster, table((1..=50_000).collect())).await)
+                .await;
+        let (fits, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024));
+        let stale = Arc::new(StaleDatasets::default());
+        let budget = ReloadBudget {
+            memory_pool: Arc::clone(&memory_pool),
+            stale: Arc::clone(&stale),
+        };
+        // At each subscribe: whether the dataset was reported stale, how many
+        // reloads were refused, and what the pool still had reserved.
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut subscriptions: VecDeque<Messages> =
+            vec![failed_after_ready, held_open(too_large), held_open(fits)].into();
+        let subscribe = {
+            let seen = Arc::clone(&seen);
+            let stale = Arc::clone(&stale);
+            let memory_pool = Arc::clone(&memory_pool);
+            move || {
+                seen.lock().push((
+                    stale.stale_for(DATASET).is_some(),
+                    stale.refused(DATASET),
+                    memory_pool.reserved(),
+                ));
+                let next = subscriptions.pop_front();
+                async move {
+                    next.map(FlightDataDecoder::new)
+                        .ok_or("no more subscriptions")
+                }
+            }
+        };
+
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        tokio::time::pause();
+        let mut stream = append_stream(subscribe, DATASET.to_string(), budget).boxed();
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(replacement(&mut stream).await, 2, "the reload that fits");
+        assert_eq!(
+            *seen.lock(),
+            vec![(false, 0, 0), (false, 0, 0), (true, 1, 0)],
+            "the refused reload is reported stale and returns its reservation before the retry"
+        );
+        assert_eq!(
+            stale.stale_for(DATASET),
+            None,
+            "current again after the swap"
+        );
+        assert_eq!(stale.refused(DATASET), 1);
+        assert_eq!(memory_pool.reserved(), 0);
+        let logs = String::from_utf8(logs.0.lock().clone()).expect("utf8");
+        assert!(
+            logs.contains("ERROR")
+                && logs.contains("'orders' refused to reload from its source")
+                && logs.contains("keeps serving its previous data, which last changed"),
+            "{logs}"
+        );
     }
 
     /// Updates that arrive during a reload are staged with it, and their
