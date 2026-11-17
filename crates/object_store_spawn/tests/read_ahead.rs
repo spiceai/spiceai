@@ -311,7 +311,10 @@ async fn reader_paused_past_the_client_timeout_reads_the_whole_object() {
         received += chunk.len();
     }
     assert_eq!(received, OBJECT_LEN);
-    assert_eq!(mismatch, None, "the object differs from what the server holds");
+    assert_eq!(
+        mismatch, None,
+        "the object differs from what the server holds"
+    );
 
     let starts = starts.lock().expect("starts lock").clone();
     assert_eq!(starts.first(), Some(&0), "{starts:?}");
@@ -322,4 +325,3 @@ async fn reader_paused_past_the_client_timeout_reads_the_whole_object() {
 
     server.abort();
 }
-

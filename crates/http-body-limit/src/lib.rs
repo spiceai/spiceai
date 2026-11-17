@@ -436,8 +436,11 @@ mod tests {
     }
 
     /// `len` bytes produced by `fill`, encoded as `encoding`, built a block at a time
-    /// so the plain text is never held whole. The fastest levels keep the test quick;
-    /// a run of one byte still compresses past 200:1 at every one of them.
+    /// so the plain text is never held whole. gzip and deflate use their best level:
+    /// `flate2`'s backends differ most at the fastest one (`zlib-rs` is chosen when
+    /// another crate in the build enables it), and at the best level a run of one byte
+    /// compresses near the format's limit whichever backend is linked. zstd and brotli
+    /// use their fastest levels, which already compress such a run past 200:1.
     fn compressed(encoding: Encoding, len: usize, fill: impl Fn(usize) -> u8) -> Vec<u8> {
         let mut remaining = len;
         let mut offset = 0;
@@ -453,13 +456,13 @@ mod tests {
         match encoding {
             Encoding::Gzip => {
                 let mut encoder =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
                 write_all(&mut encoder);
                 encoder.finish().expect("finish gzip")
             }
             Encoding::Deflate => {
                 let mut encoder =
-                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
                 write_all(&mut encoder);
                 encoder.finish().expect("finish deflate")
             }

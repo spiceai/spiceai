@@ -2227,8 +2227,8 @@ mod log_archive_tests {
     const MIB: usize = 1024 * 1024;
 
     /// An archive like the one GitHub serves: a root log of `log_bytes` repeated lines,
-    /// which deflate shrinks hundreds of times over, beside a step log in a directory and
-    /// a file that is not a log.
+    /// which deflate shrinks over a hundred times, beside a step log in a directory and a
+    /// file that is not a log.
     fn archive(log_bytes: usize) -> bytes::Bytes {
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let deflated =
@@ -2277,9 +2277,9 @@ mod log_archive_tests {
 
     #[test]
     fn an_archive_that_expands_past_the_pool_is_refused() {
-        // A few hundred kilobytes that decompress to 256 MiB, against a 64 MiB pool.
+        // A couple of megabytes that decompress to 256 MiB, against a 64 MiB pool.
         let archive = archive(256 * MIB);
-        assert!(archive.len() < MIB, "{} bytes on the wire", archive.len());
+        assert!(archive.len() < 4 * MIB, "{} bytes on the wire", archive.len());
         let held = reservation(Some(64 * MIB));
         held.try_grow(archive.len()).expect("the archive fits");
 
