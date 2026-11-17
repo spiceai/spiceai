@@ -450,7 +450,10 @@ mod login {
                 .expect("run spice login");
 
             let printed = combined_output(&output);
-            assert!(!output.status.success(), "{name}: login must fail: {printed}");
+            assert!(
+                !output.status.success(),
+                "{name}: login must fail: {printed}"
+            );
             assert!(
                 printed.contains(&format!(
                     "Failed to update configuration at '{name}': it is a symbolic link. `spice login` writes credentials only to a regular file, never through a link, so they cannot land in the file it points to. Replace '{name}' with a regular file, or store credentials in the keychain with `spice login --output keychain`. See: https://spiceai.org/docs/cli/reference/login"
@@ -1109,7 +1112,10 @@ mod add {
     ) {
         let printed = printed(output);
         assert!(!output.status.success(), "spice add must fail: {printed}");
-        assert!(printed.contains(expected), "expected '{expected}' in: {printed}");
+        assert!(
+            printed.contains(expected),
+            "expected '{expected}' in: {printed}"
+        );
         assert!(
             printed.contains("so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"),
             "a size limit is advised as a size limit: {printed}"
@@ -1142,7 +1148,8 @@ mod add {
         body[central + 24..central + 28].copy_from_slice(&0x8000_0000_u32.to_le_bytes());
 
         let project = TempDir::new().expect("create the project");
-        let output = add_from_registry(project.path(), &stub_registry(RegistryReply::Archive(body)));
+        let output =
+            add_from_registry(project.path(), &stub_registry(RegistryReply::Archive(body)));
         assert_refused_and_nothing_installed(
             project.path(),
             &output,
@@ -1153,7 +1160,8 @@ mod add {
     #[test]
     fn test_add_refuses_an_archive_with_too_many_entries() {
         let names: Vec<String> = (0..10_001).map(|i| format!("f/{i}.txt")).collect();
-        let entries: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+        let entries: Vec<(&str, &[u8])> =
+            names.iter().map(|name| (name.as_str(), &b""[..])).collect();
 
         let project = TempDir::new().expect("create the project");
         let output = add_from_registry(
@@ -1200,7 +1208,11 @@ mod add {
             .filter_map(Result::ok)
             .map(|entry| entry.file_name())
             .collect();
-        assert_eq!(leftovers, ["evil"], "no staging directory may be left behind");
+        assert_eq!(
+            leftovers,
+            ["evil"],
+            "no staging directory may be left behind"
+        );
         assert!(!project.path().join("escaped.txt").exists());
     }
 

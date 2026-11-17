@@ -102,7 +102,10 @@ fn run_spiced(instance: &Path) -> (Option<ExitStatus>, String) {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    (status, std::fs::read_to_string(&log_path).unwrap_or_default())
+    (
+        status,
+        std::fs::read_to_string(&log_path).unwrap_or_default(),
+    )
 }
 
 fn assert_refused(instance: &Path, reason: &str) {
@@ -165,10 +168,7 @@ fn a_deployment_file_spice_wrote_is_served() {
 
     let (_status, printed) = run_spiced(&instance);
     assert!(
-        printed.contains(&format!(
-            "{SERVES_DEPLOYMENT} '{}'",
-            deployment.display()
-        )),
+        printed.contains(&format!("{SERVES_DEPLOYMENT} '{}'", deployment.display())),
         "the deployment file must be selected: {printed}"
     );
 }

@@ -381,11 +381,12 @@ fn install_archive(
         path: pods_dir.display().to_string(),
         source: e,
     })?;
-    let installed = stage_archive(&mut archive, pods_dir, response.pod, limits).and_then(|staged| {
-        let dest_dir = pods_dir.join(pod_path);
-        promote(staged, &dest_dir)?;
-        Ok(dest_dir)
-    });
+    let installed =
+        stage_archive(&mut archive, pods_dir, response.pod, limits).and_then(|staged| {
+            let dest_dir = pods_dir.join(pod_path);
+            promote(staged, &dest_dir)?;
+            Ok(dest_dir)
+        });
     if installed.is_err() && !pods_dir_existed {
         // Only removes the directory if nothing else landed in it.
         let _ = std::fs::remove_dir(pods_dir);
@@ -890,7 +891,10 @@ mod tests {
         assert_eq!(describe_limit(2560), "2,560 bytes");
         assert_eq!(describe_size(3_221_225_510, 1024 * MIB), "3.0 GiB");
         assert_eq!(describe_size(1_610_612_736, 1024 * MIB), "1.5 GiB");
-        assert_eq!(describe_size(10 * 1024 * 1024 * 1024, 256 * MIB), "10,240.0 MiB");
+        assert_eq!(
+            describe_size(10 * 1024 * 1024 * 1024, 256 * MIB),
+            "10,240.0 MiB"
+        );
         assert_eq!(describe_size(3000, 2560), "3,000 bytes");
         assert_eq!(with_thousands(10_000), "10,000");
         assert_eq!(with_thousands(999), "999");
