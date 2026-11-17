@@ -6473,12 +6473,14 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-physical-expr",
+ "flate2",
  "futures",
  "object_store 0.13.2",
  "serde_json",
  "snafu",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

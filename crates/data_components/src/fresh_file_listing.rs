@@ -37,7 +37,7 @@ use futures::TryStreamExt;
 use object_store::ObjectMeta;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
-use crate::file_schema_drift::scanned_files;
+use crate::file_schema_drift::{is_appending_acceleration_refresh, scanned_files};
 
 /// Whether a listed object should count as a data file for this dataset.
 pub type IsListedDataFile = Arc<dyn Fn(&ObjectMeta) -> bool + Send + Sync>;
@@ -52,8 +52,12 @@ pub type ScanSkipsListing = Arc<dyn Fn(&[Expr]) -> bool + Send + Sync>;
 /// `ObjectMeta` (Parquet footers, file statistics) stay valid for unchanged files.
 ///
 /// When constructed with [`Self::over_rejecting_empty`], a scan whose listing has no data
-/// file is an error instead of an empty table. A file that exists and matches the
-/// listing (header-only CSV, zero-row Parquet) still scans as zero rows.
+/// file is an error instead of an empty table, so a full refresh cannot replace the
+/// accelerated data with nothing. A file that exists and matches the listing (header-only
+/// CSV, zero-row Parquet) still scans as zero rows. An appending acceleration refresh
+/// ([`is_appending_acceleration_refresh`]) is not rejected: it replaces no data, so a source
+/// with no files yet appends zero rows, and a dataset whose source starts empty becomes
+/// ready instead of failing every refresh until the first file arrives.
 ///
 /// The check reads the files the scan beneath already listed, so a scan that reads a
 /// data file costs no object-store request beyond the scan's own. Only a scan that
@@ -236,7 +240,10 @@ impl TableLayer for FreshFileListingLayer {
             .as_ref()
             .is_some_and(|skips| skips(args.filters().unwrap_or_default()));
         let result = below.scan_with_args(state, args).await?;
-        if !skips_listing && !self.plan_reads_data_file(result.plan()) {
+        if !skips_listing
+            && !is_appending_acceleration_refresh(state)
+            && !self.plan_reads_data_file(result.plan())
+        {
             self.ensure_data_files(state).await?;
         }
         Ok(result)
@@ -391,6 +398,47 @@ mod tests {
 
         write_ids(&part0, 1..=50);
         assert_eq!(count_and_max(&ctx).await, (50, Some(50)));
+    }
+
+    /// A session marked as an acceleration refresh, appending or not, with `t` registered
+    /// over `dir`.
+    async fn refresh_session(dir: &Path, appends: bool) -> SessionContext {
+        let mut config = SessionConfig::new();
+        if appends {
+            crate::file_schema_drift::mark_appending_acceleration_refresh(&mut config);
+        } else {
+            crate::file_schema_drift::mark_acceleration_refresh(&mut config);
+        }
+        let ctx = SessionContext::new_with_config(config);
+        register_rejecting(&ctx, dir).await;
+        ctx
+    }
+
+    /// An empty listing fails an ordinary query and a full refresh, which would replace the
+    /// acceleration with nothing. An appending refresh replaces nothing, so it reads the
+    /// empty source as zero rows rather than failing until the first file arrives.
+    #[tokio::test]
+    async fn an_appending_refresh_reads_an_empty_source_as_zero_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let part0 = dir.path().join("part-0.parquet");
+        write_ids(&part0, 1..=10);
+        let query = SessionContext::new();
+        register_rejecting(&query, dir.path()).await;
+        let full = refresh_session(dir.path(), false).await;
+        let append = refresh_session(dir.path(), true).await;
+        std::fs::remove_file(&part0).expect("empty the source");
+
+        for (session, ctx) in [("query", &query), ("full refresh", &full)] {
+            let err = query_err(ctx).await;
+            assert!(
+                err.contains("No data files are yet available for dataset t"),
+                "{session}: expected the missing-source error, got {err:?}"
+            );
+        }
+        assert_eq!(count_and_max(&append).await, (0, None));
+
+        write_ids(&part0, 1..=5);
+        assert_eq!(count_and_max(&append).await, (5, Some(5)));
     }
 
     #[test]
