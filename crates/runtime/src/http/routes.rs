@@ -670,6 +670,13 @@ pub(crate) fn routes(
     authenticated_router =
         authenticated_router.route_layer(RequestBodyLimitLayer::new(DEFAULT_REQUEST_BODY_LIMIT));
 
+    // Inside authentication and the client certificate gate below, so a request
+    // either of them refuses never initializes a component from its headers.
+    authenticated_router = authenticated_router.route_layer(middleware::from_fn_with_state(
+        Arc::clone(&rt.df),
+        load_request_extensions,
+    ));
+
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
         tracing::info!("Enabled API key authentication on HTTP routes");
@@ -747,16 +754,10 @@ async fn track_metrics(
     next: Next,
 ) -> impl IntoResponse {
     let app = app.read().await.as_ref().map(Arc::clone);
-    let mut request_context_builder = RequestContext::builder(Protocol::Http)
-        .with_app_opt(app.clone())
-        .from_headers(&headers);
-
-    if let Some(ext) = DatabricksAuthExtension::from_headers(&app, &Some(Arc::clone(&df)), &headers)
-    {
-        request_context_builder = ext.add_from_headers(request_context_builder, &headers);
-    }
     let request_context = Arc::new(
-        request_context_builder
+        RequestContext::builder(Protocol::Http)
+            .with_app_opt(app)
+            .from_headers(&headers)
             .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
             .build(),
     );
@@ -785,7 +786,6 @@ async fn track_metrics(
 
     let response = Arc::clone(&request_context)
         .scope(async move {
-            request_context.load_extensions().await;
             // Install a drop guard on the request's cancellation token so
             // that if the response body is dropped before the body completes
             // (for example, the client disconnects while a streaming SQL or
@@ -882,6 +882,35 @@ async fn track_metrics(
     };
 
     axum::response::Response::from_parts(parts, body)
+}
+
+/// Adds the request extensions its headers carry, such as the Databricks user
+/// tokens of a `spice-databricks-auth` header, and loads them: a Databricks
+/// token initializes the deferred datasets and catalogs that authenticate with
+/// it.
+///
+/// A route layer inside authentication and the client certificate gate, so it
+/// runs only for a request the runtime has authenticated. The credentials a
+/// header carries must not initialize a component, which every later request
+/// shares, on behalf of a caller the runtime refused.
+async fn load_request_extensions(
+    State(df): State<Arc<DataFusion>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    if let Some(request_context) = req.extensions().get::<Arc<RequestContext>>() {
+        if DatabricksAuthExtension::in_headers(req.headers()) {
+            let app = app.read().await.as_ref().map(Arc::clone);
+            if let Some(extension) =
+                DatabricksAuthExtension::from_headers(&app, &Some(df), req.headers())
+            {
+                request_context.insert_extension(extension);
+            }
+        }
+        request_context.load_extensions().await;
+    }
+    next.run(req).await
 }
 
 /// CORS config that feeds the MCP Origin allow-list.

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use app::App;
 use async_trait::async_trait;
 use datafusion::common::TableReference;
 use http::HeaderMap;
-use runtime_request_context::{Extension, RequestContextBuilder};
+use runtime_request_context::Extension;
 use secrecy::SecretString;
 use spicepod::param::ParamValue;
 use std::collections::HashMap;
@@ -67,17 +67,11 @@ impl DatabricksAuthExtension {
         Self { app, df, tokens }
     }
 
+    /// Whether `headers` carry Databricks user tokens, which
+    /// [`Self::from_headers`] reads.
     #[must_use]
-    pub fn add_from_headers(
-        self,
-        mut bldr: RequestContextBuilder,
-        headers: &HeaderMap,
-    ) -> RequestContextBuilder {
-        if let Some(extension) = DatabricksAuthExtension::from_headers(&self.app, &self.df, headers)
-        {
-            bldr = bldr.with_extension(extension);
-        }
-        bldr
+    pub fn in_headers(headers: &HeaderMap) -> bool {
+        headers.contains_key(SPICE_DATABRICKS_HEADER)
     }
 
     #[must_use]
