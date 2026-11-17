@@ -1,0 +1,89 @@
+name: http-response-limits
+description: >
+  A response an HTTP API returns is held to the query memory limit, by its
+  size once decompressed. An HTTP dataset whose response is larger than
+  `runtime.query.memory_limit` fails the query with an error that names the
+  dataset and the setting to raise, while a response that fits is read. A
+  GraphQL dataset reads a gzip response like any other, and one whose gzip
+  body decodes past the limit fails to load with an error that names the
+  limit, instead of being decoded into memory. Likewise a gzip JSON document,
+  which schema inference parses whole: a small one loads, and one that
+  decodes past the limit fails to load with an error naming the file.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-response-limits
+  runtime:
+    query:
+      memory_limit: 64MiB
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: api
+      params: { file_format: json, allowed_request_paths: '/*', max_retries: '0', response_cache_max_size_bytes: '0' }
+    - from: graphql:${sources.api.url}/graphql-ok
+      name: gql_ok
+      params: { graphql_query: 'query { items { id } }', json_pointer: /data/items }
+    - from: graphql:${sources.api.url}/graphql-bomb
+      name: gql_bomb
+      params: { graphql_query: 'query { items { id } }', json_pointer: /data/items }
+    - from: ${sources.api.url}/files/small.json.gz
+      name: doc_small
+      params: &doc { file_format: json, json_format: object, file_compression_type: GZIP }
+    - from: ${sources.api.url}/files/large.json.gz
+      name: doc_large
+      params: *doc
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /v1/small, headers: { content-type: application/json }, body: '[{\"k\": \"a\"}]' }"
+        # 128 MiB, twice the query memory limit.
+        - "{ path: /v1/large, headers: { content-type: application/x-ndjson }, body: \"{\\\"k\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\"}\\n\", repeat: 2097152 }"
+        - "{ path: /graphql-ok, method: POST, headers: { content-type: application/json }, body: '{\"data\": {\"items\": [{\"id\": 1}, {\"id\": 2}]}}', encoding: gzip }"
+        # A few MiB on the wire that decode to 160 MiB, past the limit.
+        - "{ path: /graphql-bomb, method: POST, headers: { content-type: application/json }, body: '{\"a\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}', repeat: 4194304, encoding: gzip }"
+        - "{ path: /files/small.json.gz, body: '{\"a\": 1, \"b\": \"x\"}', encoding: gzip }"
+        # A few MiB that decode to 160 MiB: the document is read whole to infer its schema.
+        - "{ path: /files/large.json.gz, body: '{\"a\": 1, \"b\": \"xxxxxxxxxxxxxxxxxxxxxxxxx\"}', repeat: 4194304, encoding: gzip }"
+  - start: { ready: false }
+
+  # A response that fits the query memory limit is read.
+  - query: SELECT content FROM api WHERE request_path = '/small'
+    expect: { rows: [['{"k":"a"}']] }
+    eventually: 60s
+
+  # One larger than the limit fails the query, naming the dataset and the fix, and is
+  # not asked for again.
+  - query: SELECT count(*) FROM api WHERE request_path = '/large'
+    expect-error: "for dataset 'api': holding the decoded data would pass the query memory limit"
+  - query: SELECT count(*) FROM api WHERE request_path = '/large'
+    expect-error: "Raise `runtime.query.memory_limit`"
+  - source-query: { api: count /v1/large }
+    expect: { rows: [['2']] }
+
+  # A gzip GraphQL response is decoded by the connector and read.
+  - query: SELECT id FROM gql_ok ORDER BY id
+    expect: { rows: [['1'], ['2']] }
+    eventually: 60s
+
+  # A gzip body that decodes past the limit is refused at registration.
+  - assert-status:
+      dataset: gql_bomb
+      status: Error
+      message-contains: "holding the decoded data would pass the query memory limit"
+    eventually: 60s
+
+  # A gzip JSON document that fits is inferred and read; one that decodes past the limit
+  # is refused while it is decompressed, naming the file.
+  - query: SELECT a, b FROM doc_small
+    expect: { rows: [['1', 'x']] }
+    eventually: 60s
+  - assert-status:
+      dataset: doc_large
+      status: Error
+      message-contains: "large.json.gz' to infer its schema: holding the decoded data would pass the query memory limit"
+    eventually: 60s

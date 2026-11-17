@@ -20,6 +20,7 @@ bollard = "0.18.1"
 bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
+flate2 = "1.1"
 flight_client = { path = "../../crates/flight_client" }
 futures.workspace = true
 hex.workspace = true

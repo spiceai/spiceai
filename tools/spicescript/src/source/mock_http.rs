@@ -31,7 +31,13 @@ limitations under the License.
 //! body: '[{"id": 1}]'
 //! delay-ms: 0
 //! times: 1                 # answers this many requests, then the next route
+//! repeat: 1                # the body is `body` this many times over
+//! encoding: gzip           # the body is sent gzip-compressed, with `Content-Encoding: gzip`
 //! ```
+//!
+//! `repeat` and `encoding` serve a body far larger than a script would spell out: `repeat`
+//! for a large response, and both together for one small on the wire that decodes to many
+//! times its size.
 //!
 //! Later routes for a path come first, so a script changes an answer by adding
 //! a route; `reset` removes every route. `source-query` reads the requests:
@@ -75,6 +81,61 @@ struct Route {
     delay_ms: u64,
     #[serde(default)]
     times: Option<u64>,
+    #[serde(default = "once")]
+    repeat: u64,
+    #[serde(default)]
+    encoding: Option<Encoding>,
+    /// The body as sent, built from the fields above when the route is added.
+    #[serde(skip)]
+    payload: Bytes,
+}
+
+/// How a route's body is encoded on the wire.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Encoding {
+    Gzip,
+}
+
+fn once() -> u64 {
+    1
+}
+
+impl Route {
+    /// The body as it is sent: `body` repeated `repeat` times, compressed a block at a time
+    /// when the route has an `encoding`, so a body that decodes to gigabytes is never held
+    /// decoded.
+    fn build_payload(&self) -> Result<Bytes> {
+        let len = self
+            .body
+            .len()
+            .checked_mul(usize::try_from(self.repeat)?)
+            .context("the repeated body is too large to count")?;
+        match self.encoding {
+            None => {
+                let mut payload = Vec::with_capacity(len);
+                for _ in 0..self.repeat {
+                    payload.extend_from_slice(self.body.as_bytes());
+                }
+                Ok(payload.into())
+            }
+            Some(Encoding::Gzip) => {
+                use std::io::Write;
+                // Written a block of whole bodies at a time rather than one body at a time.
+                let per_block = u64::try_from((64 * 1024 / self.body.len().max(1)).max(1))?;
+                let block = self.body.repeat(usize::try_from(per_block)?);
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                for _ in 0..self.repeat / per_block {
+                    encoder.write_all(block.as_bytes())?;
+                }
+                for _ in 0..self.repeat % per_block {
+                    encoder.write_all(self.body.as_bytes())?;
+                }
+                Ok(encoder.finish()?.into())
+            }
+        }
+    }
 }
 
 fn ok() -> u16 {
@@ -187,9 +248,15 @@ async fn answer(
     }
     let mut response = (
         StatusCode::from_u16(route.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        route.body,
+        route.payload,
     )
         .into_response();
+    if let Some(Encoding::Gzip) = route.encoding {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+    }
     for (name, value) in &route.headers {
         if let (Ok(name), Ok(value)) = (
             HeaderName::try_from(name.as_str()),
@@ -238,6 +305,7 @@ impl Source for MockHttp {
             bail!("a mock route path starts with '/': {}", route.path);
         }
         route.path = format!("{prefix}{}", route.path);
+        route.payload = route.build_payload()?;
         self.state.lock().routes.push((route, 0));
         Ok(())
     }
