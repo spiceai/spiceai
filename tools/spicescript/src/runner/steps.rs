@@ -30,9 +30,9 @@ use crate::{compare, template};
 
 use super::{
     DEFAULT_READY_TIMEOUT, Instance, POLL, STOP_TIMEOUT, SourceState, Sources, apply_patch,
-    assert_files, assert_log, assert_status, check_error_text, explain, http_step, max_wait,
-    namespace, random_queries, refresh, run_query, run_slt, source_query, spice_cli,
-    start_background, start_executors, stop_background, tlp, wait_metric,
+    assert_files, assert_log, assert_status, check_error_text, explain, http_step, namespace,
+    random_queries, refresh, run_query, run_slt, source_query, spice_cli, start_background,
+    start_executors, stop_background, tlp, wait_metric,
 };
 
 pub(super) fn describe(action: &Action) -> String {
@@ -293,12 +293,23 @@ fn swap_sidecar(instance: &mut Instance) {
 
 /// The readiness wait a start allows when it names none.
 fn ready_default(script: &Script) -> Duration {
-    max_wait(
-        script
-            .defaults
-            .ready_timeout
-            .unwrap_or(DEFAULT_READY_TIMEOUT),
-    )
+    script
+        .defaults
+        .ready_timeout
+        .unwrap_or(DEFAULT_READY_TIMEOUT)
+}
+
+/// How long a start or restart waits for `spiced` to be ready: the step's
+/// own `ready-timeout`, else the script's default.
+///
+/// `--max-wait` does not cap it, as it does not cap a `wait-ready` step. The
+/// cap bounds the waits a script expected to fail sits out in full, but a
+/// readiness wait ends as soon as `spiced` is ready, so capping it only
+/// turns a slow start on a busy runner into a failure that is not the
+/// script's: a start that is expected to time out still does, at its full
+/// limit.
+fn ready_limit(step_timeout: Option<Duration>, ready_default: Duration) -> Duration {
+    step_timeout.unwrap_or(ready_default)
 }
 
 /// Starts the sidecar unless it is running, once its upstream is up, and
@@ -336,7 +347,7 @@ async fn sidecar_lifecycle(script: &Script, instance: &mut Instance, step: &Step
             wait_ready,
             ..
         } => {
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_limit(*ready_timeout, ready_default);
             start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::Stop => spiced.stop(STOP_TIMEOUT).await.context("the sidecar")?,
@@ -355,7 +366,7 @@ async fn sidecar_lifecycle(script: &Script, instance: &mut Instance, step: &Step
                 None => spiced.stop(STOP_TIMEOUT).await,
             }
             .context("the sidecar")?;
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_limit(*ready_timeout, ready_default);
             start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::WaitReady { timeout } => {
@@ -384,7 +395,7 @@ async fn run_step(
         } => {
             apply_patch(instance, patch.as_ref())?;
             instance.spiced.start(&instance.spicepod_yaml)?;
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_limit(*ready_timeout, ready_default);
             // A scheduler with accelerations is ready only once an executor
             // has joined and loaded them, so the executor starts first.
             instance.spiced.wait_http(timeout).await?;
@@ -440,7 +451,7 @@ async fn run_step(
             }
             apply_patch(instance, patch.as_ref())?;
             instance.spiced.start(&instance.spicepod_yaml)?;
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_limit(*ready_timeout, ready_default);
             // A scheduler with accelerations is ready only once an executor
             // has joined and loaded them, so the executor starts first.
             instance.spiced.wait_http(timeout).await?;
@@ -954,7 +965,48 @@ fn flat_series(samples: &[u64]) -> std::result::Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{flat_series, wipe_instance_dir};
+    use std::time::Duration;
+
+    use super::{
+        DEFAULT_READY_TIMEOUT, flat_series, ready_default, ready_limit, wipe_instance_dir,
+    };
+    use crate::script::Script;
+
+    /// The known-failing CI shards pass `--max-wait 30s`. A start there that
+    /// took longer than 30s on a busy runner failed as "spiced not ready
+    /// after 30s", which no ledger entry records, and turned the whole E2E
+    /// run red. The cap still bounds every other wait.
+    #[test]
+    fn max_wait_caps_other_waits_but_not_a_starts_readiness() {
+        super::super::set_max_wait(Duration::from_secs(1));
+
+        let unset = Script::parse("name: s\nspicepod: {}\nsteps: [ { start: {} } ]")
+            .expect("script parses");
+        assert_eq!(
+            ready_limit(None, ready_default(&unset)),
+            DEFAULT_READY_TIMEOUT
+        );
+
+        let script = Script::parse(
+            "name: s\nspicepod: {}\ndefaults: { ready-timeout: 45s }\nsteps: [ { start: {} } ]",
+        )
+        .expect("script parses");
+        assert_eq!(
+            ready_limit(None, ready_default(&script)),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            ready_limit(Some(Duration::from_secs(90)), ready_default(&script)),
+            Duration::from_secs(90),
+            "a step's own ready-timeout wins over the script's default"
+        );
+
+        assert_eq!(
+            super::super::max_wait(Duration::from_secs(60)),
+            Duration::from_secs(1),
+            "`eventually` and refresh waits stay capped"
+        );
+    }
 
     #[test]
     fn a_series_that_levels_off_is_flat_and_one_that_climbs_is_not() {
