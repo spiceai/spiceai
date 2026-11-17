@@ -23,10 +23,15 @@ function Get-GitHubHeader {
 
 function Get-LatestRelease {
     $url = "https://api.github.com/repos/$spiceOrgName/$spiceRepoName/releases/latest"
+    $hint = "If the GitHub API rate limit was exceeded, set `$env:GITHUB_TOKEN and run the installer again."
 
-    $releaseInfo = Invoke-RestMethod -Uri $url -Headers (Get-GitHubHeader) -ErrorAction Stop
+    try {
+        $releaseInfo = Invoke-RestMethod -Uri $url -Headers (Get-GitHubHeader) -ErrorAction Stop
+    } catch {
+        throw "Failed to resolve the latest Spice.ai CLI release from ${url}: $($_.Exception.Message). $hint"
+    }
     if (-not $releaseInfo.tag_name) {
-        throw "Failed to resolve the latest Spice.ai CLI release from $url."
+        throw "Failed to resolve the latest Spice.ai CLI release from $url. $hint"
     }
     return $releaseInfo.tag_name
 }
