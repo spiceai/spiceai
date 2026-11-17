@@ -208,6 +208,11 @@ runs:
         INPUT_RUST_PROFILE: ${{ inputs.rust_profile }}
         INPUT_TARGET_DIR: ${{ inputs.target_dir }}
       run: |
+        # A cargo profile name; anything else would reach `$GITHUB_OUTPUT` and cargo as-is.
+        if [[ ! "${INPUT_RUST_PROFILE}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+          echo "::error::build-spiced: rust_profile must be a cargo profile name"
+          exit 1
+        fi
         if [ "${INPUT_RUST_PROFILE}" = "dev" ]; then
           target_subdir=debug
         else
@@ -240,10 +245,15 @@ runs:
         MISTRALRS_METAL_PRECOMPILE: 0
         INPUT_FEATURES: ${{ inputs.features }}
       run: |
-        # Make re-parses the variable, so `$(...)` in it would still run; accept only
-        # a cargo feature list.
+        # Make re-parses these variables (CARGO_TARGET_DIR is also pasted unquoted into
+        # a recipe), so `$(...)` or `;` in them would still run; accept only a cargo
+        # feature list and a plain path.
         if [[ ! "${INPUT_FEATURES}" =~ ^[A-Za-z0-9_/,\ -]*$ ]]; then
           echo "::error::build-spiced: features must be a comma-separated cargo feature list"
+          exit 1
+        fi
+        if [[ ! "${CARGO_TARGET_DIR}" =~ ^[A-Za-z0-9_./:-]+$ ]]; then
+          echo "::error::build-spiced: target_dir must resolve to a path of letters, digits and _ . / : - to build with the Makefile"
           exit 1
         fi
         if [ -n "${INPUT_FEATURES}" ]; then
