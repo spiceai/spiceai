@@ -17,7 +17,7 @@ spicepod:
   name: flight-auth-handshake-limit
   runtime:
     auth:
-      api-key: { enabled: true, keys: [handshake-key, other-key] }
+      api-key: { enabled: true, keys: [handshake-key, "other-key:rw"] }
   datasets:
     - { from: 'postgres:public.orders', name: orders, params: '${sources.src.params}' }
 

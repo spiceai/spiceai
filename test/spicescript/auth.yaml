@@ -45,6 +45,7 @@ spicepod:
         databricks_sql_warehouse_id: warehouse
         databricks_auth_mode: u2m
         databricks_client_id: spicescript-u2m
+        http_max_retries: '0'
 
 defaults:
   api-key: valid-key
