@@ -84,12 +84,24 @@ const SCHEMA_PROBE_CONCURRENCY: usize = 16;
 /// [`FileSchemaDriftGuard`] fails such a scan, rather than warning, when a registered column
 /// is missing from every scanned file, so the refresh keeps the last loaded data instead of
 /// replacing it with `NULL`s.
+///
+/// An appending refresh adds the rows its scan returns and replaces none, so a source with
+/// no data files yet is an empty append for it rather than an error (see
+/// [`crate::fresh_file_listing::FreshFileListingLayer`]).
 #[derive(Debug, Default, Clone, Copy)]
-pub struct AccelerationRefreshScan;
+pub struct AccelerationRefreshScan {
+    appends: bool,
+}
 
 /// Marks `config` as an acceleration refresh session. See [`AccelerationRefreshScan`].
 pub fn mark_acceleration_refresh(config: &mut SessionConfig) {
-    config.set_extension(Arc::new(AccelerationRefreshScan));
+    config.set_extension(Arc::new(AccelerationRefreshScan { appends: false }));
+}
+
+/// Marks `config` as an acceleration refresh session whose scan results are appended to
+/// the acceleration rather than replacing it. See [`AccelerationRefreshScan`].
+pub fn mark_appending_acceleration_refresh(config: &mut SessionConfig) {
+    config.set_extension(Arc::new(AccelerationRefreshScan { appends: true }));
 }
 
 /// Whether `state` is an acceleration refresh session. See [`AccelerationRefreshScan`].
@@ -99,6 +111,16 @@ pub fn is_acceleration_refresh(state: &dyn Session) -> bool {
         .config()
         .get_extension::<AccelerationRefreshScan>()
         .is_some()
+}
+
+/// Whether `state` is an acceleration refresh session that appends its scan results.
+/// See [`AccelerationRefreshScan`].
+#[must_use]
+pub fn is_appending_acceleration_refresh(state: &dyn Session) -> bool {
+    state
+        .config()
+        .get_extension::<AccelerationRefreshScan>()
+        .is_some_and(|scan| scan.appends)
 }
 
 /// Registered columns missing from every file of one scan.
