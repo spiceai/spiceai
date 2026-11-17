@@ -16,7 +16,10 @@ limitations under the License.
 use crate::{
     Runtime,
     datafusion::request_context_extension::get_current_datafusion,
-    http::v1::{ResponseMetadata, ResponseMimeType, to_http_response},
+    http::v1::{
+        ResponseMetadata, ResponseMimeType, SqlErrorKind, collect_buffered, to_http_response,
+        too_large_to_buffer_message,
+    },
     model::{
         LLMChatCompletionsModelStore,
         nsql::{
@@ -613,6 +616,7 @@ async fn handle_nsql_query(
     payload: Request,
 ) -> (StatusCode, HeaderMap, String) {
     let df = get_current_datafusion(&context);
+    let memory_pool = Arc::clone(&df.ctx.runtime_env().memory_pool);
     let headers = HeaderMap::new();
 
     // NSQL-scoped cancellation token (child of the request token). Used for
@@ -743,16 +747,32 @@ async fn handle_nsql_query(
                 match query_result {
                     Ok(result) => {
                         let cache_status = result.cache_status;
-                        match result.collect_batches().await {
-                            Ok(data) => {
+                        let format = ResponseMimeType::from_accept_header(accept.as_ref());
+                        match collect_buffered(result.data, format, &memory_pool).await {
+                            Ok((data, _reservation)) => {
                                 return to_http_response(
                                     data,
                                     cache_status,
-                                    ResponseMimeType::from_accept_header(accept.as_ref()),
+                                    format,
                                     ResponseMetadata::empty().with_sql(&cleaned_query),
                                 )
                                 .instrument(span.clone())
                                 .await;
+                            }
+                            // Running out of query memory is the runtime's capacity, not an
+                            // error in the SQL for the model to correct.
+                            Err(e)
+                                if matches!(
+                                    SqlErrorKind::of_datafusion_error(&e),
+                                    SqlErrorKind::ResourcesExhausted
+                                ) =>
+                            {
+                                tracing::debug!("Error collecting query results: {e}");
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    headers,
+                                    too_large_to_buffer_message(&e),
+                                );
                             }
                             Err(e) => {
                                 if num_retries >= DEFAULT_NSQL_RETRIES {
@@ -866,7 +886,7 @@ mod tests {
             Volatility as FunctionVolatility,
         },
         model::Model,
-        runtime::{Functions, Runtime as SpicepodRuntime},
+        runtime::{Functions, Query as SpicepodQuery, Runtime as SpicepodRuntime},
     };
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
@@ -1062,10 +1082,12 @@ mod tests {
     }
 
     /// Loads `nsql_model`, an `openai:` model served at `endpoint` with the Spicepod `params`
-    /// given, the way the runtime loads a Spicepod model, and sends `request` to `POST /v1/nsql`.
+    /// given, the way the runtime loads a Spicepod model, and sends `request` to `POST /v1/nsql`
+    /// on a runtime with the `runtime.query` settings given.
     async fn post_nsql_to_openai_model(
         endpoint: &str,
         params: &[(&str, &str)],
+        query: Option<SpicepodQuery>,
         request: serde_json::Value,
     ) -> (StatusCode, String) {
         let mut model = Model::new("openai:gpt-test", "nsql_model");
@@ -1085,8 +1107,9 @@ mod tests {
             })
             .collect();
 
-        let rt = Arc::new(Runtime::builder().build().await);
-        *rt.app().write().await = Some(Arc::new(app_with_models(vec![model.clone()])));
+        let mut app = app_with_models(vec![model.clone()]);
+        app.runtime.query = query;
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
         // Loading a Spicepod registers `list_udfs`, which the NSQL context lists functions from.
         let df = rt.datafusion();
         df.ctx.register_udtf(
@@ -1156,6 +1179,7 @@ mod tests {
         let (status, body) = post_nsql_to_openai_model(
             &endpoint,
             &[("reasoning_effort", "high")],
+            None,
             json!({ "query": "how many rows", "model": "nsql_model", "reasoning_effort": "low" }),
         )
         .await;
@@ -1187,6 +1211,7 @@ mod tests {
             let (status, body) = post_nsql_to_openai_model(
                 &endpoint,
                 params,
+                None,
                 json!({ "query": "how many rows", "model": "nsql_model" }),
             )
             .await;
@@ -1201,6 +1226,64 @@ mod tests {
                 sent_reasoning_efforts(&mut sent),
                 vec![expected],
                 "model params: {params:?}"
+            );
+        }
+    }
+
+    /// The result of the generated SQL is held to `runtime.query.memory_limit` while the response
+    /// is built: under 32 MiB a small result is served, and 6,000,000 rows (about 46 MiB) are
+    /// refused with 503 without asking the model for another query.
+    #[tokio::test]
+    async fn generated_query_result_is_held_to_the_query_memory_limit() {
+        let query = SpicepodQuery {
+            memory_limit: Some("32MiB".to_string()),
+            // One partition keeps the NSQL context's own sort within the limit on any host.
+            target_partitions: Some(1),
+            ..SpicepodQuery::default()
+        };
+        let cases: [(&'static [&'static str], StatusCode); 2] = [
+            (&["SELECT value FROM generate_series(1, 3)"], StatusCode::OK),
+            (
+                &["SELECT value FROM generate_series(1, 6000000)"],
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+
+        for (answers, expected_status) in cases {
+            let (endpoint, mut sent) = serve_scripted_chat_completions(answers).await;
+
+            let (status, body) = post_nsql_to_openai_model(
+                &endpoint,
+                &[],
+                Some(query.clone()),
+                json!({ "query": "list the numbers", "model": "nsql_model" }),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                expected_status,
+                "{answers:?}: {}",
+                body.chars().take(200).collect::<String>()
+            );
+            if expected_status == StatusCode::OK {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&body)
+                        .expect("response body should be JSON rows"),
+                    json!([{ "value": 1 }, { "value": 2 }, { "value": 3 }])
+                );
+            } else {
+                assert!(
+                    body.starts_with(
+                        "The query result is too large to buffer in memory for this response."
+                    ),
+                    "{answers:?}: the error names the cause: `{body}`"
+                );
+            }
+            assert_eq!(
+                std::iter::from_fn(|| sent.try_recv().ok()).count(),
+                1,
+                "{answers:?}: the model is asked once"
             );
         }
     }
