@@ -455,7 +455,8 @@ mod tests {
             ]),
         )
         .await
-        .expect_err("a key with a missing secret must not load");
+        .err()
+        .unwrap_or_else(|| panic!("a key with a missing secret must not load"));
         assert_eq!(
             err.to_string(),
             format!(
@@ -468,7 +469,8 @@ mod tests {
             &config(&[format!("prefix-${{ env:{empty} }}:ro")]),
         )
         .await
-        .expect_err("a key with an empty secret must not load");
+        .err()
+        .unwrap_or_else(|| panic!("a key with an empty secret must not load"));
         assert_eq!(
             err.to_string(),
             format!(
