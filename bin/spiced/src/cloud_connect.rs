@@ -488,10 +488,8 @@ async fn read_cloud_managed_spicepod(
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Ok(None),
         Err(source) => {
-            return Err(CloudManagedSpicepodReadError {
-                path,
-                source: unsafe_deployment_file(source),
-            });
+            let source = unsafe_deployment_file(source, &path);
+            return Err(CloudManagedSpicepodReadError { path, source });
         }
     };
     match String::from_utf8(bytes) {
@@ -506,16 +504,18 @@ async fn read_cloud_managed_spicepod(
     }
 }
 
-/// Add the fix to a refusal of the persisted deployment file. I/O failures
-/// that are not about the file's shape pass through unchanged.
-fn unsafe_deployment_file(source: std::io::Error) -> std::io::Error {
+/// Add the fix to a refusal of the persisted deployment file at `path`. I/O
+/// failures that are not about the file's shape pass through unchanged.
+fn unsafe_deployment_file(source: std::io::Error, path: &Path) -> std::io::Error {
     if source.kind() != std::io::ErrorKind::InvalidData {
         return source;
     }
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::io::Error::new(
         source.kind(),
         format!(
-            "{source}. Spice writes this file itself, as a regular file it owns, so it is not loaded. Check who else can write to the config directory, then delete the file; the next Spice Cloud deployment writes it again. See: https://spiceai.org/docs"
+            "{source}. Spice loads only the deployment file it wrote itself, so this one is not loaded. Delete it; the next Spice Cloud deployment writes it again, and `chmod go-w '{}'` keeps others from replacing it. See: https://spiceai.org/docs/cli/reference/cloud",
+            config_dir.display()
         ),
     )
 }

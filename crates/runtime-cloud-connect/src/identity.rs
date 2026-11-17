@@ -856,7 +856,7 @@ pub fn read_owned_state_file_optional(
             if source.raw_os_error() == Some(libc::ELOOP) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "it is a symbolic link, and this state file is only read from a regular file",
+                    "it is a symbolic link",
                 ));
             }
             return Err(source);
@@ -874,7 +874,7 @@ pub fn read_owned_state_file_optional(
         if metadata.nlink() != 1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "it is hard-linked, and this state file must have exactly one name",
+                "it is hard-linked",
             ));
         }
         // SAFETY: `geteuid` has no preconditions and cannot fail.
@@ -892,7 +892,7 @@ pub fn read_owned_state_file_optional(
         if metadata.len() > max_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("it is larger than {max_bytes} bytes"),
+                format!("it is larger than {}", describe_size_limit(max_bytes)),
             ));
         }
 
@@ -902,7 +902,7 @@ pub fn read_owned_state_file_optional(
         if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("it is larger than {max_bytes} bytes"),
+                format!("it is larger than {}", describe_size_limit(max_bytes)),
             ));
         }
         Ok(Some(contents))
@@ -930,10 +930,23 @@ pub fn read_owned_state_file_optional(
         if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("it is larger than {max_bytes} bytes"),
+                format!("it is larger than {}", describe_size_limit(max_bytes)),
             ));
         }
         Ok(Some(contents))
+    }
+}
+
+/// A size limit as a user reads it: `16 MiB` where it is a whole number of
+/// MiB or KiB, bytes otherwise.
+fn describe_size_limit(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= 1024 && bytes.is_multiple_of(1024) {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 

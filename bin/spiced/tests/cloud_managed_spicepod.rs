@@ -120,7 +120,10 @@ fn assert_refused(instance: &Path, reason: &str) {
         "the error must name the file and why it was refused: {printed}"
     );
     assert!(
-        printed.contains("then delete the file; the next Spice Cloud deployment writes it again"),
+        printed.contains(&format!(
+            "{reason}. Spice loads only the deployment file it wrote itself, so this one is not loaded. Delete it; the next Spice Cloud deployment writes it again, and `chmod go-w '{}'` keeps others from replacing it. See: https://spiceai.org/docs/cli/reference/cloud",
+            instance.join(".spice").display()
+        )),
         "the error must say how to recover: {printed}"
     );
     assert!(
