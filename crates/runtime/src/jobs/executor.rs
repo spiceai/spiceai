@@ -681,7 +681,7 @@ mod tests {
             "{remaining:?}"
         );
         // A timeout too long to represent is no deadline, or one too far ahead to matter.
-        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let year = Duration::from_hours(365 * 24);
         assert!(
             job_deadline(now_ms, u64::MAX)
                 .is_none_or(|deadline| deadline > tokio::time::Instant::now() + year)
