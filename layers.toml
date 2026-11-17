@@ -233,7 +233,8 @@ connector-postgres-common = "shared-utility"
 # --- foundation: near-dependency-free utilities + config/platform primitives.
 # (crates/ libraries whose full normal-dep closure stays within foundation.)
 ansi_colors = "foundation"
-arrow_aws-identity = "foundation"
+arrow_tools = "foundation"
+aws-identity = "foundation"
 aws-kms-signer = "foundation"
 azure-credential = "foundation"
 azure-key-vault-signer = "foundation"
