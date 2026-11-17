@@ -24,7 +24,7 @@ pub mod access;
 pub mod naming;
 pub mod rename;
 
-pub use access::{ToolAccess, ToolCallDenied, caller_can_write, set_runtime_authenticates_callers};
+pub use access::{ToolAccess, ToolCallDenied, caller_can_write};
 
 use async_trait::async_trait;
 use serde_json::Value;

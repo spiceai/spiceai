@@ -4,15 +4,14 @@ description: >
   read-write tool (`store_memory`, or any tool of an MCP server) needs a
   principal with write access: a read-only API key is refused one through
   `POST /v1/tools/{name}`, MCP `tools/call` (whose MCP tools are passed through
-  to their server), and a model's tool use from chat completions. A refusal
-  names the tool and how to get write access, is recorded in
+  to their server), and a model's tool use from chat completions, and a
+  runtime without `runtime.auth` refuses one to anonymous chat completions and
+  `ai()`. A refusal names the tool and how to get write access, is recorded in
   `runtime.task_history`, and comes before the tool runs: the MCP server never
   sees the call and no memory is written. Read-only tools stay available to
-  every caller, and a read-write key may call every tool. On a runtime without
-  `runtime.auth`, `/v1/tools` refuses anonymous callers and a model's tool use
-  (chat completions, `ai()`) runs read-write tools for them, as every caller
-  may write there. A mock model asks for each tool call; a stdio MCP server
-  reports every call it receives to a mock HTTP endpoint.
+  every caller, and a read-write key may call every tool. A mock model asks for
+  each tool call; a stdio MCP server reports every call it receives to a mock
+  HTTP endpoint.
 
 sources:
   api: { kind: mock-http }
@@ -241,7 +240,7 @@ steps:
   - http: { method: POST, path: /v1/tools/store_memory, api-key: none, headers: { content-type: application/json }, body: '{"thoughts": ["direct"]}' }
     expect: { status: 401 }
 
-  # A model's tool use, from chat completions and from `ai()`, runs the read-write tools.
+  # A model's tool use, from chat completions and from `ai()`, is refused the read-write tools.
   - source-exec:
       api:
         - |
@@ -322,19 +321,20 @@ steps:
     expect: { rows: [['1']] }
     eventually: 30s
 
-  # The mock still counts the read-write key's two calls (`reset` removes routes, not the log),
-  # and the anonymous chat's call; anonymous chat and `ai()` each wrote a memory; nothing was
-  # refused.
+  # The mock still counts the read-write key's two calls (`reset` removes routes, not the log):
+  # no anonymous call reached the MCP server, and no memory was written.
   - source-query: { api: count /alert }
-    expect: { rows: [['3']] }
-  - query: SELECT value FROM llm_memory ORDER BY value
-    api-key: none
-    expect: { rows: [['anonymous ai'], ['anonymous chat']] }
-  - query: >-
-      SELECT count(*) AS n FROM runtime.task_history
-      WHERE error_message LIKE 'Failed to call tool %'
+    expect: { rows: [['2']] }
+  - query: SELECT count(*) AS n FROM llm_memory
     api-key: none
     expect: { rows: [['0']] }
+  - query: >-
+      SELECT task, count(*) AS n FROM runtime.task_history
+      WHERE error_message LIKE 'Failed to call tool % the request has no credentials.%'
+      GROUP BY task ORDER BY task
+    api-key: none
+    expect: { rows: [['tool_use::probe__send_alert', '1'], ['tool_use::store_memory', '2']] }
+    eventually: 30s
 
   # --- A worker's scheduled prompt runs for the operator --------------------------------------
 

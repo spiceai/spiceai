@@ -387,9 +387,8 @@ mod tests {
     }
 
     /// A tool exposed as a SQL function is held to the tool's access like every other path
-    /// that runs it: with no principal on a runtime that authenticates callers (the default
-    /// until the runtime starts serving) a read-write tool is refused before it runs, and a
-    /// principal with write access may call it.
+    /// that runs it: with no principal (a runtime without `runtime.auth`) a read-write tool is
+    /// refused before it runs, and a principal with write access may call it.
     #[tokio::test]
     async fn tool_function_is_held_to_the_tool_access() {
         use runtime_auth::{AuthPrincipalRef, AuthRequestContext};

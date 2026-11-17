@@ -1749,16 +1749,6 @@ impl Runtime {
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
-        // A request with no principal may call read-write tools only when the runtime
-        // authenticates no caller, as it may then write through `/v1/sql`.
-        tools::set_runtime_authenticates_callers(
-            endpoint_auth.http_auth.is_some()
-                || !matches!(
-                    endpoint_auth.identity_source,
-                    runtime_auth::IdentitySource::Anonymous
-                ),
-        );
-
         // Executors: mark cluster status Initializing before any await so a
         // concurrent `load_components` cannot report ready from dataset-only
         // status while task slots are still closed (Fix B for #11758).

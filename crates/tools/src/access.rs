@@ -22,31 +22,12 @@ limitations under the License.
 //! function — reaches it through [`crate::SpiceModelTool::call`] or
 //! [`crate::SpiceModelTool::authorized_mcp_proxy`], and both decide with [`authorize`]. The
 //! rule is one: a tool that can change data or act outside Spice needs a principal with write
-//! access, and a read-only principal may call only read-only tools.
-//!
-//! A request with no principal is decided by how the runtime authenticates (see
-//! [`set_runtime_authenticates_callers`]). On a runtime that authenticates no caller (no
-//! `runtime.auth`), every request has none, and it may call read-write tools as it may write
-//! through `/v1/sql`. On a runtime that authenticates callers, every request carries a
-//! principal, so a call with none is the runtime's own work: it may call only read-only tools,
-//! unless it runs as a principal (`runtime_auth::SystemPrincipal`).
+//! access. A read-only principal, or a request with no principal (a runtime without
+//! `runtime.auth`, or work the runtime does on its own), may call only read-only tools.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use runtime_auth::{AuthPrincipalRef, AuthRequestContext, principal_has_write_access};
+use runtime_auth::{AuthRequestContext, principal_has_write_access};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::Snafu;
-
-/// Whether the runtime authenticates its callers; see [`set_runtime_authenticates_callers`].
-/// Until it is set, it does, so a request with no principal is refused read-write tools.
-static RUNTIME_AUTHENTICATES_CALLERS: AtomicBool = AtomicBool::new(true);
-
-/// Records whether the runtime authenticates its callers (`runtime.auth`, or client
-/// certificates as identity), which decides what a request with no principal may call. The
-/// runtime sets it when it starts serving.
-pub fn set_runtime_authenticates_callers(authenticates: bool) {
-    RUNTIME_AUTHENTICATES_CALLERS.store(authenticates, Ordering::Relaxed);
-}
 
 /// What a call to a tool can change, which decides who may make it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,8 +37,7 @@ pub enum ToolAccess {
     /// write. Any caller may call it.
     ReadOnly,
     /// A call can write data or act outside Spice: `store_memory`, or any tool of an MCP
-    /// server, whose effects Spice cannot know. Only a principal with write access may call it,
-    /// or a request with no principal on a runtime that authenticates no caller.
+    /// server, whose effects Spice cannot know. Only a principal with write access may call it.
     ReadWrite,
 }
 
@@ -104,40 +84,22 @@ pub(crate) async fn authorize(
     access: ToolAccess,
     input: Option<&str>,
 ) -> Result<(), ToolCallDenied> {
-    if access == ToolAccess::ReadOnly {
-        return Ok(());
-    }
-    let context = RequestContext::current(AsyncMarker::new().await);
-    let Err(denied) = decide(
-        tool,
-        access,
-        AuthRequestContext::auth_principal(context.as_ref()),
-        RUNTIME_AUTHENTICATES_CALLERS.load(Ordering::Relaxed),
-    ) else {
-        return Ok(());
+    let denied = match access {
+        ToolAccess::ReadOnly => return Ok(()),
+        ToolAccess::ReadWrite => {
+            let context = RequestContext::current(AsyncMarker::new().await);
+            match AuthRequestContext::auth_principal(context.as_ref()) {
+                Some(principal) if principal_has_write_access(principal) => return Ok(()),
+                Some(_) => ReadOnlyCredentialsSnafu { tool }.build(),
+                None => NoCredentialsSnafu { tool }.build(),
+            }
+        }
     };
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use", tool = %tool, input = input.unwrap_or_default());
     let task = format!("tool_use::{tool}");
     tracing::info!(target: "task_history", parent: &span, task_override = %task, "labels");
     tracing::error!(target: "task_history", parent: &span, "{denied}");
     Err(denied)
-}
-
-/// The decision [`authorize`] makes, for a caller with `principal` on a runtime that
-/// authenticates its callers or not.
-fn decide(
-    tool: &str,
-    access: ToolAccess,
-    principal: Option<&AuthPrincipalRef>,
-    runtime_authenticates_callers: bool,
-) -> Result<(), ToolCallDenied> {
-    match (access, principal) {
-        (ToolAccess::ReadOnly, _) => Ok(()),
-        (ToolAccess::ReadWrite, Some(principal)) if principal_has_write_access(principal) => Ok(()),
-        (ToolAccess::ReadWrite, Some(_)) => ReadOnlyCredentialsSnafu { tool }.fail(),
-        (ToolAccess::ReadWrite, None) if !runtime_authenticates_callers => Ok(()),
-        (ToolAccess::ReadWrite, None) => NoCredentialsSnafu { tool }.fail(),
-    }
 }
 
 /// Runs futures as a caller with a chosen principal, for tests of the decision above.
@@ -247,28 +209,8 @@ mod tests {
         );
     }
 
-    /// On a runtime that authenticates no caller (no `runtime.auth`), a request with no
-    /// principal may call a read-write tool, as it may write through `/v1/sql`; a read-only
-    /// principal still may not. On a runtime that authenticates callers it may not.
-    #[test]
-    fn a_request_with_no_principal_follows_how_the_runtime_authenticates() {
-        decide("send_alert", ToolAccess::ReadWrite, None, false)
-            .expect("no principal on a runtime without authentication");
-        assert!(matches!(
-            decide("send_alert", ToolAccess::ReadWrite, None, true),
-            Err(ToolCallDenied::NoCredentials { .. })
-        ));
-        assert!(matches!(
-            decide("send_alert", ToolAccess::ReadWrite, Some(&read_only()), false),
-            Err(ToolCallDenied::ReadOnlyCredentials { .. })
-        ));
-        decide("send_alert", ToolAccess::ReadWrite, Some(&read_write()), true)
-            .expect("read-write principal");
-        decide("sql", ToolAccess::ReadOnly, None, true).expect("read-only tool");
-    }
-
-    /// `caller_can_write`, which the `sql` tool runs its query by, needs a principal with write
-    /// access on every runtime: with none, the query is read-only.
+    /// `caller_can_write` is the same decision, for a tool that runs each call with the
+    /// caller's own access.
     #[tokio::test]
     async fn caller_can_write_only_with_write_access() {
         assert!(!caller_can_write().await, "no principal");
