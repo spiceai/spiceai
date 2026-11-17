@@ -24,8 +24,9 @@ limitations under the License.
 //!   transport (so Kubernetes liveness/readiness probes work) but the
 //!   HTTP route layer still 401s non-probe routes that arrived
 //!   without a verified client cert.
-//! - The metrics port (`/health`, `/metrics`) is always reachable over
-//!   TLS without a client cert when `client_auth: required` is set.
+//! - Under `client_auth: required`, the metrics port's `/health` is
+//!   reachable over TLS without a client cert, and `/metrics` answers the
+//!   same JSON 401 as the HTTP API until the client presents one.
 //! - The Flight listener stays strict: no-cert and foreign-CA cert
 //!   handshakes are rejected at the TLS layer.
 //! - mTLS-as-identity mode ([`IdentitySource::Channel`]): a verified
@@ -253,6 +254,29 @@ async fn flight_statement_update(
     Ok(())
 }
 
+/// The `error` of the 401 that the HTTP and metrics listeners answer under
+/// `client_auth: required` to a request whose connection has no client cert.
+const CLIENT_CERTIFICATE_REQUIRED: &str = "This endpoint requires a client certificate signed by the configured client CA (`runtime.tls.client_auth_ca_file` or `client_auth_ca`), because `runtime.tls.client_auth_mode` is `required`. Configure the client's certificate and key; for Prometheus, set `tls_config.cert_file` and `key_file`. See https://docs.spice.ai/docs/enterprise";
+
+/// Asserts that `resp` is the JSON 401 naming the missing client certificate.
+async fn assert_client_certificate_required(resp: reqwest::Response, what: &str) {
+    assert_eq!(resp.status().as_u16(), 401, "{what} must be 401");
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "{what} must answer JSON"
+    );
+    let text = resp.text().await.expect("an error body");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("a JSON error body");
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": CLIENT_CERTIFICATE_REQUIRED }),
+        "{what}"
+    );
+}
+
 /// Wait for `f` to return `Ok(())`, retrying for up to `timeout`. Useful
 /// while the spawned `Runtime` boots its listeners.
 async fn wait_for_ok<F, Fut, E>(timeout: Duration, mut f: F) -> Result<(), E>
@@ -367,12 +391,11 @@ async fn test_public_mtls_required_channel_mode() -> Result<(), anyhow::Error> {
                 .send()
                 .await
                 .expect("no-cert /v1/sql must complete the TLS handshake");
-            assert_eq!(
-                sql_resp.status().as_u16(),
-                401,
-                "no-cert /v1/sql must be 401 under client_auth: required, got {}",
-                sql_resp.status()
-            );
+            assert_client_certificate_required(
+                sql_resp,
+                "no-cert /v1/sql under client_auth: required",
+            )
+            .await;
             tracing::info!("no-cert HTTPS /v1/sql correctly 401d by route gate");
 
             // 3. Client cert signed by a *different* CA → handshake
@@ -510,38 +533,57 @@ async fn test_public_mtls_required_anonymous_mode() -> Result<(), anyhow::Error>
                 .send()
                 .await
                 .expect("no-cert /v1/sql must complete the handshake");
-            assert_eq!(
-                sql_resp.status().as_u16(),
-                401,
-                "no-cert /v1/sql in anonymous mode must be 401, got {}",
-                sql_resp.status()
-            );
+            assert_client_certificate_required(sql_resp, "no-cert /v1/sql in anonymous mode").await;
             tracing::info!("anonymous-mode no-cert: /health 200, /v1/sql 401");
 
-            // The metrics port reuses the lax HTTP `ServerConfig` and
-            // has no application-layer client-auth gate, so /health
-            // and /metrics are reachable over TLS with no client cert.
+            // The metrics port admits the same no-cert handshake, so a probe
+            // reaches /health, and every other path answers the HTTP API's 401.
             let metrics_health = no_cert
                 .get(format!("https://localhost:{metrics_port}/health"))
                 .send()
                 .await
                 .expect("no-cert metrics /health");
-            assert!(
-                metrics_health.status().is_success(),
-                "no-cert metrics /health must succeed, got {}",
-                metrics_health.status()
+            assert_eq!(
+                metrics_health.status().as_u16(),
+                200,
+                "no-cert metrics /health must succeed"
             );
-            let metrics_body = no_cert
+            for path in ["/metrics", "/metrics?scope=cluster", "/not-a-path"] {
+                let resp = no_cert
+                    .get(format!("https://localhost:{metrics_port}{path}"))
+                    .send()
+                    .await
+                    .expect("no-cert metrics request completes the handshake");
+                assert_client_certificate_required(resp, &format!("no-cert metrics {path}")).await;
+            }
+
+            // Refused requests do not use the scrape rate limit (100 per
+            // minute): a client with a cert still scrapes after more than
+            // 100 of them.
+            for _ in 0..110 {
+                let resp = no_cert
+                    .get(format!("https://localhost:{metrics_port}/metrics"))
+                    .send()
+                    .await
+                    .expect("no-cert metrics request completes the handshake");
+                assert_eq!(resp.status().as_u16(), 401, "no-cert metrics /metrics");
+            }
+            let scrape = http
                 .get(format!("https://localhost:{metrics_port}/metrics"))
                 .send()
                 .await
-                .expect("no-cert metrics /metrics");
-            assert!(
-                metrics_body.status().is_success(),
-                "no-cert metrics /metrics must succeed, got {}",
-                metrics_body.status()
+                .expect("metrics /metrics with a valid client cert");
+            assert_eq!(
+                scrape.status().as_u16(),
+                200,
+                "metrics /metrics with a valid client cert must succeed"
             );
-            tracing::info!("metrics endpoints reachable over TLS without client cert");
+            let text = scrape.text().await.expect("a metrics body");
+            assert!(
+                text.contains("# TYPE "),
+                "the scrape must return Prometheus text, got: {text}"
+            );
+            tracing::info!("metrics: no-cert /health 200, /metrics 401; valid cert /metrics 200");
 
             Ok::<_, anyhow::Error>(())
         })
@@ -650,7 +692,17 @@ async fn test_public_mtls_request_mode() -> Result<(), anyhow::Error> {
                 .await
                 .expect("flight show tables with valid cert under request mode");
 
-            let _ = metrics_port; // metrics port behavior is covered by anonymous-mode test
+            // 6. `request` does not gate the metrics port.
+            let metrics_resp = no_cert_http
+                .get(format!("https://localhost:{metrics_port}/metrics"))
+                .send()
+                .await
+                .expect("no-cert metrics /metrics under request mode");
+            assert_eq!(
+                metrics_resp.status().as_u16(),
+                200,
+                "request-mode no-cert metrics /metrics must succeed"
+            );
             Ok::<_, anyhow::Error>(())
         })
         .await

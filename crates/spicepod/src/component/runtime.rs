@@ -348,13 +348,14 @@ pub struct TlsConfig {
 /// audit-only deployments where every cert seen should be recorded
 /// but not enforced.
 ///
-/// `Required` enables strict mTLS: the server demands a valid client
-/// cert (verified against `client_auth_ca` / `client_auth_ca_file`)
-/// for every connection on the Flight listener; on the HTTP and
-/// metrics listeners the TLS handshake admits no-cert connections so
-/// Kubernetes liveness / readiness probes and Prometheus scrapes work
-/// without a client cert, but the HTTP route layer 401s any
-/// non-probe request whose connection has no verified client cert.
+/// `Required` enables strict mTLS: the server demands a valid client cert
+/// (verified against `client_auth_ca` / `client_auth_ca_file`) for every
+/// connection on the Flight listener; on the HTTP and metrics listeners the
+/// TLS handshake admits no-cert connections so Kubernetes liveness and
+/// readiness probes (`/health`, `/v1/ready`, and `/health` on the metrics
+/// port) work without a client cert, and every other request whose
+/// connection has no verified client cert, `/metrics` included, is
+/// answered 401.
 ///
 /// Whether a presented cert *also* becomes the request's auth
 /// principal is determined separately by whether `runtime.auth` is

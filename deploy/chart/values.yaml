@@ -153,6 +153,16 @@ monitoring:
     enabled: false
     # Set labels for the PodMonitor, use this to define your scrape label for Prometheus Operator
     additionalLabels: {}
+    # TLS for the scrape, passed through as the Prometheus Operator's
+    # `PodMetricsEndpoint.tlsConfig` (`SafeTLSConfig`). When set, the PodMonitor
+    # scrapes over HTTPS. With `runtime.tls.client_auth_mode: required`, `cert` and
+    # `keySecret` name the scrape's client certificate, signed by the client CA.
+    tlsConfig: {}
+    # Example:
+    # tlsConfig:
+    #   ca:   {secret: {name: spice-scrape-tls, key: ca.crt}}
+    #   cert: {secret: {name: spice-scrape-tls, key: tls.crt}}
+    #   keySecret: {name: spice-scrape-tls, key: tls.key}
 
 spicepod:
   name: app

@@ -37,6 +37,7 @@ helm install spiceai deploy/chart \
 | `stateful.size`                    | PVC size                                                                     | `1Gi`                             |
 | `stateful.mountPath`               | Mount path in container                                                      | `/data`                           |
 | `monitoring.podMonitor.enabled`    | Create a PodMonitor for Prometheus                                           | `false`                           |
+| `monitoring.podMonitor.tlsConfig`  | Prometheus Operator `SafeTLSConfig` for the scrape; set: scrape over HTTPS   | `{}`                              |
 | `additionalLabels`                 | Labels added to all resources                                                | `{}`                              |
 | `additionalEnv`                    | Extra environment variables                                                  | `[]`                              |
 | `resources`                        | CPU/memory requests and limits                                               | `{}`                              |
