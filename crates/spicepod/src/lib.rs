@@ -41,6 +41,7 @@ pub mod acceleration;
 pub mod component;
 pub mod drasi;
 pub mod extension;
+mod field_path;
 pub mod fts;
 mod keywords;
 mod metadata;
@@ -319,7 +320,7 @@ impl Spicepod {
         validate_spicepod_header(&raw, &path)?;
 
         let spicepod_definition: SpicepodDefinition =
-            yaml::from_value(raw).context(UnableToParseSpicepodSnafu)?;
+            field_path::from_value(raw).context(UnableToParseSpicepodSnafu)?;
 
         let resolved_datasets = component::resolve_component_references(
             fs,
@@ -478,8 +479,10 @@ impl Spicepod {
             .context(UnableToOpenSpicepodSnafu { path: path.clone() })?
             .context(SpicepodNotFoundSnafu { path: path.clone() })?;
 
-        let spicepod_definition: SpicepodDefinition =
+        let raw: yaml::Value =
             yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+        let spicepod_definition: SpicepodDefinition =
+            field_path::from_value(raw).context(UnableToParseSpicepodSnafu)?;
 
         Ok(spicepod_definition)
     }

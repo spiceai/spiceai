@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Manifest editing commands for Spicepod sections.
 
+use crate::commands::set_value::{self, SetScope};
 use crate::error::{ConfigIoSnafu, InvalidArgumentSnafu, Result};
 use crate::manifest;
 use clap::{Args, Subcommand, ValueHint};
@@ -133,13 +134,15 @@ BODY FLAGS
   --sql <SQL> | --sql-ref <PATH>     Inline or referenced SQL (views, workers, functions)
   --cron <CRON>             Cron expression (workers)
   --body <BODY> | --body-ref <PATH>  Inline or referenced function body
-    --param KEY=VALUE         Add a `params:` entry. Strings by default; prefix with `yaml:`
-                                                        for typed YAML or `string:` for a literal string.
+  --param KEY=VALUE         Add a `params:` entry. Strings by default; prefix with `yaml:`
+                            for typed YAML or `string:` for a literal string.
   --env KEY=VALUE           Add an `env:` entry (same string-vs-yaml rules as --param)
   --depends-on NAME         Append to `dependsOn:`
-    --set PATH=VALUE          Set any schema field by dotted path. Strings by default; prefix
-                                                        with `yaml:` for typed YAML or `string:` for a literal string.
-  --enable | --disable      Set `enabled: true` / `enabled: false`
+  --set PATH=VALUE          Set any schema field by dotted path. VALUE is typed by the field's
+                            schema (`true` -> boolean, `64` -> integer, `{a: b}` / `[a, b]` ->
+                            mapping / list); quote it ('"true"') or prefix `string:` to force
+                            a string, or prefix `yaml:` to force YAML.
+  --enable | --disable      Set `enabled: true` / `enabled: false` (functions only)
   --file <PATH> | --stdin   Read the inline body from a YAML/JSON file or stdin
   --manifest <PATH>         Edit a non-default Spicepod file
 
@@ -149,7 +152,7 @@ EXAMPLES
       --param openai_api_key='${ secrets:OPENAI_API_KEY }'
 
   # Update a model's allowed datasets
-    spice model configure llm --set datasets='yaml:[documents, orders]'
+  spice model configure llm --set datasets='[documents, orders]'
 
   # Add a Databricks Unity catalog
   spice catalog add tpch --from databricks \
@@ -179,8 +182,8 @@ USAGE
   spice <section> configure [body flags]
 
 BODY FLAGS
-    --set PATH=VALUE          Set any schema field by dotted path (string by default; prefix `yaml:` for typed or `string:` for literal)
-    --param KEY=VALUE         Add a `params:` entry (string by default; prefix `yaml:` for typed or `string:` for literal)
+  --set PATH=VALUE          Set any schema field by dotted path (typed by the schema; quote or prefix `string:` for a string)
+  --param KEY=VALUE         Add a `params:` entry (string by default; prefix `yaml:` for typed or `string:` for literal)
   --enable | --disable      Set `enabled: true` / `enabled: false`
   --api-key <KEY>           Convenience for `management.api_key`
   --location <URI>          Convenience for `snapshots.location`
@@ -195,7 +198,7 @@ EXAMPLES
   spice snapshots configure --location s3://my-bucket/snapshots
 
   # Tweak runtime parameters
-    spice runtime configure --set telemetry.enabled=yaml:true
+  spice runtime configure --set telemetry.enabled=false
 
 Docs: https://spiceai.org/docs";
 
@@ -207,8 +210,8 @@ USAGE
   spice extension configure <name> [body flags]   # add or update an extension in place
 
 BODY FLAGS
-    --set PATH=VALUE          Set any schema field by dotted path (string by default; prefix `yaml:` for typed or `string:` for literal)
-    --param KEY=VALUE         Add to the extension's `params:` map
+  --set PATH=VALUE          Set any schema field by dotted path (typed by the schema; quote or prefix `string:` for a string)
+  --param KEY=VALUE         Add to the extension's `params:` map
   --enable | --disable      Set `enabled: true` / `enabled: false`
   --file <PATH> | --stdin   Replace the extension body from a YAML/JSON file or stdin
   --manifest <PATH>         Edit a non-default Spicepod file
@@ -328,7 +331,7 @@ pub struct CommonComponentOptions {
     #[arg(long = "body-ref", value_name = "PATH")]
     pub body_ref: Option<String>,
 
-    /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml: or string:.
+    /// Set a schema field using a dotted path. Values are typed by the field's schema; quote or prefix string: for a string.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
 
@@ -422,7 +425,7 @@ pub struct SingletonConfigureArgs {
     #[arg(long)]
     pub stdin: bool,
 
-    /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml:.
+    /// Set a schema field using a dotted path. Values are typed by the field's schema; quote or prefix string: for a string.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
 
@@ -496,7 +499,7 @@ pub struct ExtensionEditArgs {
     #[arg(long)]
     pub stdin: bool,
 
-    /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml:.
+    /// Set a schema field using a dotted path. Values are typed by the field's schema; quote or prefix string: for a string.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
 
@@ -702,6 +705,12 @@ fn build_component_value(
         set_path(&mut value, "body_ref", Value::String(body_ref.clone()))?;
     }
     if options.enable || options.disable {
+        ensure!(
+            set_value::has_field(SetScope::ComponentEntry(section.field()), "enabled"),
+            InvalidArgumentSnafu {
+                message: enable_unsupported_message(section),
+            }
+        );
         set_path(&mut value, "enabled", Value::Bool(options.enable))?;
     }
     if !options.depends_on.is_empty() {
@@ -720,7 +729,7 @@ fn build_component_value(
         set_path(&mut value, &format!("env.{key}"), Value::String(env_value))?;
     }
     for pair in &options.set {
-        let (path, field_value) = parse_key_value(pair)?;
+        let (path, field_value) = parse_set_pair(SetScope::ComponentEntry(section.field()), pair)?;
         set_path(&mut value, &path, field_value)?;
     }
 
@@ -748,6 +757,18 @@ fn build_component_value(
     }
 
     Ok(value)
+}
+
+fn enable_unsupported_message(section: ComponentSection) -> String {
+    let flag_hint = if section == ComponentSection::Dataset {
+        " To toggle acceleration, use `--set acceleration.enabled=true` (or `=false`).".to_string()
+    } else {
+        String::new()
+    };
+    format!(
+        "{} entries have no `enabled` field, so --enable/--disable would write a Spicepod that does not load.{flag_hint}",
+        section.label()
+    )
 }
 
 fn add_component_value(
@@ -902,7 +923,7 @@ fn configure_singleton(section: SingletonSection, args: &SingletonConfigureArgs)
         set_path(&mut value, &format!("params.{key}"), param_value)?;
     }
     for pair in &args.set {
-        let (path, field_value) = parse_key_value(pair)?;
+        let (path, field_value) = parse_set_pair(SetScope::Section(section.field()), pair)?;
         set_path(&mut value, &path, field_value)?;
     }
 
@@ -931,7 +952,7 @@ fn mutate_extension(args: &ExtensionEditArgs, mode: MutationMode) -> Result<()> 
         )?;
     }
     for pair in &args.set {
-        let (path, field_value) = parse_key_value(pair)?;
+        let (path, field_value) = parse_set_pair(SetScope::ExtensionEntry, pair)?;
         set_path(&mut value, &path, field_value)?;
     }
 
@@ -1096,12 +1117,14 @@ fn parse_document_value(content: &str) -> Result<Value> {
     })
 }
 
-fn parse_key_value(pair: &str) -> Result<(String, Value)> {
-    let (key, raw_value) = split_pair(pair)?;
-    Ok((
-        key.to_string(),
-        parse_string_or_yaml_prefixed_value(key, raw_value)?,
-    ))
+/// Parses a `--set PATH=VALUE` pair, typing VALUE by the Spicepod schema for
+/// `PATH` under `scope` (see [`set_value`]).
+fn parse_set_pair(scope: SetScope<'_>, pair: &str) -> Result<(String, Value)> {
+    let (path, raw_value) = split_pair(pair)?;
+    let kinds = set_value::schema_kinds(scope, path);
+    let value = set_value::typed_value(kinds, path, raw_value)
+        .map_err(|message| crate::error::Error::ConfigParse { message })?;
+    Ok((path.to_string(), value))
 }
 
 fn parse_string_or_yaml_prefixed_pair(pair: &str) -> Result<(String, Value)> {
@@ -1538,17 +1561,92 @@ mod tests {
     }
 
     #[test]
-    fn set_values_default_to_strings() {
-        let (_, value) = parse_key_value("version=1.10").expect("pair should parse");
+    fn set_values_keep_non_round_trip_numbers_as_strings() {
+        let (_, value) = parse_set_pair(SetScope::Section("metadata"), "version=1.10")
+            .expect("pair should parse");
 
         assert_eq!(value, Value::String("1.10".to_string()));
     }
 
     #[test]
     fn set_values_accept_explicit_yaml_prefix() {
-        let (_, value) = parse_key_value("enabled=yaml:true").expect("pair should parse");
+        let (_, value) = parse_set_pair(SetScope::ComponentEntry("datasets"), "enabled=yaml:true")
+            .expect("pair should parse");
 
         assert_eq!(value, Value::Bool(true));
+    }
+
+    #[test]
+    fn dataset_set_writes_typed_values() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let manifest_path = temp_dir.path().join("spicepod.yaml");
+        std::fs::write(
+            &manifest_path,
+            "version: v2\nkind: Spicepod\nname: test\ndatasets:\n  - name: d\n    from: file:/tmp/x.parquet\n",
+        )
+        .expect("manifest should be written");
+        let args = ComponentConfigureArgs {
+            name: Some("d".to_string()),
+            options: CommonComponentOptions {
+                manifest: Some(manifest_path.clone()),
+                set: vec![
+                    "acceleration.enabled=true".to_string(),
+                    "acceleration.refresh_check_interval=10s".to_string(),
+                    "acceleration.params.cayenne_target_file_size_mb=64".to_string(),
+                    "acceleration.indexes={id: unique}".to_string(),
+                    "acceleration.refresh_append_overlap=5".to_string(),
+                    "description=\"true\"".to_string(),
+                ],
+                ..CommonComponentOptions::default()
+            },
+        };
+
+        configure_component(ComponentSection::Dataset, &args).expect("dataset should update");
+
+        let manifest =
+            manifest::read_spicepod_value(&manifest_path).expect("manifest should parse");
+        let dataset = manifest
+            .get("datasets")
+            .and_then(|datasets| datasets.get(0))
+            .expect("dataset should exist");
+        let acceleration = dataset
+            .get("acceleration")
+            .expect("acceleration should exist");
+        assert_eq!(acceleration.get("enabled"), Some(&Value::Bool(true)));
+        assert_eq!(
+            acceleration
+                .get("refresh_check_interval")
+                .and_then(Value::as_str),
+            Some("10s")
+        );
+        assert_eq!(
+            acceleration
+                .get("params")
+                .and_then(|params| params.get("cayenne_target_file_size_mb")),
+            Some(&Value::Number(yaml::Number::PosInt(64)))
+        );
+        assert_eq!(
+            acceleration
+                .get("indexes")
+                .and_then(|indexes| indexes.get("id"))
+                .and_then(Value::as_str),
+            Some("unique")
+        );
+        assert_eq!(
+            acceleration
+                .get("refresh_append_overlap")
+                .and_then(Value::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            dataset.get("description").and_then(Value::as_str),
+            Some("true")
+        );
+
+        let contents = std::fs::read_to_string(&manifest_path).expect("manifest should read");
+        let spicepod: spicepod::spec::SpicepodDefinition =
+            yaml::from_str(&contents).expect("edited manifest should load as a Spicepod");
+        assert_eq!(spicepod.datasets.len(), 1);
     }
 
     #[test]

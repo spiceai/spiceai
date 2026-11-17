@@ -87,9 +87,9 @@ BODY FLAGS (same as `spice <component>` editors)
   --from <SOURCE>           Provider/URI (e.g. `s3://bucket/key`, `databricks:catalog.schema.table`)
   --description <TEXT>      Human-readable description
   --param KEY=VALUE         Add a `params:` entry (string by default; prefix `yaml:` for typed)
-  --set PATH=VALUE          Set any schema field by dotted path; VALUE is parsed as YAML
+  --set PATH=VALUE          Set any schema field by dotted path; VALUE is typed by the field's
+                            schema (quote it or prefix `string:` to force a string)
   --depends-on NAME         Append to `dependsOn:`
-  --enable | --disable      Set `enabled: true` / `enabled: false`
   --file <PATH> | --stdin   Read the dataset body from a YAML/JSON file or stdin
   --manifest <PATH>         Edit a non-default Spicepod file
 
