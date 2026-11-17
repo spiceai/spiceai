@@ -111,6 +111,11 @@ pub enum Error {
         "Job {job_id} is driven by another scheduler, so this scheduler stopped driving it"
     ))]
     JobTakenOver { job_id: String },
+
+    #[snafu(display(
+        "`timeout_seconds` is {requested}, above {limit} seconds, this runtime's `runtime.query.timeout` and the longest an async query may run. Omit it to use {limit} seconds, or set a smaller value. See https://spiceai.org/docs/api/http/queries"
+    ))]
+    TimeoutAboveQueryTimeout { requested: u64, limit: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

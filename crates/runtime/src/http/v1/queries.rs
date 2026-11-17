@@ -92,7 +92,7 @@ pub struct SubmitQueryRequest {
     pub parameters: Option<serde_json::Value>,
     /// Optional timeout for async jobs.
     /// Jobs running for longer than this, writing their results included, will automatically timeout and fail.
-    /// When `runtime.query.timeout` is set, it is the timeout of a job that sets none and the longest a job may set.
+    /// When `runtime.query.timeout` is set, it is the timeout of a job that sets none, and a longer value is refused with `400`.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
     /// Optional maximum size of results for async jobs.
@@ -316,7 +316,7 @@ pub struct CancelActiveQueryResponse {
     ),
     responses(
         (status = 202, description = "Query accepted for async execution", body = SubmitQueryResponse),
-        (status = 400, description = "Invalid request"),
+        (status = 400, description = "Invalid request, such as a `timeout_seconds` above `runtime.query.timeout`"),
         (status = 503, description = "Queries API requires cluster mode")
     )
 ))]
@@ -962,6 +962,11 @@ fn error_to_response(error: &crate::jobs::Error) -> Response {
             .into_response(),
         Error::JobNotComplete { .. } => (
             StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response(),
+        Error::TimeoutAboveQueryTimeout { .. } => (
+            StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": error.to_string()})),
         )
             .into_response(),

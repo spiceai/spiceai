@@ -65,20 +65,36 @@ fn job_deadline(created_at_ms: u64, timeout_seconds: u64) -> Option<tokio::time:
     tokio::time::Instant::now().checked_add(remaining)
 }
 
-/// The timeout, in seconds, an async query job runs under: the caller's `timeout_seconds`, but
-/// never longer than `runtime.query.timeout` (`query_timeout`), which is also the timeout when
-/// the caller sets none. A `runtime.query.timeout` with a fraction of a second rounds up to the
-/// next second, so the job never stops before the configured time.
-fn job_timeout_seconds(requested: Option<u64>, query_timeout: Option<Duration>) -> Option<u64> {
-    let limit = query_timeout.map(|timeout| {
-        timeout
-            .as_secs()
-            .saturating_add(u64::from(timeout.subsec_nanos() > 0))
-    });
-    match (requested, limit) {
-        (Some(requested), Some(limit)) => Some(requested.min(limit)),
-        (requested, limit) => requested.or(limit),
+/// The timeout, in seconds, an async query job runs under: the caller's `timeout_seconds`, or
+/// `runtime.query.timeout` (`query_timeout`) when the caller sets none. A `timeout_seconds` longer
+/// than `runtime.query.timeout` is refused rather than shortened. A `runtime.query.timeout` with a
+/// fraction of a second rounds up to the next second, so a job that sets none never stops before
+/// the configured time.
+fn job_timeout_seconds(
+    requested: Option<u64>,
+    query_timeout: Option<Duration>,
+) -> Result<Option<u64>> {
+    match (requested, query_timeout) {
+        (Some(requested), Some(limit)) if Duration::from_secs(requested) > limit => {
+            Err(Error::TimeoutAboveQueryTimeout {
+                requested,
+                limit: format_seconds(limit),
+            })
+        }
+        (Some(requested), _) => Ok(Some(requested)),
+        (None, Some(limit)) => Ok(Some(
+            limit
+                .as_secs()
+                .saturating_add(u64::from(limit.subsec_nanos() > 0)),
+        )),
+        (None, None) => Ok(None),
     }
+}
+
+/// `duration` in seconds as a person writes it: `5`, `1.5`, `300`.
+fn format_seconds(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    format!("{seconds}")
 }
 
 /// Logs how a job's background task ended. A driver that another scheduler
@@ -146,10 +162,10 @@ impl JobExecutor {
         owner: String,
     ) -> Result<JobState> {
         // `runtime.query.timeout` bounds every query the runtime's query APIs run, so it bounds
-        // an async query too: it is the job's timeout when the caller sets none, and the most a
-        // caller's `timeout_seconds` can ask for.
+        // an async query too: it is the job's timeout when the caller sets none, and a caller's
+        // `timeout_seconds` longer than it is refused before the job is created.
         let query_timeout = RequestContext::current(AsyncMarker::new().await).query_timeout();
-        request.timeout_seconds = job_timeout_seconds(request.timeout_seconds, query_timeout);
+        request.timeout_seconds = job_timeout_seconds(request.timeout_seconds, query_timeout)?;
         let state = self.job_store.create_job(request, read_only, owner).await?;
         let job_id = state.job_id.clone();
 
@@ -646,25 +662,37 @@ mod tests {
         JobExecutor::new(job_store, df)
     }
 
-    /// `runtime.query.timeout` is the job timeout when the caller sets none and the most a caller
-    /// can ask for; a fraction of a second rounds up so a job never stops early.
+    /// `runtime.query.timeout` is the job timeout when the caller sets none, and a longer
+    /// `timeout_seconds` is refused, never shortened; a fraction of a second rounds up so a job
+    /// that sets none never stops early.
     #[test]
-    fn job_timeout_is_capped_by_the_query_timeout() {
+    fn job_timeout_is_bounded_by_the_query_timeout() {
         let limit = Some(Duration::from_secs(30));
-        assert_eq!(job_timeout_seconds(None, None), None);
-        assert_eq!(job_timeout_seconds(Some(600), None), Some(600));
-        assert_eq!(job_timeout_seconds(None, limit), Some(30));
-        assert_eq!(job_timeout_seconds(Some(600), limit), Some(30));
-        assert_eq!(job_timeout_seconds(Some(10), limit), Some(10));
-        assert_eq!(job_timeout_seconds(Some(0), limit), Some(0));
+        assert_eq!(job_timeout_seconds(None, None).ok(), Some(None));
+        assert_eq!(job_timeout_seconds(Some(600), None).ok(), Some(Some(600)));
+        assert_eq!(job_timeout_seconds(None, limit).ok(), Some(Some(30)));
+        assert_eq!(job_timeout_seconds(Some(30), limit).ok(), Some(Some(30)));
+        assert_eq!(job_timeout_seconds(Some(10), limit).ok(), Some(Some(10)));
+        assert_eq!(job_timeout_seconds(Some(0), limit).ok(), Some(Some(0)));
         assert_eq!(
-            job_timeout_seconds(None, Some(Duration::from_millis(1_500))),
-            Some(2)
+            job_timeout_seconds(None, Some(Duration::from_millis(1_500))).ok(),
+            Some(Some(2))
         );
         assert_eq!(
-            job_timeout_seconds(None, Some(Duration::from_millis(1))),
-            Some(1)
+            job_timeout_seconds(Some(1), Some(Duration::from_millis(1_500))).ok(),
+            Some(Some(1))
         );
+        let Err(e) = job_timeout_seconds(Some(31), limit) else {
+            panic!("a timeout_seconds above runtime.query.timeout must be refused");
+        };
+        assert_eq!(
+            e.to_string(),
+            "`timeout_seconds` is 31, above 30 seconds, this runtime's `runtime.query.timeout` and the longest an async query may run. Omit it to use 30 seconds, or set a smaller value. See https://spiceai.org/docs/api/http/queries"
+        );
+        let Err(e) = job_timeout_seconds(Some(2), Some(Duration::from_millis(1_500))) else {
+            panic!("a timeout_seconds above a fractional runtime.query.timeout must be refused");
+        };
+        assert!(e.to_string().contains("above 1.5 seconds"), "{e}");
     }
 
     /// A job's deadline counts from its submission, so a job taken over by another scheduler
