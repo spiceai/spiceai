@@ -409,9 +409,12 @@ impl FileSchemaDriftGuard {
         let mut records = 0usize;
         let (newest, rest) = files.split_at(files.len().min(1));
         for chunk in std::iter::once(newest).chain(rest.chunks(SCHEMA_PROBE_CONCURRENCY)) {
+            // A file that carries every still-missing column ends the search, so its probe
+            // stops at the first record that completes the set instead of reading the file.
+            let wanted = remaining.clone();
             let probes: Vec<_> = chunk
                 .iter()
-                .map(|file| probe_json_file(&self.format, state, store, file, &registered))
+                .map(|file| probe_json_file(&self.format, state, store, file, &registered, &wanted))
                 .collect();
             for probe in futures::future::join_all(probes).await {
                 let probe = probe?;
@@ -516,19 +519,24 @@ pub(crate) fn scanned_files(
 /// changes type across records cannot fail the refresh. `JsonFormat`
 /// (JSONL without a pointer) is probed as `SpiceJsonFormat` JSONL so the
 /// record count uses the same reader as array/pointer scans.
+///
+/// The probe streams the file and stops once it has seen every key in
+/// `wanted`. Its keys and record count then cover only the records read,
+/// which is enough: that file proves every wanted column present.
 async fn probe_json_file(
     format: &Arc<dyn FileFormat>,
     state: &dyn Session,
     store: &Arc<dyn object_store::ObjectStore>,
     file: &ObjectMeta,
     registered: &BTreeSet<String>,
+    wanted: &BTreeSet<String>,
 ) -> DFResult<JsonKeyProbe> {
     let files = std::slice::from_ref(file);
     if let Some(json) = format.as_ref().downcast_ref::<SpiceJsonFormat>() {
         return json
             .clone()
             .with_schema_infer_max_rec(usize::MAX)
-            .probe_keys(state, store, files, registered)
+            .probe_keys(state, store, files, registered, Some(wanted))
             .await;
     }
     if let Some(json) = format.as_ref().downcast_ref::<JsonFormat>() {
@@ -539,7 +547,7 @@ async fn probe_json_file(
             .with_format(Format::Jsonl)
             .with_schema_infer_max_rec(usize::MAX)
             .with_file_compression_type(compression)
-            .probe_keys(state, store, files, registered)
+            .probe_keys(state, store, files, registered, Some(wanted))
             .await;
     }
     Err(DataFusionError::Internal(
