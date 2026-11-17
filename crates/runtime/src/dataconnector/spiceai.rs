@@ -683,16 +683,25 @@ pub fn subscribe_to_append_stream(
     table_reference: String,
     memory_pool: Arc<dyn MemoryPool>,
 ) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
-    let subscribe_to = table_reference.clone();
+    // `table_reference` is quoted for the upstream; logs and metric labels use
+    // the plain name, as other dataset metrics do.
+    let dataset = dataset_label(&table_reference);
+    let subscribe_to = table_reference;
     append_stream::append_stream(
         move || {
             let mut client = client.clone();
             let table_reference = subscribe_to.clone();
             async move { client.subscribe(&table_reference).await }
         },
-        table_reference,
+        dataset,
         append_stream::ReloadBudget::new(memory_pool),
     )
+}
+
+/// The plain name of the upstream dataset `table_reference` refers to, as other
+/// dataset metrics and logs show it (`events`, not `"events"`).
+fn dataset_label(table_reference: &str) -> String {
+    TableReference::parse_str(table_reference).to_string()
 }
 
 pub struct SpiceAIChangeCommiter {}
@@ -757,6 +766,18 @@ mod tests {
     /// From a producer that does not mark its stream, only `DATA_LOSS` (the
     /// subscriber missed updates) sends the append stream back for a fresh
     /// snapshot; any other error is reported.
+    #[test]
+    fn an_append_stream_reports_its_dataset_by_its_unquoted_name() {
+        assert_eq!(
+            dataset_label(&TableReference::bare("events").to_quoted_string()),
+            "events"
+        );
+        assert_eq!(
+            dataset_label(&TableReference::partial("audit", "events").to_quoted_string()),
+            "audit.events"
+        );
+    }
+
     #[test]
     fn only_data_loss_resubscribes_an_append_stream() {
         use arrow_flight::error::FlightError;

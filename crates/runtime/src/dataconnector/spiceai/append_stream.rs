@@ -98,6 +98,9 @@ pub(super) struct StaleDatasets {
 
 #[derive(Default)]
 struct Staleness {
+    /// The append streams of the dataset that are running; the dataset is
+    /// reported, at 0 while current, for as long as one is.
+    subscribers: usize,
     /// When the dataset last changed, while a reload of it is outstanding.
     stale_since: Option<tokio::time::Instant>,
     /// Reloads refused because staging them needed more memory than the pool had.
@@ -149,6 +152,21 @@ impl StaleDatasets {
         Arc::clone(&PUBLISHED_STALE_DATASETS.0)
     }
 
+    /// Reports `dataset`, current and with no refused reloads, until the returned
+    /// guard drops, so its metrics read 0 from the moment its append stream
+    /// starts rather than appearing only once it goes stale.
+    fn register(self: &Arc<Self>, dataset: &str) -> Registration {
+        self.datasets
+            .lock()
+            .entry(dataset.to_string())
+            .or_default()
+            .subscribers += 1;
+        Registration {
+            stale: Arc::clone(self),
+            dataset: dataset.to_string(),
+        }
+    }
+
     /// `dataset` keeps serving data that last changed at `last_changed`.
     fn mark_stale(&self, dataset: &str, last_changed: Option<tokio::time::Instant>, refused: bool) {
         let mut datasets = self.datasets.lock();
@@ -166,6 +184,12 @@ impl StaleDatasets {
         if let Some(entry) = self.datasets.lock().get_mut(dataset) {
             entry.stale_since = None;
         }
+    }
+
+    /// Whether `dataset` is reported at all.
+    #[cfg(test)]
+    pub(super) fn is_reported(&self, dataset: &str) -> bool {
+        self.datasets.lock().contains_key(dataset)
     }
 
     /// How long ago `dataset` last changed, while it is stale.
@@ -208,6 +232,24 @@ impl StaleDatasets {
             .iter()
             .map(|(dataset, entry)| (dataset.clone(), entry.refused))
             .collect()
+    }
+}
+
+/// Keeps a dataset reported in [`StaleDatasets`] while its append stream runs.
+struct Registration {
+    stale: Arc<StaleDatasets>,
+    dataset: String,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut datasets = self.stale.datasets.lock();
+        if let Some(entry) = datasets.get_mut(&self.dataset) {
+            entry.subscribers = entry.subscribers.saturating_sub(1);
+            if entry.subscribers == 0 {
+                datasets.remove(&self.dataset);
+            }
+        }
     }
 }
 
@@ -342,7 +384,8 @@ enum Ended {
     Refused(String),
 }
 
-/// Reads the append stream of `table_reference`, opening each subscription with
+/// Reads the append stream of the dataset named `table_reference` (unquoted, as
+/// it appears in logs and metric labels), opening each subscription with
 /// `subscribe`.
 pub(super) fn append_stream<F, Fut, S, E>(
     mut subscribe: F,
@@ -356,6 +399,9 @@ where
     S: Stream<Item = Result<DecodedFlightData, FlightError>> + Unpin,
 {
     stream! {
+        // Report the dataset's staleness metrics, at 0, for as long as the
+        // stream runs.
+        let _registered = budget.stale.register(&table_reference);
         let mut resubscribes = 0_u32;
         // Reloads refused in a row for lack of memory.
         let mut refusals = 0_u32;
@@ -836,6 +882,56 @@ mod tests {
                 .await;
         let mut stream = consumer(vec![held_open(snapshot)]);
         assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(3)]);
+    }
+
+    /// A dataset's staleness metrics read 0 from the moment its append stream
+    /// starts, and it stops being reported once the stream is dropped.
+    #[tokio::test]
+    async fn the_staleness_metrics_report_a_running_stream_at_zero() {
+        let runtime = crate::Runtime::builder().build().await;
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (snapshot, _) =
+            through_end(producer(&runtime.datafusion(), &broadcaster, table(vec![1])).await).await;
+        let budget = unbounded_budget();
+        let stale = Arc::clone(&budget.stale);
+        let mut subscriptions: VecDeque<Messages> = vec![held_open(snapshot)].into();
+        let mut stream = append_stream(
+            move || {
+                let next = subscriptions.pop_front();
+                async move {
+                    next.map(FlightDataDecoder::new)
+                        .ok_or("no more subscriptions")
+                }
+            },
+            DATASET.to_string(),
+            budget,
+        )
+        .boxed();
+        assert!(
+            !stale.is_reported(DATASET),
+            "nothing runs before the first poll"
+        );
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(stale.stale_seconds(), vec![(DATASET.to_string(), 0)]);
+        assert_eq!(stale.refusals(), vec![(DATASET.to_string(), 0)]);
+        drop(stream);
+        assert!(
+            !stale.is_reported(DATASET),
+            "a dropped stream is no longer reported"
+        );
+    }
+
+    /// Two streams of one dataset, such as across a Spicepod reload, keep it
+    /// reported until both stop.
+    #[test]
+    fn a_dataset_stays_reported_until_its_last_stream_stops() {
+        let stale = Arc::new(StaleDatasets::default());
+        let first = stale.register(DATASET);
+        let second = stale.register(DATASET);
+        drop(first);
+        assert!(stale.is_reported(DATASET));
+        drop(second);
+        assert!(!stale.is_reported(DATASET));
     }
 
     #[tokio::test]
