@@ -6990,7 +6990,7 @@ mod tests {
             let done = Arc::clone(&done);
             async move {
                 let ctx = SessionContext::new();
-                let mut counts = std::collections::BTreeSet::new();
+                let mut reads = std::collections::BTreeSet::new();
                 while !done.load(Ordering::SeqCst) {
                     let batches = ctx
                         .read_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>)
@@ -6998,10 +6998,29 @@ mod tests {
                         .collect()
                         .await
                         .expect("collect accelerator");
-                    counts.insert(batches.iter().map(RecordBatch::num_rows).sum::<usize>());
+                    let mut rows: Vec<(i32, String)> = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            let ids = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .expect("id is Int32")
+                                .clone();
+                            let names = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .expect("name is Utf8")
+                                .clone();
+                            (0..ids.len()).map(move |i| (ids.value(i), names.value(i).to_string()))
+                        })
+                        .collect();
+                    rows.sort_unstable();
+                    reads.insert(rows);
                     tokio::task::yield_now().await;
                 }
-                counts
+                reads
             }
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -7017,14 +7036,22 @@ mod tests {
         assert!(task.apply_envelope_run(&mut context, vec![reload]).await);
         tokio::time::sleep(Duration::from_millis(20)).await;
         done.store(true, Ordering::SeqCst);
-        let counts = reader.await.expect("reader");
+        let reads = reader.await.expect("reader");
+        let rows_of = |ids: &[i32], names: &[&str]| -> Vec<(i32, String)> {
+            ids.iter()
+                .zip(names)
+                .map(|(id, name)| (*id, (*name).to_string()))
+                .collect()
+        };
+        let old_rows = rows_of(&old_ids, &old_names);
+        let new_rows = rows_of(&new_ids, &new_names);
         assert!(
-            counts
+            reads
                 .iter()
-                .all(|count| *count == old_ids.len() || *count == new_ids.len()),
-            "a query saw a partly reloaded table: {counts:?}"
+                .all(|rows| *rows == old_rows || *rows == new_rows),
+            "a query saw a partly reloaded table: {reads:?}"
         );
-        assert!(counts.contains(&new_ids.len()), "{counts:?}");
+        assert!(reads.contains(&new_rows), "{reads:?}");
         assert_eq!(
             names_in_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>).await,
             vec!["new".to_string(); new_ids.len()]
