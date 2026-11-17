@@ -77,6 +77,9 @@ pub struct Spiced {
     container: Option<ContainerRun>,
     /// The `binary` last copied into `dir` for a container to run.
     staged_from: Option<PathBuf>,
+    /// Where the latest start's output begins in `spiced.log`, which keeps the
+    /// output of every start.
+    log_start: u64,
 }
 
 /// A container `spiced` runs in: on the host's network, so it serves on the
@@ -204,6 +207,7 @@ impl Spiced {
             sessions: std::collections::HashMap::new(),
             container: None,
             staged_from: None,
+            log_start: 0,
         })
     }
 
@@ -358,6 +362,7 @@ impl Spiced {
             .create(true)
             .append(true)
             .open(self.log_path())?;
+        self.log_start = log.metadata()?.len();
         let mut command = match self.container.clone() {
             None => {
                 let mut command = Command::new(&self.binary);
@@ -710,11 +715,16 @@ impl Spiced {
             "spiced exited successfully, but it was expected to exit with an error matching `{pattern}`; see {}",
             self.log_path().display()
         );
-        let log = std::fs::read_to_string(self.log_path())
+        // Only this start's output: `spiced.log` also holds every earlier start's.
+        let log = std::fs::read(self.log_path())
             .with_context(|| format!("Failed to read {}", self.log_path().display()))?;
+        let start = usize::try_from(self.log_start)
+            .unwrap_or(usize::MAX)
+            .min(log.len());
+        let output = String::from_utf8_lossy(&log[start..]);
         ensure!(
-            pattern.is_match(&log),
-            "spiced exited with {status}, but its log has no line matching `{pattern}`; see {}",
+            pattern.is_match(&output),
+            "spiced exited with {status}, but the output of this start has no line matching `{pattern}`; see {} from byte {start}",
             self.log_path().display()
         );
         Ok(())
@@ -1384,5 +1394,68 @@ mod bridge_tests {
             None
         );
         assert_eq!(node_bind_port(&args(&["--node-bind-address"])), None);
+    }
+}
+
+#[cfg(test)]
+mod wait_exit_tests {
+    use super::Spiced;
+    use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
+
+    /// A stand-in for `spiced` that refuses to start: the first run fails with
+    /// `first refusal`, every later run with `second refusal`.
+    fn refusing_binary(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("refusing-spiced");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nif [ -f started-once ]; then echo 'ERROR spiced: second refusal'; else touch started-once; echo 'ERROR spiced: first refusal'; fi\nexit 1\n",
+        )
+        .expect("write the stand-in binary");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in binary executable");
+        path
+    }
+
+    /// Regression test: `exits:` must match the output of the start it checks,
+    /// not an earlier start's, although `spiced.log` keeps every start's.
+    #[tokio::test]
+    async fn exits_matches_only_the_output_of_its_own_start() {
+        let dir = std::env::temp_dir().join(format!(
+            "spicescript-wait-exit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("create the instance directory");
+        let binary = refusing_binary(&dir);
+        let mut spiced =
+            Spiced::new(binary, dir.clone(), BTreeMap::new()).expect("create the instance");
+        let first = regex::Regex::new("first refusal").expect("valid pattern");
+        let timeout = Duration::from_secs(30);
+
+        spiced.start("version: v1\n").expect("start once");
+        spiced
+            .wait_exit(timeout, &first)
+            .await
+            .expect("the first start refuses with the first pattern");
+
+        spiced.start("version: v1\n").expect("start again");
+        let err = spiced
+            .wait_exit(timeout, &first)
+            .await
+            .expect_err("the second start refused for another reason");
+        assert!(
+            err.to_string()
+                .starts_with("spiced exited with exit status: 1, but the output of this start has no line matching `first refusal`"),
+            "{err:#}"
+        );
+        let log = std::fs::read_to_string(spiced.log_path()).expect("read spiced.log");
+        assert!(
+            log.contains("first refusal") && log.contains("second refusal"),
+            "spiced.log keeps the output of every start: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
