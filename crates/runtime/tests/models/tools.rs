@@ -1041,7 +1041,7 @@ params:
             .read_app()
             .await
             .ok_or_else(|| anyhow::anyhow!("App not loaded"))?;
-        let endpoint_auth = EndpointAuth::new(rt.secrets(), &app_arc).await;
+        let endpoint_auth = EndpointAuth::new(rt.secrets(), &app_arc).await?;
 
         let rt_ref_copy = Arc::clone(&rt);
         tokio::spawn(async move {
@@ -1313,7 +1313,7 @@ params:
             .read_app()
             .await
             .ok_or_else(|| anyhow::anyhow!("App not loaded"))?;
-        let endpoint_auth = EndpointAuth::new(rt.secrets(), &app_arc).await;
+        let endpoint_auth = EndpointAuth::new(rt.secrets(), &app_arc).await?;
 
         let rt_ref_copy = Arc::clone(&rt);
         tokio::spawn(async move {

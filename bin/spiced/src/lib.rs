@@ -227,6 +227,9 @@ pub enum Error {
     #[snafu(display("Unable to configure TLS: {source}"))]
     UnableToInitializeTls { source: Box<dyn std::error::Error> },
 
+    #[snafu(display("{source}"))]
+    UnableToConfigureAuth { source: runtime::auth::Error },
+
     #[snafu(display("Unable to initialize tracing: {source}"))]
     UnableToInitializeTracing {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -1197,9 +1200,22 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         rt.init_component_metrics();
     }
 
+    // Restore control-plane-delivered secrets from the local cache and register
+    // their store BEFORE resolving API keys and loading components. Both
+    // resolve `${ secrets:… }`, so a store installed after this point would
+    // arrive too late for every API key and component that referenced one —
+    // and a value a deployment rotates reaches the components holding the old
+    // one only by loading them again, which is this path. Local files only, no
+    // control-plane round trip, so this neither blocks nor fails when the
+    // gateway is unreachable.
+    let delivered_secrets =
+        cloud_connect::restore_delivered_secrets(&rt, cloud_connect_identity.as_ref()).await;
+
     let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
-        Some(app) => EndpointAuth::new(rt.secrets(), app).await,
+        Some(app) => EndpointAuth::new(rt.secrets(), app)
+            .await
+            .context(UnableToConfigureAuthSnafu)?,
         None => EndpointAuth::no_auth(),
     };
 
@@ -1271,17 +1287,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             result
         }
     });
-
-    // Restore control-plane-delivered secrets from the local cache and register
-    // their store BEFORE loading components. Component initialization is what
-    // resolves `${ secrets:… }`, so a store installed after this point would
-    // arrive too late for every component that referenced one — and a value a
-    // deployment rotates reaches the components holding the old one only by
-    // loading them again, which is this path. Local files only, no
-    // control-plane round trip, so this neither blocks nor fails when the
-    // gateway is unreachable.
-    let delivered_secrets =
-        cloud_connect::restore_delivered_secrets(&rt, cloud_connect_identity.as_ref()).await;
 
     // The connection report's two latches. The connection half is filled by the
     // control client on the first message Spice Cloud sends back; the serving
