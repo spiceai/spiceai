@@ -240,7 +240,17 @@ jobs:
             --work-dir "$RUNNER_TEMP/spicescript" \
             --results "$RUNNER_TEMP/spicescript-results.json" \
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            --max-wait 30s --record-failures \
             -- "${script_paths[@]}"
+
+      - name: Upload recorded ledgers (probe)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: probe-ledgers-${{ matrix.shard }}
+          path: test/spicescript/known-failing/**/recordings/expected-failures.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload script results
         if: ${{ !cancelled() }}
