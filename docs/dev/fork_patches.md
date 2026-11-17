@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `942e5df7ea19e9506b3f9007713efc161fc3fd0f` | `lukim/v1.0.0-fixes-2` (TEMPORARY: spiceai/llama.cpp#41 and spiceai/llama.cpp#42) |
+| [llama.cpp](#llamacpp) | `2c85942e8f1207f8caa6f2b4d5eb54b40e0f31a3` | `spiceai-v1.0.0` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aaf0209ec2a5dd1f61c5dedde20726ff04ac35a0` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
@@ -818,9 +818,9 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 Upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork carries
 upstream releases with the Spice patches below: each `spiceai-<release>` branch is the previous
 Spice branch with the upstream release tag merged in, and the pin is its tagged tip,
-`<release>-spiceai.<n>`, or a commit on it that no tag names yet: today `v1.0.0-spiceai.1`, the merge
-of spiceai/llama.cpp#38, which brought upstream `v1.0.0` into `spiceai-b11999` at the squash of
-spiceai/llama.cpp#37, which has since merged spiceai/llama.cpp#39 and #40, with #41 and #42 merged onto it while they are reviewed. Where `v1.0.0` has
+`<release>-spiceai.<n>`, or a commit on it that no tag names yet: today `2c85942e8f`, the merge of
+spiceai/llama.cpp#42 on top of `v1.0.0-spiceai.1` (the merge of spiceai/llama.cpp#38, which brought upstream `v1.0.0` into
+`spiceai-b11999` at the squash of spiceai/llama.cpp#37) and the merges of spiceai/llama.cpp#39, #40 and #41. Where `v1.0.0` has
 what a patch did, the branch takes upstream's: the `glm5-next` tensor split (spiceai/llama.cpp#8's, now
 ggml-org/llama.cpp#30499) and the meta backend's `GGML_OP_POOL_1D` and `GGML_OP_ARANGE` split states. `v1.0.0`
 gives GGML type 43 to `F8_E4M3`, so the fork's gather-only `MXFP8` type, which held that number, is gone; no GGUF
