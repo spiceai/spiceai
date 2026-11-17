@@ -197,7 +197,12 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
 
         match self
             .aggregator
-            .aggregate(generation_results, primary_keys, limit)
+            .aggregate(
+                generation_results,
+                primary_keys,
+                limit,
+                self.engine.session_context().runtime_env(),
+            )
             .await
         {
             Ok(a) => Ok(Some(a)),

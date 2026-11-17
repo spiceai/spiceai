@@ -16,10 +16,14 @@ limitations under the License.
 #![allow(clippy::doc_markdown)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
-use datafusion::{common::Column, execution::SendableRecordBatchStream};
+use datafusion::{
+    common::Column,
+    execution::{SendableRecordBatchStream, runtime_env::RuntimeEnv},
+};
 use serde_json::{Value, json};
 use snafu::{ResultExt, Snafu};
 
@@ -87,11 +91,15 @@ pub trait CandidateAggregation: Sync + Send {
     /// Consumes `generation_results` and decides how to order the underlying [`SendableRecordBatchStream`] data into a single [`SendableRecordBatchStream`].
     ///
     /// Expect `data` to be non empty, and one [`VectorSearchGenerationResult::data`] to be non-empty.
+    ///
+    /// `runtime` is the query engine's runtime: candidates an aggregation holds, and the plans it
+    /// runs, count against its memory pool (`runtime.query.memory_limit`) as a query does.
     async fn aggregate(
         &self,
         mut data: Vec<VectorSearchGenerationResult>,
         primary_keys: Vec<Column>,
         limit: usize,
+        runtime: Arc<RuntimeEnv>,
     ) -> Result<AggregationResult>;
 }
 

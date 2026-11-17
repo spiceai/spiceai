@@ -3,7 +3,8 @@ description: >
   Search on Cayenne beyond single queries: rrf fuses text_search and
   vector_search into exactly the documents either finds; a text_search
   filtered on other columns returns the matching rows; /v1/search returns
-  the documents vector search ranks first; and on a dataset kept current by
+  the documents vector search ranks first, once for a dataset named more than
+  once; and on a dataset kept current by
   change capture both indexes follow inserts, updates and deletes without a
   refresh.
 
@@ -74,6 +75,14 @@ steps:
   # /v1/search: the documents vector search ranks first.
   - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs"], "text": "fox fox fox fox", "limit": 3}' }
     expect: { status: 200, body-contains: '"results"' }
+  # A dataset named more than once, under any spelling, is searched once and its matches are
+  # returned once, under the name it was first given.
+  - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs", "public.docs", "spice.public.docs", "docs"], "text": "fox fox fox fox", "limit": 3}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /results, length: 3 }
+        - { pointer: /results/*/dataset, equals: docs }
 
   # The indexes of a change-captured dataset follow the source.
   - query: SELECT id FROM text_search(docs_cdc, 'fox')

@@ -588,7 +588,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         let explicit_datasets_requested = data_source_opt.is_some();
 
         let tables = match data_source_opt {
-            Some(ts) => ts.iter().map(TableReference::from).collect(),
+            Some(ts) => distinct_tables(ts.iter().map(TableReference::from)),
             None => self.user_tables_that_can_search().await?,
         };
 
@@ -709,6 +709,21 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             }
         }
     }
+}
+
+/// Each table of `tables` once, under the name it was first given, in that order. `docs`,
+/// `public.docs` and `spice.public.docs` name one table: it is searched once, and its matches
+/// are returned once.
+fn distinct_tables(tables: impl Iterator<Item = TableReference>) -> Vec<TableReference> {
+    let mut seen = HashSet::new();
+    tables
+        .filter(|tbl| {
+            seen.insert(
+                tbl.clone()
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+            )
+        })
+        .collect()
 }
 
 async fn get_filter_for_table(
