@@ -1,0 +1,5 @@
+{
+  "hive-null-partition": 2,
+  "hive-null-partition-upgrade": 2,
+  "ordering-window-join-semantics": 12
+}

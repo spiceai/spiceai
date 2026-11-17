@@ -49,8 +49,8 @@ use crate::{
         request_context_extension::get_current_datafusion,
     },
     flight::{
-        Service, is_auth_read_only, metrics, record_batches_to_flight_stream, to_tonic_err,
-        transaction_error_to_status,
+        Service, is_auth_read_only, metrics, to_tonic_err, transaction_error_to_status,
+        transaction_outcome_to_flight_stream,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
 };
@@ -214,7 +214,7 @@ pub(crate) async fn do_action_create_prepared_statement(
     // body is executed as a transaction at do_get, not planned as one here).
     let schema_sql = schema_statement(&query);
     let (dataset_schema, parameter_schema) = match Service::get_arrow_schema(
-        datafusion,
+        Arc::clone(&datafusion),
         &schema_sql,
     )
     .await
@@ -227,6 +227,8 @@ pub(crate) async fn do_action_create_prepared_statement(
                 || err_msg.contains("Invalid arithmetic operation")
                 || err_msg.contains("type inference")
                 || err_msg.contains("No field named")
+                // A table function can't plan until its parameters are bound.
+                || datafusion.has_table_function_placeholders(&schema_sql)
             {
                 tracing::debug!(
                     "Could not infer schema during prepare (will be determined at execution): {err_msg}"
@@ -291,6 +293,7 @@ pub(crate) async fn get_flight_info(
     // Otherwise an output column that depends on a parameter is advertised as
     // `Null`/nullable while the stream carries the bound, non-null type, and
     // clients that check the endpoint schema (ADBC, arrow-go) reject it.
+    let schema_sql = schema_statement(&sql);
     let schema_result = match decode_param_values(&parameters).map_err(param_error_to_status)? {
         Some(param_values) if transaction_statements(&sql).is_none() => {
             let sql_to_plan = match &parameter_schema {
@@ -301,13 +304,14 @@ pub(crate) async fn get_flight_info(
                 }
                 None => sql.clone(),
             };
-            Service::get_arrow_schema_with_params(datafusion, &sql_to_plan, Some(param_values))
-                .await
+            Service::get_arrow_schema_with_params(
+                Arc::clone(&datafusion),
+                &sql_to_plan,
+                Some(param_values),
+            )
+            .await
         }
-        _ => {
-            let schema_sql = schema_statement(&sql);
-            Service::get_arrow_schema(datafusion, &schema_sql).await
-        }
+        _ => Service::get_arrow_schema(Arc::clone(&datafusion), &schema_sql).await,
     };
     let maybe_arrow_schema = match schema_result {
         Ok((schema, _)) => Some(schema),
@@ -317,6 +321,8 @@ pub(crate) async fn get_flight_info(
                 || err_msg.contains("Invalid arithmetic operation")
                 || err_msg.contains("type inference")
                 || err_msg.contains("No field named")
+                // A table function can't plan until its parameters are bound.
+                || datafusion.has_table_function_placeholders(&schema_sql)
             {
                 tracing::debug!(
                     "Could not infer schema for prepared statement (will be determined at execution): {err_msg}"
@@ -383,15 +389,11 @@ pub(crate) async fn do_get(
         let context_clone = Arc::clone(&context);
         let outcome = context_clone
             .scope(async {
-                run_transaction(&datafusion, &statements, param_values, read_only).await
+                run_transaction(&datafusion, &statements, param_values, read_only, |_| 0).await
             })
             .await
             .map_err(transaction_error_to_status)?;
-        let batches = outcome
-            .result
-            .map(|(batches, _)| batches)
-            .unwrap_or_default();
-        let stream = record_batches_to_flight_stream(batches);
+        let stream = transaction_outcome_to_flight_stream(outcome);
         let timed = TimedStream::new(stream, move || start);
         return Ok(Response::new(
             Box::pin(timed) as <Service as FlightService>::DoGetStream

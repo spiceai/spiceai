@@ -23,9 +23,12 @@ limitations under the License.
 //! [`MemoryPool`] the query executed under and applies light back-pressure when
 //! the pool is under real pressure.
 
-use std::sync::Arc;
+use std::{borrow::Borrow, sync::Arc};
 
+use arrow::array::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use futures::{Stream, StreamExt};
 
 /// Cooperative yields [`EgressAccount::reserve`] makes while the pool is full
 /// before it over-commits, so it never blocks egress waiting for pool space.
@@ -102,4 +105,26 @@ impl EgressAccount {
         let to_free = bytes.min(self.reservation.size());
         self.reservation.shrink(to_free);
     }
+}
+
+/// Collects a result that is sent only once complete, growing `reservation` by
+/// each batch's size and failing with the pool's resources-exhausted error when
+/// the pool refuses. Hold `reservation` for as long as the batches live.
+pub(crate) async fn collect_reserved<S, B>(
+    batches: S,
+    reservation: &MemoryReservation,
+) -> Result<Vec<RecordBatch>, DataFusionError>
+where
+    S: Stream<Item = Result<B, DataFusionError>>,
+    B: Borrow<RecordBatch>,
+{
+    let mut batches = std::pin::pin!(batches);
+    let mut data = Vec::new();
+    while let Some(batch) = batches.next().await {
+        let batch = batch?;
+        let batch: &RecordBatch = batch.borrow();
+        reservation.try_grow(batch.get_array_memory_size())?;
+        data.push(batch.clone());
+    }
+    Ok(data)
 }
