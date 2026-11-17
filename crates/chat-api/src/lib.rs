@@ -136,8 +136,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// `from` is shown without the credentials a URL in it can carry: the message is logged
+    /// and reported by `/v1/models`.
     #[snafu(display(
-        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
+        "An unsupported model source was specified in the 'from' parameter: '{}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models",
+        redact::redact_message_credentials(from)
     ))]
     UnknownModelSource { from: String },
 
@@ -652,6 +655,20 @@ mod tests {
 
     use super::{ApiErrorKind, Chat, Error, Result, SqlGeneration, message_to_content};
     use async_openai::error::ApiError;
+
+    /// The message is logged and reported by `/v1/models`, so a credential in the URL a
+    /// model's `from` names stays out of it, and the rest of the source stays in.
+    #[test]
+    fn unknown_model_source_message_leaves_out_url_credentials() {
+        let error = Error::UnknownModelSource {
+            from: "https://alice:hunter2@models.example.com/v1?api_key=abc123&region=us"
+                .to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "An unsupported model source was specified in the 'from' parameter: 'https://models.example.com/v1?api_key=***&region=us'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
+        );
+    }
 
     #[test]
     fn each_error_type_reads_back_as_its_kind() {
