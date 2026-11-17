@@ -66,7 +66,7 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
-use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+use runtime_acceleration::dataupdate::{DataUpdatePublisher, StreamingDataUpdate, UpdateType};
 use runtime_acceleration::{SnapshotPoll, SnapshotPollOutcome};
 use runtime_component::dataset::TimeFormat;
 use runtime_component::dataset::acceleration::RefreshMode;
@@ -117,6 +117,7 @@ pub mod changes;
 #[cfg(test)]
 mod deletion;
 mod latest_by_time;
+mod published_append;
 mod slow_refresh;
 
 /// The largest UTC offset a time may carry (+14:00), in nanoseconds.
@@ -287,6 +288,9 @@ pub struct RefreshTaskBuilder {
     /// Where an append refresh keeps the source snapshot it last loaded; `None` for a
     /// refresh that never follows snapshots.
     append_cursor_store: Option<AppendCursorStore>,
+    /// Forwards committed append refreshes to the dataset's `DoExchange`
+    /// subscribers.
+    data_update_publisher: Option<DataUpdatePublisher>,
 }
 
 impl RefreshTaskBuilder {
@@ -327,7 +331,19 @@ impl RefreshTaskBuilder {
                 std::collections::HashMap::new(),
             )),
             append_cursor_store: None,
+            data_update_publisher: None,
         }
+    }
+
+    /// Forward each committed append refresh to the dataset's `DoExchange`
+    /// subscribers, so an append stream sees refresh-driven appends.
+    #[must_use]
+    pub fn with_data_update_publisher(
+        mut self,
+        publisher: Option<DataUpdatePublisher>,
+    ) -> RefreshTaskBuilder {
+        self.data_update_publisher = publisher;
+        self
     }
 
     #[must_use]
@@ -545,6 +561,7 @@ impl RefreshTaskBuilder {
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
             append_cursor_store: self.append_cursor_store,
+            data_update_publisher: self.data_update_publisher,
             last_append_fallback: parking_lot::Mutex::new(None),
             session_state,
         }
@@ -638,6 +655,9 @@ pub struct RefreshTask {
     in_flight_revalidations: super::caching::InFlightRevalidations,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
+    /// Forwards committed append refreshes to the dataset's `DoExchange`
+    /// subscribers.
+    data_update_publisher: Option<DataUpdatePublisher>,
     /// The reason the last append refresh read by time instead of following its
     /// source's commits, so the warning repeats only when the reason changes.
     last_append_fallback: parking_lot::Mutex<Option<&'static str>>,
@@ -1239,6 +1259,11 @@ impl RefreshTask {
         // holding it, and every refresh queued behind it, for ever.
         let source =
             super::source_stall::with_stall_timeout(data_update.data, dataset_name.to_string());
+        let published_append = self.published_append_for(&data_update.update_type).await;
+        let source = match &published_append {
+            Some(published) => published.keep(source),
+            None => source,
+        };
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
@@ -1407,6 +1432,11 @@ impl RefreshTask {
 
         let num_rows = refresh_stat.as_ref().map_or(0, |s| s.num_rows);
 
+        // The rows are committed: forward them to the dataset's append-stream
+        // subscribers.
+        self.publish_written_append(&data_update.update_type, published_append, schema, num_rows)
+            .await;
+
         if let Some(error) = retention_error {
             self.maybe_update_last_updated_at(&data_update.update_type, num_rows);
 
@@ -1435,6 +1465,75 @@ impl RefreshTask {
         self.maybe_update_last_updated_at(&data_update.update_type, num_rows);
 
         Ok(())
+    }
+
+    /// Whether a write of `update_type` is forwarded to append-stream
+    /// subscribers: an append to an acceleration without a primary key or
+    /// unique constraint. With one, the accelerator's conflict handling can
+    /// drop or replace input rows, so the rows the refresh read are not
+    /// necessarily the rows it committed, and forwarding them could tell a
+    /// subscriber about values the dataset never held.
+    fn forwards_appends(&self, update_type: &UpdateType) -> bool {
+        *update_type == UpdateType::Append
+            && self
+                .accelerator
+                .constraints()
+                .is_none_or(|constraints| constraints.is_empty())
+    }
+
+    /// Keeps the rows of an append write for the dataset's `DoExchange`
+    /// subscribers, when it has any. `None` when nothing is to be forwarded.
+    async fn published_append_for(
+        &self,
+        update_type: &UpdateType,
+    ) -> Option<published_append::PublishedAppend> {
+        if !self.forwards_appends(update_type) {
+            return None;
+        }
+        let publisher = self.data_update_publisher.as_ref()?;
+        publisher
+            .has_subscribers()
+            .await
+            .then(published_append::PublishedAppend::new)
+    }
+
+    /// Sends a committed append write to the dataset's `DoExchange` subscribers.
+    async fn publish_written_append(
+        &self,
+        update_type: &UpdateType,
+        published_append: Option<published_append::PublishedAppend>,
+        schema: SchemaRef,
+        rows_written: usize,
+    ) {
+        if !self.forwards_appends(update_type) {
+            return;
+        }
+        let Some(publisher) = self.data_update_publisher.as_ref() else {
+            return;
+        };
+        match published_append {
+            Some(kept_rows) => {
+                published_append::publish_committed_append(
+                    publisher,
+                    &self.dataset_name,
+                    schema,
+                    kept_rows.take(),
+                )
+                .await;
+            }
+            // The rows were not kept because no one was subscribed when the
+            // write started. One who subscribed while it ran read its snapshot
+            // before the rows committed, so it would miss them for good: end its
+            // subscription, so it resubscribes from a snapshot that has them.
+            None => {
+                if rows_written > 0 && publisher.close_subscribers().await {
+                    tracing::info!(
+                        "Dataset {}: an append-stream subscriber joined while an append refresh was writing {rows_written} row(s), so its subscription was ended for it to resubscribe from a fresh snapshot.",
+                        self.dataset_name
+                    );
+                }
+            }
+        }
     }
 
     /// Builds the data update for this refresh — a full snapshot, or the
@@ -4251,7 +4350,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use opentelemetry::KeyValue;
     use prometheus::proto::MetricType;
-    use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+    use runtime_acceleration::dataupdate::{DataUpdatePublisher, StreamingDataUpdate, UpdateType};
     use runtime_metrics::acceleration as metrics;
     use spice_table::IndexLayer;
     use std::sync::Arc;
@@ -5395,6 +5494,238 @@ mod tests {
             "{counted}"
         );
         assert_eq!(started.elapsed(), timeout, "fails at the stall timeout");
+    }
+
+    /// A task over an empty `MemTable` accelerator that forwards its appends to
+    /// `broadcaster`'s subscribers of `table`.
+    fn publishing_task(
+        schema: &SchemaRef,
+        table: &TableReference,
+        broadcaster: &runtime_acceleration::dataupdate::DataUpdateBroadcaster,
+    ) -> RefreshTask {
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(schema), vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(schema), vec![vec![]])
+                .expect("federated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            table.clone(),
+            Arc::new(FederatedTable::new_unchecked(federated_table)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .with_data_update_publisher(Some(DataUpdatePublisher::new(
+            broadcaster.clone(),
+            table.clone(),
+        )))
+        .build()
+    }
+
+    fn id_update(
+        schema: &SchemaRef,
+        ids: Vec<i32>,
+        update_type: UpdateType,
+    ) -> StreamingDataUpdate {
+        let batch = RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int32Array::from(ids))])
+            .expect("update batch should be created");
+        let stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![batch], Arc::clone(schema), None)
+                .expect("update stream should be created"),
+        );
+        StreamingDataUpdate::new(stream, update_type)
+    }
+
+    /// An append refresh forwards the rows it committed to the dataset's
+    /// `DoExchange` subscribers. Without it an append stream from an
+    /// accelerated `refresh_mode: append` dataset delivers its initial snapshot
+    /// and then nothing.
+    #[tokio::test]
+    async fn an_append_refresh_reaches_append_stream_subscribers() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = TableReference::bare("events");
+        let broadcaster = runtime_acceleration::dataupdate::DataUpdateBroadcaster::new();
+        let mut subscriber = broadcaster.subscribe(&table).await;
+        let task = publishing_task(&schema, &table, &broadcaster);
+
+        task.write_streaming_data_update(
+            None,
+            id_update(&schema, vec![1001, 1002, 1003], UpdateType::Append),
+            None,
+            None,
+        )
+        .await
+        .expect("append refresh should write");
+
+        let update = tokio::time::timeout(Duration::from_secs(5), subscriber.recv())
+            .await
+            .expect("the subscriber should receive the append")
+            .expect("an update");
+        assert_eq!(update.update_type, UpdateType::Append);
+        let ids: Vec<i32> = update
+            .data
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("ids")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![1001, 1002, 1003]);
+    }
+
+    /// A subscriber that joins while an append refresh writes read its snapshot
+    /// before the rows committed and was not there to have them kept, so it
+    /// would miss them for good. Its subscription is ended instead, for it to
+    /// resubscribe from a snapshot that has them.
+    #[tokio::test]
+    async fn a_subscriber_joining_mid_append_is_sent_to_resubscribe() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = TableReference::bare("events");
+        let broadcaster = runtime_acceleration::dataupdate::DataUpdateBroadcaster::new();
+        let task = publishing_task(&schema, &table, &broadcaster);
+
+        let (send_subscriber, mut take_subscriber) = tokio::sync::oneshot::channel();
+        let join_broadcaster = broadcaster.clone();
+        let join_table = table.clone();
+        let batch_schema = Arc::clone(&schema);
+        let source = futures::stream::once(async move {
+            // The subscriber joins once the write has started reading rows.
+            let receiver = join_broadcaster.subscribe(&join_table).await;
+            let _ = send_subscriber.send(receiver);
+            RecordBatch::try_new(batch_schema, vec![Arc::new(Int32Array::from(vec![5, 6]))])
+                .map_err(DataFusionError::from)
+        });
+        let source: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), source));
+
+        task.write_streaming_data_update(
+            None,
+            StreamingDataUpdate::new(source, UpdateType::Append),
+            None,
+            None,
+        )
+        .await
+        .expect("append refresh should write");
+
+        let mut subscriber = take_subscriber
+            .try_recv()
+            .expect("the subscriber joined mid-write");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), subscriber.recv())
+                .await
+                .expect("the subscription should end"),
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
+    }
+
+    /// An acceleration with a primary key resolves conflicts as it writes, so
+    /// the rows a refresh read may not be the rows it committed. They are not
+    /// forwarded.
+    #[tokio::test]
+    async fn appends_to_a_keyed_acceleration_are_not_forwarded() {
+        use datafusion::common::{Constraint, Constraints};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = TableReference::bare("events");
+        let broadcaster = runtime_acceleration::dataupdate::DataUpdateBroadcaster::new();
+        let mut subscriber = broadcaster.subscribe(&table).await;
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("accelerator mem table should be created")
+                .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![0],
+                )]))
+                .await
+                .expect("primary key should apply"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("federated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            table.clone(),
+            Arc::new(FederatedTable::new_unchecked(federated_table)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .with_data_update_publisher(Some(DataUpdatePublisher::new(
+            broadcaster.clone(),
+            table.clone(),
+        )))
+        .build();
+
+        task.write_streaming_data_update(
+            None,
+            id_update(&schema, vec![1, 2], UpdateType::Append),
+            None,
+            None,
+        )
+        .await
+        .expect("append refresh should write");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), subscriber.recv())
+                .await
+                .is_err(),
+            "nothing was forwarded and the subscription stays open"
+        );
+    }
+
+    /// A full refresh is not forwarded as an append, and a failed write
+    /// forwards nothing.
+    #[tokio::test]
+    async fn only_committed_appends_reach_append_stream_subscribers() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = TableReference::bare("events");
+        let broadcaster = runtime_acceleration::dataupdate::DataUpdateBroadcaster::new();
+        let mut subscriber = broadcaster.subscribe(&table).await;
+        let task = publishing_task(&schema, &table, &broadcaster);
+
+        task.write_streaming_data_update(
+            None,
+            id_update(&schema, vec![1], UpdateType::Overwrite),
+            None,
+            None,
+        )
+        .await
+        .expect("full refresh should write");
+
+        let failing = futures::stream::iter(vec![Err(DataFusionError::Execution(
+            "source failed".to_string(),
+        ))]);
+        let failing: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), failing));
+        assert!(
+            task.write_streaming_data_update(
+                None,
+                StreamingDataUpdate::new(failing, UpdateType::Append),
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "a failing source fails the append"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), subscriber.recv())
+                .await
+                .is_err(),
+            "nothing was forwarded"
+        );
     }
 
     #[tokio::test]
