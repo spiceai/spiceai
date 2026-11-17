@@ -232,14 +232,12 @@ impl ClusterPkiBundle {
                 )
             })
         };
-        tokio::time::timeout(timeout, observe)
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("no TLS handshake with {host}:{port} within {timeout:?}"),
-                )
-            })?
+        tokio::time::timeout(timeout, observe).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no TLS handshake with {host}:{port} within {timeout:?}"),
+            )
+        })?
     }
 
     /// Fingerprint of the currently-loaded bundle, for tests.

@@ -194,9 +194,7 @@ pub fn certificate_names_host(leaf: &CertificateDer<'_>, host: &str) -> bool {
 /// `host:port`: what a TLS client verifies the server's certificate against.
 #[must_use]
 pub fn address_host(address: &str) -> Option<&str> {
-    let authority = address
-        .split_once("://")
-        .map_or(address, |(_, rest)| rest);
+    let authority = address.split_once("://").map_or(address, |(_, rest)| rest);
     let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
     let authority = authority
         .rsplit_once('@')
@@ -379,7 +377,12 @@ mod tests {
         let ca = TestCa::new("cluster CA");
         let certificate = ca.issue(
             "executor-1",
-            &["executor-1.cluster.local", "*.pods.cluster.local", "10.0.0.5", "::1"],
+            &[
+                "executor-1.cluster.local",
+                "*.pods.cluster.local",
+                "10.0.0.5",
+                "::1",
+            ],
         );
         for host in [
             "executor-1.cluster.local",
@@ -406,7 +409,10 @@ mod tests {
     #[test]
     fn address_host_is_what_tls_verifies() {
         for (address, host) in [
-            ("https://scheduler.cluster.local:50052", Some("scheduler.cluster.local")),
+            (
+                "https://scheduler.cluster.local:50052",
+                Some("scheduler.cluster.local"),
+            ),
             ("http://10.0.0.5:50052", Some("10.0.0.5")),
             ("10.0.0.5:50052", Some("10.0.0.5")),
             ("scheduler", Some("scheduler")),
@@ -430,7 +436,10 @@ mod tests {
 
         let schedulers = SchedulerIdentities::new();
         assert!(schedulers.is_empty());
-        let both = vec!["https://s1:50052".to_string(), "https://s2:50052".to_string()];
+        let both = vec![
+            "https://s1:50052".to_string(),
+            "https://s2:50052".to_string(),
+        ];
         schedulers.record(
             &both,
             vec![

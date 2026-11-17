@@ -45,7 +45,9 @@ use super::harness::ClusterHarness;
 /// A TLS channel to the scheduler's cluster port, presenting the certificate the
 /// harness PKI issues for `node_name` — a node identity of the test's choosing.
 async fn channel_as(harness: &ClusterHarness, node_name: &str) -> Channel {
-    let pki = harness.cluster_pki().expect("harness runs with cluster mTLS");
+    let pki = harness
+        .cluster_pki()
+        .expect("harness runs with cluster mTLS");
     let cert = pki
         .create_client_cert(node_name)
         .expect("issue a node certificate");

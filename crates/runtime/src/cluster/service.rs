@@ -73,6 +73,7 @@ use tonic::{
     transport::{ClientTlsConfig, Endpoint},
 };
 
+use crate::cluster::peer::{Advertised, authorize_executor_claim, registered_elsewhere_message};
 use crate::cluster::{
     ExecutorRegistry, TablePartitions,
     {SchedulerPeers, partition::partition_value_to_bytes},
@@ -80,7 +81,6 @@ use crate::cluster::{
 use crate::datafusion::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
 };
-use crate::cluster::peer::{Advertised, authorize_executor_claim, registered_elsewhere_message};
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 use runtime_cluster::peer::PeerCertificate;
 use runtime_cluster::{ExecutorRegistration, Registered};

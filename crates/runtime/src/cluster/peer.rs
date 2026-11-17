@@ -299,9 +299,9 @@ mod tests {
         params
             .distinguished_name
             .push(DnType::CommonName, common_name);
-        params
-            .subject_alt_names
-            .push(SanType::DnsName("node.cluster.local".try_into().expect("DNS name")));
+        params.subject_alt_names.push(SanType::DnsName(
+            "node.cluster.local".try_into().expect("DNS name"),
+        ));
         let key = KeyPair::generate().expect("key");
         let certificate = params.self_signed(&key).expect("certificate");
         PeerIdentity::from_certificate(certificate.der()).expect("identity")
