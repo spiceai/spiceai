@@ -140,6 +140,9 @@ unsafe impl Send for Context<'_> {}
 
 impl Context<'_> {
     pub(crate) fn from_raw(raw: NonNull<sys::llama_context>) -> Self {
+        // What llama.cpp reported while creating a context it then created is no reason for
+        // one of the context's decodes to fail.
+        crate::log::clear_last_error();
         Self {
             raw,
             _model: PhantomData,
@@ -179,24 +182,31 @@ impl Context<'_> {
     }
 
     /// Decodes `batch`, computing the logits of the tokens it marks for output.
+    ///
+    /// A failed decode's reason ends with the errors llama.cpp logged on this thread since the
+    /// last decode that succeeded. A GPU backend computes asynchronously and reports a failed
+    /// command buffer when the thread next waits for it, such as reading the last decode's
+    /// logits, so the lines that name why a decode returned -3 are logged before that decode
+    /// starts, not during it.
     pub fn decode(&mut self, batch: &Batch) -> Result<()> {
         // SAFETY: the batch's arrays hold `n_tokens` entries; llama.cpp copies what it keeps.
         let status = unsafe { sys::llama_decode(self.raw.as_ptr(), batch.raw) };
-        match status {
-            0 => Ok(()),
-            1 => Err(Error::Decode {
-                reason: "the context has no room left for the batch".to_string(),
-            }),
-            2 => Err(Error::Decode {
-                reason: "decoding was aborted".to_string(),
-            }),
-            -1 => Err(Error::Decode {
-                reason: "the batch is invalid".to_string(),
-            }),
-            status => Err(Error::Decode {
-                reason: format!("llama.cpp returned {status}"),
-            }),
-        }
+        let what = match status {
+            0 => {
+                crate::log::clear_last_error();
+                return Ok(());
+            }
+            1 => "the context has no room left for the batch".to_string(),
+            2 => "decoding was aborted".to_string(),
+            -1 => "the batch is invalid".to_string(),
+            status => format!("llama.cpp returned {status}"),
+        };
+        Err(Error::Decode {
+            reason: match crate::log::reported_errors() {
+                Some(reported) => format!("{what}: {reported}"),
+                None => what,
+            },
+        })
     }
 
     /// The logits of output row `index` of the last decoded batch, one per token of the
