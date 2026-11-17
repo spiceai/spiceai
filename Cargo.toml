@@ -41,6 +41,7 @@ members = [
     "crates/flight_client",
     "crates/repl",
     "crates/result-compare",
+    "crates/redact",
     "crates/google-genai",
     "crates/hash-index",
     "crates/huggingface-hub",

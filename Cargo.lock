@@ -16790,6 +16790,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
+name = "redact"
+version = "2.5.0-unstable"
+dependencies = [
+ "percent-encoding",
+]
+
+[[package]]
 name = "redis"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17730,6 +17737,7 @@ dependencies = [
  "rayon",
  "rcgen",
  "rdkafka",
+ "redact",
  "regex",
  "repl",
  "reqwest 0.13.4",
