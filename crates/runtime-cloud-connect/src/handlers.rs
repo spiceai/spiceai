@@ -809,7 +809,10 @@ mod tests {
 
     #[test]
     fn noop_runtime_handle_advertises_nothing() {
-        assert!(advertised_capabilities(&NoopRuntimeHandle).is_empty());
+        assert_eq!(
+            advertised_capabilities(&NoopRuntimeHandle),
+            [] as [String; 0]
+        );
     }
 
     #[test]

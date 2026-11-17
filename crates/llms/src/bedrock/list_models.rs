@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn test_known_models_not_empty() {
         let models = BedrockModelLister::known_models();
-        assert!(!models.is_empty());
+        assert_ne!(models, [] as [String; 0]);
         assert!(models.iter().any(|m| m.contains("claude")));
         assert!(models.iter().any(|m| m.contains("titan")));
         assert!(models.iter().any(|m| m.contains("llama")));

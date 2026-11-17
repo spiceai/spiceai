@@ -193,7 +193,6 @@ fn parse_arrow_schema() {
 }
 
 #[test]
-#[expect(clippy::float_cmp)]
 fn parse_values() {
     let change_event_json = include_str!("./all_types.json");
 

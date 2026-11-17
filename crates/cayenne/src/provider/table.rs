@@ -5136,7 +5136,7 @@ const fn coalesced_task_state_after_signal(state: u8) -> Option<u8> {
 /// running and so owns the task it must now spawn; otherwise the signal was
 /// recorded on the task already running.
 fn coalesced_task_try_claim(state: &AtomicU8) -> bool {
-    state.fetch_update(
+    state.try_update(
         Ordering::AcqRel,
         Ordering::Acquire,
         coalesced_task_state_after_signal,
@@ -8422,7 +8422,7 @@ impl CayenneTableProvider {
         // the table's state alive while it does.
         if self
             .snapshot_cleanup_rearms_left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 (left > 0).then(|| left - 1)
             })
             .is_err()
@@ -16190,7 +16190,7 @@ impl CayenneTableProvider {
         if after == before {
             return;
         }
-        let _ = accounted_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+        let _ = accounted_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
             Some(if after > before {
                 held.saturating_add(after - before)
             } else {
@@ -20065,7 +20065,7 @@ impl CayenneTableProvider {
     fn adjust_cached_inlined_row_count(&self, delta: i64) {
         let _ =
             self.inlined_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(if delta >= 0 {
                         current.saturating_add(delta)
                     } else {
@@ -20493,7 +20493,7 @@ impl CayenneTableProvider {
         // observes the new generation (`Acquire`) also observes the updated
         // count; a reader racing ahead of the bump may still see 0, which is
         // exactly the pre-publish state its watermark capture hides anyway.
-        let _ = self.durable_inlined_row_count.fetch_update(
+        let _ = self.durable_inlined_row_count.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_add(durable_delta)),
@@ -24182,7 +24182,7 @@ impl CayenneTableProvider {
             return;
         }
         let keep = trigger_files.saturating_sub(1);
-        let _ = self.new_files_since_last_compaction.fetch_update(
+        let _ = self.new_files_since_last_compaction.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |credits| {
@@ -39975,7 +39975,7 @@ impl CayenneTableProvider {
         // `saturating_sub`); clamped at `i64::MAX` it only ever over-nets, keeping
         // the maintained count Inexact-and-conservative rather than inflated.
         let superseded_delta = i64::try_from(superseded).unwrap_or(i64::MAX);
-        let _ = self.mem_tier_pending_superseded.fetch_update(
+        let _ = self.mem_tier_pending_superseded.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_add(superseded_delta)),
@@ -49832,7 +49832,7 @@ mod tests {
             t0 + grace * 2,
             grace,
         );
-        assert!(del.is_empty());
+        assert_eq!(del, [] as [String; 0]);
         assert!(!first_seen.contains_key(&f), "re-referenced entry pruned");
 
         // Re-mark, then it disappears from the store entirely → pruned.
@@ -49846,7 +49846,7 @@ mod tests {
         assert!(first_seen.contains_key(&f));
         let del =
             CayenneTableProvider::plan_cold_gc_deletions(&[], &empty, &mut first_seen, t0, grace);
-        assert!(del.is_empty());
+        assert_eq!(del, [] as [String; 0]);
         assert!(first_seen.is_empty(), "gone-from-store entry pruned");
     }
 
@@ -77086,12 +77086,12 @@ mod tests {
             .durable_inlined_row_count
             .store(0, Ordering::Relaxed);
         provider.bump_inlined_structural_epoch();
-        assert!(
+        assert_eq!(
             provider
                 .read_inlined_batches()
                 .await
-                .expect("fast path applies again once the signal is 0")
-                .is_empty()
+                .expect("fast path applies again once the signal is 0"),
+            [] as [RecordBatch; 0]
         );
 
         // Un-poison and verify the table still scans end-to-end.

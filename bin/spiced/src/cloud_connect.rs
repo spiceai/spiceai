@@ -3530,7 +3530,7 @@ datasets:
         };
         assert_eq!(alone.restart_required(), vec!["secrets".to_string()]);
 
-        assert!(Pending::default().restart_required().is_empty());
+        assert_eq!(Pending::default().restart_required(), [] as [String; 0]);
     }
 
     // ----------------------------------------------------------------------
@@ -3667,7 +3667,7 @@ views:
         handle.clear_cloud_delivered_secrets().await;
 
         assert!(handle.delivered_secrets.is_empty());
-        assert!(handle.delivered_secrets.names().is_empty());
+        assert_eq!(handle.delivered_secrets.names(), [] as [String; 0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3989,7 +3989,7 @@ views:
         );
         assert_eq!(persisted_spicepod(&dir), SERVING_PLUS_VIEW);
         assert_eq!(handle.desired.read().as_deref(), Some(SERVING_PLUS_VIEW));
-        assert!(handle.pending.read().restart_required().is_empty());
+        assert_eq!(handle.pending.read().restart_required(), [] as [String; 0]);
         assert!(
             !handle.runtime.status().is_shutdown(),
             "no deployment may drain the runtime"
@@ -4070,7 +4070,7 @@ views:
             .expect("reverting the pending section applies");
         assert_eq!(document["restart_required"], serde_json::json!([]));
         assert_eq!(document["live"], serde_json::json!(true));
-        assert!(handle.pending.read().restart_required().is_empty());
+        assert_eq!(handle.pending.read().restart_required(), [] as [String; 0]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4276,7 +4276,7 @@ tools:
 
         assert_eq!(persisted_spicepod(&dir), SERVING);
         assert_eq!(handle.desired.read().as_deref(), Some(SERVING));
-        assert!(handle.pending.read().restart_required().is_empty());
+        assert_eq!(handle.pending.read().restart_required(), [] as [String; 0]);
         assert_eq!(live_view_names(&handle).await, vec!["served_view"]);
         assert_eq!(
             query_rows(&handle.runtime, "SELECT n FROM served_view").await,

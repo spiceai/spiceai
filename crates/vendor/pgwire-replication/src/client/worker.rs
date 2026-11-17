@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn parse_sasl_mechanisms_empty() {
         let mechs = parse_sasl_mechanisms(b"\0");
-        assert!(mechs.is_empty());
+        assert_eq!(mechs, [] as [String; 0]);
     }
 
     #[test]

@@ -511,7 +511,7 @@ mod tests {
 
         let (_, sk, others) = result.expect("should match");
         assert!(sk.is_none());
-        assert!(others.is_empty());
+        assert_eq!(others, [] as [Expr; 0]);
     }
 
     #[test]
@@ -687,7 +687,7 @@ mod tests {
         let (pk, sk, others) = result.expect("should match");
         assert!(matches!(pk, Expr::BinaryExpr(_)));
         assert!(sk.is_some());
-        assert!(others.is_empty());
+        assert_eq!(others, [] as [Expr; 0]);
     }
 
     #[test]
@@ -704,7 +704,7 @@ mod tests {
         let (pk, sk, others) = result.expect("should match");
         assert!(matches!(pk, Expr::BinaryExpr(_)));
         assert!(sk.is_some());
-        assert!(others.is_empty());
+        assert_eq!(others, [] as [Expr; 0]);
     }
 
     #[test]

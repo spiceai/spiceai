@@ -404,7 +404,7 @@ fn release_outstanding_live_rows_deltas(outstanding: &AtomicU64, count: u64) {
     if count == 0 {
         return;
     }
-    let _ = outstanding.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+    let _ = outstanding.try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
         Some(remaining.saturating_sub(count))
     });
 }
