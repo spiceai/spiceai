@@ -248,7 +248,9 @@ runs:
         # Make re-parses these variables (CARGO_TARGET_DIR is also pasted unquoted into
         # a recipe), so `$(...)` or `;` in them would still run; accept only a cargo
         # feature list and a plain path.
-        if [[ ! "${INPUT_FEATURES}" =~ ^[A-Za-z0-9_/,\ -]*$ ]]; then
+        # No whitespace (the Makefile splits on it, so a second word would become a
+        # separate cargo argument) and no leading `-` (it would read as an option).
+        if [[ ! "${INPUT_FEATURES}" =~ ^([A-Za-z0-9_][A-Za-z0-9_/,-]*)?$ ]]; then
           echo "::error::build-spiced: features must be a comma-separated cargo feature list"
           exit 1
         fi
