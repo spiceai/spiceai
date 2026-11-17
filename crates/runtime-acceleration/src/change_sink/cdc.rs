@@ -190,17 +190,7 @@ fn primary_key_lists_are_uniform(change_batch: &ChangeBatch) -> bool {
     let Some(names) = keys.values().as_any().downcast_ref::<StringArray>() else {
         return false;
     };
-    if names.null_count() > 0 {
-        return false;
-    }
-    // A null key list is a row without keys, the same as an empty one, when it
-    // spans no names: `ChangeBatch::primary_keys` and `has_primary_keys` read it
-    // as empty. A keyless producer (a `DoExchange` subscription of a table with
-    // no primary key) sends every row that way, and treating it as nonuniform
-    // would write each row on its own.
-    if keys.null_count() > 0
-        && (0..keys.len()).any(|row| keys.is_null(row) && keys.value_length(row) != 0)
-    {
+    if keys.null_count() > 0 || names.null_count() > 0 {
         return false;
     }
     let offsets = keys.value_offsets();
