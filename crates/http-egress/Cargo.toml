@@ -1,0 +1,29 @@
+[package]
+autotests = false
+name = "http-egress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "One egress policy for outbound HTTP clients: guarded DNS resolution, and redirects that never carry a request's credentials off its origin"
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+reqwest.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["net"] }
+url.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true

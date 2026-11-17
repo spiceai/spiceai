@@ -6398,6 +6398,7 @@ dependencies = [
  "hash-index",
  "http 1.4.1",
  "http-body-limit",
+ "http-egress",
  "httpdate",
  "iceberg",
  "iceberg-catalog-rest",
@@ -10176,6 +10177,19 @@ dependencies = [
  "http 1.4.1",
  "http-body 1.0.1",
  "pin-project-lite",
+]
+
+[[package]]
+name = "http-egress"
+version = "2.5.0-unstable"
+dependencies = [
+ "axum",
+ "bytes",
+ "http 1.4.1",
+ "reqwest 0.13.4",
+ "snafu",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -14047,12 +14061,12 @@ dependencies = [
  "axum",
  "bytes",
  "http-body 1.0.1",
+ "http-egress",
  "humantime",
  "object_store 0.13.2",
  "reqwest 0.12.24",
  "snafu",
  "tokio",
- "url",
 ]
 
 [[package]]
@@ -17681,6 +17695,7 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-limit",
  "http-body-util",
+ "http-egress",
  "hyper 1.10.1",
  "hyper-util",
  "iceberg",

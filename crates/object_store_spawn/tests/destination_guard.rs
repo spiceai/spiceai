@@ -270,6 +270,37 @@ async fn redirects_only_guard_refuses_a_redirect_to_another_host() {
     assert_eq!(origin_hits.load(Ordering::SeqCst), 1);
 }
 
+/// A redirect to another port on the store's own host is a new destination. A guard that
+/// trusts the store's own host still refuses it when that host answered with a blocked
+/// address, so a redirect cannot open another service on an internal host.
+#[tokio::test]
+async fn redirects_only_guard_refuses_another_port_on_its_own_internal_host() {
+    let (target_port, target_hits) = target().await;
+    let location = format!("http://localhost:{target_port}/data.csv");
+    let (origin_port, origin_hits) = redirecting_origin(location.clone()).await;
+
+    let guard = DestinationGuard::new(
+        |address| address.is_loopback(),
+        |_| false,
+        "loopback is blocked",
+    )
+    .redirects_only();
+    let connector = SpawnedReqwestConnector::new(Handle::current()).with_destination_guard(guard);
+    let message = get(&store_on("localhost", origin_port, connector))
+        .await
+        .expect_err("the redirect to another port is refused")
+        .to_string();
+
+    assert!(
+        message.contains(&format!(
+            "Refused to connect to {location}: loopback is blocked"
+        )),
+        "unexpected error: {message}"
+    );
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(origin_hits.load(Ordering::SeqCst), 1);
+}
+
 /// The redirect names another host that resolves to a blocked address, which only the
 /// resolver can see.
 #[tokio::test]

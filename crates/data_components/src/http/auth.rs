@@ -91,6 +91,15 @@ pub enum Error {
     #[snafu(display("OAuth2 token request to {url} failed: {source}"))]
     TokenRequest { url: String, source: reqwest::Error },
 
+    #[snafu(display(
+        "OAuth2 token request to {url} failed: {source}. Set `auth_token_url` to the URL the \
+         token endpoint redirects to. See: https://spiceai.org/docs/components/data-connectors/https"
+    ))]
+    TokenRedirectRefused {
+        url: String,
+        source: http_egress::RedirectRefused,
+    },
+
     #[snafu(display("OAuth2 token endpoint {url} returned HTTP {status}: {body}"))]
     TokenEndpointStatus {
         url: String,
@@ -261,6 +270,9 @@ pub struct OAuth2Config {
     pub scopes: Option<String>,
     pub client_auth: ClientAuthMethod,
     pub header: TokenHeader,
+    /// The egress policy token requests are resolved and redirected under; see
+    /// [`http_egress::Egress`].
+    pub egress: http_egress::Egress,
 }
 
 /// Authenticator that applies an `OAuth2` access token to every outgoing
@@ -292,7 +304,7 @@ impl OAuth2Auth {
     pub async fn try_new(config: OAuth2Config, grant: OAuthGrant) -> Result<Self> {
         validate_token_url(&config.token_url)?;
 
-        let client = build_token_client()?;
+        let client = build_token_client(&config.egress)?;
 
         let initial = exchange_token(&client, &config, &grant).await?;
 
@@ -435,11 +447,24 @@ fn validate_token_url(url: &str) -> Result<()> {
     }
 }
 
-fn build_token_client() -> Result<Client> {
+fn build_token_client(egress: &http_egress::Egress) -> Result<Client> {
     // Token responses are read through `http_body_limit`, which decodes them while
     // refusing decompression amplification.
+    //
+    // A token request carries the refresh token or the client secret in its body, and a
+    // `307`/`308` resends that body wherever `Location` points, so the client follows a
+    // redirect only within the token endpoint's origin and never to plaintext HTTP. Its
+    // lookups go through the same egress state, so the endpoint's host cannot later resolve
+    // to an internal address once it first resolved to a public one.
     http_body_limit::decode_manually(configure_client_builder(ClientBuilder::new()))
         .user_agent(util::spiceai_user_agent())
+        .redirect(http_egress::redirect_policy(
+            egress.clone(),
+            http_egress::OnOriginChange::Refuse,
+        ))
+        .dns_resolver(std::sync::Arc::new(http_egress::Resolver::new(
+            egress.clone(),
+        )))
         .build()
         .context(BuildClientSnafu)
 }
@@ -471,10 +496,7 @@ async fn exchange_token(
         build_token_request(client, config, grant)
     })
     .await
-    .map_err(|e| Error::TokenRequest {
-        url: config.token_url.clone(),
-        source: e,
-    })?;
+    .map_err(|e| token_request_error(&config.token_url, e))?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -508,6 +530,27 @@ async fn exchange_token(
         refresh_token: raw.refresh_token.map(SecretString::from),
         expires_in: raw.expires_in,
     })
+}
+
+/// The error a failed token request becomes: a redirect the egress policy refused is named,
+/// since `reqwest`'s own message for it does not say why.
+fn token_request_error(url: &str, source: reqwest::Error) -> Error {
+    let refused = std::iter::successors(
+        Some(&source as &(dyn std::error::Error + 'static)),
+        |error| error.source(),
+    )
+    .find_map(|error| error.downcast_ref::<http_egress::RedirectRefused>())
+    .cloned();
+    match refused {
+        Some(refused) => Error::TokenRedirectRefused {
+            url: url.to_string(),
+            source: refused,
+        },
+        None => Error::TokenRequest {
+            url: url.to_string(),
+            source,
+        },
+    }
 }
 
 fn build_token_request(
@@ -694,6 +737,7 @@ mod tests {
             scopes: None,
             client_auth,
             header: TokenHeader::default(),
+            egress: http_egress::Egress::default(),
         }
     }
 
@@ -789,7 +833,8 @@ mod tests {
         }))])
         .await;
 
-        let client = build_token_client().expect("build token client");
+        let client =
+            build_token_client(&http_egress::Egress::default()).expect("build token client");
         let config = OAuth2Config {
             token_url: format!("{url}/oauth/token"),
             client_id: Some("my-client".to_string()),
@@ -797,6 +842,7 @@ mod tests {
             scopes: Some("read:data".to_string()),
             client_auth: ClientAuthMethod::Basic,
             header: TokenHeader::default(),
+            egress: http_egress::Egress::default(),
         };
 
         let resp = exchange_token(
@@ -848,7 +894,8 @@ mod tests {
         }))])
         .await;
 
-        let client = build_token_client().expect("build token client");
+        let client =
+            build_token_client(&http_egress::Egress::default()).expect("build token client");
         let config = OAuth2Config {
             token_url: format!("{url}/oauth/token"),
             client_id: Some("cid".to_string()),
@@ -856,6 +903,7 @@ mod tests {
             scopes: None,
             client_auth: ClientAuthMethod::Body,
             header: TokenHeader::default(),
+            egress: http_egress::Egress::default(),
         };
 
         exchange_token(
@@ -890,7 +938,8 @@ mod tests {
         }))])
         .await;
 
-        let client = build_token_client().expect("build token client");
+        let client =
+            build_token_client(&http_egress::Egress::default()).expect("build token client");
         let config = OAuth2Config {
             token_url: format!("{url}/admin/oauth/access_token"),
             client_id: Some("shopify-client".to_string()),
@@ -898,6 +947,7 @@ mod tests {
             scopes: None,
             client_auth: ClientAuthMethod::Body,
             header: TokenHeader::new("X-Shopify-Access-Token").expect("valid header config"),
+            egress: http_egress::Egress::default(),
         };
 
         let resp = exchange_token(&client, &config, &OAuthGrant::ClientCredentials)
@@ -930,7 +980,8 @@ mod tests {
         )])
         .await;
 
-        let client = build_token_client().expect("build token client");
+        let client =
+            build_token_client(&http_egress::Egress::default()).expect("build token client");
         let config = test_config(format!("{url}/oauth/token"), ClientAuthMethod::Basic);
 
         let err = exchange_token(
@@ -1000,6 +1051,7 @@ mod tests {
             scopes: None,
             client_auth: ClientAuthMethod::Body,
             header: TokenHeader::new("X-Shopify-Access-Token").expect("valid header config"),
+            egress: http_egress::Egress::default(),
         };
 
         let auth = OAuth2Auth::try_new(config, OAuthGrant::ClientCredentials)
@@ -1034,7 +1086,8 @@ mod tests {
         }))])
         .await;
 
-        let client = build_token_client().expect("build token client");
+        let client =
+            build_token_client(&http_egress::Egress::default()).expect("build token client");
         let config = test_config(format!("{url}/oauth/token"), ClientAuthMethod::Basic);
 
         let err = exchange_token(

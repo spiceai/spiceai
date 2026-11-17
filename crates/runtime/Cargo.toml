@@ -12,6 +12,7 @@ autotests = false
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
 http-body-limit = { path = "../http-body-limit" }
+http-egress = { path = "../http-egress" }
 podswatcher = { path = "../podswatcher" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 adbc_core = { workspace = true, optional = true }

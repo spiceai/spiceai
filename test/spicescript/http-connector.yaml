@@ -10,11 +10,16 @@ description: >
   until it is first queried (and fails then if they do not match); a
   json_object catch-all column; JSON nulls, missing keys, nested documents
   and arrays, federated and accelerated into Cayenne; the runtime's own
-  Server-Timing and trace-id headers; and its streamed vnd JSON and CSV SQL
-  answers, which keep every DECIMAL digit.
+  Server-Timing and trace-id headers; its streamed vnd JSON and CSV SQL
+  answers, which keep every DECIMAL digit; and redirects: one within the
+  dataset's origin keeps the dataset's headers, while one that changes the
+  origin (another port on the same host included) is refused before the
+  other origin is reached when it is internal, and an OAuth token request
+  never follows its endpoint to another origin.
 
 sources:
   api: { kind: mock-http }
+  elsewhere: { kind: mock-http }
 
 spicepod:
   version: v1
@@ -104,6 +109,26 @@ spicepod:
       columns:
         - { name: id, type: bigint }
         - { name: price, type: bigint }
+    - from: ${sources.api.url}/moved
+      name: moved
+      params:
+        file_format: json
+        allowed_request_paths: '/old,/away'
+        http_headers: 'X-Api-Key: k3y'
+        response_cache_max_size_bytes: '0'
+    - from: ${sources.api.url}/oauth-moved
+      name: token_moved
+      params:
+        file_format: json
+        allowed_request_paths: /items
+        auth_token_url: ${sources.api.url}/oauth/moved
+        auth_grant_type: client_credentials
+        http_auth_client_id: demo-id
+        http_auth_client_secret: demo-secret
+        auth_client_auth: body
+    - from: ${sources.api.url}/files/hop.csv
+      name: hop_csv
+      params: { file_format: csv }
     - from: ${sources.api.url}/files/items.csv
       name: items_deferred
       params: { file_format: csv }
@@ -224,6 +249,47 @@ steps:
           path: /files/items.csv
           headers: { content-type: text/csv }
           body: "id,name\n1,one\n2,two\n"
+        - |
+          path: /moved/old
+          status: 302
+          headers: { location: '${sources.api.url}/moved/new' }
+        - |
+          path: /moved/new
+          status: 401
+          body: missing key
+        - |
+          path: /moved/new
+          headers-match: { x-api-key: k3y }
+          headers: { content-type: application/json }
+          body: '[{"moved": "within the origin"}]'
+        - |
+          path: /moved/away
+          status: 302
+          headers: { location: '${sources.elsewhere.url}/landing' }
+        - |
+          path: /oauth/moved
+          method: POST
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/collect' }
+        - |
+          path: /files/hop.csv
+          status: 302
+          headers: { location: '${sources.elsewhere.url}/files/internal.csv' }
+  - source-exec:
+      elsewhere:
+        - |
+          path: /landing
+          headers: { content-type: application/json }
+          body: '[{"landed": true}]'
+        - |
+          path: /collect
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"access_token": "collected", "token_type": "Bearer", "expires_in": 3600}'
+        - |
+          path: /files/internal.csv
+          headers: { content-type: text/csv }
+          body: "id,secret\n1,internal\n"
   - start: { ready: false }
 
   # Declared columns: nothing is fetched until the dataset is queried.
@@ -274,6 +340,32 @@ steps:
     expect: { rows: [[POST, /oauth/token, 'grant_type=client_credentials&client_id=demo-id&client_secret=demo-secret']] }
   - source-query: { api: header /secure/items authorization }
     expect: { rows: [[Bearer t0k], [Bearer t0k]] }
+
+  # Redirects. One within the dataset's origin is followed, and keeps the
+  # dataset's headers.
+  - query: SELECT content FROM moved WHERE request_path = '/old'
+    expect: { rows: [['{"moved":"within the origin"}']] }
+  - source-query: { api: header /moved/new x-api-key }
+    expect: { rows: [[k3y]] }
+  # One to another origin on an internal address is refused before that
+  # origin is reached.
+  - query: SELECT content FROM moved WHERE request_path = '/away'
+    expect-error: does not follow a redirect to a private, loopback, or link-local address
+  - source-query: { elsewhere: count /landing }
+    expect: { rows: [['0']] }
+  # Another port on the dataset's own internal host is another origin, so a
+  # file dataset cannot be redirected to it.
+  - assert-status: { dataset: hop_csv, status: Error, message-contains: 'does not follow a redirect to a private, loopback, or link-local address' }
+    eventually: 30s
+  - source-query: { elsewhere: count /files/internal.csv }
+    expect: { rows: [['0']] }
+  # A token request carries the client secret in its body, and a 307 would
+  # resend that body: a token endpoint that redirects to another origin fails
+  # the dataset, and the other origin never receives the request.
+  - assert-status: { dataset: token_moved, status: Error, message-contains: 'Set `auth_token_url` to the URL the token endpoint redirects to' }
+    eventually: 30s
+  - source-query: { elsewhere: count /collect }
+    expect: { rows: [['0']] }
 
   # Two 503s, then an answer: retried, and three requests in all.
   - query: SELECT content FROM flaky WHERE request_path = '/data'

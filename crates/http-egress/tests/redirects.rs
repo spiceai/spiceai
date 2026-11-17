@@ -1,0 +1,357 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Redirects through real `reqwest` clients built with the egress policy, between local HTTP
+//! servers that record every request they receive. Two servers on one host and different ports
+//! are two origins.
+
+use std::sync::{Arc, Mutex};
+
+use axum::{
+    Router,
+    body::Bytes,
+    http::{HeaderMap, Method, StatusCode, Uri, header::LOCATION},
+    response::{IntoResponse, Response},
+};
+use http_egress::{DestinationGuard, Egress, OnOriginChange, configure, redirect_policy, send};
+use tokio::net::TcpListener;
+
+const API_KEY: &str = "x-api-key";
+const SECRET: &str = "s3cr3t";
+
+#[derive(Clone, Debug)]
+struct Seen {
+    method: Method,
+    path: String,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+/// A local server that records every request and answers it with `answer`.
+struct Server {
+    url: String,
+    seen: Arc<Mutex<Vec<Seen>>>,
+}
+
+impl Server {
+    async fn start(answer: impl Fn(&Seen) -> Response + Clone + Send + Sync + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("local address").port()
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let router = Router::new().fallback(
+            move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
+                let answer = answer.clone();
+                let log = Arc::clone(&log);
+                async move {
+                    let request = Seen {
+                        method,
+                        path: uri.path().to_string(),
+                        headers,
+                        body,
+                    };
+                    let response = answer(&request);
+                    log.lock().expect("request log").push(request);
+                    response
+                }
+            },
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Self { url, seen }
+    }
+
+    /// A server that answers every request with `body`.
+    async fn ok(body: &'static str) -> Self {
+        Self::start(move |_| body.into_response()).await
+    }
+
+    /// A server that answers every request with `status` and `Location: location`.
+    async fn redirecting(status: StatusCode, location: String) -> Self {
+        Self::start(move |_| (status, [(LOCATION, location.clone())]).into_response()).await
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().expect("request log").clone()
+    }
+}
+
+fn client(egress: &Egress) -> reqwest::Client {
+    configure(reqwest::Client::builder(), egress)
+        .build()
+        .expect("the client builds")
+}
+
+fn get_with_credentials(client: &reqwest::Client, url: &str) -> reqwest::Request {
+    client
+        .get(url)
+        .header(API_KEY, SECRET)
+        .header("authorization", format!("Bearer {SECRET}"))
+        .header("accept", "application/json")
+        .build()
+        .expect("the request builds")
+}
+
+/// The finding this guards: a custom credential header followed a redirect to another origin,
+/// because `reqwest` strips only the standard ones. The redirect is still followed, but the
+/// other origin sees none of the request's own headers, not even an `Accept`.
+#[tokio::test]
+async fn a_redirect_to_another_origin_carries_no_credential() {
+    let elsewhere = Server::ok("[]").await;
+    let origin = Server::redirecting(StatusCode::FOUND, format!("{}/landing", elsewhere.url)).await;
+    let egress = Egress::default();
+    let client = client(&egress);
+
+    let response = send(
+        &client,
+        get_with_credentials(&client, &format!("{}/data", origin.url)),
+        &egress,
+    )
+    .await
+    .expect("the redirect is followed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let landed = elsewhere.seen();
+    assert_eq!(landed.len(), 1);
+    assert_eq!(landed[0].path, "/landing");
+    assert_eq!(landed[0].headers.get(API_KEY), None);
+    assert_eq!(landed[0].headers.get("authorization"), None);
+    assert_eq!(
+        landed[0]
+            .headers
+            .get("accept")
+            .and_then(|value| value.to_str().ok()),
+        Some("*/*"),
+        "any header name can carry a credential, so not even the request's own `Accept` is \
+         forwarded; `reqwest` adds its default"
+    );
+}
+
+/// A redirect within the origin is the one place the credential belongs, so it is kept.
+#[tokio::test]
+async fn a_redirect_within_the_origin_keeps_the_credential() {
+    let origin = Server::start(|request| {
+        if request.path == "/moved" {
+            "[]".into_response()
+        } else {
+            (StatusCode::FOUND, [(LOCATION, "/moved")]).into_response()
+        }
+    })
+    .await;
+    let egress = Egress::default();
+    let client = client(&egress);
+
+    send(
+        &client,
+        get_with_credentials(&client, &format!("{}/data", origin.url)),
+        &egress,
+    )
+    .await
+    .expect("the redirect is followed");
+
+    let seen = origin.seen();
+    assert_eq!(
+        seen.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        ["/data", "/moved"]
+    );
+    for request in &seen {
+        assert_eq!(
+            request
+                .headers
+                .get(API_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some(SECRET)
+        );
+    }
+}
+
+/// A `307` keeps the method and the body. Sending that body to another origin would replay
+/// whatever it carries there, so the redirect is refused before the other origin is contacted.
+#[tokio::test]
+async fn a_307_never_resends_a_body_to_another_origin() {
+    let elsewhere = Server::ok("{}").await;
+    let origin = Server::redirecting(
+        StatusCode::TEMPORARY_REDIRECT,
+        format!("{}/collect", elsewhere.url),
+    )
+    .await;
+    let egress = Egress::default();
+    let client = client(&egress);
+    let request = client
+        .post(format!("{}/token", origin.url))
+        .body("client_secret=s3cr3t")
+        .build()
+        .expect("the request builds");
+
+    let message = send(&client, request, &egress)
+        .await
+        .expect_err("the redirect is refused")
+        .to_string();
+    assert_eq!(
+        message,
+        format!(
+            "the server answered 307 to resend the request body to another origin, {}, and a \
+             request body is never sent to an origin other than the one it was meant for",
+            elsewhere.url
+        )
+    );
+    assert!(
+        elsewhere.seen().is_empty(),
+        "the other origin is never contacted"
+    );
+}
+
+/// A `303` answering a `POST` is followed as a `GET` without the body, as a browser does.
+#[tokio::test]
+async fn a_303_is_followed_as_a_get_without_the_body() {
+    let origin = Server::start(|request| {
+        if request.path == "/result" {
+            "done".into_response()
+        } else {
+            (StatusCode::SEE_OTHER, [(LOCATION, "/result")]).into_response()
+        }
+    })
+    .await;
+    let egress = Egress::default();
+    let client = client(&egress);
+    let request = client
+        .post(format!("{}/submit", origin.url))
+        .header("content-type", "application/json")
+        .body("{\"a\":1}")
+        .build()
+        .expect("the request builds");
+
+    let response = send(&client, request, &egress).await.expect("followed");
+    assert_eq!(response.text().await.expect("body"), "done");
+    let seen = origin.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].method, Method::GET);
+    assert!(seen[1].body.is_empty());
+    assert_eq!(seen[1].headers.get("content-type"), None);
+}
+
+/// A token request carries its secret in the body; `OnOriginChange::Refuse` keeps any redirect
+/// from taking it to another origin, even one `reqwest` would follow with a `307`.
+#[tokio::test]
+async fn a_token_client_refuses_to_leave_its_origin() {
+    let elsewhere = Server::ok("{}").await;
+    let origin = Server::redirecting(
+        StatusCode::TEMPORARY_REDIRECT,
+        format!("{}/collect", elsewhere.url),
+    )
+    .await;
+    let client = reqwest::Client::builder()
+        .redirect(redirect_policy(Egress::default(), OnOriginChange::Refuse))
+        .build()
+        .expect("the client builds");
+
+    let error = client
+        .post(format!("{}/token", origin.url))
+        .body("grant_type=client_credentials&client_secret=s3cr3t")
+        .send()
+        .await
+        .expect_err("the redirect is refused");
+    let source = std::error::Error::source(&error)
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert_eq!(
+        source,
+        format!(
+            "the server redirected to another origin, {}, and this request carries a credential \
+             that is sent only to {}",
+            elsewhere.url, origin.url
+        )
+    );
+    assert!(elsewhere.seen().is_empty());
+}
+
+/// The configured host is trusted, but a redirect that changes the port is a new destination:
+/// it is refused when that destination is internal, and a redirect within the configured origin
+/// is still followed.
+#[tokio::test]
+async fn another_port_on_an_internal_configured_host_is_a_new_destination() {
+    let target = Server::ok("leaked").await;
+    let target_port = target
+        .url
+        .rsplit(':')
+        .next()
+        .expect("the target URL has a port")
+        .to_string();
+    // Redirects to the target's port on whichever host name the request used.
+    let origin = Server::start(move |request| {
+        if request.path == "/same" {
+            "ok".into_response()
+        } else if request.path == "/hop" {
+            (StatusCode::FOUND, [(LOCATION, "/same".to_string())]).into_response()
+        } else {
+            let host = request
+                .headers
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.rsplit_once(':'))
+                .map_or("127.0.0.1", |(host, _)| host)
+                .to_string();
+            let location = format!("http://{host}:{target_port}/internal");
+            (StatusCode::FOUND, [(LOCATION, location)]).into_response()
+        }
+    })
+    .await;
+    let guard = DestinationGuard::new(
+        |address| address.is_loopback(),
+        |url| {
+            url.host_str()
+                .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
+        },
+        "loopback is blocked",
+    )
+    .redirects_only();
+    let egress = Egress::new(Some(guard), 5);
+    let client = client(&egress);
+
+    for host in ["127.0.0.1", "localhost"] {
+        let origin_url = origin.url.replace("127.0.0.1", host);
+        let request = client
+            .get(format!("{origin_url}/hop"))
+            .build()
+            .expect("the request builds");
+        let response = send(&client, request, &egress)
+            .await
+            .unwrap_or_else(|e| panic!("{host}: a redirect within the origin is followed: {e}"));
+        assert_eq!(response.text().await.expect("body"), "ok");
+
+        let request = client
+            .get(format!("{origin_url}/data"))
+            .build()
+            .expect("the request builds");
+        let message = send(&client, request, &egress)
+            .await
+            .expect_err("another port is refused")
+            .to_string();
+        assert_eq!(
+            message,
+            format!(
+                "Refused to connect to {}/internal: loopback is blocked",
+                target.url.replace("127.0.0.1", host)
+            ),
+            "{host}"
+        );
+    }
+    assert!(target.seen().is_empty(), "the other port is never reached");
+}

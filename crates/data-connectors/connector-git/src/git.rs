@@ -601,6 +601,35 @@ impl GitClient {
         }
     }
 
+    /// The credential libgit2 asks for while it talks to `url`. A user name and password (or
+    /// token) is given only when `url` is on the configured remote's protocol and host: libgit2
+    /// follows a redirect of its first request to another host, and that host must not receive
+    /// the remote's credentials.
+    fn resolve_credentials_for(
+        remote: Option<&CredentialOrigin>,
+        url: &str,
+        credentials: &GitCredentials,
+        username_from_url: Option<&str>,
+        allowed_types: CredentialType,
+    ) -> std::result::Result<Cred, git2::Error> {
+        let cred = Self::resolve_credentials(credentials, username_from_url, allowed_types)?;
+        let is_password =
+            i64::from(cred.credtype()) == i64::from(CredentialType::USER_PASS_PLAINTEXT.bits());
+        let for_remote = CredentialOrigin::of_remote(url)
+            .is_some_and(|asked| remote.is_some_and(|remote| remote.matches(&asked)));
+        if is_password && !for_remote {
+            return Err(git2::Error::new(
+                git2::ErrorCode::Auth,
+                git2::ErrorClass::Http,
+                format!(
+                    "{} asked for credentials, and the Git connector sends its credentials only to the configured repository's host",
+                    sanitize_repo_url(url)
+                ),
+            ));
+        }
+        Ok(cred)
+    }
+
     fn resolve_credentials(
         credentials: &GitCredentials,
         username_from_url: Option<&str>,
@@ -773,6 +802,7 @@ impl GitClient {
         let repo_url = self.repo_url.clone();
         let cache_path = self.cache_path.clone();
         let credentials = self.credentials.clone();
+        let remote = CredentialOrigin::of_remote(&self.repo_url);
         let enable_lfs = self.enable_lfs;
         let reference = self.reference.clone();
         let reference_for_task = reference.clone();
@@ -781,8 +811,15 @@ impl GitClient {
             let make_callbacks = || {
                 let mut callbacks = RemoteCallbacks::new();
                 let creds = credentials.clone();
-                callbacks.credentials(move |_url, username_from_url, allowed_types| {
-                    Self::resolve_credentials(&creds, username_from_url, allowed_types)
+                let remote = remote.clone();
+                callbacks.credentials(move |url, username_from_url, allowed_types| {
+                    Self::resolve_credentials_for(
+                        remote.as_ref(),
+                        url,
+                        &creds,
+                        username_from_url,
+                        allowed_types,
+                    )
                 });
                 // Intentionally no `certificate_check` override: libgit2's
                 // default verification is used, which validates TLS
@@ -853,7 +890,13 @@ impl GitClient {
         .context(SpawnBlockingSnafu)??;
 
         if enable_lfs {
-            run_git_lfs(&self.cache_path, reference.as_deref(), &self.credentials).await?;
+            run_git_lfs(
+                &self.cache_path,
+                reference.as_deref(),
+                &self.repo_url,
+                &self.credentials,
+            )
+            .await?;
         }
 
         Ok(repo)
@@ -1281,11 +1324,15 @@ fn classify_remote_error(err: git2::Error, repo_url: &str) -> Error {
 async fn run_git_lfs(
     cache_path: &Path,
     reference: Option<&str>,
+    repo_url: &str,
     credentials: &GitCredentials,
 ) -> Result<()> {
     let cache_path = cache_path.to_path_buf();
     let reference = reference.map(ToString::to_string);
-    let credentials = credentials.clone();
+    let credentials = LfsCredentials {
+        remote: CredentialOrigin::of_remote(repo_url),
+        credentials: credentials.clone(),
+    };
 
     task::spawn_blocking(move || -> Result<()> {
         ensure_git_lfs_available()?;
@@ -1406,33 +1453,109 @@ const GIT_TRACE_ENV_VARS: &[&str] = &[
     "GCM_TRACE",
 ];
 
-/// Ephemeral on-disk `GIT_ASKPASS`/`SSH_ASKPASS` script that echoes the
-/// connector's configured HTTP(S) credentials when git prompts for them.
-/// Command-line arguments for processes are observable via `ps` on most
-/// hosts, so we avoid embedding credentials in argv via `-c http.extraHeader`
-/// and go through ASKPASS instead. The backing temp dir is 0o700 and is
-/// removed automatically when this value drops.
-struct TempAskpass {
+/// The connector's credentials together with the remote they belong to.
+struct LfsCredentials {
+    remote: Option<CredentialOrigin>,
+    credentials: GitCredentials,
+}
+
+/// The `protocol` and `host` git names when it asks a credential helper for the HTTP(S)
+/// credentials of a URL. The connector's credentials belong to the configured remote, so they
+/// are given only for its origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CredentialOrigin {
+    protocol: String,
+    /// The host as git writes it: with the port only when the URL names one. Both spellings of
+    /// a default port name one origin, so both are accepted.
+    hosts: Vec<String>,
+}
+
+impl CredentialOrigin {
+    /// The origin whose credential requests the connector answers, for the configured remote.
+    ///
+    /// Git LFS reaches an HTTP(S) remote's own origin, and an SSH remote's host over HTTPS.
+    /// A local or `file://` remote has no HTTP origin, so no credential is given for it.
+    fn of_remote(remote: &str) -> Option<Self> {
+        if remote.contains("://") {
+            let url = Url::parse(remote).ok()?;
+            let host = url.host_str()?.to_ascii_lowercase();
+            return match url.scheme() {
+                "https" | "http" => {
+                    let mut hosts = vec![];
+                    match (url.port(), url.port_or_known_default()) {
+                        (Some(port), _) => hosts.push(format!("{host}:{port}")),
+                        (None, Some(default)) => {
+                            hosts.push(host.clone());
+                            hosts.push(format!("{host}:{default}"));
+                        }
+                        (None, None) => hosts.push(host.clone()),
+                    }
+                    Some(Self {
+                        protocol: url.scheme().to_string(),
+                        hosts,
+                    })
+                }
+                "ssh" | "git+ssh" | "ssh+git" => Some(Self::https(host)),
+                _ => None,
+            };
+        }
+        // scp-like `[user@]host:path`, with an IPv6 host in brackets.
+        let host = if let Some((before, rest)) = remote.split_once('[') {
+            if before.contains(':') || before.contains('/') {
+                return None;
+            }
+            format!("[{}]", rest.split_once(']')?.0)
+        } else {
+            let (authority, _) = remote.split_once(':')?;
+            authority.rsplit('@').next()?.to_string()
+        };
+        let host = host.to_ascii_lowercase();
+        (!host.is_empty() && !host.contains('/')).then(|| Self::https(host))
+    }
+
+    /// Whether `other` names the same protocol and host as this origin.
+    fn matches(&self, other: &Self) -> bool {
+        self.protocol == other.protocol && self.hosts.iter().any(|host| other.hosts.contains(host))
+    }
+
+    fn https(host: String) -> Self {
+        Self {
+            protocol: "https".to_string(),
+            hosts: vec![host.clone(), format!("{host}:443")],
+        }
+    }
+}
+
+/// Ephemeral on-disk git credential helper that gives the connector's configured HTTP(S)
+/// credentials to `git lfs`, and only for the configured remote's origin.
+///
+/// Git LFS asks for credentials for whatever endpoint it reaches, and the repository chooses
+/// that endpoint (`.lfsconfig` can name any URL). The helper reads the `protocol` and `host`
+/// git sends and answers only when they are the remote's, so a repository cannot point
+/// `git lfs` at another server and receive the connector's token.
+///
+/// Command-line arguments for processes are observable via `ps` on most hosts, so the
+/// credentials are not put in argv (`-c http.extraHeader=...`); the helper script holds them.
+/// The backing temp dir is 0o700 and is removed automatically when this value drops.
+struct TempCredentialHelper {
     _dir: tempfile::TempDir,
     script: PathBuf,
 }
 
-impl TempAskpass {
-    fn new(credentials: &GitCredentials) -> Result<Option<Self>> {
-        let Some((user, pass)) = basic_auth_parts(credentials) else {
+impl TempCredentialHelper {
+    fn new(lfs: &LfsCredentials) -> Result<Option<Self>> {
+        let Some((user, pass)) = basic_auth_parts(&lfs.credentials) else {
+            return Ok(None);
+        };
+        let Some(remote) = lfs.remote.as_ref() else {
             return Ok(None);
         };
         let dir = tempfile::Builder::new()
-            .prefix("spice-git-askpass-")
+            .prefix("spice-git-credential-")
             .tempdir()
             .context(IoSnafu)?;
-        let script = dir.path().join("askpass.sh");
-        let contents = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  *[Pp]assword*) printf '%s' {pass} ;;\n  *[Uu]sername*) printf '%s' {user} ;;\nesac\n",
-            pass = sh_single_quote(&pass),
-            user = sh_single_quote(&user),
-        );
-        std::fs::write(&script, contents).context(IoSnafu)?;
+        let script = dir.path().join("credential-helper.sh");
+        std::fs::write(&script, credential_helper_script(remote, &user, &pass)).context(IoSnafu)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1442,9 +1565,42 @@ impl TempAskpass {
         Ok(Some(Self { _dir: dir, script }))
     }
 
-    fn path(&self) -> &Path {
-        &self.script
+    /// The `credential.helper` value that runs this script: a shell snippet (`!`), so a
+    /// temporary directory with a space in its path still runs.
+    fn config_value(&self) -> String {
+        format!("!{}", sh_single_quote(&self.script.to_string_lossy()))
     }
+}
+
+/// A git credential helper (`git help credentials`) that answers `get` with `user` and `pass`
+/// when git asks for `remote`'s protocol and host, and with nothing otherwise.
+fn credential_helper_script(remote: &CredentialOrigin, user: &str, pass: &str) -> String {
+    let hosts = remote
+        .hosts
+        .iter()
+        .map(|host| sh_single_quote(host))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "#!/bin/sh\n\
+         [ \"$1\" = get ] || exit 0\n\
+         protocol=\n\
+         host=\n\
+         while IFS='=' read -r key value; do\n\
+         \x20 case \"$key\" in\n\
+         \x20   protocol) protocol=$value ;;\n\
+         \x20   host) host=$value ;;\n\
+         \x20 esac\n\
+         done\n\
+         [ \"$protocol\" = {protocol} ] || exit 0\n\
+         host=$(printf '%s' \"$host\" | tr '[:upper:]' '[:lower:]')\n\
+         case \"$host\" in\n\
+         \x20 {hosts}) printf 'username=%s\\npassword=%s\\n' {user} {pass} ;;\n\
+         esac\n",
+        protocol = sh_single_quote(&remote.protocol),
+        user = sh_single_quote(user),
+        pass = sh_single_quote(pass),
+    )
 }
 
 fn basic_auth_parts(credentials: &GitCredentials) -> Option<(String, String)> {
@@ -1466,8 +1622,9 @@ fn run_git_lfs_command(
     cache_path: &Path,
     args: &[&str],
     label: &str,
-    credentials: &GitCredentials,
+    lfs: &LfsCredentials,
 ) -> Result<()> {
+    let credentials = &lfs.credentials;
     let mut cmd = Command::new("git");
     cmd.current_dir(cache_path);
 
@@ -1482,14 +1639,18 @@ fn run_git_lfs_command(
         cmd.env_remove(key);
     }
 
-    // HTTP(S): route credential prompts through a temporary ASKPASS script
-    // instead of embedding the secret in argv via `-c http.extraHeader=...`,
-    // which would leak the credential to anyone able to enumerate processes
-    // on the host.
-    let askpass = TempAskpass::new(credentials)?;
-    if let Some(ref a) = askpass {
-        cmd.env("GIT_ASKPASS", a.path());
-        cmd.env("SSH_ASKPASS", a.path());
+    // HTTP(S): answer credential requests through a temporary credential
+    // helper bound to the remote's origin, instead of embedding the secret in
+    // argv via `-c http.extraHeader=...`, which would leak the credential to
+    // anyone able to enumerate processes on the host. An askpass program is
+    // not used: it sees only a prompt, so it cannot tell the remote from an
+    // endpoint the repository chose.
+    let helper = TempCredentialHelper::new(lfs)?;
+    if let Some(ref helper) = helper {
+        cmd.env_remove("GIT_ASKPASS");
+        cmd.env_remove("SSH_ASKPASS");
+        cmd.arg("-c")
+            .arg(format!("credential.helper={}", helper.config_value()));
     }
 
     // SSH: point `ssh` at the configured private key. The passphrase (if
@@ -1512,7 +1673,7 @@ fn run_git_lfs_command(
     cmd.arg("lfs").args(args);
 
     let output = cmd.output().context(IoSnafu)?;
-    drop(askpass); // release the askpass temp dir before we return
+    drop(helper); // release the credential helper's temp dir before we return
 
     if output.status.success() {
         Ok(())
@@ -1559,6 +1720,122 @@ mod tests {
             false,
             GitResilienceConfig::default(),
         )
+    }
+
+    fn lfs_credentials(remote: &str, token: &str) -> LfsCredentials {
+        LfsCredentials {
+            remote: CredentialOrigin::of_remote(remote),
+            credentials: GitCredentials {
+                token: Some(token.to_string()),
+                ..GitCredentials::default()
+            },
+        }
+    }
+
+    /// What `git credential fill` returns for `protocol://host` when the only credential
+    /// helper is `helper`: the request `git lfs` makes for an endpoint before it sends
+    /// credentials there. Host-level helpers and prompts are switched off, so the answer is
+    /// the helper's alone.
+    fn credential_fill(helper: &TempCredentialHelper, protocol: &str, host: &str) -> String {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let home = tempfile::tempdir().expect("an empty HOME for git");
+        let mut child = Command::new("git")
+            .args(["-c", "credential.helper="])
+            .arg("-c")
+            .arg(format!("credential.helper={}", helper.config_value()))
+            .args(["credential", "fill"])
+            .env("HOME", home.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_ASKPASS")
+            .env_remove("SSH_ASKPASS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git runs");
+        child
+            .stdin
+            .take()
+            .expect("git's stdin")
+            .write_all(format!("protocol={protocol}\nhost={host}\n\n").as_bytes())
+            .expect("git reads the request");
+        let output = child.wait_with_output().expect("git finishes");
+        String::from_utf8(output.stdout).expect("git prints text")
+    }
+
+    /// The finding this guards against: a repository's `.lfsconfig` can send `git lfs` to any
+    /// server, which then asks for credentials. The helper gives the connector's token to the
+    /// configured remote's origin and to nothing else: not another host, not plaintext HTTP,
+    /// and not another port.
+    #[test]
+    fn the_lfs_credential_helper_answers_only_for_the_remote() {
+        let lfs = lfs_credentials("https://github.com/owner/repo.git", "t0k'en");
+        let helper = TempCredentialHelper::new(&lfs)
+            .expect("the helper is written")
+            .expect("a token for an https remote yields a helper");
+
+        let answered =
+            "protocol=https\nhost=github.com\nusername=x-access-token\npassword=t0k'en\n";
+        assert_eq!(credential_fill(&helper, "https", "github.com"), answered);
+        assert_eq!(
+            credential_fill(&helper, "https", "GitHub.com"),
+            "protocol=https\nhost=GitHub.com\nusername=x-access-token\npassword=t0k'en\n",
+            "host names compare without case"
+        );
+        assert_eq!(
+            credential_fill(&helper, "https", "github.com:443"),
+            "protocol=https\nhost=github.com:443\nusername=x-access-token\npassword=t0k'en\n"
+        );
+        for (protocol, host) in [
+            ("https", "lfs.attacker.example"),
+            ("https", "github.com.attacker.example"),
+            ("http", "github.com"),
+            ("https", "github.com:8443"),
+        ] {
+            assert_eq!(
+                credential_fill(&helper, protocol, host),
+                "",
+                "{protocol}://{host} must not receive the token"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lfs_credential_origin_follows_the_remote() {
+        let origin = |remote: &str| CredentialOrigin::of_remote(remote);
+        assert_eq!(
+            origin("git@github.com:owner/repo.git"),
+            Some(CredentialOrigin {
+                protocol: "https".to_string(),
+                hosts: vec!["github.com".to_string(), "github.com:443".to_string()],
+            })
+        );
+        assert_eq!(
+            origin("http://git.internal:8080/repo.git"),
+            Some(CredentialOrigin {
+                protocol: "http".to_string(),
+                hosts: vec!["git.internal:8080".to_string()],
+            })
+        );
+        assert_eq!(
+            origin("GitHub.com:owner/repo.git"),
+            Some(CredentialOrigin {
+                protocol: "https".to_string(),
+                hosts: vec!["github.com".to_string(), "github.com:443".to_string()],
+            }),
+            "an scp-like remote without a user"
+        );
+        assert_eq!(origin("file:///tmp/repo"), None);
+        assert_eq!(origin("/srv/git/repo.git"), None);
+        assert!(
+            TempCredentialHelper::new(&lfs_credentials("file:///tmp/repo", "token"))
+                .expect("nothing to write")
+                .is_none(),
+            "a local remote has no origin to give credentials to"
+        );
     }
 
     #[test]
@@ -1802,6 +2079,93 @@ mod tests {
             // base64("x-access-token:ghp_token")
             Some("Basic eC1hY2Nlc3MtdG9rZW46Z2hwX3Rva2Vu"),
             "a token must be the password of user `x-access-token`; connect: {outcome:?}"
+        );
+    }
+
+    /// A remote that answers every request with a redirect to the same path on `target`, as a
+    /// moved repository does. Returns its URL.
+    fn redirecting_remote(target: std::net::SocketAddr) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a local port for the redirecting remote");
+        let addr = listener
+            .local_addr()
+            .expect("local address of the redirecting remote");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{target}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        format!("http://{addr}/owner/repo.git")
+    }
+
+    /// libgit2 follows a redirect of its first request to another host and asks the credentials
+    /// callback on that host's behalf. The configured remote's token is not given there.
+    #[test]
+    fn credentials_are_not_given_to_a_host_a_redirect_names() {
+        let creds = GitCredentials {
+            token: Some("ghp_token".to_string()),
+            ..Default::default()
+        };
+        let challenge = BasicAuthChallenge::start();
+        let remote_url = redirecting_remote(challenge.addr);
+        let remote_origin = CredentialOrigin::of_remote(&remote_url);
+
+        let mut remote = git2::Remote::create_detached(remote_url.as_str())
+            .expect("detached remote for the redirecting server");
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.credentials(|url, username_from_url, allowed_types| {
+            GitClient::resolve_credentials_for(
+                remote_origin.as_ref(),
+                url,
+                &creds,
+                username_from_url,
+                allowed_types,
+            )
+        });
+        let outcome = remote
+            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
+            .map(|_connection| ());
+        drop(remote);
+
+        let message = outcome
+            .expect_err("the redirected host's challenge is not answered")
+            .message()
+            .to_string();
+        assert!(
+            message.contains(
+                "asked for credentials, and the Git connector sends its credentials only to the configured repository's host"
+            ),
+            "the callback must be asked on the redirected host's behalf and refuse: {message}"
+        );
+        assert_eq!(
+            challenge.finish(),
+            None,
+            "the host the redirect named must not receive the remote's token"
         );
     }
 

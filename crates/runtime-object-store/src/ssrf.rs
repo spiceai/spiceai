@@ -19,8 +19,10 @@ limitations under the License.
 //!
 //! One classifier decides which addresses and host names are internal. URL tables apply it to
 //! the URL a query names, to every address that URL's host resolves to, and to every redirect;
-//! the HTTPS data connector applies it to every redirect and to every address a redirect's new
-//! host resolves to.
+//! the HTTPS data connector applies it to every redirect that changes the origin and to every
+//! address a redirect's new host resolves to, and once the dataset's own host first resolves to
+//! a public address, to every later answer for that host. The policy itself is the
+//! `http-egress` crate's, shared by every client that applies these guards.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -153,8 +155,8 @@ pub fn url_table_destination_guard() -> DestinationGuard {
     )
 }
 
-/// What the HTTPS data connector refuses for a host it reaches only through a redirect: any
-/// internal address that host resolves to.
+/// What the HTTPS data connector refuses for a destination a redirect introduced: an internal
+/// address, including another port or scheme on a dataset host that resolves to one.
 #[must_use]
 pub fn redirect_destination_guard() -> DestinationGuard {
     DestinationGuard::new(

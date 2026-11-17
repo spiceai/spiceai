@@ -1201,55 +1201,39 @@ mod tests {
 
     #[tokio::test]
     async fn http_redirect_is_followed_only_when_allow_http_is_set() {
-        use axum::{Router, body::Body, extract::State, http::Request, response::Response};
+        use axum::{Router, body::Body, http::Request, response::Response};
         use object_store::ObjectStoreExt;
 
-        async fn record(
-            State(seen): State<Arc<Mutex<Vec<String>>>>,
-            request: Request<Body>,
-        ) -> Response<Body> {
-            seen.lock()
-                .expect("the request log is not poisoned")
-                .push(request.uri().path().to_string());
-            Response::builder()
-                .status(404)
-                .body(Body::empty())
-                .expect("a 404 response builds")
-        }
-
-        let target_seen = Arc::new(Mutex::new(Vec::new()));
-        let target = Router::new()
-            .fallback(axum::routing::any(record))
-            .with_state(Arc::clone(&target_seen));
-        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("the redirect target binds");
-        let target_addr = target_listener
-            .local_addr()
-            .expect("the redirect target has an address");
-        tokio::spawn(async move {
-            let _ = axum::serve(target_listener, target).await;
-        });
-
+        // One origin that redirects `/items.csv` to `/secret` on itself, so the redirect stays
+        // on the dataset's origin and only `allow_http` decides whether it is followed.
         let origin_seen = Arc::new(Mutex::new(Vec::new()));
-        let location = format!("http://{target_addr}/secret");
-        let origin = Router::new()
-            .fallback(axum::routing::any(
-                move |State(seen): State<Arc<Mutex<Vec<String>>>>, request: Request<Body>| {
-                    let location = location.clone();
-                    async move {
-                        seen.lock()
-                            .expect("the request log is not poisoned")
-                            .push(request.uri().path().to_string());
-                        Response::builder()
-                            .status(302)
-                            .header("location", location)
-                            .body(Body::empty())
-                            .expect("a redirect response builds")
-                    }
-                },
-            ))
-            .with_state(Arc::clone(&origin_seen));
+        let target_seen = Arc::new(Mutex::new(Vec::new()));
+        let (origin_log, target_log) = (Arc::clone(&origin_seen), Arc::clone(&target_seen));
+        let origin = Router::new().fallback(axum::routing::any(move |request: Request<Body>| {
+            let (origin_log, target_log) = (Arc::clone(&origin_log), Arc::clone(&target_log));
+            async move {
+                let path = request.uri().path().to_string();
+                if path == "/secret" {
+                    target_log
+                        .lock()
+                        .expect("the request log is not poisoned")
+                        .push(path);
+                    return Response::builder()
+                        .status(404)
+                        .body(Body::empty())
+                        .expect("a 404 response builds");
+                }
+                origin_log
+                    .lock()
+                    .expect("the request log is not poisoned")
+                    .push(path);
+                Response::builder()
+                    .status(302)
+                    .header("location", "/secret")
+                    .body(Body::empty())
+                    .expect("a redirect response builds")
+            }
+        }));
         let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("the redirect origin binds");
