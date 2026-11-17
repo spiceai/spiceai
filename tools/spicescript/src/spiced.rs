@@ -669,6 +669,57 @@ impl Spiced {
         }
     }
 
+    /// Waits for `spiced` to exit on its own with a failure whose log matches
+    /// `pattern`, for a configuration it must refuse to start with. Fails if
+    /// it answers `/health` instead, exits successfully, or is still running
+    /// after `timeout` (it is then killed).
+    pub async fn wait_exit(&mut self, timeout: Duration, pattern: &regex::Regex) -> Result<()> {
+        let url = format!("{}://127.0.0.1:{}/health", self.scheme(), self.http);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let status = loop {
+            let Some(child) = self.child.as_mut() else {
+                bail!("spiced is not running");
+            };
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if let Ok(r) = self.bare_client.get(&url).send().await
+                && r.status().is_success()
+            {
+                bail!(
+                    "spiced started and answered /health, but it was expected to exit with an error matching `{pattern}`; see {}",
+                    self.log_path().display()
+                );
+            }
+            if tokio::time::Instant::now() > deadline {
+                self.kill(false).await?;
+                bail!(
+                    "spiced was still running {timeout:?} after it started, but it was expected to exit with an error matching `{pattern}`; see {}",
+                    self.log_path().display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        if let Some(pid) = self.child.as_ref().and_then(Child::id) {
+            crate::cleanup::untrack_process(pid);
+        }
+        self.child = None;
+        self.flight_client = None;
+        ensure!(
+            !status.success(),
+            "spiced exited successfully, but it was expected to exit with an error matching `{pattern}`; see {}",
+            self.log_path().display()
+        );
+        let log = std::fs::read_to_string(self.log_path())
+            .with_context(|| format!("Failed to read {}", self.log_path().display()))?;
+        ensure!(
+            pattern.is_match(&log),
+            "spiced exited with {status}, but its log has no line matching `{pattern}`; see {}",
+            self.log_path().display()
+        );
+        Ok(())
+    }
+
     /// Whether `/v1/ready` answers ready.
     pub async fn ready(&self) -> bool {
         let url = format!("{}://127.0.0.1:{}/v1/ready", self.scheme(), self.http);

@@ -404,6 +404,9 @@ pub enum Action {
         wait_ready: bool,
         /// A change to the spicepod, kept for every later start.
         patch: Option<VariantSpec>,
+        /// `spiced` must refuse to start: exit with a failure, before it
+        /// answers `/health`, with a log matching this pattern.
+        exits: Option<regex::Regex>,
     },
     /// Stop `spiced` with SIGTERM, escalating to SIGKILL.
     Stop,
@@ -1742,6 +1745,7 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
             wait_ready: wait_ready(&arg)?,
             patch: patch(&arg)?,
+            exits: exits(&arg)?,
         },
         "stop" => Action::Stop,
         "kill-spiced" => Action::Kill {
@@ -2699,6 +2703,18 @@ fn wait_ready(arg: &Value) -> Result<bool> {
         None => Ok(true),
         Some(Value::Bool(b)) => Ok(*b),
         Some(_) => bail!("`ready` must be true or false"),
+    }
+}
+
+/// `exits:` on `start`: the pattern the log of a `spiced` that refuses to
+/// start must match.
+fn exits(arg: &Value) -> Result<Option<regex::Regex>> {
+    match arg.get("exits") {
+        None => Ok(None),
+        Some(Value::String(pattern)) => regex::Regex::new(pattern)
+            .map(Some)
+            .with_context(|| format!("`exits` is not a valid pattern: {pattern}")),
+        Some(_) => bail!("`exits` must be the pattern spiced's log must match"),
     }
 }
 
