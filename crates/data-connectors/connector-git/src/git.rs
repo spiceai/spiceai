@@ -601,33 +601,21 @@ impl GitClient {
         }
     }
 
-    /// The credential libgit2 asks for while it talks to `url`. A user name and password (or
-    /// token) is given only when `url` is on the configured remote's protocol and host: libgit2
-    /// follows a redirect of its first request to another host, and that host must not receive
-    /// the remote's credentials.
-    fn resolve_credentials_for(
-        remote: Option<&CredentialOrigin>,
-        url: &str,
+    /// Fetch options for the configured remote. While the connector has an HTTP(S) user name
+    /// and password or token, libgit2 follows no redirect to another host: it would answer that
+    /// host's authentication challenge with the remote's credentials, and its credentials
+    /// callback is not told the request moved. A redirect within the remote's host, such as a
+    /// renamed repository, is still followed.
+    fn fetch_options<'cb>(
+        callbacks: RemoteCallbacks<'cb>,
         credentials: &GitCredentials,
-        username_from_url: Option<&str>,
-        allowed_types: CredentialType,
-    ) -> std::result::Result<Cred, git2::Error> {
-        let cred = Self::resolve_credentials(credentials, username_from_url, allowed_types)?;
-        let is_password =
-            i64::from(cred.credtype()) == i64::from(CredentialType::USER_PASS_PLAINTEXT.bits());
-        let for_remote = CredentialOrigin::of_remote(url)
-            .is_some_and(|asked| remote.is_some_and(|remote| remote.matches(&asked)));
-        if is_password && !for_remote {
-            return Err(git2::Error::new(
-                git2::ErrorCode::Auth,
-                git2::ErrorClass::Http,
-                format!(
-                    "{} asked for credentials, and the Git connector sends its credentials only to the configured repository's host",
-                    sanitize_repo_url(url)
-                ),
-            ));
+    ) -> FetchOptions<'cb> {
+        let mut options = FetchOptions::new();
+        options.remote_callbacks(callbacks);
+        if basic_auth_parts(credentials).is_some() {
+            options.follow_redirects(git2::RemoteRedirect::None);
         }
-        Ok(cred)
+        options
     }
 
     fn resolve_credentials(
@@ -802,7 +790,6 @@ impl GitClient {
         let repo_url = self.repo_url.clone();
         let cache_path = self.cache_path.clone();
         let credentials = self.credentials.clone();
-        let remote = CredentialOrigin::of_remote(&self.repo_url);
         let enable_lfs = self.enable_lfs;
         let reference = self.reference.clone();
         let reference_for_task = reference.clone();
@@ -811,15 +798,8 @@ impl GitClient {
             let make_callbacks = || {
                 let mut callbacks = RemoteCallbacks::new();
                 let creds = credentials.clone();
-                let remote = remote.clone();
-                callbacks.credentials(move |url, username_from_url, allowed_types| {
-                    Self::resolve_credentials_for(
-                        remote.as_ref(),
-                        url,
-                        &creds,
-                        username_from_url,
-                        allowed_types,
-                    )
+                callbacks.credentials(move |_url, username_from_url, allowed_types| {
+                    Self::resolve_credentials(&creds, username_from_url, allowed_types)
                 });
                 // Intentionally no `certificate_check` override: libgit2's
                 // default verification is used, which validates TLS
@@ -834,8 +814,7 @@ impl GitClient {
 
                 // Fetch latest changes
                 {
-                    let mut fetch_options = FetchOptions::new();
-                    fetch_options.remote_callbacks(make_callbacks());
+                    let mut fetch_options = Self::fetch_options(make_callbacks(), &credentials);
                     let mut remote = repo.find_remote("origin").context(GitSnafu)?;
                     remote
                         .fetch(
@@ -857,8 +836,7 @@ impl GitClient {
                     cache_path.display()
                 );
                 std::fs::create_dir_all(&cache_path).context(IoSnafu)?;
-                let mut fetch_options = FetchOptions::new();
-                fetch_options.remote_callbacks(make_callbacks());
+                let fetch_options = Self::fetch_options(make_callbacks(), &credentials);
 
                 let mut builder = RepoBuilder::new();
                 builder.fetch_options(fetch_options);
@@ -1513,11 +1491,6 @@ impl CredentialOrigin {
         (!host.is_empty() && !host.contains('/')).then(|| Self::https(host))
     }
 
-    /// Whether `other` names the same protocol and host as this origin.
-    fn matches(&self, other: &Self) -> bool {
-        self.protocol == other.protocol && self.hosts.iter().any(|host| other.hosts.contains(host))
-    }
-
     fn https(host: String) -> Self {
         Self {
             protocol: "https".to_string(),
@@ -2082,8 +2055,9 @@ mod tests {
         );
     }
 
-    /// A remote that answers every request with a redirect to the same path on `target`, as a
-    /// moved repository does. Returns its URL.
+    /// A remote on `127.0.0.1` that answers every request with a redirect to the same path on
+    /// `localhost` at `target`'s port: another host, as a repository moved to another server
+    /// is. Returns its URL.
     fn redirecting_remote(target: std::net::SocketAddr) -> String {
         use std::io::{Read, Write};
 
@@ -2114,7 +2088,8 @@ mod tests {
                     .to_string();
                 let _ = stream.write_all(
                     format!(
-                        "HTTP/1.1 302 Found\r\nLocation: http://{target}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        port = target.port()
                     )
                     .as_bytes(),
                 );
@@ -2123,8 +2098,10 @@ mod tests {
         format!("http://{addr}/owner/repo.git")
     }
 
-    /// libgit2 follows a redirect of its first request to another host and asks the credentials
-    /// callback on that host's behalf. The configured remote's token is not given there.
+    /// libgit2 follows a redirect of its first request to another host and answers that host's
+    /// authentication challenge with the remote's credentials, while its credentials callback is
+    /// still told the remote's URL. The connector's fetch options keep a credentialed fetch on
+    /// the remote's host.
     #[test]
     fn credentials_are_not_given_to_a_host_a_redirect_names() {
         let creds = GitCredentials {
@@ -2133,39 +2110,32 @@ mod tests {
         };
         let challenge = BasicAuthChallenge::start();
         let remote_url = redirecting_remote(challenge.addr);
-        let remote_origin = CredentialOrigin::of_remote(&remote_url);
+        let dir = tempfile::tempdir().expect("a directory for the repository");
+        let repo = Repository::init_bare(dir.path()).expect("an empty repository");
+        let mut remote = repo
+            .remote_anonymous(&remote_url)
+            .expect("a remote for the redirecting server");
 
-        let mut remote = git2::Remote::create_detached(remote_url.as_str())
-            .expect("detached remote for the redirecting server");
         let mut callbacks = RemoteCallbacks::new();
-        callbacks.credentials(|url, username_from_url, allowed_types| {
-            GitClient::resolve_credentials_for(
-                remote_origin.as_ref(),
-                url,
-                &creds,
-                username_from_url,
-                allowed_types,
-            )
+        callbacks.credentials(|_url, username_from_url, allowed_types| {
+            GitClient::resolve_credentials(&creds, username_from_url, allowed_types)
         });
-        let outcome = remote
-            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
-            .map(|_connection| ());
+        let mut options = GitClient::fetch_options(callbacks, &creds);
+        let outcome = remote.fetch(
+            &["refs/heads/*:refs/remotes/origin/*"],
+            Some(&mut options),
+            None,
+        );
         drop(remote);
 
         let message = outcome
-            .expect_err("the redirected host's challenge is not answered")
+            .expect_err("the fetch does not follow the redirect")
             .message()
             .to_string();
-        assert!(
-            message.contains(
-                "asked for credentials, and the Git connector sends its credentials only to the configured repository's host"
-            ),
-            "the callback must be asked on the redirected host's behalf and refuse: {message}"
-        );
         assert_eq!(
             challenge.finish(),
             None,
-            "the host the redirect named must not receive the remote's token"
+            "the host the redirect named must not receive the remote's token; fetch: {message}"
         );
     }
 

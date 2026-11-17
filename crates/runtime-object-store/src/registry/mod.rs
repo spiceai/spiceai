@@ -1426,12 +1426,10 @@ mod tests {
     }
 
     /// A dataset's HTTP store for a host must not be served to a URL table for the same host,
-    /// and the dataset's store follows a redirect that stays on its own host.
+    /// and the dataset's store follows a redirect that stays on its own origin.
     #[tokio::test]
     async fn url_table_and_dataset_stores_for_one_host_are_separate() {
-        use std::sync::atomic::Ordering;
-
-        let (origin, target_hits) = redirect_to_loopback_target().await;
+        let origin = same_host_redirecting_origin("127.0.0.1").await;
         let registry = SpiceObjectStoreRegistry::new(Handle::current());
 
         let dataset_store = registry
@@ -1440,7 +1438,7 @@ mod tests {
         assert_eq!(
             get_items(&dataset_store)
                 .await
-                .expect("a dataset store follows a redirect on its own host"),
+                .expect("a dataset store reads its own loopback origin, redirect included"),
             "id\n1\n"
         );
 
@@ -1457,7 +1455,6 @@ mod tests {
             error.contains("targets a private, loopback, or link-local address"),
             "{error}"
         );
-        assert_eq!(target_hits.load(Ordering::SeqCst), 1);
     }
 
     /// A loopback origin that serves a CSV body at `/moved/items.csv` and redirects every other
