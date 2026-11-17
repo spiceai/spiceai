@@ -2616,11 +2616,21 @@ fn remove_env_file_keys(keys: &[String]) -> Result<bool> {
 /// a logout or a keychain login report success while the old credential stays
 /// readable, so that is an error naming the keys and the fix.
 fn linked_env_file_keys(path: &std::path::Path, what: &str, keys: &[String]) -> Result<bool> {
-    let linked = std::fs::metadata(path)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .and_then(|_| std::fs::read_to_string(path).ok())
-        .unwrap_or_default();
+    // A dangling link, or a target that is not a regular file, sets nothing,
+    // and only a regular file is read so a FIFO cannot block. Any other failure
+    // to inspect or read the target is an error: taking it as empty would let
+    // the command report success while the credential stays in the file.
+    let read_failed = |source: std::io::Error| Error::ConfigIo {
+        operation: "read",
+        path: path.to_path_buf(),
+        source,
+    };
+    let linked = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => std::fs::read_to_string(path).map_err(read_failed)?,
+        Ok(_) => String::new(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => return Err(read_failed(source)),
+    };
     let still_set: Vec<&str> = keys
         .iter()
         .filter(|key| {
@@ -6504,6 +6514,37 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).expect("read the link target"),
             "OTHER_SETTING=kept\nSPICE_SPICEAI_TOKEN=live\n",
+            "the linked file must not be rewritten"
+        );
+    }
+
+    /// A linked `.env` that cannot be read does not count as setting none of
+    /// the keys: logout cannot tell whether the credential is still there, so
+    /// it fails with the read error instead of reporting success.
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_a_linked_env_file_it_cannot_read() {
+        const NOT_UTF8: &[u8] = b"SPICE_SPICEAI_TOKEN=live\n#\xff\n";
+
+        let _stores = CredentialStores::empty();
+        let elsewhere = tempfile::tempdir().expect("create the link target directory");
+        let target = elsewhere.path().join("shared.env");
+        std::fs::write(&target, NOT_UTF8).expect("write the link target");
+        let env_file = link_env_file_to(&target);
+
+        let err = remove_env_keys(&["SPICE_SPICEAI_TOKEN".to_string()])
+            .expect_err("an unreadable linked file must not count as setting nothing");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Failed to read configuration at '{}': stream did not contain valid UTF-8",
+                env_file.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read the link target"),
+            NOT_UTF8,
             "the linked file must not be rewritten"
         );
     }
