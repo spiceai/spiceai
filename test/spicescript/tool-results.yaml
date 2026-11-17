@@ -7,7 +7,9 @@ description: >
   from them; a result of exactly 100 rows, or any result that fits, has
   neither. Long text is shortened with a marker the message explains, and NaN,
   NULL and decimals keep their meaning. Called with `POST /v1/tools/{name}`, as
-  an MCP client or an agent framework calls them.
+  an MCP client or an agent framework calls them. A tool of an MCP server is
+  held to the 16 MiB tool result limit both when it is called as a Spice tool
+  and when it is called through the `/v1/mcp` gateway.
 
 sources:
   lake: { kind: files }
@@ -34,6 +36,14 @@ spicepod:
     - from: 'file://${sources.lake.path}/events/'
       name: events
       params: { file_format: parquet }
+  tools:
+    # A stdio MCP server whose `numbers` tool returns `count` numbers written `1e15`, which
+    # decode and re-encode as `1000000000000000.0`: its message stays under the stdio line
+    # limit while the result Spice would pass on does not stay under the result limit.
+    - name: big
+      from: mcp:python3
+      params:
+        mcp_args: '${script.dir}/seed/mcp-stdio-numbers.py'
 
 defaults:
   api-key: tool-key
@@ -198,3 +208,44 @@ steps:
         - { pointer: /columns, equals: [id] }
         - { pointer: /rows, length: 2 }
         - { pointer: /truncated, exists: false }
+
+  # An MCP tool's result within the 16 MiB limit passes through the `/v1/mcp` gateway as it is.
+  - http:
+      method: POST
+      path: /v1/mcp
+      headers:
+        content-type: application/json
+        accept: 'application/json, text/event-stream'
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/call
+        mcp-name: big__numbers
+      body: '{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "big__numbers", "arguments": {"count": 1000}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": {"name": "spicescript", "version": "1"}, "io.modelcontextprotocol/clientCapabilities": {}}}}'
+    expect:
+      status: 200
+      body-contains: '1000 numbers'
+      body-lacks: 'larger than the 16 MiB limit'
+    eventually: 60s
+
+  # One past the limit once decoded: called as a Spice tool, the call fails and returns none of it.
+  - http: { method: POST, path: /v1/tools/big__numbers, headers: { content-type: application/json }, body: '{"count": 1000000}' }
+    expect:
+      body-contains: "MCP tool 'big__numbers' returned a result larger than the 16 MiB limit"
+      body-lacks: '1000000000000000'
+
+  # Called through the gateway, the same result is refused the same way: the call reports the
+  # error in its result, and none of the numbers are returned.
+  - http:
+      method: POST
+      path: /v1/mcp
+      headers:
+        content-type: application/json
+        accept: 'application/json, text/event-stream'
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/call
+        mcp-name: big__numbers
+      body: '{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "big__numbers", "arguments": {"count": 1000000}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": {"name": "spicescript", "version": "1"}, "io.modelcontextprotocol/clientCapabilities": {}}}}'
+    expect:
+      status: 200
+      body-contains: "MCP tool 'big__numbers' returned a result larger than the 16 MiB limit"
+      body-matches: '"isError":\s*true'
+      body-lacks: '1000000000000000'
