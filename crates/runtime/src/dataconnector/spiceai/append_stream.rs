@@ -60,7 +60,7 @@ const SNAPSHOT_END_ERROR_AFTER: Duration = Duration::from_secs(300);
 const REFUSED_RELOAD_FIRST_RETRY: Duration = Duration::from_secs(30);
 
 /// The longest wait before retrying a reload that was refused for lack of memory.
-const REFUSED_RELOAD_MAX_RETRY: Duration = Duration::from_secs(15 * 60);
+const REFUSED_RELOAD_MAX_RETRY: Duration = Duration::from_mins(15);
 
 fn refused_reload_backoff(refusals: u32) -> Duration {
     REFUSED_RELOAD_FIRST_RETRY
