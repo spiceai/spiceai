@@ -381,11 +381,12 @@ fn install_archive(
         path: pods_dir.display().to_string(),
         source: e,
     })?;
-    let installed = stage_archive(&mut archive, pods_dir, response.pod, limits).and_then(|staged| {
-        let dest_dir = pods_dir.join(pod_path);
-        promote(staged, &dest_dir)?;
-        Ok(dest_dir)
-    });
+    let installed =
+        stage_archive(&mut archive, pods_dir, response.pod, limits).and_then(|staged| {
+            let dest_dir = pods_dir.join(pod_path);
+            promote(staged, pods_dir, &dest_dir, response.pod)?;
+            Ok(dest_dir)
+        });
     if installed.is_err() && !pods_dir_existed {
         // Only removes the directory if nothing else landed in it.
         let _ = std::fs::remove_dir(pods_dir);
@@ -554,7 +555,34 @@ fn stage_archive<R: Read + std::io::Seek>(
 /// A first install renames the whole directory into place. Re-installing over
 /// an existing directory keeps today's behavior of writing the package's files
 /// over it, now only after the package has been extracted in full.
-fn promote(staged: tempfile::TempDir, dest_dir: &Path) -> Result<()> {
+///
+/// Nothing is written through a symbolic link: every directory between
+/// `pods_dir` and `dest_dir`, and every directory inside an existing install
+/// that the package would write into, is checked first. Extraction never
+/// creates a link, so one there was put there by someone else, and following it
+/// would write the package outside the Spicepod directory.
+fn promote(staged: tempfile::TempDir, pods_dir: &Path, dest_dir: &Path, pod: &str) -> Result<()> {
+    let linked = |path: &Path| Error::LinkedInstallPath {
+        pod: pod.to_string(),
+        path: path
+            .strip_prefix(pods_dir.parent().unwrap_or(pods_dir))
+            .unwrap_or(path)
+            .display()
+            .to_string(),
+    };
+    if let Ok(relative) = dest_dir.strip_prefix(pods_dir) {
+        let mut path = pods_dir.to_path_buf();
+        for component in relative.components() {
+            path.push(component);
+            if is_symlink(&path) {
+                return Err(linked(&path));
+            }
+        }
+    }
+    if let Some(path) = first_linked_directory(staged.path(), dest_dir) {
+        return Err(linked(&path));
+    }
+
     if let Some(parent) = dest_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::Io {
             operation: "create directory",
@@ -582,6 +610,29 @@ fn promote(staged: tempfile::TempDir, dest_dir: &Path) -> Result<()> {
         }),
         Ok(_) => move_entries(staged.path(), dest_dir),
     }
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// The first directory under `to` that a move of `from`'s tree would write
+/// into and that is a symbolic link, if any.
+fn first_linked_directory(from: &Path, to: &Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(from).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            continue;
+        }
+        let target = to.join(entry.file_name());
+        if is_symlink(&target) {
+            return Some(target);
+        }
+        if let Some(linked) = first_linked_directory(&entry.path(), &target) {
+            return Some(linked);
+        }
+    }
+    None
 }
 
 /// Move every file under `from` to the same relative path under `to`.
@@ -890,7 +941,10 @@ mod tests {
         assert_eq!(describe_limit(2560), "2,560 bytes");
         assert_eq!(describe_size(3_221_225_510, 1024 * MIB), "3.0 GiB");
         assert_eq!(describe_size(1_610_612_736, 1024 * MIB), "1.5 GiB");
-        assert_eq!(describe_size(10 * 1024 * 1024 * 1024, 256 * MIB), "10,240.0 MiB");
+        assert_eq!(
+            describe_size(10 * 1024 * 1024 * 1024, 256 * MIB),
+            "10,240.0 MiB"
+        );
         assert_eq!(describe_size(3000, 2560), "3,000 bytes");
         assert_eq!(with_thousands(10_000), "10,000");
         assert_eq!(with_thousands(999), "999");

@@ -441,7 +441,10 @@ impl Spicepod {
     /// For a caller that has verified the bytes it read: parsing them, rather
     /// than reopening the file by name, means the manifest that is built is the
     /// one that was checked, whatever happens to the name afterwards.
-    pub async fn load_from_bytes(bytes: Vec<u8>, base_path: impl Into<PathBuf>) -> Result<Spicepod> {
+    pub async fn load_from_bytes(
+        bytes: Vec<u8>,
+        base_path: impl Into<PathBuf>,
+    ) -> Result<Spicepod> {
         Self::load_from_rdr(
             &reader::StdFileSystem,
             Box::new(std::io::Cursor::new(bytes)),

@@ -2500,9 +2500,7 @@ async fn restore_optional_snapshot(
     {
         let (snapshot, canonical) = (snapshot.to_path_buf(), canonical.to_path_buf());
         let copied = tokio::task::spawn_blocking(move || {
-            runtime_cloud_connect::identity::snapshot_regular_file_create_new(
-                &snapshot, &canonical,
-            )
+            runtime_cloud_connect::identity::snapshot_regular_file_create_new(&snapshot, &canonical)
         })
         .await
         .map_err(|error| std::io::Error::other(format!("the restore task stopped: {error}")))??;
