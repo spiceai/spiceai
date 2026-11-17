@@ -259,11 +259,21 @@ mod tests {
             Err(ToolCallDenied::NoCredentials { .. })
         ));
         assert!(matches!(
-            decide("send_alert", ToolAccess::ReadWrite, Some(&read_only()), false),
+            decide(
+                "send_alert",
+                ToolAccess::ReadWrite,
+                Some(&read_only()),
+                false
+            ),
             Err(ToolCallDenied::ReadOnlyCredentials { .. })
         ));
-        decide("send_alert", ToolAccess::ReadWrite, Some(&read_write()), true)
-            .expect("read-write principal");
+        decide(
+            "send_alert",
+            ToolAccess::ReadWrite,
+            Some(&read_write()),
+            true,
+        )
+        .expect("read-write principal");
         decide("sql", ToolAccess::ReadOnly, None, true).expect("read-only tool");
     }
 
