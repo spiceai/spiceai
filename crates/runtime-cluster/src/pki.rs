@@ -37,14 +37,15 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use arc_swap::ArcSwap;
 use rustls::{
     DigitallySignedStruct, DistinguishedName, SignatureScheme,
-    client::danger::HandshakeSignatureValid,
+    client::{WebPkiServerVerifier, danger::HandshakeSignatureValid},
     pki_types::{
-        CertificateDer, PrivateKeyDer, UnixTime,
+        CertificateDer, PrivateKeyDer, ServerName, UnixTime,
         pem::{self, PemObject},
     },
     server::{
@@ -58,6 +59,9 @@ use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 use x509_certificate::CapturedX509Certificate;
 
 use runtime_tls::{CertWatcher, ReloadScope, reload::record_reload_metric};
+use tokio::io::AsyncWriteExt;
+
+use crate::peer::PeerIdentity;
 
 /// Set of paths the bundle re-reads on every reload.
 #[derive(Clone, Debug)]
@@ -79,6 +83,9 @@ struct ClusterPkiSnapshot {
     /// builds its own internal rustls config from this when each channel
     /// is constructed; storing the immutable input is sufficient.
     client_tls: Arc<ClientTlsConfig>,
+    /// The same outbound trust and client identity as `client_tls`, as a
+    /// rustls config [`ClusterPkiBundle::observe_peer_identity`] connects with.
+    observe_tls: Arc<rustls::ClientConfig>,
     /// SHA-256 over (CA || cert || key) for change detection. The
     /// watcher already debounces, but on slow filesystems `notify` can
     /// surface modify events for files whose contents are byte-identical
@@ -176,6 +183,63 @@ impl ClusterPkiBundle {
     #[must_use]
     pub fn client_tls_config(&self) -> Arc<ClientTlsConfig> {
         Arc::clone(&self.inner.load().client_tls)
+    }
+
+    /// Connects to the cluster node at `host:port` the way this node connects
+    /// to its peers — verifying the node's certificate against the cluster CA
+    /// and `host`, and presenting this node's certificate — and returns the
+    /// identity the node's certificate gives it. The connection is closed once
+    /// the TLS handshake completes; no request is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node cannot be reached within `timeout`, `host`
+    /// is not a DNS name or IP address, or the handshake fails, for example
+    /// because the node's certificate is not valid for `host`.
+    pub async fn observe_peer_identity(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> io::Result<PeerIdentity> {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        let server_name = ServerName::try_from(host.to_string()).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("'{host}' is not a DNS name or IP address: {err}"),
+            )
+        })?;
+        let connector =
+            tokio_rustls::TlsConnector::from(Arc::clone(&self.inner.load().observe_tls));
+        let observe = async {
+            let tcp = tokio::net::TcpStream::connect((host, port)).await?;
+            let mut tls = connector.connect(server_name, tcp).await?;
+            let identity = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(<[CertificateDer<'static>]>::first)
+                .and_then(PeerIdentity::from_certificate);
+            // Best effort: the handshake is all this connection is for.
+            let _ = tls.shutdown().await;
+            identity.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the node at {host}:{port} presented no readable certificate"),
+                )
+            })
+        };
+        tokio::time::timeout(timeout, observe)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no TLS handshake with {host}:{port} within {timeout:?}"),
+                )
+            })?
     }
 
     /// Fingerprint of the currently-loaded bundle, for tests.
@@ -328,13 +392,16 @@ fn parse_and_validate(paths: &ClusterPkiPaths) -> io::Result<ClusterPkiSnapshot>
             )
         })?;
     }
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+    let roots = Arc::new(roots);
+    let verifier = WebPkiClientVerifier::builder(Arc::clone(&roots))
         .build()
         .map_err(|err| {
             io::Error::other(format!(
                 "rustls failed to build cluster client verifier: {err}"
             ))
         })?;
+
+    let observe_tls = build_observe_config(roots, &cert_pem, &key_pem)?;
 
     // Outbound ClientTlsConfig.
     let client_tls = Arc::new(
@@ -349,8 +416,38 @@ fn parse_and_validate(paths: &ClusterPkiPaths) -> io::Result<ClusterPkiSnapshot>
         cert: Arc::new(cert),
         verifier,
         client_tls,
+        observe_tls,
         fingerprint,
     })
+}
+
+/// The rustls client config [`ClusterPkiBundle::observe_peer_identity`] uses:
+/// the cluster CA as the only trust anchor, this node's certificate as its
+/// client identity, and h2, the protocol every cluster listener serves.
+fn build_observe_config(
+    roots: Arc<rustls::RootCertStore>,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> io::Result<Arc<rustls::ClientConfig>> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let server_verifier = WebPkiServerVerifier::builder_with_provider(roots, Arc::clone(&provider))
+        .build()
+        .map_err(|err| {
+            io::Error::other(format!(
+                "rustls failed to build cluster server verifier: {err}"
+            ))
+        })?;
+    let chain = load_certs(cert_pem)
+        .map_err(|err| io::Error::other(format!("node cert parse failed: {err}")))?;
+    let key = load_key(key_pem).map_err(io::Error::other)?;
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| io::Error::other(format!("rustls protocol versions: {err}")))?
+        .with_webpki_verifier(server_verifier)
+        .with_client_auth_cert(chain, key)
+        .map_err(|err| io::Error::other(format!("node cert/key not usable: {err}")))?;
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(Arc::new(config))
 }
 
 fn validate_chain(

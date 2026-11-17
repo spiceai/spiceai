@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use super::composite_flight_service::CompositeFlightService;
+use super::peer::ClusterPeerLayer;
+use super::scheduler_grpc::ClusterSchedulerGrpc;
 use crate::Runtime;
 use crate::auth::EndpointAuth;
 use crate::cluster::ExecutorRegistry;
@@ -141,9 +143,15 @@ pub async fn start_internal_cluster_server(
         });
     }
 
-    let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler)
-        .max_decoding_message_size(usize::MAX)
-        .max_encoding_message_size(usize::MAX);
+    // Requests on this port are executors' reports — task statuses, shuffle output
+    // locations — never plans: the scheduler's own query path calls the job
+    // methods in process. Responses carry the tasks' plans, so they stay unbounded.
+    let scheduler_grpc_server = SchedulerGrpcServer::new(ClusterSchedulerGrpc::new(
+        scheduler,
+        Arc::clone(&executor_registry),
+    ))
+    .max_decoding_message_size(SCHEDULER_MAX_DECODING_MESSAGE_SIZE)
+    .max_encoding_message_size(usize::MAX);
 
     let advertise_address = rt
         .df
@@ -224,6 +232,16 @@ pub async fn start_internal_cluster_server(
     Ok(())
 }
 
+/// The largest message the scheduler's cluster port accepts. Executors send the
+/// scheduler reports, not plans: a poll for work carries the statuses of the
+/// tasks that finished since the last one, each with one entry (about 150 bytes)
+/// per output partition, and a control-stream message carries metrics,
+/// statistics or partition acknowledgements. A poll reporting a thousand tasks
+/// that each wrote a thousand partitions is under 150 MiB, so this bound leaves
+/// headroom over any report while keeping a peer from making the scheduler
+/// buffer and decode an arbitrarily large message.
+pub(crate) const SCHEDULER_MAX_DECODING_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+
 /// Upper bound on h2 pending-accept resets the executor Flight server tolerates
 /// before tripping Rapid-Reset flood protection. Set well above any realistic
 /// shuffle cancellation burst; see `start_executor_flight_server` for rationale.
@@ -294,13 +312,20 @@ pub async fn start_executor_flight_server(
     let job_executor = rt.job_executor();
     let flight_write_rate_limit_enabled = rt.flight_write_rate_limit_enabled();
 
-    // Add middleware layers for request context, auth, and rate limiting
+    // Add middleware layers for request context, the sending cluster node, auth,
+    // and rate limiting
     let rate_limits = &rt.rate_limits;
     let mut server = server
         .layer(
             RequestContextLayer::new(rt.app(), rt.datafusion(), rt.secrets())
                 .with_job_executor(job_executor),
         )
+        .layer(ClusterPeerLayer::new(
+            rt.df
+                .cluster_config
+                .tls_config()
+                .map(|tls| Arc::clone(tls.scheduler_identities())),
+        ))
         .layer(auth_layer)
         .layer(FlightSessionLayer::new(
             rt.datafusion(),
@@ -313,8 +338,12 @@ pub async fn start_executor_flight_server(
         ));
 
     let server = server.add_service(
+        // Every cluster client — the scheduler's forwarded writes and scans, peer
+        // executors' shuffle fetches and broadcast-join scans — sends messages no
+        // larger than `flight_client::MAX_ENCODING_MESSAGE_SIZE`, so no larger
+        // message is accepted. Responses carry shuffle data and stay unbounded.
         arrow_flight::flight_service_server::FlightServiceServer::new(composite_service)
-            .max_decoding_message_size(usize::MAX)
+            .max_decoding_message_size(flight_client::MAX_ENCODING_MESSAGE_SIZE)
             .max_encoding_message_size(usize::MAX),
     );
 

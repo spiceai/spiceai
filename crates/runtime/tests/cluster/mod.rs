@@ -26,6 +26,7 @@ mod in_memory_shuffle;
 mod instance_identity;
 mod integer_sum_overflow;
 mod io_wait_lending;
+mod peer_identity;
 mod job_store;
 mod scheduler_failover;
 mod simple;

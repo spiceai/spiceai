@@ -49,6 +49,7 @@ use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
 use crate::executor_liveness::{ExecutorLiveness, VIEW_RETENTION};
 use crate::executor_processes::{Admission, ExecutorProcessOrder};
 use crate::metadata::{PartitionKey, normalized_table_name, partition_key};
+use crate::peer::PeerIdentity;
 use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
 
 /// Error type for executor registry operations.
@@ -208,6 +209,9 @@ pub enum ExecutorRegistration {
     /// A process older than the one registered last connected, so two running
     /// processes share the id. The connection is not registered.
     Duplicate,
+    /// The id is registered to a connection whose certificate gives another
+    /// identity, so this connection, from another node, is not registered.
+    IdentityMismatch,
 }
 
 /// What [`ExecutorRegistry::register`] returns: the handles for the connection
@@ -230,6 +234,10 @@ const REPLACED_PROCESSES_KEPT: usize = 8;
 struct ExecutorProcesses {
     /// The connection registered last, if it is still registered.
     connection: Option<u64>,
+    /// The identity of the certificate `connection` presented; `None` without
+    /// cluster mTLS. While `connection` is registered, only a connection with
+    /// the same identity registers under the id.
+    identity: Option<PeerIdentity>,
     /// The process that registered last. Executors that send no process id
     /// leave this unset.
     current: Option<String>,
@@ -669,14 +677,18 @@ impl ExecutorRegistry {
     }
 
     /// Registers the control-stream connection of the executor `executor_id`
-    /// whose process sent `process_id` (empty for executors that send none).
+    /// whose process sent `process_id` (empty for executors that send none), over
+    /// a connection whose certificate gives it `identity` (`None` without cluster
+    /// mTLS).
     ///
     /// The connection replaces any earlier one under the same id, except for a
-    /// [`ExecutorRegistration::Duplicate`], which is not registered.
+    /// [`ExecutorRegistration::Duplicate`] or an
+    /// [`ExecutorRegistration::IdentityMismatch`], which are not registered.
     pub async fn register(
         &self,
         executor_id: String,
         process_id: &str,
+        identity: Option<PeerIdentity>,
         request_tx: mpsc::Sender<SchedulerControlMessage>,
     ) -> Registered {
         let connection = ExecutorConnection::new(request_tx);
@@ -685,6 +697,19 @@ impl ExecutorRegistry {
             pending_acks: connection.pending_acks(),
         };
         let connection_id = self.next_connection.fetch_add(1, Ordering::Relaxed);
+        let refused = Registered {
+            handles: handles.clone(),
+            registration: ExecutorRegistration::IdentityMismatch,
+            connection: connection_id,
+        };
+        // Checked before the process is admitted, so another node's process id
+        // never enters the order the schedulers share for this executor.
+        if self
+            .registered_identity_conflict(&executor_id, identity.as_ref())
+            .is_some()
+        {
+            return refused;
+        }
         let admission = self.admit(&executor_id, process_id).await;
 
         let mut connections = self.connections.write().await;
@@ -692,9 +717,13 @@ impl ExecutorRegistry {
         let registration = {
             let mut processes = self.processes.lock();
             let seen = processes.entry(executor_id.clone()).or_default();
+            if seen.connection.is_some() && seen.identity != identity {
+                return refused;
+            }
             let registration = classify_registration(seen, process_id, admission, is_reconnect);
             if registration != ExecutorRegistration::Duplicate {
                 seen.connection = Some(connection_id);
+                seen.identity = identity;
             }
             registration
         };
@@ -863,6 +892,25 @@ impl ExecutorRegistry {
             .lock()
             .get(executor_id)
             .is_some_and(|seen| seen.connection == Some(connection))
+    }
+
+    /// The identity `executor_id` is registered to, when a control stream is
+    /// registered under it and its certificate gives an identity other than
+    /// `identity`: a request naming the executor from another node.
+    ///
+    /// `Some(None)` is an id registered without cluster mTLS, claimed over a
+    /// connection that presented a certificate.
+    #[must_use]
+    pub fn registered_identity_conflict(
+        &self,
+        executor_id: &str,
+        identity: Option<&PeerIdentity>,
+    ) -> Option<Option<PeerIdentity>> {
+        self.processes
+            .lock()
+            .get(executor_id)
+            .filter(|seen| seen.connection.is_some() && seen.identity.as_ref() != identity)
+            .map(|seen| seen.identity.clone())
     }
 
     /// Unregisters `executor_id` and removes it from all three tracking maps,
@@ -1854,7 +1902,7 @@ mod tests {
         let registry = make_registry().await;
         let (tx, _rx) = mpsc::channel(1);
 
-        let registered = registry.register("executor-1".to_string(), "", tx).await;
+        let registered = registry.register("executor-1".to_string(), "", None, tx).await;
 
         let executors = registry.connected_executors().await;
         assert_eq!(executors, vec!["executor-1"]);
@@ -1869,14 +1917,64 @@ mod tests {
         assert_eq!(executors, [] as [String; 0]);
     }
 
+    /// An executor id belongs to the node whose certificate registered it for as
+    /// long as that registration lasts: another node's claim — even one from a
+    /// newer process, which would otherwise read as a restart and replace it — is
+    /// refused and leaves the registration untouched, while the same node
+    /// restarting is accepted. Once the registration ends the id is free again.
+    #[tokio::test]
+    async fn an_executor_id_belongs_to_the_node_that_registered_it() {
+        use crate::peer::test_support::identity;
+
+        let registry = make_registry().await;
+        let victim = identity("executor-a");
+        let intruder = identity("executor-b");
+
+        let (tx1, _rx1) = mpsc::channel(1);
+        let first = registry
+            .register("exec-a".to_string(), "run-1", Some(victim.clone()), tx1)
+            .await;
+        assert_eq!(first.registration, ExecutorRegistration::New);
+
+        // Another node, from a newer process.
+        let (tx2, _rx2) = mpsc::channel(1);
+        let claim = registry
+            .register("exec-a".to_string(), "run-9", Some(intruder.clone()), tx2)
+            .await;
+        assert_eq!(claim.registration, ExecutorRegistration::IdentityMismatch);
+        assert!(registry.is_current("exec-a", first.connection));
+        assert!(!registry.is_current("exec-a", claim.connection));
+        assert_eq!(
+            registry.registered_identity_conflict("exec-a", Some(&intruder)),
+            Some(Some(victim.clone()))
+        );
+        assert_eq!(registry.registered_identity_conflict("exec-a", Some(&victim)), None);
+
+        // The registering node restarting is a restart, as before.
+        let (tx3, _rx3) = mpsc::channel(1);
+        let restart = registry
+            .register("exec-a".to_string(), "run-2", Some(victim.clone()), tx3)
+            .await;
+        assert_eq!(restart.registration, ExecutorRegistration::Restarted);
+
+        // After the registration ends, another node may take the id.
+        assert!(registry.unregister("exec-a", restart.connection).await);
+        assert_eq!(registry.registered_identity_conflict("exec-a", Some(&intruder)), None);
+        let (tx4, _rx4) = mpsc::channel(1);
+        let takeover = registry
+            .register("exec-a".to_string(), "run-3", Some(intruder), tx4)
+            .await;
+        assert_eq!(takeover.registration, ExecutorRegistration::Restarted);
+    }
+
     #[tokio::test]
     async fn test_reconnect_replaces_connection() {
         let registry = make_registry().await;
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), "", tx1).await;
-        registry.register("executor-1".to_string(), "", tx2).await;
+        registry.register("executor-1".to_string(), "", None, tx1).await;
+        registry.register("executor-1".to_string(), "", None, tx2).await;
 
         let executors = registry.connected_executors().await;
         assert_eq!(executors.len(), 1);
@@ -1892,9 +1990,9 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
 
-        let first = registry.register("exec-a".to_string(), "run-1", tx1).await;
+        let first = registry.register("exec-a".to_string(), "run-1", None, tx1).await;
         assert_eq!(first.registration, ExecutorRegistration::New);
-        let restarted = registry.register("exec-a".to_string(), "run-2", tx2).await;
+        let restarted = registry.register("exec-a".to_string(), "run-2", None, tx2).await;
         assert_eq!(restarted.registration, ExecutorRegistration::Restarted);
         assert!(!registry.is_current("exec-a", first.connection));
         assert!(registry.is_current("exec-a", restarted.connection));
@@ -1905,7 +2003,7 @@ mod tests {
         );
         assert_eq!(registry.connected_executors().await, vec!["exec-a"]);
 
-        let reconnected = registry.register("exec-a".to_string(), "run-2", tx3).await;
+        let reconnected = registry.register("exec-a".to_string(), "run-2", None, tx3).await;
         assert_eq!(reconnected.registration, ExecutorRegistration::Reconnected);
         assert!(registry.unregister("exec-a", reconnected.connection).await);
         assert_eq!(registry.connected_executors().await, [] as [String; 0]);
@@ -1922,7 +2020,7 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
 
-        registry.register("exec-a".to_string(), "run-1", tx1).await;
+        registry.register("exec-a".to_string(), "run-1", None, tx1).await;
         registry
             .insert_flight_sql_client(
                 "exec-a".to_string(),
@@ -1936,7 +2034,7 @@ mod tests {
             ["127.0.0.1:50101"]
         );
 
-        registry.register("exec-a".to_string(), "run-2", tx2).await;
+        registry.register("exec-a".to_string(), "run-2", None, tx2).await;
         assert_eq!(registry.flight_sql_clients_count().await, 0);
         assert_eq!(registry.ready_executor_addresses_sync(), [] as [String; 0]);
 
@@ -1948,7 +2046,7 @@ mod tests {
                 dummy_flight_sql_client(),
             )
             .await;
-        registry.register("exec-a".to_string(), "run-3", tx3).await;
+        registry.register("exec-a".to_string(), "run-3", None, tx3).await;
         assert_eq!(registry.flight_sql_clients_count().await, 1);
         assert_eq!(
             registry.ready_executor_addresses_sync(),
@@ -1995,7 +2093,7 @@ mod tests {
                 )
                 .await
         );
-        registry.register("exec-a".to_string(), "run-4", tx4).await;
+        registry.register("exec-a".to_string(), "run-4", None, tx4).await;
         assert_eq!(
             registry.ready_executor_addresses_sync(),
             ["127.0.0.1:50103"]
@@ -2010,7 +2108,7 @@ mod tests {
         let registry = make_registry().await;
         let (tx1, _rx1) = mpsc::channel(1);
 
-        let earlier = registry.register("exec-a".to_string(), "run-1", tx1).await;
+        let earlier = registry.register("exec-a".to_string(), "run-1", None, tx1).await;
         registry
             .insert_flight_sql_client(
                 "exec-a".to_string(),
@@ -2034,7 +2132,7 @@ mod tests {
         let registry = make_registry().await;
         let (tx1, _rx1) = mpsc::channel(1);
 
-        let earlier = registry.register("exec-a".to_string(), "run-2", tx1).await;
+        let earlier = registry.register("exec-a".to_string(), "run-2", None, tx1).await;
         assert!(
             registry
                 .insert_flight_sql_client(
@@ -2062,9 +2160,9 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
 
-        registry.register("exec-a".to_string(), "run-1", tx1).await;
-        let later = registry.register("exec-a".to_string(), "run-2", tx2).await;
-        let returning = registry.register("exec-a".to_string(), "run-1", tx3).await;
+        registry.register("exec-a".to_string(), "run-1", None, tx1).await;
+        let later = registry.register("exec-a".to_string(), "run-2", None, tx2).await;
+        let returning = registry.register("exec-a".to_string(), "run-1", None, tx3).await;
 
         assert_eq!(returning.registration, ExecutorRegistration::Duplicate);
         assert!(registry.is_current("exec-a", later.connection));
@@ -2083,20 +2181,20 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         earlier_scheduler
-            .register("exec-a".to_string(), "run-2", tx1)
+            .register("exec-a".to_string(), "run-2", None, tx1)
             .await;
         earlier_scheduler
-            .register("exec-a".to_string(), "run-1", tx2)
+            .register("exec-a".to_string(), "run-1", None, tx2)
             .await;
 
         let later_scheduler = registry_over(&store).await;
         let (tx3, _rx3) = mpsc::channel(1);
         let (tx4, _rx4) = mpsc::channel(1);
         let newer = later_scheduler
-            .register("exec-a".to_string(), "run-1", tx3)
+            .register("exec-a".to_string(), "run-1", None, tx3)
             .await;
         let older = later_scheduler
-            .register("exec-a".to_string(), "run-2", tx4)
+            .register("exec-a".to_string(), "run-2", None, tx4)
             .await;
 
         assert_eq!(newer.registration, ExecutorRegistration::New);
@@ -2130,17 +2228,17 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         earlier_scheduler
-            .register("exec-a".to_string(), "run-2", tx1)
+            .register("exec-a".to_string(), "run-2", None, tx1)
             .await;
         earlier_scheduler
-            .register("exec-a".to_string(), "run-1", tx2)
+            .register("exec-a".to_string(), "run-1", None, tx2)
             .await;
 
         let later_scheduler = registry_over(&store).await;
         let (tx3, _rx3) = mpsc::channel(1);
         let (tx4, _rx4) = mpsc::channel(1);
         let replaced = later_scheduler
-            .register("exec-a".to_string(), "run-2", tx3)
+            .register("exec-a".to_string(), "run-2", None, tx3)
             .await;
         assert_eq!(replaced.registration, ExecutorRegistration::Duplicate);
         assert!(
@@ -2155,7 +2253,7 @@ mod tests {
         );
 
         let live = later_scheduler
-            .register("exec-a".to_string(), "run-1", tx4)
+            .register("exec-a".to_string(), "run-1", None, tx4)
             .await;
         assert_eq!(live.registration, ExecutorRegistration::New);
         assert!(later_scheduler.is_current("exec-a", live.connection));
@@ -2171,11 +2269,11 @@ mod tests {
             let (tx, rx) = mpsc::channel(1);
             receivers.push(rx);
             registry
-                .register("exec-a".to_string(), &format!("run-{run}"), tx)
+                .register("exec-a".to_string(), &format!("run-{run}"), None, tx)
                 .await;
         }
         let (tx, _rx) = mpsc::channel(1);
-        let replacement = registry.register("exec-a".to_string(), "run-05", tx).await;
+        let replacement = registry.register("exec-a".to_string(), "run-05", None, tx).await;
         assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
         assert!(registry.is_current("exec-a", replacement.connection));
     }
@@ -2190,16 +2288,16 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         earlier_scheduler
-            .register("exec-a".to_string(), "run-2", tx1)
+            .register("exec-a".to_string(), "run-2", None, tx1)
             .await;
         earlier_scheduler
-            .register("exec-a".to_string(), "run-1", tx2)
+            .register("exec-a".to_string(), "run-1", None, tx2)
             .await;
 
         let later_scheduler = registry_over(&store).await;
         let (tx3, _rx3) = mpsc::channel(1);
         later_scheduler
-            .register("exec-a".to_string(), "run-1", tx3)
+            .register("exec-a".to_string(), "run-1", None, tx3)
             .await;
         assert!(
             later_scheduler
@@ -2254,10 +2352,10 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         new_scheduler
-            .register("exec-b".to_string(), "run-0", tx1)
+            .register("exec-b".to_string(), "run-0", None, tx1)
             .await;
         let replaced = new_scheduler
-            .register("exec-a".to_string(), "run-0", tx2)
+            .register("exec-a".to_string(), "run-0", None, tx2)
             .await;
         assert_eq!(replaced.registration, ExecutorRegistration::Duplicate);
     }
@@ -2291,7 +2389,7 @@ mod tests {
             .await
             .insert("exec-a".to_string(), ExecutorConnection::new(tx1));
 
-        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        let replacement = registry.register("exec-a".to_string(), "run-1", None, tx2).await;
         assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
     }
 
@@ -2325,7 +2423,7 @@ mod tests {
             .await
             .insert("exec-a".to_string(), ExecutorConnection::new(tx1));
 
-        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        let replacement = registry.register("exec-a".to_string(), "run-1", None, tx2).await;
         assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
         assert_eq!(
             order
@@ -2387,7 +2485,7 @@ mod tests {
                 assert!(insert_replacement_endpoint().await);
                 assert!(registry.unregister("exec-a", incumbent_connection).await);
             } else {
-                let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+                let replacement = registry.register("exec-a".to_string(), "run-1", None, tx2).await;
                 assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
                 assert_eq!(registry.ready_executor_addresses_sync(), [] as [String; 0]);
                 assert!(insert_replacement_endpoint().await);
@@ -2424,7 +2522,7 @@ mod tests {
         let registry = registry_over(&store).await;
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
-        registry.register("exec-a".to_string(), "run-2", tx1).await;
+        registry.register("exec-a".to_string(), "run-2", None, tx1).await;
         assert!(
             registry
                 .insert_flight_sql_client(
@@ -2437,7 +2535,7 @@ mod tests {
         );
         break_process_order(&registry, &store).await;
 
-        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        let replacement = registry.register("exec-a".to_string(), "run-1", None, tx2).await;
         assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
         assert_eq!(
             registry.ready_executor_addresses_sync(),
@@ -2480,9 +2578,9 @@ mod tests {
             };
             if replacement_endpoint_first {
                 assert!(insert_replacement_endpoint().await);
-                registry.register("exec-a".to_string(), "run-1", tx).await;
+                registry.register("exec-a".to_string(), "run-1", None, tx).await;
             } else {
-                let replacement = registry.register("exec-a".to_string(), "run-1", tx).await;
+                let replacement = registry.register("exec-a".to_string(), "run-1", None, tx).await;
                 assert_eq!(replacement.registration, ExecutorRegistration::New);
                 assert!(insert_replacement_endpoint().await);
             }
@@ -2505,7 +2603,7 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
 
-        let predecessor = registry.register("exec-a".to_string(), "run-2", tx1).await;
+        let predecessor = registry.register("exec-a".to_string(), "run-2", None, tx1).await;
         assert!(
             registry
                 .insert_flight_sql_client(
@@ -2518,7 +2616,7 @@ mod tests {
         );
         assert!(registry.unregister("exec-a", predecessor.connection).await);
 
-        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        let replacement = registry.register("exec-a".to_string(), "run-1", None, tx2).await;
         assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
         assert!(registry.is_current("exec-a", replacement.connection));
         assert!(
@@ -2536,7 +2634,7 @@ mod tests {
             ["127.0.0.1:50102"]
         );
 
-        let returning = registry.register("exec-a".to_string(), "run-2", tx3).await;
+        let returning = registry.register("exec-a".to_string(), "run-2", None, tx3).await;
         assert_eq!(returning.registration, ExecutorRegistration::Duplicate);
         assert!(registry.is_current("exec-a", replacement.connection));
     }
@@ -2550,10 +2648,10 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
 
         let first = registry
-            .register("127.0.0.1:50062".to_string(), "", tx1)
+            .register("127.0.0.1:50062".to_string(), "", None, tx1)
             .await;
         let second = registry
-            .register("127.0.0.1:50062".to_string(), "", tx2)
+            .register("127.0.0.1:50062".to_string(), "", None, tx2)
             .await;
         assert_eq!(first.registration, ExecutorRegistration::New);
         assert_eq!(second.registration, ExecutorRegistration::Reconnected);
@@ -2587,9 +2685,9 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), "", tx1).await;
-        let executor_2 = registry.register("executor-2".to_string(), "", tx2).await;
-        registry.register("executor-3".to_string(), "", tx3).await;
+        registry.register("executor-1".to_string(), "", None, tx1).await;
+        let executor_2 = registry.register("executor-2".to_string(), "", None, tx2).await;
+        registry.register("executor-3".to_string(), "", None, tx3).await;
 
         let mut executors = registry.connected_executors().await;
         executors.sort();
@@ -2751,9 +2849,9 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
-        registry.register("e1".to_string(), "", tx1).await;
-        let e2 = registry.register("e2".to_string(), "", tx2).await;
-        let e3 = registry.register("e3".to_string(), "", tx3).await;
+        registry.register("e1".to_string(), "", None, tx1).await;
+        let e2 = registry.register("e2".to_string(), "", None, tx2).await;
+        let e3 = registry.register("e3".to_string(), "", None, tx3).await;
         assert_eq!(registry.connected_executor_count().await, 3);
         assert_eq!(registry.flight_sql_clients_count().await, 0);
 
@@ -2793,7 +2891,7 @@ mod tests {
         let registry = make_registry().await;
         let (tx, _rx) = mpsc::channel(1);
 
-        let registered = registry.register("executor-1".to_string(), "", tx).await;
+        let registered = registry.register("executor-1".to_string(), "", None, tx).await;
 
         // Unregistering a non-existent executor should not panic
         assert!(
@@ -2998,7 +3096,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         std::mem::forget(rx);
         registry
-            .register(executor_id.to_string(), process_id, tx)
+            .register(executor_id.to_string(), process_id, None, tx)
             .await;
         registry
             .insert_flight_sql_client(
@@ -3223,7 +3321,7 @@ mod tests {
             .expect("assign partition");
         // Connected, but without a FlightSQL client, so not ready.
         let (tx, _rx) = mpsc::channel(1);
-        registry.register("executor-1".to_string(), "", tx).await;
+        registry.register("executor-1".to_string(), "", None, tx).await;
 
         let error = registry
             .resolve_accelerated_partitions(&table, &id_schema(), true)
@@ -3350,7 +3448,7 @@ mod tests {
     async fn send_command_with_ack_success() {
         let registry = make_registry().await;
         let (tx, rx) = mpsc::channel(8);
-        let handles = registry.register("e1".to_string(), "", tx).await.handles;
+        let handles = registry.register("e1".to_string(), "", None, tx).await.handles;
         spawn_fake_executor_ack(rx, handles.pending_acks.clone(), None);
 
         let result = registry
@@ -3368,7 +3466,7 @@ mod tests {
     async fn send_command_with_ack_propagates_application_error() {
         let registry = make_registry().await;
         let (tx, rx) = mpsc::channel(8);
-        let handles = registry.register("e1".to_string(), "", tx).await.handles;
+        let handles = registry.register("e1".to_string(), "", None, tx).await.handles;
         spawn_fake_executor_ack(
             rx,
             handles.pending_acks.clone(),
@@ -3397,7 +3495,7 @@ mod tests {
     async fn send_command_with_ack_times_out_when_no_response() {
         let registry = make_registry().await;
         let (tx, _rx) = mpsc::channel(8); // _rx kept alive but never read
-        let _handles = registry.register("e1".to_string(), "", tx).await;
+        let _handles = registry.register("e1".to_string(), "", None, tx).await;
 
         let err = registry
             .send_command_with_ack(

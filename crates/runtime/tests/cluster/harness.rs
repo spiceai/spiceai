@@ -162,6 +162,27 @@ impl ClusterHarness {
         ClusterHarnessBuilder::new()
     }
 
+    /// The `host:port` the scheduler serves its internal cluster port at, as
+    /// another node connects to it.
+    #[must_use]
+    pub fn scheduler_cluster_address(&self) -> &str {
+        &self.scheduler_cluster_addr
+    }
+
+    /// The cluster PKI the harness issues node certificates from, so a test can
+    /// mint one node's identity and connect as it. `None` on a `without_mtls`
+    /// harness.
+    #[must_use]
+    pub fn cluster_pki(&self) -> Option<&test_framework::pki::PkiConfig> {
+        self.pki.as_ref()
+    }
+
+    /// The scheduler's executor registry, which records who is registered.
+    #[must_use]
+    pub fn scheduler_executor_registry(&self) -> Option<&Arc<ExecutorRegistry>> {
+        self.executor_registry.as_ref()
+    }
+
     /// Block until exactly `n` executors have registered with the scheduler,
     /// or return an error after `timeout`.
     pub async fn wait_for_executors(&self, timeout: Duration) -> Result<(), anyhow::Error> {
