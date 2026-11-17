@@ -49,13 +49,6 @@ db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
 delta_kernel_default_engine = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "vtab",
-    "vtab-arrow",
-    "appender-arrow",
-], optional = true }
 duration-parse = { path = "../duration-parse" }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
@@ -150,13 +143,6 @@ debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
 delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
 elasticsearch = ["dep:elasticsearch"]
-duckdb = [
-    "adbc",
-    "dep:duckdb",
-    "db_connection_pool/duckdb",
-    "datafusion-table-providers/duckdb",
-    "datafusion-table-providers/duckdb-federation",
-]
 flightsql = []
 kafka = ["dep:rdkafka"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
@@ -207,7 +193,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 wiremock = "0.6"
-zstd = "0.13.3"
+zstd = "0.13.5"
 
 [[bench]]
 harness = false

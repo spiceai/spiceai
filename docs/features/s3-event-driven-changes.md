@@ -2,7 +2,7 @@
 
 S3 listing datasets can use `refresh_mode: changes` driven by **S3 Event Notifications → SQS**. Spice long-polls the queue and, on `s3:ObjectCreated:*`, reads the new object and appends its rows into the accelerator.
 
-This is the event-driven alternative to interval / `append` + `time_column: last_modified` (list-and-poll). Glue and Iceberg catalog hooks are **not** on this path.
+This is the event-driven alternative to interval / `append` + `time_column: _last_modified` and `time_format: timestamptz` (list-and-poll). Glue and Iceberg catalog hooks are **not** on this path.
 
 This is **not** row-level CDC. ObjectCreated appends the object's rows. ObjectRemoved never deletes individual rows; the default is to ignore deletes, and `s3_on_object_removed: rebuild` replaces the whole accelerator from the listing prefix.
 
@@ -31,7 +31,7 @@ datasets:
       file_format: parquet
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: changes
       primary_key: id

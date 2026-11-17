@@ -189,9 +189,9 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
 /// federation wrapper must not hide the inner `AcceleratedTable` from `should_partition`;
 /// the query must still distribute (`FlightSqlExec`).
 #[tokio::test(flavor = "multi_thread")]
-// Builds a DuckDB file to federate over, so it needs the optional `duckdb`
-// dependency this crate only carries under its own feature.
-#[cfg(feature = "duckdb")]
+// Reads the source through the installed DuckDB library, which the `duckdb:`
+// connector loads over ADBC.
+#[cfg(feature = "adbc")]
 async fn cluster_distributes_accelerated_table_with_federated_source() -> Result<(), anyhow::Error>
 {
     let _ = tracing_subscriber::fmt()
@@ -203,7 +203,7 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
     let duck_tempdir = tempfile::tempdir().expect("duckdb tempdir");
     let db_path = duck_tempdir.path().join("source.duckdb");
     {
-        let conn = duckdb::Connection::open(&db_path).expect("open duckdb");
+        let conn = duckdb_oracle::Connection::open(&db_path).expect("open duckdb");
         conn.execute_batch(
             "CREATE TABLE test_data (id BIGINT, name VARCHAR, age BIGINT, city VARCHAR, score BIGINT);
              INSERT INTO test_data VALUES

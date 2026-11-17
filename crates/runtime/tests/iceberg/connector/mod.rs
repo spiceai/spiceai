@@ -87,7 +87,7 @@ async fn iceberg_integration_test_cayenne_acceleration() -> Result<(), anyhow::E
                 dataset,
                 "SELECT * FROM customer ORDER BY c_custkey LIMIT 10",
                 true,
-                Some("iceberg_integration_test_duckdb_acceleration"),
+                Some("iceberg_integration_test_cayenne_acceleration"),
             )
             .await?;
 
@@ -136,7 +136,7 @@ async fn iceberg_integration_test_cayenne_acceleration_restart() -> Result<(), a
                 dataset,
                 "SELECT * FROM customer ORDER BY c_custkey LIMIT 10",
                 true,
-                Some("iceberg_integration_test_duckdb_acceleration_restart"),
+                Some("iceberg_integration_test_cayenne_acceleration_restart"),
             )
             .await?;
 

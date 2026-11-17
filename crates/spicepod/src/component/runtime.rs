@@ -3244,14 +3244,14 @@ datasets:
                 "Catalog 'lake' sets `goal_qph`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
             ]
         );
-        assert!(
+        assert_eq!(
             retired_tuning_param_warnings(
                 "dataset",
                 "orders",
                 &HashMap::new(),
                 RETIRED_DATASET_TUNING_PARAMS
-            )
-            .is_empty()
+            ),
+            [] as [String; 0]
         );
     }
 
@@ -3813,7 +3813,7 @@ datasets:
             .telemetry
             .otel_exporter
             .expect("otel_exporter should be present");
-        assert!(otel_config.metrics.is_empty()); // no whitelist means all metrics
+        assert_eq!(otel_config.metrics, [] as [String; 0]); // no whitelist means all metrics
     }
 
     #[test]

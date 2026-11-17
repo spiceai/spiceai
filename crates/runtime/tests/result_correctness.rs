@@ -19,11 +19,11 @@ limitations under the License.
 //!
 //! | Spice side | Standalone oracle |
 //! |------------|-------------------|
-//! | `DuckDB` accelerator (`DataAccelerator`) | `duckdb` crate |
 //! | `SQLite` accelerator (`DataAccelerator`) | `rusqlite` crate |
 //!
 //! The micro tests here reach the accelerator `TableProvider` directly; `surfaces` runs the
-//! same SQL through a Spicepod-built runtime, in-process and over HTTP and Flight SQL.
+//! same SQL through a Spicepod-built runtime, in-process and over HTTP and Flight SQL, and
+//! compares it with both `rusqlite` and the installed `DuckDB` library (`duckdb-oracle`).
 //!
 //! Cayenne vs standalone oracles live under `crates/cayenne/tests/result_correctness_*`.
 //! Standalone DuckDB↔SQLite agreement (no Spice) lives under
@@ -521,14 +521,13 @@ mod sqlite_accel {
 }
 
 // ---------------------------------------------------------------------------
-// Spice DuckDB accelerator ↔ standalone duckdb crate
+// Standalone DuckDB oracle, through the installed DuckDB library
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "duckdb")]
-mod duckdb_accel {
+mod standalone_duckdb {
     use super::write_parquet;
     use arrow::array::RecordBatch;
-    use duckdb::Connection;
+    use duckdb_oracle::Connection;
 
     pub(super) fn load_standalone_duckdb(
         tables: &[(&str, RecordBatch)],
@@ -539,7 +538,7 @@ mod duckdb_accel {
         }
         let temp = tempfile::tempdir().expect("duckdb temp");
         let db = temp.path().join("oracle.duckdb");
-        let conn = Connection::open(&db).expect("open");
+        let conn = Connection::open(&db).unwrap_or_else(|e| panic!("open the DuckDB oracle: {e}"));
         for (name, _) in tables {
             let path = stage.path().join(format!("{name}.parquet"));
             conn.execute_batch(&format!(
@@ -557,8 +556,6 @@ mod duckdb_accel {
         conn: &Connection,
         sql: &str,
     ) -> Result<Vec<RecordBatch>, String> {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let batches: Vec<RecordBatch> = stmt.query_arrow([]).map_err(|e| e.to_string())?.collect();
-        Ok(batches)
+        conn.query(sql).map_err(|e| e.to_string())
     }
 }

@@ -51,7 +51,7 @@ use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
     binary_expr, ident,
 };
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use futures::FutureExt;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
@@ -80,7 +80,7 @@ use runtime_search::{
     udtf::{EmbeddingColumnConfig, table_ref_from_column_expr},
 };
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use {
     crate::search::util::find_index_in_table_provider, search::index::SearchIndex,
     search::provider::SearchQueryProvider,
@@ -92,7 +92,7 @@ use crate::accelerated::AcceleratedTable;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
@@ -355,7 +355,7 @@ impl VectorSearchTableFunc {
         })
     }
 
-    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
     fn index_based_vector_table(
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
@@ -525,7 +525,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         };
 
         // For table with a vector engine, use it.
-        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
         if let Some(table_provider) = Self::index_based_vector_table(&table_provider, &args)? {
             return Ok(table_provider);
         }
@@ -712,8 +712,14 @@ impl VectorSearchUDTFProvider {
         col: &str,
         cfg: &EmbeddingColumnConfig,
     ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
-        let models = self.embedding_models.read().await;
-        let Some(embedding_model) = models.get(&cfg.model_name) else {
+        // Not held while embedding, so a model load or reload does not wait on the provider.
+        let embedding_model = self
+            .embedding_models
+            .read()
+            .await
+            .get(&cfg.model_name)
+            .cloned();
+        let Some(embedding_model) = embedding_model else {
             return Err(Box::from(format!(
                 "Column '{col}' in '{}' requires '{}' embedding model, but is not available.",
                 self.args.tbl, cfg.model_name

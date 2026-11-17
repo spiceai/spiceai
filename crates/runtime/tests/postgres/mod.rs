@@ -40,6 +40,8 @@ pub mod common;
 #[cfg(feature = "postgres")]
 pub mod dml;
 #[cfg(feature = "postgres")]
+pub mod federation_differential;
+#[cfg(feature = "postgres")]
 pub mod numeric_scale;
 #[cfg(feature = "postgres")]
 pub mod replication;

@@ -1,0 +1,47 @@
+name: cayenne-vnext-state-down
+description: >
+  With `runtime.params.cayenne_vnext` off, a Cayenne dataset already on the
+  SQLite metastore does not depend on `runtime.state.location`: after the
+  state bucket goes down, spiced restarts and the dataset loads and matches its
+  PostgreSQL source.
+
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-vnext-state-down
+  runtime:
+    state:
+      location: s3://${sources.lake.bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (id integer PRIMARY KEY, v text);
+        INSERT INTO items SELECT i, 'v' || i FROM generate_series(1, 1000) AS i;
+  - start: {}
+  - query: SELECT * FROM items
+    eventually: 60s
+  - stop-source: lake
+  - restart: { ready: false }
+  - query: SELECT * FROM items
+    eventually: 90s
+  - assert-log: { lacks: ['object-native metastore'] }

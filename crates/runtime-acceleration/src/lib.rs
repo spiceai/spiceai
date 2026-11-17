@@ -24,7 +24,6 @@ pub mod change_sink;
 pub mod dataset_checkpoint;
 mod engine;
 pub mod layout;
-pub mod memory_budget;
 pub mod schema_change;
 pub mod sidecar;
 pub mod snapshot;

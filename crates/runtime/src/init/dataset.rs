@@ -76,7 +76,6 @@ use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
-use runtime_async::is_shutdown_cancellation;
 use runtime_metrics::{self as metrics, components::register_component_metric};
 use runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key;
 use snafu::prelude::*;
@@ -956,14 +955,9 @@ impl Runtime {
             } else {
                 bootstrap_status.complete().await
             };
-            // A restore completed at initialization already updated the cached
-            // timestamps there; only one completed here still needs it.
             let restored = pending && bootstrap_status.is_bootstrapped();
             if restored && ds.is_snapshot_source() && self.refuses_projected_publisher(&ds).await {
                 return;
-            }
-            if restored {
-                update_cached_dataset_timestamps(ds.as_ref()).await;
             }
             // Rows restored from an acceleration snapshot are not the rows an append
             // cursor saved here before describes.
@@ -1999,8 +1993,12 @@ impl Runtime {
             .await
         {
             Ok(connector) => {
-                // File accelerated datasets don't support hot reload.
-                if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
+                // File accelerated datasets don't support hot reload. A hot reload keeps the
+                // registered table serving until its replacement has loaded, so a dataset with
+                // no registered table loads in place instead, and its views find it registered.
+                if self.df.table_exists(&ds.name)
+                    && Self::accelerated_dataset_supports_hot_reload(&ds, &*connector)
+                {
                     tracing::info!("Accelerated Dataset {} updating...", &ds.name);
                     match Arc::clone(&self)
                         .reload_accelerated_dataset(
@@ -2430,6 +2428,7 @@ impl Runtime {
                 data_connector,
                 Arc::clone(&self.embeds),
                 self.secrets(),
+                Arc::clone(&self.status),
             ));
         }
 
@@ -2716,6 +2715,45 @@ impl Runtime {
         Ok(())
     }
 
+    /// Unloads the datasets of `app` that embed with one of `models`.
+    /// [`Self::apply_dataset_diff`] loads again the ones that are valid in the new app.
+    pub(crate) async fn unload_datasets_using_embeddings(
+        self: &Arc<Self>,
+        app: &Arc<App>,
+        models: &HashSet<String>,
+    ) {
+        if models.is_empty() {
+            return;
+        }
+        for ds in Arc::clone(self).get_valid_datasets(app, LogErrors(false)) {
+            if !uses_embedding_model(&ds, models) {
+                continue;
+            }
+            // `file_create` discards the stored rows when the dataset loads again.
+            if ds.is_file_accelerated()
+                && ds.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.mode != crate::component::dataset::acceleration::Mode::FileCreate
+                })
+            {
+                tracing::warn!(
+                    "Dataset {} keeps the embeddings that its file acceleration stored with the previous configuration of its embedding model. A row is embedded with the new configuration only when a refresh writes it again.",
+                    ds.name
+                );
+            }
+            if self.df.table_exists(&ds.name) {
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
+                Arc::clone(self)
+                    .remove_dataset(
+                        ds.name.clone(),
+                        ds.acceleration.as_ref(),
+                        CacheInvalidation::Reload,
+                    )
+                    .await;
+            }
+        }
+    }
+
     /// Returns the datasets this diff loads, reloads or removes: the views that read
     /// them hold the tables they planned against, or failed to find one.
     pub(crate) async fn apply_dataset_diff(
@@ -2729,9 +2767,11 @@ impl Runtime {
 
         // Only the datasets this diff loads or updates are initialized: `mode: file_create`
         // deletes the acceleration state on init, and an unchanged dataset keeps serving from
-        // the `AcceleratedTable` it already has. The one exception is a `localpod` dataset
-        // whose parent this diff reloads: it reads through the table the parent is about to
-        // replace, so it reloads too, after its parent.
+        // the `AcceleratedTable` it already has. The exceptions read through something this
+        // diff replaces, so they reload too: a dataset that embeds with a changed embedding
+        // model, which fixed its vector size and chunker when it loaded, and a `localpod`
+        // dataset whose parent this diff reloads, after its parent.
+        let changed_embeddings = crate::init::embedding::changed_embeddings(current_app, new_app);
         let changed_datasets: Vec<Arc<Dataset>> = valid_datasets
             .iter()
             .filter(|ds| {
@@ -2739,6 +2779,7 @@ impl Runtime {
                     .iter()
                     .find(|current| current.name == ds.name)
                     .is_none_or(|current| current != *ds)
+                    || uses_embedding_model(ds, &changed_embeddings)
             })
             .map(Arc::clone)
             .collect();
@@ -2792,9 +2833,10 @@ impl Runtime {
         // apply queued behind it until the process restarts. A dataset that cannot
         // load lands in an error state reported through `status`; a transient
         // failure keeps retrying inside its own spawned task, while a permanent one
-        // is re-attempted only when the dataset's configuration changes — an
-        // identically-configured dataset is filtered out of `datasets_to_apply`
-        // above, so a later apply schedules no fresh load for it. Tracked in #13098.
+        // is re-attempted only when the dataset's configuration, or an embedding model
+        // it uses, changes — any other identically-configured dataset is filtered out of
+        // `datasets_to_apply` above, so a later apply schedules no fresh load for it.
+        // Tracked in #13098.
         //
         // Built here and spawned below so a localpod dataset can be chained behind
         // the dataset it reads from, exactly as `load_datasets` does at startup:
@@ -3197,12 +3239,7 @@ impl Runtime {
                             source: Box::new(error),
                         },
                     }) {
-                    Ok(bootstrap_status) => {
-                        if bootstrap_status.is_bootstrapped() {
-                            update_cached_dataset_timestamps(ds.as_ref()).await;
-                        }
-                        (ds.name.clone(), Ok(bootstrap_status))
-                    }
+                    Ok(bootstrap_status) => (ds.name.clone(), Ok(bootstrap_status)),
                     Err(err) => {
                         let ds_name = &ds.name;
                         status.update_dataset(
@@ -3569,6 +3606,12 @@ fn is_permanent_dataset_source(source: &(dyn std::error::Error + Send + Sync + '
     if let Some(err) = source.downcast_ref::<dataconnector::DataConnectorError>() {
         return !err.is_retriable();
     }
+    // An unresolved `${ store:key }` in `params:` (see
+    // `runtime_secrets::try_get_params_with_secrets`) is permanent unless a
+    // store errored; retrying a key that is simply absent would loop forever.
+    if let Some(err) = source.downcast_ref::<runtime_secrets::UnresolvedSecretsError>() {
+        return !err.is_retriable();
+    }
     matches!(
         source.downcast_ref::<runtime_parameters::Error>(),
         Some(runtime_parameters::Error::InvalidConfigurationNoSource { .. })
@@ -3900,50 +3943,6 @@ async fn unknown_data_connector(source: &str) -> Error {
     .build()
 }
 
-/// Updates the `fetched_at` column for all records in a cached dataset that was bootstrapped.
-/// This is necessary for caching mode to ensure all bootstrapped records have a valid timestamp.
-async fn update_cached_dataset_timestamps(dataset: &Dataset) {
-    let is_caching_mode = dataset
-        .acceleration
-        .as_ref()
-        .and_then(|acc| acc.refresh_mode)
-        .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
-
-    if !is_caching_mode {
-        return;
-    }
-
-    let is_reset_expiry_on_load_enabled = dataset
-        .acceleration
-        .as_ref()
-        .is_some_and(|acc| acc.snapshots_reset_expiry_on_load_enabled);
-
-    if !is_reset_expiry_on_load_enabled {
-        return;
-    }
-
-    match crate::dataaccelerator::spice_sys::update_caching_engine_fetched_at(dataset).await {
-        Ok(()) => {
-            tracing::info!(
-                "Updated _fetched_at for all records in cached dataset {}",
-                dataset.name
-            );
-        }
-        Err(e) if is_shutdown_cancellation(&e) => {
-            tracing::debug!(
-                "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
-                dataset.name
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to update _fetched_at for cached dataset {}: {e}",
-                dataset.name
-            );
-        }
-    }
-}
-
 /// The message logged when an accelerated dataset with data on disk waits for its
 /// source before serving, because of `reason` (see
 /// `Runtime::waits_for_source_reason`).
@@ -4019,6 +4018,19 @@ fn is_queued_localpod(
         .values()
         .flatten()
         .any(|(ds, _)| resolve_table_reference(ds.name.clone()) == *name)
+}
+
+/// Whether `ds` embeds a column with one of `models`.
+fn uses_embedding_model(ds: &Dataset, models: &HashSet<String>) -> bool {
+    ds.embeddings
+        .iter()
+        .map(|e| &e.model)
+        .chain(
+            ds.columns
+                .iter()
+                .flat_map(|c| c.embeddings.iter().map(|e| &e.model)),
+        )
+        .any(|model| models.contains(model))
 }
 
 /// Extends the datasets a spicepod apply reloads with every `localpod` dataset that reads
@@ -4260,8 +4272,8 @@ mod tests {
     #[test]
     fn the_last_arrival_warning_says_which_rows_are_missed_and_how_to_load_them() {
         assert_eq!(
-            last_arrival_without_overlap_warning("acc", Engine::DuckDB),
-            "Dataset 'acc' (`engine: duckdb`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+            last_arrival_without_overlap_warning("acc", Engine::Sqlite),
+            "Dataset 'acc' (`engine: sqlite`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
     }
 
@@ -4281,12 +4293,11 @@ mod tests {
         let (keyed, time_keyed) = (Some(&key), Some(&with_time));
         let (append, full) = (RefreshMode::Append, RefreshMode::Full);
         for (engine, key, mode, expected, what) in [
-            (Engine::DuckDB, keyed, append, true, "keyed"),
             (Engine::Sqlite, keyed, append, true, "keyed"),
-            (Engine::DuckDB, None, append, false, "unkeyed"),
-            (Engine::DuckDB, keyed, full, false, "full"),
+            (Engine::Sqlite, None, append, false, "unkeyed"),
+            (Engine::Sqlite, keyed, full, false, "full"),
             (Engine::Cayenne, keyed, append, false, "keeps newest"),
-            (Engine::DuckDB, time_keyed, append, false, "key holds time"),
+            (Engine::Sqlite, time_keyed, append, false, "key holds time"),
         ] {
             assert_eq!(
                 reads_by_time_despite_commits(&acceleration(engine, key), ts, mode),
@@ -4904,7 +4915,7 @@ mod tests {
         }
 
         let not_cayenne = Acceleration {
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             ..acceleration_with_params(WriteMode::WriteThrough, &none)
         };
         assert_eq!(
@@ -7086,7 +7097,10 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert_eq!(names(&reloading), ["child", "grandchild"]);
 
         // Nothing changed, nothing reloads.
-        assert!(with_localpod_dependents(vec![], &all).is_empty());
+        assert_eq!(
+            with_localpod_dependents(vec![], &all),
+            [] as [Arc<Dataset>; 0]
+        );
     }
 
     /// Two `localpod` datasets reading through each other can never load; the ordering walk
@@ -7219,6 +7233,53 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             reload.contains("is updating") && reload.contains("previous contents"),
             "the reload wording is unchanged, so an operator's existing alert keeps matching: {reload}"
         );
+    }
+
+    /// A dataset fixes its embedding model's vector size and chunker when it loads, so a change
+    /// to the model reloads every dataset that embeds with it, and no other dataset.
+    #[tokio::test]
+    async fn a_change_to_an_embedding_model_reloads_the_datasets_that_use_it() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let app = |endpoint: &str| {
+            let embedded = |name: &str| {
+                serde_json::from_value::<spicepod::component::dataset::Dataset>(serde_json::json!({
+                    "from": "file:docs.csv",
+                    "name": name,
+                    "columns": [{"name": "body", "embeddings": [{"from": "e"}]}],
+                }))
+                .expect("a valid dataset")
+            };
+            Arc::new(
+                app::AppBuilder::new("embedding_dependents")
+                    .with_embedding(
+                        serde_json::from_value(serde_json::json!({
+                            "name": "e",
+                            "from": "openai:text-embedding-3-small",
+                            "params": {"endpoint": endpoint},
+                        }))
+                        .expect("a valid embedding model"),
+                    )
+                    .with_dataset(embedded("docs"))
+                    .with_dataset(embedded("notes"))
+                    .with_dataset(spicepod_dataset("file:plain.csv", "plain"))
+                    .build(),
+            )
+        };
+        let reloaded = |set: HashSet<ResolvedTableReference>| {
+            let mut names: Vec<String> = set.iter().map(|t| t.table.to_string()).collect();
+            names.sort();
+            names
+        };
+
+        let unchanged = Arc::clone(&runtime)
+            .apply_dataset_diff(&app("http://a"), &app("http://a"))
+            .await;
+        assert_eq!(reloaded(unchanged), [] as [String; 0]);
+
+        let changed = Arc::clone(&runtime)
+            .apply_dataset_diff(&app("http://a"), &app("http://b"))
+            .await;
+        assert_eq!(reloaded(changed), ["docs", "notes"]);
     }
 
     /// An app declaring `names` as `file:` datasets. The `from` never has to resolve: the

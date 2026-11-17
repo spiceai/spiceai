@@ -94,6 +94,8 @@ pub struct PreparedOnConflictDeletionPublish {
     /// and the later durable flip target precisely THIS tombstone — never a
     /// later-staged tombstone for the same PK.
     pub(crate) inlined_delete_id: Option<String>,
+    /// How the inline tombstone, if any, becomes active.
+    pub(crate) tombstone_activation: TombstoneActivation,
     /// Count of existing rows superseded by this upsert, captured from
     /// [`OnConflictDeletions::total_superseded`] at validation time. This is the
     /// authoritative live-row-delta input: it must NOT be recomputed from the
@@ -101,6 +103,19 @@ pub struct PreparedOnConflictDeletionPublish {
     /// SAME `Int64Pk` deletions in two encodings (i64 + committed byte keys), so
     /// summing their lengths double-counts, and neither captures `position_deletions`.
     pub(crate) superseded: usize,
+}
+
+/// How a staged upsert's inline tombstone becomes active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TombstoneActivation {
+    /// It commits inactive; the publish activates it in memory and queues its
+    /// durable flip.
+    AtPublish,
+    /// It commits active, in the record that makes the replacement live (a
+    /// keyed write into a new protected snapshot at final keys), and its id is
+    /// in the table's `inlined_tombstones_awaiting_publish` until the publish,
+    /// which then neither activates it in memory nor queues a flip.
+    Committed,
 }
 
 pub(crate) struct PreparedOnConflictDurablePayload {
@@ -112,6 +127,23 @@ pub(crate) struct PreparedOnConflictDurablePayload {
 }
 
 impl PreparedOnConflictDeletionPublish {
+    pub(crate) fn catalog_publication(&self) -> Option<crate::catalog::CatalogPublication<'_>> {
+        self.durable_payload
+            .as_ref()
+            .map(|payload| crate::catalog::CatalogPublication {
+                table_id: &payload.table_id,
+                snapshot_id: &self.target_snapshot_id,
+                snapshot_sequence: self.snapshot_sequence,
+                insert_sequence: self.insert_sequence,
+                delete_files: &payload.delete_files,
+                insert_pk_bytes: &payload.insert_pk_bytes,
+                inline_tombstone: payload.inline_tombstone.as_ref(),
+                pending_durable_flips: &payload.pending_durable_flips,
+                dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
+                files: &[],
+            })
+    }
+
     /// The commit sequence this staged upsert publishes under. An on-conflict
     /// append carries no `append_sequence`, so this is the value its validated
     /// primary keys must be stamped with for per-key optimistic concurrency.
@@ -205,13 +237,19 @@ impl Drop for PreparedOnConflictDeletionPublish {
         if paths.is_empty() {
             return;
         }
+        let storage = self.table.dataset_storage().cloned();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                super::delete::cleanup_uncommitted_delete_paths(&paths).await;
+                super::delete::cleanup_uncommitted_delete_paths(&paths, storage.as_deref()).await;
             });
         } else {
             std::thread::spawn(move || {
                 for path in paths {
+                    // Object-store files are removed through the store, never as
+                    // a local path; without a runtime they are left for the sweep.
+                    if crate::is_object_store_path(&path.to_string_lossy()) {
+                        continue;
+                    }
                     match std::fs::remove_file(path) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -375,6 +413,9 @@ pub(crate) struct InlinedDataRewrite {
     pub(crate) updated_data: Vec<InlinedData>,
     pub(crate) deleted_inlined_ids: Vec<String>,
     pub(crate) removed_rows: usize,
+    /// The entries `updated_data` and `deleted_inlined_ids` replace, as readers
+    /// see them until the rewrite is published.
+    pub(crate) replaced: Vec<Arc<InlinedData>>,
 }
 
 impl InlinedDataRewrite {
@@ -637,14 +678,18 @@ impl DeletionSink for InlineAwareDeletionSink {
         &self,
         _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let position_based = self.table.pk_deletion_strategy.is_position_based();
+        // A key delete of an upserting table is ordered after the appends staged
+        // before it (`key_tombstones_wait_for_staged_appends`).
         let _write_guard = if super::write_lock_held::is_held() {
             None
+        } else if self.table.key_tombstones_wait_for_staged_appends() {
+            Some(self.table.lock_write_after_staged_appends().await?)
         } else {
-            Some(self.table.write_lock.lock().await)
+            Some(self.table.write_lock_arc().lock_owned().await)
         };
         self.table.ensure_publication_outcome_known()?;
         self.table.mark_maintained_aggregates_stale();
-        let position_based = self.table.pk_deletion_strategy.is_position_based();
         if position_based {
             // As `PkKeysetInvalidatingDeletionSink` does before a delete it cannot
             // enumerate by key: a filter delete leaves no per-key stamps to trust.
@@ -695,6 +740,11 @@ impl DeletionSink for InlineAwareDeletionSink {
             let delete_files = prepared_file_delete
                 .as_ref()
                 .map_or_else(Vec::new, |prepared| prepared.delete_files().to_vec());
+            // The catalog serves the rewrite from when it is applied; readers
+            // keep the entries it replaces as they were until the publish.
+            let awaiting_publish = self
+                .table
+                .hold_replaced_inlined_entries(&inline_rewrite.replaced);
             if let Err(error) = self
                 .table
                 .metadata_catalog()
@@ -710,18 +760,47 @@ impl DeletionSink for InlineAwareDeletionSink {
                 )
                 .await
             {
+                self.table
+                    .release_replaced_inlined_entries(&awaiting_publish);
                 return Err(Box::new(error));
             }
             if let Some(prepared) = &mut prepared_file_delete {
                 prepared.mark_catalog_committed();
             }
-            if let Some(prepared) = prepared_file_delete {
-                prepared.publish()?;
+            if crate::catalog::commit_left_to_scope_owner() {
+                // Buffered: the scope's owner commits the record, then runs this
+                // publish, so no reader sees the delete before it is durable.
+                // The vectors it replaces go only after that commit. Until the
+                // publish, a later upsert treats the deleted keys as tombstoned.
+                let table = self.table.clone_for_write();
+                let unpublished_deletes = prepared_file_delete.as_ref().and_then(|prepared| {
+                    self.table
+                        .hold_unpublished_key_deletes(prepared.tombstoned_keys())
+                });
+                self.table
+                    .publish_when_committed(async move {
+                        table
+                            .publish_delete(
+                                prepared_file_delete,
+                                &inline_rewrite,
+                                &awaiting_publish,
+                            )
+                            .await;
+                        drop(unpublished_deletes);
+                        table.remove_dropped_deletion_vector_files(replaced_vectors);
+                    })
+                    .await;
+            } else {
+                if let Some(prepared) = prepared_file_delete {
+                    prepared.publish()?;
+                }
+                self.table
+                    .release_replaced_inlined_entries(&awaiting_publish);
+                if !inline_rewrite.is_empty() {
+                    self.table.publish_inlined_rewrite(&inline_rewrite);
+                }
+                file_sink.remove_replaced_deletion_vector_files(replaced_vectors);
             }
-            if !inline_rewrite.is_empty() {
-                self.table.publish_inlined_rewrite(&inline_rewrite);
-            }
-            file_sink.remove_replaced_deletion_vector_files(replaced_vectors);
         }
 
         let mut deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {

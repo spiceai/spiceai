@@ -21,7 +21,7 @@ limitations under the License.
 //! unchanged. This layer only refuses what those engines already treat as a
 //! constraint error (or, for `SQLite`, silently accept): a null key, and a key
 //! repeated inside one batch. A later batch of the same write may repeat a
-//! key; that is an upsert, as `test_append_to_accelerator_duckdb` requires.
+//! key; that is an upsert.
 //!
 //! `SQLite` stores a bound NaN as NULL, so under [`NanKey::Null`] a NaN key
 //! is refused the same way. `DuckDB` keeps NaN as a value.
