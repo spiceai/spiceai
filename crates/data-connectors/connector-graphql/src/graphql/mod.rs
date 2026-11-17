@@ -165,18 +165,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// message that a backend timeout also produces, so it must not make the
 /// refresh permanent.
 #[must_use]
-/// What to do about a GraphQL response body that was refused, as the end of the
-/// sentence that names it.
-fn response_body_remedy(source: &http_body_limit::Error) -> &'static str {
-    match source {
-        http_body_limit::Error::MemoryLimit { .. } => {
-            ". Raise `runtime.query.memory_limit`, or request fewer rows per page. \
-             See: https://spiceai.org/docs/reference/memory"
-        }
-        _ => "",
-    }
-}
-
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
         Error::RateLimited { .. } => true,
@@ -223,6 +211,18 @@ pub fn is_retriable_error(error: &Error) -> bool {
                 })
         }
         _ => false,
+    }
+}
+
+/// What to do about a GraphQL response body that was refused, as the end of the
+/// sentence that names it.
+fn response_body_remedy(source: &http_body_limit::Error) -> &'static str {
+    match source {
+        http_body_limit::Error::MemoryLimit { .. } => {
+            ". Raise `runtime.query.memory_limit`, or request fewer rows per page. \
+             See: https://spiceai.org/docs/reference/memory"
+        }
+        _ => "",
     }
 }
 

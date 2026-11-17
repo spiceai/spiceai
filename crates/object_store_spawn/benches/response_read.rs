@@ -131,9 +131,10 @@ async fn read(response: object_store::client::HttpResponse, touch: bool) -> usiz
 
 fn report(name: &str, bytes_per_request: usize, mut samples: Vec<Duration>) {
     samples.sort();
-    let at = |q: f64| samples[((samples.len() as f64 * q).ceil() as usize).saturating_sub(1)];
-    let p50 = at(0.50);
-    let p99 = at(0.99);
+    // The sample at or above `percent` percent of the samples, by nearest rank.
+    let at = |percent: usize| samples[(samples.len() * percent).div_ceil(100).saturating_sub(1)];
+    let p50 = at(50);
+    let p99 = at(99);
     let max = samples[samples.len() - 1];
     let mib_per_s = bytes_per_request as f64 / MIB as f64 / p50.as_secs_f64();
     println!(
@@ -154,7 +155,11 @@ fn main() {
     runtime.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("address").to_string();
-        let body: Arc<Vec<u8>> = Arc::new((0..WHOLE_LEN).map(|i| (i % 251) as u8).collect());
+        let body: Arc<Vec<u8>> = Arc::new(
+            (0..WHOLE_LEN)
+                .map(|i| u8::try_from(i % 251).expect("below 251"))
+                .collect(),
+        );
         tokio::spawn(serve(listener, body));
 
         let client = SpawnedReqwestConnector::new(Handle::current())

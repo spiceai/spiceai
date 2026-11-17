@@ -900,10 +900,9 @@ mod tests {
         assert_eq!(read, data);
 
         let empty = reservation(Some(DECODE_BLOCK_BYTES));
-        assert!(
-            read_to_end(&b""[..], Limit::Reserve(&empty))
-                .expect("empty input")
-                .is_empty()
+        assert_eq!(
+            read_to_end(&b""[..], Limit::Reserve(&empty)).expect("empty input"),
+            Vec::<u8>::new()
         );
         assert_eq!(empty.size(), 0);
     }

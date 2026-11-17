@@ -251,7 +251,7 @@ async fn answer(
         route.payload,
     )
         .into_response();
-    if let Some(Encoding::Gzip) = route.encoding {
+    if matches!(route.encoding, Some(Encoding::Gzip)) {
         response.headers_mut().insert(
             axum::http::header::CONTENT_ENCODING,
             HeaderValue::from_static("gzip"),
