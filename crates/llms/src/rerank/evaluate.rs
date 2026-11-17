@@ -429,7 +429,7 @@ mod tests {
         let scores = reranker.rerank("q", &docs(&["a"])).await.expect("rerank");
 
         assert_eq!(scores, vec![1.0]);
-        assert!(mock.requests().is_empty());
+        assert_eq!(mock.requests(), Vec::<EvaluateRequest>::new());
     }
 
     #[tokio::test]
@@ -464,7 +464,7 @@ mod tests {
                 if count == MAX_LISTWISE_DOCUMENTS + 1 && max == MAX_LISTWISE_DOCUMENTS),
             "{err:?}"
         );
-        assert!(mock.requests().is_empty());
+        assert_eq!(mock.requests(), Vec::<EvaluateRequest>::new());
     }
 
     /// A document missing from the distribution is a wrong result, not a 0 score.
