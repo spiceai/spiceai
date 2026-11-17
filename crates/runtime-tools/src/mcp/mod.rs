@@ -441,7 +441,7 @@ mod tests {
             serde_json::Map::new(),
         )];
         assert_eq!(filter.missing_from(&listed), vec!["a", "b"]);
-        assert!(McpToolFilter::All.missing_from(&[]).is_empty());
+        assert_eq!(McpToolFilter::All.missing_from(&[]), Vec::<String>::new());
     }
 
     #[test]
