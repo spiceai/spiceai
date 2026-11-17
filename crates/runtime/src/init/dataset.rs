@@ -7274,7 +7274,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         let unchanged = Arc::clone(&runtime)
             .apply_dataset_diff(&app("http://a"), &app("http://a"))
             .await;
-        assert!(reloaded(unchanged).is_empty());
+        assert_eq!(reloaded(unchanged), [] as [String; 0]);
 
         let changed = Arc::clone(&runtime)
             .apply_dataset_diff(&app("http://a"), &app("http://b"))
