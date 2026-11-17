@@ -29,6 +29,16 @@ def run_git(*args):
     return result.stdout.strip()
 
 
+def git_records(*args):
+    """Run git with `args` and return its non-empty output lines.
+
+    Splits on `\n` only: `git log` ends each record with `\n`, while a commit
+    subject may itself contain U+2028, U+0085 or another separator that
+    `str.splitlines()` would also split on.
+    """
+    return [record for record in run_git(*args).split("\n") if record]
+
+
 def resolve_commit(value, input_name, namespace, kind, example):
     """Return the commit ID that the ref `<namespace><value>` names.
 
@@ -120,7 +130,7 @@ def main():
 
     print("Generating patch-ids for trunk commits...", file=sys.stderr)
 
-    trunk_commits = run_git("log", "refs/remotes/origin/trunk", "--format=%H", "-n", "1000").splitlines()
+    trunk_commits = git_records("log", "refs/remotes/origin/trunk", "--format=%H", "-n", "1000")
     trunk_patch_to_hash = {}
 
     # Build mapping: patch-id -> commit_hash for trunk commits
@@ -135,7 +145,7 @@ def main():
 
     # Get release branch commits since tag. Both ends are the commit IDs
     # resolved above, and `--` ends the revision list.
-    release_commits = run_git("log", f"{tag_commit}..{release_commit}", "--format=%H-%s", "--").splitlines()
+    release_commits = git_records("log", f"{tag_commit}..{release_commit}", "--format=%H-%s", "--")
 
     print()
     print("### Changelog")

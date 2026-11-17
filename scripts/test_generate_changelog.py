@@ -253,6 +253,21 @@ class GenerateChangelogStepTest(unittest.TestCase):
             ],
         )
 
+    def test_a_subject_with_a_unicode_line_separator_stays_one_entry(self):
+        # `git log` ends each record with `\n`; a subject may contain U+2028 or
+        # U+0085, which must not split one commit into two records.
+        self.repo.git("checkout", "-q", "release/1.0")
+        g = self.repo.commit("g.txt", "g\n", "docs: before\u2028middle\u0085after")
+        self.repo.git("update-ref", "refs/remotes/origin/release/1.0", "release/1.0")
+        self.repo.git("checkout", "-q", "--detach", "trunk")
+        result = self.repo.run_workflow_step("v1.0.0", "release/1.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "- !!!! (PR NOT FOUND): docs: before\u2028middle\u0085after"
+            f" - https://github.com/spiceai/spiceai/commit/{g}/",
+            result.stdout.split("\n"),
+        )
+
     def test_shell_syntax_in_an_input_runs_nothing(self):
         cases = [
             # (input, value): command separators, substitutions, quote breakouts
