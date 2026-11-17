@@ -94,6 +94,12 @@ pub enum Error {
     ))]
     ArchiveLimitExceeded { pod: String, reason: String },
 
+    /// The install directory, or a directory inside it, is a symbolic link
+    #[snafu(display(
+        "Failed to install Spicepod '{pod}' from spicerack.org: '{path}' is a symbolic link, so the package would be written outside the Spicepod directory and nothing was installed. Replace the link with a directory, or remove it, and run `spice add` again. See: https://spiceai.org/docs/cli/reference/add"
+    ))]
+    LinkedInstallPath { pod: String, path: String },
+
     /// The registry's archive names a file outside the Spicepod directory. The
     /// published package itself is malformed, so retrying cannot help.
     #[snafu(display(

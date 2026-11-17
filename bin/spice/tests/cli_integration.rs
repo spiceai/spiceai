@@ -1216,6 +1216,62 @@ mod add {
         assert!(!project.path().join("escaped.txt").exists());
     }
 
+    /// Re-adding never writes through a symbolic link in the install: not a
+    /// linked pod directory, and not a linked directory inside it. Extraction
+    /// never creates links, so one there was put there by someone else.
+    #[cfg(unix)]
+    #[test]
+    fn test_add_refuses_to_write_through_a_linked_install_directory() {
+        for (layout, linked) in [
+            ("a directory inside the install", "spicepods/evil/pod/docs"),
+            ("the install directory itself", "spicepods/evil/pod"),
+        ] {
+            let project = TempDir::new().expect("create the project");
+            let outside = TempDir::new().expect("create the outside directory");
+            let pod = project.path().join("spicepods/evil/pod");
+            if linked == "spicepods/evil/pod" {
+                fs::create_dir_all(pod.parent().expect("a parent"))
+                    .expect("create the org directory");
+            } else {
+                fs::create_dir_all(&pod).expect("create the earlier install");
+                fs::write(pod.join("spicepod.yaml"), "earlier\n")
+                    .expect("write the earlier install");
+            }
+            std::os::unix::fs::symlink(outside.path(), project.path().join(linked))
+                .expect("plant the link");
+
+            let output = add_from_registry(
+                project.path(),
+                &stub_registry(RegistryReply::Archive(archive(&[
+                    ("spicepod.yaml", POD_MANIFEST),
+                    ("docs/README.md", b"written by the package\n"),
+                ]))),
+            );
+
+            let printed = printed(&output);
+            assert!(!output.status.success(), "{layout}: {printed}");
+            assert!(
+                printed.contains(&format!("Failed to install Spicepod 'evil/pod' from spicerack.org: '{linked}' is a symbolic link, so the package would be written outside the Spicepod directory and nothing was installed. Replace the link with a directory, or remove it, and run `spice add` again. See: https://spiceai.org/docs/cli/reference/add")),
+                "{layout}: {printed}"
+            );
+            assert_eq!(
+                fs::read_dir(outside.path())
+                    .expect("list the outside directory")
+                    .count(),
+                0,
+                "{layout}: nothing may be written outside the project"
+            );
+            if linked != "spicepods/evil/pod" {
+                assert_eq!(
+                    fs::read_to_string(pod.join("spicepod.yaml"))
+                        .expect("read the earlier install"),
+                    "earlier\n",
+                    "{layout}: a refused install leaves the earlier one as it was"
+                );
+            }
+        }
+    }
+
     /// A registry that announces a body larger than a package may be is
     /// refused before the body is read.
     #[test]

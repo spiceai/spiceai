@@ -132,7 +132,10 @@ fn registry_error(error: &registry::Error) -> crate::error::Error {
         | registry::Error::NotAnArchive { .. }
         | registry::Error::ZipExtraction { .. }
         | registry::Error::ArchiveLimitExceeded { .. }
-        | registry::Error::UnsafeArchiveEntry { .. } => crate::error::Error::Registry { message },
+        | registry::Error::UnsafeArchiveEntry { .. }
+        // A link in the install is local state, not the argument; the message
+        // is fully formed and is shown as it is.
+        | registry::Error::LinkedInstallPath { .. } => crate::error::Error::Registry { message },
         registry::Error::NotFound { .. }
         | registry::Error::DirectoryNotFound { .. }
         | registry::Error::InvalidSpicepod { .. }
