@@ -8004,6 +8004,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "duckdb-oracle"
+version = "2.4.3"
+dependencies = [
+ "adbc_core",
+ "adbc_driver_manager",
+ "arrow",
+ "snafu",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -21549,7 +21559,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion",
- "duckdb",
+ "duckdb-oracle",
  "flight_client",
  "futures",
  "http 1.4.1",
