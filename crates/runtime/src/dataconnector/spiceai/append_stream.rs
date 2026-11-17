@@ -286,15 +286,35 @@ impl Reload {
             arrow::array::RecordBatch::schema,
         );
         let data = arrow::compute::concat_batches(&schema, &rows).map_err(|e| e.to_string())?;
+        drop(rows);
         let batch = cdc::wrap_data_as_change_batch(&schema, &data)
             .map_err(|e| e.to_string())?
             .with_rebuild_from_this_batch(true);
+        // The staged batches are freed; the replacement stays charged to the
+        // pool until the apply loop commits or drops it.
+        let mut reservation = self.reservation;
+        reservation.resize(batch.record.get_array_memory_size());
         Ok(ChangeEnvelope::from_parts(
-            Box::new(SpiceAIChangeCommiter {}),
+            Box::new(ReplacementCommitter {
+                _reservation: reservation,
+            }),
             batch,
             true,
             true,
         ))
+    }
+}
+
+/// The committer of a reload's replacement: it holds the replacement's memory
+/// reservation for as long as the envelope lives.
+struct ReplacementCommitter {
+    _reservation: MemoryReservation,
+}
+
+#[async_trait::async_trait]
+impl cdc::CommitChange for ReplacementCommitter {
+    async fn commit(&self) -> Result<(), cdc::CommitError> {
+        Ok(())
     }
 }
 
@@ -1057,6 +1077,31 @@ mod tests {
         let mut stream = consumer(vec![failed_after_ready, slow]);
         assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
         assert_eq!(replacement(&mut stream).await, 3);
+    }
+
+    /// A reload's replacement stays charged to the query memory pool until the
+    /// apply loop is done with it.
+    #[test]
+    fn a_replacement_stays_reserved_until_it_is_dropped() {
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from((1..=1_000).collect::<Vec<_>>()))],
+        )
+        .expect("batch");
+        let mut reload = Reload::new(&memory_pool, DATASET);
+        reload
+            .stage(
+                None,
+                cdc::wrap_data_as_change_batch(&schema, &data).expect("change batch"),
+            )
+            .expect("staged");
+        assert!(memory_pool.reserved() > 0, "staging is reserved");
+        let replacement = reload.into_replacement(0, &schema).expect("replacement");
+        assert!(memory_pool.reserved() > 0, "the replacement is reserved");
+        drop(replacement);
+        assert_eq!(memory_pool.reserved(), 0);
     }
 
     /// A reload the query memory pool cannot hold is refused: the dataset keeps
