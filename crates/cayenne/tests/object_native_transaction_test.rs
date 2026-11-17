@@ -114,7 +114,10 @@ async fn an_object_native_table_refuses_an_unplaced_data_path() {
         error.to_string(),
         "Invalid operation: Failed to load dataset 'orders' (cayenne): With `runtime.params.cayenne_vnext` enabled, its data must be in `runtime.state.location`. Remove `cayenne_file_path`, `cayenne_s3_zone_ids`, and `cayenne_datalake_location`, use a supported refresh mode (full, append, or changes), and set `runtime.state.location` to an S3 or local file location. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     );
-    assert!(catalog.list_table_names().await.expect("tables").is_empty());
+    assert_eq!(
+        catalog.list_table_names().await.expect("tables"),
+        [] as [String; 0]
+    );
 }
 
 /// Publish snapshot `snapshot` at `sequence` on `table_id`.

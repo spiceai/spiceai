@@ -138,8 +138,7 @@ impl TeiEmbed {
             kind: "embedding model",
             name: name.to_string(),
             docs_url: DOCS_URL,
-            // Spice loads an embedding model once.
-            retried: false,
+            retried: true,
         };
         let model_root = async {
             let snapshot = crate::hf::open_model(requester, model_id, revision, hub).await?;

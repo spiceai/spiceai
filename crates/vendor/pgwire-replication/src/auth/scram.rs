@@ -318,7 +318,7 @@ mod tests {
         let c = ScramClient::new("user");
         assert!(c.client_first.starts_with("n,,n=user,r="));
         assert!(c.client_first_bare.starts_with("n=user,r="));
-        assert!(!c.client_nonce_b64.is_empty());
+        assert_ne!(c.client_nonce_b64, "");
     }
 
     #[test]

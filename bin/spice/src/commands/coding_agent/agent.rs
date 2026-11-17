@@ -1440,7 +1440,7 @@ mod tests {
             ]
         );
         // Without a runtime key Codex sends no credential at all.
-        assert!(launch.env.is_empty());
+        assert_eq!(launch.env, [] as [(&str, OsString); 0]);
     }
 
     #[test]

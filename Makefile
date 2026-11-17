@@ -358,7 +358,9 @@ FEATURES ?=
 ifneq ($(strip $(PACKAGES)),)
 _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
-_FMT_FLAGS := $(_LINT_PKG_FLAGS)
+# `cargo fmt -p` takes a bare member name, not the `name@version` spec that
+# scripts/signoff passes when a dependency shares a member's name.
+_FMT_FLAGS := $(foreach p,$(PACKAGES),-p $(firstword $(subst @, ,$(p))))
 # Scoped runs pass --lib only when a selected package has a library: it is a
 # fatal `no library targets found` when every selected package is bin-only
 # (e.g. testoperator alone), which would break the targeted pre-lint that
@@ -366,7 +368,7 @@ _FMT_FLAGS := $(_LINT_PKG_FLAGS)
 # runs only for the lint recipes, not for every target that reads PACKAGES. If
 # the metadata cannot be read, --lib is left out: --tests still lints each
 # library through its unit-test build, and the full workspace lint follows.
-_LINT_LIB_FLAG = $(shell cargo metadata --no-deps --format-version 1 2>/dev/null | $(PYTHON) -c 'import json, sys; wanted = set(sys.argv[1:]); packages = json.load(sys.stdin)["packages"]; lib_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}; print("--lib" if any(p["name"] in wanted and lib_kinds & set(t["kind"]) for p in packages for t in p["targets"]) else "")' $(PACKAGES) 2>/dev/null)
+_LINT_LIB_FLAG = $(shell cargo metadata --no-deps --format-version 1 2>/dev/null | $(PYTHON) -c 'import json, sys; wanted = {spec.split("@")[0] for spec in sys.argv[1:]}; packages = json.load(sys.stdin)["packages"]; lib_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}; print("--lib" if any(p["name"] in wanted and lib_kinds & set(t["kind"]) for p in packages for t in p["targets"]) else "")' $(PACKAGES) 2>/dev/null)
 _LINT_TARGET_FLAGS = $(_LINT_LIB_FLAG) --bins --tests
 else
 _LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract

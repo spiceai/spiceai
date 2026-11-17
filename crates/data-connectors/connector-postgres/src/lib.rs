@@ -1206,7 +1206,7 @@ async fn build_write_back_deliverer(
     // Version gate: `pg_current_xact_id()` is PG13+, `txid_current()` its
     // PG10–12 equivalent. Read the server version at setup so delivery does
     // not re-decide per pass.
-    let conn = postgres.pool.connect_direct().await.map_err(&setup_error)?;
+    let conn = postgres.pool.connect_direct().await.map_err(setup_error)?;
     let server_version_num: i32 = conn
         .conn
         .query_one("SELECT current_setting('server_version_num')::int4", &[])
@@ -1558,7 +1558,7 @@ mod inferred_schema_tests {
             schema.primary_key,
             vec!["warehouse_id".to_string(), "sku".to_string()]
         );
-        assert!(schema.indexes.is_empty());
+        assert_eq!(schema.indexes, [] as [InferredIndex; 0]);
         // No clustered index → sort falls back to the primary key, ascending.
         assert_eq!(
             schema.sort_columns,
@@ -1868,7 +1868,7 @@ mod inferred_schema_tests {
             &no_stats(),
         );
 
-        assert!(schema.primary_key.is_empty());
+        assert_eq!(schema.primary_key, [] as [String; 0]);
         assert_eq!(schema.sort_columns, vec![asc("region")]);
     }
 
@@ -1991,7 +1991,7 @@ mod inferred_schema_tests {
             columns: vec![Some("region".to_string()), None],
         };
         let schema = inferred_schema_from_indexes(&BTreeMap::new(), Some(&expr_key), &no_stats());
-        assert!(schema.shard_key.is_empty());
+        assert_eq!(schema.shard_key, [] as [String; 0]);
     }
 
     #[test]

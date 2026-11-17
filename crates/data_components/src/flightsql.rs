@@ -1637,7 +1637,7 @@ mod tests {
         .try_collect::<Vec<_>>()
         .await
         .expect("query should succeed");
-        assert!(batches.is_empty());
+        assert_eq!(batches, [] as [arrow::array::RecordBatch; 0]);
         assert!(cookie_seen.load(Ordering::SeqCst));
 
         server.shutdown().await;
@@ -1895,7 +1895,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .expect("stream should succeed");
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [arrow::array::RecordBatch; 0]);
 
         let metrics = exec.metrics().expect("metrics should exist");
         assert!(has_metric(&metrics, "first_batch_time"));

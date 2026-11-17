@@ -60,7 +60,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, UploadPart,
 };
 use object_store_sim::fault::FaultStore;
-use runtime_acceleration::change_sink::ChangeSink;
+use runtime_acceleration::change_sink::{ChangeBatch, ChangeSink};
 use tokio::runtime::Handle;
 
 use super::*;
@@ -342,12 +342,12 @@ impl ChangeSinkBackend for PreparedSignal {
 
     async fn apply(
         &self,
-        batch: ChangeBatch,
+        change: ChangeWrite,
         options: WriteOptions,
         ctx: &SessionContext,
         positions: Vec<PositionWrite>,
     ) -> Result<BackendWrite> {
-        let write = self.inner.apply(batch, options, ctx, positions).await;
+        let write = self.inner.apply(change, options, ctx, positions).await;
         self.prepared.send_modify(|count| *count += 1);
         write
     }
