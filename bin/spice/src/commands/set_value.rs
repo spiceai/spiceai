@@ -278,7 +278,7 @@ pub fn typed_value(kinds: Option<Kinds>, path: &str, raw: &str) -> Result<Value,
         return Ok(Value::String(raw.to_string()));
     }
 
-    let parsed = yaml::from_str::<Value>(raw);
+    let parsed = yaml::from_str::<Value>(raw).map(|value| raw_unless_quoted(value, raw));
     match (parsed, kinds) {
         (Ok(value), Some(kinds)) => {
             if kinds.accepts(&value) {
@@ -295,6 +295,17 @@ pub fn typed_value(kinds: Option<Kinds>, path: &str, raw: &str) -> Result<Value,
             Err(format!("Failed to parse YAML value for '{path}': {source}"))
         }
         (Err(_), _) => Ok(Value::String(raw.to_string())),
+    }
+}
+
+/// An unquoted string scalar keeps its raw text, so YAML syntax inside it (a
+/// ` #` comment, say) is not dropped. Quoted values keep their decoded string.
+fn raw_unless_quoted(value: Value, raw: &str) -> Value {
+    match value {
+        Value::String(_) if !raw.trim_start().starts_with(['"', '\'']) => {
+            Value::String(raw.to_string())
+        }
+        value => value,
     }
 }
 
@@ -394,6 +405,22 @@ mod tests {
         assert_eq!(
             dataset("from", "file:/tmp/x.parquet"),
             Value::String("file:/tmp/x.parquet".to_string())
+        );
+    }
+
+    #[test]
+    fn unquoted_strings_keep_yaml_comment_characters() {
+        assert_eq!(
+            dataset("description", "report #1"),
+            Value::String("report #1".to_string())
+        );
+        assert_eq!(
+            typed_value(None, "x", "a #b"),
+            Ok(Value::String("a #b".to_string()))
+        );
+        assert_eq!(
+            typed_value(None, "x", "1 #b"),
+            Ok(Value::String("1 #b".to_string()))
         );
     }
 
