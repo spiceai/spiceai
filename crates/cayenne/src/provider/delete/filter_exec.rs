@@ -1295,6 +1295,407 @@ impl datafusion_execution::RecordBatchStream for Int64PkDeletionFilterStream {
     }
 }
 
+// ============================================================================
+// Datalake (cold) tier deletion filter
+// ============================================================================
+
+/// The deletion index a [`ColdDeletionFilterExec`] probes, with what it needs to
+/// key each row.
+#[derive(Clone)]
+pub(crate) enum ColdTombstones {
+    /// Single-column `Int64` primary key at `pk_column_index`.
+    Int64Pk {
+        tombstones: Arc<DeletionIndex>,
+        pk_column_index: usize,
+    },
+    /// Any other primary key, encoded with `row_converter`.
+    RowKeys {
+        tombstones: Arc<KeyDeletionIndex>,
+        pk_column_indices: Vec<usize>,
+        row_converter: Arc<RowConverter>,
+    },
+}
+
+impl ColdTombstones {
+    fn max_delete_sequence(&self) -> Option<i64> {
+        match self {
+            Self::Int64Pk { tombstones, .. } => tombstones.max_sequence_number(),
+            Self::RowKeys { tombstones, .. } => tombstones.max_sequence_number(),
+        }
+    }
+
+    fn delete_len(&self) -> usize {
+        match self {
+            Self::Int64Pk { tombstones, .. } => tombstones.delete_len(),
+            Self::RowKeys { tombstones, .. } => tombstones.delete_len(),
+        }
+    }
+}
+
+/// Deletion filter for the datalake (cold) tier scan, where every file carries
+/// its own cutoff.
+///
+/// A datalake file holds the table's live rows as of the sequence it was
+/// written at (`ColdTierFile::max_sequence`) and is never rewritten, so a
+/// tombstone hides a row of it only when the tombstone's newest delete is newer
+/// than that sequence: an older one was applied when the file was written, and
+/// the key it names may have its live copy in exactly that file. The scan
+/// carries each file's sequence as a constant column (`threshold_column`, an
+/// `Int64` partition value), so one scan over every datalake file applies each
+/// row its own file's cutoff. Re-inserts never make a tombstoned datalake row
+/// live again (the re-inserted copy is in a newer file or tier), as for a
+/// protected snapshot.
+///
+/// The threshold column passes through unchanged; the caller strips it. A batch
+/// whose rows all come from files at least as new as every tombstone is passed
+/// through without probing, so a file no tombstone is newer than costs one
+/// `min` over its constant threshold column.
+///
+/// Filter-pushdown transparent for the same reason as
+/// [`KeyBasedDeletionFilterExec`]: it only removes rows.
+pub(crate) struct ColdDeletionFilterExec {
+    input: Arc<dyn ExecutionPlan>,
+    tombstones: ColdTombstones,
+    threshold_column: usize,
+    properties: Arc<datafusion_physical_plan::PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl ColdDeletionFilterExec {
+    pub(crate) fn new(
+        input: Arc<dyn ExecutionPlan>,
+        tombstones: ColdTombstones,
+        threshold_column: usize,
+    ) -> Self {
+        let properties = Arc::clone(input.properties());
+        Self {
+            input,
+            tombstones,
+            threshold_column,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ColdDeletionFilterExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ColdDeletionFilterExec")
+    }
+}
+
+impl DisplayAs for ColdDeletionFilterExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "ColdDeletionFilterExec: filtered_keys={}, threshold_column={}",
+            self.tombstones.delete_len(),
+            self.threshold_column
+        )
+    }
+}
+
+impl ExecutionPlan for ColdDeletionFilterExec {
+    fn name(&self) -> &'static str {
+        "ColdDeletionFilterExec"
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
+        &self.properties
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        StatisticsContext::new().compute(self, &StatisticsArgs::new().with_partition(partition))
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<datafusion_common::Statistics>],
+        _args: &StatisticsArgs,
+    ) -> datafusion_common::Result<Arc<datafusion_common::Statistics>> {
+        let [input_stats] = input_stats else {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "{} expects statistics for exactly one input, got {}",
+                self.name(),
+                input_stats.len()
+            )));
+        };
+        // Which rows a per-file cutoff hides is unknown before the scan, so the
+        // input's figures are only an upper bound.
+        Ok(Arc::new(deletion_filtered_statistics(
+            input_stats.as_ref().clone(),
+            0,
+        )))
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let [child] = children.as_slice() else {
+            return Err(datafusion_common::DataFusionError::Plan(
+                "ColdDeletionFilterExec requires exactly 1 child".to_string(),
+            ));
+        };
+        Ok(Arc::new(Self::new(
+            Arc::clone(child),
+            self.tombstones.clone(),
+            self.threshold_column,
+        )))
+    }
+
+    /// Forward parent filters to the child scan; see
+    /// [`KeyBasedDeletionFilterExec::gather_filters_for_pushdown`]. The
+    /// threshold column is the input's last, so every other column keeps its
+    /// index between this exec's input and the plan above the caller's strip.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> datafusion_common::Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion_execution::TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let metrics = DeletionFilterMetrics::new(&self.metrics, partition);
+        let input = self.input.execute(partition, context)?;
+        let schema = input.schema();
+        Ok(Box::pin(ColdDeletionFilterStream {
+            input,
+            max_delete_sequence: self.tombstones.max_delete_sequence(),
+            tombstones: self.tombstones.clone(),
+            threshold_column: self.threshold_column,
+            schema,
+            metrics,
+        }))
+    }
+}
+
+/// Stream of [`ColdDeletionFilterExec`].
+struct ColdDeletionFilterStream {
+    input: SendableRecordBatchStream,
+    tombstones: ColdTombstones,
+    /// Newest delete in `tombstones`, read once: a batch whose cutoffs are all at
+    /// or above it has nothing to hide.
+    max_delete_sequence: Option<i64>,
+    threshold_column: usize,
+    schema: arrow_schema::SchemaRef,
+    metrics: DeletionFilterMetrics,
+}
+
+/// The per-row cutoffs of `batch` as an `Int64Array`. The column is a partition
+/// value, so it may arrive dictionary-encoded; it is never null, and a null
+/// would leave a row without a cutoff, so it is an error rather than a guess.
+fn cold_thresholds(
+    batch: &arrow::array::RecordBatch,
+    column: usize,
+) -> datafusion_common::Result<arrow::array::Int64Array> {
+    use arrow::array::{Array, Int64Array};
+
+    let Some(array) = batch.columns().get(column) else {
+        return Err(datafusion_common::DataFusionError::Internal(format!(
+            "ColdDeletionFilterExec threshold column index {column} is out of bounds for a batch with {} columns",
+            batch.num_columns()
+        )));
+    };
+    let array = if array.data_type() == &arrow_schema::DataType::Int64 {
+        Arc::clone(array)
+    } else {
+        arrow::compute::cast(array, &arrow_schema::DataType::Int64)?
+    };
+    let thresholds = array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            datafusion_common::DataFusionError::Internal(format!(
+                "ColdDeletionFilterExec threshold column has type {:?}, expected Int64",
+                array.data_type()
+            ))
+        })?
+        .clone();
+    if thresholds.null_count() > 0 {
+        return Err(datafusion_common::DataFusionError::Internal(
+            "ColdDeletionFilterExec threshold column holds a null cutoff".to_string(),
+        ));
+    }
+    Ok(thresholds)
+}
+
+impl ColdDeletionFilterStream {
+    /// Positions of the rows of `batch` a tombstone newer than their file hides,
+    /// or `None` when no row can be hidden.
+    fn hidden_rows(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> datafusion_common::Result<Option<Vec<usize>>> {
+        use arrow::array::{Array, Int64Array};
+
+        let thresholds = cold_thresholds(batch, self.threshold_column)?;
+        // Every row's file is at least as new as every tombstone: nothing to hide.
+        let Some(max_delete_sequence) = self.max_delete_sequence else {
+            return Ok(None);
+        };
+        if arrow_col_min(&thresholds).is_some_and(|oldest| oldest >= max_delete_sequence) {
+            return Ok(None);
+        }
+
+        let mut hidden = Vec::new();
+        let mut on_hit = |i: usize, tombstone: Tombstone| {
+            if !tombstone_visible(
+                tombstone,
+                InsertRecordHandling::Ignore,
+                Some(thresholds.value(i)),
+            ) {
+                hidden.push(i);
+            }
+        };
+        match &self.tombstones {
+            ColdTombstones::Int64Pk {
+                tombstones,
+                pk_column_index,
+            } => {
+                let Some(pk_column) = batch.columns().get(*pk_column_index) else {
+                    return Err(datafusion_common::DataFusionError::Internal(format!(
+                        "ColdDeletionFilterExec primary key column index {pk_column_index} is out of bounds for a batch with {} columns",
+                        batch.num_columns()
+                    )));
+                };
+                let pk_array = pk_column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::DataFusionError::Internal(format!(
+                            "Expected Int64Array for PK column at index {pk_column_index}, got {:?}",
+                            pk_column.data_type()
+                        ))
+                    })?;
+                // Same disjoint-range skip as `Int64PkDeletionFilterStream`: the
+                // range covers every tombstoned key whatever its sequence.
+                if let Some((deleted_lo, deleted_hi)) = tombstones.deleted_key_range()
+                    && let (Some(batch_lo), Some(batch_hi)) =
+                        (arrow_col_min(pk_array), arrow_col_max(pk_array))
+                    && (batch_hi < deleted_lo || batch_lo > deleted_hi)
+                {
+                    self.metrics.rows_range_skipped.add(batch.num_rows());
+                    return Ok(None);
+                }
+                tombstones.get_batch(pk_array.values(), &mut on_hit);
+            }
+            ColdTombstones::RowKeys {
+                tombstones,
+                pk_column_indices,
+                row_converter,
+            } => {
+                let mut pk_columns: Vec<ArrayRef> = Vec::with_capacity(pk_column_indices.len());
+                for &idx in pk_column_indices {
+                    let Some(column) = batch.columns().get(idx) else {
+                        return Err(datafusion_common::DataFusionError::Internal(format!(
+                            "ColdDeletionFilterExec primary key column index {idx} is out of bounds for a batch with {} columns",
+                            batch.num_columns()
+                        )));
+                    };
+                    pk_columns.push(Arc::clone(column));
+                }
+                let rows = row_converter.convert_columns(&pk_columns)?;
+                tombstones.get_batch(rows.iter(), &mut on_hit);
+            }
+        }
+        Ok((!hidden.is_empty()).then_some(hidden))
+    }
+}
+
+impl futures::Stream for ColdDeletionFilterStream {
+    type Item = datafusion_common::Result<arrow::array::RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            let batch = match std::pin::Pin::new(&mut self.input).poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(batch))) => batch,
+                other => return other,
+            };
+            let batch_size = batch.num_rows();
+            if batch_size == 0 {
+                return std::task::Poll::Ready(Some(Ok(batch)));
+            }
+            let _timer = self.metrics.baseline.elapsed_compute().timer();
+            let hidden = match self.hidden_rows(&batch) {
+                Ok(Some(hidden)) => hidden,
+                Ok(None) => {
+                    self.metrics.baseline.record_output(batch_size);
+                    return std::task::Poll::Ready(Some(Ok(batch)));
+                }
+                Err(error) => return std::task::Poll::Ready(Some(Err(error))),
+            };
+            if hidden.len() >= batch_size {
+                self.metrics.rows_deleted.add(batch_size);
+                continue;
+            }
+            let mut keep_mask = BooleanBufferBuilder::new(batch_size);
+            keep_mask.append_n(batch_size, true);
+            for &i in &hidden {
+                keep_mask.set_bit(i, false);
+            }
+            let filter_array = BooleanArray::new(keep_mask.finish(), None);
+            let filtered = match arrow::compute::filter_record_batch(&batch, &filter_array) {
+                Ok(filtered) => filtered,
+                Err(e) => {
+                    return std::task::Poll::Ready(Some(Err(
+                        datafusion_common::DataFusionError::ArrowError(Box::new(e), None),
+                    )));
+                }
+            };
+            let kept = filtered.num_rows();
+            self.metrics.rows_deleted.add(batch_size - kept);
+            self.metrics.baseline.record_output(kept);
+            return std::task::Poll::Ready(Some(Ok(filtered)));
+        }
+    }
+}
+
+impl datafusion_execution::RecordBatchStream for ColdDeletionFilterStream {
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

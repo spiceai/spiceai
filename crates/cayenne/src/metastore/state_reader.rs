@@ -828,6 +828,22 @@ impl MetadataCatalog for DatasetStateReader {
         _table_id: &str,
         _new_snapshot_id: &str,
         _cold_files: &[ColdTierFile],
+        _retain_tombstones_above: Option<i64>,
+    ) -> CatalogResult<()> {
+        Err(invalid("the dataset state reader is read-only"))
+    }
+    async fn swap_cold_tier_files(
+        &self,
+        _table_id: &str,
+        _removed_file_urls: &[String],
+        _added: &[ColdTierFile],
+    ) -> CatalogResult<bool> {
+        Err(invalid("the dataset state reader is read-only"))
+    }
+    async fn clear_key_tombstones_at_or_below(
+        &self,
+        _table_id: &str,
+        _cutoff: i64,
     ) -> CatalogResult<()> {
         Err(invalid("the dataset state reader is read-only"))
     }
