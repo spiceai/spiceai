@@ -390,8 +390,8 @@ mod tests {
         );
     }
 
-    /// A request with no principal — a runtime without `runtime.auth` — may not write memories
-    /// either: only a principal with write access may.
+    /// A request with no principal on a runtime that authenticates callers (the default until
+    /// the runtime starts serving) is the runtime's own work, and may not write memories either.
     #[tokio::test]
     async fn store_memory_rejects_request_without_principal() {
         let engine = Arc::new(RecordingQueryEngine::new());

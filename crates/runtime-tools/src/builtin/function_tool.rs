@@ -44,9 +44,11 @@ use datafusion::common::utils::quote_identifier;
 use futures::TryStreamExt;
 use serde_json::{Map, Value};
 use spicepod::component::function::{Function, FunctionArg, FunctionKind};
-use tools::{SpiceModelTool, ToolAccess, caller_can_write};
+use tools::{SpiceModelTool, ToolAccess};
 
+use runtime_auth::{AuthRequestContext, principal_has_write_access};
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 /// Build a [`FunctionAsTool`] from a user-declared [`Function`]. Fails
 /// when the function's signature references Arrow types the tool bridge
@@ -152,8 +154,8 @@ impl SpiceModelTool for FunctionAsTool {
         Some(build_parameters_schema(&self.args))
     }
 
-    /// Runs the function in a `SELECT`, read-only unless the caller may write, so a caller without
-    /// write access is refused the functions that run code or call out, as in its own SQL.
+    /// Runs the function in a `SELECT`, read-only for a principal without write access, so a
+    /// read-only key is refused the functions that run code or call out, as in its own SQL.
     fn access(&self) -> ToolAccess {
         ToolAccess::ReadOnly
     }
@@ -183,10 +185,10 @@ impl SpiceModelTool for FunctionAsTool {
             )
         })?;
 
-        // Read-only unless the caller may write, as the `sql` tool runs: with no principal (no
-        // `runtime.auth`) too, so a function that runs code or calls out needs write access.
         let batches = df
-            .execute_query(QueryRequest::new(&sql).read_only(!caller_can_write().await))
+            .execute_query(
+                QueryRequest::new(&sql).read_only(current_principal_requires_read_only().await),
+            )
             .await
             .map_err(|e| {
                 Box::<dyn std::error::Error + Send + Sync>::from(format!("query failed: {e}"))
@@ -196,6 +198,14 @@ impl SpiceModelTool for FunctionAsTool {
 
         extract_single_cell_as_json(&batches)
     }
+}
+
+/// Whether the request is made by a principal without write access. A request with no principal
+/// is not.
+async fn current_principal_requires_read_only() -> bool {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    AuthRequestContext::auth_principal(context.as_ref())
+        .is_some_and(|principal| !principal_has_write_access(principal))
 }
 
 fn function_call_sql(function_name: &str, literals: &[String]) -> String {
