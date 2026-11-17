@@ -2971,10 +2971,12 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
         .map_err(|source| Error::CloudConnectIo {
             message: format!("read the enrolled identity before linking: {source}"),
         })?;
-    let endpoint = identity
-        .as_ref()
-        .and_then(|identity| identity.control_plane_endpoint.clone())
-        .unwrap_or_else(client::get_base_url);
+    let endpoint = cloud_connect_login_endpoint(
+        identity
+            .as_ref()
+            .and_then(|identity| identity.control_plane_endpoint.as_deref()),
+        &client::get_base_url(),
+    )?;
 
     let target = if let Some(project) = args.project.as_deref() {
         resolve_project_target(Some(project), flag_org).await?
@@ -3369,15 +3371,14 @@ async fn execute_unlink() -> Result<()> {
         service_backend.authorize_uninstall(manifest)?;
     }
 
-    let configured_endpoint = client::get_base_url();
-    let endpoint = release_endpoint(
+    let endpoint = cloud_connect_login_endpoint(
         identity.control_plane_endpoint.as_deref(),
-        &configured_endpoint,
-    );
+        &client::get_base_url(),
+    )?;
     let requested_org = identity.org_name.as_deref().filter(|org| !org.is_empty());
     let token =
-        user_token_for_cloud_connect(endpoint, requested_org, "Unlinking", "unlink").await?;
-    match runtime_cloud_connect::release::release(endpoint, &identity, &token, None).await {
+        user_token_for_cloud_connect(&endpoint, requested_org, "Unlinking", "unlink").await?;
+    match runtime_cloud_connect::release::release(&endpoint, &identity, &token, None).await {
         Ok(_) => {}
         Err(error) if error.is_not_found() => {}
         Err(error) => {
@@ -3408,11 +3409,31 @@ async fn execute_unlink() -> Result<()> {
     Ok(())
 }
 
-fn release_endpoint<'a>(
-    identity_endpoint: Option<&'a str>,
-    configured_endpoint: &'a str,
-) -> &'a str {
-    identity_endpoint.unwrap_or(configured_endpoint)
+/// The Spice Cloud endpoint that `link` and `unlink` send the stored user
+/// login to.
+///
+/// The identity file is in the instance directory, which the user may not have
+/// written, so its endpoint is accepted only when it is the configured one.
+fn cloud_connect_login_endpoint(
+    identity_endpoint: Option<&str>,
+    configured_endpoint: &str,
+) -> Result<String> {
+    let Some(identity_endpoint) = identity_endpoint else {
+        return Ok(configured_endpoint.to_string());
+    };
+    let normalize = runtime_cloud_connect::config::normalize_control_plane_endpoint;
+    match (normalize(identity_endpoint), normalize(configured_endpoint)) {
+        (Ok(identity), Ok(configured)) if identity == configured => {
+            Ok(configured_endpoint.to_string())
+        }
+        _ => Err(Error::cloud_with_hint(
+            CloudErrorCode::InvalidRequest,
+            format!(
+                "This directory's Cloud Connect identity uses the Spice Cloud endpoint {identity_endpoint}, but the configured Spice Cloud endpoint is {configured_endpoint}. Spice sends your login only to the configured Spice Cloud endpoint."
+            ),
+            "To use a different Spice Cloud, set SPICE_CLOUD_API_URL.",
+        )),
+    }
 }
 
 async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result<()> {
@@ -5996,14 +6017,54 @@ mod tests {
     }
 
     #[test]
-    fn unlink_uses_the_configured_cloud_api_when_identity_has_no_endpoint() {
+    fn cloud_connect_login_goes_to_the_configured_endpoint_without_an_identity_endpoint() {
         let configured = "https://staging.api.spice.ai";
 
-        assert_eq!(release_endpoint(None, configured), configured);
         assert_eq!(
-            release_endpoint(Some("https://identity.example"), configured),
-            "https://identity.example"
+            cloud_connect_login_endpoint(None, configured).expect("configured endpoint"),
+            configured
         );
+    }
+
+    #[test]
+    fn cloud_connect_login_accepts_an_identity_on_the_configured_endpoint() {
+        for (identity, configured) in [
+            ("https://api.spice.ai", "https://api.spice.ai"),
+            ("https://dev-api.spice.ai/", "https://dev-api.spice.ai"),
+            ("https://api.spice.ai", "https://API.spice.ai/"),
+        ] {
+            assert_eq!(
+                cloud_connect_login_endpoint(Some(identity), configured)
+                    .expect("matching endpoint"),
+                configured,
+                "identity {identity} on configured {configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_connect_login_refuses_an_identity_on_another_endpoint() {
+        let configured = "https://api.spice.ai";
+        for identity in [
+            "https://identity.example",
+            "https://dev-api.spice.ai",
+            "https://api.spice.ai:8443",
+            "https://api.spice.ai/other",
+            "http://api.spice.ai",
+        ] {
+            let err = cloud_connect_login_endpoint(Some(identity), configured)
+                .expect_err("a different endpoint must not receive the login");
+            assert_eq!(err.cloud_code(), Some(CloudErrorCode::InvalidRequest));
+            let message = err.to_string();
+            assert!(
+                message.contains(identity) && message.contains(configured),
+                "the error names both endpoints: {message}"
+            );
+            assert!(
+                message.contains("SPICE_CLOUD_API_URL"),
+                "the error names the setting: {message}"
+            );
+        }
     }
 
     #[test]
