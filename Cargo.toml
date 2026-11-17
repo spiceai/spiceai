@@ -164,7 +164,7 @@ homepage = "https://spice.ai"
 license-file = "LICENSE"
 publish = false
 repository = "https://github.com/spiceai/spiceai"
-rust-version = "1.98.1"
+rust-version = "1.99.1"
 version = "2.5.0-unstable"
 
 # Clippy lint levels for the workspace. Each member crate opts in with
@@ -517,7 +517,7 @@ uuid = "1"
 # so it carries no runtime cost. Pinned to the Verus release CI runs: the
 # verifier and `vstd` ship together, so this moves with `VERUS_VSTD_VERSION` in
 # `.github/workflows/verus_verify.yml`.
-vstd = "=0.0.0-2026-09-20-0158"
+vstd = "=0.0.0-2026-11-01-0251"
 wasmtime = { version = "48.0.8", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"
 
@@ -678,12 +678,12 @@ delta_kernel_default_engine = { git = "https://github.com/spiceai/delta-kernel-r
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28" } # branch: spiceai-0.11.0-df-55
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be

@@ -3016,7 +3016,7 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(loaded.private_key_pem, "ROTATED-KEY");
-        assert!(loaded.enc_previous_private_key_pem.is_empty());
+        assert_eq!(loaded.enc_previous_private_key_pem, "");
         assert_eq!(loaded.app_id.as_deref(), Some("4002"));
         assert_eq!(merged.app_id.as_deref(), Some("4002"));
     }
@@ -3507,8 +3507,8 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(loaded.identifier, "inst_legacy");
-        assert!(loaded.ca_bundle_pem.is_empty());
-        assert!(loaded.gateway_addr.is_empty());
+        assert_eq!(loaded.ca_bundle_pem, "");
+        assert_eq!(loaded.gateway_addr, "");
     }
 
     #[test]
@@ -3672,8 +3672,8 @@ mod tests {
             .expect("a legacy identity must still parse")
             .expect("present");
         assert_eq!(loaded.identifier, "inst_old");
-        assert!(loaded.enc_previous_private_key_pem.is_empty());
-        assert!(loaded.cache_key_b64.is_empty());
+        assert_eq!(loaded.enc_previous_private_key_pem, "");
+        assert_eq!(loaded.cache_key_b64, "");
         // No cache key means no cache — a degraded mode, not an error.
         assert!(loaded.cache_key().is_none());
         // And no encryption key means no keyring, with a message that names the
@@ -3744,10 +3744,10 @@ mod tests {
     fn retiring_the_previous_key_is_idempotent() {
         let mut identity = sample_identity();
         identity.rotate_encryption_key("next".to_string(), "next-pub".to_string());
-        assert!(!identity.enc_previous_private_key_pem.is_empty());
+        assert_ne!(identity.enc_previous_private_key_pem, "");
 
         assert!(identity.retire_previous_enc_key(), "there was one to drop");
-        assert!(identity.enc_previous_private_key_pem.is_empty());
+        assert_eq!(identity.enc_previous_private_key_pem, "");
         assert!(
             !identity.retire_previous_enc_key(),
             "nothing to drop the second time, so the caller need not persist"

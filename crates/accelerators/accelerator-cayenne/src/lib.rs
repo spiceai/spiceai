@@ -6745,7 +6745,10 @@ mod tests {
         )
         .expect("disabled maintained aggregate config should parse");
 
-        assert!(specs.is_empty());
+        assert_eq!(
+            specs,
+            [] as [cayenne::maintained_aggregate::MaintainedAggregateSpec; 0]
+        );
     }
 
     #[test]
@@ -10347,7 +10350,10 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(first[0].contains("sets `cayenne_tuning`"), "{first:?}");
         // A repeat (an init retry, or a reload that changed nothing) does not.
-        assert!(unreported_retired_param_warnings(TABLE, &params(&["cayenne_tuning"])).is_empty());
+        assert_eq!(
+            unreported_retired_param_warnings(TABLE, &params(&["cayenne_tuning"])),
+            [] as [String; 0]
+        );
         // A retired key newly added to the existing table warns; the old one stays quiet.
         let added =
             unreported_retired_param_warnings(TABLE, &params(&["cayenne_tuning", "goal_qph"]));
@@ -10360,8 +10366,9 @@ mod tests {
             1
         );
         // No retired key, nothing to report.
-        assert!(
-            unreported_retired_param_warnings(TABLE, &params(&["cayenne_file_path"])).is_empty()
+        assert_eq!(
+            unreported_retired_param_warnings(TABLE, &params(&["cayenne_file_path"])),
+            [] as [String; 0]
         );
     }
 
@@ -11510,7 +11517,7 @@ mod tests {
         let options = datalake_test_options(vec!["id".to_string()], config);
         let warnings = validate_datalake_table_options("dl_t", &options)
             .expect("inferred sort columns must not conflict with explicit clustering");
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [String; 0]);
     }
 
     #[test]

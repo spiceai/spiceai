@@ -535,7 +535,7 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
     // The rebuild does not use the snapshot machinery the mode disabled: it is
     // one zero-row signal the consumer answers with an atomic replacement.
     assert_eq!(num_rows(&envelope), 0);
-    assert!(ops_of(&envelope).is_empty());
+    assert_eq!(ops_of(&envelope), [] as [String; 0]);
 
     // The stale position survives until the rebuild commits. Recording the new
     // head before the replacement lands is what made the divergence permanent,

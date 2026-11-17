@@ -196,7 +196,7 @@ pub fn next_index(
     spill_index: &Arc<AtomicU8>,
 ) -> Result<S3VectorIdentifier, super::Error> {
     if spill_index
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
             if x >= MAX_SPILL_SEQUENCE {
                 None
             } else {

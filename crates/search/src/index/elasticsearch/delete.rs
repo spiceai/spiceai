@@ -1846,7 +1846,7 @@ mod tests {
         .await
         .expect("an empty prune should succeed without reaching the index");
 
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     /// A member whose `_id` the write path would not have derived leaves that member unnamed in
@@ -1954,7 +1954,7 @@ mod tests {
         .await
         .expect_err("a normalized key column must fail the delete");
 
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     /// A normalized column that also carries an unnormalized exact sub-field is still addressable
@@ -2041,7 +2041,7 @@ mod tests {
             .await
             .expect_err("a rounding key column must fail the delete");
 
-            assert!(client.queries().is_empty());
+            assert_eq!(client.queries(), [] as [Value; 0]);
         }
     }
 
@@ -2559,7 +2559,7 @@ mod tests {
             err.to_string().contains("'id'"),
             "the error must name the group column, got: {err}"
         );
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     /// The reported bug (#13714) on the half `_id` addressing cannot reach: a chunked index's
@@ -2651,7 +2651,7 @@ mod tests {
         .expect_err("an unsearchable key column must fail the delete");
 
         assert!(err.to_string().contains("'id'"), "got: {err}");
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     /// Elasticsearch maps a field the first time a document carries it, so a key column absent
@@ -2674,7 +2674,7 @@ mod tests {
         .await
         .expect("an index holding no such column has nothing to delete");
 
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     /// The `keyword` multi-field dynamic mapping derives stops indexing past `ignore_above`, so a
@@ -2785,7 +2785,7 @@ mod tests {
         .expect_err("an unreadable mapping must fail the delete");
 
         assert!(err.to_string().contains("could not be read"), "got: {err}");
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     /// A numeric key column was never broken by the mapping gap — `long` is exact — so it must
@@ -2874,7 +2874,7 @@ mod tests {
         .await
         .expect("delete should succeed");
 
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     #[tokio::test]
@@ -2908,7 +2908,7 @@ mod tests {
         .await
         .expect("delete should succeed");
 
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     /// A large delete is split so no single request carries an unbounded id list.
@@ -3038,7 +3038,7 @@ mod tests {
             .await
             .expect("delete should succeed");
 
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     /// Chunked exactly as [`delete_by_keys`] is, so a large eviction cannot build an
@@ -3104,7 +3104,7 @@ mod tests {
         .await
         .expect("delete should succeed");
 
-        assert!(client.queries().is_empty());
+        assert_eq!(client.queries(), [] as [Value; 0]);
     }
 
     /// The reported bug (#12364): `_delete_by_query` answers `200` with a populated `failures`

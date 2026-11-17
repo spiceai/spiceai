@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn a_quiet_run_adds_no_flags_of_its_own() {
-        assert!(spiced_args(&RunConfig::default(), None).is_empty());
+        assert_eq!(spiced_args(&RunConfig::default(), None), [] as [String; 0]);
     }
 
     #[test]

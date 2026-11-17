@@ -289,7 +289,7 @@ mod tests {
     fn a_null_list_matches_an_empty_list() {
         let ids = ids(&[None, Some(vec![])]);
         assert_eq!(ids[0], ids[1]);
-        assert!(!ids[0].is_empty());
+        assert_ne!(ids[0], "");
     }
 
     /// Binary attribute lists whose payloads embed former delimiter bytes.
