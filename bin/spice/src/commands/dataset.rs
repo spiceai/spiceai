@@ -115,9 +115,12 @@ pub struct DatasetArgs {
 #[derive(Subcommand, Debug)]
 pub enum DatasetCommands {
     /// Add a dataset to spicepod.yaml
+    // Datasets have no `enabled` field, so --enable/--disable are refused; keep them out of help.
+    #[command(mut_arg("enable", |arg| arg.hide(true)), mut_arg("disable", |arg| arg.hide(true)))]
     Add(component::ComponentAddArgs),
 
     /// Create or update a dataset in spicepod.yaml, or run interactively with no arguments
+    #[command(mut_arg("enable", |arg| arg.hide(true)), mut_arg("disable", |arg| arg.hide(true)))]
     Configure(component::ComponentConfigureArgs),
 }
 
@@ -475,5 +478,25 @@ mod tests {
             updated.contains("ref: datasets/test"),
             "dataset reference should be added"
         );
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+    use clap::{Args, Command};
+
+    #[test]
+    fn dataset_help_does_not_offer_enable() {
+        let mut command = DatasetArgs::augment_args(Command::new("dataset"));
+        for name in ["add", "configure"] {
+            let subcommand = command
+                .find_subcommand_mut(name)
+                .expect("subcommand should exist");
+            let help = subcommand.render_long_help().to_string();
+            assert!(!help.contains("--enable"), "{name}: {help}");
+            assert!(!help.contains("--disable"), "{name}: {help}");
+            assert!(help.contains("--set"), "{name}: {help}");
+        }
     }
 }

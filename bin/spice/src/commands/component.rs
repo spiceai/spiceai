@@ -589,6 +589,7 @@ pub fn add_component(section: ComponentSection, args: &ComponentAddArgs) -> Resu
         &args.options,
         MutationMode::Add,
     )?;
+    ensure_component_set_fields_valid(&spicepod, section, args.name.as_deref(), &args.options)?;
     write_if_changed(&manifest_path, &spicepod, &before, created)
 }
 
@@ -602,6 +603,7 @@ pub fn configure_component(section: ComponentSection, args: &ComponentConfigureA
         &args.options,
         MutationMode::Configure,
     )?;
+    ensure_component_set_fields_valid(&spicepod, section, args.name.as_deref(), &args.options)?;
     write_if_changed(&manifest_path, &spicepod, &before, created)
 }
 
@@ -757,6 +759,130 @@ fn build_component_value(
     }
 
     Ok(value)
+}
+
+/// How an edited entry sits under its top-level Spicepod field.
+#[derive(Debug, Clone, Copy)]
+enum EntryShape<'a> {
+    /// An item of a list such as `datasets`.
+    ListItem,
+    /// The field's value itself, such as `runtime`.
+    Section,
+    /// A named entry of a map such as `extensions`.
+    MapEntry(&'a str),
+}
+
+fn ensure_component_set_fields_valid(
+    spicepod: &Value,
+    section: ComponentSection,
+    name: Option<&str>,
+    options: &CommonComponentOptions,
+) -> Result<()> {
+    if options.set.is_empty() || options.reference.is_some() {
+        return Ok(());
+    }
+    let name = name.map(ToString::to_string).or_else(|| {
+        options
+            .set
+            .iter()
+            .find_map(|pair| pair.strip_prefix("name=").map(ToString::to_string))
+    });
+    let Some(name) = name else {
+        return Ok(());
+    };
+    let Some((index, entry)) = spicepod
+        .get(section.field())
+        .and_then(Value::as_sequence)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .enumerate()
+                .find(|(_, entry)| component_name(entry) == Some(name.as_str()))
+        })
+    else {
+        return Ok(());
+    };
+    ensure_set_fields_valid(
+        section.field(),
+        EntryShape::ListItem,
+        entry,
+        &format!("{}[{index}]", section.field()),
+        &options.set,
+    )
+}
+
+/// Refuses an edit whose `--set` fields do not deserialize as the Spicepod
+/// expects (a well-formed value of the wrong type, such as `string:true` on a
+/// boolean, or an unknown field), so the manifest is left unchanged. Errors in
+/// fields the edit did not touch are left for `spice validate`.
+fn ensure_set_fields_valid(
+    field: &str,
+    shape: EntryShape<'_>,
+    entry: &Value,
+    display_path: &str,
+    set_pairs: &[String],
+) -> Result<()> {
+    if set_pairs.is_empty() {
+        return Ok(());
+    }
+    let (wrapped, local_path) = match shape {
+        EntryShape::ListItem => (Value::Sequence(vec![entry.clone()]), format!("{field}[0]")),
+        EntryShape::Section => (entry.clone(), field.to_string()),
+        EntryShape::MapEntry(name) => {
+            let mut mapping = Mapping::new();
+            mapping.insert(Value::String(name.to_string()), entry.clone());
+            (Value::Mapping(mapping), format!("{field}.{name}"))
+        }
+    };
+    let mut root = Mapping::new();
+    for (key, value) in [
+        ("version", "v2"),
+        ("kind", "Spicepod"),
+        ("name", "set-check"),
+    ] {
+        root.insert(
+            Value::String(key.to_string()),
+            Value::String(value.to_string()),
+        );
+    }
+    root.insert(Value::String(field.to_string()), wrapped);
+
+    let Err(error) = spicepod::parse_definition_value(Value::Mapping(root)) else {
+        return Ok(());
+    };
+    let message = error.to_string();
+    let Some(rest) = message
+        .strip_prefix(&local_path)
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        return Ok(());
+    };
+    let (error_path, detail) = rest.split_once(": ").unwrap_or((rest, ""));
+    let touched = set_pairs
+        .iter()
+        .filter_map(|pair| pair.split_once('=').map(|(path, _)| path))
+        .any(|path| paths_overlap(path, error_path));
+    if !touched {
+        return Ok(());
+    }
+    InvalidArgumentSnafu {
+        message: format!(
+            "{display_path}.{error_path}: {}. Nothing was written; set a value of the type the field expects.",
+            detail.trim_end_matches('.')
+        ),
+    }
+    .fail()
+}
+
+/// Whether two dotted field paths name the same field or one contains the other.
+fn paths_overlap(set_path: &str, error_path: &str) -> bool {
+    let contains = |outer: &str, inner: &str| {
+        inner == outer
+            || inner
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+    };
+    contains(set_path, error_path) || contains(error_path, set_path)
 }
 
 fn enable_unsupported_message(section: ComponentSection) -> String {
@@ -928,6 +1054,15 @@ fn configure_singleton(section: SingletonSection, args: &SingletonConfigureArgs)
     }
 
     merge_root_mapping_field(&mut spicepod, section.field(), value)?;
+    if let Some(entry) = spicepod.get(section.field()) {
+        ensure_set_fields_valid(
+            section.field(),
+            EntryShape::Section,
+            entry,
+            section.field(),
+            &args.set,
+        )?;
+    }
     write_if_changed(&manifest_path, &spicepod, &before, created)
 }
 
@@ -985,6 +1120,18 @@ fn mutate_extension(args: &ExtensionEditArgs, mode: MutationMode) -> Result<()> 
         extensions.insert(key, value);
     }
 
+    if let Some(entry) = spicepod
+        .get("extensions")
+        .and_then(|extensions| extensions.get(args.name.as_str()))
+    {
+        ensure_set_fields_valid(
+            "extensions",
+            EntryShape::MapEntry(&args.name),
+            entry,
+            &format!("extensions.{}", args.name),
+            &args.set,
+        )?;
+    }
     write_if_changed(&manifest_path, &spicepod, &before, created)
 }
 
@@ -1647,6 +1794,142 @@ mod tests {
         let spicepod: spicepod::spec::SpicepodDefinition =
             yaml::from_str(&contents).expect("edited manifest should load as a Spicepod");
         assert_eq!(spicepod.datasets.len(), 1);
+    }
+
+    fn write_manifest(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let manifest_path = temp_dir.path().join("spicepod.yaml");
+        std::fs::write(&manifest_path, contents).expect("manifest should be written");
+        (temp_dir, manifest_path)
+    }
+
+    fn configure_dataset_set(manifest_path: &Path, set: &[&str]) -> Result<()> {
+        configure_component(
+            ComponentSection::Dataset,
+            &ComponentConfigureArgs {
+                name: Some("d".to_string()),
+                options: CommonComponentOptions {
+                    manifest: Some(manifest_path.to_path_buf()),
+                    set: set.iter().map(ToString::to_string).collect(),
+                    ..CommonComponentOptions::default()
+                },
+            },
+        )
+    }
+
+    const TWO_DATASETS: &str = "version: v2\nkind: Spicepod\nname: test\ndatasets:\n  - name: other\n    from: file:/o\n  - name: d\n    from: file:/tmp/x.parquet\n";
+
+    #[test]
+    fn wrong_type_set_value_is_refused_and_manifest_unchanged() {
+        let (_dir, manifest_path) = write_manifest(TWO_DATASETS);
+
+        let error = configure_dataset_set(&manifest_path, &["acceleration.enabled=string:true"])
+            .expect_err("a string on a boolean field should be refused");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("datasets[1].acceleration.enabled: Invalid type string"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).expect("manifest should read"),
+            TWO_DATASETS
+        );
+    }
+
+    #[test]
+    fn wrong_type_integer_on_boolean_and_scalar_on_map_are_refused() {
+        for set in [
+            "acceleration.enabled=1",
+            "acceleration.indexes=not-an-object",
+        ] {
+            let (_dir, manifest_path) = write_manifest(TWO_DATASETS);
+            let error = configure_dataset_set(&manifest_path, &[set])
+                .expect_err("a wrong-typed value should be refused");
+            let field = set
+                .split_once('=')
+                .map(|(path, _)| path)
+                .unwrap_or_default();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("datasets[1].{field}: ")),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&manifest_path).expect("manifest should read"),
+                TWO_DATASETS
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_set_field_is_refused() {
+        let (_dir, manifest_path) = write_manifest(TWO_DATASETS);
+
+        let error = configure_dataset_set(&manifest_path, &["acceleratoin.enabled=true"])
+            .expect_err("an unknown field should be refused");
+
+        assert!(
+            error.to_string().contains("datasets[1].acceleratoin"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn errors_in_untouched_fields_do_not_block_an_edit() {
+        let manifest =
+            format!("{TWO_DATASETS}    acceleration:\n      refresh_retry_max_attempts: lots\n");
+        let (_dir, manifest_path) = write_manifest(&manifest);
+
+        configure_dataset_set(&manifest_path, &["description=hello"])
+            .expect("an edit to a valid field should still be written");
+
+        let written = std::fs::read_to_string(&manifest_path).expect("manifest should read");
+        assert!(written.contains("description: hello"), "{written}");
+    }
+
+    #[test]
+    fn wrong_type_runtime_set_value_is_refused() {
+        let base = "version: v2\nkind: Spicepod\nname: test\n";
+        let (_dir, manifest_path) = write_manifest(base);
+        let args = SingletonConfigureArgs {
+            manifest: Some(manifest_path.clone()),
+            set: vec!["dataset_load_parallelism=string:lots".to_string()],
+            ..SingletonConfigureArgs::default()
+        };
+
+        let error = configure_singleton(SingletonSection::Runtime, &args)
+            .expect_err("a string on an integer field should be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("runtime.dataset_load_parallelism: "),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).expect("manifest should read"),
+            base
+        );
+    }
+
+    #[test]
+    fn paths_overlap_matches_nested_fields() {
+        assert!(paths_overlap(
+            "acceleration.enabled",
+            "acceleration.enabled"
+        ));
+        assert!(paths_overlap(
+            "acceleration.indexes",
+            "acceleration.indexes.id"
+        ));
+        assert!(paths_overlap("acceleratoin.enabled", "acceleratoin"));
+        assert!(!paths_overlap(
+            "acceleration.enabled",
+            "acceleration.engine"
+        ));
+        assert!(!paths_overlap("description", "acceleration"));
     }
 
     #[test]

@@ -139,6 +139,18 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Parses a Spicepod definition from an in-memory YAML value. A type error names
+/// the failing field path, e.g. `datasets[0].acceleration.enabled: Invalid type ...`.
+///
+/// # Errors
+///
+/// Returns the deserialization error when `value` does not match the Spicepod schema.
+pub fn parse_definition_value(
+    value: yaml::Value,
+) -> std::result::Result<SpicepodDefinition, yaml::Error> {
+    field_path::from_value(value)
+}
+
 impl Error {
     /// Whether the Spicepod file is absent, as opposed to present but
     /// unloadable.
