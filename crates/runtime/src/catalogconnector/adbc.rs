@@ -32,8 +32,9 @@ use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::adbc_helpers::{
-    DUCKDB_DRIVER, build_db_options, connection_secrets, dialect_for_driver, driver_entrypoint,
-    enrich_with_bigquery_metadata, scrub_connection_secrets,
+    DUCKDB_DRIVER, bigquery_table_names, build_db_options, connection_secrets, dialect_for_driver,
+    driver_entrypoint, enrich_with_bigquery_metadata, is_bigquery_driver,
+    is_bigquery_hidden_dataset, scrub_connection_secrets,
 };
 use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -45,7 +46,7 @@ use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use runtime_datafusion::dialect::new_duckdb_dialect;
 use runtime_datafusion::function_support::{
     deny_spice_functions_for_duckdb_table_providers, expression_support_for_engine,
@@ -202,6 +203,7 @@ impl CatalogConnector for AdbcCatalog {
             table_factory,
             table_selector(catalog),
             driver_name,
+            catalog.name.clone(),
         ));
 
         provider
@@ -388,14 +390,17 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
 
 // -- Catalog Provider --
 
-/// A catalog provider for ADBC that discovers schemas and tables
-/// using the ADBC metadata API (`get_objects`).
+/// A catalog provider for ADBC that discovers schemas and tables using the ADBC
+/// metadata API (`get_objects`). It lists tables only in schemas the catalog's
+/// `include` can reach. For `BigQuery` it reads a dataset's tables from its
+/// `INFORMATION_SCHEMA.TABLES` view instead, and lists none in hidden datasets.
 struct AdbcCatalogProvider {
     pool: Arc<ADBCPool<ManagedDatabase>>,
     table_factory: AdbcTableFactory<ManagedDatabase>,
     schemas: RwLock<HashMap<String, Arc<AdbcSchemaProvider>>>,
     selector: TableSelector,
     driver_name: String,
+    catalog_name: String,
 }
 
 impl std::fmt::Debug for AdbcCatalogProvider {
@@ -411,6 +416,7 @@ impl AdbcCatalogProvider {
         table_factory: AdbcTableFactory<ManagedDatabase>,
         selector: TableSelector,
         driver_name: String,
+        catalog_name: String,
     ) -> Self {
         Self {
             pool,
@@ -418,50 +424,41 @@ impl AdbcCatalogProvider {
             schemas: RwLock::new(HashMap::new()),
             selector,
             driver_name,
+            catalog_name,
         }
     }
 
     async fn refresh_schemas(&self) -> Result<()> {
         let refresh_start = Instant::now();
-        // Phase 1: Discover schemas and tables via ADBC metadata API.
-        // These are synchronous FFI calls — offload to a blocking thread
-        // to avoid stalling the async runtime.
-        let pool = Arc::clone(&self.pool);
+        // Phase 1: Discover schemas and tables.
         let discovery_start = Instant::now();
-        let schema_tables =
-            tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<String>)>> {
-                let conn = pool
-                    .connect_sync()
-                    .map_err(|e| Error::UnableToListSchemas { source: e })?;
+        let schema_names = self.list_schema_names().await?;
 
-                let sync_conn = conn.as_sync().ok_or_else(|| Error::UnableToListSchemas {
-                    source: "ADBC connection does not support synchronous operations".into(),
-                })?;
+        // A schema no `include` pattern can reach cannot contribute a table, so
+        // its tables are never listed. It is still registered, empty, which is
+        // what listing it would have produced once `include` rejected every one
+        // of its tables: skipping changes the calls made, never the catalog's
+        // schemas.
+        let (searched, skipped): (Vec<String>, Vec<String>) = schema_names
+            .into_iter()
+            .partition(|schema_name| self.selector.may_select_within(schema_name));
+        for schema_name in &skipped {
+            tracing::debug!(
+                "Schema '{schema_name}' of ADBC catalog '{}' cannot match any include pattern; skipping its table discovery",
+                self.catalog_name
+            );
+        }
 
-                let schema_names = sync_conn
-                    .schemas()
-                    .map_err(|e| Error::UnableToListSchemas {
-                        source: Box::new(e),
-                    })?;
-
-                let mut schema_tables = Vec::with_capacity(schema_names.len());
-                for schema_name in schema_names {
-                    let table_names =
-                        sync_conn
-                            .tables(&schema_name)
-                            .map_err(|e| Error::UnableToListTables {
-                                schema: schema_name.clone(),
-                                source: Box::new(e),
-                            })?;
-                    schema_tables.push((schema_name, table_names));
-                }
-
-                Ok(schema_tables)
-            })
-            .await
-            .map_err(|e| Error::UnableToListSchemas {
-                source: Box::new(e),
-            })??;
+        let mut schema_tables = if is_bigquery_driver(&self.driver_name) {
+            self.list_bigquery_tables(searched).await?
+        } else {
+            self.list_driver_tables(searched).await?
+        };
+        schema_tables.extend(
+            skipped
+                .into_iter()
+                .map(|schema_name| (schema_name, Vec::new())),
+        );
 
         let schema_count = schema_tables.len();
         let table_count: usize = schema_tables.iter().map(|(_, t)| t.len()).sum();
@@ -499,6 +496,110 @@ impl AdbcCatalogProvider {
         );
 
         Ok(())
+    }
+
+    /// Lists every schema through the driver's `get_objects`.
+    async fn list_schema_names(&self) -> Result<Vec<String>> {
+        // Synchronous FFI calls: offload to a blocking thread so they do not
+        // stall the async runtime.
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let conn = pool
+                .connect_sync()
+                .map_err(|e| Error::UnableToListSchemas { source: e })?;
+            let sync_conn = conn.as_sync().ok_or_else(|| Error::UnableToListSchemas {
+                source: "ADBC connection does not support synchronous operations".into(),
+            })?;
+            sync_conn.schemas().map_err(|e| Error::UnableToListSchemas {
+                source: Box::new(e),
+            })
+        })
+        .await
+        .map_err(|e| Error::UnableToListSchemas {
+            source: Box::new(e),
+        })?
+    }
+
+    /// Lists the tables of each schema through the driver's `get_objects`.
+    async fn list_driver_tables(
+        &self,
+        schema_names: Vec<String>,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        if schema_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<String>)>> {
+            let conn = pool
+                .connect_sync()
+                .map_err(|e| Error::UnableToListSchemas { source: e })?;
+            let sync_conn = conn.as_sync().ok_or_else(|| Error::UnableToListSchemas {
+                source: "ADBC connection does not support synchronous operations".into(),
+            })?;
+
+            let mut schema_tables = Vec::with_capacity(schema_names.len());
+            for schema_name in schema_names {
+                let table_names =
+                    sync_conn
+                        .tables(&schema_name)
+                        .map_err(|e| Error::UnableToListTables {
+                            schema: schema_name.clone(),
+                            source: Box::new(e),
+                        })?;
+                schema_tables.push((schema_name, table_names));
+            }
+            Ok(schema_tables)
+        })
+        .await
+        .map_err(|e| Error::UnableToListSchemas {
+            source: Box::new(e),
+        })?
+    }
+
+    /// Lists the tables of each `BigQuery` dataset from its
+    /// `INFORMATION_SCHEMA.TABLES` view, several datasets at a time.
+    ///
+    /// The driver's `get_objects` fetches each table's metadata in turn, so a
+    /// dataset holding thousands of tables -- the anonymous datasets of cached
+    /// query results routinely do -- takes minutes. The view answers in one
+    /// query per dataset. See [`bigquery_table_names`].
+    ///
+    /// A hidden dataset is registered with no tables and is not queried:
+    /// `BigQuery` rejects `INFORMATION_SCHEMA` for it, and leaves it out of every
+    /// `INFORMATION_SCHEMA` view. See [`is_bigquery_hidden_dataset`].
+    async fn list_bigquery_tables(
+        &self,
+        schema_names: Vec<String>,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let (hidden, visible): (Vec<String>, Vec<String>) = schema_names
+            .into_iter()
+            .partition(|schema_name| is_bigquery_hidden_dataset(schema_name));
+        for schema_name in &hidden {
+            tracing::debug!(
+                "Schema '{schema_name}' of ADBC catalog '{}' is a hidden BigQuery dataset; skipping its table discovery",
+                self.catalog_name
+            );
+        }
+
+        let mut schema_tables: Vec<(String, Vec<String>)> = stream::iter(visible)
+            .map(|schema_name| async move {
+                match bigquery_table_names(&self.pool, &schema_name).await {
+                    Ok(table_names) => Ok((schema_name, table_names)),
+                    Err(source) => Err(Error::UnableToListTables {
+                        schema: schema_name,
+                        source,
+                    }),
+                }
+            })
+            .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY)
+            .try_collect()
+            .await?;
+        schema_tables.extend(
+            hidden
+                .into_iter()
+                .map(|schema_name| (schema_name, Vec::new())),
+        );
+        Ok(schema_tables)
     }
 
     async fn create_table_providers(
