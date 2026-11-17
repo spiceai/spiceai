@@ -13,10 +13,7 @@ sources:
   src: { kind: postgres }
 
 # The upstream: PostgreSQL tables accelerated into Cayenne, which --cluster
-# partitions across the executors. It requires no API key: an API-key
-# upstream refuses every query after its 10,000th handshake
-# (known-failing/flight-auth/flight-auth-handshake-limit.yaml), and the load
-# below sends many more.
+# partitions across the executors. It requires no API key.
 spicepod:
   version: v1
   kind: Spicepod
