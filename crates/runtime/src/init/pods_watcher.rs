@@ -285,8 +285,8 @@ impl Runtime {
     }
 
     /// Hot-apply a new [`App`] to the running runtime, reconciling catalogs,
-    /// datasets, views, tools, functions, models, and (with the `models`
-    /// feature) workers against the currently-loaded app.
+    /// embedding models, rerankers, datasets, views, tools, functions, models,
+    /// and (with the `models` feature) workers against the currently-loaded app.
     ///
     /// This is the diff-based reconcile the pods watcher performs when a
     /// spicepod file changes on disk, and the one a Spice Cloud deployment takes
@@ -354,6 +354,9 @@ impl Runtime {
             Arc::clone(&self)
                 .apply_catalog_diff(current_app, &new_app)
                 .await;
+            // Before datasets: a dataset that uses a changed embedding model reloads with it.
+            self.apply_embedding_diff(current_app, &new_app).await;
+            self.apply_reranker_diff(current_app, &new_app).await;
             let reloaded_datasets = Arc::clone(&self)
                 .apply_dataset_diff(current_app, &new_app)
                 .await;
@@ -365,7 +368,14 @@ impl Runtime {
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
             let changed_function_tools = changed_function_tools(current_app, &new_app);
             let loaded_models = self.apply_model_diff(current_app, &new_app).await;
-            models_to_reload = Some((changed_tools, changed_function_tools, loaded_models));
+            let changed_embeddings =
+                crate::init::embedding::changed_embeddings(current_app, &new_app);
+            models_to_reload = Some((
+                changed_tools,
+                changed_function_tools,
+                changed_embeddings,
+                loaded_models,
+            ));
 
             if cfg!(feature = "models") {
                 Arc::clone(&self)
@@ -378,11 +388,14 @@ impl Runtime {
         self.search_primary_keys.update(Arc::clone(&self.app)).await;
 
         // After the swap: `auto` and `all` resolve against the installed app's `tools:`.
-        if let Some((changed_tools, changed_function_tools, loaded_models)) = models_to_reload {
+        if let Some((changed_tools, changed_function_tools, changed_embeddings, loaded_models)) =
+            models_to_reload
+        {
             self.reload_models_using_tools(
                 &new_app,
                 &changed_tools,
                 &changed_function_tools,
+                &changed_embeddings,
                 &loaded_models,
             )
             .await;
