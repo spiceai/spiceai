@@ -240,6 +240,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/spicescript" \
             --results "$RUNNER_TEMP/spicescript-results.json" \
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            --max-wait 30s \
             -- "${script_paths[@]}"
 
       - name: Upload script results
