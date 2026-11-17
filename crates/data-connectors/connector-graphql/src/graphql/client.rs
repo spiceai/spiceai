@@ -49,6 +49,7 @@ use util::{RetryError, retry};
 
 use url::Url;
 
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchReceiverStream};
 use futures::future::try_join_all;
@@ -815,6 +816,8 @@ fn unnest_json_objects(
 
 pub struct GraphQLClient {
     client: reqwest::Client,
+    /// The query memory pool every response body is charged to while it is held.
+    memory_pool: Arc<dyn MemoryPool>,
     endpoint: Url,
     pub(crate) json_pointer: Option<Arc<str>>,
     unnest_parameters: UnnestParameters,
@@ -965,6 +968,7 @@ impl GraphQLClient {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         client: reqwest::Client,
+        memory_pool: Arc<dyn MemoryPool>,
         endpoint: Url,
         json_pointer: Option<&str>,
         token: Option<Arc<dyn TokenProvider>>,
@@ -1026,6 +1030,7 @@ impl GraphQLClient {
 
         Ok(Self {
             client,
+            memory_pool,
             endpoint,
             json_pointer,
             unnest_parameters,
@@ -1036,6 +1041,18 @@ impl GraphQLClient {
             semaphore,
             nested_pager: None,
         })
+    }
+
+    /// The error for a response body that could not be read: a failed read is reported as
+    /// before, and a refused or undecodable body names the endpoint's origin.
+    fn response_body_error(&self, source: http_body_limit::Error) -> Error {
+        match source {
+            http_body_limit::Error::Read { source } => Error::ReqwestInternal { source },
+            source => Error::ResponseBody {
+                endpoint: self.endpoint.origin().ascii_serialization(),
+                source,
+            },
+        }
     }
 
     #[must_use]
@@ -1288,9 +1305,26 @@ impl GraphQLClient {
             self.record_adaptive_outcome(RequestOutcome::Success);
         }
 
-        // Read the raw body first so we can classify it before JSON decoding.
-        let response_bytes = response.bytes().await.context(ReqwestInternalSnafu)?;
+        // Read the raw body first so we can classify it before JSON decoding. It is charged,
+        // as decompressed, to the query memory pool as it is read and while it is held
+        // below, so a response the pool cannot hold, however small it was compressed, is
+        // refused instead of exhausting the process.
+        let reservation = MemoryConsumer::new(format!(
+            "GraphQL response from {}",
+            self.endpoint.origin().ascii_serialization()
+        ))
+        .register(&self.memory_pool);
+        let response_bytes =
+            http_body_limit::read_bytes(response, http_body_limit::Limit::Reserve(&reservation))
+                .await
+                .map_err(|source| self.response_body_error(source))?;
         let http_elapsed = http_started.elapsed();
+        // The text is a second copy of the body, charged before it is made.
+        reservation
+            .try_grow(response_bytes.len())
+            .map_err(|source| {
+                self.response_body_error(http_body_limit::Error::MemoryLimit { source })
+            })?;
         let response_text = String::from_utf8_lossy(&response_bytes).into_owned();
 
         let header = |name: &str| response_headers.get(name).and_then(|v| v.to_str().ok());
@@ -2629,7 +2663,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::new(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             // The provider normally stamps the client's pointer onto the query;
@@ -2757,7 +2796,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::new(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
@@ -2863,7 +2907,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::new(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
@@ -2973,7 +3022,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::new(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
@@ -3067,7 +3121,12 @@ mod tests {
                 node_selection: "id",
                 page_size: 2,
             }))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::new(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
@@ -3136,7 +3195,12 @@ mod tests {
             )
             .with_json_pointer(Some("/data/view/nodes"))
             .with_schema(schema)
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::new(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build")
         }
 
@@ -4028,6 +4092,7 @@ mod tests {
 
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             Some("/data"),
             Some(token),
@@ -4061,6 +4126,7 @@ mod tests {
 
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             Some(token),
@@ -4085,6 +4151,7 @@ mod tests {
     fn test_auth_basic_when_no_token() {
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             None,
@@ -4111,6 +4178,7 @@ mod tests {
 
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             None,
@@ -4137,6 +4205,7 @@ mod tests {
 
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             None,
@@ -4161,6 +4230,7 @@ mod tests {
     fn test_auth_none_when_nothing_set() {
         let client = super::GraphQLClient::new(
             reqwest::Client::new(),
+            std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
             Url::parse("https://example.com/graphql").expect("valid url"),
             None,
             None,
@@ -4433,7 +4503,12 @@ mod tests {
                 DataType::Utf8,
                 true,
             )]))))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::new(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build");
 
             let provider = GraphQLTableProviderBuilder::new(client)
@@ -4560,7 +4635,12 @@ mod tests {
                 DataType::Utf8,
                 true,
             )]))))
-            .build(reqwest::Client::new())
+            .build(
+                reqwest::Client::new(),
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("client to build")
         }
 

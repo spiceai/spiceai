@@ -1148,7 +1148,12 @@ mod tests {
             )
             .with_json_pointer(params.json_pointer)
             .with_schema(params.schema)
-            .build(http_client)
+            .build(
+                http_client,
+                std::sync::Arc::new(
+                    datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                ),
+            )
             .expect("GitHub-style GraphQL client to build");
 
             let provider = GraphQLTableProviderBuilder::new(client)

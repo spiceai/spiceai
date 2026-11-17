@@ -36,6 +36,7 @@ use datafusion::{
     common::Column,
     datasource::TableProvider,
     error::DataFusionError,
+    execution::memory_pool::MemoryPool,
     logical_expr::{Operator, TableProviderFilterPushDown},
     prelude::Expr,
     scalar::ScalarValue,
@@ -421,9 +422,11 @@ impl Github {
         }
     }
 
+    /// The GraphQL client for `tbl`, whose response bodies are charged to `memory_pool`.
     pub(crate) async fn create_graphql_client(
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
         let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
             return Err(
@@ -474,7 +477,7 @@ impl Github {
         .with_semaphore(Some(Arc::clone(&self.semaphore)))
         .with_rate_controller(Some(rate_controller))
         .with_nested_pager(gql_client_params.nested_pager)
-        .build(client)
+        .build(client, Arc::clone(memory_pool))
         .boxed()
     }
 
@@ -529,8 +532,9 @@ impl Github {
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        self.build_gql_table_provider(table_args, context, health_check_query_string)
+        self.build_gql_table_provider(table_args, context, health_check_query_string, memory_pool)
             .await
             .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
     }
@@ -540,15 +544,17 @@ impl Github {
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<GraphQLTableProvider> {
         let connector_component_name = format!("{}", table_args.get_component());
         let graphql_values = table_args.get_graphql_values();
-        let client = self.create_graphql_client(&table_args).await.context(
-            data_connector_api::UnableToGetReadProviderSnafu {
+        let client = self
+            .create_graphql_client(&table_args, memory_pool)
+            .await
+            .context(data_connector_api::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: table_args.get_component(),
-            },
-        )?;
+            })?;
 
         let provider_builder = GraphQLTableProviderBuilder::new(client)
             .with_schema_transform(github_gql_raw_schema_cast);
@@ -585,12 +591,13 @@ impl Github {
                 "GitHub GraphQL preflight validation failed for {connector_component_name}; continuing with the configured schema so the dataset can recover on a later refresh: {initial_build_error}"
             );
 
-            let fallback_client = self.create_graphql_client(&table_args).await.context(
-                data_connector_api::UnableToGetReadProviderSnafu {
+            let fallback_client = self
+                .create_graphql_client(&table_args, memory_pool)
+                .await
+                .context(data_connector_api::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: table_args.get_component(),
-                },
-            )?;
+                })?;
 
             let fallback_builder = GraphQLTableProviderBuilder::new(fallback_client)
                 .with_schema_transform(github_gql_raw_schema_cast);
@@ -710,6 +717,7 @@ impl Github {
         repo: &str,
         requested_ref: Option<&str>,
         dataset: &DatasetSpec,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_args = Arc::new(CommitsTableArgs {
             owner: owner.to_string(),
@@ -726,6 +734,7 @@ impl Github {
                 Arc::clone(&gql_table_args),
                 Some(gql_context),
                 Github::get_health_check_for_owner_and_repo(owner, repo),
+                memory_pool,
             )
             .await?;
         let client = delegate_provider.client();
@@ -1302,9 +1311,17 @@ impl DataConnector for Github {
 
     async fn read_provider(
         &self,
-        _context: &dyn ConnectorContext,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        // GraphQL response bodies are held to the runtime's query memory pool, at
+        // registration as in queries.
+        let memory_pool = Arc::clone(
+            &context
+                .datafusion_session_context()
+                .runtime_env()
+                .memory_pool,
+        );
         let path = dataset.path().to_string();
 
         // Parse owner, repo, and resource type from the path for validation
@@ -1418,7 +1435,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1430,6 +1447,7 @@ impl DataConnector for Github {
                     repo,
                     parsed.remaining.as_deref(),
                     dataset,
+                    &memory_pool,
                 )
                 .await
             }
@@ -1445,7 +1463,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1461,7 +1479,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1477,7 +1495,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1493,7 +1511,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1509,7 +1527,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1525,7 +1543,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1541,7 +1559,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1557,7 +1575,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_repository_owner(parsed.owner)
+                    Github::get_health_check_for_repository_owner(parsed.owner), &memory_pool
                 )
                 .await
             }
@@ -1572,7 +1590,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_user(parsed.owner)
+                    Github::get_health_check_for_user(parsed.owner), &memory_pool
                 )
                 .await
             }
@@ -1585,7 +1603,7 @@ impl DataConnector for Github {
                     repo: repo.to_string(),
                     component,
                 });
-                self.create_gql_table_provider(Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>, Some(table_args), Github::get_health_check_for_owner_and_repo(parsed.owner, repo)).await
+                self.create_gql_table_provider(Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>, Some(table_args), Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool).await
             }
             ("files", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "files", &component);
@@ -1680,7 +1698,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo), &memory_pool
                 )
                 .await
             }
@@ -1695,7 +1713,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_org(parsed.owner)
+                    Github::get_health_check_for_org(parsed.owner), &memory_pool
                 )
                 .await
             }
@@ -1709,7 +1727,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_org(parsed.owner)
+                    Github::get_health_check_for_org(parsed.owner), &memory_pool
                 )
                 .await
             }

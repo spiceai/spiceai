@@ -14,37 +14,45 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Reads of HTTP response bodies that refuse decompression amplification.
+//! Bounded reads of remote data: HTTP response bodies, and data read whole through
+//! [`std::io::Read`], such as a decompressed file or archive entry.
 //!
-//! A compressed body costs the sender far less than it costs the reader: a few hundred
-//! kilobytes of gzip decode to hundreds of megabytes, and brotli or zstd to gigabytes.
-//! An uncompressed body costs both sides the same, like any other large data source,
-//! and is read as it always was. So the check here applies only to a body sent with a
-//! `Content-Encoding`: once it has decoded past [`RATIO_CHECK_FLOOR_BYTES`], it is
-//! refused as soon as it has expanded more than [`MAX_COMPRESSION_RATIO`] times the
-//! bytes received for it. The check runs as each block is decoded, so a refused body
-//! holds at most one block more than the larger of the floor and that ratio times the
-//! bytes received. The ratio is over the whole body, so bytes sent early that compress
-//! poorly delay the refusal of a run that compresses well: a sender gets past the floor
-//! only by sending one byte for every [`MAX_COMPRESSION_RATIO`] it makes spiced hold.
+//! - **Every read is bounded by what it holds.** A [`Limit`] says how much a read may hold once decoded: a
+//!   share of the query memory pool for a body that carries data ([`Limit::Reserve`]),
+//!   or a fixed cap for a token, schema or error response ([`Limit::Size`]). A body the
+//!   pool cannot hold is refused instead of exhausting the process, so a response is
+//!   held to `runtime.query.memory_limit` like any other buffer a query holds.
+//! - **A compressed HTTP body is also bounded by how far it expands.** It costs the
+//!   sender far less than it costs the reader: a few hundred kilobytes of gzip decode to hundreds of megabytes,
+//!   and brotli or zstd to gigabytes. Once a compressed input has decoded past
+//!   [`RATIO_CHECK_FLOOR_BYTES`], it is refused as soon as it has expanded more than
+//!   [`MAX_COMPRESSION_RATIO`] times the bytes received for it. The
+//!   check runs as each block is decoded, so a refused input holds at most one block more
+//!   than the larger of the floor and that ratio times the bytes received. The ratio is
+//!   over the whole input, so bytes sent early that compress poorly delay the refusal of
+//!   a run that compresses well: a sender gets past the floor only by sending one byte
+//!   for every [`MAX_COMPRESSION_RATIO`] it makes spiced hold.
 //!
-//! Counting the bytes received needs the body before it is decoded, which `reqwest`'s
-//! transparent decompression does not expose. A client whose bodies are checked is
-//! therefore built with [`decode_manually`], and *every* body read from it must go
-//! through [`buffer`], [`read_bytes`] or [`read_prefix`]: they decode with the same
-//! decoders `reqwest` uses, while counting both sides.
+//! Counting the bytes received for an HTTP body needs the body before it is decoded,
+//! which `reqwest`'s transparent decompression does not expose. A client whose bodies are
+//! checked is therefore built with [`decode_manually`], and *every* body read from it
+//! must go through [`buffer`], [`read_bytes`] or [`read_prefix`]: they decode with the
+//! same decoders `reqwest` uses, while counting both sides.
 //!
-//! On a client that still decompresses transparently, `reqwest` has already removed
-//! the `Content-Encoding` header from a body it decoded, so these functions read that
-//! body as an uncompressed one: correct, but without the ratio check.
+//! On a client that still decompresses transparently, `reqwest` has already removed the
+//! `Content-Encoding` header from a body it decoded, so these functions read that body
+//! as an uncompressed one: still held to its [`Limit`], but without the ratio check.
+
+mod expansion;
+
+pub use expansion::{Limit, read_to_end};
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
 use bytes::{Bytes, BytesMut};
+use datafusion_common::DataFusionError;
 use futures::{StreamExt, TryStreamExt};
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HeaderMap, HeaderValue};
 use reqwest::{ClientBuilder, Response, ResponseBuilderExt};
@@ -52,15 +60,17 @@ use snafu::prelude::*;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
-/// How much a compressed body may decode to before its compression ratio is checked.
+use expansion::{Expansion, Held};
+
+/// How much a compressed input may decode to before its compression ratio is checked.
 ///
 /// Below it, any ratio is accepted: a small response that compresses extremely well
 /// (a page of identical rows) is ordinary, and costs little however small it was on
-/// the wire. A body refused for its ratio holds no more than one block past the larger
+/// the wire. An input refused for its ratio holds no more than one block past the larger
 /// of this and [`MAX_COMPRESSION_RATIO`] times the bytes received for it.
 pub const RATIO_CHECK_FLOOR_BYTES: usize = 64 * 1024 * 1024;
 
-/// The most a compressed body may expand, decoded bytes per byte received, once it has
+/// The most a compressed input may expand, decoded bytes per byte received, once it has
 /// decoded past [`RATIO_CHECK_FLOOR_BYTES`].
 ///
 /// Realistic JSON responses compress far less: TPC-H-shaped rows as a JSON array or
@@ -71,7 +81,7 @@ pub const RATIO_CHECK_FLOOR_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_COMPRESSION_RATIO: usize = 100;
 
 /// The most a metadata or token response is allowed to hold once decoded, compressed
-/// or not, on the paths that also cap size because they never carry bulk data.
+/// or not, on the paths that cap size because they never carry bulk data.
 ///
 /// It matches the 128 MiB the runtime accepts as a request body on its own HTTP API.
 pub const MAX_METADATA_BODY_BYTES: usize = 128 * 1024 * 1024;
@@ -80,67 +90,56 @@ pub const MAX_METADATA_BODY_BYTES: usize = 128 * 1024 * 1024;
 /// `reqwest` sends when it decompresses transparently.
 const ACCEPT_ENCODING_VALUE: &str = "zstd,gzip,deflate,br";
 
-/// The size of each block decoded at a time, and so how far past a limit a body can
+/// The size of each block decoded at a time, and so how far past a limit a read can
 /// get before the limit is enforced.
 pub const DECODE_BLOCK_BYTES: usize = 64 * 1024;
 
-/// What a read enforces beyond decoding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Limit {
-    /// The compression ratio check on a compressed body. An uncompressed body is read
-    /// exactly as `reqwest` reads it, at any size.
-    CompressionRatio,
-    /// The compression ratio check, and a cap on the decoded size of any body, for
-    /// responses that are never bulk data.
-    CompressionRatioAndSize(usize),
-}
-
-impl Limit {
-    /// The limit for a metadata or token response: the ratio check, and
-    /// [`MAX_METADATA_BODY_BYTES`].
-    pub const METADATA: Self = Self::CompressionRatioAndSize(MAX_METADATA_BODY_BYTES);
-
-    fn max_bytes(self) -> Option<usize> {
-        match self {
-            Self::CompressionRatio => None,
-            Self::CompressionRatioAndSize(max) => Some(max),
-        }
-    }
-}
-
 #[derive(Debug, Snafu)]
 pub enum Error {
-    /// The compressed body expanded past [`MAX_COMPRESSION_RATIO`] once past
+    /// The compressed input expanded past [`MAX_COMPRESSION_RATIO`] once past
     /// [`RATIO_CHECK_FLOOR_BYTES`]. Asking again gets the same answer.
     #[snafu(display(
-        "the {encoding}-compressed response body expanded more than {MAX_COMPRESSION_RATIO}:1 \
+        "the {codec}-compressed response body expanded more than {MAX_COMPRESSION_RATIO}:1 \
          when decoded ({decoded} bytes from {received} received), which is refused once a \
          body passes {} decoded",
         format_bytes(RATIO_CHECK_FLOOR_BYTES)
     ))]
     CompressionRatio {
-        encoding: Encoding,
+        codec: &'static str,
         decoded: usize,
         received: usize,
     },
 
-    /// The decoded body would pass the size cap. Asking again gets the same answer.
+    /// The decoded body would pass a [`Limit::Size`] cap. Asking again gets the same
+    /// answer.
     #[snafu(display(
         "the response body is larger than the {} that is read from one HTTP response",
         format_bytes(*limit)
     ))]
     TooLarge { limit: usize },
 
+    /// The query memory pool could not hold the decoded data ([`Limit::Reserve`]).
+    #[snafu(display(
+        "holding the decoded data would pass the query memory limit \
+         (`runtime.query.memory_limit`): {source}"
+    ))]
+    MemoryLimit { source: DataFusionError },
+
     /// Reading the body failed: a connection reset, a timeout or a truncated body.
     #[snafu(display("{source}"))]
     Read { source: reqwest::Error },
 
     /// The body does not decode as the encoding it was sent with.
-    #[snafu(display("Failed to decode the {encoding}-compressed response body: {source}"))]
+    #[snafu(display("Failed to decode the {codec}-compressed response body: {source}"))]
     Decode {
-        encoding: Encoding,
+        codec: &'static str,
         source: io::Error,
     },
+
+    /// Reading data through [`read_to_end`] failed, including a decoder in it failing to
+    /// decode.
+    #[snafu(display("{source}"))]
+    Io { source: io::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -168,7 +167,9 @@ impl Encoding {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    /// The `Content-Encoding` token.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Gzip => "gzip",
             Self::Deflate => "deflate",
@@ -206,16 +207,96 @@ pub fn decode_manually(builder: ClientBuilder) -> ClientBuilder {
 
 /// Read the decoded body of `response` under `limit`.
 ///
+/// An uncompressed body that declares its length is charged that length before any of it
+/// is read, so a body larger than `limit` allows is refused before it is received, and is
+/// read into one allocation of exactly its size. Any other body is read a block at a
+/// time, each block charged before it is allocated, and joined once at the end into an
+/// allocation of exactly its size: a refused body holds no more than the blocks it read,
+/// and the join briefly holds the body twice, which is charged too. A compressed body is
+/// also held to the compression ratio check.
+///
 /// # Errors
 ///
-/// [`Error::CompressionRatio`] or [`Error::TooLarge`] when the body breaks `limit`,
-/// [`Error::Read`] when reading it fails, and [`Error::Decode`] when it does not decode.
-pub async fn read_bytes(response: Response, limit: Limit) -> Result<Bytes> {
-    match (Encoding::of(response.headers()), limit.max_bytes()) {
-        (Some(encoding), max_bytes) => decode(response, encoding, max_bytes).await,
-        (None, None) => response.bytes().await.context(ReadSnafu),
-        (None, Some(max_bytes)) => read_capped(response, max_bytes).await,
+/// [`Error::CompressionRatio`], [`Error::TooLarge`] or [`Error::MemoryLimit`] when the
+/// body breaks `limit` or the ratio, [`Error::Read`] when reading it fails, and
+/// [`Error::Decode`] when it does not decode.
+pub async fn read_bytes(response: Response, limit: Limit<'_>) -> Result<Bytes> {
+    let encoding = Encoding::of(response.headers());
+    let declared = match encoding {
+        None => response
+            .content_length()
+            .and_then(|len| usize::try_from(len).ok()),
+        Some(_) => None,
+    };
+    let (mut reader, expansion) = reader(response, encoding);
+    let mut held = Held::new(limit);
+
+    if let Some(declared) = declared {
+        held.check_size(declared)?;
+        held.grow(declared)?;
+        let mut body = BytesMut::with_capacity(declared);
+        // The HTTP client ends the body at its declared length, and fails a read of one
+        // that ends early.
+        while body.len() < declared {
+            let n = reader
+                .read_buf(&mut body)
+                .await
+                .map_err(|error| read_failure(error, encoding))?;
+            if n == 0 {
+                break;
+            }
+        }
+        held.shrink(declared - body.len());
+        held.keep();
+        return Ok(body.freeze());
     }
+
+    let mut blocks: Vec<Bytes> = Vec::new();
+    held.grow(DECODE_BLOCK_BYTES)?;
+    let mut block = BytesMut::with_capacity(DECODE_BLOCK_BYTES);
+    let mut decoded = 0usize;
+    loop {
+        if block.len() == block.capacity() {
+            blocks.push(block.split().freeze());
+            held.grow(DECODE_BLOCK_BYTES)?;
+            block.reserve(DECODE_BLOCK_BYTES);
+        }
+        let n = reader
+            .read_buf(&mut block)
+            .await
+            .map_err(|error| read_failure(error, encoding))?;
+        if n == 0 {
+            break;
+        }
+        decoded += n;
+        held.check_size(decoded)?;
+        if let Some(expansion) = &expansion {
+            expansion.decoded(n)?;
+        }
+    }
+
+    // Charged at block capacity while reading, and held at exactly the body's size once
+    // it is joined: the join is charged before it allocates, and the blocks are released
+    // after it.
+    let charged_for_blocks = (blocks.len() + 1) * DECODE_BLOCK_BYTES;
+    let body = if blocks.is_empty() {
+        held.shrink(charged_for_blocks - block.len());
+        let body = Bytes::copy_from_slice(&block);
+        drop(block);
+        body
+    } else {
+        held.grow(decoded)?;
+        let mut body = BytesMut::with_capacity(decoded);
+        for part in blocks.drain(..) {
+            body.extend_from_slice(&part);
+        }
+        body.extend_from_slice(&block);
+        drop(block);
+        held.shrink(charged_for_blocks);
+        body.freeze()
+    };
+    held.keep();
+    Ok(body)
 }
 
 /// Read the body of `response` under `limit` (see [`read_bytes`]) and hand back a
@@ -224,17 +305,12 @@ pub async fn read_bytes(response: Response, limit: Limit) -> Result<Bytes> {
 /// The returned response's `text()` and `json()` behave as on a client that
 /// decompresses transparently — the same charset handling and the same errors. Like
 /// that client, a decoded response loses its `Content-Encoding` and `Content-Length`.
-/// An uncompressed response under [`Limit::CompressionRatio`] is returned untouched.
 ///
 /// # Errors
 ///
 /// As [`read_bytes`].
-pub async fn buffer(response: Response, limit: Limit) -> Result<Response> {
+pub async fn buffer(response: Response, limit: Limit<'_>) -> Result<Response> {
     let encoding = Encoding::of(response.headers());
-    if encoding.is_none() && limit == Limit::CompressionRatio {
-        return Ok(response);
-    }
-
     let status = response.status();
     let version = response.version();
     let mut headers = response.headers().clone();
@@ -275,31 +351,21 @@ pub async fn read_prefix(response: Response, max_bytes: usize) -> Vec<u8> {
     out
 }
 
-async fn read_capped(mut response: Response, max_bytes: usize) -> Result<Bytes> {
-    let mut body = BytesMut::new();
-    while let Some(chunk) = response.chunk().await.context(ReadSnafu)? {
-        ensure!(
-            chunk.len() <= max_bytes - body.len(),
-            TooLargeSnafu { limit: max_bytes }
-        );
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body.freeze())
-}
-
 type Reader = Pin<Box<dyn AsyncRead + Send>>;
 
 /// A reader of the body of `response`, decoded as `encoding` if it has one, and the
-/// count of body bytes it has been handed so far.
-fn reader(response: Response, encoding: Option<Encoding>) -> (Reader, Arc<AtomicUsize>) {
-    let received = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&received);
+/// ratio check that counts the body bytes it has been handed when it does.
+fn reader(response: Response, encoding: Option<Encoding>) -> (Reader, Option<Expansion>) {
+    let expansion = encoding.map(|encoding| Expansion::new(encoding.as_str()));
+    let counter = expansion.clone();
     let chunks = futures::stream::try_unfold(response, |mut response| async move {
         let chunk: Option<Bytes> = response.chunk().await?;
         Ok::<_, reqwest::Error>(chunk.map(|chunk| (chunk, response)))
     })
     .map_ok(move |chunk: Bytes| {
-        counter.fetch_add(chunk.len(), Ordering::Relaxed);
+        if let Some(counter) = &counter {
+            counter.received(chunk.len());
+        }
         chunk
     })
     .map_err(io::Error::other)
@@ -312,63 +378,19 @@ fn reader(response: Response, encoding: Option<Encoding>) -> (Reader, Arc<Atomic
         Some(Encoding::Brotli) => Box::pin(BrotliDecoder::new(body)),
         Some(Encoding::Zstd) => Box::pin(ZstdDecoder::new(body)),
     };
-    (reader, received)
+    (reader, expansion)
 }
 
-async fn decode(response: Response, encoding: Encoding, max_bytes: Option<usize>) -> Result<Bytes> {
-    let (mut reader, received_bytes) = reader(response, Some(encoding));
-
-    // Decoded into blocks of a fixed size and joined once at the end, so a body that
-    // is refused holds no more than the blocks it decoded, and one that is not is
-    // copied once into an allocation of exactly its size.
-    let mut blocks: Vec<Bytes> = Vec::new();
-    let mut block = BytesMut::with_capacity(DECODE_BLOCK_BYTES);
-    let mut decoded = 0usize;
-    loop {
-        if block.len() == block.capacity() {
-            blocks.push(block.split().freeze());
-            block.reserve(DECODE_BLOCK_BYTES);
-        }
-        let n = reader
-            .read_buf(&mut block)
-            .await
-            .map_err(|error| read_failure(error, encoding))?;
-        if n == 0 {
-            break;
-        }
-        decoded += n;
-        if let Some(max_bytes) = max_bytes {
-            ensure!(decoded <= max_bytes, TooLargeSnafu { limit: max_bytes });
-        }
-        let received = received_bytes.load(Ordering::Relaxed);
-        ensure!(
-            decoded <= RATIO_CHECK_FLOOR_BYTES
-                || decoded <= received.saturating_mul(MAX_COMPRESSION_RATIO),
-            CompressionRatioSnafu {
-                encoding,
-                decoded,
-                received,
-            }
-        );
-    }
-
-    if blocks.is_empty() {
-        return Ok(block.freeze());
-    }
-    let mut body = BytesMut::with_capacity(decoded);
-    for part in blocks.drain(..) {
-        body.extend_from_slice(&part);
-    }
-    body.extend_from_slice(&block);
-    Ok(body.freeze())
-}
-
-/// A failed read from a decoder: either reading the body failed, which is passed
-/// through, or the body does not decode.
-fn read_failure(error: io::Error, encoding: Encoding) -> Error {
-    match error.downcast::<reqwest::Error>() {
-        Ok(source) => Error::Read { source },
-        Err(source) => Error::Decode { encoding, source },
+/// A failed read from the body: either reading the body failed, which is passed
+/// through, or a compressed body does not decode.
+fn read_failure(error: io::Error, encoding: Option<Encoding>) -> Error {
+    match (error.downcast::<reqwest::Error>(), encoding) {
+        (Ok(source), _) => Error::Read { source },
+        (Err(source), Some(encoding)) => Error::Decode {
+            codec: encoding.as_str(),
+            source,
+        },
+        (Err(source), None) => Error::Io { source },
     }
 }
 
@@ -384,11 +406,24 @@ fn format_bytes(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_execution::memory_pool::{
+        GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation, UnboundedMemoryPool,
+    };
     use std::io::Write;
+    use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     const MIB: usize = 1024 * 1024;
+
+    /// A reservation on a pool of `bytes`, or on an unbounded pool.
+    fn reservation(bytes: Option<usize>) -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = match bytes {
+            Some(bytes) => Arc::new(GreedyMemoryPool::new(bytes)),
+            None => Arc::new(UnboundedMemoryPool::default()),
+        };
+        MemoryConsumer::new("test body").register(&pool)
+    }
 
     /// `len` bytes produced by `fill`, encoded as `encoding`, built a block at a time
     /// so the plain text is never held whole. The fastest levels keep the test quick;
@@ -503,18 +538,20 @@ mod tests {
         assert!(body.len() < MIB, "the bomb is small on the wire");
         let url = serve(header, body).await;
 
-        let error = read_bytes(get(&url).await, Limit::CompressionRatio)
+        let held = reservation(None);
+        let error = read_bytes(get(&url).await, Limit::Reserve(&held))
             .await
             .expect_err("a body that expands past the ratio is refused");
         let Error::CompressionRatio {
-            encoding: refused,
+            codec: refused,
             decoded,
             received,
         } = error
         else {
             panic!("expected a compression ratio error, got {error:?}");
         };
-        assert_eq!(refused, encoding);
+        assert_eq!(refused, encoding.as_str());
+        assert_eq!(held.size(), 0, "a refused body returns what it charged");
         assert!(
             decoded > RATIO_CHECK_FLOOR_BYTES
                 && decoded <= RATIO_CHECK_FLOOR_BYTES + DECODE_BLOCK_BYTES,
@@ -555,10 +592,12 @@ mod tests {
         );
         let url = serve("Content-Encoding: gzip\r\n", body).await;
 
-        let decoded = read_bytes(get(&url).await, Limit::CompressionRatio)
+        let held = reservation(None);
+        let decoded = read_bytes(get(&url).await, Limit::Reserve(&held))
             .await
             .expect("a realistic ratio is read in full");
         assert_eq!(decoded.len(), len);
+        assert_eq!(held.size(), len, "the body is charged at exactly its size");
         assert!(
             decoded
                 .iter()
@@ -574,7 +613,8 @@ mod tests {
             compressed(Encoding::Gzip, 8 * MIB, same_byte),
         )
         .await;
-        let decoded = read_bytes(get(&url).await, Limit::CompressionRatio)
+        let held = reservation(None);
+        let decoded = read_bytes(get(&url).await, Limit::Reserve(&held))
             .await
             .expect("a small body is read at any ratio");
         assert_eq!(decoded.len(), 8 * MIB);
@@ -608,7 +648,8 @@ mod tests {
         );
         let url = serve("Content-Encoding: gzip\r\n", body).await;
 
-        let error = read_bytes(get(&url).await, Limit::CompressionRatio)
+        let held = reservation(None);
+        let error = read_bytes(get(&url).await, Limit::Reserve(&held))
             .await
             .expect_err("a body that expands past the ratio is refused");
         let Error::CompressionRatio {
@@ -637,11 +678,11 @@ mod tests {
     #[tokio::test]
     async fn size_cap_applies_to_compressed_and_uncompressed_bodies() {
         let url = serve("", vec![b'A'; 2 * MIB]).await;
-        let body = read_bytes(get(&url).await, Limit::CompressionRatioAndSize(2 * MIB))
+        let body = read_bytes(get(&url).await, Limit::Size(2 * MIB))
             .await
             .expect("a body of exactly the cap is read");
         assert_eq!(body.len(), 2 * MIB);
-        let error = read_bytes(get(&url).await, Limit::CompressionRatioAndSize(2 * MIB - 1))
+        let error = read_bytes(get(&url).await, Limit::Size(2 * MIB - 1))
             .await
             .expect_err("one byte over the cap is refused");
         assert!(
@@ -654,11 +695,11 @@ mod tests {
             compressed(Encoding::Gzip, 2 * MIB, same_byte),
         )
         .await;
-        let body = read_bytes(get(&url).await, Limit::CompressionRatioAndSize(2 * MIB))
+        let body = read_bytes(get(&url).await, Limit::Size(2 * MIB))
             .await
             .expect("a compressed body of exactly the cap is read");
         assert_eq!(body.len(), 2 * MIB);
-        let error = read_bytes(get(&url).await, Limit::CompressionRatioAndSize(2 * MIB - 1))
+        let error = read_bytes(get(&url).await, Limit::Size(2 * MIB - 1))
             .await
             .expect_err("one decoded byte over the cap is refused");
         assert!(
@@ -674,17 +715,11 @@ mod tests {
     #[tokio::test]
     async fn corrupt_compressed_body_is_a_decode_error() {
         let url = serve("Content-Encoding: gzip\r\n", b"not gzip at all".to_vec()).await;
-        let error = read_bytes(get(&url).await, Limit::CompressionRatio)
+        let error = read_bytes(get(&url).await, Limit::METADATA)
             .await
             .expect_err("a body that does not decode is refused");
         assert!(
-            matches!(
-                error,
-                Error::Decode {
-                    encoding: Encoding::Gzip,
-                    ..
-                }
-            ),
+            matches!(error, Error::Decode { codec: "gzip", .. }),
             "{error:?}"
         );
     }
@@ -692,7 +727,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_encoding_is_read_as_it_is() {
         let url = serve("Content-Encoding: x-custom\r\n", b"raw bytes".to_vec()).await;
-        let body = read_bytes(get(&url).await, Limit::CompressionRatio)
+        let body = read_bytes(get(&url).await, Limit::METADATA)
             .await
             .expect("an encoding reqwest does not decode is passed through");
         assert_eq!(&body[..], b"raw bytes");
@@ -701,7 +736,7 @@ mod tests {
     #[tokio::test]
     async fn empty_bodies_read_as_empty() {
         let url = serve("", Vec::new()).await;
-        let body = read_bytes(get(&url).await, Limit::CompressionRatioAndSize(0))
+        let body = read_bytes(get(&url).await, Limit::Size(0))
             .await
             .expect("an empty body fits any cap");
         assert!(body.is_empty());
@@ -711,7 +746,7 @@ mod tests {
             compressed(Encoding::Gzip, 0, same_byte),
         )
         .await;
-        let body = read_bytes(get(&url).await, Limit::CompressionRatio)
+        let body = read_bytes(get(&url).await, Limit::METADATA)
             .await
             .expect("an empty compressed body decodes");
         assert!(body.is_empty());
@@ -727,7 +762,7 @@ mod tests {
             gz.finish().expect("finish gzip"),
         )
         .await;
-        let response = buffer(get(&url).await, Limit::CompressionRatio)
+        let response = buffer(get(&url).await, Limit::METADATA)
             .await
             .expect("a small body is buffered");
 
@@ -785,5 +820,75 @@ mod tests {
 
         let url = serve("", b"short error".to_vec()).await;
         assert_eq!(read_prefix(get(&url).await, 1024).await, b"short error");
+    }
+
+    #[tokio::test]
+    async fn reserved_body_is_charged_and_refused_past_the_pool() {
+        let url = serve("", vec![b'A'; 4 * MIB]).await;
+
+        let held = reservation(Some(8 * MIB));
+        let body = read_bytes(get(&url).await, Limit::Reserve(&held))
+            .await
+            .expect("a body the pool can hold is read");
+        assert_eq!(body.len(), 4 * MIB);
+        assert_eq!(held.size(), 4 * MIB, "the caller holds the body's charge");
+        drop(body);
+        held.free();
+
+        // Refused on its declared length, before any of it is read.
+        let held = reservation(Some(2 * MIB));
+        let error = read_bytes(get(&url).await, Limit::Reserve(&held))
+            .await
+            .expect_err("a body larger than the pool is refused");
+        assert!(matches!(error, Error::MemoryLimit { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("holding the decoded data would pass the query memory limit (`runtime.query.memory_limit`): Resources exhausted"),
+            "{error}"
+        );
+        assert_eq!(held.size(), 0, "a refused body returns what it charged");
+    }
+
+    #[tokio::test]
+    async fn compressed_body_is_charged_by_its_decoded_size() {
+        let url = serve(
+            "Content-Encoding: gzip\r\n",
+            compressed(Encoding::Gzip, 8 * MIB, same_byte),
+        )
+        .await;
+        let held = reservation(Some(4 * MIB));
+        let error = read_bytes(get(&url).await, Limit::Reserve(&held))
+            .await
+            .expect_err("a body that decodes past the pool is refused");
+        assert!(matches!(error, Error::MemoryLimit { .. }), "{error:?}");
+        assert_eq!(held.size(), 0);
+    }
+
+    #[test]
+    fn sync_read_is_held_to_the_pool_and_the_size_cap() {
+        let data = vec![b'x'; 3 * MIB];
+        let held = reservation(Some(2 * MIB));
+        let error = read_to_end(data.as_slice(), Limit::Reserve(&held))
+            .expect_err("more than the pool holds is refused");
+        assert!(matches!(error, Error::MemoryLimit { .. }), "{error:?}");
+        assert_eq!(held.size(), 0);
+
+        let error = read_to_end(data.as_slice(), Limit::Size(3 * MIB - 1))
+            .expect_err("one byte over the cap is refused");
+        assert!(
+            matches!(error, Error::TooLarge { limit } if limit == 3 * MIB - 1),
+            "{error:?}"
+        );
+        let read = read_to_end(data.as_slice(), Limit::Size(3 * MIB)).expect("the cap itself fits");
+        assert_eq!(read, data);
+
+        let empty = reservation(Some(DECODE_BLOCK_BYTES));
+        assert!(
+            read_to_end(&b""[..], Limit::Reserve(&empty))
+                .expect("empty input")
+                .is_empty()
+        );
+        assert_eq!(empty.size(), 0);
     }
 }

@@ -35,6 +35,7 @@ use data_http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use datafusion::datasource::TableProvider;
+use datafusion::execution::memory_pool::MemoryPool;
 use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -165,9 +166,11 @@ impl DataConnectorFactory for GraphQLFactory {
 }
 
 impl GraphQL {
+    /// The client for `dataset`, whose response bodies are charged to `memory_pool`.
     async fn get_client(
         &self,
         dataset: &DatasetSpec,
+        memory_pool: Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<(
         GraphQLClient,
         http_rate_control::SharedRateControllerReservation,
@@ -288,7 +291,7 @@ impl GraphQL {
         .with_rate_limiter(Some(rate_limiter))
         .with_rate_controller(rate_controller.shared().controller.clone())
         .with_auth_header(auth_header)
-        .build(client)
+        .build(client, memory_pool)
         .boxed();
 
         match client_result {
@@ -313,7 +316,7 @@ impl DataConnector for GraphQL {
 
     async fn read_provider(
         &self,
-        _context: &dyn ConnectorContext,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let query = self.params.get("query").expose().ok_or_else(|p| {
@@ -324,7 +327,15 @@ impl DataConnector for GraphQL {
             }
         })?;
 
-        let (client, rate_controller) = self.get_client(dataset).await?;
+        // Response bodies are held to the runtime's query memory pool, at registration as
+        // in queries.
+        let memory_pool = Arc::clone(
+            &context
+                .datafusion_session_context()
+                .runtime_env()
+                .memory_pool,
+        );
+        let (client, rate_controller) = self.get_client(dataset, memory_pool).await?;
 
         match GraphQLTableProviderBuilder::new(client).build(query).await {
             Ok(provider) => {
@@ -462,7 +473,10 @@ mod tests {
         let dataset = test_dataset("https://graphql-dataset-params.example.com/graphql").await;
 
         let (_, reservation) = graphql
-            .get_client(&dataset)
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
             .await
             .expect("GraphQL client should build with rate-control params");
         reservation.commit().await;
@@ -494,7 +508,10 @@ mod tests {
         let dataset = test_dataset("https://graphql-runtime-defaults.example.com/graphql").await;
 
         let (_, reservation) = graphql
-            .get_client(&dataset)
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
             .await
             .expect("GraphQL client should build with runtime rate-control defaults");
         reservation.commit().await;
@@ -516,7 +533,13 @@ mod tests {
         };
         let dataset = test_dataset("https://graphql-invalid-limit.example.com/graphql").await;
 
-        let Err(error) = graphql.get_client(&dataset).await else {
+        let Err(error) = graphql
+            .get_client(
+                &dataset,
+                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
+            )
+            .await
+        else {
             panic!("zero GraphQL rate-control limit should be rejected");
         };
 

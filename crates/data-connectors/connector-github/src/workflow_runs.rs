@@ -263,7 +263,7 @@ impl WorkflowRunsTableProvider {
                 workflow_id.into(),
                 None,
                 Some(1),
-                false,
+                None,
             )
             .await
         {
@@ -541,20 +541,31 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let owner = Arc::clone(&self.owner);
         let repo = Arc::clone(&self.repo);
         let workflow_id = Arc::clone(&self.workflow_id);
         let query_params = self.query_params.clone();
         let limit = self.limit;
-        let fetch_logs = self.fetch_logs;
+        // Logs are charged to this query's memory pool while they are held.
+        let logs_memory_pool = self.fetch_logs.then(|| Arc::clone(context.memory_pool()));
         let client = Arc::clone(&self.client);
 
         let stream = futures::stream::once(
             client
-                .fetch_workflow_runs(owner, repo, workflow_id, query_params, limit, fetch_logs)
-                .map_err(DataFusionError::External),
+                .fetch_workflow_runs(
+                    owner,
+                    repo,
+                    workflow_id,
+                    query_params,
+                    limit,
+                    logs_memory_pool,
+                )
+                .map_err(|e| match e.downcast::<DataFusionError>() {
+                    Ok(error) => *error,
+                    Err(e) => DataFusionError::External(e),
+                }),
         )
         .try_flatten();
 

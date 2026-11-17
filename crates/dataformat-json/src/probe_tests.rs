@@ -248,3 +248,58 @@ async fn schema_probe_flattens_streamed_records() {
         );
     }
 }
+
+/// A session whose query memory pool holds `bytes`.
+fn session_with_memory(bytes: usize) -> SessionContext {
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_memory_limit(bytes, 1.0)
+        .build_arc()
+        .expect("runtime with a memory limit");
+    SessionContext::new_with_config_rt(datafusion::prelude::SessionConfig::new(), runtime)
+}
+
+/// A gzip-compressed JSON object far larger decompressed than the pool: the probe
+/// parses an object whole, so it fails naming the file instead of holding it.
+#[tokio::test]
+async fn whole_document_probe_is_held_to_the_query_memory_limit() {
+    const MIB: usize = 1024 * 1024;
+    let mut document = b"{\"a\":\"".to_vec();
+    document.resize(document.len() + 32 * MIB, b'x');
+    document.extend_from_slice(b"\"}");
+    let compressed = gzip(&document);
+    assert!(compressed.len() < MIB, "the file is small on the wire");
+
+    let format = SpiceJsonFormat::default()
+        .with_format(Format::Object)
+        .with_file_compression_type(FileCompressionType::GZIP);
+    for payload in [Payload::File, Payload::Stream] {
+        let (store, meta, _directory) = store_with(&compressed, payload).await;
+
+        let state = session_with_memory(8 * MIB).state();
+        let error = format
+            .probe_schema(&state, &store, std::slice::from_ref(&meta))
+            .await
+            .expect_err("a document larger than the pool is refused");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(
+                "Resources exhausted: Failed to read JSON file 'records.json' to infer its \
+                 schema: holding the decoded data would pass the query memory limit"
+            ),
+            "{payload:?}: {message}"
+        );
+        assert!(
+            message.contains("Raise `runtime.query.memory_limit`"),
+            "{message}"
+        );
+        assert_eq!(state.runtime_env().memory_pool.reserved(), 0, "{payload:?}");
+
+        let state = session_with_memory(256 * MIB).state();
+        let probe = format
+            .probe_schema(&state, &store, &[meta])
+            .await
+            .expect("the same document fits a larger pool");
+        assert_eq!(probe.record_count, 1, "{payload:?}");
+        assert_eq!(state.runtime_env().memory_pool.reserved(), 0, "{payload:?}");
+    }
+}

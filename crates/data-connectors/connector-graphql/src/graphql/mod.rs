@@ -41,6 +41,17 @@ pub enum Error {
     #[snafu(display("Failed to send GraphQL HTTP request: {source}"))]
     ReqwestInternal { source: reqwest::Error },
 
+    /// The response body could not be read: the query memory pool could not hold it, or
+    /// it could not be read as sent.
+    #[snafu(display(
+        "Failed to read the GraphQL response from {endpoint}: {source}{}",
+        response_body_remedy(source)
+    ))]
+    ResponseBody {
+        endpoint: String,
+        source: http_body_limit::Error,
+    },
+
     #[snafu(display("HTTP {status}: {message}"))]
     InvalidReqwestStatus {
         status: reqwest::StatusCode,
@@ -154,6 +165,18 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// message that a backend timeout also produces, so it must not make the
 /// refresh permanent.
 #[must_use]
+/// What to do about a GraphQL response body that was refused, as the end of the
+/// sentence that names it.
+fn response_body_remedy(source: &http_body_limit::Error) -> &'static str {
+    match source {
+        http_body_limit::Error::MemoryLimit { .. } => {
+            ". Raise `runtime.query.memory_limit`, or request fewer rows per page. \
+             See: https://spiceai.org/docs/reference/memory"
+        }
+        _ => "",
+    }
+}
+
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
         Error::RateLimited { .. } => true,
@@ -175,6 +198,12 @@ pub fn is_retriable_error(error: &Error) -> bool {
         Error::UnexpectedResponse { status, format, .. } => {
             response::is_retryable_unexpected_response(*status, *format)
         }
+        // A body that could not be read may have been cut short in transit, as a failed
+        // read is; one the query memory pool could not hold is not asked for again.
+        Error::ResponseBody { source, .. } => matches!(
+            source,
+            http_body_limit::Error::Decode { .. } | http_body_limit::Error::Io { .. }
+        ),
         Error::ReqwestInternal { source } => {
             // Check for transient network/connection errors:
             // - is_timeout(): Connection or request timeouts

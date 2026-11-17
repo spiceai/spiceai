@@ -32,7 +32,10 @@ use datafusion::{
     common::{Constraints, TableReference, project_schema, runtime::IoWaitExt},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{SendableRecordBatchStream, TaskContext},
+    execution::{
+        SendableRecordBatchStream, TaskContext,
+        memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
+    },
     logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, expr::InList},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -132,6 +135,17 @@ pub enum Error {
 
     #[snafu(display("Failed to read the response from {endpoint} for {dataset}: {source}"))]
     ResponseDecode {
+        endpoint: String,
+        dataset: String,
+        source: http_body_limit::Error,
+    },
+
+    #[snafu(display(
+        "Failed to read the response from {endpoint} for {dataset}: {source}. Raise \
+        `runtime.query.memory_limit`, or request less data per call with filters or \
+        pagination. See: https://spiceai.org/docs/reference/memory"
+    ))]
+    ResponseMemory {
         endpoint: String,
         dataset: String,
         source: http_body_limit::Error,
@@ -362,6 +376,11 @@ impl From<Error> for DataFusionError {
             }
             // `Plan`, so a refresh does not re-ask: the response will expand as far again.
             err @ Error::CompressionRatio { .. } => DataFusionError::Plan(err.to_string()),
+            // The pool's own error kind, so the query fails as any other that ran out of
+            // query memory does.
+            err @ Error::ResponseMemory { .. } => {
+                DataFusionError::ResourcesExhausted(err.to_string())
+            }
             err @ Error::ResponseDecode { .. } => {
                 DataFusionError::External(Box::new(std::io::Error::other(err.to_string())))
             }
@@ -510,9 +529,10 @@ impl CachedResponse {
     /// The reported window is the entry's own retention rather than anything
     /// re-derived: it is already the effective value the entry was admitted
     /// under.
-    fn into_fetch_result(self) -> HttpFetchResult {
+    fn into_fetch_result(self, reservation: MemoryReservation) -> HttpFetchResult {
         HttpFetchResult {
             content: (*self.content).clone(),
+            _reservation: reservation,
             directives: CacheDirectives {
                 present: true,
                 max_age: Some(self.max_age),
@@ -807,6 +827,10 @@ impl ForwardedTraceParent {
 
 struct HttpFetchResult {
     content: String,
+    /// The share of the query memory pool `content` is charged to. Never read: it is
+    /// held so the charge lasts exactly as long as the result, and returned when the
+    /// result is dropped.
+    _reservation: MemoryReservation,
     /// What the origin's `Cache-Control` said. The retention decision is made by
     /// the caller, which is where a configured fallback is in scope.
     directives: CacheDirectives,
@@ -987,6 +1011,13 @@ impl HttpTableProvider {
     /// that still reads as a sentence when there is not.
     fn dataset_subject(&self) -> String {
         dataset_subject(self.dataset_name.as_deref())
+    }
+
+    /// A reservation on `memory_pool` for one response to this dataset, named so that a
+    /// query that runs out of memory says which dataset's response it was holding.
+    fn response_reservation(&self, memory_pool: &Arc<dyn MemoryPool>) -> MemoryReservation {
+        MemoryConsumer::new(format!("HTTP response for {}", self.dataset_subject()))
+            .register(memory_pool)
     }
 
     /// Set what a response the origin did not mark successful becomes: a failed
@@ -1822,9 +1853,11 @@ impl HttpTableProvider {
         request_headers: Option<&HeaderMap>,
         trace_parent: Option<&ForwardedTraceParent>,
         path_label: &str,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> Result<HttpFetchResult> {
         let retry_strategy = self.retry_strategy.clone();
         let this = self.clone();
+        let memory_pool = Arc::clone(memory_pool);
         let url_clone = url.clone();
         let body_owned = body.map(ToOwned::to_owned);
         let request_headers_owned = request_headers.cloned();
@@ -1842,6 +1875,7 @@ impl HttpTableProvider {
             let request_headers = request_headers_owned.clone();
             let trace_parent = trace_parent_owned.clone();
             let path = path_owned.clone();
+            let memory_pool = Arc::clone(&memory_pool);
 
             async move {
                 this.perform_single_request(
@@ -1850,6 +1884,7 @@ impl HttpTableProvider {
                     request_headers.as_ref(),
                     trace_parent.as_ref(),
                     &path,
+                    &memory_pool,
                 )
                 .await
             }
@@ -1884,6 +1919,7 @@ impl HttpTableProvider {
         request_headers: Option<&HeaderMap>,
         trace_parent: Option<&ForwardedTraceParent>,
         path_label: &str,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         // Held until the body below has been read, so a response still streaming counts
         // against the rate controller's concurrency limit.
@@ -1995,6 +2031,7 @@ impl HttpTableProvider {
 
         let fetched = Self::extract_response(
             response,
+            self.response_reservation(memory_pool),
             &self.base_url,
             status_code,
             path_label,
@@ -2019,8 +2056,13 @@ impl HttpTableProvider {
     }
 
     /// Extract content and metadata from an HTTP response.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a distinct property of the one response being read"
+    )]
     async fn extract_response(
         response: reqwest::Response,
+        reservation: MemoryReservation,
         endpoint: &Url,
         status_code: u16,
         path_label: &str,
@@ -2143,37 +2185,56 @@ impl HttpTableProvider {
         // the retriable-error classification in `graphql/mod.rs`, which groups
         // is_timeout/is_connect/is_body/is_decode together as transient.
         //
-        // The client is built with `http_body_limit::decode_manually`, so a compressed body
-        // is decoded here and refused once it expands past a ratio real responses do not
-        // reach. That refusal is permanent: asking again gets the same body.
-        let response = http_body_limit::buffer(response, http_body_limit::Limit::CompressionRatio)
-            .io_wait()
-            .await
-            .map_err(|e| match e {
-                http_body_limit::Error::Read { source } => {
-                    RetryError::transient(Error::http_request(endpoint, source))
-                }
-                source @ http_body_limit::Error::Decode { .. } => {
-                    RetryError::transient(Error::ResponseDecode {
-                        endpoint: endpoint_label(endpoint),
-                        dataset: dataset_subject(dataset_name),
-                        source,
-                    })
-                }
-                source @ (http_body_limit::Error::CompressionRatio { .. }
-                | http_body_limit::Error::TooLarge { .. }) => {
-                    RetryError::Permanent(Error::CompressionRatio {
-                        endpoint: endpoint_label(endpoint),
-                        dataset: dataset_subject(dataset_name),
-                        source,
-                    })
-                }
-            })?;
+        // The body is charged to the query memory pool as it is read, so a response larger
+        // than the pool can hold fails the query instead of the process. The client is
+        // built with `http_body_limit::decode_manually`, so a compressed body is decoded
+        // here and refused once it expands past a ratio real responses do not reach. Both
+        // refusals are permanent: asking again gets the same body.
+        let memory_error = |source| Error::ResponseMemory {
+            endpoint: endpoint_label(endpoint),
+            dataset: dataset_subject(dataset_name),
+            source,
+        };
+        let response =
+            http_body_limit::buffer(response, http_body_limit::Limit::Reserve(&reservation))
+                .io_wait()
+                .await
+                .map_err(|e| match e {
+                    http_body_limit::Error::Read { source } => {
+                        RetryError::transient(Error::http_request(endpoint, source))
+                    }
+                    source @ (http_body_limit::Error::Decode { .. }
+                    | http_body_limit::Error::Io { .. }) => {
+                        RetryError::transient(Error::ResponseDecode {
+                            endpoint: endpoint_label(endpoint),
+                            dataset: dataset_subject(dataset_name),
+                            source,
+                        })
+                    }
+                    source @ http_body_limit::Error::MemoryLimit { .. } => {
+                        RetryError::Permanent(memory_error(source))
+                    }
+                    source @ (http_body_limit::Error::CompressionRatio { .. }
+                    | http_body_limit::Error::TooLarge { .. }) => {
+                        RetryError::Permanent(Error::CompressionRatio {
+                            endpoint: endpoint_label(endpoint),
+                            dataset: dataset_subject(dataset_name),
+                            source,
+                        })
+                    }
+                })?;
+        // `text()` copies the body into a `String` while the body is still held, so the
+        // copy is charged before it is made; once the body is released, the charge is
+        // what the text holds.
+        reservation.try_grow(reservation.size()).map_err(|source| {
+            RetryError::Permanent(memory_error(http_body_limit::Error::MemoryLimit { source }))
+        })?;
         let content = response
             .text()
             .io_wait()
             .await
             .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
+        reservation.resize(content.capacity());
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -2185,6 +2246,7 @@ impl HttpTableProvider {
 
         Ok(HttpFetchResult {
             content,
+            _reservation: reservation,
             directives,
             // The age on arrival plus the time spent here since — reading the
             // body and getting to admission. Saturating throughout, because
@@ -2207,6 +2269,7 @@ impl HttpTableProvider {
         body: Option<&str>,
         request_headers: Option<&str>,
         trace_parent: Option<&ForwardedTraceParent>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
@@ -2224,6 +2287,7 @@ impl HttpTableProvider {
                 parsed_request_headers.as_ref(),
                 trace_parent,
                 &path_owned,
+                memory_pool,
             )
             .await?;
 
@@ -2233,6 +2297,9 @@ impl HttpTableProvider {
         Ok(fetch_result)
     }
 
+    /// The response to one request, from the response cache or the origin. Its content
+    /// is charged to `memory_pool`, the query memory pool of the query reading it, for as
+    /// long as the result is held.
     async fn get_response(
         &self,
         path: &str,
@@ -2240,11 +2307,19 @@ impl HttpTableProvider {
         body: Option<&str>,
         request_headers: Option<&str>,
         trace_parent: Option<&ForwardedTraceParent>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> Result<HttpFetchResult> {
         // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
             return self
-                .fetch_response(path, query, body, request_headers, trace_parent)
+                .fetch_response(
+                    path,
+                    query,
+                    body,
+                    request_headers,
+                    trace_parent,
+                    memory_pool,
+                )
                 .await;
         }
 
@@ -2262,11 +2337,27 @@ impl HttpTableProvider {
                     cache_key.redacted_label()
                 );
             }
-            return Ok(cached.into_fetch_result());
+            // The copy handed to the query is charged like a body read from the origin.
+            let reservation = self.response_reservation(memory_pool);
+            reservation
+                .try_grow(cached.content.len())
+                .map_err(|source| Error::ResponseMemory {
+                    endpoint: endpoint_label(&self.base_url),
+                    dataset: self.dataset_subject(),
+                    source: http_body_limit::Error::MemoryLimit { source },
+                })?;
+            return Ok(cached.into_fetch_result(reservation));
         }
 
         let fetch_result = self
-            .fetch_response(path, query, body, request_headers, trace_parent)
+            .fetch_response(
+                path,
+                query,
+                body,
+                request_headers,
+                trace_parent,
+                memory_pool,
+            )
             .await?;
 
         // Retention is resolved here because this is the only place both the
@@ -2556,7 +2647,13 @@ impl HttpExec {
         values: &[String],
     ) -> DataFusionResult<Self> {
         let existing = &self.partitions;
-        let new_count = existing.len() * values.len();
+        let new_count = existing.len().checked_mul(values.len()).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "HttpExec: expanding params would create more partitions than can be counted ({} existing x {} values). Reduce the number of dynamic values.",
+                existing.len(),
+                values.len(),
+            ))
+        })?;
 
         if let Some(max) = self.max_request_partitions()
             && new_count > max
@@ -2626,6 +2723,7 @@ impl HttpExec {
         provider: &HttpTableProvider,
         partition: usize,
         trace_parent: Option<&ForwardedTraceParent>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataFusionResult<RecordBatch> {
         let (path, query, body, request_headers) = &self.partitions[partition];
 
@@ -2652,6 +2750,7 @@ impl HttpExec {
                 body_val,
                 request_headers_val,
                 trace_parent,
+                memory_pool,
             )
             .await
             .map_err(DataFusionError::from)?;
@@ -3197,6 +3296,8 @@ impl ExecutionPlan for HttpExec {
         let provider = Arc::clone(&self.provider);
         let schema = Arc::clone(&self.projected_schema);
         let trace_parent = ForwardedTraceParent::from_task_context(&context);
+        // Every response body this partition reads is charged to the query's memory pool.
+        let memory_pool = Arc::clone(context.memory_pool());
         let completion = self
             .completion
             .as_ref()
@@ -3229,6 +3330,7 @@ impl ExecutionPlan for HttpExec {
                 let provider = Arc::clone(&provider);
                 let progress = progress.clone();
                 let trace_parent = trace_parent.clone();
+                let memory_pool = Arc::clone(&memory_pool);
 
                 async move {
                     loop {
@@ -3294,6 +3396,7 @@ impl ExecutionPlan for HttpExec {
                                     body_val,
                                     state.request_headers.as_deref(),
                                     trace_parent.as_ref(),
+                                    &memory_pool,
                                 )
                                 .await
                                 .map_err(DataFusionError::from)?
@@ -3341,6 +3444,7 @@ impl ExecutionPlan for HttpExec {
                                             parsed_request_headers.as_ref(),
                                             trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
+                                            &memory_pool,
                                         )
                                         .await
                                         .map_err(DataFusionError::from)?
@@ -3370,6 +3474,7 @@ impl ExecutionPlan for HttpExec {
                                             parsed_request_headers.as_ref(),
                                             trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
+                                            &memory_pool,
                                         )
                                         .await
                                         .map_err(DataFusionError::from)?
@@ -3400,6 +3505,7 @@ impl ExecutionPlan for HttpExec {
                                             parsed_request_headers.as_ref(),
                                             trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
+                                            &memory_pool,
                                         )
                                         .await
                                         .map_err(DataFusionError::from)?
@@ -3541,7 +3647,12 @@ impl ExecutionPlan for HttpExec {
             let stream = futures::stream::once(async move {
                 tracing::trace!("Fetching partition {}", partition);
                 let batch = exec
-                    .fetch_and_create_batch(&provider, partition, trace_parent.as_ref())
+                    .fetch_and_create_batch(
+                        &provider,
+                        partition,
+                        trace_parent.as_ref(),
+                        &memory_pool,
+                    )
                     .await?;
                 if batch
                     .schema()
@@ -4605,6 +4716,12 @@ impl HttpTableProvider {
     }
 }
 
+/// A pool with no limit, for tests whose responses are not about memory.
+#[cfg(test)]
+pub(crate) fn test_memory_pool() -> Arc<dyn MemoryPool> {
+    Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+}
+
 #[cfg(test)]
 mod response_cache_tests {
     use super::{
@@ -4760,7 +4877,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served to its caller");
         assert_eq!(served.content, r#"{"rows":1}"#);
@@ -4801,7 +4925,14 @@ mod response_cache_tests {
         let provider = provider_for(&origin);
         for id in 0..200 {
             provider
-                .get_response(&format!("/report/{id}"), None, None, None, None)
+                .get_response(
+                    &format!("/report/{id}"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
                 .expect("each response is served");
         }
@@ -4837,7 +4968,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served to its caller");
         assert_eq!(served.content, r#"{"rows":6}"#);
@@ -4869,7 +5007,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -4904,7 +5049,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is served rather than panicking the query");
         assert_eq!(served.content, r#"{"rows":8}"#);
@@ -5030,14 +5182,28 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(4096, None);
         provider
-            .get_response("/small", None, None, None, None)
+            .get_response(
+                "/small",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&provider.cache).await;
         assert_eq!(provider.cache.entry_count(), 1, "the small entry is held");
 
         provider
-            .get_response("/huge", None, None, None, None)
+            .get_response(
+                "/huge",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the oversized response is still served to its caller");
         settle(&provider.cache).await;
@@ -5067,7 +5233,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5096,7 +5269,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5228,7 +5408,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5258,7 +5445,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5302,7 +5496,14 @@ mod response_cache_tests {
         // `Vary` naming anything at all.
         let unauthenticated = provider_for(&origin);
         unauthenticated
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&unauthenticated.cache).await;
@@ -5310,7 +5511,14 @@ mod response_cache_tests {
 
         let authenticated = provider_for(&origin).with_auth(Arc::new(RotatingAuth));
         authenticated
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&authenticated.cache).await;
@@ -5342,7 +5550,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5374,7 +5589,14 @@ mod response_cache_tests {
         let provider = provider_for(&origin);
         for _ in 0..3 {
             let served = provider
-                .get_response("/report", None, None, None, None)
+                .get_response(
+                    "/report",
+                    None,
+                    None,
+                    None,
+                    None,
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
                 .expect("the response is served");
             assert_eq!(served.content, r#"{"rows":2}"#);
@@ -5403,7 +5625,14 @@ mod response_cache_tests {
 
         let without_fallback = provider_for(&origin);
         without_fallback
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&without_fallback.cache).await;
@@ -5416,7 +5645,14 @@ mod response_cache_tests {
         let with_fallback =
             provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::from_mins(5)));
         with_fallback
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&with_fallback.cache).await;
@@ -5440,7 +5676,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::ZERO));
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5463,7 +5706,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(0, None);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5493,7 +5743,14 @@ mod response_cache_tests {
         let provider = provider_for(&origin)
             .with_error_response_action(crate::http::provider::ErrorResponseAction::Store);
         let fetched = provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("`store` must answer a 404 with its body, or this asserts nothing");
         assert_eq!(
@@ -5940,7 +6197,14 @@ mod tests {
             let (provider, permits) =
                 retry_test_provider(url.clone(), budget, Duration::from_secs(2));
             let Err(error) = provider
-                .perform_request_with_retry(url.clone(), None, None, None, "/lookup")
+                .perform_request_with_retry(
+                    url.clone(),
+                    None,
+                    None,
+                    None,
+                    "/lookup",
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
             else {
                 panic!("connection refusal should fail");
@@ -5953,7 +6217,14 @@ mod tests {
             retry_test_server(vec![(200, "{}".to_string())], Duration::from_millis(300)).await;
         let (provider, permits) = retry_test_provider(url.clone(), 0, Duration::from_millis(50));
         let Err(error) = provider
-            .perform_request_with_retry(url, None, None, None, "/lookup")
+            .perform_request_with_retry(
+                url,
+                None,
+                None,
+                None,
+                "/lookup",
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
         else {
             panic!("timed out origin should fail");
@@ -5981,7 +6252,14 @@ mod tests {
         let (provider, _) = retry_test_provider(url.clone(), 0, Duration::from_secs(2));
 
         let Err(send_error) = provider
-            .perform_request_with_retry(url, None, None, None, "/path-secret")
+            .perform_request_with_retry(
+                url,
+                None,
+                None,
+                None,
+                "/path-secret",
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
         else {
             panic!("connection refusal should fail");
@@ -6049,7 +6327,14 @@ mod tests {
                         retry_test_provider(url.clone(), budget, Duration::from_secs(3));
                     let provider = provider.with_error_response_action(action);
                     let Err(error) = provider
-                        .perform_request_with_retry(url, None, None, None, "/lookup")
+                        .perform_request_with_retry(
+                            url,
+                            None,
+                            None,
+                            None,
+                            "/lookup",
+                            &crate::http::provider::test_memory_pool(),
+                        )
                         .await
                     else {
                         panic!("{status} under `{action}` must fail the request");
@@ -6129,7 +6414,14 @@ mod tests {
         let second_url = url.clone();
         let request = tokio::spawn(async move {
             provider
-                .perform_request_with_retry(url, None, None, None, "/lookup")
+                .perform_request_with_retry(
+                    url,
+                    None,
+                    None,
+                    None,
+                    "/lookup",
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
         });
         tokio::time::timeout(Duration::from_secs(2), headers_received)
@@ -6138,7 +6430,14 @@ mod tests {
             .expect("headers signal sent");
         let second_request = tokio::spawn(async move {
             second_provider
-                .perform_request_with_retry(second_url, None, None, None, "/lookup")
+                .perform_request_with_retry(
+                    second_url,
+                    None,
+                    None,
+                    None,
+                    "/lookup",
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
         });
         assert!(
@@ -6211,7 +6510,14 @@ mod tests {
             .with_error_response_action(ErrorResponseAction::Store);
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            provider.perform_request_with_retry(url, None, None, None, "/lookup"),
+            provider.perform_request_with_retry(
+                url,
+                None,
+                None,
+                None,
+                "/lookup",
+                &crate::http::provider::test_memory_pool(),
+            ),
         )
         .await
         .expect("the refusal must not wait for the withheld body");
@@ -6257,7 +6563,14 @@ mod tests {
             // `store`, so the 404 body is data and the case can assert what was read.
             let provider = provider.with_error_response_action(ErrorResponseAction::Store);
             let result = provider
-                .perform_request_with_retry(url, None, None, None, "/lookup")
+                .perform_request_with_retry(
+                    url,
+                    None,
+                    None,
+                    None,
+                    "/lookup",
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
                 .expect("HTTP response should remain available");
             assert_eq!(result.response_status, expected_status);
@@ -6276,7 +6589,14 @@ mod tests {
         .await;
         let (provider, permits) = retry_test_provider(url.clone(), 2, Duration::from_secs(3));
         let Err(error) = provider
-            .perform_request_with_retry(url, None, None, None, "/lookup")
+            .perform_request_with_retry(
+                url,
+                None,
+                None,
+                None,
+                "/lookup",
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
         else {
             panic!("a 404 under the default `on_error_response` must fail the request");
@@ -7346,6 +7666,8 @@ mod tests {
         let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
+            _reservation: datafusion::execution::memory_pool::MemoryConsumer::new("test")
+                .register(&crate::http::provider::test_memory_pool()),
             directives: CacheDirectives {
                 present: true,
                 max_age: Some(Duration::from_mins(1)),
@@ -7392,7 +7714,12 @@ mod tests {
         );
 
         let batch = exec
-            .fetch_and_create_batch(provider.as_ref(), 0, None)
+            .fetch_and_create_batch(
+                provider.as_ref(),
+                0,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("batch should be created from cached response");
 
@@ -10678,6 +11005,8 @@ mod tests {
     fn empty_fetch_result() -> HttpFetchResult {
         HttpFetchResult {
             content: String::new(),
+            _reservation: datafusion::execution::memory_pool::MemoryConsumer::new("test")
+                .register(&crate::http::provider::test_memory_pool()),
             directives: CacheDirectives::default(),
             response_age: None,
             age_measured_at: Instant::now(),
@@ -11224,6 +11553,8 @@ mod tests {
         );
         let fetch_result = HttpFetchResult {
             content: String::new(),
+            _reservation: datafusion::execution::memory_pool::MemoryConsumer::new("test")
+                .register(&crate::http::provider::test_memory_pool()),
             directives: CacheDirectives::default(),
             response_age: None,
             age_measured_at: Instant::now(),
@@ -11299,6 +11630,8 @@ mod tests {
         ];
         let fetch_result = HttpFetchResult {
             content: String::new(),
+            _reservation: datafusion::execution::memory_pool::MemoryConsumer::new("test")
+                .register(&crate::http::provider::test_memory_pool()),
             directives: CacheDirectives::default(),
             response_age: None,
             age_measured_at: Instant::now(),

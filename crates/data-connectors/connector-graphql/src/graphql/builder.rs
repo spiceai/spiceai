@@ -18,6 +18,7 @@ use data_components::rate_limit::RateLimiter;
 
 use super::{Result, client::GraphQLClient, client::UnnestBehavior};
 use arrow::datatypes::SchemaRef;
+use datafusion::execution::memory_pool::MemoryPool;
 use runtime_rate_control::RateController;
 use std::sync::Arc;
 use token_provider::TokenProvider;
@@ -122,9 +123,21 @@ impl GraphQLClientBuilder {
         self
     }
 
-    pub fn build(self, client: reqwest::Client) -> Result<GraphQLClient> {
+    /// Build the client over `client`. Every response body, as decompressed, is charged
+    /// to `memory_pool`, the runtime's query memory pool, while it is held, so a response
+    /// the pool cannot hold is refused instead of exhausting the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid.
+    pub fn build(
+        self,
+        client: reqwest::Client,
+        memory_pool: Arc<dyn MemoryPool>,
+    ) -> Result<GraphQLClient> {
         let graphql_client = GraphQLClient::new(
             client,
+            memory_pool,
             self.endpoint,
             self.json_pointer.as_deref(),
             self.token_provider,

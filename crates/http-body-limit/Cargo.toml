@@ -6,13 +6,16 @@ rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Reads of HTTP response bodies that refuse decompression amplification"
+description = "Bounded reads of remote data: HTTP bodies and compressed files held to a memory budget and refused past a compression ratio"
 
 [dependencies]
 # The decoders `reqwest` itself uses (through tower-http), so a body decoded here
 # decodes exactly as one `reqwest` decompresses transparently.
 async-compression = { version = "0.4.42", features = ["tokio", "gzip", "zlib", "brotli", "zstd"] }
 bytes.workspace = true
+# `MemoryReservation`, so a body that carries data is charged to the query memory pool.
+datafusion-common.workspace = true
+datafusion-execution.workspace = true
 futures.workspace = true
 http.workspace = true
 reqwest.workspace = true

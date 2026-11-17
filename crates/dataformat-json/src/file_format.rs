@@ -40,6 +40,7 @@ use async_trait::async_trait;
 use datafusion::common::parsers::CompressionTypeVariant;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -232,7 +233,7 @@ impl SpiceJsonFormat {
     /// pointer, or inferring a schema from the records.
     pub async fn probe_schema(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> Result<JsonSchemaProbe> {
@@ -242,7 +243,7 @@ impl SpiceJsonFormat {
         for object in objects {
             let budget = max_records - record_count;
             let (schema, records) = self
-                .probe_file(store, &object.location, move |format, body| {
+                .probe_file(state, store, &object.location, move |format, body| {
                     format.schema_from_body(body, budget)
                 })
                 .await?;
@@ -284,7 +285,7 @@ impl SpiceJsonFormat {
     /// an error.
     pub async fn probe_keys(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
         registered: &BTreeSet<String>,
@@ -302,7 +303,7 @@ impl SpiceJsonFormat {
                 until_found.map(|wanted| wanted.difference(&probe.keys).cloned().collect());
             let registered = Arc::clone(&registered);
             let file = self
-                .probe_file(store, &object.location, move |format, body| {
+                .probe_file(state, store, &object.location, move |format, body| {
                     format.keys_from_body(body, budget, &registered, missing.as_ref())
                 })
                 .await?;
@@ -331,9 +332,13 @@ impl SpiceJsonFormat {
     /// reads it. A JSONL or array body therefore never holds the compressed or
     /// the decompressed file in memory, and a probe that stops early stops the
     /// download. Only a body that must be parsed whole is buffered (see
-    /// [`ProbeBody::Document`]).
+    /// [`ProbeBody::Document`]), and it is charged to the query memory pool of
+    /// `state` as it is decompressed, so a document the pool cannot hold, however
+    /// small it was compressed, fails the probe with an error that names the file
+    /// rather than exhausting memory.
     async fn probe_file<T, F>(
         &self,
+        state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         location: &object_store::path::Path,
         probe: F,
@@ -349,19 +354,28 @@ impl SpiceJsonFormat {
             ))),
         };
         let format = self.clone();
+        let reservation = MemoryConsumer::new(format!("JSON schema probe of '{location}'"))
+            .register(&state.runtime_env().memory_pool);
         tokio::task::spawn_blocking(move || {
             let decoded =
                 FileCompressionType::from(format.options.compression).convert_read(reader)?;
-            let body = format.open_body(decoded)?;
+            let body = format.open_body(decoded, &reservation)?;
+            // `reservation` outlives the probe, so a document stays charged while it is read.
             probe(&format, body)
         })
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| crate::limits::locate_refusal(location, e))
     }
 
     /// Classifies a decompressed body as streamable records or a whole
-    /// document. A leading UTF-8 BOM and whitespace are consumed either way.
-    fn open_body(&self, reader: Box<dyn Read + Send>) -> Result<ProbeBody> {
+    /// document. A leading UTF-8 BOM and whitespace are consumed either way. A
+    /// document is read under `reservation`.
+    fn open_body(
+        &self,
+        reader: Box<dyn Read + Send>,
+        reservation: &MemoryReservation,
+    ) -> Result<ProbeBody> {
         let mut reader = BufReader::new(reader);
         let opens_array = body_opens_a_json_array(&mut reader)?;
         if self.options.json_pointer.is_none() {
@@ -377,8 +391,13 @@ impl SpiceJsonFormat {
                 )?)));
             }
         }
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
+        let buf =
+            http_body_limit::read_to_end(reader, http_body_limit::Limit::Reserve(reservation))
+                .map_err(|e| match e {
+                    // A failed read is reported as it always was.
+                    http_body_limit::Error::Io { source } => DataFusionError::IoError(source),
+                    refused => DataFusionError::External(Box::new(refused)),
+                })?;
         Ok(ProbeBody::Document(buf))
     }
 
@@ -1081,6 +1100,12 @@ mod tests {
         })
     }
 
+    fn unbounded() -> MemoryReservation {
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        MemoryConsumer::new("test probe").register(&pool)
+    }
+
     #[test]
     fn streamed_key_probe_never_reads_past_the_record_that_completes_the_wanted_keys() {
         let wanted: BTreeSet<String> = ["a", "b"].map(String::from).into();
@@ -1090,7 +1115,9 @@ mod tests {
             (Format::Auto, "[{\"a\":1,\"b\":2},"),
         ] {
             let json = SpiceJsonFormat::default().with_format(format);
-            let body = json.open_body(fails_after(head)).expect("open body");
+            let body = json
+                .open_body(fails_after(head), &unbounded())
+                .expect("open body");
             let probe = json
                 .keys_from_body(body, usize::MAX, &BTreeSet::new(), Some(&wanted))
                 .expect("the probe stops before the unreadable remainder");
@@ -1103,14 +1130,19 @@ mod tests {
         for format in [Format::Object, Format::Soda, Format::Auto] {
             let json = SpiceJsonFormat::default().with_format(format);
             assert!(
-                json.open_body(fails_after("{\"a\":1}")).is_err(),
+                json.open_body(fails_after("{\"a\":1}"), &unbounded())
+                    .is_err(),
                 "{format:?} parses the document whole, so it reads to the end"
             );
         }
         let pointer = SpiceJsonFormat::default()
             .with_format(Format::Array)
             .with_json_pointer("/data".to_string());
-        assert!(pointer.open_body(fails_after("[{\"a\":1}")).is_err());
+        assert!(
+            pointer
+                .open_body(fails_after("[{\"a\":1}"), &unbounded())
+                .is_err()
+        );
     }
 
     #[test]
