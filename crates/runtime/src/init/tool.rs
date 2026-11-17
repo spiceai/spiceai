@@ -77,7 +77,11 @@ impl Runtime {
         let builtin_names = Arc::new(builtin_names);
         if let Some(app) = self.read_app().await {
             join_all(app.tools.iter().map(|tool| {
-                tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
+                tracing::debug!(
+                    "Loading tool [{}] from {}...",
+                    tool.name,
+                    crate::http::v1::redact_source_credentials(&tool.from)
+                );
                 Arc::clone(&self).load_tool(tool.clone(), Arc::clone(&builtin_names))
             }))
             .await;

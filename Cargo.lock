@@ -18750,6 +18750,7 @@ dependencies = [
  "http-body-util",
  "itertools 0.14.0",
  "jsonschema",
+ "redact",
  "reqwest 0.13.4",
  "rmcp",
  "runtime-auth",
