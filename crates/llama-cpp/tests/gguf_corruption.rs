@@ -195,6 +195,72 @@ fn a_zero_output_group_count_fails_a_deepseek_load() {
     );
 }
 
+/// GGML type 43 was the fork's gather-only `MXFP8` (one `E8M0` scale and 32 `E4M3` codes per 32
+/// values) before llama.cpp v1.0.0 gave the number to `F8_E4M3` (one byte per value). A tensor
+/// written as `MXFP8` and read last as `F8_E4M3` passes the offset checks, which only see a tensor
+/// that another follows, so the fork refuses a data section that runs past its tensors instead of
+/// loading the wrong values.
+#[test]
+fn a_tensor_written_as_the_old_type_43_fails_the_load_instead_of_reading_as_f8_e4m3() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("mxfp8-last.gguf");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&2u64.to_le_bytes()); // tensors
+    bytes.extend_from_slice(&4u64.to_le_bytes()); // key-value pairs
+    put_string(&mut bytes, "general.architecture");
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    put_string(&mut bytes, "llama");
+    put_string(&mut bytes, "llama.block_count");
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    put_string(&mut bytes, "llama.embedding_length");
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    put_string(&mut bytes, "general.alignment");
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&32u32.to_le_bytes());
+    // An F32 [8, 4] tensor (128 bytes), then a type 43 [64, 2] tensor laid out as MXFP8: four
+    // blocks of 33 bytes, 132 bytes padded to 160, where F8_E4M3 takes 128.
+    put_string(&mut bytes, "token_embd.weight");
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&8u64.to_le_bytes());
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    put_string(&mut bytes, "output.weight");
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&64u64.to_le_bytes());
+    bytes.extend_from_slice(&2u64.to_le_bytes());
+    bytes.extend_from_slice(&43u32.to_le_bytes());
+    bytes.extend_from_slice(&128u64.to_le_bytes());
+    while !bytes.len().is_multiple_of(32) {
+        bytes.push(0);
+    }
+    bytes.extend(std::iter::repeat_n(0u8, 8 * 4 * 4));
+    for _ in 0..4 {
+        // scale 2^0, and 32 codes of 1.0
+        bytes.push(127);
+        bytes.extend(std::iter::repeat_n(0x38u8, 32));
+    }
+    while !bytes.len().is_multiple_of(32) {
+        bytes.push(0);
+    }
+    std::fs::write(&path, bytes).expect("the file is written");
+
+    let refused = refusal(&path).expect("the file does not load");
+
+    assert_eq!(
+        reason(&refused),
+        "gguf_init_from_reader: the data section holds 288 bytes but its tensors take 256, so a \
+         tensor's type is not the one it was written with (GGML type 43 was MXFP8 in \
+         spiceai/llama.cpp before v1.0.0, and is F8_E4M3 since). Convert the model again with \
+         this release",
+        "the data section check is the reason: {refused}"
+    );
+}
+
 /// One mutation of `bytes`: a flipped byte, a truncation, a run of 0xFF that turns a count or
 /// length into a huge one, or a run of random bytes.
 fn mutate(bytes: &mut Vec<u8>, rng: &mut XorShift) {
