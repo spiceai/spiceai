@@ -38,7 +38,10 @@ async fn a_refused_decode_carries_what_llama_cpp_logged() {
     let backend = Backend::get();
     let model = Model::load(backend, &gguf, &ModelParams::default()).expect("Qwen3-0.6B loads");
     let mut context = model
-        .new_context(backend, &ContextParams::default().with_n_ctx(NonZeroU32::new(64)))
+        .new_context(
+            backend,
+            &ContextParams::default().with_n_ctx(NonZeroU32::new(64)),
+        )
         .expect("a context");
     let mut outside = Batch::new(1);
     outside
