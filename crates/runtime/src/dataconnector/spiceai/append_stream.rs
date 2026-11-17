@@ -238,6 +238,8 @@ struct Reload {
     /// `None` for a snapshot batch.
     staged: Vec<(Option<u64>, ChangeBatch)>,
     reservation: MemoryReservation,
+    /// The dataset being reloaded, reported current once the swap commits.
+    dataset: String,
 }
 
 impl Reload {
@@ -246,6 +248,7 @@ impl Reload {
             staged: Vec::new(),
             reservation: MemoryConsumer::new(format!("append_stream_reload[{dataset}]"))
                 .register(memory_pool),
+            dataset: dataset.to_string(),
         }
     }
 
@@ -268,6 +271,7 @@ impl Reload {
         self,
         snapshot_sequence: u64,
         data_schema: &SchemaRef,
+        stale: &Arc<StaleDatasets>,
     ) -> Result<ChangeEnvelope, String> {
         let mut rows: Vec<arrow::array::RecordBatch> = Vec::new();
         for (sequence, batch) in self.staged {
@@ -299,6 +303,8 @@ impl Reload {
         Ok(ChangeEnvelope::from_parts(
             Box::new(ReplacementCommitter {
                 _reservation: reservation,
+                stale: Arc::clone(stale),
+                dataset: self.dataset,
             }),
             batch,
             true,
@@ -308,14 +314,19 @@ impl Reload {
 }
 
 /// The committer of a reload's replacement: it holds the replacement's memory
-/// reservation for as long as the envelope lives.
+/// reservation for as long as the envelope lives, and reports the dataset
+/// current only once the apply loop has written the replacement. A replacement
+/// that fails to apply or is dropped leaves the dataset reported stale.
 struct ReplacementCommitter {
     _reservation: MemoryReservation,
+    stale: Arc<StaleDatasets>,
+    dataset: String,
 }
 
 #[async_trait::async_trait]
 impl cdc::CommitChange for ReplacementCommitter {
     async fn commit(&self) -> Result<(), cdc::CommitError> {
+        self.stale.mark_current(&self.dataset);
         Ok(())
     }
 }
@@ -449,10 +460,10 @@ where
                                 let snapshot_sequence = subscription.snapshot_sequence().unwrap_or(0);
                                 let envelope = match reload.take() {
                                     Some(reload) => {
-                                        let replacement = reload.into_replacement(snapshot_sequence, schema);
+                                        let replacement =
+                                            reload.into_replacement(snapshot_sequence, schema, &budget.stale);
                                         if replacement.is_ok() {
                                             refusals = 0;
-                                            budget.stale.mark_current(&table_reference);
                                         }
                                         replacement
                                     }
@@ -768,6 +779,18 @@ mod tests {
     async fn replacement(
         stream: &mut BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>,
     ) -> usize {
+        replacement_envelope(stream)
+            .await
+            .change_batch()
+            .expect("built")
+            .data_batch()
+            .num_rows()
+    }
+
+    /// The next envelope, asserted to be a reload's atomic replacement.
+    async fn replacement_envelope(
+        stream: &mut BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>,
+    ) -> ChangeEnvelope {
         // Long enough for a reload to time out under paused time.
         let envelope = tokio::time::timeout(SNAPSHOT_END_ERROR_AFTER * 4, stream.next())
             .await
@@ -778,9 +801,13 @@ mod tests {
             envelope.history_unavailable() && envelope.is_dataset_ready(),
             "a reload is swapped in as one atomic replacement"
         );
-        let batch = envelope.change_batch().expect("built");
-        assert!(batch.rebuild_from_this_batch());
-        batch.data_batch().num_rows()
+        assert!(
+            envelope
+                .change_batch()
+                .expect("built")
+                .rebuild_from_this_batch()
+        );
+        envelope
     }
 
     /// The snapshot's sequence number, from its end marker.
@@ -1100,10 +1127,18 @@ mod tests {
             )
             .expect("staged");
         assert!(memory_pool.reserved() > 0, "staging is reserved");
-        let replacement = reload.into_replacement(0, &schema).expect("replacement");
+        let stale = Arc::new(StaleDatasets::default());
+        stale.mark_stale(DATASET, None, false);
+        let replacement = reload
+            .into_replacement(0, &schema, &stale)
+            .expect("replacement");
         assert!(memory_pool.reserved() > 0, "the replacement is reserved");
         drop(replacement);
         assert_eq!(memory_pool.reserved(), 0);
+        assert!(
+            stale.stale_for(DATASET).is_some(),
+            "a replacement dropped before it commits leaves the dataset stale"
+        );
     }
 
     /// A reload the query memory pool cannot hold is refused: the dataset keeps
@@ -1168,16 +1203,26 @@ mod tests {
         tokio::time::pause();
         let mut stream = append_stream(subscribe, DATASET.to_string(), budget).boxed();
         assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
-        assert_eq!(replacement(&mut stream).await, 2, "the reload that fits");
+        let fits = replacement_envelope(&mut stream).await;
+        assert_eq!(
+            fits.change_batch().expect("built").data_batch().num_rows(),
+            2,
+            "the reload that fits"
+        );
         assert_eq!(
             *seen.lock(),
             vec![(false, 0, 0), (false, 0, 0), (true, 1, 0)],
             "the refused reload is reported stale and returns its reservation before the retry"
         );
+        assert!(
+            stale.stale_for(DATASET).is_some(),
+            "still stale while the swap is pending"
+        );
+        fits.commit().await.expect("commit the swap");
         assert_eq!(
             stale.stale_for(DATASET),
             None,
-            "current again after the swap"
+            "current again once the swap commits"
         );
         assert_eq!(stale.refused(DATASET), 1);
         assert_eq!(memory_pool.reserved(), 0);

@@ -4418,7 +4418,7 @@ impl DataFusion {
         accelerated_table_builder.data_update_publisher(Some(
             crate::dataupdate::DataUpdatePublisher::new(
                 self.data_update_broadcaster.clone(),
-                qualify_dataset_reference(self.normalize_table_reference(dataset.name.clone())),
+                qualify_dataset_reference(dataset.name.clone()),
             ),
         ));
         accelerated_table_builder.cdc_param_overrides(
@@ -9804,10 +9804,12 @@ mod tests {
 }
 
 /// The fully qualified name a dataset registers under, which is the name its
-/// `DoExchange` subscribers are keyed by. A dataset's accelerated table is
-/// built before the dataset registers, so normalizing its name then can still
-/// leave it bare. A bare or partial name registers in the default catalog and
-/// schema, the same defaults `get_table_provider` resolves with.
+/// `DoExchange` subscribers are keyed by. The name is qualified directly, not
+/// resolved against the catalog: a dataset's accelerated table is built before
+/// the dataset registers, so resolving a bare name then can leave it bare or
+/// bind it to a same-named table in another schema. A bare or partial name
+/// registers in the default catalog and schema, the same defaults
+/// `get_table_provider` resolves with.
 fn qualify_dataset_reference(table_reference: TableReference) -> TableReference {
     match table_reference {
         TableReference::Full { .. } => table_reference,
