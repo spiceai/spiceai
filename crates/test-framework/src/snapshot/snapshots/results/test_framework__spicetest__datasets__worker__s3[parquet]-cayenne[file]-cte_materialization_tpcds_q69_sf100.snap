@@ -7,11 +7,11 @@ description: "Query: tpcds_q69"
 +-----------+-------------------+---------------------+------+----------------------+------+------------------+------+
 | F         | D                 | 2 yr Degree         | 3    | 500                  | 3    | Good             | 3    |
 | F         | D                 | 2 yr Degree         | 10   | 500                  | 10   | High Risk        | 10   |
-| F         | D                 | 2 yr Degree         | 6    | 500                  | 6    | Low Risk         | 6    |
+| F         | D                 | 2 yr Degree         | 7    | 500                  | 7    | Low Risk         | 7    |
 | F         | D                 | 2 yr Degree         | 5    | 500                  | 5    | Unknown          | 5    |
 | F         | D                 | 2 yr Degree         | 6    | 1000                 | 6    | Good             | 6    |
-| F         | D                 | 2 yr Degree         | 5    | 1000                 | 5    | High Risk        | 5    |
-| F         | D                 | 2 yr Degree         | 6    | 1000                 | 6    | Low Risk         | 6    |
+| F         | D                 | 2 yr Degree         | 4    | 1000                 | 4    | High Risk        | 4    |
+| F         | D                 | 2 yr Degree         | 5    | 1000                 | 5    | Low Risk         | 5    |
 | F         | D                 | 2 yr Degree         | 11   | 1000                 | 11   | Unknown          | 11   |
 | F         | D                 | 2 yr Degree         | 11   | 1500                 | 11   | Good             | 11   |
 | F         | D                 | 2 yr Degree         | 3    | 1500                 | 3    | High Risk        | 3    |
