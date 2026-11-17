@@ -16,6 +16,7 @@ limitations under the License.
 
 //! GitHub release types and operations.
 
+use super::verify::{VerifyOptions, verify_release_asset};
 use super::{GitHubClient, GitHubError};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
@@ -61,6 +62,10 @@ pub struct ReleaseAsset {
     pub size: u64,
     pub download_count: u64,
     pub browser_download_url: String,
+    /// `sha256:<hex>` of the asset, which GitHub records at upload. Releases published before
+    /// GitHub recorded digests have none.
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 /// Get the latest release from GitHub.
@@ -83,7 +88,8 @@ pub async fn get_release(client: &GitHubClient, version: &str) -> Result<RepoRel
     }
 }
 
-/// Download a release asset and extract it to a directory.
+/// Download a release asset, check it against the sha256 its release records, and extract it
+/// to a directory.
 pub async fn download_release_asset(
     client: &GitHubClient,
     release: &RepoRelease,
@@ -103,6 +109,8 @@ pub async fn download_release_asset(
     );
 
     let data = download_reporting_progress(client, asset, "Downloading").await?;
+    let data =
+        verify_release_asset(client, release, asset, data, &VerifyOptions::from_env()).await?;
 
     // Extract tar.gz
     extract_tar_gz(&data, download_dir)?;
@@ -170,13 +178,15 @@ pub async fn download_release_asset_with_fallback(
 /// Upgrade the CLI binary in-place by downloading and replacing the current executable.
 ///
 /// This function:
-/// 1. Downloads the CLI asset from the release
+/// 1. Downloads the CLI asset from the release and checks it against the sha256 the release
+///    records for it
 /// 2. Extracts the binary to a temporary file
 /// 3. Atomically replaces the current executable with the new one
 ///
 /// # Errors
 ///
-/// Returns an error if the download fails, extraction fails, or the file replacement fails.
+/// Returns an error if the download fails or does not verify, extraction fails, or the file
+/// replacement fails.
 pub async fn upgrade_cli_in_place(
     client: &GitHubClient,
     release: &RepoRelease,
@@ -195,6 +205,8 @@ pub async fn upgrade_cli_in_place(
     );
 
     let data = download_reporting_progress(client, asset, "Downloading CLI").await?;
+    let data =
+        verify_release_asset(client, release, asset, data, &VerifyOptions::from_env()).await?;
 
     // Get the current executable path
     let current_exe = std::env::current_exe().map_err(|e| GitHubError::Io {
@@ -574,8 +586,9 @@ mod tests {
             .expect("gzip stream is finished")
     }
 
-    /// A release advertising one asset of `size` bytes, served by `server_uri`.
-    fn release_advertising(server_uri: &str, size: u64) -> RepoRelease {
+    /// A release advertising one asset of `size` bytes with GitHub digest `digest`, served by
+    /// `server_uri`.
+    fn release_advertising(server_uri: &str, size: u64, digest: Option<String>) -> RepoRelease {
         RepoRelease {
             url: String::new(),
             html_url: String::new(),
@@ -594,14 +607,27 @@ mod tests {
                 size,
                 download_count: 0,
                 browser_download_url: format!("{server_uri}/{ASSET_NAME}"),
+                digest,
             }],
         }
     }
 
-    /// Serve `body` for the asset, and download it into a fresh directory.
+    /// Serve `body` for the asset, and download it into a fresh directory. The release records
+    /// the sha256 of `body`, so only the size check and the archive decide.
     async fn download_body(
         body: Vec<u8>,
         advertised_size: u64,
+    ) -> (Result<(), GitHubError>, tempfile::TempDir) {
+        let digest = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(&body));
+        download_body_recorded_as(body, advertised_size, Some(digest)).await
+    }
+
+    /// Serve `body` for the asset, recorded with GitHub digest `digest`, and download it into a
+    /// fresh directory.
+    async fn download_body_recorded_as(
+        body: Vec<u8>,
+        advertised_size: u64,
+        digest: Option<String>,
     ) -> (Result<(), GitHubError>, tempfile::TempDir) {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -610,7 +636,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let release = release_advertising(&server.uri(), advertised_size);
+        let release = release_advertising(&server.uri(), advertised_size, digest);
         let dest = tempfile::tempdir().expect("temp dir is created");
         let client = GitHubClient::new("spiceai", "spiceai");
 
@@ -694,6 +720,30 @@ mod tests {
         result.expect("a complete download extracts");
         let extracted = std::fs::read(dest.path().join("spiced")).expect("spiced is extracted");
         assert_eq!(extracted, b"runtime binary");
+    }
+
+    /// A complete archive whose sha256 is not the one its release records is refused before
+    /// anything is extracted from it.
+    #[tokio::test]
+    async fn an_archive_not_matching_its_recorded_sha256_is_not_extracted() {
+        let archive = tar_gz_containing("spiced", b"altered runtime binary");
+        let advertised_size = archive.len() as u64;
+        let recorded = format!("sha256:{}", "ab".repeat(32));
+
+        let (result, dest) =
+            download_body_recorded_as(archive, advertised_size, Some(recorded)).await;
+
+        assert!(
+            matches!(&result, Err(GitHubError::ChecksumMismatch { asset, .. }) if asset == ASSET_NAME),
+            "expected a checksum mismatch, got: {result:?}"
+        );
+        assert!(
+            std::fs::read_dir(dest.path())
+                .expect("destination is readable")
+                .next()
+                .is_none(),
+            "a refused download must not leave anything extracted"
+        );
     }
 
     /// The length check is not a stand-in for decoding: a body of the right length that is

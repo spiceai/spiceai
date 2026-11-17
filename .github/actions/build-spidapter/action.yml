@@ -99,11 +99,11 @@ runs:
 
     - name: Setup Rust
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')
-      uses: ./.github/actions/setup-rust
+      uses: $/.github/actions/setup-rust
 
     - name: Setup cc
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')) && steps.detect-os.outputs.os == 'linux'
-      uses: ./.github/actions/setup-cc
+      uses: $/.github/actions/setup-cc
 
     # Reports only whether an sccache endpoint was configured, which decides
     # whether `setup-sccache` runs. It deliberately does not export a
@@ -126,7 +126,7 @@ runs:
 
     - name: Set up sccache
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')) && steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
-      uses: ./.github/actions/setup-sccache
+      uses: $/.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
         minio_access_key: ${{ inputs.minio_access_key }}
@@ -191,7 +191,7 @@ runs:
 
     - name: Upload spidapter artifact
       if: inputs.upload_artifact == 'true'
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: spidapter-${{ steps.detect-os.outputs.os }}
         path: target/release/spidapter${{ steps.detect-os.outputs.ext }}

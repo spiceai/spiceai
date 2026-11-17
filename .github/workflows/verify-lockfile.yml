@@ -1,0 +1,67 @@
+# Fails when .github/workflows/actions.lock is out of sync with the
+# workflows, a locked pin no longer verifies upstream, or a `uses:` is not
+# pinned to a full-length commit SHA with a lockfile entry keyed by that SHA.
+#
+# After adding a workflow or changing any `uses:`, regenerate the lockfile,
+# then put the SHAs back. `gh actions-lock` rewrites SHA pins to tags and keys
+# the lockfile by tag, and the runner matches a `uses:` to its lockfile entry
+# by the exact ref, so a SHA `uses:` needs its entry keyed by that SHA:
+#   gh extension install github/gh-actions-lock
+#   gh actions-lock
+#   python3 scripts/pin_actions_to_sha.py
+# See https://github.com/github/gh-actions-lock
+
+name: verify-lockfile
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - trunk
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    # Uses only the job's own `github.token`, no environment secret.
+    environment: secret-free
+    # `gh` comes from the dev-runner image (spicehq/ai-platform
+    # infra/docker/arc-runner).
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install gh-actions-lock into this job's temp directory
+        # A runner can be reused, and `gh extension install` leaves an installed
+        # extension as it is. Installing under RUNNER_TEMP, which the runner
+        # empties for each job, makes this job run the pinned release, not a copy
+        # an earlier job left behind.
+        run: |
+          set -euo pipefail
+          echo "XDG_DATA_HOME=${RUNNER_TEMP}/gh-data" >> "$GITHUB_ENV"
+          echo "GH_CONFIG_DIR=${RUNNER_TEMP}/gh-config" >> "$GITHUB_ENV"
+          XDG_DATA_HOME="${RUNNER_TEMP}/gh-data" GH_CONFIG_DIR="${RUNNER_TEMP}/gh-config" \
+            gh extension install github/gh-actions-lock --pin v0.4.1
+      - run: gh actions-lock --verify
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install PyYAML
+        run: pip install pyyaml
+      # The tests run first: a check that stopped finding `uses:` keys would
+      # pass every workflow.
+      - name: Test the full-length SHA pin check
+        run: python scripts/test_pin_actions_to_sha.py -v
+      - name: Check every uses is pinned to a full-length commit SHA
+        run: python scripts/pin_actions_to_sha.py --check
