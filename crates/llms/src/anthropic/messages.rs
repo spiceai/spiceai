@@ -357,7 +357,7 @@ mod tests {
                 "{\"type\":\"content_block_delta\",\"delta\":{\"text\":\"h\u{e9}\"}}",
             ]
         );
-        assert!(decoder.buffer.is_empty());
+        assert_eq!(decoder.buffer, [] as [u8; 0]);
     }
 
     /// An event ends at a blank line, whichever of LF, CRLF or CR ends its lines, even when a

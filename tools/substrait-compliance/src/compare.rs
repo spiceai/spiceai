@@ -1233,7 +1233,7 @@ mod tests {
             parse_typed_csv("avg_qty:decimal(15,6)\n").expect("parameterized decimal header");
         assert_eq!(table.columns[0].name, "avg_qty");
         assert_eq!(table.columns[0].type_token, "decimal(15,6)");
-        assert!(table.rows.is_empty());
+        assert_eq!(table.rows, [] as [Vec<String>; 0]);
     }
 
     #[test]
@@ -1266,7 +1266,7 @@ mod tests {
     fn header_only_decimal_golden_passes_empty_actual() {
         let expected = parse_typed_csv("n:decimal(15,2)\n").expect("header-only decimal golden");
         assert_eq!(expected.columns[0].type_token, "decimal(15,2)");
-        assert!(expected.rows.is_empty());
+        assert_eq!(expected.rows, [] as [Vec<String>; 0]);
 
         let actual = TableData {
             columns: expected.columns.clone(),
@@ -1290,7 +1290,7 @@ mod tests {
         let expected =
             parse_typed_csv("flag:string|n:integer\n").expect("header-only typed golden");
         assert_eq!(expected.columns.len(), 2);
-        assert!(expected.rows.is_empty());
+        assert_eq!(expected.rows, [] as [Vec<String>; 0]);
 
         let actual = TableData {
             columns: expected.columns.clone(),

@@ -967,7 +967,8 @@ struct E2eRuntimeState {
     /// The path, spicepod, and app id of the last apply.
     applied_spicepod: Option<(std::path::PathBuf, String, Option<String>)>,
     /// Names of the secrets delivered with the last applied spicepod, never
-    /// values. `None` when the deployment carried no payload at all.
+    /// values. `None` before any apply, or after the delivered secrets were
+    /// cleared.
     delivered_secret_names: Option<Vec<String>>,
 }
 
@@ -1010,10 +1011,8 @@ impl RuntimeHandle for E2eRuntime {
     ) -> Result<serde_json::Value, CommandError> {
         // Record the delivered names (never values) so a test can assert the
         // payload reached the runtime adapter.
-        self.state.lock().await.delivered_secret_names = deployment
-            .delivered_secrets
-            .as_ref()
-            .map(|secrets| secrets.keys().cloned().collect());
+        self.state.lock().await.delivered_secret_names =
+            Some(deployment.delivered_secrets.keys().cloned().collect());
         // Persist to the canonical path and report what could not be put into
         // effect here, mirroring the spiced adapter's observable behavior.
         let path = deployment
@@ -3374,6 +3373,12 @@ async fn apply_spicepod_persists_and_answers_without_ending_the_client() {
     // The app id rides the deploy: it is the only way the runtime learns which
     // app to attribute its metrics to, and it exports none until it has one.
     assert_eq!(app_id.as_deref(), Some("4002"));
+    // No sealed payload deploys an app with no secrets: the runtime receives an
+    // empty set, which withdraws any secrets an earlier deployment delivered.
+    assert_eq!(
+        rt_state.lock().await.delivered_secret_names,
+        Some(Vec::new())
+    );
 
     // The stream the deployment arrived on is still up: a second command is
     // dispatched and answered on it. Asserting only on the apply result would

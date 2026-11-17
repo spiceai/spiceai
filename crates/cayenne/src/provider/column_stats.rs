@@ -309,7 +309,7 @@ impl ColumnStatsAccumulator {
         // accumulators surfaces as a clamped row count rather than wrapping to
         // a negative value that would get persisted as a bogus `num_rows`.
         let delta = i64::try_from(num_rows).unwrap_or(i64::MAX);
-        let _ = self.row_count.fetch_update(
+        let _ = self.row_count.try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |current| Some(current.saturating_add(delta)),
@@ -675,7 +675,7 @@ impl ColumnStatsAccumulator {
             return;
         };
 
-        let _ = self.row_count.fetch_update(
+        let _ = self.row_count.try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |current| Some(current.saturating_add(other_row_count)),

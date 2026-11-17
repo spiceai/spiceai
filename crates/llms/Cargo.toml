@@ -52,8 +52,8 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec", optional = true } # branch: spiceai (spiceai/mistral.rs#58: Mistral [THINK] reasoning; on #55, which includes #52, #53, #54)
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#58: Mistral [THINK] reasoning; on #55, which includes #52, #53, #54)
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "aaf0209ec2a5dd1f61c5dedde20726ff04ac35a0", optional = true } # branch: spiceai (spiceai/mistral.rs#59: Gemma and Gemma 2 tie lm_head to the embeddings; on #58, Mistral [THINK] reasoning, and #55, which includes #52, #53, #54)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "aaf0209ec2a5dd1f61c5dedde20726ff04ac35a0", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#59: Gemma and Gemma 2 tie lm_head to the embeddings; on #58, Mistral [THINK] reasoning, and #55, which includes #52, #53, #54)
 rand.workspace = true
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [

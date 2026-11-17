@@ -109,7 +109,7 @@ pub(super) struct Progress {
 impl Progress {
     fn mark(&self, outcome: u8) {
         let state = &self.completion.partitions[self.partition];
-        let _ = state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        let _ = state.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             if current == REUSED || (outcome == COMPLETE && current != RUNNING) {
                 None
             } else {

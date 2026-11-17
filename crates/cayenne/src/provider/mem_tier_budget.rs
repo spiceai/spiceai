@@ -140,7 +140,7 @@ impl MemTierBudget {
         // never underflows even if the same reservation is released twice.
         let _ = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(bytes))
             });
     }

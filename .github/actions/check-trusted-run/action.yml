@@ -1,0 +1,169 @@
+name: Check a run is a trusted build
+description: >-
+  Fails unless a workflow run of this repository is one whose artifacts a privileged job may
+  download and run or publish. A fork's pull request run uploads whatever its author built, so
+  spicescript_dispatch, spicescript_long and release_from_run check the run they are given here
+  before they touch its artifacts. One list for every caller, identical in spiceai/spiceai and
+  spicehq/spiceai so the OSS merge stays clean; a workflow name a repository lacks matches nothing.
+  The run must be all of:
+    - from one of these workflows, matched by display name and by the file the run ran (the run's
+      `path`, any @ref suffix stripped), on only the events that workflow uses (`on:`, less
+      pull_request and workflow_call). spicehq/spiceai runs its own ent_*.yml copies of four; a
+      file a repository lacks matches nothing.
+        name                    file in spiceai/spiceai      file in spicehq/spiceai         events
+        E2E Test CI             e2e_test_ci.yml              ent_e2e_test_ci.yml             push, merge_group
+        build_release           build_release.yml            ent_build_release.yml           push, workflow_dispatch
+        build_and_release       build_and_release.yml        ent_build_and_release.yml       push, workflow_dispatch
+        build_and_release_cuda  build_and_release_cuda.yml   ent_build_and_release_cuda.yml  push, workflow_dispatch
+        build_nightly           build_nightly.yml            build_nightly.yml               schedule, workflow_dispatch
+        Enterprise Release      enterprise_release.yml       enterprise_release.yml          workflow_dispatch
+        release_from_run        release_from_run.yml         release_from_run.yml            workflow_dispatch
+      (all under .github/workflows/). Never pull_request or pull_request_target;
+    - built from this repository, not a fork;
+    - built from trunk or a release branch (release/X.Y or release/X.Y.Z, optionally -rc.N or
+      -rcN) and on that branch's history; from a merge queue branch
+      gh-readonly-queue/<one of those>/pr-<number>-<sha> (merge_group only); or from a release
+      tag (vX.Y.Z, optionally -rc.N or -rcN, optionally -enterprise) of this repository that
+      points at the commit the run built, where that commit is on trunk or a release branch.
+      Nothing else. head_branch is only a name, and a tag can be called `trunk`, so the commit
+      is checked against the branches themselves.
+  It fetches the commit history (no trees or blobs) of trunk and refs/heads/release/* into a
+  scratch repository under $RUNNER_TEMP, runs nothing from it, and fails if the fetch fails.
+
+inputs:
+  run-id:
+    description: Workflow run ID to check. Must be numeric.
+    required: true
+  token:
+    description: Token that can read this repository's Actions runs, tags and contents.
+    required: true
+
+outputs:
+  workflow:
+    description: The run's workflow display name.
+    value: ${{ steps.check.outputs.workflow }}
+  event:
+    description: The event that triggered the run.
+    value: ${{ steps.check.outputs.event }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the run
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        RUN_ID: ${{ inputs.run-id }}
+      run: |
+        set -euo pipefail
+        [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
+        # `gh run view --json` has no head repository field, so read the run from the API. A pull
+        # request run takes its name from the author's workflow file, so a name could carry line
+        # breaks to forge the fields read after it: flatten them, and require one line per field.
+        info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+          -q '.name, (.path // ""), .event, (.head_repository.full_name // ""), (.head_branch // ""), .head_sha
+            | tostring | gsub("[\r\n]"; " ")')
+        [ "$(wc -l <<<"$info")" -eq 6 ] || { echo "::error::Run $RUN_ID returned an unexpected metadata record"; exit 1; }
+        { read -r workflow; read -r path; read -r event; read -r head_repo; read -r head_branch; read -r head_sha; } <<<"$info"
+        path=${path%%@*}
+        refuse() {
+          echo "::error::Run $RUN_ID ($workflow, $event event, $head_repo @ $head_branch) $1"
+          exit 1
+        }
+
+        # Each allowed workflow: the one file it must come from and the events it may run on, from
+        # its `on:` block less pull_request and workflow_call (a called workflow's run is its caller's).
+        # spicehq/spiceai keeps upstream copies of four of these disabled and runs ent_*.yml instead.
+        case "$GITHUB_REPOSITORY" in spicehq/spiceai) ent=ent_ ;; *) ent="" ;; esac
+        case "$workflow" in
+          "E2E Test CI")          file=${ent}e2e_test_ci.yml;            events="push merge_group" ;;
+          build_release)          file=${ent}build_release.yml;          events="push workflow_dispatch" ;;
+          build_and_release)      file=${ent}build_and_release.yml;      events="push workflow_dispatch" ;;
+          build_and_release_cuda) file=${ent}build_and_release_cuda.yml; events="push workflow_dispatch" ;;
+          build_nightly)          file=build_nightly.yml;                events="schedule workflow_dispatch" ;;
+          "Enterprise Release")   file=enterprise_release.yml;           events="workflow_dispatch" ;;
+          release_from_run)       file=release_from_run.yml;             events="workflow_dispatch" ;;
+          *) refuse "is not from E2E Test CI, build_release, build_and_release, build_nightly, build_and_release_cuda, Enterprise Release or release_from_run" ;;
+        esac
+        [ "$path" = ".github/workflows/$file" ] || refuse "ran ${path:-no workflow file}, not .github/workflows/$file"
+
+        case "$event" in
+          pull_request | pull_request_target) refuse "is a pull request run, whose build its author controls" ;;
+        esac
+        [[ " $events " == *" $event "* ]] || refuse "was triggered by $event; $workflow runs are accepted only from ${events// / or }"
+
+        [ "$head_repo" = "$GITHUB_REPOSITORY" ] || refuse "was not built from $GITHUB_REPOSITORY"
+
+        release_branch='release/[0-9]+\.[0-9]+(\.[0-9]+)?(-rc\.?[0-9]+)?'
+        release_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.?[0-9]+)?(-enterprise)?$'
+
+        # The commit history of trunk and the release branches, fetched once into a scratch repo.
+        # The token goes to git through GIT_CONFIG_* for this one command, never to disk.
+        git_dir=""
+        fetch_branches() {
+          [ -z "$git_dir" ] || return 0
+          git_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/check-trusted-run.XXXXXX")
+          git init -q --bare "$git_dir"
+          server="${GITHUB_SERVER_URL:-https://github.com}"
+          git --git-dir "$git_dir" remote add origin "$server/$GITHUB_REPOSITORY.git"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          # Three tries for a transient network error; still failing means the run is refused.
+          fetched=""
+          for attempt in 1 2 3; do
+            if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server/.extraheader" \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git --git-dir "$git_dir" fetch -q --no-tags --filter=tree:0 origin \
+                '+refs/heads/trunk:refs/remotes/origin/trunk' \
+                '+refs/heads/release/*:refs/remotes/origin/release/*'; then
+              fetched=1; break
+            fi
+            [ "$attempt" = 3 ] || sleep 5
+          done
+          [ -n "$fetched" ] || refuse "could not be checked: fetching trunk and the release branches failed"
+          git --git-dir "$git_dir" rev-parse -q --verify refs/remotes/origin/trunk >/dev/null \
+            || refuse "could not be checked: trunk was not fetched"
+        }
+        # True when head_sha is the tip of, or an ancestor of, refs/remotes/origin/<branch>.
+        # GIT_NO_LAZY_FETCH keeps a missing commit missing (so: not on the branch) on git 2.45+.
+        on_branch() {
+          GIT_NO_LAZY_FETCH=1 git --git-dir "$git_dir" merge-base --is-ancestor \
+            "$head_sha" "refs/remotes/origin/$1" 2>/dev/null
+        }
+
+        if [ "$head_branch" = trunk ] || [[ "$head_branch" =~ ^${release_branch}$ ]]; then
+          fetch_branches
+          git --git-dir "$git_dir" rev-parse -q --verify "refs/remotes/origin/$head_branch" >/dev/null \
+            || refuse "names branch $head_branch, which this repository does not have"
+          on_branch "$head_branch" || refuse "built $head_sha, which is not on branch $head_branch"
+        elif [[ "$head_branch" =~ ^gh-readonly-queue/(trunk|${release_branch})/pr-[0-9]+-[0-9a-f]+$ ]]; then
+          [ "$event" = merge_group ] || refuse "is on a merge queue branch but was not a merge_group run"
+        elif [[ "$head_branch" =~ $release_tag ]]; then
+          # A tag build reports the tag name as head_branch, but a branch can carry the same name,
+          # so the tag must exist here and point at the commit the run built. The commits endpoint
+          # peels an annotated tag to its commit.
+          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$head_branch" -q .sha 2>/dev/null) \
+            || refuse "names $head_branch, which is not a tag of $GITHUB_REPOSITORY"
+          [ "$tag_sha" = "$head_sha" ] \
+            || refuse "built $head_sha, but tag $head_branch points at $tag_sha"
+          # Anyone who can push a tag can put one on any commit, so the commit must already be on
+          # trunk or a release branch (strict names only).
+          fetch_branches
+          trusted=""
+          while read -r branch; do
+            if [ "$branch" = trunk ] || [[ "$branch" =~ ^${release_branch}$ ]]; then
+              on_branch "$branch" && { trusted="$branch"; break; }
+            fi
+          done < <(git --git-dir "$git_dir" for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/)
+          [ -n "$trusted" ] || refuse "built $head_sha, which is not on trunk or a release branch"
+          head_branch="$head_branch (on $trusted)"
+        else
+          refuse "was built from $head_branch, not trunk, a release branch or a release tag"
+        fi
+
+        echo "Run $RUN_ID is a $workflow $event run of $GITHUB_REPOSITORY @ $head_branch"
+        {
+          echo "workflow=$workflow"
+          echo "event=$event"
+        } >> "$GITHUB_OUTPUT"

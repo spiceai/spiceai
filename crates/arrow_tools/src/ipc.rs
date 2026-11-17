@@ -587,7 +587,7 @@ mod tests {
     fn a_zero_row_batch_declares_a_record_batch_with_an_empty_body() {
         let (_, batch_header, batch_body) = encode(&RecordBatch::new_empty(int_batch().schema()));
 
-        assert!(batch_body.is_empty());
+        assert_eq!(batch_body, [] as [u8; 0]);
         assert_eq!(declares_record_batch(&batch_header), Ok(true));
     }
 

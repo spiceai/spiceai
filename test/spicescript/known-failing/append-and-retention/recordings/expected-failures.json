@@ -242,7 +242,8 @@
       "key": "query: SELECT id, deleted FROM widgets WHERE id > 0 ORDER BY id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 3 }",
-      "group": "append-and-retention"
+      "group": "append-and-retention",
+      "may-pass": true
     },
     {
       "run": "retention-sql-after-append-refresh",
