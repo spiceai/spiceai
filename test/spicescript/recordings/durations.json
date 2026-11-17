@@ -6,7 +6,7 @@
   "append-kill": 14,
   "append-time-column": 8,
   "append-time-partition": 4,
-  "async-queries": 12,
+  "async-queries": 21,
   "auth": 3,
   "azure-model-credentials": 5,
   "builtins": 4,
