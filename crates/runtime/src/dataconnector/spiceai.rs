@@ -183,6 +183,10 @@ pub struct SpiceAI {
     /// The runtime's query memory pool, which a reload of the append stream
     /// stages its snapshot in.
     reload_memory_pool: Arc<dyn MemoryPool>,
+    /// The local dataset this connector serves, when it serves one. Its append
+    /// stream tracks staleness, labels metrics and logs under this name, so two
+    /// local datasets reading the same upstream table are reported apart.
+    local_dataset: Option<String>,
 }
 
 impl SpiceAI {
@@ -469,9 +473,11 @@ impl DataConnectorFactory for SpiceAIFactory {
                     .runtime_env()
                     .memory_pool,
             );
+            let local_dataset = local_dataset_name(&params.component);
             Ok(Arc::new(SpiceAI {
                 flight_factory,
                 reload_memory_pool,
+                local_dataset,
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -589,18 +595,30 @@ impl DataConnector for SpiceAI {
         &self,
         _context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
-        _dataset: &DatasetSpec,
+        dataset: &DatasetSpec,
         _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
-        self.append_stream(federated_table)
+        Some(self.append_stream_for(federated_table, Some(dataset.name.to_string())))
     }
 
     fn append_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
     ) -> Option<ChangesStream> {
+        Some(self.append_stream_for(federated_table, self.local_dataset.clone()))
+    }
+}
+
+impl SpiceAI {
+    /// The append stream of `federated_table`, tracked under `local_dataset`
+    /// or, when the connector serves no single dataset, the upstream name.
+    fn append_stream_for(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+        local_dataset: Option<String>,
+    ) -> ChangesStream {
         let reload_memory_pool = Arc::clone(&self.reload_memory_pool);
-        Some(Box::pin(stream! {
+        Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(federated_table_provider_adaptor) = table_provider
             .downcast_ref::<FederatedTableProviderAdaptor>() else {
@@ -614,16 +632,19 @@ impl DataConnector for SpiceAI {
                 return;
             };
 
+            let table_reference = flight_table.get_table_reference();
+            let dataset = local_dataset.unwrap_or_else(|| dataset_label(&table_reference));
             let mut stream = Box::pin(subscribe_to_append_stream(
                 flight_table.get_flight_client(),
-                flight_table.get_table_reference(),
+                table_reference,
+                dataset,
                 reload_memory_pool,
             ));
 
             while let Some(item) = stream.next().await {
                 yield item;
             }
-        }))
+        })
     }
 }
 
@@ -675,17 +696,20 @@ impl SpiceAI {
 mod append_stream;
 
 /// Reads the append stream (`DoExchange`) of the upstream dataset
-/// `table_reference` into change envelopes. A reload of the dataset stages its
-/// snapshot in memory reserved from `memory_pool`, and is refused (and retried
-/// later) when the pool cannot hold it.
+/// `table_reference` into change envelopes for the local dataset `dataset`. A
+/// reload of the dataset stages its snapshot in memory reserved from
+/// `memory_pool`, and is refused (and retried later) when the pool cannot hold
+/// it.
+///
+/// `table_reference` is only what the upstream is asked for; staleness
+/// tracking, metric labels and logs use `dataset`, the plain local name, so
+/// two local datasets reading one upstream table are reported apart.
 pub fn subscribe_to_append_stream(
     client: FlightClient,
     table_reference: String,
+    dataset: String,
     memory_pool: Arc<dyn MemoryPool>,
 ) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
-    // `table_reference` is quoted for the upstream; logs and metric labels use
-    // the plain name, as other dataset metrics do.
-    let dataset = dataset_label(&table_reference);
     let subscribe_to = table_reference;
     append_stream::append_stream(
         move || {
@@ -702,6 +726,14 @@ pub fn subscribe_to_append_stream(
 /// dataset metrics and logs show it (`events`, not `"events"`).
 fn dataset_label(table_reference: &str) -> String {
     TableReference::parse_str(table_reference).to_string()
+}
+
+/// The plain name of the local dataset `component` is, if it is one.
+fn local_dataset_name(component: &ConnectorComponent) -> Option<String> {
+    match component {
+        ConnectorComponent::Dataset(dataset) => Some(dataset.name.to_string()),
+        ConnectorComponent::Catalog(_) => None,
+    }
 }
 
 pub struct SpiceAIChangeCommiter {}
@@ -763,9 +795,7 @@ mod tests {
         }
     }
 
-    /// From a producer that does not mark its stream, only `DATA_LOSS` (the
-    /// subscriber missed updates) sends the append stream back for a fresh
-    /// snapshot; any other error is reported.
+    /// Logs and metric labels name an upstream dataset by its unquoted name.
     #[test]
     fn an_append_stream_reports_its_dataset_by_its_unquoted_name() {
         assert_eq!(
@@ -778,6 +808,28 @@ mod tests {
         );
     }
 
+    /// Two local datasets reading one upstream table track their append
+    /// streams under their own names, not the shared upstream one.
+    #[tokio::test]
+    async fn an_append_stream_is_tracked_under_its_local_dataset_name() {
+        let app = Arc::new(app::AppBuilder::new("test").build());
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let name_of = |local: &str| {
+            let dataset = DatasetBuilder::try_new("spice.ai/test.table".to_string(), local)
+                .expect("failed to create builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&runtime))
+                .build()
+                .expect("failed to build dataset");
+            local_dataset_name(&ConnectorComponent::from(&dataset))
+        };
+        assert_eq!(name_of("east").as_deref(), Some("east"));
+        assert_eq!(name_of("west").as_deref(), Some("west"));
+    }
+
+    /// From a producer that does not mark its stream, only `DATA_LOSS` (the
+    /// subscriber missed updates) sends the append stream back for a fresh
+    /// snapshot; any other error is reported.
     #[test]
     fn only_data_loss_resubscribes_an_append_stream() {
         use arrow_flight::error::FlightError;

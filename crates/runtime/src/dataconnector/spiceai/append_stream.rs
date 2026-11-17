@@ -406,6 +406,11 @@ where
         // Reloads refused in a row for lack of memory.
         let mut refusals = 0_u32;
         let mut last_epoch: Option<String> = None;
+        // Whether the producer has marked any subscription of this stream. A
+        // reconnect can end before its `begin` marker, so it carries no epoch
+        // of its own; it is still resubscribed rather than treated as the end
+        // of an unmarked producer's stream.
+        let mut marked_producer = false;
         // Whether a snapshot of this stream has made the dataset ready, so a
         // later snapshot is a reload to stage and swap in.
         let mut been_ready = false;
@@ -472,8 +477,9 @@ where
                     snapshot_end_error_at = tokio::time::Instant::now() + SNAPSHOT_END_ERROR_AFTER;
                 }
 
+                let marked = marked_producer || subscription.epoch().is_some();
                 let Some(decoded_data) = next else {
-                    break if subscription.epoch().is_some() {
+                    break if marked {
                         Ended::Resubscribe("the source ended the stream".to_string())
                     } else {
                         Ended::Done
@@ -487,7 +493,7 @@ where
                     // A producer that marks its stream restarts it from a fresh
                     // snapshot, so a failed stream is resubscribed; one that does
                     // not keeps the old behavior.
-                    Err(e) if subscription.epoch().is_some() => {
+                    Err(e) if marked => {
                         break Ended::Resubscribe(format!("the stream from its source failed ({e})"));
                     }
                     Err(e) => {
@@ -593,6 +599,7 @@ where
                 }
             };
 
+            marked_producer |= subscription.epoch().is_some();
             let stale_for = last_applied_at.map_or_else(
                 || "an unknown time".to_string(),
                 |at| format!("{}s", at.elapsed().as_secs()),
@@ -632,7 +639,7 @@ where
             // completed its snapshot, so one that keeps failing to finish a
             // snapshot still exhausts the retry budget.
             if subscribed_at.elapsed() >= APPEND_STREAM_HEALTHY_SUBSCRIPTION
-                && (completed_snapshot || subscription.epoch().is_none())
+                && (completed_snapshot || !marked_producer)
             {
                 resubscribes = 0;
             }
@@ -1329,6 +1336,136 @@ mod tests {
                 && logs.contains("keeps serving its previous data, which last changed"),
             "{logs}"
         );
+    }
+
+    /// After a marked producer's stream fails, a reconnect that ends, or
+    /// fails, before its `begin` marker carries no epoch of its own; it is
+    /// still resubscribed within the retry budget rather than ending the
+    /// stream as if the producer never marked it.
+    #[tokio::test]
+    async fn a_reconnect_that_ends_before_begin_after_a_marked_stream_is_retried() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let failed_after_ready: Messages = futures::stream::iter(first.into_iter().map(Ok))
+            .chain(futures::stream::once(async {
+                Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                    "connection reset",
+                ))))
+            }))
+            .boxed();
+        let ended_before_begin: Messages = futures::stream::empty().boxed();
+        let failed_before_begin: Messages = futures::stream::once(async {
+            Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                "connection reset",
+            ))))
+        })
+        .boxed();
+        let (recovered, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+
+        tokio::time::pause();
+        let mut stream = consumer(vec![
+            failed_after_ready,
+            ended_before_begin,
+            failed_before_begin,
+            held_open(recovered),
+        ]);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(
+            replacement(&mut stream).await,
+            2,
+            "the stream recovers from the snapshot after the reconnects"
+        );
+    }
+
+    /// Two local datasets reading the same upstream table are tracked apart: a
+    /// reload that commits for one leaves the other, whose reload was refused,
+    /// reported stale.
+    #[tokio::test]
+    async fn two_local_datasets_over_one_upstream_table_are_tracked_apart() {
+        const EAST: &str = "east";
+        const WEST: &str = "west";
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let failed_after_ready = || async {
+            let (first, _) =
+                through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+            futures::stream::iter(first.into_iter().map(Ok))
+                .chain(futures::stream::once(async {
+                    Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                        "connection reset",
+                    ))))
+                }))
+                .boxed()
+        };
+        let east_first: Messages = failed_after_ready().await;
+        let west_first: Messages = failed_after_ready().await;
+        let (too_large, _) =
+            through_end(producer(&datafusion, &broadcaster, table((1..=50_000).collect())).await)
+                .await;
+        let (fits, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+
+        // One staleness record, as the published metrics share one.
+        let stale = Arc::new(StaleDatasets::default());
+        let budget = |memory_pool: Arc<dyn MemoryPool>| ReloadBudget {
+            memory_pool,
+            stale: Arc::clone(&stale),
+        };
+        let reading = |subscriptions: Vec<Messages>, dataset: &str, budget| {
+            let mut subscriptions: VecDeque<Messages> = subscriptions.into();
+            append_stream(
+                move || {
+                    let next = subscriptions.pop_front();
+                    async move {
+                        next.map(FlightDataDecoder::new)
+                            .ok_or("no more subscriptions")
+                    }
+                },
+                dataset.to_string(),
+                budget,
+            )
+            .boxed()
+        };
+
+        tokio::time::pause();
+        let mut east = reading(
+            vec![east_first, held_open(too_large)],
+            EAST,
+            budget(Arc::new(GreedyMemoryPool::new(64 * 1024))),
+        );
+        let mut west = reading(
+            vec![west_first, held_open(fits)],
+            WEST,
+            budget(Arc::new(UnboundedMemoryPool::default())),
+        );
+        assert_eq!(snapshots(&mut east, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(snapshots(&mut west, 1).await, vec![snapshot_of(1)]);
+        // East's reload is refused, and it waits to retry.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), east.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(stale.refused(EAST), 1);
+        assert!(stale.stale_for(EAST).is_some());
+
+        replacement_envelope(&mut west)
+            .await
+            .commit()
+            .await
+            .expect("commit the swap");
+        assert_eq!(stale.stale_for(WEST), None, "west is current");
+        assert_eq!(stale.refused(WEST), 0);
+        assert!(
+            stale.stale_for(EAST).is_some(),
+            "west's reload does not clear east's stale flag"
+        );
+        assert_eq!(stale.refused(EAST), 1);
     }
 
     /// Updates that arrive during a reload are staged with it, and their
