@@ -5555,10 +5555,10 @@ mod tests {
             }
             None => {}
         }
-        let table_path = ListingTableUrl::parse(format!("{}/", dir.display()))
-            .expect("listing table url");
-        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-            .with_file_extension(".parquet");
+        let table_path =
+            ListingTableUrl::parse(format!("{}/", dir.display())).expect("listing table url");
+        let options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
         let schema = Arc::new(Schema::new(vec![Field::new(
             "id",
             arrow_schema::DataType::Int64,
@@ -5616,10 +5616,7 @@ mod tests {
         );
 
         write_id_file(&file, &[1, 2, 3, 4, 5]);
-        assert_eq!(
-            id_rows(&append).await.expect("a new file is read"),
-            5
-        );
+        assert_eq!(id_rows(&append).await.expect("a new file is read"), 5);
     }
 
     /// The S3 single-object table (`S3SingleFileCached`) does not go through `wrap`,
