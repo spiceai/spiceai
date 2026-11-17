@@ -330,6 +330,18 @@ impl ObjectStore for GitHubRawObjectStore {
                     return;
                 }
             };
+            // A truncated tree leaves files out without saying which; listing it would return
+            // some of the files under the prefix as if they were all of them.
+            if git_tree.truncated {
+                yield Err(object_store::Error::Generic {
+                    store: "GitHubRawObjectStore",
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to list the files of GitHub repository '{}/{}' at '{}': the repository has more files than GitHub lists in one response, so the list would be incomplete. Reference individual files instead of a folder.",
+                        config.org, config.repo, config.rev
+                    ))),
+                });
+                return;
+            }
 
             // Keep only file entries within the prefix path
             let files: Vec<GitTreeNode> = git_tree
@@ -379,6 +391,10 @@ fn not_implemented(operation: &'static str) -> object_store::Error {
 #[derive(Debug, Deserialize)]
 struct GitTree {
     tree: Vec<GitTreeNode>,
+    /// Set when the repository has more entries than GitHub returns in one recursive tree, so
+    /// `tree` is incomplete.
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -773,6 +789,36 @@ mod tests {
         assert!(
             error.contains("429"),
             "the error must name the status the API returned: {error}"
+        );
+    }
+
+    /// GitHub truncates a recursive tree past its size limit and says so; the files it left out
+    /// are unknown, so the listing fails instead of returning the files it did list.
+    #[tokio::test]
+    async fn list_refuses_a_truncated_tree() {
+        let raw = StubSurface::responding(200, Vec::new());
+        let api = StubSurface::responding(
+            200,
+            serde_json::json!({
+                "tree": [{ "path": "data/a.csv", "type": "blob", "size": 1 }],
+                "truncated": true,
+            })
+            .to_string(),
+        );
+        let store = store_against(&raw, &api, None).await;
+
+        let results: Vec<_> = store
+            .list(Some(&Path::from("data")))
+            .collect::<Vec<_>>()
+            .await;
+        let error = match results.as_slice() {
+            [Err(error)] => error.to_string(),
+            other => panic!("a truncated tree must yield exactly one error, got {other:?}"),
+        };
+        assert!(
+            error.contains("Failed to list the files of GitHub repository 'spiceai/spiceai'")
+                && error.contains("the list would be incomplete"),
+            "the error must say the listing is incomplete: {error}"
         );
     }
 

@@ -64,6 +64,9 @@ pub enum Error {
 
     #[snafu(display("Failed to parse the provided Spicepod component. {}", source))]
     UnableToParseSpicepodComponent { source: yaml::Error },
+
+    #[snafu(display("Failed to create zip archive. {}", source))]
+    ZipTaskFailed { source: tokio::task::JoinError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -132,8 +135,13 @@ fn is_folder_reference(path: &PathReference) -> bool {
 /// Creates a zip package from the given object store and path to a spicepod.yaml.
 ///
 /// It will parse the spicepod and find all of the linked files, and add them to the returned zip archive.
+///
+/// A data file (a view's SQL, a dataset's file, or each file of a dataset's folder) is added to the
+/// archive as soon as it is downloaded and is not kept after that, so besides the archive the
+/// package holds the Spicepod and component files it parsed and at most one data file. A file
+/// referenced more than once (by two datasets, or by a folder and a file in it) is downloaded and
+/// added once.
 pub async fn make_zip(store: &dyn ObjectStore, spicepod_path: &Path) -> Result<Bytes> {
-    let mut linked_files = Vec::new();
     let (spicepod_references, spicepods) = load_spicepods(store, spicepod_path).await?;
     let mut linked_paths = find_linked_files(store, &spicepods).await?;
     linked_paths.extend(spicepod_references);
@@ -143,55 +151,102 @@ pub async fn make_zip(store: &dyn ObjectStore, spicepod_path: &Path) -> Result<B
         linked_paths.len()
     );
 
+    let mut zip = ZipArchive::new();
     for linked_path in linked_paths {
-        // Can get in parallel
         tracing::debug!("[zip package] Extracting content for linked path: {linked_path:?}");
         if is_folder_reference(&linked_path) {
-            let files = get_files_from_folder_reference(store, &linked_path).await?;
+            let folder = linked_path.try_get_path()?;
+            let mut files_stream = store.list(Some(&folder));
+            let mut files = 0usize;
+            while let Some(item) = files_stream.next().await {
+                let file_path = item.context(FailedToReadObjectSnafu)?.location;
+                if zip.contains(&file_path) {
+                    continue;
+                }
+                let file_bytes = get_file_bytes(store, &file_path).await?;
+                zip = zip.add(file_path, file_bytes).await?;
+                files += 1;
+            }
             tracing::debug!(
-                "[zip package] Folder reference {:?} resolved in {} files",
+                "[zip package] Folder reference {:?} resolved in {files} files",
                 &linked_path,
-                files.len()
             );
-            linked_files.extend(files);
         } else {
+            let file_path = linked_path.try_get_path()?;
+            if zip.contains(&file_path) {
+                continue;
+            }
             let file_bytes = get_file_bytes_from_reference(store, &linked_path).await?;
-            linked_files.push((linked_path.try_get_path()?, file_bytes));
+            zip = zip.add(file_path, file_bytes).await?;
         }
     }
 
     tracing::info!(
-        "[zip package] Resolved {} files, {} bytes total",
-        linked_files.len(),
-        linked_files
-            .iter()
-            .map(|(_, bytes)| bytes.len())
-            .sum::<usize>()
+        "[zip package] Packaged {} files, {} bytes total",
+        zip.files.len(),
+        zip.input_bytes
     );
 
-    tracing::info!("[zip package] Creating zip archive...");
+    zip.finish().await
+}
 
-    // Add the root spicepod to the zip
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+/// A zip archive built in memory. Compressing a file is CPU work, so each file is written on the
+/// blocking thread pool rather than on the async runtime.
+struct ZipArchive {
+    writer: zip::ZipWriter<std::io::Cursor<Vec<u8>>>,
+    /// The directories already added to the archive.
+    directories: HashSet<String>,
+    /// The paths of the files already added to the archive.
+    files: HashSet<Path>,
+    /// The bytes of the files added, before compression.
+    input_bytes: usize,
+}
 
-    // Add all of the linked files to the zip
-    let mut directories = HashSet::new();
-    for (file_path, file_bytes) in linked_files {
-        let std_file_path = std::path::Path::new(file_path.as_ref());
-        add_file_to_zip(
-            &mut zip,
-            options,
-            &mut directories,
-            std_file_path,
-            &file_bytes,
-        )?;
+impl ZipArchive {
+    fn new() -> Self {
+        Self {
+            writer: zip::ZipWriter::new(std::io::Cursor::new(Vec::new())),
+            directories: HashSet::new(),
+            files: HashSet::new(),
+            input_bytes: 0,
+        }
     }
 
-    Ok(Bytes::from(
-        zip.finish().context(FailedToCreateZipSnafu)?.into_inner(),
-    ))
+    fn contains(&self, file_path: &Path) -> bool {
+        self.files.contains(file_path)
+    }
+
+    /// Adds `file_bytes` to the archive as `file_path`, and drops them.
+    async fn add(mut self, file_path: Path, file_bytes: Bytes) -> Result<Self> {
+        let input_bytes = file_bytes.len();
+        let mut zip = tokio::task::spawn_blocking(move || {
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            add_file_to_zip(
+                &mut self.writer,
+                options,
+                &mut self.directories,
+                std::path::Path::new(file_path.as_ref()),
+                &file_bytes,
+            )
+            .map(|()| {
+                self.files.insert(file_path);
+                self
+            })
+        })
+        .await
+        .context(ZipTaskFailedSnafu)??;
+        zip.input_bytes = zip.input_bytes.saturating_add(input_bytes);
+        Ok(zip)
+    }
+
+    async fn finish(self) -> Result<Bytes> {
+        let archive = tokio::task::spawn_blocking(move || self.writer.finish())
+            .await
+            .context(ZipTaskFailedSnafu)?
+            .context(FailedToCreateZipSnafu)?;
+        Ok(Bytes::from(archive.into_inner()))
+    }
 }
 
 async fn load_spicepods(
@@ -416,23 +471,6 @@ async fn get_file_bytes_from_reference(
         }
         PathReference::Retrieved { file_bytes, .. } => Ok(file_bytes.clone()),
     }
-}
-
-async fn get_files_from_folder_reference(
-    store: &dyn ObjectStore,
-    reference: &PathReference,
-) -> Result<Vec<(Path, Bytes)>> {
-    let path = reference.try_get_path()?;
-    let mut files_stream = store.list(Some(&path));
-
-    let mut linked_files = Vec::new();
-
-    while let Some(item) = files_stream.next().await {
-        let file_path = item.context(FailedToReadObjectSnafu)?.location;
-        let file_bytes = get_file_bytes(store, &file_path).await?;
-        linked_files.push((file_path, file_bytes));
-    }
-    Ok(linked_files)
 }
 
 async fn get_file_bytes(store: &dyn ObjectStore, file_path: &Path) -> Result<Bytes> {

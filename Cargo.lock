@@ -14800,12 +14800,14 @@ dependencies = [
 name = "package"
 version = "2.5.0-unstable"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "object_store 0.13.2",
  "serde",
  "snafu",
  "spicepod",
+ "tokio",
  "tracing",
  "yaml",
  "zip",

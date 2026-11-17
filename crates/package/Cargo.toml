@@ -7,6 +7,7 @@ name = "package"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+autotests = false
 
 [dependencies]
 object_store.workspace = true
@@ -18,6 +19,14 @@ spicepod = { path = "../spicepod" }
 zip = "9.1"
 bytes.workspace = true
 futures.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true
