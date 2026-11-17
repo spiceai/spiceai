@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `5e0429cc5ccd0854de93dd300bb4a0622cb9f559` | `lukim/v1.0.0-fixes` (TEMPORARY: spiceai/llama.cpp#39, spiceai/llama.cpp#40 and spiceai/llama.cpp#41) |
+| [llama.cpp](#llamacpp) | `0d39485bb50f6c47a9b4adb140c93202e8064cd9` | `lukim/v1.0.0-fixes` (TEMPORARY: spiceai/llama.cpp#39, spiceai/llama.cpp#40, spiceai/llama.cpp#41 and spiceai/llama.cpp#42) |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aaf0209ec2a5dd1f61c5dedde20726ff04ac35a0` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
@@ -813,7 +813,7 @@ upstream releases with the Spice patches below: each `spiceai-<release>` branch 
 Spice branch with the upstream release tag merged in, and the pin is its tagged tip,
 `<release>-spiceai.<n>`, or a commit on it that no tag names yet: today `v1.0.0-spiceai.1`, the merge
 of spiceai/llama.cpp#38, which brought upstream `v1.0.0` into `spiceai-b11999` at the squash of
-spiceai/llama.cpp#37, with spiceai/llama.cpp#39, #40 and #41 merged onto it while they are reviewed. Where `v1.0.0` has
+spiceai/llama.cpp#37, with spiceai/llama.cpp#39, #40, #41 and #42 merged onto it while they are reviewed. Where `v1.0.0` has
 what a patch did, the branch takes upstream's: the `glm5-next` tensor split (spiceai/llama.cpp#8's, now
 ggml-org/llama.cpp#30499) and the meta backend's `GGML_OP_POOL_1D` and `GGML_OP_ARANGE` split states. `v1.0.0`
 gives GGML type 43 to `F8_E4M3`, so the fork's gather-only `MXFP8` type, which held that number, is gone; no GGUF
@@ -848,6 +848,7 @@ release, follow `spiceai/README.md` in the fork.
 | A quantized rows view on a meta backend, flattened to one dimension, offsets each device's part by whole blocks rather than elements (spiceai/llama.cpp#29) | Every device after the first reads past the matrix. The DSpark drafter multiplies its rows view without flattening it, so nothing Spice serves builds such a view today | crash (out-of-bounds read) | **GAP** — the fork's `test-argmax-split` (`test_meta_flat_quantized_rows`) covers it; see [Open gaps](#open-gaps) |
 | A tensor split keeps the offset of a view that picks the same part of every element along the split axis, as the rope part of each head of an MLA query does: when the view's offset and its extent below the split axis fit in one element, each device's part starts that far into its own elements instead of at the offset scaled by its share (spiceai/llama.cpp#39) | Mistral Large 4 split by tensor reads the rope part of its query from the wrong values: on two devices the other part of each head, with no error (the fork's `test-llama-archs` NMSE was 3.37e-07 against 1.92e-12 with it), and on three or four from addresses no float starts at, which gives NaN logits | silent (wrong data) | **GAP** — no small `mistral-large4` GGUF to split here; the fork's `test-argmax-split` (`test_meta_view_within_heads`) and `test-llama-archs -a mistral-large4 --rpc` cover it; see [Open gaps](#open-gaps) |
 | A tensor split splits a view that spans one of the q, k and v windows of `glm5-next`'s conv state, as upstream's `build_conv_state_store` writes a window into its rollback slots when a draft keeps them: the permuted view's dim that spans one repetition of a segment of the split source splits as that segment does, when every segment splits between the devices in one ratio, and its offset scales with the device's share (spiceai/llama.cpp#41) | GLM-5.3 split across nodes by tensor with its MTP draft aborts its first request at `ggml-backend-meta.cpp:913` (`view of permuted tensor not implemented`), and `spiced` with it: two loads of two on three DGX Sparks at `4484442938`. Without a draft the store takes a view that splits, so only a drafted model reaches it | crash | **GAP** — no `glm5-next` GGUF with an MTP head small enough to split here; the fork's `test-llama-archs -a glm5-next --rpc … --n-rs-seq 3` and `--rollback` cover it, both aborting without the patch; see [Open gaps](#open-gaps) |
+| A graph whose attention mask spans the whole cache is reused while flash attention over K/V rows is on, which `v1.0.0` turns on with a unified cache: the reuse check compares such a mask, which never takes rows, as a whole-cache mask instead of with the rows layout the ubatch could use (spiceai/llama.cpp#42) | Every step rebuilds the graph of a model whose attention builds its own mask, and a model split across nodes also re-splits it and sends it to every rank again: GLM-5.3 split across three DGX Sparks with its MTP draft decoded at 26.1–29.7 tok/s single-request against 51.11 / 53.10 with the fix, and multi-turn at concurrency 2 at 49.00–50.00 against 71.01. Fifteen architectures in the fork's `test-llama-archs` reused 0 of 5 graphs with rows on and 5 of 5 without | silent (perf) | **GAP** — a perf-only row; the fork's `test-llama-archs --graph-reuse` checks that rows on reuse as many graphs as rows off, with the same logits; see [Open gaps](#open-gaps) |
 | The argmax output: `llama_set_argmax_output` and `llama_get_argmax_ith` compute a split output head's picks on its devices and return only the picks, with no logits (spiceai/llama.cpp#30) | Nothing yet: Spice does not turn it on. The change that does will call both, so losing them will then fail the build | none | none needed until Spice calls it |
 | The MTP draft head pairs a batch's first token only with the hidden state at the position before it: it keeps that state and the one before it with their positions, saves and restores them through `common_speculative_get_state` and `common_speculative_set_state`, and moves them with the sequence through `common_speculative_seq_add`, also where upstream keeps the target's hidden states on the device (spiceai/llama.cpp#31) | A second request on a sequence, or a turn that reads only past a cached prefix, drafts from the hidden state the previous request left, not as the same request does on a fresh context. Losing the patch still builds: upstream's `get_state` and `set_state` save the pending state alone, with no position, so the next batch pairs with it whichever position it starts at | silent (different drafts) | `mtp::a_second_request_drafts_as_on_a_fresh_context` and `mtp::a_reused_prefix_drafts_as_on_a_fresh_context` (`crates/llms-llamacpp/tests/mtp.rs`), run by the llama.cpp engine job in `.github/workflows/integration_llms.yml`; both fail without the patch on Metal and on CPU |
 | A meta backend rebuilds a split it would reuse when another backend's rebuilds have reset the containers holding the device tensors of its views (spiceai/llama.cpp#33) | With one graph slot (`LLAMA_GRAPH_SLOTS=0`), DeepSeek-V4.1 split by tensor with its DSpark drafter aborts on its first or second request at `ggml-cuda/binbcast.cu:417`: since spiceai/llama.cpp#27 the drafter's graphs view the target's weights, and their rebuilds reset the views the target's reused split points at. Spice runs a tensor split with two graph slots, whose splits are built from clones, so only that variable reaches it | crash | **GAP** — the fork's `test-meta-shared-views` covers it; see [Open gaps](#open-gaps) |
@@ -924,7 +925,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**64 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**65 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -1072,7 +1073,8 @@ without becoming a flaky timing test:
     its DSpark drafter head split by vocabulary rows (spiceai/llama.cpp#27), its RDMA sends kept
     in flight (spiceai/llama.cpp#34), its large mesh partials reduced by a reduce-scatter and
     an all-gather (spiceai/llama.cpp#35) and its F32 weights that hold only BF16 values loaded as BF16
-    (spiceai/llama.cpp#36), measured on the same cluster;
+    (spiceai/llama.cpp#36) and its graph reuse for a whole-cache attention mask while flash
+    attention over K/V rows is on (spiceai/llama.cpp#42), measured on the same cluster;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
     `async-openai` retry-after handling; `datafusion`'s `IoWaitHook` carry through
