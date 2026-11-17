@@ -339,10 +339,15 @@ steps:
   # --- A worker's scheduled prompt runs for the operator --------------------------------------
 
   # The prompt is the operator's own, so its model may call the read-write tools the operator gave
-  # it, though no caller (and no `runtime.auth`) is involved.
+  # it, on a runtime that authenticates callers, though no caller is involved.
   - restart:
       patch:
         spicepod:
+          runtime:
+            auth:
+              api-key:
+                enabled: true
+                keys: ['writer-key:rw', 'reader-key:ro']
           workers:
             - name: reminder
               cron: '*/2 * * * * *'
@@ -363,6 +368,5 @@ steps:
           headers: { content-type: application/json }
           body: '{"id":"remember","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_remember","type":"function","function":{"name":"store_memory","arguments":"{\"thoughts\":[\"scheduled\"]}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
   - query: SELECT value FROM llm_memory
-    api-key: none
     expect: { rows: [['scheduled']] }
     eventually: 30s
