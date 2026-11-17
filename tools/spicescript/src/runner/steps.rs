@@ -1002,7 +1002,7 @@ mod tests {
         );
 
         assert_eq!(
-            super::super::max_wait(Duration::from_secs(60)),
+            super::super::max_wait(Duration::from_mins(1)),
             Duration::from_secs(1),
             "`eventually` and refresh waits stay capped"
         );
