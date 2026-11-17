@@ -2585,7 +2585,12 @@ impl Runtime {
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
             && let Some(tool) = catalog.get(&name).await
         {
-            return Some(tool);
+            // Under the name it is listed as, as `list_all_tools` returns it, so the tool is
+            // named the same in its errors and `task_history` whichever path called it.
+            return Some(with_name(
+                &tool,
+                encode_tool_name(&catalog_name, &name).as_str(),
+            ));
         }
         // Fall back to a direct (non-catalog) lookup — covers top-level tools
         // whose names legitimately contain the `__` catalog separator.

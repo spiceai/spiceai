@@ -47,7 +47,7 @@ use spicepod::semantic::Column;
 use std::collections::HashMap;
 use std::{borrow::Cow, sync::Arc};
 use tokio::sync::RwLock;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 use tracing_futures::Instrument;
 
 /// A tool to retrieve the schema of one or more available SQL tables.
@@ -340,7 +340,12 @@ impl SpiceModelTool for TableSchemaTool {
         parameters::<TableSchemaToolParams>()
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Reads the schema of a dataset the caller can query.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let req: TableSchemaToolParams = serde_json::from_str(arg)?;
         self.get_schema(&req).await
     }

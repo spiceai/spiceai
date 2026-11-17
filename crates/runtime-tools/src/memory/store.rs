@@ -24,11 +24,10 @@ use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
-use crate::builtin::function_tool::current_principal_requires_read_only;
 use crate::utils::parameters;
 use app::App;
 use tokio::sync::RwLock;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 
 use super::{MemoryTableElement, memory_table_name, try_from};
 
@@ -130,16 +129,16 @@ impl SpiceModelTool for StoreMemoryTool {
         parameters::<StoreMemoryParams>()
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Appends to the memory dataset.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadWrite
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::store_memory", tool = self.name().to_string(), input = arg);
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
-            // Auth gate before table lookup so RO rejection does not depend on app
-            // wiring and is covered by unit tests without a live memory dataset.
-            // Inside this future so `task_history` records a refusal as an error,
-            // like every other failure below.
-            if current_principal_requires_read_only().await {
-                return Err("Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth".into());
-            }
+            // `call` has already refused a caller without write access (`access` is
+            // `ReadWrite`), and recorded that refusal in `task_history`.
             let table_name = memory_table_name(&self.app).await?;
             let params: StoreMemoryParams = serde_json::from_str(arg).boxed()?;
             validate_store_memory_params(&params)?;
@@ -382,12 +381,37 @@ mod tests {
             .await;
         assert_eq!(
             err.to_string(),
-            "Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
+            "Failed to call tool 'store_memory': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
         );
         assert_eq!(
             engine.write_calls(),
             0,
             "RO principal must not reach write_data"
+        );
+    }
+
+    /// A request with no principal — a runtime without `runtime.auth` — may not write memories
+    /// either: only a principal with write access may.
+    #[tokio::test]
+    async fn store_memory_rejects_request_without_principal() {
+        let engine = Arc::new(RecordingQueryEngine::new());
+        let tool = store_memory_tool(Arc::clone(&engine));
+        let ctx = Arc::new(SpiceRequestContext::builder(Protocol::Http).build());
+        let err = ctx
+            .scope(async {
+                tool.call(r#"{"thoughts":["remember this"]}"#)
+                    .await
+                    .expect_err("a request with no principal must not store memories")
+            })
+            .await;
+        assert_eq!(
+            err.to_string(),
+            "Failed to call tool 'store_memory': the tool can change data or act outside Spice, and the request has no credentials. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth"
+        );
+        assert_eq!(
+            engine.write_calls(),
+            0,
+            "no principal must not reach write_data"
         );
     }
 
@@ -435,27 +459,37 @@ mod tests {
             event: &tracing::Event<'_>,
             ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if event.metadata().target() != "task_history"
-                || *event.metadata().level() != tracing::Level::ERROR
-            {
+            if event.metadata().target() != "task_history" {
                 return;
             }
-            let mut message = String::new();
-            event.record(&mut MessageVisitor(&mut message));
             let span = ctx.event_span(event).map(|span| span.name().to_string());
-            self.0
-                .lock()
-                .expect("task_history errors lock")
-                .push((span, message));
+            if *event.metadata().level() == tracing::Level::ERROR {
+                let mut message = String::new();
+                event.record(&mut FieldVisitor("message", &mut message));
+                self.0
+                    .lock()
+                    .expect("task_history errors lock")
+                    .push((span, message));
+                return;
+            }
+            // The task a span is recorded under, when it overrides the span's name.
+            let mut task = String::new();
+            event.record(&mut FieldVisitor("task_override", &mut task));
+            if !task.is_empty() {
+                self.0
+                    .lock()
+                    .expect("task_history errors lock")
+                    .push((span, format!("task_override={task}")));
+            }
         }
     }
 
-    struct MessageVisitor<'a>(&'a mut String);
+    struct FieldVisitor<'a>(&'static str, &'a mut String);
 
-    impl tracing::field::Visit for MessageVisitor<'_> {
+    impl tracing::field::Visit for FieldVisitor<'_> {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                *self.0 = format!("{value:?}");
+            if field.name() == self.0 {
+                *self.1 = format!("{value:?}");
             }
         }
     }
@@ -478,8 +512,15 @@ mod tests {
             .await;
         assert_eq!(
             errors.recorded(),
-            vec![(Some("tool_use::store_memory".to_string()), err.to_string())],
-            "a refused write must be recorded as an error on its task_history span"
+            vec![
+                (
+                    Some("tool_use".to_string()),
+                    "task_override=tool_use::store_memory".to_string()
+                ),
+                (Some("tool_use".to_string()), err.to_string()),
+            ],
+            "a refused write must be recorded as an error of the `tool_use::store_memory` task"
         );
+        assert_eq!(engine.write_calls(), 0);
     }
 }

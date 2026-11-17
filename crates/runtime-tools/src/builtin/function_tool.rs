@@ -44,11 +44,9 @@ use datafusion::common::utils::quote_identifier;
 use futures::TryStreamExt;
 use serde_json::{Map, Value};
 use spicepod::component::function::{Function, FunctionArg, FunctionKind};
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess, caller_can_write};
 
-use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
-use runtime_request_context::{AsyncMarker, RequestContext};
 
 /// Build a [`FunctionAsTool`] from a user-declared [`Function`]. Fails
 /// when the function's signature references Arrow types the tool bridge
@@ -154,7 +152,13 @@ impl SpiceModelTool for FunctionAsTool {
         Some(build_parameters_schema(&self.args))
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Runs the function in a `SELECT`, read-only unless the caller may write, so a caller without
+    /// write access is refused the functions that run code or call out, as in its own SQL.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let req: Value = serde_json::from_str(arg)?;
         let obj = req.as_object().ok_or_else(|| {
             Box::<dyn std::error::Error + Send + Sync>::from("expected a JSON object of arguments")
@@ -179,10 +183,10 @@ impl SpiceModelTool for FunctionAsTool {
             )
         })?;
 
+        // Read-only unless the caller may write, as the `sql` tool runs: with no principal (no
+        // `runtime.auth`) too, so a function that runs code or calls out needs write access.
         let batches = df
-            .execute_query(
-                QueryRequest::new(&sql).read_only(current_principal_requires_read_only().await),
-            )
+            .execute_query(QueryRequest::new(&sql).read_only(!caller_can_write().await))
             .await
             .map_err(|e| {
                 Box::<dyn std::error::Error + Send + Sync>::from(format!("query failed: {e}"))
@@ -192,26 +196,6 @@ impl SpiceModelTool for FunctionAsTool {
 
         extract_single_cell_as_json(&batches)
     }
-}
-
-pub(crate) async fn current_principal_requires_read_only() -> bool {
-    let context = RequestContext::current(AsyncMarker::new().await);
-    AuthRequestContext::auth_principal(context.as_ref())
-        .is_some_and(|principal| !principal_has_write_access(principal))
-}
-
-/// Whether the request is authenticated as a principal with write access. A request with no
-/// principal does not have it.
-pub(crate) async fn current_principal_allows_write() -> bool {
-    let context = RequestContext::current(AsyncMarker::new().await);
-    AuthRequestContext::auth_principal(context.as_ref()).is_some_and(principal_has_write_access)
-}
-
-fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
-    principal
-        .groups()
-        .iter()
-        .any(|group| *group == "write" || *group == "read_write")
 }
 
 fn function_call_sql(function_name: &str, literals: &[String]) -> String {

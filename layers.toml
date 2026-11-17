@@ -233,8 +233,7 @@ connector-postgres-common = "shared-utility"
 # --- foundation: near-dependency-free utilities + config/platform primitives.
 # (crates/ libraries whose full normal-dep closure stays within foundation.)
 ansi_colors = "foundation"
-arrow_tools = "foundation"
-aws-identity = "foundation"
+arrow_aws-identity = "foundation"
 aws-kms-signer = "foundation"
 azure-credential = "foundation"
 azure-key-vault-signer = "foundation"
@@ -307,6 +306,9 @@ runtime-metrics = "foundation"
 # shared-utility, not foundation: `state` resolves the state store's params through
 # runtime-parameters and runtime-secrets (both shared-utility).
 runtime-object-store = "shared-utility"
+# shared-utility, not foundation: `SpiceModelTool::call` decides who may call a tool from
+# the request's principal, read through runtime-auth and runtime-request-context.
+tools = "shared-utility"
 runtime-otel-push = "foundation"
 runtime-parameter-spec = "foundation"
 runtime-parameters-typed = "foundation"
@@ -331,7 +333,6 @@ system-open = "foundation"
 tantivy_datafusion_filter = "foundation"
 telemetry = "foundation"
 token_provider = "foundation"
-tools = "foundation"
 write-retry = "foundation"
 util = "foundation"
 vortex-datafusion = "foundation"

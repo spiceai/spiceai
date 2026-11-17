@@ -228,13 +228,9 @@ impl AsyncScalarUDFImpl for ToolAsScalarUdf {
         &self,
         args: ScalarFunctionArgs,
     ) -> std::result::Result<ColumnarValue, DataFusionError> {
-        if crate::http::v1::current_principal_requires_read_only().await {
-            return Err(DataFusionError::Execution(format!(
-                "tool-backed function '{}' requires a read-write API key",
-                self.name
-            )));
-        }
-
+        // Who may call the tool is decided by `call` for each row, as on every other path
+        // that runs a tool. A read-only principal is refused every tool-backed function
+        // earlier, when its read-only query is planned.
         if args.args.len() != self.arg_names.len() {
             return Err(DataFusionError::Execution(format!(
                 "tool-backed function '{}' expected {} args, got {}",
@@ -318,12 +314,123 @@ mod tests {
             None
         }
 
-        async fn call(
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(
             &self,
             _: &str,
         ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Value::Null)
         }
+    }
+
+    /// A read-write tool exposed as a SQL function, counting the calls that reach it.
+    struct WriteTool {
+        runs: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for WriteTool {
+        fn name(&self) -> std::borrow::Cow<'_, str> {
+            "send_alert".into()
+        }
+
+        fn description(&self) -> Option<std::borrow::Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadWrite
+        }
+
+        async fn run(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(Value::from(1))
+        }
+    }
+
+    fn write_tool_udf(tool: &Arc<WriteTool>) -> ToolAsScalarUdf {
+        ToolAsScalarUdf {
+            id: 0,
+            name: "send_alert".to_string(),
+            signature: Signature::exact(vec![DataType::Int64], DfVolatility::Volatile),
+            return_type: DataType::Int64,
+            arg_names: vec!["x".to_string()],
+            arg_types: vec![DataType::Int64],
+            tool: Arc::clone(tool) as Arc<dyn SpiceModelTool>,
+        }
+    }
+
+    fn one_row() -> ScalarFunctionArgs {
+        ScalarFunctionArgs {
+            args: vec![ColumnarValue::Scalar(
+                datafusion::common::ScalarValue::Int64(Some(7)),
+            )],
+            arg_fields: vec![],
+            number_rows: 1,
+            return_field: Arc::new(datafusion::arrow::datatypes::Field::new(
+                "send_alert",
+                DataType::Int64,
+                true,
+            )),
+            config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+        }
+    }
+
+    /// A tool exposed as a SQL function is held to the tool's access like every other path
+    /// that runs it: with no principal (a runtime without `runtime.auth`) a read-write tool is
+    /// refused before it runs, and a principal with write access may call it.
+    #[tokio::test]
+    async fn tool_function_is_held_to_the_tool_access() {
+        use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+        use runtime_request_context::{Protocol, RequestContext};
+        use spicepod::component::runtime::ApiKey;
+
+        let tool = Arc::new(WriteTool {
+            runs: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let udf = write_tool_udf(&tool);
+
+        let error = udf
+            .invoke_async_with_args(one_row())
+            .await
+            .expect_err("a request with no principal is refused a read-write tool");
+        assert_eq!(
+            error.to_string(),
+            "Execution error: tool-backed function 'send_alert' call failed: Failed to call tool 'send_alert': the tool can change data or act outside Spice, and the request has no credentials. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth"
+        );
+        assert_eq!(tool.runs.load(Ordering::SeqCst), 0, "the tool must not run");
+
+        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+        let principal: AuthPrincipalRef = Arc::new(ApiKey::parse_str("writer:rw"));
+        context
+            .set_auth_principal(principal)
+            .expect("a new request has no principal yet");
+        let result = context
+            .scope(udf.invoke_async_with_args(one_row()))
+            .await
+            .expect("a read-write key may call it");
+        let ColumnarValue::Array(values) = result else {
+            panic!("expected an array, got {result:?}");
+        };
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("int64 result")
+                .values(),
+            &[1]
+        );
+        assert_eq!(tool.runs.load(Ordering::SeqCst), 1);
     }
 
     #[test]

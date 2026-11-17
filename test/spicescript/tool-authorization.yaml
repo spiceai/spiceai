@@ -1,0 +1,366 @@
+name: tool-authorization
+description: >
+  Who may call a tool is decided the same way on every path that runs one. A
+  read-write tool (`store_memory`, or any tool of an MCP server) needs a
+  principal with write access: a read-only API key is refused one through
+  `POST /v1/tools/{name}`, MCP `tools/call` (whose MCP tools are passed through
+  to their server), and a model's tool use from chat completions, and a
+  runtime without `runtime.auth` refuses one to anonymous chat completions and
+  `ai()`. A refusal names the tool and how to get write access, is recorded in
+  `runtime.task_history`, and comes before the tool runs: the MCP server never
+  sees the call and no memory is written. Read-only tools stay available to
+  every caller, and a read-write key may call every tool. A mock model asks for
+  each tool call; a stdio MCP server reports every call it receives to a mock
+  HTTP endpoint.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: tool-authorization
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: ['writer-key:rw', 'reader-key:ro']
+  datasets:
+    - from: memory:store
+      name: llm_memory
+      access: read_write
+  tools:
+    # An MCP server with one tool, `send_alert`, that POSTs its arguments to the mock's `/alert`,
+    # so the mock counts the calls that reached the server.
+    - name: probe
+      from: mcp:python3
+      params:
+        mcp_args: |-
+          -u -c '
+          import json, sys, urllib.request
+          for line in sys.stdin:
+              message = json.loads(line)
+              if "id" not in message:
+                  continue
+              method = message.get("method")
+              if method == "initialize":
+                  result = {"protocolVersion": message["params"]["protocolVersion"], "capabilities": {"tools": {}}, "serverInfo": {"name": "probe", "version": "1"}}
+              elif method == "tools/list":
+                  result = {"tools": [{"name": "send_alert", "description": "Send an alert to the on-call channel.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}]}
+              elif method == "tools/call":
+                  body = json.dumps(message["params"].get("arguments") or {}).encode()
+                  try:
+                      urllib.request.urlopen(urllib.request.Request(sys.argv[1], data=body, method="POST"), timeout=10)
+                  except Exception:
+                      pass
+                  result = {"content": [{"type": "text", "text": "sent"}], "isError": False}
+              elif method == "ping":
+                  result = {}
+              else:
+                  print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "Method not found"}}), flush=True)
+                  continue
+              print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+          ' ${sources.api.url}/alert
+  models:
+    - name: m
+      from: openai:gpt-4o-mini
+      params:
+        endpoint: ${sources.api.url}/v1
+        openai_api_key: test
+        tools: memory, probe
+
+defaults:
+  api-key: writer-key
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /alert, method: POST, body: ok }"
+        # The answer the model gives once it has the result of a tool call.
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"id":"done","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+  - start: {}
+
+  # --- A read-only API key ---------------------------------------------------------------------
+
+  # `POST /v1/tools/{name}`: refused with 403, before the tool runs.
+  - http: { method: POST, path: /v1/tools/probe__send_alert, api-key: reader-key, headers: { content-type: application/json }, body: '{"text": "direct"}' }
+    expect:
+      status: 403
+      json:
+        - { pointer: /message, equals: "Failed to call tool 'probe__send_alert': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth" }
+  - http: { method: POST, path: /v1/tools/store_memory, api-key: reader-key, headers: { content-type: application/json }, body: '{"thoughts": ["direct"]}' }
+    expect:
+      status: 403
+      json:
+        - { pointer: /message, equals: "Failed to call tool 'store_memory': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth" }
+
+  # MCP `tools/call` passes an MCP tool through to its server: refused in the result, unsent.
+  - http:
+      method: POST
+      path: /v1/mcp
+      api-key: reader-key
+      headers:
+        content-type: application/json
+        accept: application/json, text/event-stream
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/call
+        mcp-name: probe__send_alert
+      body: '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe__send_alert","arguments":{"text":"mcp"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"spicescript","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+    expect:
+      status: 200
+      body-contains: "Failed to call tool 'probe__send_alert': the tool can change data or act outside Spice, and the credentials on this request do not allow write access."
+
+  # A model's tool use: the model asks for the call, and gets the refusal as the tool's result.
+  - source-exec:
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"alert","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_alert","type":"function","function":{"name":"probe__send_alert","arguments":"{\"text\":\"chat\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+  - http: { method: POST, path: /v1/chat/completions, api-key: reader-key, headers: { content-type: application/json }, body: '{"model": "m", "messages": [{"role": "user", "content": "Alert the on-call channel."}]}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, equals: done }
+  - source-exec:
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"remember","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_remember","type":"function","function":{"name":"store_memory","arguments":"{\"thoughts\":[\"chat by reader\"]}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+  - http: { method: POST, path: /v1/chat/completions, api-key: reader-key, headers: { content-type: application/json }, body: '{"model": "m", "messages": [{"role": "user", "content": "Remember this."}]}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, equals: done }
+
+  # A read-only tool stays available to it.
+  - http: { method: POST, path: /v1/tools/load_memory, api-key: reader-key, headers: { content-type: application/json }, body: '{"last": "1h"}' }
+    expect: { status: 200 }
+
+  # None of those calls reached the MCP server or wrote a memory, and each refusal is recorded.
+  - source-query: { api: count /alert }
+    expect: { rows: [['0']] }
+  - query: SELECT count(*) AS n FROM llm_memory
+    expect: { rows: [['0']] }
+  - query: >-
+      SELECT task, count(*) AS n FROM runtime.task_history
+      WHERE error_message LIKE 'Failed to call tool % the credentials on this request do not allow write access.%'
+      GROUP BY task ORDER BY task
+    expect: { rows: [['tool_use::probe__send_alert', '3'], ['tool_use::store_memory', '2']] }
+    eventually: 30s
+
+  # --- A read-write API key: every tool -------------------------------------------------------
+
+  - http: { method: POST, path: /v1/tools/probe__send_alert, headers: { content-type: application/json }, body: '{"text": "direct"}' }
+    expect: { status: 200, body-contains: sent }
+  - http:
+      method: POST
+      path: /v1/mcp
+      headers:
+        content-type: application/json
+        accept: application/json, text/event-stream
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/call
+        mcp-name: probe__send_alert
+      body: '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"probe__send_alert","arguments":{"text":"mcp"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"spicescript","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+    expect: { status: 200, body-contains: sent, body-lacks: Failed to call tool }
+  - source-exec:
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"remember","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_remember","type":"function","function":{"name":"store_memory","arguments":"{\"thoughts\":[\"chat by writer\"]}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+  - http: { method: POST, path: /v1/chat/completions, headers: { content-type: application/json }, body: '{"model": "m", "messages": [{"role": "user", "content": "Remember this."}]}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, equals: done }
+  # `ai()` runs the model's tool use as the key on the SQL request.
+  - source-exec:
+      api:
+        - |+
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: text/event-stream }
+          body: |+
+            data: {"id":"done","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"done"},"finish_reason":null}]}
+
+            data: {"id":"done","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+            data: [DONE]
+
+        - |+
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: text/event-stream }
+          body: |+
+            data: {"id":"remember","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_remember","type":"function","function":{"name":"store_memory","arguments":"{\"thoughts\":[\"ai by writer\"]}"}}]},"finish_reason":null}]}
+
+            data: {"id":"remember","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+            data: [DONE]
+
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: "SELECT ai('Remember this.', 'm') AS answer" }
+    expect:
+      status: 200
+      json:
+        - { pointer: /0/answer, equals: done }
+  - source-query: { api: count /alert }
+    expect: { rows: [['2']] }
+  - query: SELECT value FROM llm_memory ORDER BY value
+    expect: { rows: [['ai by writer'], ['chat by writer']] }
+
+  # --- No `runtime.auth`: anonymous callers ---------------------------------------------------
+
+  - restart: { patch: { spicepod: { runtime: { auth: null } } } }
+  - source-exec: { api: reset }
+  - source-exec:
+      api:
+        - "{ path: /alert, method: POST, body: ok }"
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"id":"done","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+
+  # The tool routes still refuse anonymous callers outright.
+  - http: { method: POST, path: /v1/tools/store_memory, api-key: none, headers: { content-type: application/json }, body: '{"thoughts": ["direct"]}' }
+    expect: { status: 401 }
+
+  # A model's tool use, from chat completions and from `ai()`, is refused the read-write tools.
+  - source-exec:
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"alert","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_alert","type":"function","function":{"name":"probe__send_alert","arguments":"{\"text\":\"anonymous chat\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+  - http: { method: POST, path: /v1/chat/completions, api-key: none, headers: { content-type: application/json }, body: '{"model": "m", "messages": [{"role": "user", "content": "Alert the on-call channel."}]}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, equals: done }
+  - source-exec:
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"remember","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_remember","type":"function","function":{"name":"store_memory","arguments":"{\"thoughts\":[\"anonymous chat\"]}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+  - http: { method: POST, path: /v1/chat/completions, api-key: none, headers: { content-type: application/json }, body: '{"model": "m", "messages": [{"role": "user", "content": "Remember this."}]}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, equals: done }
+  # `ai()` streams: the model streams its tool call, then its answer.
+  - source-exec:
+      api:
+        - |+
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: text/event-stream }
+          body: |+
+            data: {"id":"done","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"done"},"finish_reason":null}]}
+
+            data: {"id":"done","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+            data: [DONE]
+
+        - |+
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: text/event-stream }
+          body: |+
+            data: {"id":"remember","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_remember","type":"function","function":{"name":"store_memory","arguments":"{\"thoughts\":[\"anonymous ai\"]}"}}]},"finish_reason":null}]}
+
+            data: {"id":"remember","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+            data: [DONE]
+
+  - http: { method: POST, path: /v1/sql, api-key: none, headers: { content-type: text/plain }, body: "SELECT ai('Remember this.', 'm') AS answer" }
+    expect:
+      status: 200
+      json:
+        - { pointer: /0/answer, equals: done }
+
+  # A read-only tool stays available to an anonymous caller.
+  - source-exec:
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"recall","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_recall","type":"function","function":{"name":"load_memory","arguments":"{\"last\":\"2h\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+  - http: { method: POST, path: /v1/chat/completions, api-key: none, headers: { content-type: application/json }, body: '{"model": "m", "messages": [{"role": "user", "content": "What do you remember?"}]}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, equals: done }
+  - query: >-
+      SELECT count(*) AS n FROM runtime.task_history
+      WHERE task = 'tool_use::load_memory' AND input = '{"last":"2h"}' AND error_message IS NULL
+    api-key: none
+    expect: { rows: [['1']] }
+    eventually: 30s
+
+  - source-query: { api: count /alert }
+    expect: { rows: [['0']] }
+  - query: SELECT count(*) AS n FROM llm_memory
+    api-key: none
+    expect: { rows: [['0']] }
+  - query: >-
+      SELECT task, count(*) AS n FROM runtime.task_history
+      WHERE error_message LIKE 'Failed to call tool % the request has no credentials.%'
+      GROUP BY task ORDER BY task
+    api-key: none
+    expect: { rows: [['tool_use::probe__send_alert', '1'], ['tool_use::store_memory', '2']] }
+    eventually: 30s
+
+  # --- A worker's scheduled prompt runs for the operator --------------------------------------
+
+  # The prompt is the operator's own, so its model may call the read-write tools the operator gave
+  # it, though no caller (and no `runtime.auth`) is involved.
+  - restart:
+      patch:
+        spicepod:
+          workers:
+            - name: reminder
+              cron: '*/2 * * * * *'
+              params: { prompt: Remember the alert state. }
+              load_balance: { routing: [{ from: m }] }
+  - source-exec: { api: reset }
+  - source-exec:
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"id":"done","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"remember","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_remember","type":"function","function":{"name":"store_memory","arguments":"{\"thoughts\":[\"scheduled\"]}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+  - query: SELECT value FROM llm_memory
+    api-key: none
+    expect: { rows: [['scheduled']] }
+    eventually: 30s
