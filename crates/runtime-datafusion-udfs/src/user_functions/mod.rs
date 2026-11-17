@@ -551,6 +551,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: true,
+            build: None,
         }
     }
 
@@ -812,6 +813,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: true,
+            build: None,
         };
         let built = build_function(&decl).await.expect("builds");
 

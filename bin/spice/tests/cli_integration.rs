@@ -1005,6 +1005,56 @@ mod add {
         );
     }
 
+    /// `spice add` names a host program the added Spicepod declares, and how to
+    /// trust it. Re-adding a dependency already listed in the mapping form adds
+    /// no second entry, and a trusted one gets no note.
+    #[test]
+    fn test_add_names_a_host_program_and_keeps_a_trusted_mapping_entry() {
+        let temp_dir = TempDir::new().expect("create the project");
+        fs::write(
+            temp_dir.path().join("spicepod.yaml"),
+            "version: v2\nkind: Spicepod\nname: app\n",
+        )
+        .expect("write spicepod.yaml");
+        let pod = temp_dir.path().join("localpod");
+        fs::create_dir_all(&pod).expect("create the pod");
+        fs::write(
+            pod.join("spicepod.yaml"),
+            "version: v2\nkind: Spicepod\nname: localpod\ntools:\n  - name: fetch\n    from: mcp:docker\n",
+        )
+        .expect("write the pod");
+
+        let output = spice_cmd()
+            .current_dir(temp_dir.path())
+            .arg("add")
+            .arg(&pod)
+            .output()
+            .expect("run spice add");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("Note: 'spicepods/localpod' declares tool 'fetch', which starts the program 'docker' on this host. It is not loaded until you trust this dependency: replace `- spicepods/localpod` under `dependencies:` with `- { from: spicepods/localpod, trust: full }`."),
+            "{stdout}"
+        );
+
+        let trusted = "version: v2\nkind: Spicepod\nname: app\ndependencies:\n  - from: spicepods/localpod\n    trust: full\n";
+        fs::write(temp_dir.path().join("spicepod.yaml"), trusted).expect("trust the dependency");
+        let output = spice_cmd()
+            .current_dir(temp_dir.path())
+            .arg("add")
+            .arg(&pod)
+            .output()
+            .expect("run spice add again");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(!stdout.contains("Note:"), "a trusted dependency gets no note: {stdout}");
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("spicepod.yaml")).expect("read spicepod.yaml"),
+            trusted,
+            "the mapping entry is recognized, not duplicated"
+        );
+    }
+
     /// What the stub registry answers a pod request with.
     enum RegistryReply {
         /// A complete archive, with its `Content-Length`.

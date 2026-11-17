@@ -39,9 +39,11 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod acceleration;
 pub mod component;
+pub mod dependency;
 pub mod drasi;
 pub mod extension;
 pub mod fts;
+pub mod host_program;
 mod keywords;
 mod metadata;
 pub mod metric;
@@ -174,7 +176,7 @@ pub struct Spicepod {
 
     pub models: Vec<Model>,
 
-    pub dependencies: Vec<String>,
+    pub dependencies: Vec<dependency::Dependency>,
 
     pub embeddings: Vec<Embeddings>,
 

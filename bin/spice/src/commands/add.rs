@@ -117,7 +117,68 @@ pub async fn execute_add_or_connect(
 
     println!("added {relative_path}");
 
+    // Name anything the new Spicepod would run on the host, which a dependency
+    // may do only once `spicepod.yaml` trusts it.
+    if !trusted_in_manifest(&spicepod, &dependency_path)
+        && let Ok(added) = spicepod::Spicepod::load(&download_path).await
+    {
+        for note in host_program_notes(&dependency_path, &added) {
+            println!("{note}");
+        }
+    }
+
     Ok(())
+}
+
+/// Whether `spicepod.yaml` already lists `dependency` with `trust: full`.
+fn trusted_in_manifest(manifest: &yaml::Value, dependency: &str) -> bool {
+    manifest
+        .get("dependencies")
+        .and_then(yaml::Value::as_sequence)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("from").and_then(yaml::Value::as_str) == Some(dependency)
+                    && entry.get("trust").and_then(yaml::Value::as_str) == Some("full")
+            })
+        })
+}
+
+/// One note for each component in `added` that runs a program on the host,
+/// with the line that trusts the dependency.
+fn host_program_notes(dependency: &str, added: &spicepod::Spicepod) -> Vec<String> {
+    use spicepod::host_program::{ComponentRef, HostProgram, host_program};
+
+    let components = added
+        .tools
+        .iter()
+        .map(ComponentRef::Tool)
+        .chain(added.datasets.iter().map(ComponentRef::Dataset))
+        .chain(added.catalogs.iter().map(ComponentRef::Catalog))
+        .chain(added.functions.iter().map(ComponentRef::Function));
+    components
+        .filter_map(|component| {
+            let program = host_program(component)?;
+            let kind = component.kind();
+            let name = component.name();
+            let (what, until) = match &program {
+                HostProgram::Program(program) => (
+                    format!("which starts the program '{program}' on this host"),
+                    "loaded",
+                ),
+                HostProgram::NativeLibrary(library) => (
+                    format!("which loads the native library '{library}' on this host"),
+                    "loaded",
+                ),
+                HostProgram::BuildCommand(_) => (
+                    "whose `build:` command runs a program on this host".to_string(),
+                    "built",
+                ),
+            };
+            Some(format!(
+                "Note: '{dependency}' declares {kind} '{name}', {what}. It is not {until} until you trust this dependency: replace `- {dependency}` under `dependencies:` with `- {{ from: {dependency}, trust: full }}`."
+            ))
+        })
+        .collect()
 }
 
 /// Classify a registry failure so the user is told whose fault it is.
