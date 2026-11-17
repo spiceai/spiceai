@@ -651,6 +651,9 @@ async fn the_spicepod_system_prompt_and_defaults_reach_anthropic() {
     );
 }
 
+/// What `list_datasets` returns when the runtime has no datasets.
+const EMPTY_DATASET_PAGE: &str = r#"{"datasets":[],"total":0,"has_more":false}"#;
+
 #[tokio::test]
 async fn an_anthropic_model_runs_spice_tools_in_one_message() {
     let seen = Seen::default();
@@ -673,7 +676,7 @@ async fn an_anthropic_model_runs_spice_tools_in_one_message() {
         json!([
             {"type": "text", "text": "Checking."},
             {"type": "mcp_tool_use", "id": "toolu_ds", "name": "list_datasets", "input": {}, "server_name": "spice"},
-            {"type": "mcp_tool_result", "tool_use_id": "toolu_ds", "is_error": false, "content": [{"type": "text", "text": "[]"}]},
+            {"type": "mcp_tool_result", "tool_use_id": "toolu_ds", "is_error": false, "content": [{"type": "text", "text": EMPTY_DATASET_PAGE}]},
             {"type": "text", "text": "There are no datasets."},
         ])
     );
@@ -690,7 +693,7 @@ async fn an_anthropic_model_runs_spice_tools_in_one_message() {
     assert_eq!(rounds.len(), 2);
     assert_eq!(
         rounds[1].body["messages"][2],
-        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_ds", "content": [{"type": "text", "text": "[]"}]}]})
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_ds", "content": [{"type": "text", "text": EMPTY_DATASET_PAGE}]}]})
     );
 
     // Streamed, the client builds the same message from the events.
@@ -1168,7 +1171,7 @@ async fn a_chat_model_runs_spice_tools_in_one_message() {
         (
             &json!([
                 {"type": "mcp_tool_use", "id": "call_ds", "name": "list_datasets", "input": {}, "server_name": "spice"},
-                {"type": "mcp_tool_result", "tool_use_id": "call_ds", "is_error": false, "content": [{"type": "text", "text": "[]"}]},
+                {"type": "mcp_tool_result", "tool_use_id": "call_ds", "is_error": false, "content": [{"type": "text", "text": EMPTY_DATASET_PAGE}]},
                 {"type": "text", "text": "pong"},
             ]),
             &json!("end_turn")

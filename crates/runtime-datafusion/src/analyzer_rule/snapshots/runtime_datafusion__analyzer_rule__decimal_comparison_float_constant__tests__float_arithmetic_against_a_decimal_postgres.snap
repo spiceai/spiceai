@@ -1,0 +1,5 @@
+---
+source: crates/runtime-datafusion/src/analyzer_rule/decimal_comparison_float_constant.rs
+expression: postgres
+---
+SELECT * FROM "m" WHERE ("m"."disc" BETWEEN 0.050000000000000 AND 0.070000000000000)
