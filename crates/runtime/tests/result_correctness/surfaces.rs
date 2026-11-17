@@ -23,6 +23,10 @@ limitations under the License.
 //! table, and the answer crosses the HTTP JSON and Flight encoders on its way back. The
 //! source files are deleted once the acceleration is loaded, so a query that read the
 //! source instead of the acceleration fails rather than passing on the source's rows.
+//!
+//! A `partition_by: [bucket(4, id)]` Cayenne acceleration runs the same queries, so a
+//! union of partitions, and a filter on `id` pruned to one partition, answer the same as
+//! one unpartitioned table in the oracles.
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -65,9 +69,37 @@ impl Storage {
     }
 }
 
+/// How an acceleration lays its rows out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    Unpartitioned,
+    /// `partition_by: [bucket(4, id)]` on both tables, so every query reads a union of
+    /// partitions, and a filter on `id` can prune all but one.
+    BucketById,
+}
+
+impl Layout {
+    /// The number of partitions `BucketById` splits a table into.
+    const BUCKETS: usize = 4;
+
+    fn label(self) -> &'static str {
+        match self {
+            Layout::Unpartitioned => "unpartitioned",
+            Layout::BucketById => "bucket(4, id)",
+        }
+    }
+
+    fn spicepod_lines(self) -> &'static str {
+        match self {
+            Layout::Unpartitioned => "",
+            Layout::BucketById => "      partition_by:\n        - bucket(4, id)\n",
+        }
+    }
+}
+
 /// A Spicepod accelerating `t` and `d` from parquet files in `dir` with `engine`, keeping
-/// the rows in `storage`.
-fn spicepod(engine: &str, storage: Storage, dir: &std::path::Path) -> String {
+/// the rows in `storage`, laid out as `layout`.
+fn spicepod(engine: &str, storage: Storage, layout: Layout, dir: &std::path::Path) -> String {
     let mut datasets = String::new();
     for name in ["t", "d"] {
         // A file-mode Cayenne acceleration keeps its data and metastore under `dir`, and one
@@ -84,14 +116,20 @@ fn spicepod(engine: &str, storage: Storage, dir: &std::path::Path) -> String {
         };
         write!(
             datasets,
-            "  - from: file://{path}\n    name: {name}\n    acceleration:\n      enabled: true\n      engine: {engine}\n      refresh_mode: full\n{storage}",
+            "  - from: file://{path}\n    name: {name}\n    acceleration:\n      enabled: true\n      engine: {engine}\n      refresh_mode: full\n{storage}{layout}",
             path = dir.join(format!("{name}.parquet")).display(),
+            layout = layout.spicepod_lines(),
         )
         .expect("writing to a String cannot fail");
     }
     format!(
-        "version: v1\nkind: Spicepod\nname: surfaces_{engine}_{mode}\ndatasets:\n{datasets}",
-        mode = storage.label()
+        "version: v1\nkind: Spicepod\nname: surfaces_{engine}_{mode}{partitioned}\ndatasets:\n{datasets}",
+        mode = storage.label(),
+        partitioned = if layout == Layout::Unpartitioned {
+            ""
+        } else {
+            "_partitioned"
+        },
     )
 }
 
@@ -167,8 +205,11 @@ fn row_count(batches: &[RecordBatch]) -> usize {
 /// Loads `engine` in `storage` from a Spicepod, deletes the source files, starts the HTTP
 /// and Flight servers, and compares every micro query on every client with both standalone
 /// oracles.
-async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
-    let subject = format!("{engine}[{}]", storage.label());
+async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage, layout: Layout) {
+    let subject = match layout {
+        Layout::Unpartitioned => format!("{engine}[{}]", storage.label()),
+        Layout::BucketById => format!("{engine}[{}, {}]", storage.label(), layout.label()),
+    };
     let tables = [("t", make_fact(FACT_ROWS, 64)), ("d", make_dim(DIM_ROWS))];
     let dir = tempfile::tempdir().expect("temp dir");
     for (name, batch) in &tables {
@@ -176,7 +217,7 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
     }
     std::fs::write(
         dir.path().join("spicepod.yaml"),
-        spicepod(engine, storage, dir.path()),
+        spicepod(engine, storage, layout, dir.path()),
     )
     .expect("the spicepod must be written");
 
@@ -231,6 +272,9 @@ async fn surfaces_match_standalone_oracles(engine: &str, storage: Storage) {
 
     if engine == "cayenne" {
         assert_cayenne_storage(&rt, storage).await;
+    }
+    if layout == Layout::BucketById {
+        assert_bucket_partitions(&rt).await;
     }
 
     let mut fails = Vec::new();
@@ -321,28 +365,60 @@ async fn assert_cayenne_storage(rt: &Arc<Runtime>, storage: Storage) {
     );
 }
 
-async fn run(engine: &'static str, storage: Storage) {
+/// Fails unless the acceleration of `t` is split into `Layout::BUCKETS` partitions that a
+/// full scan reads as a union, and a filter on `id` prunes to one, so the micro queries
+/// below ran on the partitioned path rather than on one unpartitioned table.
+async fn assert_bucket_partitions(rt: &Arc<Runtime>) {
+    for (sql, scans) in [
+        ("EXPLAIN SELECT SUM(value) FROM t", Layout::BUCKETS),
+        ("EXPLAIN SELECT id, name, value FROM t WHERE id = 42", 1),
+    ] {
+        let plan = run_query(rt, sql).await.expect("EXPLAIN must succeed");
+        let plan = arrow::util::pretty::pretty_format_batches(&plan)
+            .expect("the plan must format")
+            .to_string();
+        assert_eq!(
+            plan.matches("CayenneAccelerationExec").count(),
+            scans,
+            "`{sql}` must scan {scans} of the {} `bucket(4, id)` partitions:\n{plan}",
+            Layout::BUCKETS,
+        );
+        if scans > 1 {
+            assert!(
+                plan.contains("PartitionedUnionExec"),
+                "`{sql}` must read the partitions as a union:\n{plan}"
+            );
+        }
+    }
+}
+
+async fn run(engine: &'static str, storage: Storage, layout: Layout) {
     test_request_context()
-        .scope(surfaces_match_standalone_oracles(engine, storage))
+        .scope(surfaces_match_standalone_oracles(engine, storage, layout))
         .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn arrow_surfaces_vs_standalone_engines() {
-    run("arrow", Storage::Memory).await;
+    run("arrow", Storage::Memory, Layout::Unpartitioned).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_surfaces_vs_standalone_engines() {
-    run("sqlite", Storage::Memory).await;
+    run("sqlite", Storage::Memory, Layout::Unpartitioned).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_surfaces_vs_standalone_engines() {
-    run("cayenne", Storage::File).await;
+    run("cayenne", Storage::File, Layout::Unpartitioned).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_memory_surfaces_vs_standalone_engines() {
-    run("cayenne", Storage::Memory).await;
+    run("cayenne", Storage::Memory, Layout::Unpartitioned).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cayenne_bucket_partitioned_surfaces_vs_standalone_engines() {
+    run("cayenne", Storage::File, Layout::BucketById).await;
 }
