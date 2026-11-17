@@ -5,7 +5,7 @@ runs:
   steps:
     - name: Configure apt mirrors (Linux)
       if: runner.os == 'Linux'
-      uses: ./.github/actions/configure-apt
+      uses: $/.github/actions/configure-apt
 
     - name: Install Oracle Instant Client
       if: runner.os == 'Linux'

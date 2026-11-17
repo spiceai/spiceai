@@ -6,7 +6,7 @@ runs:
   steps:
     - name: Configure apt mirrors (Linux)
       if: runner.os == 'Linux'
-      uses: ./.github/actions/configure-apt
+      uses: $/.github/actions/configure-apt
 
     - name: Install Databricks ODBC driver
       if: runner.os == 'Linux'

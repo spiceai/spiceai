@@ -347,6 +347,12 @@ fn is_permanent_catalog_source(source: &(dyn std::error::Error + Send + Sync + '
     if let Some(err) = source.downcast_ref::<catalogconnector::Error>() {
         return err.is_configuration_error();
     }
+    // An unresolved `${ store:key }` in `params:` (see
+    // `runtime_secrets::try_get_params_with_secrets`) is permanent unless a
+    // store errored; retrying a key that is simply absent would loop forever.
+    if let Some(err) = source.downcast_ref::<runtime_secrets::UnresolvedSecretsError>() {
+        return !err.is_retriable();
+    }
     matches!(
         source.downcast_ref::<runtime_parameters::Error>(),
         Some(runtime_parameters::Error::InvalidConfigurationNoSource { .. })

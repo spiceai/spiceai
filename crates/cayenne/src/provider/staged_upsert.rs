@@ -189,6 +189,9 @@ impl CayenneStagedUpsert {
         // `apply_prepared_on_conflict_in_txn` — so re-enable just the in-memory
         // promotion, which `finish` performs via `publish_prepared_on_conflict_deletions`.
         publish.publish_as_protected_snapshot = true;
+        self.table
+            .record_new_protected_snapshot_files(&self.new_snapshot_id, publish.snapshot_sequence)
+            .await?;
         Ok(PreparedTxnCommit {
             table: self.table,
             new_snapshot_id: self.new_snapshot_id,
@@ -318,6 +321,11 @@ impl PreparedTxnCommit {
     #[must_use]
     pub fn table_id(&self) -> &str {
         self.table.table_id()
+    }
+
+    /// Whether the written table's data is in the object-native location.
+    pub(crate) fn data_in_object_native_location(&self) -> bool {
+        self.table.data_in_object_native_location()
     }
 
     /// The written table's provider — the multi-table orchestrator holds its
@@ -584,7 +592,7 @@ impl CayenneTableProvider {
 /// (S3) have no atomic "remove dir" and are left to the next successful
 /// snapshot-cleanup cycle, mirroring [`super::overwrite::PreparedOverwrite::rollback`].
 pub(super) async fn cleanup_orphan_snapshot_dir(table: &CayenneTableProvider, snapshot_id: &str) {
-    if table.table_path().starts_with("s3://") {
+    if table.data_in_store() {
         return;
     }
     let snapshot_dir = table.snapshot_dir_path_for(snapshot_id);

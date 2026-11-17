@@ -21,7 +21,7 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCalls, CompletionUsage, CreateChatCompletionResponse, FinishReason,
 };
 use chat_api::ApiErrorKind;
-use messages_api::types::{ContentBlock, Message, StopReason, Usage};
+use messages_api::types::{ContentBlock, Message, StopReason, ThinkingDisplay, Usage};
 use messages_api::{ErrorType, MessagesError};
 use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};
@@ -115,7 +115,8 @@ pub(crate) fn tool_input(model: &str, tool: &str, arguments: &str) -> Result<Val
     }
 }
 
-/// `response` as a Message. Its reasoning becomes a thinking block when `show_thinking`.
+/// `response` as a Message. Its reasoning becomes a thinking block as `thinking` asks: with the
+/// reasoning in it when shown, with its text left empty when omitted, and none when off.
 ///
 /// # Errors
 ///
@@ -123,7 +124,7 @@ pub(crate) fn tool_input(model: &str, tool: &str, arguments: &str) -> Result<Val
 /// are not a JSON object.
 pub fn message(
     response: CreateChatCompletionResponse,
-    show_thinking: bool,
+    thinking: ThinkingDisplay,
 ) -> Result<Message, MessagesError> {
     let CreateChatCompletionResponse {
         id,
@@ -140,14 +141,21 @@ pub fn message(
 
     let mut content = Vec::new();
     let response_message = choice.message;
-    if show_thinking
-        && let Some(reasoning) = response_message.reasoning_content
-        && !reasoning.is_empty()
+    if let Some(reasoning) = response_message
+        .reasoning_content
+        .filter(|reasoning| !reasoning.is_empty())
     {
-        content.push(ContentBlock::Thinking {
-            thinking: reasoning,
-            signature: String::new(),
-        });
+        match thinking {
+            ThinkingDisplay::Shown => content.push(ContentBlock::Thinking {
+                thinking: reasoning,
+                signature: String::new(),
+            }),
+            ThinkingDisplay::Omitted => content.push(ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            }),
+            ThinkingDisplay::Off => {}
+        }
     }
     if let Some(text) = response_message.content.filter(|text| !text.is_empty()) {
         content.push(ContentBlock::Text { text });

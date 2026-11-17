@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::builtin::function_tool::current_principal_allows_write;
-use crate::utils::{MAX_TOOL_RESULT_BYTES, parameters, stream_to_json_string};
+use crate::result::{current_budget, encode_stream, result_schema};
+use crate::utils::parameters;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
@@ -38,7 +40,7 @@ pub struct SqlToolParams {
 /// (e.g. the request is authenticated with a `:rw`-tagged API key); the
 /// strict read-only validator is still applied for `ReadOnly` / anonymous
 /// callers and for any deployment that hasn't configured `runtime.auth`.
-const DEFAULT_DESCRIPTION: &str = "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.";
+const DEFAULT_DESCRIPTION: &str = "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result as `{\"columns\": [...], \"rows\": [[...], ...]}`, at most 100 rows and a few thousand tokens. A result cut short has `truncated: true` and a `message`: never compute totals, counts, or averages from a truncated result; aggregate in SQL instead. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.";
 
 pub struct SqlTool {
     name: String,
@@ -79,6 +81,10 @@ impl SpiceModelTool for SqlTool {
         parameters::<SqlToolParams>()
     }
 
+    fn output_schema(&self) -> Option<Value> {
+        Some(result_schema())
+    }
+
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
@@ -89,16 +95,26 @@ impl SpiceModelTool for SqlTool {
             // to be writable (`access: read_write`).
             let read_only = !current_principal_allows_write().await;
 
-            let mut query_request = QueryRequest::new(&query).read_only(read_only);
+            // The query asks for one row more than the result shows, to know whether there are
+            // more: sources and operators stop there, and the query finishes instead of being
+            // cancelled when the result is cut short.
+            let budget = current_budget();
+            let mut query_request = QueryRequest::new(&query)
+                .read_only(read_only)
+                .fetch(budget.max_rows().saturating_add(1));
 
             if let Some(ref allowlist) = self.allowed_tables {
                 query_request = query_request.allow_tables(allowlist.clone());
             }
 
-            let stream = self.df.execute_query(query_request).await?;
-            Ok(Value::String(
-                stream_to_json_string(stream, MAX_TOOL_RESULT_BYTES).await?,
-            ))
+            let mut stream = self.df.execute_query(query_request).await?;
+            let rows = encode_stream(&mut stream, budget).await?;
+            // At most a row past the result is left, or a statement's own few rows, so reading
+            // them to the end is cheap and records the query as finished.
+            while let Some(batch) = stream.next().await {
+                batch?;
+            }
+            Ok(rows.into_value()?)
         }
         .instrument(span.clone())
         .await;

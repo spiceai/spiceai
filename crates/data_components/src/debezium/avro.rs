@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apache_avro::{Schema as AvroSchema, from_avro_datum, types::Value as AvroValue};
+use apache_avro::{Schema as AvroSchema, from_avro_datum, schema::Name, types::Value as AvroValue};
 use arrow::datatypes::SchemaRef;
 use parking_lot::Mutex;
 use snafu::prelude::*;
@@ -53,6 +53,11 @@ pub enum Error {
 
     #[snafu(display("Invalid Avro schema JSON: {source}"))]
     InvalidSchema { source: Box<apache_avro::Error> },
+
+    #[snafu(display(
+        "Invalid Avro schema: record '{name}' contains itself, directly or through other types. CDC ingest does not accept recursive Avro schemas; send a schema without self-referencing records"
+    ))]
+    RecursiveSchema { name: String },
 
     #[snafu(display("Failed to decode Avro datum: {source}"))]
     DecodeDatum { source: Box<apache_avro::Error> },
@@ -177,18 +182,58 @@ fn parse_explicit_schema(schema_json: &str) -> Result<Arc<AvroSchema>> {
     if let Some(schema) = EXPLICIT_SCHEMA_CACHE.lock().get(schema_json).cloned() {
         return Ok(schema);
     }
-    let schema =
-        Arc::new(
-            AvroSchema::parse_str(schema_json).map_err(|e| Error::InvalidSchema {
-                source: Box::new(e),
-            })?,
-        );
+    let schema = Arc::new(parse_schema(schema_json)?);
     let mut cache = EXPLICIT_SCHEMA_CACHE.lock();
     if cache.len() >= EXPLICIT_SCHEMA_CACHE_MAX {
         cache.clear();
     }
     cache.insert(schema_json.to_string(), Arc::clone(&schema));
     Ok(schema)
+}
+
+/// Parse an Avro schema for CDC ingest, rejecting recursive schemas. The Avro
+/// decoder recurses once per nested record with no depth limit, so with a
+/// recursive schema the request body would set the recursion depth.
+fn parse_schema(schema_json: &str) -> Result<AvroSchema> {
+    let schema = AvroSchema::parse_str(schema_json).map_err(|e| Error::InvalidSchema {
+        source: Box::new(e),
+    })?;
+    if let Some(name) = recursive_record_name(&schema) {
+        return RecursiveSchemaSnafu {
+            name: name.fullname(None),
+        }
+        .fail();
+    }
+    Ok(schema)
+}
+
+/// Returns the name of a record that refers to itself, directly or through
+/// other types. The parser resolves a reference to a record still being
+/// defined, by name or alias, to a `Schema::Ref` with that record's full name,
+/// so every cycle closes at a `Ref` that names an enclosing record.
+fn recursive_record_name(schema: &AvroSchema) -> Option<&Name> {
+    fn visit<'a>(schema: &'a AvroSchema, enclosing: &mut Vec<&'a Name>) -> Option<&'a Name> {
+        match schema {
+            AvroSchema::Ref { name } => enclosing.contains(&name).then_some(name),
+            AvroSchema::Record(record) => {
+                enclosing.push(&record.name);
+                let found = record
+                    .fields
+                    .iter()
+                    .find_map(|field| visit(&field.schema, enclosing));
+                enclosing.pop();
+                found
+            }
+            AvroSchema::Array(array) => visit(&array.items, enclosing),
+            AvroSchema::Map(map) => visit(&map.types, enclosing),
+            AvroSchema::Union(union) => union
+                .variants()
+                .iter()
+                .find_map(|variant| visit(variant, enclosing)),
+            _ => None,
+        }
+    }
+    visit(schema, &mut Vec::new())
 }
 
 fn is_confluent_wire_format(body: &[u8]) -> bool {
@@ -270,11 +315,7 @@ async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSche
             message: "response missing 'schema' field".to_string(),
         })?;
 
-    let schema = Arc::new(
-        AvroSchema::parse_str(schema_str).map_err(|e| Error::InvalidSchema {
-            source: Box::new(e),
-        })?,
-    );
+    let schema = Arc::new(parse_schema(schema_str)?);
     let mut cache = SCHEMA_CACHE.lock();
     if cache.len() >= SCHEMA_CACHE_MAX {
         cache.clear();
@@ -503,5 +544,113 @@ mod tests {
         assert!(matches!(events[0].payload.op, Op::Create));
         assert_eq!(events[0].payload.after["id"], 7);
         assert_eq!(events[0].payload.ts_ms, 42);
+    }
+
+    fn recursive_schema_name(schema_json: &str) -> String {
+        match parse_schema(schema_json) {
+            Err(Error::RecursiveSchema { name }) => name,
+            Err(other) => panic!("expected a recursive schema error, got: {other}"),
+            Ok(_) => panic!("recursive schema was accepted: {schema_json}"),
+        }
+    }
+
+    #[test]
+    fn rejects_self_reference_through_union() {
+        let schema = r#"{"type": "record", "name": "Node", "fields": [
+            {"name": "id", "type": "long"},
+            {"name": "next", "type": ["null", "Node"]}
+        ]}"#;
+        assert_eq!(recursive_schema_name(schema), "Node");
+    }
+
+    #[test]
+    fn rejects_self_reference_through_array_and_map() {
+        let array = r#"{"type": "record", "name": "Tree", "fields": [
+            {"name": "children", "type": {"type": "array", "items": "Tree"}}
+        ]}"#;
+        assert_eq!(recursive_schema_name(array), "Tree");
+
+        let map = r#"{"type": "record", "name": "Tree", "fields": [
+            {"name": "children", "type": {"type": "map", "values": "Tree"}}
+        ]}"#;
+        assert_eq!(recursive_schema_name(map), "Tree");
+    }
+
+    #[test]
+    fn rejects_mutual_recursion() {
+        let schema = r#"{"type": "record", "name": "A", "fields": [
+            {"name": "b", "type": ["null", {"type": "record", "name": "B", "fields": [
+                {"name": "a", "type": ["null", "A"]}
+            ]}]}
+        ]}"#;
+        assert_eq!(recursive_schema_name(schema), "A");
+    }
+
+    #[test]
+    fn rejects_self_reference_through_alias_in_namespace() {
+        let schema = r#"{"type": "record", "name": "Node", "namespace": "cdc",
+            "aliases": ["Link"], "fields": [
+                {"name": "next", "type": ["null", "Link"]}
+            ]}"#;
+        assert_eq!(recursive_schema_name(schema), "cdc.Node");
+    }
+
+    #[tokio::test]
+    async fn recursive_explicit_schema_is_rejected_before_decode() {
+        let schema = r#"{"type": "record", "name": "Node", "fields": [
+            {"name": "next", "type": ["null", "Node"]}
+        ]}"#;
+        let Err(err) = parse_avro_change_events(
+            &[0],
+            &AvroDecodeOptions {
+                avro_schema_json: Some(schema.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        else {
+            panic!("recursive schema was accepted");
+        };
+        assert!(
+            matches!(&err, Error::RecursiveSchema { name } if name == "Node"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_flat_envelope_and_non_recursive_reuse() {
+        let envelope = r#"{"type": "record", "name": "Envelope", "namespace": "pg.public.orders",
+            "fields": [
+                {"name": "before", "type": ["null", {"type": "record", "name": "Value", "fields": [
+                    {"name": "id", "type": "long"},
+                    {"name": "amount", "type": ["null", "double"], "default": null}
+                ]}], "default": null},
+                {"name": "after", "type": ["null", "Value"], "default": null},
+                {"name": "source", "type": {"type": "record", "name": "Source",
+                    "namespace": "io.debezium.connector.postgresql", "fields": [
+                        {"name": "db", "type": "string"},
+                        {"name": "table", "type": "string"},
+                        {"name": "lsn", "type": ["null", "long"], "default": null}
+                    ]}},
+                {"name": "op", "type": "string"},
+                {"name": "ts_ms", "type": ["null", "long"], "default": null}
+            ]}"#;
+        let reuse = r#"{"type": "record", "name": "Outer", "fields": [
+            {"name": "first", "type": {"type": "record", "name": "Point", "fields": [
+                {"name": "x", "type": "long"}
+            ]}},
+            {"name": "second", "type": "Point"},
+            {"name": "inner", "type": {"type": "record", "name": "Inner", "fields": [
+                {"name": "points", "type": {"type": "array", "items": "Point"}},
+                {"name": "by_key", "type": {"type": "map", "values": ["null", "Point"]}}
+            ]}}
+        ]}"#;
+        for (schema, root) in [(envelope, "pg.public.orders.Envelope"), (reuse, "Outer")] {
+            let parsed = parse_schema(schema).expect("non-recursive schema is accepted");
+            assert_eq!(
+                parsed.name().map(|name| name.fullname(None)).as_deref(),
+                Some(root)
+            );
+        }
     }
 }

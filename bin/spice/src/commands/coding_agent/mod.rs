@@ -181,7 +181,6 @@ async fn prepare_agent(
         api_key: ctx.api_key(),
         model: &selection.model,
         models: &selection.available,
-        native_messages: selection.native_messages,
         model_given,
         limits: &selection.limits,
     };

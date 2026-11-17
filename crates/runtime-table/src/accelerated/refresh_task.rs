@@ -1366,9 +1366,13 @@ impl RefreshTask {
                             )),
                         }
                     } else {
+                        // The receiver lives in the refresh that reads these stats after its
+                        // write, so it is gone only when that refresh ended first: cancelled,
+                        // as at shutdown, or failed. Either way no one reads the stats, and the
+                        // refresh reported anything that went wrong itself.
                         if notify_refresh_stat_available.send(stat).is_err() {
-                            tracing::error!(
-                                "Failed to provide stats on the amount of data written into {ds_name}"
+                            tracing::debug!(
+                                "Dataset {ds_name}: the refresh ended before it read the amount of data it wrote"
                             );
                         }
                         None

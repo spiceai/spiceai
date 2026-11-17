@@ -19,6 +19,7 @@ limitations under the License.
 //! Each `tests/<name>.rs` is a module here rather than its own test target, so
 //! the crate's dependencies are linked once instead of once per file.
 
+mod data_file_replay;
 mod fault;
 mod headlog;
 mod headlog_replay;

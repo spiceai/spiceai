@@ -58,3 +58,12 @@ steps:
     oracle-sql: SELECT 42 AS k FROM (SELECT row_number() OVER () AS rn FROM (SELECT max(id) AS m FROM e WHERE v = 99) x) q WHERE rn = 1
   - query: SELECT count(*) AS n FROM (SELECT 42 AS k FROM e GROUP BY v QUALIFY row_number() OVER (ORDER BY v) = 1) x
     oracle-sql: SELECT count(*) AS n FROM (SELECT v FROM e GROUP BY v ORDER BY v LIMIT 1) x
+  # A join that reads none of the unnested columns leaves an empty projection
+  # over the Unnest, which keeps the Unnest's rows: every pair, not one per row.
+  - query: SELECT count(*) AS n FROM e a CROSS JOIN (SELECT * FROM unnest(range(0, 100))) b
+    oracle-sql: SELECT count(*) AS n FROM e a CROSS JOIN generate_series(0, 99) b
+  - query: SELECT count(*) AS n FROM e a CROSS JOIN (SELECT * FROM unnest(range(0, 100)) LIMIT 10) b
+    oracle-sql: SELECT count(*) AS n FROM e a CROSS JOIN (SELECT * FROM generate_series(0, 99) LIMIT 10) b
+  - explain: SELECT count(*) AS n FROM e a CROSS JOIN (SELECT * FROM unnest(range(0, 100))) b
+    contains: [VirtualExecutionPlan, __unnest_rows]
+    only: duckdb

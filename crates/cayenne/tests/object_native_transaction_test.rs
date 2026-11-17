@@ -80,12 +80,41 @@ async fn create(catalog: &ObjectNativeCatalog, name: &str) -> String {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: format!("/tmp/unused/{name}"),
+            base_path: format!("s3://bucket/v1/datasets/{name}/data"),
             partition_column: None,
             vortex_config: VortexConfig::default(),
         })
         .await
         .expect("create table")
+}
+
+/// The real catalog refuses an unplaced path before publishing a table.
+#[tokio::test]
+async fn an_object_native_table_refuses_an_unplaced_data_path() {
+    use cayenne::metadata::{CreateTableOptions, VortexConfig};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = ObjectNativeCatalog::create(Arc::clone(&store), Path::from("catalog"))
+        .await
+        .expect("catalog");
+    let error = catalog
+        .create_table(CreateTableOptions {
+            table_name: "orders".to_string(),
+            schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            ])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/unplaced".to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        })
+        .await
+        .expect_err("unplaced data must be refused");
+    assert_eq!(
+        error.to_string(),
+        "Invalid operation: Failed to load dataset 'orders' (cayenne): With `runtime.params.cayenne_vnext` enabled, its data must be in `runtime.state.location`. Remove `cayenne_file_path`, `cayenne_s3_zone_ids`, and `cayenne_datalake_location`, use a supported refresh mode (full, append, or changes), and set `runtime.state.location` to an S3 or local file location. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    );
+    assert!(catalog.list_table_names().await.expect("tables").is_empty());
 }
 
 /// Publish snapshot `snapshot` at `sequence` on `table_id`.
@@ -100,6 +129,7 @@ fn publication<'a>(table_id: &'a str, snapshot: &'a str, sequence: i64) -> Catal
         inline_tombstone: None,
         pending_durable_flips: &[],
         dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
+        files: &[],
     }
 }
 
@@ -109,6 +139,8 @@ fn across<'a>(orders: &'a str, audit: &'a str) -> Vec<CatalogPublication<'a>> {
         publication(audit, "audit-txn", 6),
     ]
 }
+
+use crate::common::one_file;
 
 /// Each table's sequence for its transaction snapshot.
 async fn published(catalog: &ObjectNativeCatalog, orders: &str, audit: &str) -> [Option<i64>; 2] {
@@ -366,6 +398,93 @@ async fn a_change_to_a_reserved_dataset_waits_for_the_transaction() {
     );
 }
 
+/// While a transaction across datasets holds a dataset prepared, a sweep can
+/// neither read which of the dataset's snapshots are retired nor forget them: it
+/// waits for the transaction, so it never deletes on the strength of a state a
+/// pending outcome may change and never commits on a reserved table (a refused
+/// record would stop the dataset's log). It answers once the transaction is
+/// resolved, and the log keeps accepting changes.
+#[tokio::test]
+async fn a_sweep_waits_for_a_transaction_that_reserves_the_dataset() {
+    let (faults, _store, catalog, orders, audit) = setup().await;
+    let first = uuid::Uuid::now_v7().to_string();
+    let merged = uuid::Uuid::now_v7().to_string();
+    let first_files = one_file(&orders, &first);
+    let first_key = "part-0.vortex".to_string();
+    catalog
+        .commit_publications(&[CatalogPublication {
+            files: &first_files,
+            ..publication(&orders, &first, 3)
+        }])
+        .await
+        .expect("publish a protected snapshot");
+    assert!(
+        catalog
+            .swap_protected_snapshots(&orders, std::slice::from_ref(&first), &merged, 4)
+            .await
+            .expect("merge")
+    );
+    assert_eq!(
+        catalog.retired_files(&orders).await.expect("read"),
+        Some(vec![first_key.clone()])
+    );
+
+    faults.arm(Op::Create, is_decision, Fault::Hold);
+    let coordinator = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        let (orders, audit) = (orders.clone(), audit.clone());
+        async move { catalog.commit_publications(&across(&orders, &audit)).await }
+    });
+    let held = faults.wait_held(None).await;
+    let read = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        let orders = orders.clone();
+        async move { catalog.retired_files(&orders).await }
+    });
+    let forget = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        let (orders, first_key) = (orders.clone(), first_key.clone());
+        async move {
+            catalog
+                .forget_retired_files(&orders, std::slice::from_ref(&first_key))
+                .await
+        }
+    });
+    // A bounded wait for something that must not happen.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !read.is_finished() && !forget.is_finished(),
+        "the sweep did not wait for the transaction"
+    );
+    faults.clear_rules();
+    faults.deliver(held).await.expect("the decision lands");
+    faults
+        .respond(held)
+        .expect("release the decision's response");
+    coordinator
+        .await
+        .expect("coordinator task")
+        .expect("the transaction commits");
+    let read = read.await.expect("read task").expect("read");
+    assert!(
+        read == Some(vec![first_key.clone()]) || read == Some(vec![]),
+        "the retired set after the transaction: {read:?}"
+    );
+    assert!(forget.await.expect("forget task").expect("forget"));
+    assert_eq!(
+        catalog.retired_files(&orders).await.expect("read"),
+        Some(vec![])
+    );
+    assert_eq!(
+        published(&catalog, &orders, &audit).await,
+        [Some(5), Some(6)]
+    );
+    catalog
+        .commit_publications(&[publication(&orders, "orders-later", 7)])
+        .await
+        .expect("the log accepts changes after the sweep");
+}
+
 /// A dropped dataset's log, and the log of a create that stopped before the
 /// registry named the dataset, are removed once older than `reclaim_after`; the
 /// logs of datasets that exist are kept with their state.
@@ -450,7 +569,7 @@ async fn create_fails(catalog: &ObjectNativeCatalog, name: &str) {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: format!("/tmp/unused/{name}"),
+            base_path: format!("s3://bucket/v1/datasets/{name}/data"),
             partition_column: None,
             vortex_config: VortexConfig::default(),
         })

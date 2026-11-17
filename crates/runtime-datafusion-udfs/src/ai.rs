@@ -1099,6 +1099,7 @@ mod tests {
                     choices: vec![ChatChoiceStream {
                         index: 0,
                         delta: ChatCompletionStreamResponseDelta {
+                            reasoning_content: None,
                             content: None, // Empty content
                             role: Some(Role::Assistant),
                             tool_calls: None,
@@ -1727,6 +1728,7 @@ mod tests {
                         choices: vec![ChatChoiceStream {
                             index: 0,
                             delta: ChatCompletionStreamResponseDelta {
+                                reasoning_content: None,
                                 content: Some("Starting...".to_string()),
                                 role: Some(Role::Assistant),
                                 tool_calls: None,
