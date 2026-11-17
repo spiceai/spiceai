@@ -187,6 +187,10 @@ pub enum Error {
     #[snafu(display("{message}"))]
     Registry { message: String },
 
+    /// `spice build` could not build a function. The message is fully formed.
+    #[snafu(display("{message}"))]
+    BuildFailed { message: String },
+
     /// Failed to read/write configuration
     #[snafu(display("Failed to {operation} configuration at '{}': {source}", path.display()))]
     ConfigIo {

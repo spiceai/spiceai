@@ -68,6 +68,12 @@ pub struct RunArgs {
 
 /// Execute the run command.
 pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Result<()> {
+    // Build the function modules the runtime is about to load. The runtime
+    // itself never builds anything.
+    if let Some(app_dir) = local_spicepod_dir(ctx.app_dir(), &args.args) {
+        crate::commands::build::build_before_run(&app_dir).await?;
+    }
+
     run_runtime(
         ctx,
         &RunConfig {
@@ -84,4 +90,23 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
         },
     )
     .await
+}
+
+/// The local directory holding the Spicepod `spiced` will run: the leading
+/// positional argument passed through to it (`spice run ./app/spicepod.yaml`),
+/// or the app directory. A remote Spicepod (`s3://`, `https://`) has nothing
+/// local to build.
+fn local_spicepod_dir(app_dir: &std::path::Path, args: &[String]) -> Option<std::path::PathBuf> {
+    let Some(spicepod) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        return Some(app_dir.to_path_buf());
+    };
+    if spicepod.contains("://") {
+        return None;
+    }
+    let path = app_dir.join(spicepod);
+    if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent().map(std::path::Path::to_path_buf)
+    }
 }

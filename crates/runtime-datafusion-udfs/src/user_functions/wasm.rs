@@ -29,11 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::hash::Hash;
 use std::io::Cursor;
-#[cfg(feature = "wasm-functions-compile")]
-use std::path::Path;
 use std::path::PathBuf;
-#[cfg(feature = "wasm-functions-compile")]
-use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -70,13 +66,13 @@ use wasmtime::{Config, Engine, Instance, Module, ResourceLimiter, Store, TypedFu
 static NEXT_WASM_SCALAR_ID: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_ENTRYPOINT: &str = "spice_transform";
-#[cfg(feature = "wasm-functions-compile")]
-const DEFAULT_LANGUAGE: &str = "rust";
-#[cfg(feature = "wasm-functions-compile")]
-const DEFAULT_TARGET: &str = "wasm32-unknown-unknown";
 const INPUT_TABLE_PARAM: &str = "input_table";
 const MODULE_PARAM: &str = "module";
-const SOURCE_PARAM: &str = "source";
+const SHA256_PARAM: &str = "sha256";
+/// Params that described compiling a function from source, which the runtime
+/// no longer does. Each is a load error that names it, never ignored.
+const REMOVED_COMPILE_PARAMS: [&str; 5] = ["source", "language", "target", "artifact", "cache_dir"];
+const FUNCTIONS_DOCS: &str = "https://spiceai.org/docs/components/functions/wasm";
 const DEFAULT_WASM_FUEL: u64 = 100_000_000;
 const DEFAULT_WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_WASM_MAX_TABLE_ELEMENTS: usize = 1_000_000;
@@ -124,13 +120,29 @@ pub enum WasmBuildError {
     ))]
     ConflictingInputSource,
 
-    #[snafu(display("WASM function requires one of `params.module` or `params.source`"))]
-    MissingModuleOrSource,
+    #[snafu(display(
+        "'params.module' is required: set it to the .wasm file the function runs. See: {FUNCTIONS_DOCS}"
+    ))]
+    MissingModule,
 
     #[snafu(display(
-        "WASM function has both `params.module` and `params.source`; provide exactly one"
+        "'params.source' is no longer compiled by the runtime. Add a `build:` block and run `spice build`, then set 'params.module' to the file it writes. See: {FUNCTIONS_DOCS}"
     ))]
-    ConflictingModuleSource,
+    SourceNotCompiled,
+
+    #[snafu(display(
+        "'params.{param}' only configured compiling 'params.source', which the runtime no longer does. Remove it, add a `build:` block and run `spice build`, then set 'params.module' to the file it writes. See: {FUNCTIONS_DOCS}"
+    ))]
+    RemovedCompileParam { param: String },
+
+    #[snafu(display(
+        "the module '{path}' has SHA-256 {actual}, but 'params.sha256' expects {expected}. Rebuild it with `spice build`, or update the pin. See: {FUNCTIONS_DOCS}"
+    ))]
+    ModuleDigestMismatch {
+        path: String,
+        actual: String,
+        expected: String,
+    },
 
     #[snafu(display("WASM param `{param}` must be a string"))]
     InvalidStringParam { param: String },
@@ -141,52 +153,6 @@ pub enum WasmBuildError {
         expected: String,
         got: String,
     },
-
-    #[snafu(display("unsupported WASM source language '{language}'. Supported languages: rust"))]
-    UnsupportedLanguage { language: String },
-
-    #[cfg(not(feature = "wasm-functions-compile"))]
-    #[snafu(display(
-        "compiling WASM source requires the `wasm-functions-compile` feature; use `params.module` with a precompiled .wasm artifact or rebuild with that feature"
-    ))]
-    SourceCompileDisabled,
-
-    #[cfg(feature = "wasm-functions-compile")]
-    #[snafu(display("failed to hash WASM source '{path}': {source}"))]
-    HashSource {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[cfg(feature = "wasm-functions-compile")]
-    #[snafu(display("failed to create WASM cache directory '{path}': {source}"))]
-    CreateCacheDir {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[cfg(feature = "wasm-functions-compile")]
-    #[snafu(display("failed to compile Rust source to WASM: {message}"))]
-    CompileRust { message: String },
-
-    #[cfg(feature = "wasm-functions-compile")]
-    #[snafu(display("failed to read compiled WASM artifact directory '{path}': {source}"))]
-    ReadArtifactDir {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[cfg(feature = "wasm-functions-compile")]
-    #[snafu(display("failed to copy compiled WASM artifact from '{from}' to '{to}': {source}"))]
-    CopyArtifact {
-        from: String,
-        to: String,
-        source: std::io::Error,
-    },
-
-    #[cfg(feature = "wasm-functions-compile")]
-    #[snafu(display("WASM source compilation task failed: {source}"))]
-    CompileTask { source: tokio::task::JoinError },
 
     #[snafu(display("failed to read WASM module '{path}': {source}"))]
     ReadModule {
@@ -364,15 +330,25 @@ async fn build_table_func(
     if input_source.is_none() && input_schema.is_none() {
         return MissingInputSourceSnafu.fail();
     }
-    #[cfg(feature = "wasm-functions-compile")]
-    let module_path = resolve_module_path(&config).await?;
-    #[cfg(not(feature = "wasm-functions-compile"))]
-    let module_path = resolve_module_path(&config)?;
+    let module_path = config.module.clone();
     let module_bytes = tokio::fs::read(&module_path)
         .await
         .context(ReadModuleSnafu {
             path: module_path.display().to_string(),
         })?;
+    // The pin is checked against the bytes about to be compiled, before
+    // Wasmtime sees them.
+    if let Some(expected) = &config.sha256 {
+        let actual = sha256_hex(&module_bytes);
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            return ModuleDigestMismatchSnafu {
+                path: module_path.display().to_string(),
+                actual,
+                expected: expected.clone(),
+            }
+            .fail();
+        }
+    }
     let limits = config.limits;
     let mut engine_config = Config::new();
     engine_config.consume_fuel(true);
@@ -767,52 +743,36 @@ fn dealloc_unique(
 
 #[derive(Debug)]
 struct WasmConfig {
-    module: Option<PathBuf>,
-    #[cfg(feature = "wasm-functions-compile")]
-    source: Option<PathBuf>,
-    #[cfg(feature = "wasm-functions-compile")]
-    language: String,
+    module: PathBuf,
+    /// Optional SHA-256 of the module, in hex; the module is refused if it
+    /// does not match.
+    sha256: Option<String>,
     entrypoint: String,
     input_table: Option<String>,
     limits: WasmLimits,
-    #[cfg(feature = "wasm-functions-compile")]
-    cache_dir: Option<PathBuf>,
-    #[cfg(feature = "wasm-functions-compile")]
-    artifact: Option<String>,
-    #[cfg(feature = "wasm-functions-compile")]
-    target: String,
 }
 
 impl WasmConfig {
     fn from_decl(decl: &Function) -> Result<Self> {
-        let module = param_path(&decl.params, MODULE_PARAM)?;
-        let source = param_path(&decl.params, SOURCE_PARAM)?;
-        if module.is_some() && source.is_some() {
-            return ConflictingModuleSourceSnafu.fail();
-        }
-        if module.is_none() && source.is_none() {
-            return MissingModuleOrSourceSnafu.fail();
-        }
-
-        #[cfg(feature = "wasm-functions-compile")]
-        let language = {
-            let language = param_string(&decl.params, "language")?
-                .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string())
-                .to_ascii_lowercase();
-            if source.is_some() && language != DEFAULT_LANGUAGE {
-                return UnsupportedLanguageSnafu { language }.fail();
+        // The runtime never compiles. A param that only described compiling is
+        // an error naming it, so a Spicepod written for the old behavior fails
+        // loudly instead of loading something else.
+        for param in REMOVED_COMPILE_PARAMS {
+            if decl.params.contains_key(param) {
+                return Err(if param == "source" {
+                    WasmBuildError::SourceNotCompiled
+                } else {
+                    WasmBuildError::RemovedCompileParam {
+                        param: param.to_string(),
+                    }
+                });
             }
-            language
-        };
-        #[cfg(not(feature = "wasm-functions-compile"))]
-        let _ = param_string(&decl.params, "language")?;
+        }
+        let module = param_path(&decl.params, MODULE_PARAM)?.ok_or(WasmBuildError::MissingModule)?;
 
         Ok(Self {
             module,
-            #[cfg(feature = "wasm-functions-compile")]
-            source,
-            #[cfg(feature = "wasm-functions-compile")]
-            language,
+            sha256: param_string(&decl.params, SHA256_PARAM)?,
             entrypoint: param_string(&decl.params, "entrypoint")?
                 .unwrap_or_else(|| DEFAULT_ENTRYPOINT.to_string()),
             input_table: param_string(&decl.params, INPUT_TABLE_PARAM)?,
@@ -829,15 +789,13 @@ impl WasmConfig {
                     DEFAULT_WASM_MAX_TABLE_ELEMENTS,
                 )?,
             },
-            #[cfg(feature = "wasm-functions-compile")]
-            cache_dir: param_path(&decl.params, "cache_dir")?,
-            #[cfg(feature = "wasm-functions-compile")]
-            artifact: param_string(&decl.params, "artifact")?,
-            #[cfg(feature = "wasm-functions-compile")]
-            target: param_string(&decl.params, "target")?
-                .unwrap_or_else(|| DEFAULT_TARGET.to_string()),
         })
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 fn param_string(params: &HashMap<String, Value>, key: &str) -> Result<Option<String>> {
@@ -940,37 +898,6 @@ fn table_ref_from_column_expr(column: &Column) -> TableReference {
             table,
         },
     }
-}
-
-#[cfg(not(feature = "wasm-functions-compile"))]
-fn resolve_module_path(config: &WasmConfig) -> Result<PathBuf> {
-    if let Some(module) = &config.module {
-        return Ok(module.clone());
-    }
-
-    SourceCompileDisabledSnafu.fail()
-}
-
-#[cfg(feature = "wasm-functions-compile")]
-async fn resolve_module_path(config: &WasmConfig) -> Result<PathBuf> {
-    if let Some(module) = &config.module {
-        return Ok(module.clone());
-    }
-
-    let source = config
-        .source
-        .clone()
-        .ok_or(WasmBuildError::MissingModuleOrSource)?;
-    let compile_config = CompileConfig {
-        source,
-        cache_dir: config.cache_dir.clone(),
-        artifact: config.artifact.clone(),
-        target: config.target.clone(),
-        language: config.language.clone(),
-    };
-    tokio::task::spawn_blocking(move || compile_rust_source(&compile_config))
-        .await
-        .context(CompileTaskSnafu)?
 }
 
 fn function_arg_schema(args: &[FunctionArg]) -> Result<SchemaRef> {
@@ -1228,193 +1155,6 @@ fn truncate_batches(batches: &mut Vec<RecordBatch>, limit: usize) {
     batches.truncate(keep);
 }
 
-#[cfg(feature = "wasm-functions-compile")]
-#[derive(Debug)]
-struct CompileConfig {
-    source: PathBuf,
-    cache_dir: Option<PathBuf>,
-    artifact: Option<String>,
-    target: String,
-    language: String,
-}
-
-#[cfg(feature = "wasm-functions-compile")]
-fn compile_rust_source(config: &CompileConfig) -> Result<PathBuf> {
-    if config.language != DEFAULT_LANGUAGE {
-        return UnsupportedLanguageSnafu {
-            language: config.language.clone(),
-        }
-        .fail();
-    }
-    let cache_dir = config
-        .cache_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(".spice/wasm-cache"));
-    std::fs::create_dir_all(&cache_dir).context(CreateCacheDirSnafu {
-        path: cache_dir.display().to_string(),
-    })?;
-
-    let cache_key = source_hash(&config.source)?;
-    let cached = cache_dir.join(format!("{cache_key}.wasm"));
-    if cached.exists() {
-        return Ok(cached);
-    }
-
-    if config.source.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
-        compile_rust_file(config, &cached)?;
-        return Ok(cached);
-    }
-
-    let artifact = compile_cargo_project(config)?;
-    std::fs::copy(&artifact, &cached).context(CopyArtifactSnafu {
-        from: artifact.display().to_string(),
-        to: cached.display().to_string(),
-    })?;
-    Ok(cached)
-}
-
-#[cfg(feature = "wasm-functions-compile")]
-fn source_hash(path: &Path) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    hash_path(path, &mut hasher)?;
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
-#[cfg(feature = "wasm-functions-compile")]
-fn hash_path(path: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
-    if path.is_file() {
-        hasher.update(path.to_string_lossy().as_bytes());
-        let bytes = std::fs::read(path).context(HashSourceSnafu {
-            path: path.display().to_string(),
-        })?;
-        hasher.update(&bytes);
-        return Ok(());
-    }
-
-    let mut entries = std::fs::read_dir(path)
-        .context(HashSourceSnafu {
-            path: path.display().to_string(),
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context(HashSourceSnafu {
-            path: path.display().to_string(),
-        })?;
-    entries.sort_by_key(std::fs::DirEntry::path);
-    for entry in entries {
-        let entry_path = entry.path();
-        if entry_path.is_dir()
-            && entry_path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|name| name == "target")
-        {
-            continue;
-        }
-        if entry_path.is_dir()
-            || entry_path
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|ext| matches!(ext, "rs" | "toml" | "lock"))
-        {
-            hash_path(&entry_path, hasher)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "wasm-functions-compile")]
-fn compile_rust_file(config: &CompileConfig, output: &Path) -> Result<()> {
-    let result = Command::new("rustc")
-        .arg("--edition")
-        .arg("2024")
-        .arg("--crate-type")
-        .arg("cdylib")
-        .arg("--target")
-        .arg(&config.target)
-        .arg("-O")
-        .arg(&config.source)
-        .arg("-o")
-        .arg(output)
-        .output()
-        .map_err(|source| WasmBuildError::CompileRust {
-            message: source.to_string(),
-        })?;
-    if !result.status.success() {
-        return CompileRustSnafu {
-            message: String::from_utf8_lossy(&result.stderr).to_string(),
-        }
-        .fail();
-    }
-    Ok(())
-}
-
-#[cfg(feature = "wasm-functions-compile")]
-fn compile_cargo_project(config: &CompileConfig) -> Result<PathBuf> {
-    let manifest = manifest_path(&config.source);
-    let result = Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .arg("--target")
-        .arg(&config.target)
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .output()
-        .map_err(|source| WasmBuildError::CompileRust {
-            message: source.to_string(),
-        })?;
-    if !result.status.success() {
-        return CompileRustSnafu {
-            message: String::from_utf8_lossy(&result.stderr).to_string(),
-        }
-        .fail();
-    }
-
-    let release_dir = manifest
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("target")
-        .join(&config.target)
-        .join("release");
-    if let Some(artifact) = &config.artifact {
-        return Ok(release_dir.join(artifact));
-    }
-
-    let mut wasm_files = std::fs::read_dir(&release_dir)
-        .context(ReadArtifactDirSnafu {
-            path: release_dir.display().to_string(),
-        })?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("wasm"))
-        .collect::<Vec<_>>();
-    wasm_files.sort();
-    match wasm_files.as_slice() {
-        [artifact] => Ok(artifact.clone()),
-        [] => CompileRustSnafu {
-            message: format!("no .wasm artifact found in {}", release_dir.display()),
-        }
-        .fail(),
-        _ => CompileRustSnafu {
-            message: "multiple .wasm artifacts found; set params.artifact".to_string(),
-        }
-        .fail(),
-    }
-}
-
-#[cfg(feature = "wasm-functions-compile")]
-fn manifest_path(source: &Path) -> PathBuf {
-    if source.is_dir() {
-        source.join("Cargo.toml")
-    } else if source.file_name().and_then(std::ffi::OsStr::to_str) == Some("Cargo.toml") {
-        source.to_path_buf()
-    } else {
-        source
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("Cargo.toml")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![expect(deprecated)] // DF54: test-only TableFunctionImpl::call/create_table_provider; migration deferred (needs Session)
@@ -1606,6 +1346,75 @@ mod tests {
             .expect("walks the plan");
             assert_eq!(scan_types, [expected], "{volatility:?}");
         }
+    }
+
+    async fn load_error(decl: &Function) -> String {
+        match crate::user_functions::build_function(decl).await {
+            Ok(_) => panic!("function '{}' must not load", decl.name),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// The runtime never compiles. `params.source`, and every param that only
+    /// described compiling it, is a load error naming the param and the fix.
+    #[tokio::test]
+    async fn removed_compile_params_are_load_errors() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+
+        let mut source = wasm_identity_decl(&module);
+        source.params.remove(MODULE_PARAM);
+        source.params.insert(
+            "source".to_string(),
+            Value::String("./functions/score".to_string()),
+        );
+        assert_eq!(
+            load_error(&source).await,
+            "Failed to load function 'wasm_identity' (wasm): 'params.source' is no longer compiled by the runtime. Add a `build:` block and run `spice build`, then set 'params.module' to the file it writes. See: https://spiceai.org/docs/components/functions/wasm"
+        );
+
+        for param in ["language", "target", "artifact", "cache_dir"] {
+            let mut decl = wasm_identity_decl(&module);
+            decl.params
+                .insert(param.to_string(), Value::String("x".to_string()));
+            assert_eq!(
+                load_error(&decl).await,
+                format!(
+                    "Failed to load function 'wasm_identity' (wasm): 'params.{param}' only configured compiling 'params.source', which the runtime no longer does. Remove it, add a `build:` block and run `spice build`, then set 'params.module' to the file it writes. See: https://spiceai.org/docs/components/functions/wasm"
+                ),
+                "{param}"
+            );
+        }
+    }
+
+    /// `params.sha256` pins the module: a match loads, whatever its case, and
+    /// anything else is refused before Wasmtime compiles the bytes.
+    #[tokio::test]
+    async fn the_module_must_match_its_sha256_pin() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+        let actual = sha256_hex(&std::fs::read(&module).expect("read the module"));
+
+        let mut pinned = wasm_identity_decl(&module);
+        pinned
+            .params
+            .insert(SHA256_PARAM.to_string(), Value::String(actual.to_uppercase()));
+        build_table_udtf(&pinned, None)
+            .await
+            .expect("a matching pin loads");
+
+        let wrong = "0".repeat(64);
+        let mut mismatched = wasm_identity_decl(&module);
+        mismatched
+            .params
+            .insert(SHA256_PARAM.to_string(), Value::String(wrong.clone()));
+        assert_eq!(
+            load_error(&mismatched).await,
+            format!(
+                "Failed to load function 'wasm_identity' (wasm): the module '{}' has SHA-256 {actual}, but 'params.sha256' expects {wrong}. Rebuild it with `spice build`, or update the pin. See: https://spiceai.org/docs/components/functions/wasm",
+                module.display()
+            )
+        );
     }
 
     #[tokio::test]

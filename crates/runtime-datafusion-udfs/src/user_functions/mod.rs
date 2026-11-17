@@ -130,7 +130,7 @@ pub enum UserFunctionError {
     },
 
     #[cfg(feature = "wasm-functions")]
-    #[snafu(display("Failed to register function {name}: {source}"))]
+    #[snafu(display("Failed to load function '{name}' (wasm): {source}"))]
     Wasm {
         name: String,
         source: wasm::WasmBuildError,
