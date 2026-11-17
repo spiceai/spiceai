@@ -224,7 +224,7 @@ const MAX_ERROR_BODY_BYTES: u64 = MIB;
 
 /// A limit as a user reads it: whole MiB where it is one, bytes otherwise.
 fn describe_bytes(bytes: u64) -> String {
-    if bytes >= MIB && bytes % MIB == 0 {
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
         format!("{} MiB", bytes / MIB)
     } else {
         format!("{bytes} bytes")
