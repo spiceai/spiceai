@@ -16,9 +16,9 @@ limitations under the License.
 
 fn main() {
     // The append tests' `file_append` source loads the installed libduckdb
-    // through ADBC, and this binary also links the bundled DuckDB: export nothing
-    // from this package's binaries on macOS, for the reason `bin/spiced/build.rs`
-    // gives.
+    // through ADBC, and this binary also links the bundled DuckDB. On macOS the
+    // executable's exported DuckDB symbols would bind into the loaded library
+    // and corrupt it, so export nothing from this package's binaries.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-arg=-Wl,-exported_symbol,__mh_execute_header");
     }

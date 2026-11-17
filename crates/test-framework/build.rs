@@ -16,10 +16,11 @@ limitations under the License.
 
 fn main() {
     // The `file_append` source loads the installed libduckdb through ADBC, and a
-    // workspace build can also link the bundled DuckDB into the same binaries:
-    // export nothing from this package's test binaries on macOS, for the reason
-    // `bin/spiced/build.rs` gives. A library links nothing itself, so this reaches
-    // only those binaries.
+    // workspace build can also link the bundled DuckDB into the same binaries.
+    // On macOS an executable's exported DuckDB symbols would bind into the loaded
+    // library and corrupt it, so export nothing from this package's test
+    // binaries. A library links nothing itself, so this reaches only those
+    // binaries; testoperator carries its own guard.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-arg=-Wl,-exported_symbol,__mh_execute_header");
     }
