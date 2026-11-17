@@ -321,8 +321,10 @@ steps:
     expect: { rows: [['1']] }
     eventually: 30s
 
+  # The mock still counts the read-write key's two calls (`reset` removes routes, not the log):
+  # no anonymous call reached the MCP server, and no memory was written.
   - source-query: { api: count /alert }
-    expect: { rows: [['0']] }
+    expect: { rows: [['2']] }
   - query: SELECT count(*) AS n FROM llm_memory
     api-key: none
     expect: { rows: [['0']] }
