@@ -181,8 +181,11 @@ runs:
     - name: Check if sccache can be set up
       id: check-sccache
       shell: bash
+      env:
+        INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
+        INPUT_SPICEIO_ENDPOINT: ${{ inputs.spiceio_endpoint }}
       run: |
-        if [ -z "${{ inputs.minio_endpoint }}" ] && [ -z "${{ inputs.spiceio_endpoint }}" ]; then
+        if [ -z "${INPUT_MINIO_ENDPOINT}" ] && [ -z "${INPUT_SPICEIO_ENDPOINT}" ]; then
           echo "SCCACHE_SETUP=false" >> $GITHUB_OUTPUT
         else
           echo "SCCACHE_SETUP=true" >> $GITHUB_OUTPUT
@@ -201,16 +204,19 @@ runs:
     - name: Resolve build paths
       id: resolve-build-paths
       shell: bash
+      env:
+        INPUT_RUST_PROFILE: ${{ inputs.rust_profile }}
+        INPUT_TARGET_DIR: ${{ inputs.target_dir }}
       run: |
-        if [ "${{ inputs.rust_profile }}" = "dev" ]; then
+        if [ "${INPUT_RUST_PROFILE}" = "dev" ]; then
           target_subdir=debug
         else
-          target_subdir="${{ inputs.rust_profile }}"
+          target_subdir="${INPUT_RUST_PROFILE}"
         fi
 
         pushd bin/spiced >/dev/null
-        mkdir -p "${{ inputs.target_dir }}"
-        target_dir=$(cd "${{ inputs.target_dir }}" && pwd)
+        mkdir -p "${INPUT_TARGET_DIR}"
+        target_dir=$(cd "${INPUT_TARGET_DIR}" && pwd)
         popd >/dev/null
 
         workspace_dir=$(cd "$GITHUB_WORKSPACE" && pwd)
@@ -232,9 +238,10 @@ runs:
         CARGO_NET_GIT_FETCH_WITH_CLI: true
         # Skip Metal kernel precompilation on macOS to avoid requiring Xcode Metal Toolchain
         MISTRALRS_METAL_PRECOMPILE: 0
+        INPUT_FEATURES: ${{ inputs.features }}
       run: |
-        if [ -n "${{ inputs.features }}" ]; then
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="${{ inputs.features }}"
+        if [ -n "${INPUT_FEATURES}" ]; then
+          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="${INPUT_FEATURES}"
         else
           make -C bin/spiced
         fi
@@ -249,14 +256,17 @@ runs:
         CARGO_INCREMENTAL: 0
         CARGO_NET_GIT_FETCH_WITH_CLI: true
         MISTRALRS_METAL_PRECOMPILE: 0
+        INPUT_FEATURES: ${{ inputs.features }}
+        INPUT_RUST_PROFILE: ${{ inputs.rust_profile }}
+        RESOLVE_BUILD_PATHS_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
       working-directory: bin/spiced
       run: |
         FEATURES_FLAG=""
-        if [ -n "${{ inputs.features }}" ]; then
-          FEATURES_FLAG="--features ${{ inputs.features }}"
+        if [ -n "${INPUT_FEATURES}" ]; then
+          FEATURES_FLAG="--features ${INPUT_FEATURES}"
         fi
 
-        cargo build --profile ${{ inputs.rust_profile }} ${FEATURES_FLAG} -p spiced --target-dir "${{ steps.resolve-build-paths.outputs.target_dir }}"
+        cargo build --profile "${INPUT_RUST_PROFILE}" ${FEATURES_FLAG} -p spiced --target-dir "${RESOLVE_BUILD_PATHS_TARGET_DIR}"
 
     - name: Build spice CLI
       if: inputs.build_cli == 'true'
@@ -268,15 +278,22 @@ runs:
         AWS_SESSION_TOKEN: ${{ inputs.minio_session_token }}
         CARGO_INCREMENTAL: 0
         CARGO_NET_GIT_FETCH_WITH_CLI: true
+        INPUT_RUST_PROFILE: ${{ inputs.rust_profile }}
+        RESOLVE_BUILD_PATHS_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
       run: |
-        cargo build --profile ${{ inputs.rust_profile }} -p spice --target-dir "${{ steps.resolve-build-paths.outputs.target_dir }}"
+        cargo build --profile "${INPUT_RUST_PROFILE}" -p spice --target-dir "${RESOLVE_BUILD_PATHS_TARGET_DIR}"
 
     - name: Stage binaries
       shell: bash
+      env:
+        RESOLVE_BUILD_PATHS_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
+        RESOLVE_BUILD_PATHS_TARGET_SUBDIR: ${{ steps.resolve-build-paths.outputs.target_subdir }}
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
+        INPUT_BUILD_CLI: ${{ inputs.build_cli }}
       run: |
-        TARGET_DIR="${{ steps.resolve-build-paths.outputs.target_dir }}"
-        TARGET_SUBDIR="${{ steps.resolve-build-paths.outputs.target_subdir }}"
-        EXT="${{ steps.detect-os.outputs.ext }}"
+        TARGET_DIR="${RESOLVE_BUILD_PATHS_TARGET_DIR}"
+        TARGET_SUBDIR="${RESOLVE_BUILD_PATHS_TARGET_SUBDIR}"
+        EXT="${DETECT_OS_EXT}"
 
         if [ -f "${TARGET_DIR}/${TARGET_SUBDIR}/spiced${EXT}" ]; then
           cp "${TARGET_DIR}/${TARGET_SUBDIR}/spiced${EXT}" "spiced${EXT}"
@@ -287,7 +304,7 @@ runs:
           exit 1
         fi
 
-        if [ "${{ inputs.build_cli }}" = "true" ]; then
+        if [ "${INPUT_BUILD_CLI}" = "true" ]; then
           if [ -f "${TARGET_DIR}/${TARGET_SUBDIR}/spice${EXT}" ]; then
             cp "${TARGET_DIR}/${TARGET_SUBDIR}/spice${EXT}" "spice${EXT}"
           elif [ -f "${TARGET_DIR}/release/spice${EXT}" ]; then
@@ -299,17 +316,20 @@ runs:
         fi
 
         chmod +x "spiced${EXT}"
-        if [ "${{ inputs.build_cli }}" = "true" ]; then
+        if [ "${INPUT_BUILD_CLI}" = "true" ]; then
           chmod +x "spice${EXT}"
         fi
 
     - name: Set output paths
       id: set-paths
       shell: bash
+      env:
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
+        INPUT_BUILD_CLI: ${{ inputs.build_cli }}
       run: |
-        echo "spiced_path=${{ github.workspace }}/spiced${{ steps.detect-os.outputs.ext }}" >> $GITHUB_OUTPUT
-        if [ "${{ inputs.build_cli }}" == "true" ]; then
-          echo "spice_path=${{ github.workspace }}/spice${{ steps.detect-os.outputs.ext }}" >> $GITHUB_OUTPUT
+        echo "spiced_path=${{ github.workspace }}/spiced${DETECT_OS_EXT}" >> $GITHUB_OUTPUT
+        if [ "${INPUT_BUILD_CLI}" == "true" ]; then
+          echo "spice_path=${{ github.workspace }}/spice${DETECT_OS_EXT}" >> $GITHUB_OUTPUT
         fi
 
     - name: Print spiced version
