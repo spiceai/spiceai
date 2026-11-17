@@ -54,7 +54,14 @@ runs:
       env:
         CUDA_COMPUTE_CAP: ${{ inputs.cuda-compute-capability }}
         INPUT_RUST_PROFILE: ${{ inputs.rust-profile }}
-      run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES='cuda' RUST_PROFILE="${INPUT_RUST_PROFILE}"
+      # Make re-parses RUST_PROFILE, so `$(...)` in it would still run; accept only a
+      # cargo profile name.
+      run: |
+        if [[ ! "${INPUT_RUST_PROFILE}" =~ ^[A-Za-z0-9_-]*$ ]]; then
+          echo "::error::spiced-cuda-build: rust-profile must be a cargo profile name"
+          exit 1
+        fi
+        make -C bin/spiced SPICED_NON_DEFAULT_FEATURES='cuda' RUST_PROFILE="${INPUT_RUST_PROFILE}"
       shell: ${{ env.SHELL }}
 
     - name: Package binary

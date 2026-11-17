@@ -240,6 +240,12 @@ runs:
         MISTRALRS_METAL_PRECOMPILE: 0
         INPUT_FEATURES: ${{ inputs.features }}
       run: |
+        # Make re-parses the variable, so `$(...)` in it would still run; accept only
+        # a cargo feature list.
+        if [[ ! "${INPUT_FEATURES}" =~ ^[A-Za-z0-9_/,\ -]*$ ]]; then
+          echo "::error::build-spiced: features must be a comma-separated cargo feature list"
+          exit 1
+        fi
         if [ -n "${INPUT_FEATURES}" ]; then
           make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="${INPUT_FEATURES}"
         else
