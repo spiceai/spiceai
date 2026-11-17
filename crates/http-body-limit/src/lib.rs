@@ -120,8 +120,8 @@ pub enum Error {
 
     /// The query memory pool could not hold the decoded data ([`Limit::Reserve`]).
     #[snafu(display(
-        "holding the decoded data would pass the query memory limit \
-         (`runtime.query.memory_limit`): {source}"
+        "holding the decoded data would pass the query memory limit: {}",
+        pool_refusal(source)
     ))]
     MemoryLimit { source: DataFusionError },
 
@@ -392,6 +392,16 @@ fn read_failure(error: io::Error, encoding: Option<Encoding>) -> Error {
         },
         (Err(source), None) => Error::Io { source },
     }
+}
+
+/// The memory pool's refusal on one line, without the error kind `DataFusion` prefixes it
+/// with: the pool's message lists its largest consumers a line each.
+fn pool_refusal(source: &DataFusionError) -> String {
+    let text = match source {
+        DataFusionError::ResourcesExhausted(text) => text.clone(),
+        other => other.to_string(),
+    };
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -841,12 +851,15 @@ mod tests {
             .await
             .expect_err("a body larger than the pool is refused");
         assert!(matches!(error, Error::MemoryLimit { .. }), "{error:?}");
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .starts_with("holding the decoded data would pass the query memory limit (`runtime.query.memory_limit`): Resources exhausted"),
-            "{error}"
+            message.starts_with(
+                "holding the decoded data would pass the query memory limit: Failed to allocate \
+                 additional 4.0 MB for test body"
+            ),
+            "{message}"
         );
+        assert!(!message.contains('\n'), "one line: {message}");
         assert_eq!(held.size(), 0, "a refused body returns what it charged");
     }
 

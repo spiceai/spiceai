@@ -39,6 +39,7 @@ use data_components::cdc::{
     AccelerationContents, ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter,
     StreamError, build_ready_signal_envelope, shutdown_epoch, wrap_data_as_change_batch,
 };
+use datafusion::execution::memory_pool::MemoryPool;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -326,6 +327,8 @@ impl Drop for AppliedKeysCommitter {
 struct ListingObjectReader {
     connector: S3,
     dataset: DatasetSpec,
+    /// The runtime's query memory pool, which schema inference of each object reads under.
+    memory_pool: Arc<dyn MemoryPool>,
 }
 
 #[async_trait]
@@ -363,7 +366,13 @@ impl ObjectReader for ListingObjectReader {
         })?;
         let table = self
             .connector
-            .create_listing_table(&self.dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &self.dataset,
+                &url,
+                &extension,
+                file_format,
+                &self.memory_pool,
+            )
             .await
             .map_err(|e| StreamError::Connector {
                 connector: "S3",
@@ -883,7 +892,7 @@ fn error_stream(error: impl std::error::Error + Send + Sync + 'static) -> Change
 
 pub async fn s3_changes_stream(
     connector: &S3,
-    _context: &dyn ConnectorContext,
+    context: &dyn ConnectorContext,
     federated_table: Arc<dyn FederatedTableProvider>,
     dataset: &DatasetSpec,
     acceleration: AccelerationContents,
@@ -933,6 +942,12 @@ pub async fn s3_changes_stream(
     let object_reader = Arc::new(ListingObjectReader {
         connector: connector.clone(),
         dataset: dataset.clone(),
+        memory_pool: Arc::clone(
+            &context
+                .datafusion_session_context()
+                .runtime_env()
+                .memory_pool,
+        ),
     });
     let object_lister = Arc::new(ListingPrefixScanner {
         connector: connector.clone(),

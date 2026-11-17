@@ -51,7 +51,9 @@ use datafusion::execution::cache::cache_manager::{
 };
 use datafusion::execution::cache::default_cache::DefaultCache;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
@@ -1817,18 +1819,22 @@ pub trait ListingTableConnector: DataConnector {
         ))
     }
 
+    /// The listing table for `dataset`. Its schema is inferred from the source files under
+    /// `memory_pool`, the runtime's query memory pool, since inference can hold a file
+    /// whole (a JSON document is parsed whole).
     async fn create_listing_table(
         &self,
         dataset: &DatasetSpec,
         url: &Url,
         extension: &str,
         file_format: Arc<dyn FileFormat>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
     where
         Self: Display,
     {
         let template = self
-            .listing_table_template(dataset, url, extension, file_format)
+            .listing_table_template(dataset, url, extension, file_format, memory_pool)
             .await?;
 
         // This shouldn't error because `listing_table_template` already parsed the same URL.
@@ -1897,6 +1903,7 @@ pub trait ListingTableConnector: DataConnector {
         url: &Url,
         extension: &str,
         file_format: Arc<dyn FileFormat>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<ListingTableTemplate>
     where
         Self: Display,
@@ -1913,7 +1920,19 @@ pub trait ListingTableConnector: DataConnector {
 
         let object_store = self.get_object_store(dataset)?;
 
-        let ctx: SessionContext = self.get_session_context();
+        // Inference reads source files, holding a JSON document whole, so it is charged to
+        // the runtime's query memory pool rather than to an unbounded one of its own.
+        let ctx = self.get_session_context();
+        let runtime_env = RuntimeEnvBuilder::from_runtime_env(&ctx.runtime_env())
+            .with_memory_pool(Arc::clone(memory_pool))
+            .build_arc()
+            .boxed()
+            .context(crate::InternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "LTC-RP-RTE".to_string(), // ListingTableConnector-ReadProvider-RuntimeEnv
+            })?;
+        let ctx = SessionContext::new_with_config_rt(ctx.copied_config(), runtime_env);
         let params = self.get_params();
         let displayed_extension = if params.secret_source("file_extension").is_some() {
             params.display_value("file_extension", extension)
@@ -2206,7 +2225,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn read_provider(
         &self,
-        _context: &dyn ConnectorContext,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         ListingTableConnector::validate_dataset(self, dataset)?;
@@ -2222,7 +2241,13 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             }
             Some(file_format) => {
                 // Structured tabular data, use a [`ListingTable`].
-                self.create_listing_table(dataset, &url, &extension, file_format)
+                let memory_pool = Arc::clone(
+                    &context
+                        .datafusion_session_context()
+                        .runtime_env()
+                        .memory_pool,
+                );
+                self.create_listing_table(dataset, &url, &extension, file_format, &memory_pool)
                     .await
             }
         }
@@ -4397,7 +4422,14 @@ mod tests {
             .expect("csv plus file_extension must resolve");
         let file_format = file_format.expect("csv must use the listing-table path");
         let err = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect_err("secret-derived file_extension with no matching files must fail");
         assert_error_hides_canary(&err, "CANARYPGPW7731", REFERENCE);
@@ -4702,7 +4734,14 @@ mod tests {
         };
 
         let template = connector
-            .listing_table_template(&dataset, &url, &extension, Arc::clone(&file_format))
+            .listing_table_template(
+                &dataset,
+                &url,
+                &extension,
+                Arc::clone(&file_format),
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("template");
         assert!(
@@ -4716,7 +4755,14 @@ mod tests {
         );
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -4799,7 +4845,14 @@ mod tests {
         };
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -4883,7 +4936,14 @@ mod tests {
         };
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
 
@@ -4993,7 +5053,14 @@ mod tests {
         };
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
 
@@ -5086,7 +5153,14 @@ mod tests {
             panic!("expected a JSONL file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -5127,7 +5201,14 @@ mod tests {
             panic!("expected a JSONL file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -5182,7 +5263,14 @@ mod tests {
             "listing must enable flatten_json so user.name is a registered column"
         );
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
         assert_eq!(
@@ -5535,7 +5623,14 @@ mod tests {
         );
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
 
@@ -5658,7 +5753,14 @@ mod tests {
         assert_eq!(extension, ".orc");
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table must not publish a schema_source_path prefix schema");
 
@@ -6204,7 +6306,14 @@ mod tests {
             panic!("expected a parquet file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
         ctx.register_table(name, provider)
@@ -6332,7 +6441,14 @@ mod tests {
             "the production listing path must wrap Parquet so float stats cannot be trusted"
         );
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
         let ctx = SessionContext::new();
@@ -7639,7 +7755,14 @@ mod tests {
             panic!("expected a parquet file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
 
@@ -7830,7 +7953,14 @@ mod tests {
             panic!("expected a parquet file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
 
