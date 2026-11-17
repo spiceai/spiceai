@@ -204,6 +204,10 @@ impl ToolUsingResponses {
             .cloned()
     }
 
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     async fn call_tool(&self, tool_call: &FunctionToolCall) -> ToolOutcome {
         let FunctionToolCall {
             name,
@@ -211,46 +215,43 @@ impl ToolUsingResponses {
             id,
             ..
         } = tool_call;
-        match self.as_spiced_tool(name) {
-            Some(t) => match with_budget(self.result_budget, t.call(arguments)).await {
-                Ok(v) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::log()
-                            .id(id.clone())
-                            .title(format!("'{name}' tool completed successfully"))
-                            .json_content(v.clone())
-                            .to_jsonl(),
-                    );
-                    ToolOutcome::Completed(v)
-                }
-                Err(e) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::error()
-                            .id(id.clone())
-                            .title(format!("'{name}' tool completed unsuccessfully"))
-                            .content(e.to_string())
-                            .to_jsonl(),
-                    );
-                    ToolOutcome::Failed(format!(
-                        "Failed to call the tool {}. An error occurred: {e}",
-                        t.name()
-                    ))
-                }
-            },
-            None => {
-                // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
-                if cfg!(feature = "dev") {
-                    panic!(
-                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible."
-                    );
-                } else {
-                    tracing::warn!(
-                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible.",
-                    );
-                    ToolOutcome::Completed(Value::Null)
-                }
+        let Some(t) = self.as_spiced_tool(name) else {
+            // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
+            if cfg!(feature = "dev") {
+                panic!(
+                    "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible."
+                );
+            }
+            tracing::warn!(
+                "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible.",
+            );
+            return ToolOutcome::Completed(Value::Null);
+        };
+        match with_budget(self.result_budget, t.call(arguments)).await {
+            Ok(v) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::log()
+                        .id(id.clone())
+                        .title(format!("'{name}' tool completed successfully"))
+                        .json_content(v.clone())
+                        .to_jsonl(),
+                );
+                ToolOutcome::Completed(v)
+            }
+            Err(e) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::error()
+                        .id(id.clone())
+                        .title(format!("'{name}' tool completed unsuccessfully"))
+                        .content(e.to_string())
+                        .to_jsonl(),
+                );
+                ToolOutcome::Failed(format!(
+                    "Failed to call the tool {}. An error occurred: {e}",
+                    t.name()
+                ))
             }
         }
     }

@@ -5540,7 +5540,7 @@ mod tests {
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
             if self
                 .failures_remaining
-                .fetch_update(
+                .try_update(
                     AtomicOrdering::SeqCst,
                     AtomicOrdering::SeqCst,
                     |remaining| remaining.checked_sub(1),
@@ -6552,7 +6552,7 @@ mod tests {
         .await
         .expect("must not hang on empty stream");
         res.expect("must return Ok on empty stream");
-        assert!(log.ids().await.is_empty());
+        assert_eq!(log.ids().await, [] as [i32; 0]);
     }
 
     #[tokio::test]

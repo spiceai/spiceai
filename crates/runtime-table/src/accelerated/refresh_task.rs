@@ -2760,6 +2760,7 @@ impl RefreshTask {
                         io_runtime,
                     )
                     .await;
+                    mark_refresh_update_type(&ctx, &update_type_for_runtime);
 
                     let data = get_data(
                         &mut ctx,
@@ -2796,6 +2797,7 @@ impl RefreshTask {
             self.io_runtime.clone(),
         )
         .await;
+        mark_refresh_update_type(&ctx, &update_type);
 
         let get_data_result = get_data(
             &mut ctx,
@@ -3666,6 +3668,18 @@ impl RefreshTask {
 
     fn update_last_updated_at(&self) {
         super::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
+    }
+}
+
+/// Marks a refresh session whose scan results are appended, so a file source with no data
+/// files yet is an empty append rather than an error. A full refresh keeps the default
+/// marking, under which an empty listing fails the scan instead of replacing the
+/// accelerated data with nothing.
+fn mark_refresh_update_type(ctx: &SessionContext, update_type: &UpdateType) {
+    if *update_type == UpdateType::Append {
+        data_components::file_schema_drift::mark_appending_acceleration_refresh(
+            ctx.state_ref().write().config_mut(),
+        );
     }
 }
 
@@ -5382,6 +5396,47 @@ mod tests {
             ),
             "an ordinary query session must not be treated as a refresh"
         );
+    }
+
+    /// Only an append marks its session as appending: a file source with no data files is
+    /// then an empty append, while a full refresh still fails rather than replacing the
+    /// accelerated data with nothing.
+    #[tokio::test]
+    async fn only_an_append_refresh_session_is_marked_as_appending() {
+        use data_components::file_schema_drift::{
+            is_acceleration_refresh, is_appending_acceleration_refresh,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        for (update_type, appends) in [
+            (UpdateType::Append, true),
+            (UpdateType::Overwrite, false),
+            (UpdateType::Changes, false),
+        ] {
+            let source = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                    .expect("source mem table should be created"),
+            ) as Arc<dyn TableProvider>;
+            let accelerator = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                    .expect("accelerator mem table should be created"),
+            ) as Arc<dyn TableProvider>;
+            let ctx = RefreshTask::create_refresh_df_context(
+                source,
+                &TableReference::bare("append_marked_refresh"),
+                &accelerator,
+                false,
+                Handle::current(),
+            )
+            .await;
+            mark_refresh_update_type(&ctx, &update_type);
+            let state = ctx.state();
+            assert!(is_acceleration_refresh(&state), "{update_type:?}");
+            assert_eq!(
+                is_appending_acceleration_refresh(&state),
+                appends,
+                "{update_type:?}"
+            );
+        }
     }
 
     /// The missing-column refresh error is permanent: retrying cannot bring the column back,

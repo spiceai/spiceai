@@ -1420,7 +1420,7 @@ mod tests {
     fn test_json_array_to_jsonl_empty_array() {
         let input = "[]";
         let result = json_array_to_jsonl(input).expect("should parse empty array");
-        assert!(result.is_empty());
+        assert_eq!(result, "");
     }
 
     #[test]

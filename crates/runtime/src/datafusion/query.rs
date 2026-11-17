@@ -6416,7 +6416,7 @@ mod tests {
         assert!(reconciled.schema().field(0).is_nullable());
 
         let batches = collect_stream(reconciled).await;
-        assert!(batches.is_empty());
+        assert_eq!(batches, [] as [RecordBatch; 0]);
     }
 
     #[tokio::test]

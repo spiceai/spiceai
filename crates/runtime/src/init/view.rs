@@ -1142,13 +1142,13 @@ mod startup_view_wait_tests {
 
     #[test]
     fn chain_and_self_reference_are_not_cycles() {
-        assert!(
+        assert_eq!(
             flagged(&reads(&[
                 ("a", &["orders", "a"]),
                 ("b", &["public.a", "a"]),
                 ("c", &["b"]),
-            ]))
-            .is_empty()
+            ])),
+            [] as [String; 0]
         );
     }
 
@@ -1156,7 +1156,7 @@ mod startup_view_wait_tests {
     fn a_view_whose_sql_did_not_resolve_links_nothing() {
         let mut views = reads(&[("a", &["b"])]);
         views.insert(r("b"), None);
-        assert!(flagged(&views).is_empty());
+        assert_eq!(flagged(&views), [] as [String; 0]);
     }
 
     /// Only the views in a cycle, and those reading one, give up waiting on the

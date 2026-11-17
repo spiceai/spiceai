@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q68"
 ---
-+-------------+--------------+-------------+-------------+------------------+----------------+--------------+------------+
-| c_last_name | c_first_name | ca_city     | bought_city | ss_ticket_number | extended_price | extended_tax | list_price |
-+-------------+--------------+-------------+-------------+------------------+----------------+--------------+------------+
-|             |              | Unionville  | Woodlawn    | 70               | 15617.02       | 1059.20      | 35200.10   |
-|             |              | Ashland     | Cedar Grove | 6019             | 24714.08       | 1308.29      | 63935.66   |
-|             |              |             | Walnut      | 6303             | 21528.46       | 572.52       | 35532.61   |
-|             | Clyde        |             | Franklin    | 6570             | 21078.46       | 263.63       | 46404.01   |
-|             |              | Lewis       | Church Hill | 6991             | 41914.79       | 1889.37      | 65258.51   |
-|             |              | Midway      | Oakwood     | 11488            | 16050.99       | 361.53       | 25084.90   |
-|             | Michael      | Oak Grove   |             | 15164            | 15234.39       | 723.77       | 23344.65   |
-|             |              | Newtown     | Marion      | 23929            | 23226.16       | 1102.38      | 36049.65   |
-|             | John         | Parkwood    | Edgewood    | 24159            | 27211.89       | 1604.38      | 43810.22   |
-|             | Keith        | Green Acres | Newtown     | 24227            | 23813.22       | 1224.49      | 43097.79   |
-+-------------+--------------+-------------+-------------+------------------+----------------+--------------+------------+
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+
+| c_last_name | c_first_name | ca_city       | bought_city    | ss_ticket_number | extended_price | extended_tax | list_price |
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+
+| Abbott      | Joseph       | Greenfield    | Midway         | 62751            | 37795.50       | 1086.40      | 53385.17   |
+| Abbott      | Harriet      | Wesley        | Forest Hills   | 84405            | 23666.36       | 1274.86      | 45689.64   |
+| Abney       | Louis        | Gladstone     | Green Acres    | 140967           | 20698.82       | 491.86       | 48086.21   |
+| Acosta      | Johnnie      | Centerville   | Enterprise     | 69183            | 21688.97       | 1059.74      | 34387.30   |
+| Adair       | Kimberly     | Centerville   | Forest Hills   | 157619           | 20277.95       | 929.31       | 44425.20   |
+| Adams       | Jonathon     | Highland Park | Pleasant Grove | 26218            | 21246.49       | 611.03       | 51453.82   |
+| Adams       | Michelle     | Unionville    | Hillcrest      | 55515            | 31090.74       | 1174.85      | 51510.85   |
+| Adams       | Genevieve    | Enterprise    | Union Hill     | 109910           | 32666.21       | 1432.96      | 61189.81   |
+| Adams       | David        | Bridgeport    | Antioch        | 213366           | 12990.48       | 225.47       | 28512.17   |
+| Adkins      | Daniel       | Wilson        | Providence     | 131164           | 11376.01       | 508.57       | 34817.21   |
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+

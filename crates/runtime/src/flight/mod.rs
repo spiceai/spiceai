@@ -2071,7 +2071,7 @@ mod tests {
         );
         let (messages, error) = sent(response).await;
         assert!(error.is_none(), "{error:?}");
-        assert!(!messages.is_empty());
+        assert_ne!(messages, [] as [FlightData; 0]);
         assert_eq!(pool.reserved(), 0);
     }
 

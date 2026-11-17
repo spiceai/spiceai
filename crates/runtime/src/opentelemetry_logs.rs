@@ -1209,11 +1209,11 @@ mod tests {
     fn an_export_with_no_records_builds_no_batch() {
         let request = request_with(vec![s("service.name", "a")], None, vec![]);
         assert_eq!(log_record_count(&request), 0);
-        assert!(
+        assert_eq!(
             export_to_batches(&request, RECEIVED, MAX_LOGS_BATCH_ROWS)
                 .expect("batches")
-                .batches
-                .is_empty()
+                .batches,
+            [] as [RecordBatch; 0]
         );
     }
 
