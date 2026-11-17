@@ -2160,42 +2160,39 @@ mod tests {
                 .questions
                 .iter()
                 .map(|(id, question)| {
-                    let answer = match question {
-                        Question::Choice { criteria, .. } => {
-                            let documents = state.get("documents").expect("listwise documents");
-                            let scores: std::collections::BTreeMap<String, f64> = criteria
-                                .keys()
-                                .map(|option| {
-                                    let document = documents[option.as_str()]
-                                        .as_str()
-                                        .expect("a document for each option");
-                                    (option.clone(), Self::score(document))
-                                })
-                                .collect();
-                            let total: f64 = scores.values().sum();
-                            let probabilities: std::collections::BTreeMap<String, f64> = scores
-                                .into_iter()
-                                .map(|(option, score)| (option, score / total))
-                                .collect();
-                            let choice = probabilities
-                                .iter()
-                                .max_by(|a, b| a.1.total_cmp(b.1))
-                                .map(|(option, _)| option.clone())
-                                .expect("at least one option");
-                            Answer::Choice {
-                                choice,
-                                probabilities,
-                                confidence: 0.5,
-                            }
+                    let answer = if let Question::Choice { criteria, .. } = question {
+                        let documents = state.get("documents").expect("listwise documents");
+                        let scores: std::collections::BTreeMap<String, f64> = criteria
+                            .keys()
+                            .map(|option| {
+                                let document = documents[option.as_str()]
+                                    .as_str()
+                                    .expect("a document for each option");
+                                (option.clone(), Self::score(document))
+                            })
+                            .collect();
+                        let total: f64 = scores.values().sum();
+                        let probabilities: std::collections::BTreeMap<String, f64> = scores
+                            .into_iter()
+                            .map(|(option, score)| (option, score / total))
+                            .collect();
+                        let choice = probabilities
+                            .iter()
+                            .max_by(|a, b| a.1.total_cmp(b.1))
+                            .map(|(option, _)| option.clone())
+                            .expect("at least one option");
+                        Answer::Choice {
+                            choice,
+                            probabilities,
+                            confidence: 0.5,
                         }
-                        _ => {
-                            let document = state
-                                .get("document")
-                                .and_then(serde_json::Value::as_str)
-                                .expect("a pointwise document");
-                            Answer::Noul {
-                                noul: Self::score(document),
-                            }
+                    } else {
+                        let document = state
+                            .get("document")
+                            .and_then(serde_json::Value::as_str)
+                            .expect("a pointwise document");
+                        Answer::Noul {
+                            noul: Self::score(document),
                         }
                     };
                     (id.clone(), answer)
