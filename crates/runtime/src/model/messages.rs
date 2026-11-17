@@ -79,11 +79,11 @@ pub async fn try_to_messages_model(
     if tools.is_empty() {
         return Ok(Some(messages));
     }
-    Ok(Some(Arc::new(ToolUsingMessages::new(
-        messages,
-        tools.to_vec(),
-        recursion_limit,
-    ))))
+    let context_window = chat.without_tools().token_limits().await.context_window;
+    Ok(Some(Arc::new(
+        ToolUsingMessages::new(messages, tools.to_vec(), recursion_limit)
+            .with_context_window(context_window),
+    )))
 }
 
 /// The native Messages API of `component`, with what Spice adds to each request.

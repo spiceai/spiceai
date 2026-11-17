@@ -56,6 +56,14 @@ pub(crate) enum SnapshotMaintenanceTrigger {
         trigger_len: usize,
         over_memory_ceiling: bool,
     },
+    /// Key deletion vectors have accumulated past their trigger on a key-delete
+    /// table whose current snapshot holds rows they may hide. A change stream
+    /// writes one a commit, and none of them is reclaimed while those rows are
+    /// unrewritten, however small the deletion index stays.
+    DeletionVectorFiles {
+        deletion_vector_files: usize,
+        trigger_files: usize,
+    },
 }
 
 fn should_warn_protected_snapshot_age(

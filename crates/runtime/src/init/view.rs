@@ -22,6 +22,7 @@ use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
+    dataaccelerator::AccelerationSource,
     datafusion::{DeferredRefreshOutcome, TableInstance, resolve_table_reference},
     secrets::Secrets,
     status,
@@ -178,6 +179,14 @@ fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<
             .map(|table| (resolve_table_reference(table.clone()), table))
             .collect(),
     )
+}
+
+/// Whether `view` embeds a column with one of `models`.
+fn view_uses_embedding_model(view: &View, models: &HashSet<String>) -> bool {
+    view.columns
+        .iter()
+        .flat_map(|c| &c.embeddings)
+        .any(|e| models.contains(&e.model))
 }
 
 /// The views in a cycle of views reading each other, and the views that read,
@@ -896,6 +905,39 @@ impl Runtime {
         let _ = self.load_view(view, secrets);
     }
 
+    /// Unloads the views of `app` that embed with one of `models`.
+    /// [`Self::apply_view_diff`] loads again the ones that are valid in the new app.
+    pub(crate) async fn unload_views_using_embeddings(
+        self: &Arc<Self>,
+        app: &Arc<App>,
+        models: &HashSet<String>,
+    ) {
+        if models.is_empty() {
+            return;
+        }
+        for vv in Arc::clone(self).get_valid_views(app, LogErrors(false)) {
+            if !view_uses_embedding_model(&vv.view, models) {
+                continue;
+            }
+            // `file_create` discards the stored rows when the view loads again.
+            if vv.view.is_file_accelerated()
+                && vv.view.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.mode != crate::component::dataset::acceleration::Mode::FileCreate
+                })
+            {
+                tracing::warn!(
+                    "View {} keeps the embeddings that its file acceleration stored with the previous configuration of its embedding model. A row is embedded with the new configuration only when a refresh writes it again.",
+                    vv.view.name
+                );
+            }
+            if self.df.table_exists(&vv.view.name) {
+                self.status
+                    .update_view(&vv.view.name, status::ComponentStatus::Refreshing);
+                Arc::clone(self).remove_view(&vv.view.name).await;
+            }
+        }
+    }
+
     /// Update views based on changed between the current and new app.
     /// This function will update views that have changed, and remove views that are no longer in the app.
     /// It will also update views that have dependencies that have changed, and views
@@ -932,8 +974,10 @@ impl Runtime {
 
         // A view's plan holds the tables it read when it registered, so a view that
         // reads a dataset this change loads, reloads or removes registers again to read
-        // the dataset the Spicepod now declares, or to fail when it is gone. The views
-        // that read it follow through the dependency order below.
+        // the dataset the Spicepod now declares, or to fail when it is gone. A view that
+        // embeds with a changed embedding model registers again with the new model. The
+        // views that read it follow through the dependency order below.
+        let changed_embeddings = crate::init::embedding::changed_embeddings(current_app, new_app);
         let reads: HashMap<ResolvedTableReference, TablesRead> = {
             let state = self.df.ctx.state();
             validated_views
@@ -948,11 +992,12 @@ impl Runtime {
         };
         for vv in &validated_views {
             if !views_that_changed.contains(&vv.view.name)
-                && reads
+                && (reads
                     .get(&resolve_table_reference(vv.view.name.clone()))
                     .is_some_and(|tables| {
                         tables.keys().any(|table| reloaded_datasets.contains(table))
                     })
+                    || view_uses_embedding_model(&vv.view, &changed_embeddings))
             {
                 views_that_changed.push(vv.view.name.clone());
             }

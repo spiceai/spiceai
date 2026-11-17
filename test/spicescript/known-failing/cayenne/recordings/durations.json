@@ -7,5 +7,6 @@
   "cayenne-writes-known": 90,
   "maintained-aggregates-served": 6,
   "memory-limit-spill": 21,
-  "postgres-cdc-kill-during-compaction": 124
+  "postgres-cdc-kill-during-compaction": 124,
+  "postgres-cdc-kill-under-load": 337
 }

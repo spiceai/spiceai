@@ -108,6 +108,24 @@ impl Source for Files {
         Ok(found)
     }
 
+    async fn sizes(&self, namespace: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let mut sized = Vec::new();
+        for path in self.list(namespace, prefix).await? {
+            // A file deleted since the listing is no longer there to measure;
+            // any other failure is reported rather than counted as zero bytes.
+            let len = match std::fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to read the size of '{path}'"));
+                }
+            };
+            sized.push((path, len));
+        }
+        Ok(sized)
+    }
+
     /// Writes the rows as `files` part files, numbered after any already
     /// there when appending.
     async fn generate(&self, namespace: &str, spec: &TableSpec) -> Result<u64> {

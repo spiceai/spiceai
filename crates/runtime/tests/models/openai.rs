@@ -1378,12 +1378,24 @@ async fn openai_test_responses_api_tool_history_replay() -> Result<(), anyhow::E
                         assert_eq!(call["server_label"], "spice", "{label}: {call:#}");
                         assert_eq!(call["name"], "sql", "{label}: {call:#}");
                         assert_eq!(call["status"], "completed", "{label}: {call:#}");
-                        // The result is the rows as JSON, not a JSON string holding them.
+                        // The result is the `sql` tool's `{"columns", "rows"}` as JSON, not a JSON
+                        // string holding it: a name per column, and a value per column in each row.
+                        let result = call["output"]
+                            .as_str()
+                            .and_then(|output| serde_json::from_str::<Value>(output).ok());
+                        let columns = result
+                            .as_ref()
+                            .and_then(|result| result["columns"].as_array())
+                            .filter(|columns| columns.iter().all(Value::is_string));
+                        let rows = result.as_ref().and_then(|result| result["rows"].as_array());
                         assert!(
-                            call["output"]
-                                .as_str()
-                                .and_then(|output| serde_json::from_str::<Value>(output).ok())
-                                .is_some_and(|rows| rows.is_array()),
+                            columns.zip(rows).is_some_and(|(columns, rows)| {
+                                !columns.is_empty()
+                                    && !rows.is_empty()
+                                    && rows.iter().all(|row| {
+                                        row.as_array().is_some_and(|row| row.len() == columns.len())
+                                    })
+                            }),
                             "{label}: {call:#}"
                         );
                         assert!(
