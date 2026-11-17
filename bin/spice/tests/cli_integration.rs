@@ -452,8 +452,9 @@ mod login {
             let printed = combined_output(&output);
             assert!(!output.status.success(), "{name}: login must fail: {printed}");
             assert!(
-                printed.contains(&format!("configuration at {name}: it is a symbolic link"))
-                    && printed.contains("--output keychain"),
+                printed.contains(&format!(
+                    "Failed to update configuration at '{name}': it is a symbolic link. `spice login` writes credentials only to a regular file, never through a link, so they cannot land in the file it points to. Replace '{name}' with a regular file, or store credentials in the keychain with `spice login --output keychain`. See: https://spiceai.org/docs/cli/reference/login"
+                )),
                 "{name}: the error must name the file, the reason and the fix: {printed}"
             );
             assert_eq!(
@@ -495,7 +496,9 @@ mod login {
         let printed = combined_output(&output);
         assert!(!output.status.success(), "login must fail: {printed}");
         assert!(
-            printed.contains("configuration at .env: it is not a regular file"),
+            printed.contains(
+                "Failed to update configuration at '.env': it is not a regular file. `spice login` writes credentials only to a regular file. Replace '.env' with a regular file, or store credentials in the keychain with `spice login --output keychain`. See: https://spiceai.org/docs/cli/reference/login"
+            ),
             "{printed}"
         );
     }
@@ -1107,7 +1110,10 @@ mod add {
         let printed = printed(output);
         assert!(!output.status.success(), "spice add must fail: {printed}");
         assert!(printed.contains(expected), "expected '{expected}' in: {printed}");
-        assert!(printed.contains("so nothing was installed"), "{printed}");
+        assert!(
+            printed.contains("so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"),
+            "a size limit is advised as a size limit: {printed}"
+        );
         assert!(
             !project.join("spicepods").exists(),
             "a refused archive must leave no pods directory: {:?}",
@@ -1137,13 +1143,10 @@ mod add {
 
         let project = TempDir::new().expect("create the project");
         let output = add_from_registry(project.path(), &stub_registry(RegistryReply::Archive(body)));
-        let declared = 0x8000_0000_u64 + POD_MANIFEST.len() as u64;
         assert_refused_and_nothing_installed(
             project.path(),
             &output,
-            &format!(
-                "the archive expands to {declared} bytes, more than the 1024 MiB a Spicepod package may expand to"
-            ),
+            "the archive expands to 2.0 GiB, more than the 1 GiB a Spicepod package may expand to",
         );
     }
 
@@ -1160,7 +1163,7 @@ mod add {
         assert_refused_and_nothing_installed(
             project.path(),
             &output,
-            "the archive holds 10001 entries, more than the 10000 a Spicepod package may hold",
+            "the archive holds 10,001 entries, more than the 10,000 a Spicepod package may hold",
         );
     }
 
@@ -1184,7 +1187,7 @@ mod add {
         let printed = printed(&output);
         assert!(!output.status.success(), "spice add must fail: {printed}");
         assert!(
-            printed.contains("the archive entry '../../../escaped.txt' does not name a file inside the Spicepod directory, so nothing was installed"),
+            printed.contains("Failed to install Spicepod 'evil/pod' from spicerack.org: its entry '../../../escaped.txt' is outside the Spicepod directory, so the package cannot be installed and nothing was installed. Report it to the Spicepod's publisher, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"),
             "{printed}"
         );
         assert_eq!(
@@ -1213,7 +1216,7 @@ mod add {
         assert_refused_and_nothing_installed(
             project.path(),
             &output,
-            "the archive is 10737418240 bytes, more than the 256 MiB a Spicepod package may be",
+            "the archive is 10,240.0 MiB, more than the 256 MiB a Spicepod package may be",
         );
     }
 

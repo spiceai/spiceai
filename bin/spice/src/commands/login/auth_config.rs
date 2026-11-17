@@ -64,7 +64,7 @@ pub fn merge_auth_config(auth_type: &str, params: &[(&str, &str)]) -> Result<()>
 /// names, so only a regular file is ever read or replaced.
 pub(crate) fn unsafe_credential_file(path: &Path) -> std::io::Result<Option<&'static str>> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some("a symbolic link")),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some(SYMBOLIC_LINK)),
         Ok(metadata) if !metadata.is_file() => Ok(Some("not a regular file")),
         Ok(_) => Ok(None),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -73,19 +73,29 @@ pub(crate) fn unsafe_credential_file(path: &Path) -> std::io::Result<Option<&'st
 }
 
 /// The error for a credential file that is a link or not a regular file.
-fn refuse_credential_file(operation: &'static str, path: &Path, what: &str) -> crate::error::Error {
+///
+/// It states the rule that is enforced, which is about writes: commands that
+/// only read a credential still read a linked `.env`.
+fn refuse_credential_file(path: &Path, what: &str) -> crate::error::Error {
+    let through_link = if what == SYMBOLIC_LINK {
+        ", never through a link, so they cannot land in the file it points to"
+    } else {
+        ""
+    };
     crate::error::Error::ConfigIo {
-        operation,
+        operation: "update",
         path: path.to_path_buf(),
         source: std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "it is {what}. Credentials are only read from and written to a regular file, never through a link, so no other file can receive them. Replace '{}' with a regular file, or keep credentials in the platform keychain with `spice login --output keychain`. See: https://spiceai.org/docs/cli",
+                "it is {what}. `spice login` writes credentials only to a regular file{through_link}. Replace '{}' with a regular file, or store credentials in the keychain with `spice login --output keychain`. See: https://spiceai.org/docs/cli/reference/login",
                 path.display()
             ),
         ),
     }
 }
+
+const SYMBOLIC_LINK: &str = "a symbolic link";
 
 /// Read the env file a credential update will replace, or `None` when there is
 /// none yet.
@@ -101,7 +111,7 @@ pub(crate) fn read_env_file_for_update(path: &Path) -> Result<Option<String>> {
         operation: "read",
         path: path.to_path_buf(),
     })? {
-        return Err(refuse_credential_file("read", path, what));
+        return Err(refuse_credential_file(path, what));
     }
 
     let mut options = std::fs::OpenOptions::new();
@@ -129,7 +139,7 @@ pub(crate) fn read_env_file_for_update(path: &Path) -> Result<Option<String>> {
         path: path.to_path_buf(),
     })?;
     if !metadata.is_file() {
-        return Err(refuse_credential_file("read", path, "not a regular file"));
+        return Err(refuse_credential_file(path, "not a regular file"));
     }
     let mut contents = String::new();
     file.read_to_string(&mut contents).context(ConfigIoSnafu {
@@ -158,7 +168,7 @@ pub(crate) fn replace_env_file(path: &Path, contents: &[u8]) -> Result<()> {
         operation: "write",
         path: path.to_path_buf(),
     })? {
-        return Err(refuse_credential_file("write", path, what));
+        return Err(refuse_credential_file(path, what));
     }
 
     let directory = match path.parent() {

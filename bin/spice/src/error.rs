@@ -188,7 +188,7 @@ pub enum Error {
     Registry { message: String },
 
     /// Failed to read/write configuration
-    #[snafu(display("Failed to {operation} configuration at {}: {source}", path.display()))]
+    #[snafu(display("Failed to {operation} configuration at '{}': {source}", path.display()))]
     ConfigIo {
         operation: &'static str,
         path: PathBuf,

@@ -90,13 +90,14 @@ pub enum Error {
 
     /// The registry's archive is larger, or expands larger, than a Spicepod package may be
     #[snafu(display(
-        "Failed to install Spicepod '{pod}' from spicerack.org: the archive {reason}, so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs"
+        "Failed to install Spicepod '{pod}' from spicerack.org: the archive {reason}, so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"
     ))]
     ArchiveLimitExceeded { pod: String, reason: String },
 
-    /// The registry's archive names a file that cannot be written inside the Spicepod directory
+    /// The registry's archive names a file outside the Spicepod directory. The
+    /// published package itself is malformed, so retrying cannot help.
     #[snafu(display(
-        "Failed to install Spicepod '{pod}' from spicerack.org: the archive entry '{entry}' does not name a file inside the Spicepod directory, so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs"
+        "Failed to install Spicepod '{pod}' from spicerack.org: its entry '{entry}' is outside the Spicepod directory, so the package cannot be installed and nothing was installed. Report it to the Spicepod's publisher, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"
     ))]
     UnsafeArchiveEntry { pod: String, entry: String },
 }

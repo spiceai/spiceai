@@ -222,13 +222,46 @@ impl ArchiveLimits {
 /// Largest body that is read back to quote a registry error message.
 const MAX_ERROR_BODY_BYTES: u64 = MIB;
 
-/// A limit as a user reads it: whole MiB where it is one, bytes otherwise.
-fn describe_bytes(bytes: u64) -> String {
-    if bytes >= MIB && bytes.is_multiple_of(MIB) {
-        format!("{} MiB", bytes / MIB)
-    } else {
-        format!("{bytes} bytes")
+/// The unit a limit is written in: the largest binary unit it is a whole
+/// number of (`1 GiB`, `256 MiB`), so the limit itself never shows a fraction.
+fn size_unit(limit: u64) -> (u64, &'static str) {
+    const UNITS: [(u64, &str); 3] = [(1024 * MIB, "GiB"), (MIB, "MiB"), (1024, "KiB")];
+    UNITS
+        .into_iter()
+        .find(|(size, _)| limit >= *size && limit.is_multiple_of(*size))
+        .unwrap_or((1, "bytes"))
+}
+
+/// A limit as a user reads it: `1 GiB`, `256 MiB`, `2,560 bytes`.
+fn describe_limit(limit: u64) -> String {
+    let (size, unit) = size_unit(limit);
+    format!("{} {unit}", with_thousands(u128::from(limit / size)))
+}
+
+/// A measured size in the unit of the limit it is compared with, to one
+/// decimal place, so both sides of the sentence read alike: `3.0 GiB` against
+/// `1 GiB`.
+fn describe_size(bytes: u128, limit: u64) -> String {
+    let (size, unit) = size_unit(limit);
+    if size == 1 {
+        return format!("{} {unit}", with_thousands(bytes));
     }
+    let size = u128::from(size);
+    let tenths = bytes.saturating_mul(10).saturating_add(size / 2) / size;
+    format!("{}.{} {unit}", with_thousands(tenths / 10), tenths % 10)
+}
+
+/// `10000` as `10,000`.
+fn with_thousands(value: u128) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 /// What the registry answered, for the errors an archive can produce.
@@ -266,8 +299,9 @@ async fn download_archive(
         return Err(archive_limit(
             pod,
             format!(
-                "is {len} bytes, more than the {} a Spicepod package may be",
-                describe_bytes(limits.archive_bytes)
+                "is {}, more than the {} a Spicepod package may be",
+                describe_size(u128::from(len), limits.archive_bytes),
+                describe_limit(limits.archive_bytes)
             ),
         ));
     }
@@ -296,7 +330,7 @@ async fn download_archive(
                 pod,
                 format!(
                     "is larger than the {} a Spicepod package may be",
-                    describe_bytes(limits.archive_bytes)
+                    describe_limit(limits.archive_bytes)
                 ),
             ));
         }
@@ -403,8 +437,8 @@ fn check_declared_size<R: Read + std::io::Seek>(
             pod,
             format!(
                 "holds {} entries, more than the {} a Spicepod package may hold",
-                archive.len(),
-                limits.entries
+                with_thousands(u128::try_from(archive.len()).unwrap_or(u128::MAX)),
+                with_thousands(u128::try_from(limits.entries).unwrap_or(u128::MAX))
             ),
         ));
     }
@@ -414,8 +448,9 @@ fn check_declared_size<R: Read + std::io::Seek>(
         return Err(archive_limit(
             pod,
             format!(
-                "expands to {declared} bytes, more than the {} a Spicepod package may expand to",
-                describe_bytes(limits.expanded_bytes)
+                "expands to {}, more than the {} a Spicepod package may expand to",
+                describe_size(declared, limits.expanded_bytes),
+                describe_limit(limits.expanded_bytes)
             ),
         ));
     }
@@ -504,7 +539,7 @@ fn stage_archive<R: Read + std::io::Seek>(
                 pod,
                 format!(
                     "expands to more than the {} a Spicepod package may expand to",
-                    describe_bytes(limits.expanded_bytes)
+                    describe_limit(limits.expanded_bytes)
                 ),
             ));
         }
@@ -835,7 +870,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Failed to install Spicepod 'test/pod' from spicerack.org: the archive expands to more than the 2560 bytes a Spicepod package may expand to, so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs"
+            "Failed to install Spicepod 'test/pod' from spicerack.org: the archive expands to more than the 2,560 bytes a Spicepod package may expand to, so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs/cli/reference/add"
         );
         assert_eq!(
             std::fs::read_dir(pods_dir.path())
@@ -844,6 +879,22 @@ mod tests {
             0,
             "the partly extracted staging directory must be removed"
         );
+    }
+
+    /// Both sides of a size comparison read in the limit's unit, to one decimal
+    /// place, and counts carry thousands separators.
+    #[test]
+    fn sizes_are_described_in_the_unit_of_their_limit() {
+        assert_eq!(describe_limit(1024 * MIB), "1 GiB");
+        assert_eq!(describe_limit(256 * MIB), "256 MiB");
+        assert_eq!(describe_limit(2560), "2,560 bytes");
+        assert_eq!(describe_size(3_221_225_510, 1024 * MIB), "3.0 GiB");
+        assert_eq!(describe_size(1_610_612_736, 1024 * MIB), "1.5 GiB");
+        assert_eq!(describe_size(10 * 1024 * 1024 * 1024, 256 * MIB), "10,240.0 MiB");
+        assert_eq!(describe_size(3000, 2560), "3,000 bytes");
+        assert_eq!(with_thousands(10_000), "10,000");
+        assert_eq!(with_thousands(999), "999");
+        assert_eq!(with_thousands(1_000_000), "1,000,000");
     }
 
     #[tokio::test]

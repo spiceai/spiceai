@@ -2633,13 +2633,18 @@ fn linked_env_file_keys(path: &std::path::Path, what: &str, keys: &[String]) -> 
     if still_set.is_empty() {
         return Ok(false);
     }
+    // The file the user has to edit is the one the link resolves to.
+    let target = std::fs::canonicalize(path)
+        .or_else(|_| std::fs::read_link(path))
+        .unwrap_or_else(|_| path.to_path_buf());
     Err(crate::error::Error::ConfigIo {
         operation: "update",
         path: path.to_path_buf(),
         source: std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "it is {what}, and the file it points to still sets {}. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{}' with a regular file and run this command again. See: https://spiceai.org/docs/cli",
+                "it is {what}, and the file it points to ('{}') still sets {}. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{}' with a regular file and run this command again. See: https://spiceai.org/docs/cli/reference/login",
+                target.display(),
                 still_set.join(", "),
                 path.display()
             ),
@@ -6489,8 +6494,11 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Failed to update configuration at {path}: it is a symbolic link, and the file it points to still sets SPICE_SPICEAI_TOKEN. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{path}' with a regular file and run this command again. See: https://spiceai.org/docs/cli",
-                path = env_file.display()
+                "Failed to update configuration at '{path}': it is a symbolic link, and the file it points to ('{target}') still sets SPICE_SPICEAI_TOKEN. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{path}' with a regular file and run this command again. See: https://spiceai.org/docs/cli/reference/login",
+                path = env_file.display(),
+                target = std::fs::canonicalize(&target)
+                    .expect("resolve the link target")
+                    .display()
             )
         );
         assert_eq!(
