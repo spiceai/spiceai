@@ -215,7 +215,9 @@ impl CatalogConnector for UnityCatalog {
         )
         .await
         {
-            Ok(provider) => provider,
+            Ok(provider) => {
+                provider.with_change_listener(super::clear_caches_on_catalog_change(&runtime))
+            }
             Err(e) => {
                 return Err(super::Error::UnableToGetCatalogProvider {
                     connector: "unity_catalog".to_string(),
