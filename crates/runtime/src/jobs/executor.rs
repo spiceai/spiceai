@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use runtime_request_context::RequestContext;
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use crate::datafusion::DataFusion;
 use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
@@ -33,7 +33,7 @@ use crate::jobs::state::JobErrorCode;
 
 use super::Result;
 use super::error::Error;
-use super::state::{JobState, JobStatus};
+use super::state::{JobResult, JobState, JobStatus, now_ms_or_zero};
 use super::store::JobStore;
 
 /// How a job comes to be driven by this scheduler.
@@ -43,6 +43,42 @@ enum Start {
     /// It was taken over from a scheduler that stopped: this is the state the
     /// takeover wrote.
     TakenOver(Box<JobState>),
+}
+
+/// How a job's distributed query and the writing of its results ended, when neither a
+/// cancellation nor the timeout stopped them first.
+enum JobRun {
+    /// Every result chunk was written.
+    Finished(JobResult),
+    /// The query could not be planned or submitted, it failed, or its results could not be
+    /// read back.
+    Failed(JobErrorCode, String),
+    /// Writing the results to the job store failed.
+    WriteFailed(Error),
+}
+
+/// When a job submitted at `created_at_ms` with `timeout_seconds` must stop, or `None` when that
+/// is too far ahead to represent (in effect, never).
+fn job_deadline(created_at_ms: u64, timeout_seconds: u64) -> Option<tokio::time::Instant> {
+    let deadline_ms = created_at_ms.saturating_add(timeout_seconds.saturating_mul(1_000));
+    let remaining = Duration::from_millis(deadline_ms.saturating_sub(now_ms_or_zero()));
+    tokio::time::Instant::now().checked_add(remaining)
+}
+
+/// The timeout, in seconds, an async query job runs under: the caller's `timeout_seconds`, but
+/// never longer than `runtime.query.timeout` (`query_timeout`), which is also the timeout when
+/// the caller sets none. A `runtime.query.timeout` with a fraction of a second rounds up to the
+/// next second, so the job never stops before the configured time.
+fn job_timeout_seconds(requested: Option<u64>, query_timeout: Option<Duration>) -> Option<u64> {
+    let limit = query_timeout.map(|timeout| {
+        timeout
+            .as_secs()
+            .saturating_add(u64::from(timeout.subsec_nanos() > 0))
+    });
+    match (requested, limit) {
+        (Some(requested), Some(limit)) => Some(requested.min(limit)),
+        (requested, limit) => requested.or(limit),
+    }
 }
 
 /// Logs how a job's background task ended. A driver that another scheduler
@@ -105,10 +141,15 @@ impl JobExecutor {
     /// Returns the job state immediately. The query will be executed in the background.
     pub async fn submit(
         &self,
-        request: SubmitQueryRequest,
+        mut request: SubmitQueryRequest,
         read_only: bool,
         owner: String,
     ) -> Result<JobState> {
+        // `runtime.query.timeout` bounds every query the runtime's query APIs run, so it bounds
+        // an async query too: it is the job's timeout when the caller sets none, and the most a
+        // caller's `timeout_seconds` can ask for.
+        let query_timeout = RequestContext::current(AsyncMarker::new().await).query_timeout();
+        request.timeout_seconds = job_timeout_seconds(request.timeout_seconds, query_timeout);
         let state = self.job_store.create_job(request, read_only, owner).await?;
         let job_id = state.job_id.clone();
 
@@ -426,75 +467,75 @@ impl JobExecutor {
             return Ok(());
         }
 
-        // Build and submit the query using Query::submit_distributed
-        let mut query_builder =
-            QueryBuilder::new(&state.sql, Arc::clone(&df)).read_only(state.read_only);
+        // The job stops at its deadline, `timeout_seconds` after it was submitted, wherever it is:
+        // planning and submitting the distributed query, waiting for it, or reading its results
+        // back and writing them to the job store. The deadline is fixed by the submission time,
+        // so a scheduler that takes the job over keeps it rather than starting the clock again.
+        let deadline = state
+            .timeout_seconds
+            .and_then(|secs| job_deadline(state.created_at_ms, secs));
+        let timeout_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match deadline {
+            Some(deadline) => Box::pin(tokio::time::sleep_until(deadline)),
+            None => Box::pin(std::future::pending()),
+        };
 
-        // Parse parameters if present
-        if let Some(p) = state.parameters {
-            match crate::datafusion::param_utils::convert_json_to_param_values(p) {
-                Ok(params) => {
-                    query_builder = query_builder.parameters(Some(params));
+        let run = async {
+            let mut query_builder =
+                QueryBuilder::new(&state.sql, Arc::clone(&df)).read_only(state.read_only);
+            if let Some(p) = state.parameters.clone() {
+                match crate::datafusion::param_utils::convert_json_to_param_values(p) {
+                    Ok(params) => query_builder = query_builder.parameters(Some(params)),
+                    Err(e) => {
+                        return JobRun::Failed(JobErrorCode::ParameterBindingFailed, e.to_string());
+                    }
                 }
+            }
+            let query = query_builder.build();
+
+            let submit_result = if resume {
+                query.resume_distributed(job_id).await
+            } else {
+                query.submit_distributed(job_id).await
+            };
+            let query_handle = match submit_result {
+                Ok(handle) => handle,
+                Err(e) => return JobRun::Failed(Self::query_error_to_code(&e), e.to_string()),
+            };
+
+            tracing::debug!(
+                job_id,
+                ballista_job_id = %query_handle.ballista_job_id(),
+                is_cached = %query_handle.is_cached(),
+                "Query submitted for distributed execution"
+            );
+
+            // Store the Ballista job ID for cancellation
+            if let Some(info) = active_jobs.write().await.get_mut(job_id) {
+                info.query_handle = Some(query_handle.clone());
+            }
+
+            let result_stream = match query_handle.into_stream().await {
+                Ok(stream) => stream,
                 Err(e) => {
-                    job_store
-                        .fail_job(
-                            job_id,
-                            &driver,
-                            JobErrorCode::ParameterBindingFailed,
-                            e.to_string(),
-                        )
-                        .await?;
-                    return Ok(());
+                    let (error_code, error_msg) = Self::handle_error_to_code_and_msg(&e);
+                    return JobRun::Failed(error_code, error_msg);
                 }
-            }
-        }
-
-        let query = query_builder.build();
-
-        let submit_result = if resume {
-            query.resume_distributed(job_id).await
-        } else {
-            query.submit_distributed(job_id).await
-        };
-        let query_handle = match submit_result {
-            Ok(handle) => handle,
-            Err(e) => {
-                let error_code = Self::query_error_to_code(&e);
-                job_store
-                    .fail_job(job_id, &driver, error_code, e.to_string())
-                    .await?;
-                return Ok(());
+            };
+            match job_store
+                .write_result_chunks_from_stream(job_id, &driver, result_stream)
+                .await
+            {
+                Ok(result) => JobRun::Finished(result),
+                Err(e) => JobRun::WriteFailed(e),
             }
         };
-
-        tracing::debug!(
-            job_id,
-            ballista_job_id = %query_handle.ballista_job_id(),
-            is_cached = %query_handle.is_cached(),
-            "Query submitted for distributed execution"
-        );
-
-        // Store the Ballista job ID for cancellation
-        let mut active = active_jobs.write().await;
-        if let Some(info) = active.get_mut(job_id) {
-            info.query_handle = Some(query_handle.clone());
-        }
-
-        drop(active);
-
-        let timeout_fut: Pin<Box<dyn Future<Output = ()> + Send>> = state.timeout_seconds.map_or(
-            Box::pin(std::future::pending()) as Pin<Box<dyn Future<Output = ()> + Send>>,
-            |secs| {
-                Box::pin(tokio::time::sleep(Duration::from_secs(secs)))
-                    as Pin<Box<dyn Future<Output = ()> + Send>>
-            },
-        );
 
         tokio::select! {
             () = cancel.cancelled() => {
                 tracing::debug!(job_id = %job_id, "Job cancelled before completion");
-                if let Err(e) = query_handle.cancel().await {
+                if let Some(query_handle) = Self::submitted_query(active_jobs, job_id).await
+                    && let Err(e) = query_handle.cancel().await
+                {
                     tracing::error!("Failed to cancel the distributed query '{job_id}': {e}");
                 }
                 // Don't call cancel_job here - executor.cancel() already updates the
@@ -504,44 +545,44 @@ impl JobExecutor {
             },
             () = timeout_fut => {
                 tracing::debug!(job_id = %job_id, "Job timed out");
-                if let Err(e) = query_handle.cancel().await {
+                if let Some(query_handle) = Self::submitted_query(active_jobs, job_id).await
+                    && let Err(e) = query_handle.cancel().await
+                {
                     tracing::error!("Failed to cancel the timed-out query '{job_id}': {e}");
                 }
                 job_store.fail_job(job_id, &driver, JobErrorCode::Timeout, "Job execution timed out".to_string()).await?;
                 Ok(())
             }
-            result_stream = query_handle.into_stream() => {
-                // Wait for completion and get the result stream
-                let result_stream = match result_stream {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        let (error_code, error_msg) = Self::handle_error_to_code_and_msg(&e);
-                        job_store.fail_job(job_id, &driver, error_code, error_msg).await?;
-                        return Ok(());
-                    }
-                };
-
-                // Write result chunks as batches arrive from the stream
-                let job_result = match job_store
-                    .write_result_chunks_from_stream(job_id, &driver, result_stream)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(e @ Error::JobTakenOver { .. }) => return Err(e),
-                    Err(e) => {
-                        job_store
-                            .fail_job(job_id, &driver, JobErrorCode::FetchingResultsFailed, e.to_string())
-                            .await?;
-                        return Ok(());
-                    }
-                };
-
-                // Mark job as succeeded
-                job_store.complete_job(job_id, &driver, job_result).await?;
-
-                Ok(())
+            outcome = run => match outcome {
+                JobRun::Finished(job_result) => {
+                    job_store.complete_job(job_id, &driver, job_result).await?;
+                    Ok(())
+                }
+                JobRun::Failed(error_code, error_msg) => {
+                    job_store.fail_job(job_id, &driver, error_code, error_msg).await?;
+                    Ok(())
+                }
+                JobRun::WriteFailed(e @ Error::JobTakenOver { .. }) => Err(e),
+                JobRun::WriteFailed(e) => {
+                    job_store
+                        .fail_job(job_id, &driver, JobErrorCode::FetchingResultsFailed, e.to_string())
+                        .await?;
+                    Ok(())
+                }
             }
         }
+    }
+
+    /// The distributed query of job `job_id`, once it was submitted.
+    async fn submitted_query(
+        active_jobs: &RwLock<std::collections::HashMap<String, ActiveJobInfo>>,
+        job_id: &str,
+    ) -> Option<QueryHandle> {
+        active_jobs
+            .read()
+            .await
+            .get(job_id)
+            .and_then(|info| info.query_handle.clone())
     }
 
     /// Converts a `Query::Error` to an error code string.
@@ -603,6 +644,48 @@ mod tests {
             .build(),
         );
         JobExecutor::new(job_store, df)
+    }
+
+    /// `runtime.query.timeout` is the job timeout when the caller sets none and the most a caller
+    /// can ask for; a fraction of a second rounds up so a job never stops early.
+    #[test]
+    fn job_timeout_is_capped_by_the_query_timeout() {
+        let limit = Some(Duration::from_secs(30));
+        assert_eq!(job_timeout_seconds(None, None), None);
+        assert_eq!(job_timeout_seconds(Some(600), None), Some(600));
+        assert_eq!(job_timeout_seconds(None, limit), Some(30));
+        assert_eq!(job_timeout_seconds(Some(600), limit), Some(30));
+        assert_eq!(job_timeout_seconds(Some(10), limit), Some(10));
+        assert_eq!(job_timeout_seconds(Some(0), limit), Some(0));
+        assert_eq!(
+            job_timeout_seconds(None, Some(Duration::from_millis(1_500))),
+            Some(2)
+        );
+        assert_eq!(
+            job_timeout_seconds(None, Some(Duration::from_millis(1))),
+            Some(1)
+        );
+    }
+
+    /// A job's deadline counts from its submission, so a job taken over by another scheduler
+    /// after its timeout passed stops at once instead of starting the clock again.
+    #[tokio::test]
+    async fn job_deadline_counts_from_submission() {
+        let now_ms = now_ms_or_zero();
+        let submitted_long_ago = job_deadline(now_ms - 60_000, 30).expect("a deadline");
+        assert!(submitted_long_ago <= tokio::time::Instant::now());
+        let submitted_now = job_deadline(now_ms, 30).expect("a deadline");
+        let remaining = submitted_now - tokio::time::Instant::now();
+        assert!(
+            remaining > Duration::from_secs(25) && remaining <= Duration::from_secs(30),
+            "{remaining:?}"
+        );
+        // A timeout too long to represent is no deadline, or one too far ahead to matter.
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        assert!(
+            job_deadline(now_ms, u64::MAX)
+                .is_none_or(|deadline| deadline > tokio::time::Instant::now() + year)
+        );
     }
 
     /// Creates a job owned by `owner` directly through the store, so the test

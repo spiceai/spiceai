@@ -91,7 +91,8 @@ pub struct SubmitQueryRequest {
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
     /// Optional timeout for async jobs.
-    /// Jobs running for longer than this will automatically timeout and fail.
+    /// Jobs running for longer than this, writing their results included, will automatically timeout and fail.
+    /// When `runtime.query.timeout` is set, it is the timeout of a job that sets none and the longest a job may set.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
     /// Optional maximum size of results for async jobs.

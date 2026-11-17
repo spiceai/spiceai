@@ -47,6 +47,14 @@ use super::state::{
     JobSchema, JobState, JobStatus, now_ms_or_zero,
 };
 
+/// The result bytes a job may still store: `maximum_size` less the bytes of the chunks it
+/// already `written`.
+#[derive(Debug, Clone, Copy)]
+struct ChunkBudget {
+    written: usize,
+    maximum_size: Option<u64>,
+}
+
 /// Stores job state and results in the shared object store.
 ///
 /// Layout:
@@ -350,7 +358,16 @@ impl JobStore {
             // Flush chunk if we've reached the chunk size
             if current_chunk_rows >= self.chunk_size {
                 let bytes = self
-                    .write_chunk(job_id, driver, chunk_index, &current_chunk_batches)
+                    .write_chunk(
+                        job_id,
+                        driver,
+                        chunk_index,
+                        &current_chunk_batches,
+                        ChunkBudget {
+                            written: total_bytes,
+                            maximum_size: state.maximum_size,
+                        },
+                    )
                     .await?;
                 total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
                     super::error::Error::IntegerOverflow {
@@ -359,12 +376,6 @@ impl JobStore {
                         right_value: bytes,
                     }
                 })?;
-
-                if let Some(maximum_size) = state.maximum_size
-                    && (total_bytes as u64) > maximum_size
-                {
-                    return Err(super::error::Error::MaximumJobSizeExceeded { maximum_size });
-                }
 
                 chunk_indices.push(chunk_index);
                 chunk_row_offsets.push(committed_rows);
@@ -391,7 +402,16 @@ impl JobStore {
         // Flush remaining batches
         if !current_chunk_batches.is_empty() {
             let bytes = self
-                .write_chunk(job_id, driver, chunk_index, &current_chunk_batches)
+                .write_chunk(
+                    job_id,
+                    driver,
+                    chunk_index,
+                    &current_chunk_batches,
+                    ChunkBudget {
+                        written: total_bytes,
+                        maximum_size: state.maximum_size,
+                    },
+                )
                 .await?;
             total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
                 super::error::Error::IntegerOverflow {
@@ -400,12 +420,6 @@ impl JobStore {
                     right_value: bytes,
                 }
             })?;
-
-            if let Some(maximum_size) = state.maximum_size
-                && (total_bytes as u64) > maximum_size
-            {
-                return Err(super::error::Error::MaximumJobSizeExceeded { maximum_size });
-            }
 
             chunk_indices.push(chunk_index);
             chunk_row_offsets.push(committed_rows);
@@ -478,6 +492,7 @@ impl JobStore {
         driver: &JobDriver,
         chunk_index: usize,
         batches: &[RecordBatch],
+        budget: ChunkBudget,
     ) -> Result<usize> {
         if batches.is_empty() {
             return Ok(0);
@@ -499,6 +514,15 @@ impl JobStore {
 
         let path = self.chunk_path(job_id, chunk_index);
         let bytes_len = buffer.len();
+
+        // Checked before the chunk is stored, so a job that fails for its size never leaves
+        // more than `maximum_size` bytes of results behind.
+        if let Some(maximum_size) = budget.maximum_size
+            && u64::try_from(budget.written.saturating_add(bytes_len)).unwrap_or(u64::MAX)
+                > maximum_size
+        {
+            return Err(super::error::Error::MaximumJobSizeExceeded { maximum_size });
+        }
 
         let written = fenced_put(
             self.store.as_ref(),
@@ -1824,6 +1848,12 @@ mod tests {
             assert!(
                 matches!(result, Err(Error::MaximumJobSizeExceeded { .. })),
                 "Expected MaximumJobSizeExceeded error, got: {result:?}"
+            );
+            // The chunk that would pass the limit is never stored.
+            let chunk = job_store.read_chunk(&state.job_id, 0).await;
+            assert!(
+                matches!(chunk, Err(Error::ChunkNotFound { chunk_index: 0, .. })),
+                "a chunk over the maximum size must not be stored, got: {chunk:?}"
             );
         }
 
