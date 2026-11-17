@@ -169,6 +169,7 @@ impl StaleDatasets {
     }
 
     /// How long ago `dataset` last changed, while it is stale.
+    #[cfg(test)]
     pub(super) fn stale_for(&self, dataset: &str) -> Option<Duration> {
         self.datasets
             .lock()
@@ -178,6 +179,7 @@ impl StaleDatasets {
     }
 
     /// How many reloads of `dataset` were refused.
+    #[cfg(test)]
     pub(super) fn refused(&self, dataset: &str) -> u64 {
         self.datasets
             .lock()
@@ -292,7 +294,7 @@ impl Reload {
             .with_rebuild_from_this_batch(true);
         // The staged batches are freed; the replacement stays charged to the
         // pool until the apply loop commits or drops it.
-        let mut reservation = self.reservation;
+        let reservation = self.reservation;
         reservation.resize(batch.record.get_array_memory_size());
         Ok(ChangeEnvelope::from_parts(
             Box::new(ReplacementCommitter {
