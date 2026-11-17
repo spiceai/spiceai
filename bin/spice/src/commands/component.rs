@@ -260,6 +260,49 @@ pub enum ComponentCommand {
     Configure(ComponentConfigureArgs),
 }
 
+/// Component add/configure for sections with no `enabled` field.
+///
+/// `--enable`/`--disable` are refused at runtime for these sections, so they are hidden
+/// from help the same way `spice dataset add|configure` hides them.
+#[derive(Args, Debug)]
+#[command(
+    about = "Add or configure a component entry in spicepod.yaml",
+    long_about = COMPONENT_LONG_ABOUT,
+)]
+pub struct ComponentArgsWithoutEnable {
+    #[command(subcommand)]
+    pub command: ComponentCommandWithoutEnable,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ComponentCommandWithoutEnable {
+    /// Add a new component or component reference
+    // These sections have no `enabled` field, so --enable/--disable are refused; keep them out of help.
+    #[command(mut_arg("enable", |arg| arg.hide(true)), mut_arg("disable", |arg| arg.hide(true)))]
+    Add(ComponentAddArgs),
+
+    /// Create or update a component by name
+    #[command(mut_arg("enable", |arg| arg.hide(true)), mut_arg("disable", |arg| arg.hide(true)))]
+    Configure(ComponentConfigureArgs),
+}
+
+impl From<ComponentCommandWithoutEnable> for ComponentCommand {
+    fn from(command: ComponentCommandWithoutEnable) -> Self {
+        match command {
+            ComponentCommandWithoutEnable::Add(args) => Self::Add(args),
+            ComponentCommandWithoutEnable::Configure(args) => Self::Configure(args),
+        }
+    }
+}
+
+impl From<ComponentArgsWithoutEnable> for ComponentArgs {
+    fn from(args: ComponentArgsWithoutEnable) -> Self {
+        Self {
+            command: args.command.into(),
+        }
+    }
+}
+
 #[derive(Args, Debug, Default)]
 pub struct ComponentAddArgs {
     /// Component name for inline definitions
@@ -409,6 +452,41 @@ pub struct SingletonArgs {
 pub enum SingletonCommand {
     /// Create or update this section
     Configure(SingletonConfigureArgs),
+}
+
+/// Runtime configure args: `--enable`/`--disable` are refused, so they are hidden from help.
+#[derive(Args, Debug)]
+#[command(
+    about = "Configure a singleton Spicepod section",
+    long_about = SINGLETON_LONG_ABOUT,
+)]
+pub struct SingletonArgsWithoutEnable {
+    #[command(subcommand)]
+    pub command: SingletonCommandWithoutEnable,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SingletonCommandWithoutEnable {
+    /// Create or update this section
+    // runtime has no `enabled` field, so --enable/--disable are refused; keep them out of help.
+    #[command(mut_arg("enable", |arg| arg.hide(true)), mut_arg("disable", |arg| arg.hide(true)))]
+    Configure(SingletonConfigureArgs),
+}
+
+impl From<SingletonCommandWithoutEnable> for SingletonCommand {
+    fn from(command: SingletonCommandWithoutEnable) -> Self {
+        match command {
+            SingletonCommandWithoutEnable::Configure(args) => Self::Configure(args),
+        }
+    }
+}
+
+impl From<SingletonArgsWithoutEnable> for SingletonArgs {
+    fn from(args: SingletonArgsWithoutEnable) -> Self {
+        Self {
+            command: args.command.into(),
+        }
+    }
 }
 
 #[derive(Args, Debug, Default)]
@@ -2002,5 +2080,46 @@ mod tests {
                 .and_then(Value::as_str),
             Some("yaml:literal")
         );
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+    use clap::{Args, Command};
+
+    fn subcommand_help<T: Args>(top: &str, name: &str) -> String {
+        let mut command = T::augment_args(Command::new("component"));
+        command
+            .find_subcommand_mut(name)
+            .unwrap_or_else(|| panic!("{top} {name} should exist"))
+            .render_long_help()
+            .to_string()
+    }
+
+    #[test]
+    fn component_help_hides_enable_when_unsupported() {
+        for name in ["add", "configure"] {
+            let hidden = subcommand_help::<ComponentArgsWithoutEnable>("view", name);
+            assert!(!hidden.contains("--enable"), "{name}: {hidden}");
+            assert!(!hidden.contains("--disable"), "{name}: {hidden}");
+            assert!(hidden.contains("--set"), "{name}: {hidden}");
+
+            let visible = subcommand_help::<ComponentArgs>("function", name);
+            assert!(visible.contains("--enable"), "{name}: {visible}");
+            assert!(visible.contains("--disable"), "{name}: {visible}");
+        }
+    }
+
+    #[test]
+    fn runtime_help_hides_enable() {
+        let hidden = subcommand_help::<SingletonArgsWithoutEnable>("runtime", "configure");
+        assert!(!hidden.contains("--enable"), "{hidden}");
+        assert!(!hidden.contains("--disable"), "{hidden}");
+        assert!(hidden.contains("--set"), "{hidden}");
+
+        let visible = subcommand_help::<SingletonArgs>("management", "configure");
+        assert!(visible.contains("--enable"), "{visible}");
+        assert!(visible.contains("--disable"), "{visible}");
     }
 }
