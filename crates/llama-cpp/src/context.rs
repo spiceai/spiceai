@@ -140,9 +140,6 @@ unsafe impl Send for Context<'_> {}
 
 impl Context<'_> {
     pub(crate) fn from_raw(raw: NonNull<sys::llama_context>) -> Self {
-        // What llama.cpp reported while creating a context it then created is no reason for
-        // one of the context's decodes to fail.
-        crate::log::clear_last_error();
         Self {
             raw,
             _model: PhantomData,
@@ -183,19 +180,18 @@ impl Context<'_> {
 
     /// Decodes `batch`, computing the logits of the tokens it marks for output.
     ///
-    /// A failed decode's reason ends with the errors llama.cpp logged on this thread since the
-    /// last decode that succeeded. A GPU backend computes asynchronously and reports a failed
-    /// command buffer when the thread next waits for it, such as reading the last decode's
-    /// logits, so the lines that name why a decode returned -3 are logged before that decode
-    /// starts, not during it.
+    /// A failed decode's reason ends with the errors llama.cpp logged during this call, on this
+    /// thread. Only this call's: the thread may serve other contexts, such as an MTP draft
+    /// context, whose errors are not this decode's reason. A GPU backend computes
+    /// asynchronously, so a command buffer that failed after an earlier decode is reported
+    /// while the thread waits for it; that line is not carried, but the backend then refuses
+    /// every later graph and says so during the decode that returns -3.
     pub fn decode(&mut self, batch: &Batch) -> Result<()> {
+        crate::log::clear_last_error();
         // SAFETY: the batch's arrays hold `n_tokens` entries; llama.cpp copies what it keeps.
         let status = unsafe { sys::llama_decode(self.raw.as_ptr(), batch.raw) };
         let what = match status {
-            0 => {
-                crate::log::clear_last_error();
-                return Ok(());
-            }
+            0 => return Ok(()),
             1 => "the context has no room left for the batch".to_string(),
             2 => "decoding was aborted".to_string(),
             -1 => "the batch is invalid".to_string(),
