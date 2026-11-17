@@ -665,17 +665,11 @@ mod tests {
         let (e_f64, a_f64) =
             cast_pair_to_f64(expected.column(0).as_ref(), actual.column(0).as_ref())
                 .expect("both cast to f64");
-        #[expect(
-            clippy::float_cmp,
-            reason = "bit-exact f64 equality IS the collision being guarded"
-        )]
-        {
-            assert_eq!(
-                e_f64.value(0),
-                a_f64.value(0),
-                "premise: f64 must collide here, or this test proves nothing"
-            );
-        }
+        assert_eq!(
+            e_f64.value(0),
+            a_f64.value(0),
+            "premise: f64 must collide here, or this test proves nothing"
+        );
 
         let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
         assert!(

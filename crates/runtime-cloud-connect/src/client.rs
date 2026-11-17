@@ -2457,7 +2457,7 @@ mod tests {
         // No enrollment bundle and no dev CA: native roots alone.
         let trust = server_trust("", None);
         assert!(trust.native_roots);
-        assert!(trust.extra_cas.is_empty());
+        assert_eq!(trust.extra_cas, [] as [&str; 0]);
     }
 
     #[test]

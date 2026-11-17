@@ -445,7 +445,7 @@ mod tests {
         .expect("batch should not be empty");
 
         assert!(matches!(batch.op(0), ChangeOperation::Truncate));
-        assert!(batch.primary_keys(0).is_empty());
+        assert_eq!(batch.primary_keys(0), [] as [String; 0]);
     }
 
     #[test]
@@ -476,7 +476,7 @@ mod tests {
 
         assert_eq!(batch.record.num_rows(), 1);
         assert!(matches!(batch.op(0), ChangeOperation::Truncate));
-        assert!(batch.primary_keys(0).is_empty());
+        assert_eq!(batch.primary_keys(0), [] as [String; 0]);
     }
 
     #[test]

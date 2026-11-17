@@ -9717,7 +9717,7 @@ mod tests {
             .get_table("test_table")
             .await
             .expect("Failed to get table");
-        assert!(metadata.primary_key.is_empty());
+        assert_eq!(metadata.primary_key, [] as [String; 0]);
         assert_eq!(metadata.table_id, table_id_1);
 
         // Now try to create with a primary key change — should fall back to stored config
@@ -9745,7 +9745,7 @@ mod tests {
             .get_table("test_table")
             .await
             .expect("Failed to get table");
-        assert!(metadata.primary_key.is_empty());
+        assert_eq!(metadata.primary_key, [] as [String; 0]);
         assert_eq!(metadata.table_id, table_id_1);
 
         // Recreate with the SAME config — should return the same table_id
@@ -11701,8 +11701,14 @@ mod tests {
             id_schema(),
         );
         let requested = requested_like(&stored, |_| {});
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
-        assert!(layout_setting_changes(&stored.vortex_config, &requested.vortex_config).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
+        assert_eq!(
+            layout_setting_changes(&stored.vortex_config, &requested.vortex_config),
+            [] as [SettingChange; 0]
+        );
     }
 
     #[test]
@@ -11746,7 +11752,10 @@ mod tests {
         let requested = requested_like(&stored, |options| {
             options.on_conflict = Some(upsert_on(&["id"]));
         });
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
     }
 
     fn with_detection(pk_conflict_detection: PkConflictDetection) -> crate::metadata::VortexConfig {
@@ -11908,7 +11917,10 @@ mod tests {
             options.vortex_config = with_detection(PkConflictDetection::None);
         });
         assert!(disables_pk_conflict_detection(&stored, &requested));
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
     }
 
     /// A table without conflict detection resolves no conflicts whatever its row records,
@@ -11931,7 +11943,10 @@ mod tests {
         let requested = requested_like(&stored, |options| {
             options.on_conflict = None;
         });
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
     }
 
     #[test]
@@ -11972,7 +11987,10 @@ mod tests {
         let requested = requested_like(&stored, |options| {
             options.base_path = "/data/trips".to_string();
         });
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
     }
 
     /// Layout settings change how rows are written, never what a stored row means, so
@@ -11997,7 +12015,10 @@ mod tests {
                 ..crate::metadata::VortexConfig::default()
             };
         });
-        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            identity_setting_changes(&stored, &requested),
+            [] as [SettingChange; 0]
+        );
         assert_eq!(
             described(&layout_setting_changes(
                 &stored.vortex_config,
@@ -12289,13 +12310,13 @@ mod tests {
             refused.to_string(),
             "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id'])"
         );
-        assert!(
+        assert_eq!(
             catalog
                 .get_table("trips")
                 .await
                 .expect("read the table")
-                .primary_key
-                .is_empty()
+                .primary_key,
+            [] as [String; 0]
         );
 
         // The same change while the source cannot be read on the table's schema: kept,
@@ -12311,13 +12332,13 @@ mod tests {
                 .expect("reopen while the source cannot be read"),
             table_id
         );
-        assert!(
+        assert_eq!(
             catalog
                 .get_table("trips")
                 .await
                 .expect("read the table")
-                .primary_key
-                .is_empty()
+                .primary_key,
+            [] as [String; 0]
         );
 
         // The same change when the caller keeps stored tables: the stored settings win
@@ -12334,7 +12355,7 @@ mod tests {
             table_id
         );
         let stored = catalog.get_table("trips").await.expect("read the table");
-        assert!(stored.primary_key.is_empty());
+        assert_eq!(stored.primary_key, [] as [String; 0]);
         assert_eq!(stored.vortex_config.sort_columns, vec!["id".to_string()]);
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);

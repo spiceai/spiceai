@@ -1821,7 +1821,7 @@ mod tests {
             write_concurrency: Some(8),
             ..VortexConfig::default()
         };
-        assert!(ok.config_warnings(8).is_empty());
+        assert_eq!(ok.config_warnings(8), [] as [String; 0]);
     }
 
     #[test]

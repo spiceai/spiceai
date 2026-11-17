@@ -1288,11 +1288,12 @@ mod tests {
         assert_eq!(body["context"], json!("context"));
         assert_eq!(body["sql"]["engine"], json!("Apache DataFusion"));
         assert_eq!(body["sql"]["dialect"], json!("PostgreSQL"));
-        assert!(
+        assert_eq!(
             body["datasets"]
                 .as_array()
                 .expect("datasets should be an array")
-                .is_empty()
+                .as_slice(),
+            [] as [serde_json::Value; 0]
         );
     }
 
@@ -1320,7 +1321,7 @@ mod tests {
         assert_eq!(options.sampling_limit, DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT);
         assert!(!options.include_examples);
         assert_eq!(options.examples_limit, DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT);
-        assert!(request.datasets.is_empty());
+        assert_eq!(request.datasets, [] as [String; 0]);
     }
 
     #[test]
@@ -1733,7 +1734,10 @@ mod tests {
             vec![test_user_function_info("Registered_Fn")],
         );
 
-        assert!(entries.is_empty());
+        assert_eq!(
+            entries,
+            [] as [crate::model::nsql::UserFunctionContextEntry; 0]
+        );
     }
 
     // regression test for #14394

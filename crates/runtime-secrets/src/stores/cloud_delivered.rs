@@ -286,7 +286,7 @@ mod tests {
         store.replace(values(&[("dropped", b"1"), ("kept", b"2")]));
 
         let update = store.install_new(&values(&[("kept", b"2")]));
-        assert!(update.installed.is_empty());
+        assert_eq!(update.installed, [] as [String; 0]);
         assert_eq!(update.pending, vec!["dropped"]);
         assert_eq!(store.names(), vec!["dropped", "kept"]);
     }
@@ -353,6 +353,6 @@ mod tests {
     fn starts_empty() {
         let store = CloudDeliveredSecretStore::new();
         assert!(store.is_empty());
-        assert!(store.names().is_empty());
+        assert_eq!(store.names(), [] as [String; 0]);
     }
 }

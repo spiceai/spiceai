@@ -3101,7 +3101,7 @@ mod tests {
             let input = Cursor::new(b"[]".to_vec());
             let mut adapter = ArrayToNdjson::try_new(input).expect("should parse empty array");
             let lines = read_all_lines(&mut adapter).expect("should read lines");
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
         }
 
         /// JSON array with a single element
@@ -3615,7 +3615,7 @@ mod tests {
                 // Either we get an error or we get partial results
                 if let Ok(lines) = result {
                     // If it somehow succeeded, we should at least have the valid element
-                    assert!(!lines.is_empty());
+                    assert_ne!(lines, [] as [String; 0]);
                 }
             }
         }
@@ -3877,7 +3877,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            assert!(output.trim().is_empty());
+            assert_eq!(output.trim(), "");
         }
 
         #[test]
@@ -5265,7 +5265,7 @@ mod tests {
             let lines =
                 ndjson_lines(&empty).expect("whitespace in an empty array must still parse");
             let elapsed = started.elapsed();
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
             assert!(
                 elapsed < limit,
                 "skipping {SPACES} empty-array bytes took {elapsed:?}"
@@ -5321,10 +5321,9 @@ mod tests {
         let mut empty = vec![b'['];
         empty.resize(empty.len() + 1024 * 1024, b' ');
         empty.push(b']');
-        assert!(
-            push_chunked(&empty, 4096)
-                .expect("gap in an empty array")
-                .is_empty()
+        assert_eq!(
+            push_chunked(&empty, 4096).expect("gap in an empty array"),
+            [] as [String; 0]
         );
 
         let mut small = br"[1".to_vec();
@@ -5625,7 +5624,7 @@ mod tests {
             let adapter =
                 ArrayToNdjson::try_new(Cursor::new(data)).expect("should parse empty array");
             let lines = read_all_lines(adapter).expect("should read");
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
         }
 
         #[test]
@@ -5652,7 +5651,10 @@ mod tests {
             assert_eq!(r0["meta"]["version"], 1);
 
             let r2: serde_json::Value = serde_json::from_str(&lines[2]).expect("parse");
-            assert!(r2["tags"].as_array().expect("tags").is_empty());
+            assert_eq!(
+                r2["tags"].as_array().expect("tags").as_slice(),
+                [] as [serde_json::Value; 0]
+            );
         }
 
         #[test]
@@ -5690,7 +5692,7 @@ mod tests {
         fn test_file_array_empty_auto_detect() {
             let data = load_fixture("array_empty.json");
             let lines = auto_detect_and_read(&data).expect("auto-detect empty array");
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
         }
 
         #[test]
@@ -6070,7 +6072,7 @@ mod tests {
         fn test_file_soda_empty_data_auto_detect() {
             let data = load_fixture("soda_empty_data.json");
             let lines = auto_detect_and_read(&data).expect("auto-detect empty SODA");
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
         }
     }
 

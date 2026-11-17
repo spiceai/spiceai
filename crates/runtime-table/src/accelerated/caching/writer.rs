@@ -319,7 +319,7 @@ impl Drop for CachePublication {
         let _ =
             self.freshness
                 .revision
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
                     Some(revision.saturating_add(1))
                 });
     }

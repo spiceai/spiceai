@@ -7097,7 +7097,10 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert_eq!(names(&reloading), ["child", "grandchild"]);
 
         // Nothing changed, nothing reloads.
-        assert!(with_localpod_dependents(vec![], &all).is_empty());
+        assert_eq!(
+            with_localpod_dependents(vec![], &all),
+            [] as [Arc<Dataset>; 0]
+        );
     }
 
     /// Two `localpod` datasets reading through each other can never load; the ordering walk
