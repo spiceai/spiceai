@@ -1616,7 +1616,14 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
     let local_manifest = local_spicepod_manifest(&spicepod_path);
 
     if let Some(deployed) = cloud_managed_spicepod {
-        match AppBuilder::build_from_path(deployed.path.clone()).await {
+        // Built from the bytes that were read and checked, not by reopening the
+        // path, which could name another file by now.
+        match AppBuilder::build_from_manifest_bytes(
+            deployed.spicepod_yaml.as_bytes().to_vec(),
+            &deployed.path,
+        )
+        .await
+        {
             Ok(mut app) => {
                 app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
                 deployment_note = Some(cloud_managed_deployed_note(

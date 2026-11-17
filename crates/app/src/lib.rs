@@ -16,7 +16,11 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -720,6 +724,29 @@ impl AppBuilder {
             .await
             .context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
         Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
+    }
+
+    /// Build an app from a manifest file's contents, already read into memory.
+    ///
+    /// `manifest_path` is the file the bytes came from: errors name it, and
+    /// component references and dependencies resolve relative to its directory,
+    /// exactly as [`Self::build_from_path`] resolves them for that file. The
+    /// file itself is not reopened, so the app is built from the bytes the
+    /// caller read and checked.
+    pub async fn build_from_manifest_bytes(
+        bytes: Vec<u8>,
+        manifest_path: impl Into<PathBuf>,
+    ) -> Result<App> {
+        let path = manifest_path.into();
+        let base_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let spicepod_root = Spicepod::load_from_bytes(bytes, base_path.clone())
+            .await
+            .context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
+        Self::build_from_spicepod(spicepod_root, base_path).await
     }
 
     pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {

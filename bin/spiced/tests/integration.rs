@@ -31,6 +31,7 @@ limitations under the License.
 
 mod build_logging;
 mod cloud_connect_bootstrap;
+mod cloud_managed_spicepod;
 mod cpu_budget;
 mod dependency_logging;
 #[cfg(unix)]
