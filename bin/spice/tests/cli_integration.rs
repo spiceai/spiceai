@@ -416,6 +416,134 @@ mod login {
         }
     }
 
+    /// Everything `spice` printed, both streams, for asserting on an error
+    /// whichever stream it is written to.
+    fn combined_output(output: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// A checkout can ship `.env` or `.env.local` as a link to any file the user
+    /// can write. `spice login` must refuse it rather than rewrite, `chmod`, and
+    /// place a credential in whatever the link names.
+    #[cfg(unix)]
+    #[test]
+    fn test_login_refuses_a_linked_env_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in [".env", ".env.local"] {
+            let temp_dir = TempDir::new().expect("temp dir should be creatable");
+            let target = temp_dir.path().join("unrelated.conf");
+            fs::write(&target, "untouched\n").expect("write the link target");
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+                .expect("set the target mode");
+            let link = temp_dir.path().join(name);
+            std::os::unix::fs::symlink(&target, &link).expect("create the env link");
+
+            let output = spice_cmd()
+                .current_dir(temp_dir.path())
+                .args(["login", "--key", "sk_test_abc123"])
+                .output()
+                .expect("run spice login");
+
+            let printed = combined_output(&output);
+            assert!(!output.status.success(), "{name}: login must fail: {printed}");
+            assert!(
+                printed.contains(&format!("configuration at {name}: it is a symbolic link"))
+                    && printed.contains("--output keychain"),
+                "{name}: the error must name the file, the reason and the fix: {printed}"
+            );
+            assert_eq!(
+                fs::read_to_string(&target).expect("read the link target"),
+                "untouched\n",
+                "{name}: the link target must not be rewritten"
+            );
+            assert_eq!(
+                fs::metadata(&target)
+                    .expect("stat the link target")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644,
+                "{name}: the link target's mode must not change"
+            );
+            assert!(
+                fs::symlink_metadata(&link)
+                    .expect("stat the link")
+                    .file_type()
+                    .is_symlink(),
+                "{name}: the link itself is left for the user to replace"
+            );
+        }
+    }
+
+    /// Something other than a regular file at `.env` is refused the same way.
+    #[test]
+    fn test_login_refuses_an_env_path_that_is_not_a_file() {
+        let temp_dir = TempDir::new().expect("temp dir should be creatable");
+        fs::create_dir(temp_dir.path().join(".env")).expect("create a directory at .env");
+
+        let output = spice_cmd()
+            .current_dir(temp_dir.path())
+            .args(["login", "--key", "sk_test_abc123"])
+            .output()
+            .expect("run spice login");
+
+        let printed = combined_output(&output);
+        assert!(!output.status.success(), "login must fail: {printed}");
+        assert!(
+            printed.contains("configuration at .env: it is not a regular file"),
+            "{printed}"
+        );
+    }
+
+    /// An existing regular `.env` keeps its other variables, ends up
+    /// owner-only, and no staging file is left beside it.
+    #[test]
+    fn test_login_merges_into_an_existing_env_file() {
+        let temp_dir = TempDir::new().expect("temp dir should be creatable");
+        let env_path = temp_dir.path().join(".env");
+        fs::write(&env_path, "OTHER_SETTING=kept\n").expect("write the existing .env");
+
+        spice_cmd()
+            .current_dir(temp_dir.path())
+            .args(["login", "--key", "sk_test_abc123"])
+            .assert()
+            .success();
+
+        assert_eq!(
+            fs::read_to_string(&env_path).expect("read .env"),
+            "OTHER_SETTING=kept\nSPICE_SPICEAI_API_KEY=sk_test_abc123\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&env_path)
+                    .expect("stat .env")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "the credential file must be owner-only"
+            );
+        }
+        let entries: Vec<String> = fs::read_dir(temp_dir.path())
+            .expect("list the directory")
+            .map(|entry| {
+                entry
+                    .expect("read an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(entries, [".env"], "no staging file may be left behind");
+    }
+
     /// Provider regression guard: the `SharePoint` and ABFS logins keep their
     /// OAuth device-code flows and vocabulary — their help still asks for the
     /// Azure AD tenant/client pair rather than anything session-based.
@@ -872,6 +1000,276 @@ mod add {
                 .exists(),
             "local yml dependency should be normalized to spicepod.yaml"
         );
+    }
+
+    /// What the stub registry answers a pod request with.
+    enum RegistryReply {
+        /// A complete archive, with its `Content-Length`.
+        Archive(Vec<u8>),
+        /// Only a `Content-Length` header claiming this many bytes.
+        Claims(u64),
+        /// A chunked body of zeros, sent until the client hangs up.
+        Endless,
+    }
+
+    /// A Spicerack registry answering every request with `reply`, from a thread
+    /// of this process. Returns its base URL, for `SPICERACK_BASE_URL`.
+    fn stub_registry(reply: RegistryReply) -> String {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stub registry");
+        let port = listener.local_addr().expect("stub registry address").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(reader) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                match &reply {
+                    RegistryReply::Archive(body) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(body);
+                    }
+                    RegistryReply::Claims(len) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {len}\r\nConnection: close\r\n\r\nPK"
+                        );
+                    }
+                    RegistryReply::Endless => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        );
+                        let chunk = vec![0_u8; 1024 * 1024];
+                        while write!(stream, "{:x}\r\n", chunk.len()).is_ok()
+                            && stream.write_all(&chunk).is_ok()
+                            && stream.write_all(b"\r\n").is_ok()
+                        {}
+                    }
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// A stored archive holding `entries`.
+    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, contents) in entries {
+            writer.start_file(*name, options).expect("start an entry");
+            writer.write_all(contents).expect("write an entry");
+        }
+        writer.finish().expect("finish the archive").into_inner()
+    }
+
+    const POD_MANIFEST: &[u8] = b"version: v1\nkind: Spicepod\nname: pod\n";
+
+    /// Run `spice add evil/pod` in `project` against the registry at `base_url`.
+    fn add_from_registry(project: &std::path::Path, base_url: &str) -> std::process::Output {
+        spice_cmd()
+            .current_dir(project)
+            .env("SPICERACK_BASE_URL", base_url)
+            .args(["add", "evil/pod"])
+            .timeout(std::time::Duration::from_mins(2))
+            .output()
+            .expect("run spice add")
+    }
+
+    fn printed(output: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// Assert `spice add` failed with `expected` in its error and left no
+    /// trace: no pod directory, no staging directory, no dependency entry.
+    fn assert_refused_and_nothing_installed(
+        project: &std::path::Path,
+        output: &std::process::Output,
+        expected: &str,
+    ) {
+        let printed = printed(output);
+        assert!(!output.status.success(), "spice add must fail: {printed}");
+        assert!(printed.contains(expected), "expected '{expected}' in: {printed}");
+        assert!(printed.contains("so nothing was installed"), "{printed}");
+        assert!(
+            !project.join("spicepods").exists(),
+            "a refused archive must leave no pods directory: {:?}",
+            fs::read_dir(project.join("spicepods")).map(|entries| entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+        );
+        assert!(
+            !project.join("spicepod.yaml").exists(),
+            "a refused archive must not be registered as a dependency"
+        );
+    }
+
+    /// An archive whose entries declare more expanded bytes than a package may
+    /// hold is refused before anything is written.
+    #[test]
+    fn test_add_refuses_an_archive_that_expands_past_the_package_limit() {
+        let mut body = archive(&[("spicepod.yaml", POD_MANIFEST), ("data.bin", &[0_u8; 16])]);
+        // Declare 2 GiB for `data.bin` in the central directory, which is what a
+        // highly compressed entry of that size looks like before it is read.
+        let central = body
+            .windows(4)
+            .rposition(|window| window == b"PK\x01\x02")
+            .expect("the archive has a central directory entry");
+        body[central + 24..central + 28].copy_from_slice(&0x8000_0000_u32.to_le_bytes());
+
+        let project = TempDir::new().expect("create the project");
+        let output = add_from_registry(project.path(), &stub_registry(RegistryReply::Archive(body)));
+        let declared = 0x8000_0000_u64 + POD_MANIFEST.len() as u64;
+        assert_refused_and_nothing_installed(
+            project.path(),
+            &output,
+            &format!(
+                "the archive expands to {declared} bytes, more than the 1024 MiB a Spicepod package may expand to"
+            ),
+        );
+    }
+
+    #[test]
+    fn test_add_refuses_an_archive_with_too_many_entries() {
+        let names: Vec<String> = (0..10_001).map(|i| format!("f/{i}.txt")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+
+        let project = TempDir::new().expect("create the project");
+        let output = add_from_registry(
+            project.path(),
+            &stub_registry(RegistryReply::Archive(archive(&entries))),
+        );
+        assert_refused_and_nothing_installed(
+            project.path(),
+            &output,
+            "the archive holds 10001 entries, more than the 10000 a Spicepod package may hold",
+        );
+    }
+
+    /// An entry naming a path outside the pod directory fails the install
+    /// instead of being skipped, and an earlier install of the pod is untouched.
+    #[test]
+    fn test_add_refuses_an_archive_entry_outside_the_pod_directory() {
+        let project = TempDir::new().expect("create the project");
+        let installed = project.path().join("spicepods/evil/pod");
+        fs::create_dir_all(&installed).expect("create an earlier install");
+        fs::write(installed.join("spicepod.yaml"), "earlier\n").expect("write the earlier install");
+
+        let output = add_from_registry(
+            project.path(),
+            &stub_registry(RegistryReply::Archive(archive(&[
+                ("spicepod.yaml", POD_MANIFEST),
+                ("../../../escaped.txt", b"outside\n"),
+            ]))),
+        );
+
+        let printed = printed(&output);
+        assert!(!output.status.success(), "spice add must fail: {printed}");
+        assert!(
+            printed.contains("the archive entry '../../../escaped.txt' does not name a file inside the Spicepod directory, so nothing was installed"),
+            "{printed}"
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("spicepod.yaml")).expect("read the earlier install"),
+            "earlier\n",
+            "a refused archive must leave the earlier install as it was"
+        );
+        let leftovers: Vec<_> = fs::read_dir(project.path().join("spicepods"))
+            .expect("list the pods directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(leftovers, ["evil"], "no staging directory may be left behind");
+        assert!(!project.path().join("escaped.txt").exists());
+    }
+
+    /// A registry that announces a body larger than a package may be is
+    /// refused before the body is read.
+    #[test]
+    fn test_add_refuses_an_announced_download_larger_than_a_package() {
+        let project = TempDir::new().expect("create the project");
+        let output = add_from_registry(
+            project.path(),
+            &stub_registry(RegistryReply::Claims(10 * 1024 * 1024 * 1024)),
+        );
+        assert_refused_and_nothing_installed(
+            project.path(),
+            &output,
+            "the archive is 10737418240 bytes, more than the 256 MiB a Spicepod package may be",
+        );
+    }
+
+    /// Without a `Content-Length`, the download stops as soon as it passes the
+    /// limit rather than when the registry stops sending.
+    #[test]
+    fn test_add_stops_an_unannounced_download_at_the_package_limit() {
+        let project = TempDir::new().expect("create the project");
+        let output = add_from_registry(project.path(), &stub_registry(RegistryReply::Endless));
+        assert_refused_and_nothing_installed(
+            project.path(),
+            &output,
+            "the archive is larger than the 256 MiB a Spicepod package may be",
+        );
+    }
+
+    /// A package within the limits installs, and installing it again writes its
+    /// files over the earlier install, leaving no staging directory behind.
+    #[test]
+    fn test_add_installs_and_reinstalls_a_registry_package() {
+        let project = TempDir::new().expect("create the project");
+        let first = stub_registry(RegistryReply::Archive(archive(&[
+            ("spicepod.yaml", POD_MANIFEST),
+            ("docs/README.md", b"first\n"),
+        ])));
+        let output = add_from_registry(project.path(), &first);
+        assert!(output.status.success(), "{}", printed(&output));
+
+        let pod = project.path().join("spicepods/evil/pod");
+        fs::write(pod.join("local-notes.md"), "mine\n").expect("add a file of the user's own");
+        let second = stub_registry(RegistryReply::Archive(archive(&[
+            ("spicepod.yaml", POD_MANIFEST),
+            ("docs/README.md", b"second\n"),
+        ])));
+        let output = add_from_registry(project.path(), &second);
+        assert!(output.status.success(), "{}", printed(&output));
+
+        assert_eq!(
+            fs::read(pod.join("spicepod.yaml")).expect("read the manifest"),
+            POD_MANIFEST
+        );
+        assert_eq!(
+            fs::read_to_string(pod.join("docs/README.md")).expect("read the readme"),
+            "second\n"
+        );
+        assert_eq!(
+            fs::read_to_string(pod.join("local-notes.md")).expect("read the user's file"),
+            "mine\n",
+            "re-adding writes the package over the install, as before, and keeps other files"
+        );
+        let entries: Vec<_> = fs::read_dir(project.path().join("spicepods"))
+            .expect("list the pods directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(entries, ["evil"], "no staging directory may be left behind");
     }
 }
 

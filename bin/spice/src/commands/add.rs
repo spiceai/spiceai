@@ -130,7 +130,9 @@ fn registry_error(error: &registry::Error) -> crate::error::Error {
     match error {
         registry::Error::FetchFailed { .. }
         | registry::Error::NotAnArchive { .. }
-        | registry::Error::ZipExtraction { .. } => crate::error::Error::Registry { message },
+        | registry::Error::ZipExtraction { .. }
+        | registry::Error::ArchiveLimitExceeded { .. }
+        | registry::Error::UnsafeArchiveEntry { .. } => crate::error::Error::Registry { message },
         registry::Error::NotFound { .. }
         | registry::Error::DirectoryNotFound { .. }
         | registry::Error::InvalidSpicepod { .. }

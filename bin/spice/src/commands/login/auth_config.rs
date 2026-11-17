@@ -38,11 +38,12 @@ use std::path::{Path, PathBuf};
 pub fn merge_auth_config(auth_type: &str, params: &[(&str, &str)]) -> Result<()> {
     let env_file = env_file_path();
 
-    // Read existing env vars (ignore errors - file might not exist)
-    let mut env_vars: HashMap<String, String> = if env_file.exists() {
-        read_env_file(&env_file).unwrap_or_default()
-    } else {
-        HashMap::new()
+    // The existing variables are read only from a regular file. A link is
+    // refused rather than read through: its target's contents would otherwise
+    // be copied into the credential file written below.
+    let mut env_vars: HashMap<String, String> = match read_env_file_for_update(&env_file)? {
+        Some(contents) => parse_env_file(&contents),
+        None => HashMap::new(),
     };
 
     // Add new auth params
@@ -51,20 +52,153 @@ pub fn merge_auth_config(auth_type: &str, params: &[(&str, &str)]) -> Result<()>
         env_vars.insert(secret_key, (*value).to_string());
     }
 
-    // Write back to file
-    write_env_file(&env_file, &env_vars)?;
+    write_env_file(&env_file, &env_vars)
+}
 
-    // Set file permissions to 0600 (owner read/write only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&env_file, permissions).context(ConfigIoSnafu {
-            operation: "set permissions",
-            path: env_file,
-        })?;
+/// Why a credential file cannot be read or replaced in place, or `None` when
+/// it is absent or a regular file.
+///
+/// The env file is named relative to the working directory, which may be a
+/// checkout someone else controls. Following a link there would send the
+/// credential, the rewrite, and the permission change to whatever file the link
+/// names, so only a regular file is ever read or replaced.
+pub(crate) fn unsafe_credential_file(path: &Path) -> std::io::Result<Option<&'static str>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some("a symbolic link")),
+        Ok(metadata) if !metadata.is_file() => Ok(Some("not a regular file")),
+        Ok(_) => Ok(None),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source),
+    }
+}
+
+/// The error for a credential file that is a link or not a regular file.
+fn refuse_credential_file(operation: &'static str, path: &Path, what: &str) -> crate::error::Error {
+    crate::error::Error::ConfigIo {
+        operation,
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "it is {what}. Credentials are only read from and written to a regular file, never through a link, so no other file can receive them. Replace '{}' with a regular file, or keep credentials in the platform keychain with `spice login --output keychain`. See: https://spiceai.org/docs/cli",
+                path.display()
+            ),
+        ),
+    }
+}
+
+/// Read the env file a credential update will replace, or `None` when there is
+/// none yet.
+///
+/// # Errors
+///
+/// Returns an error when the path is a symbolic link or not a regular file, or
+/// when it cannot be read.
+pub(crate) fn read_env_file_for_update(path: &Path) -> Result<Option<String>> {
+    use std::io::Read as _;
+
+    if let Some(what) = unsafe_credential_file(path).context(ConfigIoSnafu {
+        operation: "read",
+        path: path.to_path_buf(),
+    })? {
+        return Err(refuse_credential_file("read", path, what));
     }
 
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // The check above inspected the name; these flags make the open itself
+    // refuse a link swapped in since, and keep a FIFO from blocking the read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(crate::error::Error::ConfigIo {
+                operation: "read",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let metadata = file.metadata().context(ConfigIoSnafu {
+        operation: "read",
+        path: path.to_path_buf(),
+    })?;
+    if !metadata.is_file() {
+        return Err(refuse_credential_file("read", path, "not a regular file"));
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).context(ConfigIoSnafu {
+        operation: "read",
+        path: path.to_path_buf(),
+    })?;
+    Ok(Some(contents))
+}
+
+/// Replace the env file at `path` with `contents`, owner-readable only.
+///
+/// The contents go to a new file created beside `path` with mode `0600`, which
+/// is synchronized and then renamed over `path`. The rename replaces the
+/// directory entry itself, so a link swapped in after the check below is
+/// replaced rather than followed, and a failure part-way leaves the previous
+/// file intact.
+///
+/// # Errors
+///
+/// Returns an error when `path` is a symbolic link or not a regular file, or
+/// when the new file cannot be written or moved into place.
+pub(crate) fn replace_env_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    if let Some(what) = unsafe_credential_file(path).context(ConfigIoSnafu {
+        operation: "write",
+        path: path.to_path_buf(),
+    })? {
+        return Err(refuse_credential_file("write", path, what));
+    }
+
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(".env");
+    // `tempfile` creates the file exclusively (`O_CREAT | O_EXCL`), so it never
+    // opens an existing entry, and with mode 0600 from the start.
+    let mut staged = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(directory)
+        .context(ConfigIoSnafu {
+            operation: "write",
+            path: path.to_path_buf(),
+        })?;
+    staged.write_all(contents).context(ConfigIoSnafu {
+        operation: "write",
+        path: path.to_path_buf(),
+    })?;
+    staged.as_file().sync_all().context(ConfigIoSnafu {
+        operation: "write",
+        path: path.to_path_buf(),
+    })?;
+    staged
+        .persist(path)
+        .map_err(|error| crate::error::Error::ConfigIo {
+            operation: "write",
+            path: path.to_path_buf(),
+            source: error.error,
+        })?;
+    // Make the rename durable. Best-effort: the new file is already complete.
+    #[cfg(unix)]
+    if let Ok(directory) = std::fs::File::open(directory) {
+        let _ = directory.sync_all();
+    }
     Ok(())
 }
 
@@ -109,7 +243,11 @@ fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
         operation: "read",
         path: path.to_path_buf(),
     })?;
+    Ok(parse_env_file(&contents))
+}
 
+/// Parse `KEY=value` lines, unquoting values the way [`write_env_file`] quotes them.
+fn parse_env_file(contents: &str) -> HashMap<String, String> {
     let mut vars = HashMap::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -133,7 +271,7 @@ fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
         }
     }
 
-    Ok(vars)
+    vars
 }
 
 /// Write environment variables to a .env file.
@@ -154,12 +292,7 @@ fn write_env_file(path: &Path, vars: &HashMap<String, String>) -> Result<()> {
     lines.sort();
 
     let contents = lines.join("\n") + "\n";
-    std::fs::write(path, contents).context(ConfigIoSnafu {
-        operation: "write",
-        path: path.to_path_buf(),
-    })?;
-
-    Ok(())
+    replace_env_file(path, contents.as_bytes())
 }
 
 /// Store authentication credentials in the platform keyring.

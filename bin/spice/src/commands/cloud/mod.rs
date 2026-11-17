@@ -2541,24 +2541,32 @@ fn remove_keychain_keys(keys: &[String]) -> (bool, Vec<String>) {
 
 /// Drop `keys` from the env file. Returns whether anything was removed.
 fn remove_env_file_keys(keys: &[String]) -> Result<bool> {
-    use crate::commands::login::env_file_path;
+    use crate::commands::login::{
+        env_file_path, read_env_file_for_update, replace_env_file, unsafe_credential_file,
+    };
 
     let mut removed = false;
 
     let env_file = env_file_path();
     let path = env_file.as_path();
-    if !path.exists() {
-        return Ok(removed);
+
+    // A link or other non-regular entry is never rewritten, so no credential
+    // edit can land in whatever it points to. It only stands in the way when it
+    // still sets one of `keys`; otherwise there is nothing here to remove.
+    if let Some(what) = unsafe_credential_file(path).map_err(|source| Error::ConfigIo {
+        operation: "update",
+        path: path.to_path_buf(),
+        source,
+    })? {
+        return linked_env_file_keys(path, what, keys);
     }
 
     // Never rewrite or delete the file on a failed read. Treating an unreadable
     // or non-UTF-8 file as empty would delete it wholesale, taking every
     // unrelated setting with it.
-    let content = std::fs::read_to_string(path).map_err(|e| crate::error::Error::ConfigIo {
-        operation: "read",
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let Some(content) = read_env_file_for_update(path)? else {
+        return Ok(removed);
+    };
 
     // Keep every line that does not assign a removed key, byte-for-byte.
     // Rebuilding the file from a parsed map instead would drop comments and
@@ -2571,6 +2579,11 @@ fn remove_env_file_keys(keys: &[String]) -> Result<bool> {
         } else {
             kept.push(line);
         }
+    }
+
+    // Leave the file exactly as it is when it sets none of `keys`.
+    if !removed {
+        return Ok(false);
     }
 
     // Only discard the file once nothing but comments and blank lines remain.
@@ -2590,13 +2603,48 @@ fn remove_env_file_keys(keys: &[String]) -> Result<bool> {
     if content.ends_with('\n') {
         updated.push('\n');
     }
-    std::fs::write(path, updated).map_err(|e| crate::error::Error::ConfigIo {
-        operation: "write",
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    replace_env_file(path, updated.as_bytes())?;
 
     Ok(removed)
+}
+
+/// Whether removing `keys` is blocked by an env file that is a link (or not a
+/// regular file), which is never rewritten.
+///
+/// Nothing is removed either way. A link to a regular file is read only to
+/// tell whether it still sets any of `keys`: if it does, keeping quiet would let
+/// a logout or a keychain login report success while the old credential stays
+/// readable, so that is an error naming the keys and the fix.
+fn linked_env_file_keys(path: &std::path::Path, what: &str, keys: &[String]) -> Result<bool> {
+    let linked = std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|_| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let still_set: Vec<&str> = keys
+        .iter()
+        .filter(|key| {
+            linked
+                .lines()
+                .any(|line| assigns_any(line, std::slice::from_ref(*key)))
+        })
+        .map(String::as_str)
+        .collect();
+    if still_set.is_empty() {
+        return Ok(false);
+    }
+    Err(crate::error::Error::ConfigIo {
+        operation: "update",
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "it is {what}, and the file it points to still sets {}. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{}' with a regular file and run this command again. See: https://spiceai.org/docs/cli",
+                still_set.join(", "),
+                path.display()
+            ),
+        ),
+    })
 }
 
 fn ensure_keychain_credentials_removed(failures: &[String]) -> Result<()> {
@@ -6383,6 +6431,91 @@ mod tests {
         assert_eq!(short_commit(Some("abc")), "abc");
         assert_eq!(short_commit(None), "-");
         assert_eq!(short_commit(Some("")), "-");
+    }
+
+    /// Point the test env file at `target` through a symbolic link.
+    #[cfg(unix)]
+    fn link_env_file_to(target: &std::path::Path) -> std::path::PathBuf {
+        let env_file = crate::commands::login::env_file_path();
+        std::os::unix::fs::symlink(target, &env_file).expect("link the env file");
+        env_file
+    }
+
+    /// A keychain login clears stale env-file copies of the credentials it
+    /// saved. A linked `.env` that sets none of them is left alone, and the
+    /// login succeeds: there is nothing there to clear.
+    #[cfg(unix)]
+    #[test]
+    fn a_keychain_login_leaves_a_linked_env_file_without_its_keys_alone() {
+        let org = "linked-env-keychain-login";
+        let _stores = CredentialStores::user_login(org);
+        let elsewhere = tempfile::tempdir().expect("create the link target directory");
+        let target = elsewhere.path().join("shared.env");
+        std::fs::write(&target, "OTHER_SETTING=kept\n").expect("write the link target");
+        let env_file = link_env_file_to(&target);
+
+        persist_user_login(LoginOutput::Keychain, "fresh-token", org)
+            .expect("a keychain login must not be blocked by a link it has nothing to clear in");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the link target"),
+            "OTHER_SETTING=kept\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&env_file)
+                .expect("stat the env file")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(org::default_token().as_deref(), Some("fresh-token"));
+    }
+
+    /// Logout never writes through a linked `.env`. When the linked file still
+    /// sets the credential, logout says so, naming the key and the fix, rather
+    /// than reporting a logout that left the credential readable.
+    #[cfg(unix)]
+    #[test]
+    fn logout_refuses_to_rewrite_a_linked_env_file_that_sets_the_credential() {
+        let _stores = CredentialStores::empty();
+        let elsewhere = tempfile::tempdir().expect("create the link target directory");
+        let target = elsewhere.path().join("shared.env");
+        std::fs::write(&target, "OTHER_SETTING=kept\nSPICE_SPICEAI_TOKEN=live\n")
+            .expect("write the link target");
+        let env_file = link_env_file_to(&target);
+
+        let err = remove_env_keys(&["SPICE_SPICEAI_TOKEN".to_string()])
+            .expect_err("a credential behind a link cannot be removed");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Failed to update configuration at {path}: it is a symbolic link, and the file it points to still sets SPICE_SPICEAI_TOKEN. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{path}' with a regular file and run this command again. See: https://spiceai.org/docs/cli",
+                path = env_file.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the link target"),
+            "OTHER_SETTING=kept\nSPICE_SPICEAI_TOKEN=live\n",
+            "the linked file must not be rewritten"
+        );
+    }
+
+    /// Removing keys a regular `.env` does not set leaves it byte-for-byte as
+    /// it was, rather than replacing it with an identical new file.
+    #[test]
+    fn logout_leaves_an_env_file_without_the_keys_untouched() {
+        let _stores = CredentialStores::empty();
+        let env_file = crate::commands::login::env_file_path();
+        std::fs::write(&env_file, "# only comments\r\n").expect("write the env file");
+
+        assert!(
+            !remove_env_keys(&["SPICE_SPICEAI_TOKEN".to_string()]).expect("remove nothing"),
+            "nothing was set, so nothing was removed"
+        );
+        assert_eq!(
+            std::fs::read(&env_file).expect("the env file is kept"),
+            b"# only comments\r\n"
+        );
     }
 
     #[test]

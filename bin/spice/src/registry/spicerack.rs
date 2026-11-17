@@ -19,7 +19,7 @@ limitations under the License.
 use super::{Error, Result, ZipExtractionSnafu};
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 /// Base URL for spicerack API.
@@ -163,122 +163,437 @@ impl SpicerackRegistry {
             .unwrap_or("unset")
             .to_string();
 
-        // Download to temp file
-        let bytes = response.bytes().await.map_err(|e| Error::FetchFailed {
-            pod: pod_full_path.to_string(),
-            message: e.to_string(),
-        })?;
+        let limits = ArchiveLimits::SPICEPOD;
+        let downloaded = download_archive(response, pod_full_path, &limits).await?;
 
-        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| Error::Io {
-            operation: "create temp file",
-            path: "tempfile".to_string(),
-            source: e,
-        })?;
+        // Unzipping is blocking file I/O and CPU work, so it runs off the async
+        // worker threads.
+        let pod = pod_full_path.to_string();
+        let pod_path = pod_path.to_string();
+        let pods_dir = pods_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            install_archive(
+                &downloaded,
+                &RegistryResponse {
+                    pod: &pod,
+                    status: status.as_u16(),
+                    content_type: &content_type,
+                },
+                &pods_dir,
+                &pod_path,
+                &limits,
+            )
+        })
+        .await
+        .map_err(|source| Error::Io {
+            operation: "extract",
+            path: pod_full_path.to_string(),
+            source: std::io::Error::other(source),
+        })?
+    }
+}
 
-        temp_file.write_all(&bytes).map_err(|e| Error::Io {
+const MIB: u64 = 1024 * 1024;
+
+/// How large a Spicepod archive from the registry may be.
+///
+/// A Spicepod package is a manifest and a few companion files, so every limit
+/// is far above any real package. They are finite so that a registry response
+/// cannot exhaust memory or fill the disk, however it is built.
+#[derive(Clone, Copy, Debug)]
+struct ArchiveLimits {
+    /// Largest archive downloaded, whatever its `Content-Length` claims.
+    archive_bytes: u64,
+    /// Most entries one archive may hold.
+    entries: usize,
+    /// Largest total the entries may expand to. A few MiB of deflated zeros
+    /// would otherwise expand to many GiB.
+    expanded_bytes: u64,
+}
+
+impl ArchiveLimits {
+    const SPICEPOD: Self = Self {
+        archive_bytes: 256 * MIB,
+        entries: 10_000,
+        expanded_bytes: 1024 * MIB,
+    };
+}
+
+/// Largest body that is read back to quote a registry error message.
+const MAX_ERROR_BODY_BYTES: u64 = MIB;
+
+/// A limit as a user reads it: whole MiB where it is one, bytes otherwise.
+fn describe_bytes(bytes: u64) -> String {
+    if bytes >= MIB && bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// What the registry answered, for the errors an archive can produce.
+struct RegistryResponse<'a> {
+    pod: &'a str,
+    status: u16,
+    content_type: &'a str,
+}
+
+/// A response body saved to a temporary file.
+struct DownloadedArchive {
+    file: tempfile::NamedTempFile,
+    len: u64,
+}
+
+fn archive_limit(pod: &str, reason: String) -> Error {
+    Error::ArchiveLimitExceeded {
+        pod: pod.to_string(),
+        reason,
+    }
+}
+
+/// Stream the response body to a temporary file, stopping as soon as it is
+/// larger than the archive limit.
+async fn download_archive(
+    mut response: reqwest::Response,
+    pod: &str,
+    limits: &ArchiveLimits,
+) -> Result<DownloadedArchive> {
+    use tokio::io::AsyncWriteExt as _;
+
+    if let Some(len) = response.content_length()
+        && len > limits.archive_bytes
+    {
+        return Err(archive_limit(
+            pod,
+            format!(
+                "is {len} bytes, more than the {} a Spicepod package may be",
+                describe_bytes(limits.archive_bytes)
+            ),
+        ));
+    }
+
+    let file = tempfile::NamedTempFile::new().map_err(|e| Error::Io {
+        operation: "create temp file",
+        path: "tempfile".to_string(),
+        source: e,
+    })?;
+    let temp_path = file.path().display().to_string();
+    let mut writer = tokio::fs::File::from_std(file.reopen().map_err(|e| Error::Io {
+        operation: "open temp file",
+        path: temp_path.clone(),
+        source: e,
+    })?);
+
+    let mut len: u64 = 0;
+    while let Some(chunk) = response.chunk().await.map_err(|e| Error::FetchFailed {
+        pod: pod.to_string(),
+        message: e.to_string(),
+    })? {
+        len = len.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if len > limits.archive_bytes {
+            // The rest is never read, so only the lower bound is known.
+            return Err(archive_limit(
+                pod,
+                format!(
+                    "is larger than the {} a Spicepod package may be",
+                    describe_bytes(limits.archive_bytes)
+                ),
+            ));
+        }
+        writer.write_all(&chunk).await.map_err(|e| Error::Io {
             operation: "write temp file",
-            path: "tempfile".to_string(),
+            path: temp_path.clone(),
             source: e,
         })?;
+    }
+    writer.flush().await.map_err(|e| Error::Io {
+        operation: "write temp file",
+        path: temp_path,
+        source: e,
+    })?;
 
-        // Extract zip
-        let file = std::fs::File::open(temp_file.path()).map_err(|e| Error::Io {
-            operation: "open temp file",
-            path: temp_file.path().display().to_string(),
-            source: e,
-        })?;
+    Ok(DownloadedArchive { file, len })
+}
 
-        // The registry can answer a success status with an error body - a JSON payload under
-        // `Content-Type: application/zip`. Reporting that as a corrupt archive throws the
-        // server's own message away, so when the body is text the registry meant for the user,
-        // quote it back instead. A body still carrying a zip signature is a damaged archive, not
-        // a message, even when its bytes happen to be valid UTF-8. The zip reader decides what is
-        // an archive, so a body it accepts is never diverted here.
-        let mut archive = match zip::ZipArchive::new(file) {
-            Ok(archive) => archive,
-            Err(source) => {
-                return Err(match std::str::from_utf8(&bytes) {
-                    Ok(text) if !claims_to_be_an_archive(&bytes) => Error::NotAnArchive {
-                        pod: pod_full_path.to_string(),
-                        status: status.as_u16(),
-                        content_type,
-                        body_len: bytes.len(),
-                        message: registry_error_message(text),
-                    },
-                    _ => Error::ZipExtraction { source },
-                });
-            }
-        };
+/// Extract a downloaded archive and install it as `pods_dir/pod_path`.
+///
+/// The archive is checked and extracted into a new directory beside the
+/// destination first, and only moved into place once every entry has been
+/// written. An archive that breaks a limit or names an unsafe path therefore
+/// installs nothing and leaves an existing install as it was.
+fn install_archive(
+    downloaded: &DownloadedArchive,
+    response: &RegistryResponse<'_>,
+    pods_dir: &Path,
+    pod_path: &str,
+    limits: &ArchiveLimits,
+) -> Result<std::path::PathBuf> {
+    let archive_path = downloaded.file.path();
+    let file = std::fs::File::open(archive_path).map_err(|e| Error::Io {
+        operation: "open temp file",
+        path: archive_path.display().to_string(),
+        source: e,
+    })?;
 
-        // Create destination directory
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(source) => return Err(unreadable_archive(downloaded, response, source)),
+    };
+    check_declared_size(&archive, response.pod, limits)?;
+
+    let pods_dir_existed = pods_dir.exists();
+    std::fs::create_dir_all(pods_dir).map_err(|e| Error::Io {
+        operation: "create directory",
+        path: pods_dir.display().to_string(),
+        source: e,
+    })?;
+    let installed = stage_archive(&mut archive, pods_dir, response.pod, limits).and_then(|staged| {
         let dest_dir = pods_dir.join(pod_path);
-        std::fs::create_dir_all(&dest_dir).map_err(|e| Error::Io {
+        promote(staged, &dest_dir)?;
+        Ok(dest_dir)
+    });
+    if installed.is_err() && !pods_dir_existed {
+        // Only removes the directory if nothing else landed in it.
+        let _ = std::fs::remove_dir(pods_dir);
+    }
+    installed
+}
+
+/// The error for a body the zip reader rejected.
+///
+/// The registry can answer a success status with an error body - a JSON payload under
+/// `Content-Type: application/zip`. Reporting that as a corrupt archive throws the
+/// server's own message away, so when the body is text the registry meant for the user,
+/// quote it back instead. A body still carrying a zip signature is a damaged archive, not
+/// a message, even when its bytes happen to be valid UTF-8. The zip reader decides what is
+/// an archive, so a body it accepts is never diverted here.
+fn unreadable_archive(
+    downloaded: &DownloadedArchive,
+    response: &RegistryResponse<'_>,
+    source: zip::result::ZipError,
+) -> Error {
+    if downloaded.len <= MAX_ERROR_BODY_BYTES
+        && let Ok(bytes) = std::fs::read(downloaded.file.path())
+        && let Ok(text) = std::str::from_utf8(&bytes)
+        && !claims_to_be_an_archive(&bytes)
+    {
+        return Error::NotAnArchive {
+            pod: response.pod.to_string(),
+            status: response.status,
+            content_type: response.content_type.to_string(),
+            body_len: bytes.len(),
+            message: registry_error_message(text),
+        };
+    }
+    Error::ZipExtraction { source }
+}
+
+/// Refuse an archive whose central directory already declares more entries or
+/// expanded bytes than a Spicepod package may hold, before anything is written.
+///
+/// Declared sizes can lie, so [`stage_archive`] still counts every byte it
+/// writes; this only turns away an honest oversized archive early.
+fn check_declared_size<R: Read + std::io::Seek>(
+    archive: &zip::ZipArchive<R>,
+    pod: &str,
+    limits: &ArchiveLimits,
+) -> Result<()> {
+    if archive.len() > limits.entries {
+        return Err(archive_limit(
+            pod,
+            format!(
+                "holds {} entries, more than the {} a Spicepod package may hold",
+                archive.len(),
+                limits.entries
+            ),
+        ));
+    }
+    if let Some(declared) = archive.decompressed_size()
+        && declared > u128::from(limits.expanded_bytes)
+    {
+        return Err(archive_limit(
+            pod,
+            format!(
+                "expands to {declared} bytes, more than the {} a Spicepod package may expand to",
+                describe_bytes(limits.expanded_bytes)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Extract every entry into a new directory inside `pods_dir`, streaming each
+/// one to disk and stopping once the archive has expanded past its limit.
+///
+/// The directory is new and only this function writes to it, so no entry can
+/// be redirected by a link that was already there.
+fn stage_archive<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    pods_dir: &Path,
+    pod: &str,
+    limits: &ArchiveLimits,
+) -> Result<tempfile::TempDir> {
+    let staging = tempfile::Builder::new()
+        .prefix(".spice-add-")
+        .tempdir_in(pods_dir)
+        .map_err(|e| Error::Io {
             operation: "create directory",
-            path: dest_dir.display().to_string(),
+            path: pods_dir.display().to_string(),
             source: e,
         })?;
 
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).context(ZipExtractionSnafu)?;
+    let mut remaining = limits.expanded_bytes;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).context(ZipExtractionSnafu)?;
 
-            // Sanitize path to prevent traversal attacks
-            let file_name = match file.enclosed_name() {
-                Some(name) => name.clone(),
-                None => continue, // Skip files with invalid paths
-            };
+        // `enclosed_name` refuses a name that escapes the directory, and one
+        // that cannot be a file name here at all (a NUL, a drive prefix, a
+        // name this platform reserves). Either way the entry cannot be written
+        // where the archive says, so the package is not installed in part.
+        let Some(file_name) = entry.enclosed_name() else {
+            return Err(Error::UnsafeArchiveEntry {
+                pod: pod.to_string(),
+                entry: entry.name().map_or_else(
+                    |_| format!("#{i}"),
+                    |name| {
+                        name.chars()
+                            .take(256)
+                            .map(|c| if c.is_control() { ' ' } else { c })
+                            .collect()
+                    },
+                ),
+            });
+        };
+        let dest_path = staging.path().join(&file_name);
 
-            let dest_path = dest_dir.join(&file_name);
-
-            // Ensure destination is within dest_dir
-            if !dest_path.starts_with(&dest_dir) {
-                continue; // Skip files that would escape the destination
-            }
-
-            if file.is_dir() {
-                std::fs::create_dir_all(&dest_path).map_err(|e| Error::Io {
-                    operation: "create directory",
-                    path: dest_path.display().to_string(),
-                    source: e,
-                })?;
-            } else {
-                // Ensure parent directory exists
-                if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| Error::Io {
-                        operation: "create directory",
-                        path: parent.display().to_string(),
-                        source: e,
-                    })?;
-                }
-
-                let mut outfile = std::fs::File::create(&dest_path).map_err(|e| Error::Io {
-                    operation: "create file",
-                    path: dest_path.display().to_string(),
-                    source: e,
-                })?;
-
-                let mut contents = Vec::new();
-                file.read_to_end(&mut contents).map_err(|e| Error::Io {
-                    operation: "read from archive",
-                    path: file_name.display().to_string(),
-                    source: e,
-                })?;
-
-                outfile.write_all(&contents).map_err(|e| Error::Io {
-                    operation: "write file",
-                    path: dest_path.display().to_string(),
-                    source: e,
-                })?;
-            }
+        if entry.is_dir() {
+            std::fs::create_dir_all(&dest_path).map_err(|e| Error::Io {
+                operation: "create directory",
+                path: dest_path.display().to_string(),
+                source: e,
+            })?;
+            continue;
         }
 
-        Ok(dest_dir)
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Io {
+                operation: "create directory",
+                path: parent.display().to_string(),
+                source: e,
+            })?;
+        }
+        let mut outfile = std::fs::File::create(&dest_path).map_err(|e| Error::Io {
+            operation: "create file",
+            path: dest_path.display().to_string(),
+            source: e,
+        })?;
+
+        // One byte past the budget is enough to know it was exceeded, and is
+        // as far as the entry is ever expanded.
+        let written = std::io::copy(
+            &mut (&mut entry).take(remaining.saturating_add(1)),
+            &mut outfile,
+        )
+        .map_err(|e| Error::Io {
+            operation: "extract",
+            path: file_name.display().to_string(),
+            source: e,
+        })?;
+        if written > remaining {
+            return Err(archive_limit(
+                pod,
+                format!(
+                    "expands to more than the {} a Spicepod package may expand to",
+                    describe_bytes(limits.expanded_bytes)
+                ),
+            ));
+        }
+        remaining -= written;
     }
+
+    Ok(staging)
+}
+
+/// Move a fully extracted Spicepod to `dest_dir`.
+///
+/// A first install renames the whole directory into place. Re-installing over
+/// an existing directory keeps today's behavior of writing the package's files
+/// over it, now only after the package has been extracted in full.
+fn promote(staged: tempfile::TempDir, dest_dir: &Path) -> Result<()> {
+    if let Some(parent) = dest_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::Io {
+            operation: "create directory",
+            path: parent.display().to_string(),
+            source: e,
+        })?;
+    }
+
+    match std::fs::symlink_metadata(dest_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let staged = staged.keep();
+            std::fs::rename(&staged, dest_dir).map_err(|e| {
+                let _ = std::fs::remove_dir_all(&staged);
+                Error::Io {
+                    operation: "install",
+                    path: dest_dir.display().to_string(),
+                    source: e,
+                }
+            })
+        }
+        Err(e) => Err(Error::Io {
+            operation: "inspect",
+            path: dest_dir.display().to_string(),
+            source: e,
+        }),
+        Ok(_) => move_entries(staged.path(), dest_dir),
+    }
+}
+
+/// Move every file under `from` to the same relative path under `to`.
+fn move_entries(from: &Path, to: &Path) -> Result<()> {
+    let entries = std::fs::read_dir(from).map_err(|e| Error::Io {
+        operation: "read directory",
+        path: from.display().to_string(),
+        source: e,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::Io {
+            operation: "read directory",
+            path: from.display().to_string(),
+            source: e,
+        })?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let is_dir = entry
+            .file_type()
+            .map_err(|e| Error::Io {
+                operation: "inspect",
+                path: source.display().to_string(),
+                source: e,
+            })?
+            .is_dir();
+        if is_dir {
+            std::fs::create_dir_all(&target).map_err(|e| Error::Io {
+                operation: "create directory",
+                path: target.display().to_string(),
+                source: e,
+            })?;
+            move_entries(&source, &target)?;
+        } else {
+            std::fs::rename(&source, &target).map_err(|e| Error::Io {
+                operation: "install",
+                path: target.display().to_string(),
+                source: e,
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -491,6 +806,44 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// The expansion budget counts the bytes actually written, across entries. A central
+    /// directory can leave the total unknown (entries written with data descriptors), so the
+    /// count is the bound that always holds - and an archive that crosses it leaves nothing
+    /// behind in the pods directory.
+    #[test]
+    fn extraction_stops_at_the_expansion_budget_across_entries() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            writer.start_file(name, options).expect("start entry");
+            writer.write_all(&[b'x'; 1024]).expect("write entry");
+        }
+        let body = writer.finish().expect("finish archive").into_inner();
+        let mut archive = zip::ZipArchive::new(Cursor::new(body)).expect("open archive");
+
+        let pods_dir = tempfile::tempdir().expect("create pods dir");
+        let limits = ArchiveLimits {
+            archive_bytes: MIB,
+            entries: 10,
+            expanded_bytes: 2560,
+        };
+        let err = stage_archive(&mut archive, pods_dir.path(), "test/pod", &limits)
+            .expect_err("3 KiB of entries cannot fit a 2560-byte budget");
+
+        assert_eq!(
+            err.to_string(),
+            "Failed to install Spicepod 'test/pod' from spicerack.org: the archive expands to more than the 2560 bytes a Spicepod package may expand to, so nothing was installed. Check the Spicepod name and retry, or install from a local path with `spice add <path>`. See: https://spiceai.org/docs"
+        );
+        assert_eq!(
+            std::fs::read_dir(pods_dir.path())
+                .expect("read pods dir")
+                .count(),
+            0,
+            "the partly extracted staging directory must be removed"
+        );
     }
 
     #[tokio::test]
