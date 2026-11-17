@@ -6426,6 +6426,7 @@ dependencies = [
  "prost 0.14.3",
  "rand 0.10.1",
  "rdkafka",
+ "redact",
  "regex",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",
