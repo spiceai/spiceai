@@ -30,6 +30,33 @@ use std::{
 };
 use tokio::{runtime::Handle, sync::Semaphore};
 
+/// When `POST /v1/packages/generate` was deprecated: 2026-11-17T00:00:00Z, the date the
+/// deprecation was decided. Sent as the `Deprecation` header (RFC 9745) on every response.
+const PACKAGE_GENERATE_DEPRECATED_AT: u64 = 1_794_873_600;
+
+/// The documentation a deprecated `POST /v1/packages/generate` points to, as its `Link` header.
+const PACKAGE_GENERATE_DEPRECATION_LINK: &str = "<https://spiceai.org/docs/api/http/packages#deprecation>; rel=\"deprecation\"; type=\"text/html\"";
+
+/// The `warn` line each call to the deprecated endpoint logs: when it is removed and what to use
+/// instead.
+fn deprecation_warning() -> &'static str {
+    "`POST /v1/packages/generate` is deprecated and is removed in v2.6. Build the package from a checkout of the repository instead (for example, with `git archive`). See https://spiceai.org/docs/api/http/packages#deprecation"
+}
+
+/// Adds the `Deprecation` and `Link` headers every `POST /v1/packages/generate` response carries,
+/// success or error.
+pub(crate) fn add_deprecation_headers(headers: &mut http::HeaderMap) {
+    headers.insert(
+        http::HeaderName::from_static("deprecation"),
+        HeaderValue::from_str(&format!("@{PACKAGE_GENERATE_DEPRECATED_AT}"))
+            .unwrap_or_else(|_| HeaderValue::from_static("@1794873600")),
+    );
+    headers.insert(
+        http::header::LINK,
+        HeaderValue::from_static(PACKAGE_GENERATE_DEPRECATION_LINK),
+    );
+}
+
 /// One package is built at a time on a runtime; a request that arrives while one is building is
 /// answered `503` at once rather than waiting.
 static PACKAGE_BUILD: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
@@ -112,6 +139,8 @@ pub struct GeneratePackageRequest {
 
 /// Generate Package
 ///
+/// Deprecated: removed in v2.6. Build the package from a checkout of the repository instead.
+///
 /// This endpoint generates a zip package from a specified GitHub source. A package holds at most
 /// 10,000 files and 1 GiB, is built within 5 minutes, and one package is built at a time.
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -168,9 +197,16 @@ pub struct GeneratePackageRequest {
         )))
     )
 ))]
+// The OpenAPI operation is marked deprecated from this attribute.
+#[deprecated(
+    since = "2.5.0",
+    note = "removed in v2.6; build the package from a checkout of the repository instead"
+)]
 pub(crate) async fn generate(
     payload: Result<Json<GeneratePackageRequest>, JsonRejection>,
 ) -> Response {
+    tracing::warn!(target: "spiced", "{}", deprecation_warning());
+
     let payload = match payload {
         Ok(Json(payload)) => payload,
         Err(rejection) => return json_error(rejection.status(), rejection.body_text()),
@@ -243,6 +279,7 @@ mod tests {
     /// While a package is building, another request is answered `503` at once, with
     /// `Retry-After` and the JSON error body, rather than waiting for the build.
     #[tokio::test]
+    #[expect(deprecated, reason = "tests the deprecated endpoint's handler")]
     async fn a_second_request_while_one_builds_gets_503() {
         let from = "github:org/repo/abc123/spicepod.yaml";
         let _building = PACKAGE_BUILD
@@ -265,6 +302,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(deprecated, reason = "tests the deprecated endpoint's handler")]
     async fn an_invalid_source_gets_400_with_a_json_body() {
         let response = generate(Ok(Json(GeneratePackageRequest {
             from: "s3://bucket/spicepod.yaml".to_string(),
@@ -295,6 +333,31 @@ mod tests {
         assert_eq!(
             body_json(response).await,
             serde_json::json!({"error": "Failed to generate the package from 'github:org/repo/abc123/spicepod.yaml': GitHub lists only part of the files of repository 'org/repo' at 'abc123', so the list would be incomplete. Reference individual files instead of a folder. See https://spiceai.org/docs/api/http/packages"})
+        );
+    }
+
+    #[test]
+    fn the_deprecation_warning_names_the_removal_release_and_the_replacement() {
+        assert_eq!(
+            deprecation_warning(),
+            "`POST /v1/packages/generate` is deprecated and is removed in v2.6. Build the package from a checkout of the repository instead (for example, with `git archive`). See https://spiceai.org/docs/api/http/packages#deprecation"
+        );
+    }
+
+    /// The headers every response carries, success or error.
+    #[test]
+    fn deprecation_headers() {
+        let mut headers = http::HeaderMap::new();
+        add_deprecation_headers(&mut headers);
+        assert_eq!(
+            headers.get("deprecation"),
+            Some(&HeaderValue::from_static("@1794873600"))
+        );
+        assert_eq!(
+            headers.get(http::header::LINK),
+            Some(&HeaderValue::from_static(
+                "<https://spiceai.org/docs/api/http/packages#deprecation>; rel=\"deprecation\"; type=\"text/html\""
+            ))
         );
     }
 
