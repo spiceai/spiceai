@@ -2408,7 +2408,7 @@ pub(crate) mod tests {
             .try_collect::<Vec<_>>()
             .await
             .expect("stream should be collected successfully");
-        assert!(output_batches.is_empty());
+        assert_eq!(output_batches, [] as [RecordBatch; 0]);
 
         let cached = cache_provider
             .get_raw_key(&raw_cache_key)

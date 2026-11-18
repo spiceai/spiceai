@@ -15,6 +15,8 @@ variants:
   baseline: {}
   indexed:
     datasets: { orders: { acceleration: { indexes: { o_custkey: enabled } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
@@ -66,7 +68,7 @@ steps:
     only: indexed
   - explain: SELECT * FROM orders WHERE o_custkey = 42
     omits: "lookup_index=o_custkey"
-    only: baseline
+    only: [baseline, object-native]
 
   # Move rows between keys, delete some, add new ones.
   - source-exec:

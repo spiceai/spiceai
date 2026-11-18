@@ -491,9 +491,9 @@ pub struct LocalModelOptions<'a> {
     /// ([`engine::LocalChatEngine::distributed`]); mistral.rs reads its ring from the environment.
     pub distributed: Option<&'a DistributedConfig>,
     /// How many requests the llama.cpp engine decodes together, each in its own sequence of one
-    /// shared cache. `None` takes the engine's own choice, one request at a time until
-    /// continuous batching is enabled (#15598). Tests set it; no Spicepod field, flag or
-    /// environment variable reaches it.
+    /// shared cache. `None` takes the engine's own ceiling, which it lowers at load to what the
+    /// model's memory holds (#15598). Tests set it; no Spicepod field, flag or environment
+    /// variable reaches it.
     pub concurrent_requests: Option<std::num::NonZeroU32>,
 }
 

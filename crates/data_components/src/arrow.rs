@@ -570,7 +570,7 @@ mod tests {
         let schema = create_schema_with_columns(&[("col1", arrow::datatypes::DataType::Int64)]);
 
         let result = parse_indexes_option("", &schema).expect("parse failed");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [(Vec<String>, IndexType); 0]);
     }
 
     #[test]

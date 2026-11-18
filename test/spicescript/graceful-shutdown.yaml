@@ -14,6 +14,8 @@ matrix:
 
 variants:
   default: {}
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
@@ -60,6 +62,9 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # The timed writer can finish a different number of rounds in each instance,
+  # so their rows differ; every instance is checked against its own source instead.
+  compare-variants: false
 
 steps:
   - source-exec:

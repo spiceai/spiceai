@@ -1162,6 +1162,16 @@ pub trait SlotAdvancer: Send + Sync {
     /// advancing the source slot. Errors are the runtime's to log/surface; this
     /// returns nothing so a slow source ack cannot block the write path's fence.
     async fn on_checkpoint_durable(&self, durable_epoch: u64);
+
+    /// Write the source position `durable_epoch` covers to the dataset's position
+    /// store without acknowledging the source, so a metastore that commits it in
+    /// the checkpoint's own record holds the position with the data it covers.
+    /// Called before [`Self::on_checkpoint_durable`]; an error acknowledges
+    /// nothing. Forward it in every wrapper.
+    async fn record_position(&self, durable_epoch: u64) -> std::result::Result<(), String> {
+        let _ = durable_epoch;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

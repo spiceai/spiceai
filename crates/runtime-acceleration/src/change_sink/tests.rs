@@ -45,8 +45,9 @@ use super::provider::{ProviderChangeSinkBackend, refusal::is_before_mutation};
 use super::source_policy::{CdcPolicy, SchemaDecision};
 use super::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangeSink, ChangeSinkBackend,
-    ChangeSinkContext, DurabilityObserver, Recovery, ReplacementSupport, SchemaEvolutionSupport,
-    SetKey, StorageDurability, WriteOptions,
+    ChangeSinkContext, ChangeWrite, DurabilityObserver, Recovery, ReplacementSupport, Rows,
+    RowsWrite, SchemaEvolutionSupport, ScopeKind, ScopedRows, SetKey, StorageDurability,
+    WriteOptions,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -79,58 +80,61 @@ async fn validate_scopes(columns: Vec<usize>, inputs: Vec<(Expr, RecordBatch)>) 
         ),
     );
     let context = ChangeSinkContext::new(TableReference::bare("scoped"), table);
-    let mut merged: Option<ChangeBatch> = None;
+    let mut merged: Option<RowsWrite> = None;
     for (filter, batch) in inputs {
         let scope = SetKey::from_filters(Arc::clone(&schema), &[filter])?;
         let input = ChangeBatch::append_scoped(scope, Arc::clone(&schema), vec![batch])?;
         if let Some(merged) = &mut merged {
             assert!(
-                merged.merge_append(input).is_continue(),
+                merged.merge(input).is_continue(),
                 "scoped appends must merge"
             );
         } else {
-            merged = Some(input);
+            merged = Some(rows_write(input));
         }
     }
     ProviderChangeSinkBackend::new(context)
         .apply(
-            merged.expect("test needs at least one scope"),
+            merged.expect("test needs at least one scope").into(),
             WriteOptions::default(),
             &SessionContext::new(),
+            Vec::new(),
         )
         .await
         .map(|_| ())
 }
 
+fn rows_write(batch: ChangeBatch) -> RowsWrite {
+    let (ChangeWrite::Rows(write), _) = batch.into_parts() else {
+        panic!("a row write");
+    };
+    write
+}
+
 #[test]
 fn append_merge_preserves_unconsumed_replacement() {
     let schema = scope_schema();
-    let mut first = ChangeBatch::append(
-        Arc::clone(&schema),
-        vec![scope_row(&schema, "A", "west", 1)],
-    )
-    .expect("first append");
+    let mut first = rows_write(
+        ChangeBatch::append(
+            Arc::clone(&schema),
+            vec![scope_row(&schema, "A", "west", 1)],
+        )
+        .expect("first append"),
+    );
     let row = scope_row(&schema, "B", "east", 2);
     let scope = SetKey::from_filters(Arc::clone(&schema), &[col("tenant").eq(lit("B"))])
         .expect("replacement scope");
     let replacement =
         ChangeBatch::replace_set(scope.clone(), schema, vec![row.clone()]).expect("replacement");
-    let ControlFlow::Break(returned) = first.merge_append(replacement) else {
+    let ControlFlow::Break(returned) = first.merge(replacement) else {
         panic!("replacement must remain separate from the append");
     };
     assert_eq!(first.num_rows(), 1);
-    assert_eq!(
-        returned
-            .replaced_scopes()
-            .next()
-            .expect("scope retained")
-            .filters(),
-        scope.filters()
-    );
-    let super::ChangePayload::Rows { batches, .. } = returned.payload() else {
-        panic!("replacement rows retained");
+    let ChangeBatch::Replace { rows, .. } = &returned else {
+        panic!("replacement retained");
     };
-    assert_eq!(batches, &[row]);
+    assert_eq!(rows.scope().filters(), scope.filters());
+    assert_eq!(rows.rows().batches(), &[row]);
 }
 
 fn two_input_limits() -> CoalescingLimits {
@@ -148,16 +152,17 @@ fn append_burst_returns_unconsumed_input_at_capacity() {
         &TableReference::bare("append"),
         two_input_limits(),
     ));
-    let input = |id| {
-        ChangeBatch::append(
+    let input = |id| ChangeBatch::Append {
+        rows: Rows::try_new(
             Arc::clone(&schema),
             vec![scope_row(&schema, "A", "west", id)],
         )
-        .expect("append")
-        .with_append_ingress(Arc::clone(&ingress))
-        .expect("append lane")
+        .expect("append"),
+        lane: Some(Arc::clone(&ingress)),
     };
-    let mut burst = AppendBurst::new(input(1), WriteOptions::default()).expect("burst");
+    let mut burst = AppendBurst::new(input(1), WriteOptions::default())
+        .continue_value()
+        .expect("burst");
     assert!(burst.push(input(2), WriteOptions::default()).is_continue());
     let ControlFlow::Break(returned) = burst.push(input(3), WriteOptions::default()) else {
         panic!("third input must remain outside the full burst");
@@ -167,10 +172,10 @@ fn append_burst_returns_unconsumed_input_at_capacity() {
         returned.append_ingress().expect("lane retained"),
         &ingress
     ));
-    let super::ChangePayload::Rows { batches, .. } = returned.payload() else {
+    let ChangeBatch::Append { rows, .. } = &returned else {
         panic!("append rows retained");
     };
-    assert_eq!(batches, &[scope_row(&schema, "A", "west", 3)]);
+    assert_eq!(rows.batches(), &[scope_row(&schema, "A", "west", 3)]);
     let (accepted, _) = burst.finish();
     assert_eq!(accepted.num_rows(), 2);
 }
@@ -228,7 +233,10 @@ fn cdc_burst_returns_unconsumed_input_at_capacity() {
             Arc::clone(&ingress),
         )
     };
-    let mut burst = CdcBurst::new(input(vec![1, 2]), WriteOptions::default()).expect("CDC burst");
+    let ChangeBatch::Cdc(first) = input(vec![1, 2]) else {
+        panic!("CDC input");
+    };
+    let mut burst = CdcBurst::new(first, WriteOptions::default());
     assert!(
         burst
             .push(input(vec![3, 4]), WriteOptions::default())
@@ -241,7 +249,7 @@ fn cdc_burst_returns_unconsumed_input_at_capacity() {
     };
     assert_eq!(burst.len(), 2);
     assert_eq!(returned.cdc_batch().expect("CDC retained").record, record);
-    let super::ChangePayload::Cdc(rows) = returned.payload() else {
+    let ChangeBatch::Cdc(rows) = &returned else {
         panic!("CDC payload retained");
     };
     assert!(Arc::ptr_eq(
@@ -326,6 +334,43 @@ async fn same_scope_preserves_duplicate_inputs() {
     )
     .await
     .expect("duplicates inside the same scope belong to the provider conflict policy");
+}
+
+/// A keyless `DoExchange` subscription sends every row with a null key list.
+/// Those rows have no keys, exactly like empty lists, so a snapshot batch must
+/// group into one write rather than one write per row.
+#[test]
+fn null_primary_key_lists_group_as_keyless_rows() {
+    use super::provider::cdc::{ChangeOperationType, group_into_sub_batches};
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let rows = 5;
+    let changes = SourceBatch::try_new(
+        RecordBatch::try_new(
+            Arc::new(changes_schema(&schema)),
+            vec![
+                Arc::new(StringArray::from(vec!["r"; rows])),
+                Arc::new(ListArray::new_null(
+                    Arc::new(Field::new("item", DataType::Utf8, false)),
+                    rows,
+                )),
+                Arc::new(StructArray::new(
+                    schema.fields().clone(),
+                    vec![Arc::new(Int64Array::from((0..5).collect::<Vec<i64>>())) as ArrayRef],
+                    None,
+                )),
+            ],
+        )
+        .expect("CDC rows"),
+    )
+    .expect("valid CDC batch");
+
+    let groups = group_into_sub_batches(&changes);
+    assert_eq!(
+        groups,
+        vec![(ChangeOperationType::Upsert, (0..rows).collect::<Vec<_>>())],
+        "null key lists are keyless rows and share one write"
+    );
 }
 
 #[tokio::test]
@@ -414,7 +459,12 @@ async fn mixed_primary_key_lists_preserve_deletes() {
             table,
         ));
         backend
-            .apply(ChangeBatch::cdc(changes), WriteOptions::default(), &context)
+            .apply(
+                ChangeBatch::cdc(changes).into(),
+                WriteOptions::default(),
+                &context,
+                Vec::new(),
+            )
             .await
             .expect("mixed-key deletes must execute");
         let rows = context
@@ -488,9 +538,10 @@ async fn assert_float_primary_key_delete_rejected(values: ArrayRef) {
     ));
     let result = backend
         .apply(
-            ChangeBatch::cdc(changes),
+            ChangeBatch::cdc(changes).into(),
             WriteOptions::default(),
             &SessionContext::new(),
+            Vec::new(),
         )
         .await;
     let Err(DataFusionError::External(error)) = result else {
@@ -544,9 +595,10 @@ impl ChangeSinkBackend for GatedBackend {
 
     async fn apply(
         &self,
-        _batch: ChangeBatch,
+        _write: ChangeWrite,
         _options: WriteOptions,
         _context: &SessionContext,
+        _positions: Vec<super::PositionWrite>,
     ) -> Result<BackendWrite> {
         let started = Arc::clone(&self.started);
         let release = Arc::clone(&self.release);
@@ -683,14 +735,13 @@ fn scoped_write(
         .iter()
         .map(|&id| scope_row(schema, tenant, region, id))
         .collect();
+    let rows = ScopedRows::try_new(scope, Arc::clone(schema), rows).expect("scoped write");
+    let lane = Some(Arc::clone(ingress));
     if replaces {
-        ChangeBatch::replace_set(scope, Arc::clone(schema), rows)
+        ChangeBatch::Replace { rows, lane }
     } else {
-        ChangeBatch::append_scoped(scope, Arc::clone(schema), rows)
+        ChangeBatch::AppendScoped { rows, lane }
     }
-    .expect("scoped write")
-    .with_append_ingress(Arc::clone(ingress))
-    .expect("append lane")
 }
 
 async fn id_keyed_table(rows: Vec<RecordBatch>) -> Arc<dyn TableProvider> {
@@ -737,7 +788,9 @@ fn append_burst_admits_only_scopes_no_replacement_can_overlap() {
     let ingress = scoped_lane(Duration::ZERO);
     let options = WriteOptions::default();
     let write = |scope, replaces| scoped_write(&schema, &ingress, scope, &[1], replaces);
-    let mut burst = AppendBurst::new(write(("A", "west"), true), options).expect("burst");
+    let mut burst = AppendBurst::new(write(("A", "west"), true), options)
+        .continue_value()
+        .expect("burst");
     assert!(
         burst
             .push(write(("B", "west"), false), options)
@@ -766,14 +819,15 @@ fn append_burst_admits_only_scopes_no_replacement_can_overlap() {
     }
     let tenant_only =
         SetKey::from_filters(Arc::clone(&schema), &[col("tenant").eq(lit("D"))]).expect("scope");
-    let wider = ChangeBatch::replace_set(
-        tenant_only,
-        Arc::clone(&schema),
-        vec![scope_row(&schema, "D", "east", 1)],
-    )
-    .expect("replacement")
-    .with_append_ingress(Arc::clone(&ingress))
-    .expect("append lane");
+    let wider = ChangeBatch::Replace {
+        rows: ScopedRows::try_new(
+            tenant_only,
+            Arc::clone(&schema),
+            vec![scope_row(&schema, "D", "east", 1)],
+        )
+        .expect("replacement"),
+        lane: Some(Arc::clone(&ingress)),
+    };
     assert!(
         burst.push(wider, options).is_break(),
         "a replacement over other grouping columns may overlap the burst"
@@ -782,7 +836,7 @@ fn append_burst_admits_only_scopes_no_replacement_can_overlap() {
     let members = batch
         .scoped_inputs()
         .iter()
-        .map(|input| (input.batch_range(), input.replaces()))
+        .map(|input| (input.batch_range(), input.kind() == ScopeKind::Replace))
         .collect::<Vec<_>>();
     assert_eq!(members, vec![(0..1, true), (1..2, false), (2..3, true)]);
 }
@@ -806,14 +860,15 @@ impl ChangeSinkBackend for CountingBackend {
 
     async fn apply(
         &self,
-        batch: ChangeBatch,
+        write: ChangeWrite,
         options: WriteOptions,
         context: &SessionContext,
+        positions: Vec<super::PositionWrite>,
     ) -> Result<BackendWrite> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         self.most_replaced
-            .fetch_max(batch.replaced_scopes().count(), Ordering::SeqCst);
-        self.inner.apply(batch, options, context).await
+            .fetch_max(write.replaced_scopes().count(), Ordering::SeqCst);
+        self.inner.apply(write, options, context, positions).await
     }
 
     fn set_durability_observer(&self, observer: Arc<dyn DurabilityObserver>) {
@@ -996,9 +1051,10 @@ async fn coalesced_probe_exempts_only_keys_in_replaced_scopes() {
 
     let Err(error) = backend
         .apply(
-            scoped_write(&schema, &ingress, ("B", "west"), &[1], false),
+            scoped_write(&schema, &ingress, ("B", "west"), &[1], false).into(),
             options,
             &SessionContext::new(),
+            Vec::new(),
         )
         .await
     else {
@@ -1020,6 +1076,7 @@ async fn coalesced_probe_exempts_only_keys_in_replaced_scopes() {
         scoped_write(&schema, &ingress, ("A", "west"), &[], true),
         options,
     )
+    .continue_value()
     .expect("burst");
     assert!(
         burst
@@ -1029,9 +1086,9 @@ async fn coalesced_probe_exempts_only_keys_in_replaced_scopes() {
             )
             .is_continue()
     );
-    let (batch, options) = burst.finish();
+    let (write, options) = burst.finish();
     backend
-        .apply(batch, options, &SessionContext::new())
+        .apply(write.into(), options, &SessionContext::new(), Vec::new())
         .await
         .expect("the held row is deleted before the append");
     assert_eq!(

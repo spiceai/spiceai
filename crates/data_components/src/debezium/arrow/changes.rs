@@ -475,7 +475,7 @@ mod tests {
         let batch = to_change_batch(&orders_schema(), &[], &change, None).expect("change batch");
 
         assert!(!batch.has_primary_keys(0));
-        assert!(batch.primary_keys(0).is_empty());
+        assert_eq!(batch.primary_keys(0), [] as [String; 0]);
     }
 
     /// CDC is order-sensitive: a create followed by a delete of the same key

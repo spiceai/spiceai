@@ -101,6 +101,7 @@ pub fn create_stream_choice(
     ChatChoiceStream {
         index,
         delta: ChatCompletionStreamResponseDelta {
+            reasoning_content: None,
             content,
             role,
             #[expect(deprecated)]
@@ -124,7 +125,6 @@ pub fn generate_stream_id(model_id: &str) -> String {
 }
 
 /// Converts a basic string stream to an `OpenAI` compatible chat completion stream
-#[must_use]
 pub fn string_stream_to_chat_stream(
     model_id: String,
     mut stream: Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>,
@@ -168,7 +168,6 @@ pub fn string_stream_to_chat_stream(
 }
 
 /// Creates a stream that yields multiple content chunks for testing streaming behavior
-#[must_use]
 pub fn create_mock_streaming_response(
     model_name: String,
     content_chunks: Vec<String>,

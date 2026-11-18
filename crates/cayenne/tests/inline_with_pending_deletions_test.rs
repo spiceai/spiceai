@@ -24,9 +24,7 @@ use crate::common;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::DEFAULT_INLINE_MAX_ROWS;
-use cayenne::{
-    CayenneCatalog, CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
@@ -329,7 +327,7 @@ async fn test_inlined_upsert_survives_restart_impl(fixture: TestFixture) -> Test
     // ---- Restart ----
     drop(table);
 
-    let catalog2 = Arc::new(CayenneCatalog::new(&connection_string)?);
+    let catalog2 = common::fixture_catalog(connection_string.clone()).await?;
     catalog2.init().await?;
     let catalog_trait2: Arc<dyn MetadataCatalog> =
         Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
@@ -625,7 +623,7 @@ async fn test_double_inline_upsert_same_pk_impl(fixture: TestFixture) -> TestRes
     drop(table);
     drop(ctx);
 
-    let catalog2 = Arc::new(CayenneCatalog::new(&connection_string)?);
+    let catalog2 = common::fixture_catalog(connection_string.clone()).await?;
     catalog2.init().await?;
     let catalog_trait2: Arc<dyn MetadataCatalog> =
         Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;

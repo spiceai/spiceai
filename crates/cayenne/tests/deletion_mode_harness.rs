@@ -223,7 +223,7 @@ fn checksum(batches: &[RecordBatch]) -> String {
 /// Position-delete files and rows the catalog holds for the table (key-delete
 /// files carry no source data file).
 async fn position_delete_counts(
-    catalog: &Arc<cayenne::CayenneCatalog>,
+    catalog: &Arc<impl MetadataCatalog + ?Sized>,
     table: &CayenneTableProvider,
 ) -> (usize, i64, usize, i64) {
     let files = catalog

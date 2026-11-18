@@ -30,7 +30,6 @@ use super::on_conflict::{OnConflictDeletions, PreparedOnConflictDeletionPublish}
 use super::pk_index::PkDigestSet;
 use super::table::{CayenneTableProvider, record_cayenne_write_phase};
 use super::{Error, Result};
-use crate::CayenneCatalog;
 use crate::catalog::{CatalogResult, MetadataCatalog};
 use crate::metastore::MetastoreTransaction;
 
@@ -65,9 +64,9 @@ pub(super) struct PreparedResolvedAppend {
 
 /// A failed publication, and whether its snapshot's files must be kept because
 /// the catalog may reference them.
-struct Failure {
-    error: Error,
-    keep_files: bool,
+pub(super) struct Failure {
+    pub(super) error: Error,
+    pub(super) keep_files: bool,
 }
 
 impl Failure {
@@ -110,14 +109,7 @@ impl PreparedResolvedAppend {
             super::staged_upsert::cleanup_orphan_snapshot_dir(&self.table, &self.snapshot_id).await;
             return Ok(0);
         }
-        let catalog = self
-            .table
-            .catalog()
-            .as_any()
-            .downcast_ref::<CayenneCatalog>()
-            .ok_or(Failure::discard(Error::Unsupported {
-                operation: "atomic append with a non-Cayenne metadata catalog",
-            }))?;
+        let catalog = self.table.catalog().as_ref();
         self.table
             .sync_local_snapshot_dir(&self.snapshot_id)
             .await
@@ -150,6 +142,10 @@ impl PreparedResolvedAppend {
             tombstone.published = true;
         }
         let sequence = prepared.snapshot_sequence;
+        self.table
+            .record_new_protected_snapshot_files(&self.snapshot_id, sequence)
+            .await
+            .map_err(Failure::discard)?;
         let reserved_delta = self.table.reserve_live_rows_delta();
         commit_metadata(catalog, &mut prepared).await?;
 
@@ -184,23 +180,30 @@ impl PreparedResolvedAppend {
     }
 }
 
+/// Commit the publications' tables at the append's acknowledgement point.
+async fn commit_tables_at_acknowledgement(
+    catalog: &dyn MetadataCatalog,
+    publications: &[crate::catalog::CatalogPublication<'_>],
+) -> crate::catalog::CatalogResult<()> {
+    for publication in publications {
+        crate::catalog::commit_at_acknowledgement_for(catalog, publication.table_id).await?;
+    }
+    Ok(())
+}
+
 async fn commit_metadata(
-    catalog: &CayenneCatalog,
+    catalog: &dyn MetadataCatalog,
     prepared: &mut PreparedOnConflictDeletionPublish,
 ) -> std::result::Result<(), Failure> {
     for attempt in 1..=DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS {
-        let mut txn = catalog
-            .begin_transaction()
-            .await
-            .map_err(Failure::discard)?;
-        if let Err(error) = catalog
-            .apply_prepared_on_conflict_in_txn(txn.as_mut(), prepared)
-            .await
-        {
-            let _ = txn.rollback().await;
-            return Err(Failure::discard(error));
-        }
-        match commit_transaction(txn, prepared.table.table_id()).await {
+        let publications: Vec<_> = prepared.catalog_publication().into_iter().collect();
+        // The append is acknowledged when this returns, so its metastore change
+        // commits now rather than waiting in a buffering catalog.
+        let committed = match catalog.commit_publications(&publications).await {
+            Ok(()) => commit_tables_at_acknowledgement(catalog, &publications).await,
+            Err(error) => Err(error),
+        };
+        match committed {
             Ok(()) => {
                 prepared.mark_catalog_committed();
                 return Ok(());
@@ -224,19 +227,32 @@ async fn commit_metadata(
 /// before anything is discarded: present, the publication stands; absent, it
 /// never happened; unreadable, the files are kept and the table refuses writes
 /// until it is reloaded.
-async fn resolve_failed_commit(
-    catalog: &CayenneCatalog,
+pub(super) async fn resolve_failed_commit(
+    catalog: &dyn MetadataCatalog,
     prepared: &mut PreparedOnConflictDeletionPublish,
     error: Error,
 ) -> std::result::Result<(), Failure> {
     let table = prepared.table.table_name().to_string();
-    match snapshot_sequence(
-        catalog,
-        prepared.table.table_id(),
-        &prepared.target_snapshot_id,
-    )
-    .await
-    {
+    // A table in the object-native location reads its state back in the
+    // background after a commit whose outcome is unknown, so its read-back
+    // waits for that, rather than leaving the table unable to take writes until
+    // a restart: the answer then says whether the publication stands.
+    let read_back = if prepared.table.data_in_object_native_location() {
+        snapshot_sequence_once_readable(
+            catalog,
+            prepared.table.table_id(),
+            &prepared.target_snapshot_id,
+        )
+        .await
+    } else {
+        snapshot_sequence(
+            catalog,
+            prepared.table.table_id(),
+            &prepared.target_snapshot_id,
+        )
+        .await
+    };
+    match read_back {
         Ok(Some(sequence)) if sequence == prepared.snapshot_sequence => {
             tracing::warn!(
                 "Dataset '{table}': the metastore reported that a write failed to commit, but it did commit, so it is published. Cause: {error}"
@@ -255,7 +271,10 @@ async fn resolve_failed_commit(
                 error: Error::IncompleteWrite {
                     table,
                     message: format!(
-                        "a write's commit failed ({error}), and reading back whether it committed failed too ({read_error}). Its files are kept, and writes are refused until the table is reloaded from its catalog. Restart Spice to reload it"
+                        "a write's commit failed ({error}), and reading back whether it committed failed too ({read_error}). Its files are kept, and {} until the table is reloaded from its catalog. Restart Spice to reload it",
+                        super::table::refused_until_reload(
+                            prepared.table.data_in_object_native_location()
+                        )
                     ),
                 },
                 keep_files: true,
@@ -265,7 +284,7 @@ async fn resolve_failed_commit(
 }
 
 #[cfg(not(test))]
-pub(super) async fn commit_transaction(
+pub(crate) async fn commit_transaction(
     txn: Box<dyn MetastoreTransaction>,
     _table_id: &str,
 ) -> CatalogResult<()> {
@@ -274,15 +293,41 @@ pub(super) async fn commit_transaction(
 
 #[cfg(not(test))]
 pub(super) async fn snapshot_sequence(
-    catalog: &CayenneCatalog,
+    catalog: &dyn MetadataCatalog,
     table_id: &str,
     snapshot_id: &str,
 ) -> CatalogResult<Option<i64>> {
     catalog.get_snapshot_sequence(table_id, snapshot_id).await
 }
 
+/// How long a write whose commit's outcome is unknown waits for its dataset to
+/// read its state back before it gives up and reports the outcome as unknown.
+const UNKNOWN_OUTCOME_READ_BACK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`snapshot_sequence`], retried with a doubling wait while the dataset's state
+/// cannot be read (it is reading its state back after a commit whose outcome is
+/// unknown), for up to [`UNKNOWN_OUTCOME_READ_BACK_WAIT`].
+pub(super) async fn snapshot_sequence_once_readable(
+    catalog: &dyn MetadataCatalog,
+    table_id: &str,
+    snapshot_id: &str,
+) -> CatalogResult<Option<i64>> {
+    let deadline = tokio::time::Instant::now() + UNKNOWN_OUTCOME_READ_BACK_WAIT;
+    let mut wait = std::time::Duration::from_millis(20);
+    loop {
+        match snapshot_sequence(catalog, table_id, snapshot_id).await {
+            Ok(sequence) => return Ok(sequence),
+            Err(error) if tokio::time::Instant::now() + wait >= deadline => return Err(error),
+            Err(_) => {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-pub(super) async fn commit_transaction(
+pub(crate) async fn commit_transaction(
     txn: Box<dyn MetastoreTransaction>,
     table_id: &str,
 ) -> CatalogResult<()> {
@@ -303,7 +348,7 @@ pub(super) async fn commit_transaction(
 
 #[cfg(test)]
 pub(super) async fn snapshot_sequence(
-    catalog: &CayenneCatalog,
+    catalog: &dyn MetadataCatalog,
     table_id: &str,
     snapshot_id: &str,
 ) -> CatalogResult<Option<i64>> {

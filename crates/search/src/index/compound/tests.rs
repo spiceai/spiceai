@@ -1603,6 +1603,6 @@ mod warm_memory {
             .await
             .expect("delete succeeds");
         let plan = idx.list_table_provider().expect("list plan builds");
-        assert!(collect_ids(plan).await.is_empty());
+        assert_eq!(collect_ids(plan).await, [] as [i64; 0]);
     }
 }
