@@ -27,7 +27,7 @@ limitations under the License.
 use std::time::Duration;
 
 use ballista_core::serde::protobuf::{
-    GetJobStatusParams, scheduler_grpc_client::SchedulerGrpcClient,
+    GetJobStatusParams, HeartBeatParams, scheduler_grpc_client::SchedulerGrpcClient,
 };
 use runtime_proto::{
     AllocateInitialPartitionsRequest, ExecutorControlMessage, ExecutorHeartbeat,
@@ -140,9 +140,24 @@ async fn a_node_cannot_act_as_an_executor_another_node_registered() -> Result<()
                 let status = allocate.expect_err("partition allocation is refused");
                 assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
 
-                // (3) A Ballista executor-half call that names the victim is
-                //     refused, and the client half is not served here at all.
+                // (3) A Ballista executor-half call that names the victim — the
+                //     executor's own poll/heartbeat path — is refused. This is
+                //     the identity check on the Ballista wrapper, distinct from
+                //     the client-half refusal in (4).
                 let mut scheduler = SchedulerGrpcClient::new(intruder_channel);
+                let heartbeat = scheduler
+                    .heart_beat_from_executor(HeartBeatParams {
+                        executor_id: claim.clone(),
+                        metrics: Vec::new(),
+                        status: None,
+                        metadata: None,
+                    })
+                    .await;
+                let status =
+                    heartbeat.expect_err("a heartbeat naming another node's executor is refused");
+                assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+
+                // (4) The Ballista client half is not served on this port at all.
                 let job = scheduler
                     .get_job_status(GetJobStatusParams {
                         job_id: "no-such-job".to_string(),
