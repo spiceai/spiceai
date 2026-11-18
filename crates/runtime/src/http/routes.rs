@@ -2063,10 +2063,13 @@ mod mcp_origin_tests {
             config.allowed_origins
         );
         let status = post_mcp_with_origin(config, Some("http://localhost:5173")).await;
+        // This helper talks to rmcp's Streamable HTTP service directly. A
+        // sessionless unknown-tool call returns 404, not 200. 403 would mean
+        // the Origin was rejected.
         assert_eq!(
             status,
-            StatusCode::OK,
-            "Origin http://localhost:5173 must be accepted (HTTP 200) on the default CORS * MCP allow-list, got {status}"
+            StatusCode::NOT_FOUND,
+            "Origin http://localhost:5173 must pass the default CORS * MCP allow-list (rmcp answers this helper with 404, not 403), got {status}"
         );
     }
 
