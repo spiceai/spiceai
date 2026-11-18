@@ -1041,7 +1041,8 @@ pub(crate) fn handle_datafusion_error(e: &DataFusionError) -> Status {
         // Data a connector refused as a compression bomb: the query is the client's to
         // change, so a client error, as `/v1/sql` answers it.
         DataFusionError::External(e)
-            if data_components::refusal::is_compression_refusal(e.as_ref()) =>
+            if data_components::refusal::is_compression_refusal(e.as_ref())
+                || data_components::refusal::is_request_bound_refusal(e.as_ref()) =>
         {
             Status::invalid_argument(e.to_string())
         }
@@ -1458,6 +1459,32 @@ mod tests {
 
         let text_only = DataFusionError::External(Box::new(std::io::Error::other(
             "the response was refused as a compression bomb",
+        )));
+        assert_eq!(
+            handle_datafusion_error(&text_only).code(),
+            tonic::Code::Internal
+        );
+    }
+
+    /// A query over an HTTP dataset's request bound is a client error with the
+    /// refusal's own message, however it was wrapped; text alone does not make an
+    /// error one.
+    #[test]
+    fn a_request_bound_refusal_is_a_client_error_by_its_type() {
+        let error = DataFusionError::Context(
+            "scan".to_string(),
+            Box::new(DataFusionError::External(Box::new(
+                data_components::http::provider::Error::TooManyRequests {
+                    message: "a reworded request-bound refusal".to_string(),
+                },
+            ))),
+        );
+        let status = handle_datafusion_error(&error);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "a reworded request-bound refusal");
+
+        let text_only = DataFusionError::External(Box::new(std::io::Error::other(
+            "set `max_request_partitions` on the dataset",
         )));
         assert_eq!(
             handle_datafusion_error(&text_only).code(),

@@ -6338,7 +6338,7 @@ mod tests {
     fn request_limit_http_source(
         url: &str,
         paths: &[String],
-        cap: Option<usize>,
+        cap: usize,
     ) -> Arc<dyn TableProvider> {
         use data_components::http::provider::HttpTableProvider;
         #[expect(
@@ -6432,7 +6432,7 @@ mod tests {
         }
     }
 
-    const REQUEST_LIMIT_OVER_3: &str = "The HTTP connector would create 6 request partitions, which exceeds max_request_partitions=3.";
+    const REQUEST_LIMIT_OVER_3: &str = "Failed to plan the query on this dataset (https): its request filters combine into 6 requests, more than the 3 allowed. Use fewer request_path, request_query, request_body or request_headers values, or set `max_request_partitions: 6` on the dataset. See: https://spiceai.org/docs/components/data-connectors/https";
 
     /// A partial hit is refused where a miss is: the query names 6 request
     /// keys with `max_request_partitions = 3`, so it must not reach the origin
@@ -6444,7 +6444,7 @@ mod tests {
         let paths = request_limit_strings(&["/a", "/b", "/c"]);
         let queries = request_limit_strings(&["x=1", "y=1"]);
         let (url, seen) = request_limit_counting_origin().await;
-        let source = request_limit_http_source(&url, &paths, Some(3));
+        let source = request_limit_http_source(&url, &paths, 3);
         let filters = vec![
             col("request_path").in_list(request_limit_lits(&paths), false),
             col("request_query").in_list(request_limit_lits(&queries), false),
@@ -6456,9 +6456,12 @@ mod tests {
             0,
             "a refused miss sends nothing"
         );
-        let cold_error = cold
-            .expect_err("a miss over the limit is refused")
-            .to_string();
+        let cold_error = cold.expect_err("a miss over the limit is refused");
+        assert!(
+            data_components::refusal::is_request_bound_refusal(&cold_error),
+            "the refusal keeps its type: {cold_error:?}"
+        );
+        let cold_error = cold_error.to_string();
         assert!(cold_error.contains(REQUEST_LIMIT_OVER_3), "{cold_error}");
 
         let warm = request_limit_warm(
@@ -6483,9 +6486,12 @@ mod tests {
             Vec::<String>::new(),
             "no origin request: {summary}"
         );
-        let partial_error = partial
-            .expect_err("a partial hit over the limit is refused")
-            .to_string();
+        let partial_error = partial.expect_err("a partial hit over the limit is refused");
+        assert!(
+            data_components::refusal::is_request_bound_refusal(&partial_error),
+            "the refusal keeps its type: {partial_error:?}"
+        );
+        let partial_error = partial_error.to_string();
         assert_eq!(
             partial_error, cold_error,
             "the partial hit fails as the miss does"
@@ -6498,7 +6504,7 @@ mod tests {
     async fn partial_hit_within_request_limit_fetches_missing_keys() {
         let paths = request_limit_strings(&["/a", "/b", "/c"]);
         let (url, seen) = request_limit_counting_origin().await;
-        let source = request_limit_http_source(&url, &paths, Some(3));
+        let source = request_limit_http_source(&url, &paths, 3);
         let filters = vec![
             col("request_path").in_list(request_limit_lits(&paths), false),
             col("request_query").eq(lit("x=1")),
@@ -6548,7 +6554,7 @@ mod tests {
         let paths = request_limit_strings(&["/a", "/b", "/c"]);
         let queries = request_limit_strings(&["x=1", "y=1"]);
         let (url, seen) = request_limit_counting_origin().await;
-        let source = request_limit_http_source(&url, &paths, Some(3));
+        let source = request_limit_http_source(&url, &paths, 3);
         let mut cached = Vec::new();
         for path in &paths {
             for query in &queries {
@@ -6586,7 +6592,7 @@ mod tests {
         let queries: Vec<String> = (0..200).map(|i| format!("q={i}")).collect();
         let bodies: Vec<String> = (0..100).map(|i| format!("b{i}")).collect();
         let (url, seen) = request_limit_counting_origin().await;
-        let source = request_limit_http_source(&url, &paths, Some(3));
+        let source = request_limit_http_source(&url, &paths, 3);
         let filters = vec![
             col("request_path").in_list(request_limit_lits(&paths), false),
             col("request_query").in_list(request_limit_lits(&queries), false),
@@ -6611,10 +6617,15 @@ mod tests {
             request_limit_summary(&partial)
         );
         assert_eq!(seen.lock().drain(..).count(), 0);
-        let error = partial.expect_err("refused").to_string();
+        let error = partial.expect_err("refused");
+        assert!(
+            data_components::refusal::is_request_bound_refusal(&error),
+            "the refusal keeps its type: {error:?}"
+        );
+        let error = error.to_string();
         assert!(
             error.contains(
-                "would create 1000000 request partitions, which exceeds max_request_partitions=3"
+                "its request filters combine into 1,000,000 requests, more than the 3 allowed"
             ),
             "{error}"
         );

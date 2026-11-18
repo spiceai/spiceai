@@ -719,12 +719,19 @@ enum SqlErrorKind {
     /// (`data_components::refusal`): the query is well formed, but the data it reads
     /// is what the runtime will not process.
     RefusedData,
+    /// An HTTP dataset refused a query whose request filters combine into more
+    /// requests than `max_request_partitions` allows: the query is the client's to
+    /// change.
+    RefusedRequests,
 }
 
 impl SqlErrorKind {
     fn of_query_error(e: &QueryError) -> Self {
         if data_components::refusal::is_compression_refusal(e) {
             return Self::RefusedData;
+        }
+        if data_components::refusal::is_request_bound_refusal(e) {
+            return Self::RefusedRequests;
         }
         match e {
             QueryError::QueryCancelled { .. } => Self::Cancellation,
@@ -744,6 +751,8 @@ impl SqlErrorKind {
     fn of_datafusion_error(e: &datafusion::error::DataFusionError) -> Self {
         if data_components::refusal::is_compression_refusal(e) {
             Self::RefusedData
+        } else if data_components::refusal::is_request_bound_refusal(e) {
+            Self::RefusedRequests
         } else if is_cancellation_error(e) {
             Self::Cancellation
         } else if is_timeout_error(e) {
@@ -787,6 +796,14 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
         SqlErrorKind::RefusedData => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
+        // A request the runtime will not send, answered as JSON a client reads to act on.
+        SqlErrorKind::RefusedRequests => {
+            return (
+                StatusCode::BAD_REQUEST,
                 axum::Json(json!({ "error": message })),
             )
                 .into_response();
@@ -1698,9 +1715,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// A compression bomb is data the runtime will not process (422), carried as
-    /// `{"error": …}`. The answer is chosen by the error's type, so a reworded message
-    /// still maps, and a message that only mentions a compression bomb does not.
+    /// A compression bomb is data the runtime will not process (422), and a query over
+    /// the request bound a request it will not send (400); both carry `{"error": …}`.
+    /// The answer is chosen by the error's type, so a reworded message still maps, and a
+    /// message that only mentions either refusal does not.
     #[tokio::test]
     async fn sql_error_response_answers_refusals_as_json() {
         async fn answer(error: datafusion::error::DataFusionError) -> (StatusCode, Vec<u8>) {
@@ -1743,9 +1761,24 @@ mod tests {
             );
         }
 
+        // A query over the request bound is a 400 with a JSON body, by its type too.
+        let bound = datafusion::error::DataFusionError::External(Box::new(
+            data_components::http::provider::Error::TooManyRequests {
+                message: "a reworded request-bound refusal".to_string(),
+            },
+        ));
+        let bound_text = bound.to_string();
+        let (status, body) = answer(bound).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("a JSON body"),
+            json!({ "error": bound_text })
+        );
+
         // Text alone is not a refusal.
         let text_only = datafusion::error::DataFusionError::Plan(
-            "the response was refused as a compression bomb".to_string(),
+            "the response was refused as a compression bomb; set `max_request_partitions`"
+                .to_string(),
         );
         let text_only_message = text_only.to_string();
         let (status, body) = answer(text_only).await;

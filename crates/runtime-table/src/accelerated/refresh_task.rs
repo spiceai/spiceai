@@ -4266,9 +4266,12 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     if let Some(message) = latest_by_time::not_applied_message(&error) {
         return RetryError::permanent(super::Error::RefreshNotApplied { message });
     }
-    // Data a connector refused as a compression bomb would expand as far again, so it
-    // is not asked for again, however the scan marked the failure.
-    if data_components::refusal::is_compression_refusal(&error) {
+    // Data a connector refused as a compression bomb would expand as far again, and a
+    // query over the request bound would be refused again, so neither is asked for again,
+    // however the scan marked the failure.
+    if data_components::refusal::is_compression_refusal(&error)
+        || data_components::refusal::is_request_bound_refusal(&error)
+    {
         return RetryError::permanent(super::Error::FailedToRefreshDataset {
             source: find_datafusion_root(error),
         });
@@ -4781,6 +4784,19 @@ mod tests {
         assert!(
             matches!(retry_from_df_error(marked), RetryError::Permanent(_)),
             "a compression refusal is not asked for again"
+        );
+
+        let bound =
+            datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error(
+                DataFusionError::External(Box::new(
+                    data_components::http::provider::Error::TooManyRequests {
+                        message: "too many requests".to_string(),
+                    },
+                )),
+            );
+        assert!(
+            matches!(retry_from_df_error(bound), RetryError::Permanent(_)),
+            "a query over the request bound is not asked for again"
         );
     }
 

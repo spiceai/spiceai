@@ -20,3 +20,21 @@ limitations under the License.
 /// Whether `error`, or any error in its chain of sources, is data a connector refused as
 /// a compression bomb. The answer is the same however many layers wrapped it.
 pub use http_body_limit::is_compression_refusal;
+
+/// Whether `error`, or any error in its chain of sources, is a query an HTTP dataset
+/// refused because its request filters, or a subquery's values, combine into more
+/// requests than `max_request_partitions` allows.
+#[must_use]
+pub fn is_request_bound_refusal(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if matches!(
+            error.downcast_ref::<crate::http::provider::Error>(),
+            Some(crate::http::provider::Error::TooManyRequests { .. })
+        ) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
