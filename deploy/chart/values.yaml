@@ -33,11 +33,13 @@ cluster:
   # and testing: cluster connections are neither authenticated nor encrypted.
   allowInsecureConnections: false
 
-# Update strategy for the Deployment (used when stateful.enabled is false).
+# Update strategy for the Deployment (used when stateful.enabled is false and
+# role is not executor).
 # strategy:
 #   type: Recreate
 
-# Update strategy for the StatefulSet (used when stateful.enabled is true).
+# Update strategy for the StatefulSet (used when stateful.enabled is true or
+# role is executor).
 # updateStrategy:
 #   type: RollingUpdate
 

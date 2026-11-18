@@ -329,7 +329,8 @@ impl ClusterHarness {
     /// This is used to test late-join scenarios (e.g. DDL replay on join).
     /// The executor is added to `self.executors` and its server handle to `self.handles`.
     pub async fn add_executor(&mut self, app: Option<App>) -> Result<(), anyhow::Error> {
-        self.add_executor_on(app, None).await
+        self.add_executor_on(app, None, EXECUTOR_ADVERTISE_ADDRESS)
+            .await
     }
 
     /// Start and register a new executor configured with `cluster_port` as its
@@ -338,13 +339,24 @@ impl ClusterHarness {
         &mut self,
         cluster_port: u16,
     ) -> Result<(), anyhow::Error> {
-        self.add_executor_on(None, Some(cluster_port)).await
+        self.add_executor_on(None, Some(cluster_port), EXECUTOR_ADVERTISE_ADDRESS)
+            .await
+    }
+
+    /// Start a new executor that advertises `advertise_address` as its
+    /// `--node-advertise-address`, which its certificate may not name.
+    pub async fn add_executor_advertising(
+        &mut self,
+        advertise_address: &str,
+    ) -> Result<(), anyhow::Error> {
+        self.add_executor_on(None, None, advertise_address).await
     }
 
     async fn add_executor_on(
         &mut self,
         app: Option<App>,
         cluster_port: Option<u16>,
+        advertise_address: &str,
     ) -> Result<(), anyhow::Error> {
         let i = self.next_executor_index;
         self.next_executor_index += 1;
@@ -358,6 +370,7 @@ impl ClusterHarness {
             self.pki.as_ref(),
             &self.scheduler_cluster_addr,
             cluster_port,
+            advertise_address,
         )
         .await?;
 
@@ -528,6 +541,7 @@ impl ClusterHarnessBuilder {
                 pki.as_ref(),
                 &scheduler_cluster_addr,
                 None,
+                EXECUTOR_ADVERTISE_ADDRESS,
             )
             .await?;
 
@@ -567,6 +581,10 @@ impl ClusterHarnessBuilder {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The address executors advertise unless a test chooses another; every
+/// harness-issued certificate names it.
+const EXECUTOR_ADVERTISE_ADDRESS: &str = "127.0.0.1";
+
 fn node_tls_config(
     pki: Option<&test_framework::pki::PkiConfig>,
     label: &str,
@@ -596,6 +614,7 @@ async fn start_executor(
     pki: Option<&test_framework::pki::PkiConfig>,
     scheduler_cluster_addr: &str,
     cluster_port: Option<u16>,
+    advertise_address: &str,
 ) -> Result<(Arc<Runtime>, JoinHandle<RuntimeResult<()>>), anyhow::Error> {
     let mut executor_ports = NodePorts::allocate();
     if let Some(cluster_port) = cluster_port {
@@ -610,7 +629,7 @@ async fn start_executor(
             role: Some(Role::Executor),
             node_bind_address: executor_ports.cluster_addr(),
             scheduler_address: Some(scheduler_cluster_addr.to_string()),
-            node_advertise_address: Some("127.0.0.1".to_string()),
+            node_advertise_address: Some(advertise_address.to_string()),
             ..node_tls_config(pki, label)?
         },
         ..Default::default()

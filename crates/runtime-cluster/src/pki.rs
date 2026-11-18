@@ -40,7 +40,7 @@ use std::{
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use rustls::{
     DigitallySignedStruct, DistinguishedName, SignatureScheme,
     client::{WebPkiServerVerifier, danger::HandshakeSignatureValid},
@@ -117,6 +117,20 @@ pub struct ClusterPkiBundle {
     /// (rare) requires a restart for the hint to refresh; verification
     /// itself uses the current snapshot and remains correct.
     hint_subjects: Vec<DistinguishedName>,
+    /// The node's kind (`executor`/`scheduler`), instance identity, and the host
+    /// it advertises to peers, set once cluster configuration resolves them (see
+    /// [`Self::set_advertise_identity`]). When set, a reloaded certificate that
+    /// does not name the host is rejected, because peers reach this node there
+    /// and verify its certificate against the host.
+    advertise: ArcSwapOption<AdvertiseIdentity>,
+}
+
+/// How this node is reached by its peers, for the certificate reload check.
+#[derive(Debug)]
+struct AdvertiseIdentity {
+    node_kind: String,
+    node_id: String,
+    host: String,
 }
 
 impl std::fmt::Debug for ClusterPkiSnapshot {
@@ -157,6 +171,7 @@ impl ClusterPkiBundle {
             inner: ArcSwap::from_pointee(snapshot),
             paths: paths.clone(),
             hint_subjects,
+            advertise: ArcSwapOption::empty(),
         });
 
         let weak = Arc::downgrade(&this);
@@ -240,6 +255,55 @@ impl ClusterPkiBundle {
         })?
     }
 
+    /// Records how this node is reached by its peers — its kind, instance
+    /// identity, and advertise host — so a later certificate reload that drops
+    /// the host name is rejected (see [`Self::reload_now`]). An executor sets it
+    /// once its cluster configuration resolves (spiceai/spiceai#16481); a
+    /// scheduler does not, so its reloads are not tied to its advertise address.
+    pub fn set_advertise_identity(
+        &self,
+        node_kind: impl Into<String>,
+        node_id: impl Into<String>,
+        host: impl Into<String>,
+    ) {
+        self.advertise.store(Some(Arc::new(AdvertiseIdentity {
+            node_kind: node_kind.into(),
+            node_id: node_id.into(),
+            host: host.into(),
+        })));
+    }
+
+    /// This node's own identity, from the leaf of the certificate it currently
+    /// serves. `None` only if that leaf does not parse, which construction
+    /// already rejects.
+    #[must_use]
+    pub fn self_identity(&self) -> Option<PeerIdentity> {
+        let snapshot = self.inner.load();
+        let leaf = snapshot.cert.end_entity_cert().ok()?;
+        PeerIdentity::from_certificate(leaf)
+    }
+
+    /// The subject of this node's own certificate, for messages (for example
+    /// `CN=executor-1`); empty when the subject is empty.
+    #[must_use]
+    pub fn self_subject(&self) -> String {
+        self.self_identity()
+            .map(|identity| identity.subject().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Whether this node's own certificate is valid for `host` — the check a TLS
+    /// client applies when it dials this node there. A node advertises only an
+    /// address its certificate names.
+    #[must_use]
+    pub fn self_certificate_names_host(&self, host: &str) -> bool {
+        let snapshot = self.inner.load();
+        let Ok(leaf) = snapshot.cert.end_entity_cert() else {
+            return false;
+        };
+        crate::peer::certificate_names_host(leaf, host)
+    }
+
     /// Fingerprint of the currently-loaded bundle, for tests.
     #[doc(hidden)]
     #[must_use]
@@ -259,6 +323,39 @@ impl ClusterPkiBundle {
                 if new_snap.fingerprint == self.inner.load().fingerprint {
                     tracing::debug!("Cluster mTLS reload: file changed but content identical");
                     return;
+                }
+                // A rotated certificate that no longer names the address this
+                // node advertises is not loaded: peers reach this node there and
+                // verify its certificate against the host, so loading it would
+                // make the node unreachable.
+                if let Some(advertise) = self.advertise.load_full() {
+                    let names = new_snap.cert.end_entity_cert().is_ok_and(|leaf| {
+                        crate::peer::certificate_names_host(leaf, &advertise.host)
+                    });
+                    if !names {
+                        let subject = new_snap
+                            .cert
+                            .end_entity_cert()
+                            .ok()
+                            .and_then(PeerIdentity::from_certificate)
+                            .map(|identity| identity.subject().to_string())
+                            .unwrap_or_default();
+                        tracing::error!(
+                            "{}",
+                            crate::peer::advertise_address_mismatch_message(
+                                crate::peer::MismatchSite::Reload,
+                                &advertise.node_kind,
+                                &advertise.node_id,
+                                &subject,
+                                &advertise.host,
+                            )
+                        );
+                        // Counted with the other rotations whose material fails
+                        // validation and is not loaded; the log line names the
+                        // cause.
+                        record_reload_metric(ReloadScope::Cluster, "parse_error");
+                        return;
+                    }
                 }
                 self.inner.store(Arc::new(new_snap));
                 tracing::info!(

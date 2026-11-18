@@ -29,15 +29,17 @@ limitations under the License.
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
     task::{Context, Poll},
 };
 
+use dashmap::DashMap;
 use runtime_cluster::{
     ExecutorRegistry,
     peer::{PeerCertificate, PeerIdentity, SchedulerIdentities, address_host},
 };
 use runtime_request_context::{Extension, RequestContext};
+use rustls::pki_types::CertificateDer;
 use tonic::{
     Status,
     transport::server::{TcpConnectInfo, TlsConnectInfo},
@@ -60,36 +62,77 @@ pub(crate) enum ClusterPeerRole {
     Unauthenticated,
 }
 
+/// Per-connection cache of a peer's parsed certificate identity, keyed by the
+/// address of the chain `Arc` tonic shares across every request on one TLS
+/// connection. The value holds a [`Weak`] to that `Arc`: it keeps the allocation,
+/// so the address cannot be reused by a later connection while the entry lives,
+/// yet lets the certificates themselves be freed when the connection closes.
+///
+/// Only the identity is cached, never the role: the role is decided on each
+/// request against the scheduler identities observed now, so a change to them (a
+/// scheduler replaced at its address, a scheduler address forgotten) takes effect
+/// on a connection that is already open.
+type PeerIdentityCache = DashMap<usize, (Weak<Vec<CertificateDer<'static>>>, Option<PeerIdentity>)>;
+
+/// Bound on cached connections. A cluster has few peers, so this is only a
+/// safety bound: over it the entries of closed connections are dropped, and if
+/// the cache is still full the identity is resolved without caching.
+const PEER_IDENTITY_CACHE_CAP: usize = 4096;
+
 /// The cluster node that sent a request to this executor's Flight server, kept
 /// on the request's [`RequestContext`].
 ///
 /// The role is decided from the node's certificate the first time a handler
-/// asks, so requests that never ask (shuffle fetches) do not parse it.
+/// asks, so requests that never ask (shuffle fetches) do not parse it. The
+/// certificate's identity is parsed once per TLS connection; the role is decided
+/// from it on each request.
 #[derive(Clone)]
 pub(crate) struct ClusterPeer {
-    connect_info: Option<TlsConnectInfo<TcpConnectInfo>>,
+    /// The certificate chain the peer presented on its TLS connection, shared by
+    /// every request on that connection; `None` without a client certificate.
+    peer_certs: Option<Arc<Vec<CertificateDer<'static>>>>,
     /// `None` without cluster mTLS.
     schedulers: Option<Arc<SchedulerIdentities>>,
+    identities: Arc<PeerIdentityCache>,
     role: Arc<OnceLock<ClusterPeerRole>>,
 }
 
 impl ClusterPeer {
     pub(crate) fn role(&self) -> ClusterPeerRole {
-        *self.role.get_or_init(|| {
-            let Some(schedulers) = self.schedulers.as_ref() else {
-                return ClusterPeerRole::Unauthenticated;
-            };
-            let certificate = self
-                .connect_info
-                .as_ref()
-                .and_then(PeerCertificate::from_connect_info);
-            match certificate {
-                Some(certificate) if schedulers.contains(certificate.identity()) => {
-                    ClusterPeerRole::Scheduler
-                }
-                _ => ClusterPeerRole::Executor,
-            }
-        })
+        *self.role.get_or_init(|| self.resolve_role())
+    }
+
+    fn resolve_role(&self) -> ClusterPeerRole {
+        let Some(schedulers) = self.schedulers.as_ref() else {
+            return ClusterPeerRole::Unauthenticated;
+        };
+        match self.identity() {
+            Some(identity) if schedulers.contains(&identity) => ClusterPeerRole::Scheduler,
+            _ => ClusterPeerRole::Executor,
+        }
+    }
+
+    /// The identity of the certificate the peer presented on this connection,
+    /// parsed on the connection's first request that asks and cached for the
+    /// rest.
+    fn identity(&self) -> Option<PeerIdentity> {
+        let chain = self.peer_certs.as_ref()?;
+        let key = Arc::as_ptr(chain) as usize;
+        // While `chain` is held its address is live, and an entry's `Weak` keeps
+        // its own allocation, so an entry at this address is this connection's.
+        if let Some(entry) = self.identities.get(&key) {
+            return entry.1.clone();
+        }
+        let identity = chain.first().and_then(PeerIdentity::from_certificate);
+        if self.identities.len() >= PEER_IDENTITY_CACHE_CAP {
+            self.identities
+                .retain(|_, (connection, _)| connection.strong_count() > 0);
+        }
+        if self.identities.len() < PEER_IDENTITY_CACHE_CAP {
+            self.identities
+                .insert(key, (Arc::downgrade(chain), identity.clone()));
+        }
+        identity
     }
 }
 
@@ -127,11 +170,15 @@ pub(crate) fn is_from_peer_executor(context: &RequestContext) -> bool {
 #[derive(Clone)]
 pub(crate) struct ClusterPeerLayer {
     schedulers: Option<Arc<SchedulerIdentities>>,
+    identities: Arc<PeerIdentityCache>,
 }
 
 impl ClusterPeerLayer {
     pub(crate) fn new(schedulers: Option<Arc<SchedulerIdentities>>) -> Self {
-        Self { schedulers }
+        Self {
+            schedulers,
+            identities: Arc::new(PeerIdentityCache::new()),
+        }
     }
 }
 
@@ -142,6 +189,7 @@ impl<S> Layer<S> for ClusterPeerLayer {
         ClusterPeerMiddleware {
             inner,
             schedulers: self.schedulers.clone(),
+            identities: Arc::clone(&self.identities),
         }
     }
 }
@@ -150,6 +198,7 @@ impl<S> Layer<S> for ClusterPeerLayer {
 pub(crate) struct ClusterPeerMiddleware<S> {
     inner: S,
     schedulers: Option<Arc<SchedulerIdentities>>,
+    identities: Arc<PeerIdentityCache>,
 }
 
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for ClusterPeerMiddleware<S>
@@ -171,11 +220,12 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         if let Some(context) = req.extensions().get::<Arc<RequestContext>>() {
             context.insert_extension(ClusterPeer {
-                connect_info: req
+                peer_certs: req
                     .extensions()
                     .get::<TlsConnectInfo<TcpConnectInfo>>()
-                    .cloned(),
+                    .and_then(TlsConnectInfo::peer_certs),
                 schedulers: self.schedulers.clone(),
+                identities: Arc::clone(&self.identities),
                 role: Arc::new(OnceLock::new()),
             });
         }
@@ -186,24 +236,24 @@ where
 /// An address an executor advertises, where other nodes connect to it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Advertised<'a> {
-    /// A URL or `host:port`, such as its Flight endpoint.
+    /// A URL or `host:port`: its Flight endpoint, or the `host:port` of its
+    /// Ballista registration.
     Address(&'a str),
-    /// A bare host, such as the host of its Ballista registration.
-    Host(&'a str),
 }
 
 impl Advertised<'_> {
     fn host(&self) -> Option<&str> {
-        match self {
-            Self::Address(address) => address_host(address),
-            Self::Host(host) => Some(host),
-        }
+        let Self::Address(address) = self;
+        address_host(address)
     }
 
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Address(value) | Self::Host(value) => value,
-        }
+    /// The address as a refusal names it: `host:port`, without a URL scheme.
+    fn display(&self) -> &str {
+        let Self::Address(address) = self;
+        address
+            .split_once("://")
+            .map_or(*address, |(_, rest)| rest)
+            .trim_end_matches('/')
     }
 }
 
@@ -212,16 +262,14 @@ impl Advertised<'_> {
 /// that id. This is the identity binding that stops one cluster node acting as
 /// another's executor.
 ///
-/// When the request advertises an address the node's certificate does not name,
-/// it is served but a warning is logged: the scheduler's TLS client will not
-/// complete a handshake to a mismatched certificate there, so the address is
-/// unreachable, but refusing it is gated behind an Enhancement because it would
-/// reject a node whose certificate omits its advertise address (see the
-/// `cluster-trust` report).
+/// It also refuses a request that advertises an address the node's certificate
+/// does not name: other nodes reach this executor there and verify its
+/// certificate against the host, so an address the certificate does not name is
+/// unreachable (Enhancement spiceai/spiceai#16481).
 ///
 /// `certificate` is the certificate the request's connection presented; `None`
 /// without cluster mTLS, where no request is refused. `action` names what was
-/// refused, for the message.
+/// refused, for the identity message.
 pub(crate) fn authorize_executor_claim(
     registry: &ExecutorRegistry,
     certificate: Option<&PeerCertificate>,
@@ -241,15 +289,13 @@ pub(crate) fn authorize_executor_claim(
             .host()
             .is_some_and(|host| certificate.names_host(host));
         if !named {
-            tracing::warn!(
-                "{}",
-                unnamed_address_message(
-                    action,
-                    executor_id,
-                    certificate.identity(),
-                    advertised.as_str(),
-                )
+            let message = runtime_cluster::peer::registration_address_mismatch_message(
+                executor_id,
+                certificate.identity().subject(),
+                advertised.display(),
             );
+            tracing::warn!("{message}");
+            return Err(Status::permission_denied(message));
         }
     }
     Ok(())
@@ -276,35 +322,121 @@ pub(crate) fn registered_elsewhere_message(
     )
 }
 
-/// Warns that an executor advertises an address its certificate does not name,
-/// so the scheduler cannot reach it there.
-pub(crate) fn unnamed_address_message(
-    action: &str,
-    executor_id: &str,
-    from: &PeerIdentity,
-    advertised: &str,
-) -> String {
-    format!(
-        "Executor '{executor_id}' ({action}) advertises address '{advertised}', which the certificate of the cluster node that sent it, {from}, is not valid for, so the scheduler cannot reach it there and sends it no work. Issue each node a certificate that names its `--node-advertise-address`. See: {DISTRIBUTED_QUERY_DOCS}",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rcgen::{CertificateParams, DnType, KeyPair, SanType};
 
-    fn identity(common_name: &str) -> PeerIdentity {
+    fn certificate(common_name: &str, sans: &[&str]) -> PeerCertificate {
+        PeerCertificate::from_chain(std::slice::from_ref(&certificate_der(common_name, sans)))
+            .expect("peer certificate")
+    }
+
+    fn certificate_der(common_name: &str, sans: &[&str]) -> CertificateDer<'static> {
         let mut params = CertificateParams::default();
         params
             .distinguished_name
             .push(DnType::CommonName, common_name);
-        params.subject_alt_names.push(SanType::DnsName(
-            "node.cluster.local".try_into().expect("DNS name"),
-        ));
+        for san in sans {
+            params.subject_alt_names.push(match san.parse() {
+                Ok(ip) => SanType::IpAddress(ip),
+                Err(_) => SanType::DnsName((*san).try_into().expect("DNS name")),
+            });
+        }
         let key = KeyPair::generate().expect("key");
-        let certificate = params.self_signed(&key).expect("certificate");
-        PeerIdentity::from_certificate(certificate.der()).expect("identity")
+        let cert = params.self_signed(&key).expect("certificate");
+        cert.der().clone()
+    }
+
+    /// A request on the connection whose presented chain is `chain`.
+    fn request_on(
+        chain: &Arc<Vec<CertificateDer<'static>>>,
+        schedulers: &Arc<SchedulerIdentities>,
+        identities: &Arc<PeerIdentityCache>,
+    ) -> ClusterPeer {
+        ClusterPeer {
+            peer_certs: Some(Arc::clone(chain)),
+            schedulers: Some(Arc::clone(schedulers)),
+            identities: Arc::clone(identities),
+            role: Arc::new(OnceLock::new()),
+        }
+    }
+
+    #[test]
+    fn a_connection_role_follows_the_scheduler_identities_observed_now() {
+        let schedulers = Arc::new(SchedulerIdentities::new());
+        let identities = Arc::new(PeerIdentityCache::new());
+        let address = vec!["https://scheduler:50052".to_string()];
+        let scheduler_der = certificate_der("scheduler", &["scheduler"]);
+        let scheduler = PeerIdentity::from_certificate(&scheduler_der).expect("identity");
+        let connection = Arc::new(vec![scheduler_der]);
+
+        // Before any scheduler is observed, the connection is a peer executor's.
+        assert_eq!(
+            request_on(&connection, &schedulers, &identities).role(),
+            ClusterPeerRole::Executor
+        );
+        assert_eq!(identities.len(), 1, "identity cached for the connection");
+
+        // Once this certificate is observed at the scheduler address, a later
+        // request on the same connection is the scheduler's.
+        schedulers.record(&address, vec![(address[0].clone(), scheduler.clone())]);
+        assert_eq!(
+            request_on(&connection, &schedulers, &identities).role(),
+            ClusterPeerRole::Scheduler
+        );
+
+        // A different scheduler now answers at that address: the open connection
+        // loses the scheduler role on its next request.
+        schedulers.record(
+            &address,
+            vec![(address[0].clone(), identity("scheduler-2"))],
+        );
+        assert_eq!(
+            request_on(&connection, &schedulers, &identities).role(),
+            ClusterPeerRole::Executor
+        );
+
+        // And regains it when the original scheduler is observed again.
+        schedulers.record(&address, vec![(address[0].clone(), scheduler)]);
+        assert_eq!(
+            request_on(&connection, &schedulers, &identities).role(),
+            ClusterPeerRole::Scheduler
+        );
+        assert_eq!(
+            identities.len(),
+            1,
+            "every request on one connection reuses its cached identity"
+        );
+    }
+
+    #[test]
+    fn closed_connections_leave_the_identity_cache_when_it_fills() {
+        let schedulers = Arc::new(SchedulerIdentities::new());
+        let identities = Arc::new(PeerIdentityCache::new());
+        let der = certificate_der("executor", &["executor"]);
+
+        // Fill the cache with connections that then close.
+        for _ in 0..PEER_IDENTITY_CACHE_CAP {
+            let closed = Arc::new(vec![der.clone()]);
+            assert_eq!(
+                request_on(&closed, &schedulers, &identities).role(),
+                ClusterPeerRole::Executor
+            );
+        }
+        assert_eq!(identities.len(), PEER_IDENTITY_CACHE_CAP);
+
+        // The next connection drops the closed ones and is cached itself.
+        let open = Arc::new(vec![der]);
+        request_on(&open, &schedulers, &identities).role();
+        assert_eq!(identities.len(), 1);
+        assert!(identities.contains_key(&(Arc::as_ptr(&open) as usize)));
+    }
+
+    fn identity(common_name: &str) -> PeerIdentity {
+        certificate(common_name, &["node.cluster.local"])
+            .identity()
+            .clone()
     }
 
     #[test]
@@ -318,14 +450,33 @@ mod tests {
             ),
             "Refused to open the control stream for executor 'executor-0' from the cluster node with certificate 'CN=executor-1', so that node gets no work as 'executor-0': the executor is registered by the cluster node with certificate 'CN=executor-0', and a node acts only as the executor it registered. If two instances use SPICE_INSTANCE_ID 'executor-0', give each its own. See: https://spiceai.org/docs/features/distributed-query"
         );
+    }
+
+    #[test]
+    fn a_node_advertises_only_an_address_its_certificate_names() {
+        // The node's certificate names its per-pod DNS name, not an arbitrary IP.
+        let cert = certificate("executor-1", &["executor-1.cluster.local"]);
+        assert!(
+            Advertised::Address("https://executor-1.cluster.local:50052")
+                .host()
+                .is_some_and(|host| cert.names_host(host))
+        );
+        assert!(
+            !Advertised::Address("https://10.0.0.7:50052")
+                .host()
+                .is_some_and(|host| cert.names_host(host))
+        );
+        // The refusal names the address as `host:port`, without the URL scheme.
+        let advertised = Advertised::Address("https://10.0.0.7:50052");
+        assert_eq!(advertised.display(), "10.0.0.7:50052");
+        assert_eq!(Advertised::Address("[::1]:50052").display(), "[::1]:50052");
         assert_eq!(
-            unnamed_address_message(
-                "allocate partitions",
+            runtime_cluster::peer::registration_address_mismatch_message(
                 "executor-1",
-                &identity("executor-1"),
-                "https://10.0.0.7:50052",
+                cert.identity().subject(),
+                advertised.display(),
             ),
-            "Executor 'executor-1' (allocate partitions) advertises address 'https://10.0.0.7:50052', which the certificate of the cluster node that sent it, 'CN=executor-1', is not valid for, so the scheduler cannot reach it there and sends it no work. Issue each node a certificate that names its `--node-advertise-address`. See: https://spiceai.org/docs/features/distributed-query"
+            "Refused to register executor 'executor-1': it advertises '10.0.0.7:50052', which its cluster certificate (CN=executor-1) does not name, so other cluster nodes could not connect to it. Issue each node a certificate that names its `--node-advertise-address`. See: https://spiceai.org/docs/features/distributed-query"
         );
     }
 }

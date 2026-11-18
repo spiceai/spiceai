@@ -39,4 +39,31 @@ spec:
     {{- else }}
     {{- include "spiceai.labels" . | indent 4 }}
     app: {{ .Release.Name }}
-    {{- end }}
+    {{- end }}{{- if eq (include "spiceai.role" .) "executor" }}
+---
+# Headless Service: gives each executor pod a stable DNS name
+# `<pod>.<this-service>.<namespace>.svc.cluster.local`, which its certificate
+# covers with one wildcard SAN, so the scheduler reaches each executor at a name
+# the executor's certificate names (https://spiceai.org/docs/features/distributed-query).
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    {{- include "spiceai.labels" . | indent 4 }}
+    app: {{ .Release.Name }}
+  name: {{ template "spiceai.headlessServiceName" . }}
+  namespace: {{ template "spiceai.namespace" . }}
+spec:
+  clusterIP: None
+  # Give each pod its DNS record as soon as it exists, before it is ready, so the
+  # scheduler can reach an executor while it registers.
+  publishNotReadyAddresses: true
+  ports:
+    - port: {{ .Values.cluster.port }}
+      name: cluster
+    - port: 50051
+      name: flight
+  selector:
+    {{- include "spiceai.selectorLabels" . | indent 4 }}
+    app: {{ .Release.Name }}
+{{- end }}

@@ -50,7 +50,7 @@ helm install spiceai deploy/chart \
 
 `role: sidecar` serves an application's queries beside it, answering from its results cache and accelerations and sending reads from a remote Spice runtime as Substrait plans created locally. See [Application sidecars](../../docs/features/cluster-sidecar.md). The chart runs the sidecar as its own workload; to share a pod with your application, add a `spiced --role sidecar` container to the application's pod spec.
 
-A distributed cluster is two releases: one with `role: scheduler` and one with `role: executor` whose `cluster.schedulerAddress` points at the scheduler's Service. Both expose the cluster port, `50052` by default, and advertise their pod IP unless `cluster.advertiseAddress` is set. The scheduler's `spicepod` needs `runtime.state.location`:
+A distributed cluster is two releases: one with `role: scheduler` and one with `role: executor` whose `cluster.schedulerAddress` points at the scheduler's Service. Both expose the cluster port, `50052` by default. The executors run as a StatefulSet behind a headless Service, each advertising its stable per-pod DNS name `<pod>.<release>-spiceai-headless.<namespace>.svc.cluster.local`; the scheduler advertises its pod IP. `cluster.advertiseAddress` overrides either. The scheduler's `spicepod` needs `runtime.state.location`:
 
 ```bash
 helm install spice-scheduler deploy/chart \
@@ -65,7 +65,27 @@ helm install spice-executor deploy/chart \
   --set cluster.tls.secretName=spice-cluster-tls
 ```
 
-Cluster nodes authenticate each other with mTLS. The Secret holds `ca.crt`, `tls.crt`, and `tls.key`, the layout cert-manager writes, and each certificate must name the address its node is reached at: the scheduler Service host for the scheduler, and each node's advertise address. For development and testing on a trusted network, `cluster.allowInsecureConnections: true` runs the cluster without mTLS. The chart refuses to render a scheduler or executor with neither. An executor serves only `/health`, so its readiness probe checks `/health` in place of the default `/v1/ready`.
+Cluster nodes authenticate each other with mTLS. The Secret holds `ca.crt`, `tls.crt`, and `tls.key`, the layout cert-manager writes, and **each certificate must name the address its node is reached at**: the scheduler Service host for the scheduler, and each executor's per-pod DNS name. A node whose certificate does not name its advertise address refuses to start, and the scheduler refuses to register it, because peers could not reach it there ([distributed query](https://spiceai.org/docs/features/distributed-query)). One cert-manager `Certificate` with a wildcard DNS name covers every executor pod, so a single Secret serves the whole executor StatefulSet:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: spice-cluster-tls
+spec:
+  secretName: spice-cluster-tls         # the Secret cluster.tls.secretName points at
+  issuerRef:
+    name: spice-cluster-ca              # a cert-manager Issuer backed by the cluster CA
+    kind: Issuer
+  commonName: spice-executor
+  dnsNames:
+    - spice-scheduler-spiceai           # the scheduler Service host
+    - "*.spice-executor-spiceai-headless.default.svc.cluster.local"   # every executor pod
+```
+
+Set `cluster.advertiseAddress` only to override the defaults above; the value must be a name the certificate covers. For development and testing on a trusted network, `cluster.allowInsecureConnections: true` runs the cluster without mTLS. The chart refuses to render a scheduler or executor with neither. An executor serves only `/health`, so its readiness probe checks `/health` in place of the default `/v1/ready`.
+
+**Upgrading from a release before per-pod executor DNS:** issue the wildcard certificate above first, then upgrade the chart and the executors, and the scheduler last. The executor release moves from a Deployment to a StatefulSet, so its pods are replaced.
 
 Probe values use the standard Kubernetes probe configuration shape. They can be omitted entirely to use the built-in defaults, or partially overridden while omitted fields keep the defaults from `values.yaml`. If `exec`, `tcpSocket`, or `grpc` is configured, the chart omits the default `httpGet` handler from the rendered probe.
 
