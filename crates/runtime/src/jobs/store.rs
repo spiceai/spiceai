@@ -1452,8 +1452,8 @@ mod tests {
 
             assert_eq!(result.manifest.total_row_count, 0);
             assert_eq!(result.manifest.total_chunk_count, 0);
-            assert!(result.chunk_indices.is_empty());
-            assert!(result.chunk_row_offsets.is_empty());
+            assert_eq!(result.chunk_indices, [] as [usize; 0]);
+            assert_eq!(result.chunk_row_offsets, [] as [usize; 0]);
 
             // Schema should be preserved even with empty stream
             assert_eq!(result.manifest.schema.column_count, 2);
@@ -1604,7 +1604,7 @@ mod tests {
                     .read_chunk(&state.job_id, i)
                     .await
                     .expect("to read chunk");
-                assert!(!chunks.is_empty());
+                assert_ne!(chunks, [] as [RecordBatch; 0]);
             }
         }
 

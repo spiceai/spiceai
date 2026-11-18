@@ -510,6 +510,15 @@ impl LoadTasks {
         }
     }
 
+    /// Whether a load of `name` is running.
+    #[cfg(test)]
+    pub(crate) fn is_running(&self, name: &str) -> bool {
+        self.tasks
+            .lock()
+            .get(name)
+            .is_some_and(|task| !task.is_finished())
+    }
+
     /// Stops the load of `name`. When this returns, no attempt to load it is
     /// running and none will start.
     pub(crate) async fn stop(&self, name: &str) {

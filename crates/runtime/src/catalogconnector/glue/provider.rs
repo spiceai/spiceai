@@ -942,7 +942,10 @@ mod tests {
         );
 
         // Every table readable again: no summary for `sales` at all.
-        assert!(reconcile(&warnings, &[], start + Duration::from_mins(1)).is_empty());
+        assert_eq!(
+            reconcile(&warnings, &[], start + Duration::from_mins(1)),
+            [] as [String; 0]
+        );
         assert_eq!(
             warnings.tracked_databases(),
             0,

@@ -1236,7 +1236,7 @@ mod tests {
                 ],
             })
             .expect("protect");
-        assert!(retired(&state, "t").is_empty());
+        assert_eq!(retired(&state, "t"), [] as [&str; 0]);
 
         // A protected merge: g1 and g2 out, g3 in.
         state
