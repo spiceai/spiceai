@@ -810,6 +810,14 @@ pub struct Runtime {
     /// The Spicepod tool loads in progress, so a Spicepod change can stop the load of a
     /// configuration it replaces or removes.
     tool_loads: Arc<init::model::LoadTasks>,
+    /// The embedding model loads in progress, kept apart from `model_loads` because a model and
+    /// an embedding model can share a name.
+    embedding_loads: Arc<init::model::LoadTasks>,
+    /// The reranker loads in progress.
+    reranker_loads: Arc<init::model::LoadTasks>,
+    /// The catalog loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    catalog_loads: Arc<init::model::LoadTasks>,
     /// Names of the SQL functions registered for `as_sql` tools.
     tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// The installed app's `row_id` keys, read by `/v1/search` and `vector_search`.
@@ -976,6 +984,12 @@ impl Runtime {
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         self.llm_runtime_stores.rate_controllers()
+    }
+
+    /// This node's rank in each loaded model split across several nodes, by model name.
+    #[must_use]
+    pub fn model_node_ranks(&self) -> Arc<RwLock<HashMap<String, usize>>> {
+        self.llm_runtime_stores.node_ranks()
     }
 
     #[must_use]

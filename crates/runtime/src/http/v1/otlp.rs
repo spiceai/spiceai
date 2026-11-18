@@ -40,6 +40,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
     metrics_service_server::MetricsService,
 };
 use prost::Message;
+use tokio::sync::Semaphore;
 
 use crate::opentelemetry::Service as MetricsIngestService;
 use crate::opentelemetry_logs::LogsIngestService;
@@ -133,7 +134,17 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// Cap on a decompressed body, so a small gzip body cannot expand without bound. Matches the
 /// authenticated router's limit on the compressed body.
-pub(crate) const MAX_DECOMPRESSED_BODY_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_DECOMPRESSED_BODY_BYTES: usize = 128 * 1024 * 1024;
+
+/// Most exports decompressed and decoded at once. Each can inflate to
+/// [`MAX_DECOMPRESSED_BODY_BYTES`], so this bounds the memory they use together; other exports
+/// wait for a permit.
+const MAX_CONCURRENT_DECODES: usize = 4;
+
+static DECODE_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_DECODES);
+
+/// Size of each read from the gzip decoder.
+const INFLATE_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Encoding {
@@ -306,29 +317,56 @@ pub(crate) fn decompress(headers: &HeaderMap, body: Bytes) -> Result<Bytes, (Sta
         "" | "identity" => Ok(body),
         "gzip" => {
             let mut decoded = Vec::new();
-            let read = flate2::read::GzDecoder::new(body.as_ref())
-                .take(MAX_DECOMPRESSED_BODY_BYTES + 1)
-                .read_to_end(&mut decoded)
-                .map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to decompress gzip body: {e}"),
-                    )
-                })?;
-            if read as u64 > MAX_DECOMPRESSED_BODY_BYTES {
-                return Err((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!(
-                        "Decompressed body exceeds the {MAX_DECOMPRESSED_BODY_BYTES} byte limit."
-                    ),
-                ));
-            }
+            inflate_gzip(&body, MAX_DECOMPRESSED_BODY_BYTES, &mut decoded)?;
             Ok(Bytes::from(decoded))
         }
         other => Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             format!("Unsupported Content-Encoding '{other}'. Use gzip or no encoding."),
         )),
+    }
+}
+
+/// Inflates a gzip body into `decoded`, and fails if it inflates to more than `limit` bytes. It
+/// reads at most `limit + 1` bytes, and the buffer never grows past that.
+fn inflate_gzip(
+    body: &[u8],
+    limit: usize,
+    decoded: &mut Vec<u8>,
+) -> Result<(), (StatusCode, String)> {
+    let max_read = limit.saturating_add(1);
+    let mut gzip = flate2::read::GzDecoder::new(body);
+    let mut chunk = vec![0; INFLATE_CHUNK_BYTES];
+    loop {
+        let want = chunk.len().min(max_read.saturating_sub(decoded.len()));
+        if want == 0 {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Decompressed body exceeds the {limit} byte limit."),
+            ));
+        }
+        let read = match gzip.read(&mut chunk[..want]) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to decompress gzip body: {e}"),
+                ));
+            }
+        };
+        let needed = decoded.len() + read;
+        if needed > decoded.capacity() {
+            // Grow geometrically, as `Vec` does, but not past `max_read`.
+            let target = decoded
+                .capacity()
+                .saturating_mul(2)
+                .min(max_read)
+                .max(needed);
+            decoded.reserve_exact(target - decoded.len());
+        }
+        decoded.extend_from_slice(&chunk[..read]);
     }
 }
 
@@ -558,17 +596,34 @@ pub(crate) async fn post_logs(
     handle(service.as_ref(), &headers, body).await
 }
 
+/// Runs `work` on the blocking pool once `permits` has a free permit. The permit moves into the
+/// blocking task, so it stays held until `work` returns, even if the caller is dropped first.
+async fn spawn_blocking_with_permit<T, F>(permits: &'static Semaphore, work: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = permits.acquire().await.map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Decompresses and decodes an export, as [`decompress`] and [`decode`] do, on the blocking
-/// pool: a gzip body can inflate to [`MAX_DECOMPRESSED_BODY_BYTES`], and inflating and decoding
-/// that much would hold an HTTP runtime thread that also answers `/health`. An error is the
-/// HTTP status and message, which the caller encodes for the request.
+/// pool with at most [`MAX_CONCURRENT_DECODES`] at once: a gzip body can inflate to
+/// [`MAX_DECOMPRESSED_BODY_BYTES`], and inflating and decoding that much would hold an HTTP
+/// runtime thread that also answers `/health`. An error is the HTTP status and message, which
+/// the caller encodes for the request.
 async fn decode_body<S: Signal>(
     encoding_kind: Encoding,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<S::Request, (StatusCode, String)> {
     let headers = headers.clone();
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_with_permit(&DECODE_PERMITS, move || {
         let body = decompress(&headers, body)?;
         decode::<S>(encoding_kind, &body).map_err(|message| (StatusCode::BAD_REQUEST, message))
     })
@@ -609,7 +664,9 @@ pub(crate) async fn handle<S: Signal>(service: &S, headers: &HeaderMap, body: By
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn json_body() -> &'static str {
         r#"{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"spiced"}}]},
@@ -708,6 +765,97 @@ mod tests {
             !other_task.await.expect("task"),
             "another task ran only after the body was decoded"
         );
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(data).expect("write");
+        encoder.finish().expect("finish")
+    }
+
+    #[test]
+    fn gzip_inflation_stops_one_byte_past_the_limit() {
+        // More than one read chunk, and not a power of two.
+        const LIMIT: usize = 100_000;
+        let body = vec![7; LIMIT + 1];
+
+        let mut decoded = Vec::new();
+        inflate_gzip(&gzip(&body[..LIMIT]), LIMIT, &mut decoded).expect("a body at the limit");
+        assert_eq!(decoded, body[..LIMIT]);
+        assert!(decoded.capacity() <= LIMIT + 1, "{}", decoded.capacity());
+
+        let mut decoded = Vec::new();
+        let (status, message) = inflate_gzip(&gzip(&body), LIMIT, &mut decoded)
+            .expect_err("a body one byte over the limit");
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(message, "Decompressed body exceeds the 100000 byte limit.");
+        assert_eq!(decoded.len(), LIMIT + 1);
+        assert!(decoded.capacity() <= LIMIT + 1, "{}", decoded.capacity());
+
+        let mut decoded = Vec::new();
+        let (status, message) =
+            inflate_gzip(b"not gzip", LIMIT, &mut decoded).expect_err("not a gzip body");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            message.starts_with("Failed to decompress gzip body:"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn decodes_past_the_permit_count_wait_for_a_permit() {
+        const PERMITS: usize = 2;
+        static PERMIT_POOL: Semaphore = Semaphore::const_new(PERMITS);
+        let in_progress = Arc::new(AtomicUsize::new(0));
+        let most_in_progress = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut gates = Vec::new();
+        let mut tasks = Vec::new();
+        for id in 0..=PERMITS {
+            let (gate_tx, gate_rx) = mpsc::channel::<()>();
+            gates.push(gate_tx);
+            let in_progress = Arc::clone(&in_progress);
+            let most_in_progress = Arc::clone(&most_in_progress);
+            let started_tx = started_tx.clone();
+            tasks.push(tokio::spawn(spawn_blocking_with_permit(
+                &PERMIT_POOL,
+                move || {
+                    let now = in_progress.fetch_add(1, Ordering::SeqCst) + 1;
+                    most_in_progress.fetch_max(now, Ordering::SeqCst);
+                    started_tx.send(id).expect("started");
+                    gate_rx.recv().expect("gate");
+                    in_progress.fetch_sub(1, Ordering::SeqCst);
+                },
+            )));
+        }
+        let first = started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first decode started");
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second decode started");
+
+        // A dropped request keeps its permit until its decode returns.
+        tasks[first].abort();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "a decode started while every permit was held"
+        );
+
+        gates[first].send(()).expect("release the first decode");
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the waiting decode started once a permit was free");
+        for gate in &gates {
+            let _ = gate.send(());
+        }
+        for (id, task) in tasks.into_iter().enumerate() {
+            if id != first {
+                task.await.expect("task").expect("decode ran");
+            }
+        }
+        assert_eq!(most_in_progress.load(Ordering::SeqCst), PERMITS);
     }
 
     #[test]

@@ -19,6 +19,8 @@ sources:
 variants:
   federated: {}
   cayenne: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
   cayenne-changes:
     datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id } } }
 
@@ -78,6 +80,6 @@ steps:
         INSERT INTO t VALUES (5, '000000000000000000000005', '2024-06-01 00:00:00', 1.5, 5, 5, 5.5, false, 'late');
         UPDATE t SET i32 = 4, s = 'was null' WHERE _id = 4;
   - refresh: t
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - query: SELECT _id, oid, at, dec, i32, i64, dbl, flag, s FROM t ORDER BY _id
     eventually: 60s

@@ -58,6 +58,12 @@ matrix:
   # handed the transaction first in one run and last in the other.
   written_first: [held, free]
 
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod

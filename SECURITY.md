@@ -2,14 +2,14 @@
 
 ## Supported Versions
 
-The open-source Spice.ai runtime and CLI receive security updates **only in the latest release**, currently **v2.4.1**.
+The open-source Spice.ai runtime and CLI receive security updates **only in the latest release**, currently **v2.4.2**.
 
 Security fixes ship as a patch release of the latest minor version, or in the next release. Earlier versions, including earlier patches of the latest minor version, do not receive fixes. To stay protected, upgrade to the latest release.
 
 | Version          | Supported          |
 | ---------------- | ------------------ |
-| 2.4.1 (latest)   | :white_check_mark: |
-| < 2.4.1          | :x:                |
+| 2.4.2 (latest)   | :white_check_mark: |
+| < 2.4.2          | :x:                |
 
 ### Extended support with Spice.ai Enterprise
 

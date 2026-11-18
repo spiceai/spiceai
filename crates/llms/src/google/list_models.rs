@@ -338,10 +338,9 @@ mod tests {
 
     #[test]
     fn parse_publisher_models_handles_an_empty_catalog() {
-        assert!(
-            parse_publisher_models("{}")
-                .expect("an empty response should parse")
-                .is_empty()
+        assert_eq!(
+            parse_publisher_models("{}").expect("an empty response should parse"),
+            [] as [String; 0]
         );
     }
 

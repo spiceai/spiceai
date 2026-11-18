@@ -29,6 +29,8 @@ variants:
       products: { from: 'duckdb:products', params: '${sources.duck.params}' }
       categories: { from: 'duckdb:categories', params: '${sources.duck.params}' }
   cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
 
 spicepod:
   version: v1

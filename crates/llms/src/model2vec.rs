@@ -116,8 +116,7 @@ impl Model2Vec {
                     kind: "embedding model",
                     name: component.to_string(),
                     docs_url: DOCS_URL,
-                    // Spice loads an embedding model once.
-                    retried: false,
+                    retried: true,
                 };
                 let dir = download(requester, model, hub, options.subfolder.as_deref())
                     .await

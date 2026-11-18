@@ -865,11 +865,9 @@ mod tests {
         let verdict = ledger(&script, Vec::new()).judge(&script, &[]);
         assert_eq!(verdict.passes_in_known_failing.as_deref(), Some("s"));
         let passing = script_in("t");
-        assert!(
-            ledger(&passing, Vec::new())
-                .judge(&passing, &[])
-                .problems()
-                .is_empty()
+        assert_eq!(
+            ledger(&passing, Vec::new()).judge(&passing, &[]).problems(),
+            [] as [String; 0]
         );
     }
 

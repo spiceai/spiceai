@@ -362,12 +362,13 @@ async fn lookup_index_matches_the_ordinary_scan() {
         "SELECT * FROM {{table}} WHERE \"TenantId\" = '{INACTIVE_ACCOUNT}' \
          AND \"ServiceId\" = '{INACTIVE_APPLICATION}' AND \"Active\" = 1 LIMIT 1"
     );
-    assert!(
-        rendered(&query(&indexed, INDEXED, &inactive_sql.replace("{table}", INDEXED)).await)
-            .is_empty()
+    assert_eq!(
+        rendered(&query(&indexed, INDEXED, &inactive_sql.replace("{table}", INDEXED)).await),
+        [] as [String; 0]
     );
-    assert!(
-        rendered(&query(&plain, PLAIN, &inactive_sql.replace("{table}", PLAIN)).await).is_empty()
+    assert_eq!(
+        rendered(&query(&plain, PLAIN, &inactive_sql.replace("{table}", PLAIN)).await),
+        [] as [String; 0]
     );
 
     // --- A key present in no row.
@@ -375,10 +376,14 @@ async fn lookup_index_matches_the_ordinary_scan() {
         "SELECT * FROM {{table}} WHERE \"TenantId\" = '{MISSING_ACCOUNT}' \
          AND \"ServiceId\" = '{MISSING_APPLICATION}' AND \"Active\" = 1 LIMIT 1"
     );
-    assert!(
-        rendered(&query(&indexed, INDEXED, &miss_sql.replace("{table}", INDEXED)).await).is_empty()
+    assert_eq!(
+        rendered(&query(&indexed, INDEXED, &miss_sql.replace("{table}", INDEXED)).await),
+        [] as [String; 0]
     );
-    assert!(rendered(&query(&plain, PLAIN, &miss_sql.replace("{table}", PLAIN)).await).is_empty());
+    assert_eq!(
+        rendered(&query(&plain, PLAIN, &miss_sql.replace("{table}", PLAIN)).await),
+        [] as [String; 0]
+    );
     assert!(
         counters(&indexed).full > 0,
         "a complete index miss should be a fully covered probe"
@@ -942,11 +947,9 @@ async fn indexed_miss_has_zero_scan_and_join_statistics() {
     assert_eq!(scan_stats.num_rows, Precision::Exact(0));
     let scan_display = displayable(scan.as_ref()).indent(true).to_string();
     assert!(scan_display.contains("EmptyExec"), "{scan_display}");
-    assert!(
-        collect(scan, ctx.task_ctx())
-            .await
-            .expect("empty scan")
-            .is_empty()
+    assert_eq!(
+        collect(scan, ctx.task_ctx()).await.expect("empty scan"),
+        [] as [RecordBatch; 0]
     );
 
     let sql = format!(
@@ -971,11 +974,9 @@ async fn indexed_miss_has_zero_scan_and_join_statistics() {
         !join_display.contains("mode=Partitioned"),
         "an absent indexed build must not require a partitioned join:\n{join_display}"
     );
-    assert!(
-        collect(join, ctx.task_ctx())
-            .await
-            .expect("empty join")
-            .is_empty()
+    assert_eq!(
+        collect(join, ctx.task_ctx()).await.expect("empty join"),
+        [] as [RecordBatch; 0]
     );
     println!(
         "fully covered absent key: scan rows={:?}, join rows={:?}; \

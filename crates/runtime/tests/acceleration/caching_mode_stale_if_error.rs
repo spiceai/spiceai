@@ -723,10 +723,11 @@ async fn zero_ttl_fallback_handles_success_failures_timeout_and_recovery()
     Ok(())
 }
 
-/// The disabled fallback uses the cache-first path even with zero TTL.
+/// With a zero TTL, no stale-while-revalidate window and the fallback disabled,
+/// no stored entry could ever be served. So every lookup asks the origin, the
+/// origin's failure reaches the client, and nothing is stored.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn zero_ttl_disabled_fallback_preserves_origin_error_and_cache_writes()
--> Result<(), anyhow::Error> {
+async fn zero_ttl_disabled_fallback_passes_through_to_the_origin() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     register_test_connectors().await;
     let origin = Origin::start().await;
@@ -744,10 +745,14 @@ async fn zero_ttl_disabled_fallback_preserves_origin_error_and_cache_writes()
         ],
     );
     let rt = build_runtime(dataset, "zero_ttl_disabled").await;
+    let before = origin.fetches();
     assert_eq!(fetch_statuses(&rt, "key=a").await?, vec![200; ROWS]);
-    wait_for_cached_rows(&rt, ROWS, Duration::from_secs(10))
-        .await
-        .map_err(anyhow::Error::msg)?;
+    assert_eq!(fetch_statuses(&rt, "key=a").await?, vec![200; ROWS]);
+    assert_eq!(
+        origin.fetches(),
+        before + 2,
+        "each lookup asks the origin; none replays the one before it"
+    );
     origin.set_status(503);
     assert_origin_failure(
         fetch_statuses(&rt, "key=a").await,
@@ -756,6 +761,14 @@ async fn zero_ttl_disabled_fallback_preserves_origin_error_and_cache_writes()
     );
     origin.set_status(200);
     assert_eq!(fetch_statuses(&rt, "key=a").await?, vec![200; ROWS]);
+    // Time is what is under test here: cache writes are batched and flushed
+    // every 500 ms, so a write queued by any lookup above has landed by now.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        cached_rows(&rt).await,
+        0,
+        "nothing stored could be served, so the acceleration stays empty"
+    );
     Ok(())
 }
 

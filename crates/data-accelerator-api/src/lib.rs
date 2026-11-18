@@ -95,6 +95,9 @@ pub struct CayenneRuntimeConfig {
     /// Vortex footer-metadata cache. `None` when the operator set none, which is distinct
     /// from `Some(0)` — no footer cache at all.
     pub footer_cache_mb: Option<usize>,
+    /// The cluster membership of the `spiced` process, from `--role`: `None` for a
+    /// server or sidecar.
+    pub cluster_role: Option<runtime_component::ClusterRole>,
 }
 
 /// Runtime-level (not per-dataset) settings for one engine, at construction.
@@ -1497,12 +1500,18 @@ mod tests {
     #[test]
     fn unique_constraints_are_not_reported_as_primary_keys() {
         let constraints = Constraints::new_unverified(vec![Constraint::Unique(vec![2])]);
-        assert!(get_primary_keys_from_constraints(&constraints, &schema()).is_empty());
+        assert_eq!(
+            get_primary_keys_from_constraints(&constraints, &schema()),
+            [] as [String; 0]
+        );
     }
 
     #[test]
     fn no_constraints_yields_no_primary_keys() {
-        assert!(get_primary_keys_from_constraints(&Constraints::default(), &schema()).is_empty());
+        assert_eq!(
+            get_primary_keys_from_constraints(&Constraints::default(), &schema()),
+            [] as [String; 0]
+        );
     }
 
     /// Turning primary-key conflict detection off is a Cayenne-only escape
