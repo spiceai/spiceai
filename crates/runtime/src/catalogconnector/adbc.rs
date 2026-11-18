@@ -32,9 +32,9 @@ use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::adbc_helpers::{
-    DUCKDB_DRIVER, bigquery_table_names, build_db_options, connection_secrets, dialect_for_driver,
-    driver_entrypoint, enrich_with_bigquery_metadata, is_bigquery_driver,
-    is_bigquery_hidden_dataset, scrub_connection_secrets,
+    BIGQUERY_SKIP_ANONYMOUS_TABLES, DUCKDB_DRIVER, build_db_options, connection_secrets,
+    dialect_for_driver, driver_entrypoint, enrich_with_bigquery_metadata, is_bigquery_driver,
+    scrub_connection_secrets, skip_bigquery_anonymous_tables,
 };
 use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -46,7 +46,7 @@ use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, StreamExt};
 use runtime_datafusion::dialect::new_duckdb_dialect;
 use runtime_datafusion::function_support::{
     deny_spice_functions_for_duckdb_table_providers, expression_support_for_engine,
@@ -109,6 +109,16 @@ pub enum Error {
     /// scrubbed; the raw error is not kept because drivers echo the URI.
     #[snafu(display("Failed to create ADBC database (driver='{driver_location}'): {message}"))]
     UnableToCreateDatabase {
+        driver_location: String,
+        message: String,
+    },
+
+    /// `message` is the driver's error with the connection's credentials
+    /// scrubbed.
+    #[snafu(display(
+        "Failed to create ADBC database (driver='{driver_location}'): the BigQuery driver does not support the `{BIGQUERY_SKIP_ANONYMOUS_TABLES}` option, which the catalog needs to list hidden datasets without fetching the metadata of every cached query result. Use the BigQuery ADBC driver built from https://github.com/spiceai/bigquery. Cause: {message}"
+    ))]
+    UnsupportedBigQueryDriver {
         driver_location: String,
         message: String,
     },
@@ -360,13 +370,25 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
             driver_location: driver_location.clone(),
         })?;
 
-        let db = driver.new_database_with_opts(db_options).map_err(|e| {
+        let mut db = driver.new_database_with_opts(db_options).map_err(|e| {
             UnableToCreateDatabaseSnafu {
                 driver_location: driver_location.clone(),
                 message: scrub_connection_secrets(&e.to_string(), &secrets),
             }
             .build()
         })?;
+
+        // Without the option, listing a `BigQuery` hidden dataset fetches the
+        // metadata of every cached query result in it, one call per table.
+        if is_bigquery_driver(&driver_name) {
+            skip_bigquery_anonymous_tables(&mut db).map_err(|e| {
+                UnsupportedBigQueryDriverSnafu {
+                    driver_location: driver_location.clone(),
+                    message: scrub_connection_secrets(&e.to_string(), &secrets),
+                }
+                .build()
+            })?;
+        }
 
         let pool = AdbcConnectionPoolBuilder::new(db)
             .with_max_size(pool_size)
@@ -392,8 +414,8 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
 
 /// A catalog provider for ADBC that discovers schemas and tables using the ADBC
 /// metadata API (`get_objects`). It lists tables only in schemas the catalog's
-/// `include` can reach. For `BigQuery` it reads a dataset's tables from its
-/// `INFORMATION_SCHEMA.TABLES` view instead, and lists none in hidden datasets.
+/// `include` can reach. A `BigQuery` driver must leave out the tables of cached
+/// query results; see [`skip_bigquery_anonymous_tables`].
 struct AdbcCatalogProvider {
     pool: Arc<ADBCPool<ManagedDatabase>>,
     table_factory: AdbcTableFactory<ManagedDatabase>,
@@ -449,11 +471,7 @@ impl AdbcCatalogProvider {
             );
         }
 
-        let mut schema_tables = if is_bigquery_driver(&self.driver_name) {
-            self.list_bigquery_tables(searched).await?
-        } else {
-            self.list_driver_tables(searched).await?
-        };
+        let mut schema_tables = self.list_driver_tables(searched).await?;
         schema_tables.extend(
             skipped
                 .into_iter()
@@ -554,52 +572,6 @@ impl AdbcCatalogProvider {
         .map_err(|e| Error::UnableToListSchemas {
             source: Box::new(e),
         })?
-    }
-
-    /// Lists the tables of each `BigQuery` dataset from its
-    /// `INFORMATION_SCHEMA.TABLES` view, several datasets at a time.
-    ///
-    /// The driver's `get_objects` fetches each table's metadata in turn, so a
-    /// dataset holding thousands of tables -- the anonymous datasets of cached
-    /// query results routinely do -- takes minutes. The view answers in one
-    /// query per dataset. See [`bigquery_table_names`].
-    ///
-    /// A hidden dataset is registered with no tables and is not queried:
-    /// `BigQuery` rejects `INFORMATION_SCHEMA` for it, and leaves it out of every
-    /// `INFORMATION_SCHEMA` view. See [`is_bigquery_hidden_dataset`].
-    async fn list_bigquery_tables(
-        &self,
-        schema_names: Vec<String>,
-    ) -> Result<Vec<(String, Vec<String>)>> {
-        let (hidden, visible): (Vec<String>, Vec<String>) = schema_names
-            .into_iter()
-            .partition(|schema_name| is_bigquery_hidden_dataset(schema_name));
-        for schema_name in &hidden {
-            tracing::debug!(
-                "Schema '{schema_name}' of ADBC catalog '{}' is a hidden BigQuery dataset; skipping its table discovery",
-                self.catalog_name
-            );
-        }
-
-        let mut schema_tables: Vec<(String, Vec<String>)> = stream::iter(visible)
-            .map(|schema_name| async move {
-                match bigquery_table_names(&self.pool, &schema_name).await {
-                    Ok(table_names) => Ok((schema_name, table_names)),
-                    Err(source) => Err(Error::UnableToListTables {
-                        schema: schema_name,
-                        source,
-                    }),
-                }
-            })
-            .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY)
-            .try_collect()
-            .await?;
-        schema_tables.extend(
-            hidden
-                .into_iter()
-                .map(|schema_name| (schema_name, Vec::new())),
-        );
-        Ok(schema_tables)
     }
 
     async fn create_table_providers(

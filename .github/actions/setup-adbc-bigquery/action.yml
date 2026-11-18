@@ -3,9 +3,11 @@ description: 'Build and install the ADBC BigQuery driver from source'
 
 inputs:
   adbc_bigquery_commit:
-    description: 'Git commit hash to build the driver from'
+    description: >-
+      Commit of spiceai/bigquery to build the driver from: upstream go/v1.15.0
+      plus the Spice patches docs/dev/fork_patches.md lists.
     required: false
-    default: '2ecfe26c798012e0e289e2ba25e78849a4f90851'
+    default: 'cde50558ad9b77d7d29ff7cce163c4d87ce4c054'
   go_version:
     description: >-
       Go version to build the driver with. Must satisfy the `go` directive in the
@@ -43,11 +45,22 @@ runs:
         set -eu
         DRIVER_DIR="/etc/adbc/drivers"
 
-        git clone --depth=1 https://github.com/adbc-drivers/bigquery.git /tmp/adbc-bigquery
+        git clone --depth=1 https://github.com/spiceai/bigquery.git /tmp/adbc-bigquery
         cd /tmp/adbc-bigquery
         git fetch --depth=1 origin "$ADBC_BIGQUERY_COMMIT"
         git checkout "$ADBC_BIGQUERY_COMMIT"
         cd go
+
+        # A driver without these patches still builds and loads, so check for
+        # each one: see the ADBC BigQuery driver section of docs/dev/fork_patches.md.
+        missing=""
+        grep -q '"bigquery.skip_anonymous_tables"' driver.go || missing="$missing bigquery.skip_anonymous_tables"
+        grep -q '^func getTableInfos(' connection.go || missing="$missing getTableInfos"
+        grep -q '^func isInaccessibleTable(' connection.go || missing="$missing isInaccessibleTable"
+        if [ -n "$missing" ]; then
+          echo "::error::${ADBC_BIGQUERY_COMMIT} lacks the Spice driver patches:${missing}. Pin a spiceai/bigquery commit that carries them, and re-audit docs/dev/fork_patches.md."
+          exit 1
+        fi
 
         # `actions/setup-go` v7 sets GOTOOLCHAIN=local, so Go no longer downloads
         # the toolchain go.mod asks for when the installed one is older — it just

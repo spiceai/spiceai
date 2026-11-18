@@ -21,7 +21,7 @@ limitations under the License.
 //! runtime and connector crates.
 
 use adbc_core::options::OptionDatabase;
-use arrow::array::{Array, ArrayRef, AsArray, LargeStringArray, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
@@ -537,89 +537,32 @@ pub fn is_bigquery_driver(driver_name: &str) -> bool {
 }
 
 /// Whether `dataset` is a `BigQuery` hidden dataset: one whose name starts with
-/// `_`. These include the anonymous datasets `BigQuery` fills with the cached
-/// result of every query, which can hold thousands of tables.
-///
-/// `BigQuery` hides them from the console and from every `INFORMATION_SCHEMA`
-/// view, and rejects a query against a hidden dataset's `INFORMATION_SCHEMA`
-/// ("Cannot use `INFORMATION_SCHEMA` with a hidden dataset"), so
-/// [`bigquery_table_names`] must not be called for one.
+/// `_`. `BigQuery` rejects a query against a hidden dataset's
+/// `INFORMATION_SCHEMA` ("Cannot use `INFORMATION_SCHEMA` with a hidden
+/// dataset").
 #[must_use]
 pub fn is_bigquery_hidden_dataset(dataset: &str) -> bool {
     dataset.starts_with('_')
 }
 
-/// Lists the tables of one `BigQuery` dataset from its `INFORMATION_SCHEMA.TABLES`
-/// view.
-///
-/// The driver's `get_objects` fetches each table's metadata with its own API
-/// call, one table after another, so listing a dataset that way takes time in
-/// proportion to its table count. The view answers in one query.
-///
-/// `BigQuery` rejects this query for a hidden dataset; see
-/// [`is_bigquery_hidden_dataset`].
-///
-/// Names are returned exactly as `BigQuery` stores them: a table name may
-/// contain spaces, so nothing is trimmed.
+/// The `BigQuery` ADBC driver option that leaves the tables of cached query
+/// results out of `get_objects`, before the driver fetches any table's metadata.
+/// Tables in a user's own hidden datasets are still listed. Only the
+/// `spiceai/bigquery` build of the driver has it.
+pub const BIGQUERY_SKIP_ANONYMOUS_TABLES: &str = "bigquery.skip_anonymous_tables";
+
+/// Turns on [`BIGQUERY_SKIP_ANONYMOUS_TABLES`] for a `BigQuery` database.
 ///
 /// # Errors
 ///
-/// When the query fails, or when its answer does not have the shape the
-/// statement asks for: one string column with no NULLs.
-pub async fn bigquery_table_names(
-    pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
-    dataset: &str,
-) -> std::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let conn = Arc::clone(pool).connect().await?;
-    let batches: Vec<RecordBatch> = query_arrow(conn, bigquery_table_names_sql(dataset), None)
-        .await?
-        .try_collect()
-        .await?;
-    exact_string_column(&batches)
-}
-
-fn bigquery_table_names_sql(dataset: &str) -> String {
-    format!(
-        "SELECT table_name FROM {}",
-        bigquery_information_schema_view(None, Some(dataset), "TABLES")
+/// When the driver rejects the option, as a driver build without it does.
+pub fn skip_bigquery_anonymous_tables(
+    database: &mut impl adbc_core::Optionable<Option = OptionDatabase>,
+) -> adbc_core::error::Result<()> {
+    database.set_option(
+        OptionDatabase::Other(BIGQUERY_SKIP_ANONYMOUS_TABLES.to_string()),
+        "true".into(),
     )
-}
-
-/// Every value of a single-column string answer, untrimmed. A NULL or a
-/// non-string column is an error rather than a skipped row: the caller is
-/// listing names, and a name dropped here is a table that silently never
-/// appears.
-fn exact_string_column(
-    batches: &[RecordBatch],
-) -> std::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut values = Vec::new();
-    for batch in batches {
-        if batch.num_columns() != 1 {
-            return Err(format!(
-                "expected one column of table names, got {} columns",
-                batch.num_columns()
-            )
-            .into());
-        }
-        let column = batch.column(0);
-        if column.null_count() > 0 {
-            return Err("expected no NULL table names, got a NULL".into());
-        }
-        if let Some(array) = column.as_string_opt::<i32>() {
-            values.extend(array.iter().flatten().map(str::to_string));
-        } else if let Some(array) = column.as_string_opt::<i64>() {
-            values.extend(array.iter().flatten().map(str::to_string));
-        } else if let Some(array) = column.as_string_view_opt() {
-            values.extend(array.iter().flatten().map(str::to_string));
-        } else {
-            return Err(format!(
-                "expected a string column of table names, got {}",
-                column.data_type()
-            )
-            .into());
-        }
-    }
-    Ok(values)
 }
 
 /// Enriches a table provider with BigQuery-specific schema metadata (descriptions,
@@ -632,6 +575,14 @@ pub async fn enrich_with_bigquery_metadata(
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
     if !is_bigquery_driver(driver_name) {
+        return provider;
+    }
+    // The metadata comes from `INFORMATION_SCHEMA`, which `BigQuery` rejects for
+    // a hidden dataset, so a table in one has none to read.
+    if table_reference
+        .schema()
+        .is_some_and(is_bigquery_hidden_dataset)
+    {
         return provider;
     }
 
@@ -793,23 +744,12 @@ fn string_value(array: &ArrayRef, row: usize) -> Option<&str> {
 }
 
 fn bigquery_information_schema_table(table_reference: &TableReference, view: &str) -> String {
-    bigquery_information_schema_view(table_reference.catalog(), table_reference.schema(), view)
-}
-
-/// A dataset-qualified (or project- and dataset-qualified) `INFORMATION_SCHEMA`
-/// view. `BigQuery` runs a dataset-qualified view in the dataset's own region,
-/// so the caller need not know where the dataset lives.
-fn bigquery_information_schema_view(
-    project: Option<&str>,
-    dataset: Option<&str>,
-    view: &str,
-) -> String {
     let mut parts = Vec::new();
-    if let Some(project) = project {
-        parts.push(project.to_string());
+    if let Some(catalog) = table_reference.catalog() {
+        parts.push(catalog.to_string());
     }
-    if let Some(dataset) = dataset {
-        parts.push(dataset.to_string());
+    if let Some(schema) = table_reference.schema() {
+        parts.push(schema.to_string());
     }
     parts.push("INFORMATION_SCHEMA".to_string());
     parts.push(view.to_string());
@@ -1196,83 +1136,74 @@ mod scrub_tests {
 }
 
 #[cfg(test)]
-mod bigquery_table_listing_tests {
+mod bigquery_anonymous_table_skip_tests {
     use super::*;
-    use arrow::array::{Int64Array, StringViewArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status};
+    use adbc_core::options::OptionValue;
 
-    fn batch(column: ArrayRef) -> RecordBatch {
-        let schema = Schema::new(vec![Field::new(
-            "table_name",
-            column.data_type().clone(),
-            true,
-        )]);
-        RecordBatch::try_new(Arc::new(schema), vec![column]).expect("valid batch")
+    /// A database that records the options set on it, and rejects them the way
+    /// a driver build without the option does when `known` is false.
+    struct Database {
+        known: bool,
+        set: Vec<(String, String)>,
+    }
+
+    impl adbc_core::Optionable for Database {
+        type Option = OptionDatabase;
+
+        fn set_option(&mut self, key: OptionDatabase, value: OptionValue) -> AdbcResult<()> {
+            if !self.known {
+                return Err(AdbcError::with_message_and_status(
+                    format!("Unknown database option '{}'", key.as_ref()),
+                    Status::NotImplemented,
+                ));
+            }
+            let OptionValue::String(value) = value else {
+                panic!("expected a string option value");
+            };
+            self.set.push((key.as_ref().to_string(), value));
+            Ok(())
+        }
+
+        fn get_option_string(&self, _: OptionDatabase) -> AdbcResult<String> {
+            unimplemented!()
+        }
+        fn get_option_bytes(&self, _: OptionDatabase) -> AdbcResult<Vec<u8>> {
+            unimplemented!()
+        }
+        fn get_option_int(&self, _: OptionDatabase) -> AdbcResult<i64> {
+            unimplemented!()
+        }
+        fn get_option_double(&self, _: OptionDatabase) -> AdbcResult<f64> {
+            unimplemented!()
+        }
     }
 
     #[test]
-    fn the_table_listing_reads_the_dataset_qualified_tables_view() {
+    fn a_driver_with_the_option_skips_anonymous_tables() {
+        let mut database = Database {
+            known: true,
+            set: Vec::new(),
+        };
+        skip_bigquery_anonymous_tables(&mut database).expect("the option is applied");
         assert_eq!(
-            bigquery_table_names_sql("tpch_sf1"),
-            "SELECT table_name FROM `tpch_sf1.INFORMATION_SCHEMA.TABLES`"
+            database.set,
+            vec![(
+                "bigquery.skip_anonymous_tables".to_string(),
+                "true".to_string()
+            )]
         );
     }
 
     #[test]
-    fn table_names_are_returned_exactly_across_batches_and_string_types() {
-        let batches = [
-            batch(Arc::new(StringArray::from(vec!["orders", " padded name "]))),
-            batch(Arc::new(LargeStringArray::from(vec!["line items"]))),
-            batch(Arc::new(StringViewArray::from(vec!["nation"]))),
-            batch(Arc::new(StringArray::from(Vec::<&str>::new()))),
-        ];
-        assert_eq!(
-            exact_string_column(&batches).expect("string columns"),
-            vec!["orders", " padded name ", "line items", "nation"]
-        );
-    }
-
-    #[test]
-    fn a_null_table_name_is_an_error_not_a_skipped_row() {
-        let batches = [batch(Arc::new(StringArray::from(vec![
-            Some("orders"),
-            None,
-        ])))];
-        assert_eq!(
-            exact_string_column(&batches)
-                .expect_err("a NULL name must fail")
-                .to_string(),
-            "expected no NULL table names, got a NULL"
-        );
-    }
-
-    #[test]
-    fn an_answer_of_the_wrong_shape_is_an_error() {
-        let batches = [batch(Arc::new(Int64Array::from(vec![1])))];
-        assert_eq!(
-            exact_string_column(&batches)
-                .expect_err("a non-string column must fail")
-                .to_string(),
-            "expected a string column of table names, got Int64"
-        );
-
-        let schema = Schema::new(vec![
-            Field::new("table_name", DataType::Utf8, false),
-            Field::new("table_type", DataType::Utf8, false),
-        ]);
-        let two_columns = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(StringArray::from(vec!["orders"])),
-                Arc::new(StringArray::from(vec!["BASE TABLE"])),
-            ],
-        )
-        .expect("valid batch");
-        assert_eq!(
-            exact_string_column(&[two_columns])
-                .expect_err("two columns must fail")
-                .to_string(),
-            "expected one column of table names, got 2 columns"
-        );
+    fn a_driver_without_the_option_rejects_it() {
+        let mut database = Database {
+            known: false,
+            set: Vec::new(),
+        };
+        let error = skip_bigquery_anonymous_tables(&mut database)
+            .expect_err("a driver without the option rejects it");
+        assert_eq!(error.status, Status::NotImplemented);
+        assert!(database.set.is_empty());
     }
 }
