@@ -11890,6 +11890,7 @@ dependencies = [
  "google-genai",
  "governor",
  "http 1.4.1",
+ "http-egress",
  "huggingface-hub",
  "indexmap 2.14.0",
  "insta",
@@ -11928,6 +11929,7 @@ dependencies = [
  "tracing-futures",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "util",
  "wiremock",
 ]
@@ -18319,6 +18321,7 @@ dependencies = [
  "fundu",
  "futures",
  "http 1.4.1",
+ "http-egress",
  "insta",
  "libnfs",
  "nix 0.30.1",

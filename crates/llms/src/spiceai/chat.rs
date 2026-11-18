@@ -57,12 +57,16 @@ pub fn is_cloud_platform(endpoint: Option<&str>) -> bool {
 ///
 /// `api_key` is optional: the Spice.ai Cloud Platform requires one, but a Spice runtime reached
 /// over a trusted network may not have authentication enabled.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built (see
+/// [`crate::provider::client_without_retry`]).
 pub fn new_spiceai_client(
     model: String,
     endpoint: Option<&str>,
     api_key: Option<&str>,
-) -> Openai<HostedModelConfig> {
+) -> Result<Openai<HostedModelConfig>, async_openai::error::OpenAIError> {
     let config = HostedModelConfig::from_url(&api_base(endpoint)).with_api_key(api_key);
     new_openai_client_with_config(model, config)
 }
@@ -126,7 +130,8 @@ mod tests {
     #[tokio::test]
     async fn a_hosted_model_request_carries_one_content_type() {
         let (api_base, rx) = capture_one_request();
-        let client = new_spiceai_client("m".to_string(), Some(&api_base), None);
+        let client =
+            new_spiceai_client("m".to_string(), Some(&api_base), None).expect("the client builds");
         // The reply is not a chat completion, so this fails; the request it sent first is
         // what the assertion reads.
         let _ = tokio::time::timeout(Duration::from_secs(20), client.health()).await;

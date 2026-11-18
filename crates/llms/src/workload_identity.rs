@@ -851,14 +851,16 @@ pub async fn azure_federated_client(
             .identity
             .into_token_provider(component, resolved.first_token)
     };
-    Ok(Some(crate::openai::new_azure_client_with_token_provider(
+    crate::openai::new_azure_client_with_token_provider(
         model.to_string(),
         endpoint,
         federation.api_version,
         federation.deployment_name,
         token,
         chat_backend,
-    )))
+    )
+    .map(Some)
+    .map_err(FederationError::Client)
 }
 
 #[cfg(test)]

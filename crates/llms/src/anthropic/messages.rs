@@ -52,7 +52,7 @@ impl Anthropic {
         let mut config = self.client.config().clone();
         config.default_headers.remove("anthropic-beta");
         AnthropicMessages {
-            http: reqwest::Client::new(),
+            http: self.http.clone(),
             config,
             model: self.model.clone(),
             model_from_default: self.model_from_default,

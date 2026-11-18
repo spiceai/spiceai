@@ -53,21 +53,24 @@ impl SpiceAiModelLister {
             params.get("spiceai_api_key")
         };
 
-        Ok(Self::new(api_key, endpoint))
+        Self::new(api_key, endpoint)
     }
 
     /// Creates a new model lister with explicit credentials.
     ///
     /// `api_key` is optional so listing works against a Spice runtime reached over a trusted
     /// network, matching what [`crate::spiceai::new_spiceai_client`] accepts for chat.
-    #[must_use]
-    pub fn new(api_key: Option<&SecretString>, endpoint: Option<&str>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the HTTP client cannot be built.
+    pub fn new(api_key: Option<&SecretString>, endpoint: Option<&str>) -> ListModelsResult<Self> {
         let config = HostedModelConfig::from_url(&api_base(endpoint))
             .with_api_key(api_key.map(ExposeSecret::expose_secret));
 
-        Self {
-            client: crate::provider::client_without_retry(config),
-        }
+        Ok(Self {
+            client: crate::provider::lister_client(config, PROVIDER_NAME)?,
+        })
     }
 
     /// Returns common Spice.ai Cloud Platform model names as a fallback.
@@ -191,7 +194,8 @@ mod tests {
             .mount(&server)
             .await;
         let endpoint = server.uri();
-        let lister = SpiceAiModelLister::new(None, Some(endpoint.as_str()));
+        let lister =
+            SpiceAiModelLister::new(None, Some(endpoint.as_str())).expect("the lister builds");
         let models = lister
             .list_models()
             .await

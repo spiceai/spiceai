@@ -135,9 +135,15 @@ impl Provider {
     fn lister(self, base: &str) -> Box<dyn ListModels> {
         let key = SecretString::from("not-a-real-key");
         match self {
-            Self::OpenAi => Box::new(OpenAiModelLister::new(&key, Some(base))),
-            Self::Xai => Box::new(XaiModelLister::new(&key, Some(base))),
-            Self::Spice => Box::new(SpiceAiModelLister::new(Some(&key), Some(base))),
+            Self::OpenAi => {
+                Box::new(OpenAiModelLister::new(&key, Some(base)).expect("the lister builds"))
+            }
+            Self::Xai => {
+                Box::new(XaiModelLister::new(&key, Some(base)).expect("the lister builds"))
+            }
+            Self::Spice => Box::new(
+                SpiceAiModelLister::new(Some(&key), Some(base)).expect("the lister builds"),
+            ),
         }
     }
 }

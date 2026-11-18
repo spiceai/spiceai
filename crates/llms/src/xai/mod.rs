@@ -60,29 +60,40 @@ pub struct Xai {
 }
 
 impl Xai {
-    #[must_use]
-    pub fn new(model: Option<&str>, api_key: &str) -> Self {
+    /// An xAI model served from `https://api.x.ai/v1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the HTTP client cannot be built.
+    pub fn new(model: Option<&str>, api_key: &str) -> Result<Self, OpenAIError> {
         Self::with_endpoint(model, api_key, DEFAULT_ENDPOINT)
     }
 
     /// An xAI model served from `endpoint` rather than `https://api.x.ai/v1`.
-    #[must_use]
-    pub fn with_endpoint(model: Option<&str>, api_key: &str, endpoint: &str) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the HTTP client cannot be built.
+    pub fn with_endpoint(
+        model: Option<&str>,
+        api_key: &str,
+        endpoint: &str,
+    ) -> Result<Self, OpenAIError> {
         let cfg = OpenAIConfig::default()
             .with_api_base(endpoint)
             .with_api_key(api_key);
 
-        // No retries, as `crate::provider::client_without_retry`. The service also reads xAI's
-        // error bodies, which `async-openai` cannot.
-        let http_client = reqwest::Client::new();
+        // No retries, as `crate::provider::client_without_retry`, under the same egress policy.
+        // The service also reads xAI's error bodies, which `async-openai` cannot.
+        let http_client = crate::provider::guarded_client_builder().build()?;
         let client = Client::build(http_client.clone(), cfg)
             .with_http_service(error::XaiErrorService::new(http_client));
 
-        Self {
+        Ok(Self {
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),
             client,
             rate_controller: default_rate_controller(),
-        }
+        })
     }
 
     /// Changes to `req` to accommodate xAi not being `OpenAI` compatible.
@@ -263,7 +274,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_key_is_moved_to_chat_header_value() {
-        let xai = Xai::new(Some("grok-4.3"), "test-key");
+        let xai = Xai::new(Some("grok-4.3"), "test-key").expect("the client builds");
         let req = CreateChatCompletionRequest {
             prompt_cache_key: Some("conversation-123".to_string()),
             ..CreateChatCompletionRequest::default()

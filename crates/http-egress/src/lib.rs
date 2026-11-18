@@ -40,7 +40,9 @@ limitations under the License.
 mod client;
 mod egress;
 mod guard;
+mod internal;
 
 pub use client::{OnOriginChange, Resolver, SendError, configure, redirect_policy, send};
 pub use egress::{Egress, Hop, RedirectRefused};
 pub use guard::{DestinationGuard, DestinationRefused};
+pub use internal::{is_blocked_internal_hostname, is_internal_ip, redirect_target_is_internal};

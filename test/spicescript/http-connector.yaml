@@ -18,6 +18,11 @@ description: >
   never follows its endpoint to another origin. The GraphQL connector follows
   the same rule: a redirect within its endpoint's origin keeps its auth
   header, and one to another internal origin is refused before it is made.
+  So do hosted models (Anthropic, OpenAI-compatible, Azure OpenAI): a model
+  whose endpoint redirects to another origin fails to load, naming the fix,
+  and that origin never receives its key or prompt, while a model on a
+  loopback endpoint reached by name loads through a redirect within its
+  origin.
 
 sources:
   api: { kind: mock-http }
@@ -152,6 +157,30 @@ spicepod:
       columns:
         - { name: id, type: bigint }
         - { name: name, type: text }
+  models:
+    - from: anthropic:claude-sonnet-4-6
+      name: claude_moved
+      params:
+        anthropic_api_key: sk-ant-guard
+        endpoint: ${sources.api.url}/anthropic/v1
+    - from: openai:gpt-4o-mini
+      name: gpt_moved
+      params:
+        openai_api_key: sk-openai-guard
+        endpoint: ${sources.api.url}/openai/v1
+    - from: azure:gpt-4o-mini
+      name: azure_moved
+      params:
+        azure_api_key: azure-guard
+        azure_deployment_name: chat
+        azure_api_version: '2024-10-21'
+        endpoint: ${sources.api.url}/azure
+    # A local server (an Ollama or vLLM on this host) reached by name, through the resolver.
+    - from: openai:gpt-4o-mini
+      name: gpt_local
+      params:
+        openai_api_key: sk-openai-local
+        endpoint: http://localhost:${sources.api.port}${sources.api.prefix}/local/v1
 
 steps:
   - source-exec:
@@ -308,6 +337,26 @@ steps:
           path: /gql-away
           status: 307
           headers: { location: '${sources.elsewhere.url}/gql' }
+        - |
+          path: /anthropic/v1/messages
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/anthropic/v1/messages' }
+        - |
+          path: /openai/v1/chat/completions
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/openai/v1/chat/completions' }
+        - |
+          path: /azure/openai/deployments/chat/chat/completions
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/azure/openai/deployments/chat/chat/completions' }
+        - |
+          path: /local/v1/chat/completions
+          status: 307
+          headers: { location: 'http://localhost:${sources.api.port}${sources.api.prefix}/local2/v1/chat/completions' }
+        - |
+          path: /local2/v1/chat/completions
+          headers: { content-type: application/json }
+          body: '{"id": "c1", "object": "chat.completion", "created": 1, "model": "gpt-4o-mini", "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}'
   - source-exec:
       elsewhere:
         - |
@@ -413,6 +462,25 @@ steps:
     eventually: 30s
   - source-query: { elsewhere: count /gql }
     expect: { rows: [['0']] }
+
+  # Hosted models: an endpoint that redirects to another origin fails the model, naming the
+  # fix, and the other origin never receives the key or the prompt. A loopback endpoint reached
+  # by name loads through a redirect within its origin, which keeps the key.
+  - assert-log:
+      contains:
+        - "Failed to load model 'claude_moved': the server redirected to another origin, http://127\\.0\\.0\\.1:[0-9]+, and this request carries a credential that is sent only to http://127\\.0\\.0\\.1:[0-9]+\\. Set `endpoint` to the URL the endpoint redirects to\\. See: https://spiceai\\.org/docs/components/models"
+        - "Failed to load model 'gpt_moved': the server redirected to another origin, .* Set `endpoint` to the URL the endpoint redirects to"
+        - "Failed to load model 'azure_moved': the server redirected to another origin, .* Set `endpoint` to the URL the endpoint redirects to"
+        - "Model \\[gpt_local\\] deployed, ready for inferencing"
+    eventually: 60s
+  - source-query: { elsewhere: count /anthropic/v1/messages }
+    expect: { rows: [['0']] }
+  - source-query: { elsewhere: count /openai/v1/chat/completions }
+    expect: { rows: [['0']] }
+  - source-query: { elsewhere: count /azure/openai/deployments/chat/chat/completions }
+    expect: { rows: [['0']] }
+  - source-query: { api: header /local2/v1/chat/completions authorization }
+    expect: { rows: [[Bearer sk-openai-local]] }
 
   # Two 503s, then an answer: retried, and three requests in all.
   - query: SELECT content FROM flaky WHERE request_path = '/data'

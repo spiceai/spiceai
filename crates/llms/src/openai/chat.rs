@@ -282,6 +282,7 @@ mod service_tier_tests {
             None,
             backend,
         )
+        .expect("the client builds")
     }
 
     fn received(rx: &mpsc::Receiver<ReceivedRequest>) -> ReceivedRequest {
