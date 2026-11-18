@@ -1446,15 +1446,16 @@ mod budget_response_tests {
         assert_eq!(third.status, JobStatus::Pending);
     }
 
-    /// Results count against the caller's stored-results budget until they expire. At the
-    /// budget a submission is a `429` whose `Retry-After` is the seconds until the oldest result
-    /// expires, and whose body names that time; it leaves no job behind.
+    /// Results count against the caller's stored-results budget until the minute they expire in
+    /// ends. At the budget a submission is a `429` whose `Retry-After` is the seconds until then,
+    /// and whose body names that time; it leaves no job behind.
     #[tokio::test]
     async fn a_caller_at_its_stored_results_budget_gets_429_until_the_oldest_result_expires() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        // An hour from now, on a whole second.
-        let expires_at_ms = (crate::jobs::now_ms() / 1_000 + 3_600) * 1_000;
-        // The caller's ledger as a scheduler stores it, holding one 1 GiB result.
+        // The end of a minute about an hour from now.
+        let expires_at_ms = (crate::jobs::now_ms() / 60_000 + 61) * 60_000;
+        // The caller's ledger as a scheduler stores it, holding 1 GiB of results that expire in
+        // that minute.
         let owner_hex = OWNER.bytes().fold(String::new(), |mut hex, byte| {
             write!(hex, "{byte:02x}").expect("writing to a String");
             hex
@@ -1462,7 +1463,7 @@ mod budget_response_tests {
         let ledger = serde_json::json!({
             "running": {},
             "pending": [],
-            "stored": {"an-earlier-query": {"bytes": 1_u64 << 30, "expires_at_ms": expires_at_ms}},
+            "stored": {expires_at_ms.to_string(): 1_u64 << 30},
         });
         store
             .put(
@@ -1492,9 +1493,14 @@ mod budget_response_tests {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
             .expect("Retry-After seconds");
-        // Whole seconds until the expiry, rounded up: 3600 unless the clock passed a second
-        // boundary since the expiry was set.
-        assert!((3_599..=3_600).contains(&retry_after), "{retry_after}");
+        // Whole seconds until then, rounded up, as of the response, a moment before this check.
+        let at_least = expires_at_ms
+            .saturating_sub(crate::jobs::now_ms())
+            .div_ceil(1_000);
+        assert!(
+            (at_least..=at_least + 1).contains(&retry_after),
+            "{retry_after} vs {at_least}"
+        );
         let expires_at = chrono::DateTime::from_timestamp_millis(
             i64::try_from(expires_at_ms).expect("a time in range"),
         )

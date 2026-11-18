@@ -79,10 +79,27 @@ pub struct JobStore {
     node_id: String,
     result_ttl: Duration,
     chunk_size: usize,
-    /// One lock per caller, held across a read-modify-write of its ledger, so this scheduler's
-    /// own writes to a ledger take turns instead of conflicting and backing off; conditional
-    /// writes still settle races with other schedulers.
-    ledger_locks: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// One slot per caller this scheduler wrote the ledger of recently. Its lock is held across
+    /// a read-modify-write of the ledger, so this scheduler's own writes take turns instead of
+    /// conflicting and backing off; conditional writes still settle races with other
+    /// schedulers. It keeps the ledger as last written, so the next change is written without
+    /// reading it first.
+    ledger_slots: dashmap::DashMap<String, Arc<tokio::sync::Mutex<LedgerSlot>>>,
+}
+
+/// A caller's ledger as this scheduler last wrote or read it, at the version it was written at.
+#[derive(Default)]
+struct LedgerSlot {
+    cached: Option<Ledger>,
+    used_at: Option<std::time::Instant>,
+}
+
+/// Whether a later conditional write can name the version `ledger` was read or written at.
+fn has_version(ledger: &Ledger) -> bool {
+    ledger
+        .version
+        .as_ref()
+        .is_some_and(|version| version.e_tag.is_some() || version.version.is_some())
 }
 
 impl std::fmt::Debug for JobStore {
@@ -108,7 +125,7 @@ impl JobStore {
             store,
             base_prefix: base_prefix.into(),
             node_id: node_id.into(),
-            ledger_locks: dashmap::DashMap::new(),
+            ledger_slots: dashmap::DashMap::new(),
             result_ttl: object_store_occ::cleanup::age(DEFAULT_RESULT_TTL),
             chunk_size: DEFAULT_CHUNK_SIZE,
         }
@@ -941,48 +958,54 @@ impl JobStore {
 
     /// Applies `change` to `owner`'s ledger and writes it back if `change` says it changed,
     /// starting again from a fresh read when another scheduler wrote it first.
+    ///
+    /// The change is first applied to the ledger as this scheduler last wrote it, which is
+    /// usually still current: the common write is then one conditional write with no read, and
+    /// the write landing proves the ledger was current. When another scheduler wrote the ledger
+    /// since, that write is refused and the ledger is read and changed again at once; only a
+    /// conflict after a fresh read backs off. A change that writes nothing proves nothing about
+    /// the copy it saw, such as a refused admission, so it is decided again on a fresh read.
     pub(crate) async fn modify_ledger<T: Send>(
         &self,
         owner: &str,
         change: impl FnMut(&mut Ledger) -> (T, bool) + Send,
     ) -> Result<T> {
-        let lock = Arc::clone(
-            self.ledger_locks
+        let slot = Arc::clone(
+            self.ledger_slots
                 .entry(owner.to_string())
                 .or_default()
                 .value(),
         );
-        let _turn = lock.lock().await;
+        let mut slot = slot.lock().await;
+        slot.used_at = Some(std::time::Instant::now());
+        let cached = Mutex::new(slot.cached.take());
         let change = Mutex::new(change);
         let path = self.ledger_path(owner);
-        retry_on_conflict(&ConflictRetry::default(), || async {
+        let result = retry_on_conflict(&ConflictRetry::default(), || async {
+            let last_written = cached.lock().take();
+            if let Some(mut ledger) = last_written {
+                let (out, changed) = (*change.lock())(&mut ledger);
+                if changed && self.write_ledger(&path, &mut ledger).await? {
+                    *cached.lock() = Some(ledger).filter(has_version);
+                    return Ok(Attempt::Done(out));
+                }
+            }
             let mut ledger = self.read_ledger(owner).await?;
             let (out, changed) = (*change.lock())(&mut ledger);
             if !changed {
+                *cached.lock() = Some(ledger).filter(has_version);
                 return Ok(Attempt::Done(out));
             }
-            let payload = serde_json::to_vec(&ledger).context(SerializeStateSnafu)?;
-            let expected = match ledger.version.clone() {
-                Some(version) => Expected::at_version(version).ok_or_else(|| {
-                    super::error::Error::ObjectStoreWrite {
-                        source: ConditionalWriteError::Unsupported {
-                            path: path.to_string(),
-                            source: ObjectStoreError::NotSupported {
-                                source: "the store reported neither an ETag nor a version".into(),
-                            },
-                        },
-                    }
-                })?,
-                None => Expected::Absent,
-            };
-            match conditional_put(self.store.as_ref(), &path, payload.into(), &expected).await {
-                Ok(_) => Ok(Attempt::Done(out)),
-                Err(ConditionalWriteError::Conflict { .. }) => Ok(Attempt::Conflict),
-                Err(source) => Err(super::error::Error::ObjectStoreWrite { source }),
+            if self.write_ledger(&path, &mut ledger).await? {
+                *cached.lock() = Some(ledger).filter(has_version);
+                Ok(Attempt::Done(out))
+            } else {
+                Ok(Attempt::Conflict)
             }
         })
-        .await
-        .map_err(|err| match err {
+        .await;
+        slot.cached = cached.into_inner();
+        result.map_err(|err| match err {
             RetryOnConflictError::ConflictsExhausted { .. } => {
                 super::error::Error::ConcurrentModification {
                     job_id: format!("owners/{owner}"),
@@ -990,6 +1013,47 @@ impl JobStore {
             }
             RetryOnConflictError::Failed(err) => err,
         })
+    }
+
+    /// Writes `ledger` over the version it was read or last written at, and records the version
+    /// written. Returns `false` when another writer changed it first. On an error the outcome is
+    /// unknown, so the caller drops the ledger it holds.
+    async fn write_ledger(&self, path: &Path, ledger: &mut Ledger) -> Result<bool> {
+        let payload = serde_json::to_vec(&ledger).context(SerializeStateSnafu)?;
+        let expected = match ledger.version.clone() {
+            Some(version) => Expected::at_version(version).ok_or_else(|| {
+                super::error::Error::ObjectStoreWrite {
+                    source: ConditionalWriteError::Unsupported {
+                        path: path.to_string(),
+                        source: ObjectStoreError::NotSupported {
+                            source: "the store reported neither an ETag nor a version".into(),
+                        },
+                    },
+                }
+            })?,
+            None => Expected::Absent,
+        };
+        match conditional_put(self.store.as_ref(), path, payload.into(), &expected).await {
+            Ok(written) => {
+                ledger.version = Some(UpdateVersion {
+                    e_tag: written.e_tag,
+                    version: written.version,
+                });
+                Ok(true)
+            }
+            Err(ConditionalWriteError::Conflict { .. }) => Ok(false),
+            Err(source) => Err(super::error::Error::ObjectStoreWrite { source }),
+        }
+    }
+
+    /// Forgets the ledgers of callers this scheduler has not written for `idle`.
+    pub(crate) fn forget_idle_ledgers(&self, idle: Duration) {
+        self.ledger_slots.retain(|_, slot| {
+            Arc::strong_count(slot) > 1
+                || slot.try_lock().map_or(true, |slot| {
+                    slot.used_at.is_some_and(|at| at.elapsed() < idle)
+                })
+        });
     }
 
     /// The owners that have a ledger.

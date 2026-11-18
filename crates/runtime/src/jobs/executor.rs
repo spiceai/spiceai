@@ -181,9 +181,13 @@ struct Runner {
 /// the identity that submitted it.
 const RESUBMIT_MESSAGE: &str = "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.";
 
-/// How long a job may wait between being created and entering its caller's ledger before the
-/// recovery sweep treats it as abandoned by a scheduler that stopped in between.
+/// How long a job may go without a ledger entry, or a ledger entry without its job, before the
+/// recovery sweep treats it as left by a scheduler that stopped between the two writes. It also
+/// covers a submission that lands after the sweep listed the jobs.
 const UNADMITTED_GRACE_MS: u64 = 60_000;
+
+/// How long this scheduler keeps a caller's ledger in memory after it last changed it.
+const LEDGER_IDLE: Duration = Duration::from_mins(10);
 
 impl Runner {
     /// Starts `job_id` in a task of its own, under `context` when it has one, and releases its
@@ -250,6 +254,29 @@ impl Runner {
             Err(e) => tracing::warn!(
                 job_id,
                 "Failed to release the running slot of async query '{job_id}': {e}. The recovery sweep releases it."
+            ),
+        }
+    }
+
+    /// Releases the running slot or queue place of `job_id`, admitted while its job record
+    /// failed to be written, and starts the caller's next queued jobs here. A release that does
+    /// not land is left to the recovery sweep, which drops an entry without a job once
+    /// `UNADMITTED_GRACE_MS` has passed.
+    async fn release_unwritten(&self, owner: &str, job_id: &str) {
+        let node = self.job_store.node_id().to_string();
+        let limits = self.limits;
+        match self
+            .job_store
+            .modify_ledger(owner, |ledger| {
+                let (changed, promoted) = ledger.finish_and_promote(job_id, None, &node, limits);
+                (promoted, changed)
+            })
+            .await
+        {
+            Ok(promoted) => self.start_promoted(owner, promoted).await,
+            Err(e) => tracing::warn!(
+                job_id,
+                "Failed to release the place of async query '{job_id}', whose submission failed: {e}. The recovery sweep releases it."
             ),
         }
     }
@@ -395,33 +422,41 @@ impl JobExecutor {
             job_timeout_seconds(request.timeout_seconds, context.query_timeout())?;
         request.maximum_size = Some(job_maximum_size(request.maximum_size)?);
 
-        // The job is created before it enters its caller's ledger, so a ledger entry always has
-        // a job behind it and the recovery sweep can drop an entry whose job is gone.
-        let state = self
-            .job_store
-            .create_job(request, read_only, owner.clone())
-            .await?;
-        let job_id = state.job_id.clone();
+        // The job is written and admitted to its caller's ledger at the same time, so a
+        // submission waits for one write rather than two. Each side is undone when the other
+        // fails: a job whose admission did not land is deleted, and an admission whose job was
+        // not written is released. A scheduler that stops between the two leaves a job the
+        // recovery sweep fails, or a ledger entry it releases once `UNADMITTED_GRACE_MS` has
+        // passed.
+        let job_id = JobStore::generate_job_id();
         let node = self.job_store.node_id().to_string();
         let limits = self.runner.limits;
-        let admission = self
-            .job_store
-            .modify_ledger(&owner, |ledger| {
-                let admission = ledger.admit(&job_id, &node, limits, now_ms_or_zero());
+        let admitted_at_ms = now_ms_or_zero();
+        let (created, admission) = tokio::join!(
+            self.job_store
+                .create_job_with_id(job_id.clone(), request, read_only, owner.clone()),
+            self.job_store.modify_ledger(&owner, |ledger| {
+                let admission = ledger.admit(&job_id, &node, limits, admitted_at_ms);
                 let changed = admission.is_ok();
                 (admission, changed)
-            })
-            .await;
-        let admission = match admission {
-            Ok(Ok(admission)) => admission,
-            Ok(Err(refusal)) => {
+            }),
+        );
+        let (state, admission) = match (created, admission) {
+            (Ok(state), Ok(Ok(admission))) => (state, admission),
+            (Ok(_), Ok(Err(refusal))) => {
                 self.discard(&job_id).await;
                 return Err(refusal_error(refusal));
             }
-            Err(e) => {
+            (Ok(_), Err(e)) => {
                 self.discard(&job_id).await;
                 return Err(e);
             }
+            (Err(e), Ok(Ok(_))) => {
+                self.runner.release_unwritten(&owner, &job_id).await;
+                return Err(e);
+            }
+            (Err(_), Ok(Err(refusal))) => return Err(refusal_error(refusal)),
+            (Err(e), Err(_)) => return Err(e),
         };
 
         match admission {
@@ -464,22 +499,23 @@ impl JobExecutor {
         }
     }
 
-    /// Reconciles every caller's ledger with the job states, so a scheduler that stopped
-    /// between writing a job and its ledger leaves nothing behind for long:
-    /// - a slot or place whose job finished or is gone is released, and a succeeded job's
-    ///   result is kept in the budget until it expires;
+    /// Reconciles every caller's ledger with `jobs`, every job's state as the recovery sweep
+    /// listed it, so a scheduler that stopped between writing a job and its ledger leaves
+    /// nothing behind for long:
+    /// - a slot or place whose job finished is released, and a succeeded job's result is kept in
+    ///   the budget until it expires; one whose job is missing is released once
+    ///   `UNADMITTED_GRACE_MS` has passed since it was admitted, since its job may still be
+    ///   being written, or have been written after `jobs` was listed;
+    /// - a ledger that was lost is rebuilt with the results of the caller's succeeded jobs;
     /// - a queued job accepted by a scheduler that is not live is taken over here when its
     ///   caller is public, and otherwise failed with a request to resubmit, as a running job
     ///   is; the rest keep their order;
-    /// - a job that never entered its caller's ledger is failed after a grace period.
-    pub async fn reconcile_ledgers(&self, live_nodes: &std::collections::HashSet<String>) {
-        let jobs = match self.job_store.list_jobs(None).await {
-            Ok(jobs) => jobs,
-            Err(e) => {
-                tracing::warn!("Failed to list async query jobs to reconcile caller budgets: {e}");
-                return;
-            }
-        };
+    /// - a job that never entered its caller's ledger is failed after the same grace period.
+    pub async fn reconcile_ledgers(
+        &self,
+        jobs: &[JobState],
+        live_nodes: &std::collections::HashSet<String>,
+    ) {
         let mut owners: std::collections::BTreeSet<String> = jobs
             .iter()
             .map(|job| job.owner_scope().to_string())
@@ -514,16 +550,20 @@ impl JobExecutor {
                                 tracked.insert(job_id);
                             }
                             Some(job) => changed |= ledger.finish(&job_id, stored_entry(job)),
+                            None if ledger.admitted_at_ms(&job_id).is_some_and(|at| {
+                                now_ms.saturating_sub(at) <= UNADMITTED_GRACE_MS
+                            }) => {}
                             None => changed |= ledger.finish(&job_id, None),
                         }
                     }
-                    for job in jobs.iter().filter(|job| job.owner_scope() == owner) {
-                        if let Some(stored) = stored_entry(job)
-                            && stored.expires_at_ms > now_ms
-                            && !ledger.stored.contains_key(&job.job_id)
-                        {
-                            ledger.stored.insert(job.job_id.clone(), stored);
-                            changed = true;
+                    if ledger.version.is_none() {
+                        for job in jobs.iter().filter(|job| job.owner_scope() == owner) {
+                            if let Some(stored) = stored_entry(job)
+                                && stored.expires_at_ms > now_ms
+                            {
+                                ledger.keep_stored(stored);
+                                changed = true;
+                            }
                         }
                     }
                     for entry in &ledger.pending {
@@ -878,6 +918,7 @@ impl JobExecutor {
     ///
     /// Returns how many jobs were deleted.
     pub async fn cleanup_expired_jobs(&self) -> Result<usize> {
+        self.job_store.forget_idle_ledgers(LEDGER_IDLE);
         let deleted = self.job_store.cleanup_expired_jobs().await?;
         let now_ms = now_ms_or_zero();
         match self.job_store.ledger_owners().await {
@@ -1729,5 +1770,213 @@ mod tests {
             "the internal recovery sweep still sees every job"
         );
         assert!(all.iter().any(|j| j.job_id == theirs));
+    }
+
+    /// An object store that refuses every write of a job record, and serves everything else
+    /// from memory: a job write that fails while its ledger admission lands.
+    #[derive(Debug)]
+    struct FailingJobWrites {
+        inner: InMemory,
+    }
+
+    impl std::fmt::Display for FailingJobWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingJobWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FailingJobWrites {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().contains("/jobs/") {
+                return Err(object_store::Error::Generic {
+                    store: "FailingJobWrites",
+                    source: "injected job write failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn limited_executor(job_store: Arc<JobStore>, limits: JobLimits) -> JobExecutor {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        JobExecutor::with_limits(job_store, df, limits)
+    }
+
+    fn select_one() -> SubmitQueryRequest {
+        SubmitQueryRequest {
+            sql: "SELECT 1".to_string(),
+            parameters: None,
+            timeout_seconds: None,
+            maximum_size: None,
+        }
+    }
+
+    /// A submission whose job record fails to be written while its admission lands releases
+    /// the slot or place it was admitted to, so the failed submission holds nothing.
+    #[tokio::test]
+    async fn a_job_write_that_fails_releases_its_admission() {
+        let job_store = Arc::new(JobStore::new(
+            Arc::new(FailingJobWrites {
+                inner: InMemory::new(),
+            }),
+            "test",
+            "node-1",
+        ));
+        let executor = limited_executor(
+            Arc::clone(&job_store),
+            JobLimits {
+                running: 1,
+                pending: 1,
+                stored_bytes: u64::MAX,
+            },
+        );
+        // One query of another scheduler holds the only running slot, so the next admission is
+        // a queue place; the one after it would be refused.
+        job_store
+            .modify_ledger(OWNER, |ledger| {
+                let admission = ledger.admit("elsewhere", "node-2", executor.runner.limits, 0);
+                ((), admission.is_ok())
+            })
+            .await
+            .expect("ledger written");
+
+        let error = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect_err("the job write fails");
+        assert!(matches!(error, Error::ObjectStoreWrite { .. }), "{error:?}");
+        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
+        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["elsewhere"]);
+        assert_eq!(ledger.pending.len(), 0);
+        assert!(executor.runner.pending.lock().is_empty());
+
+        // The released place is free again: a second failing submission is admitted to it, not
+        // refused for a full queue, and releases it too.
+        let error = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect_err("the job write fails again");
+        assert!(matches!(error, Error::ObjectStoreWrite { .. }), "{error:?}");
+        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
+        assert_eq!(ledger.running.len(), 1);
+        assert_eq!(ledger.pending.len(), 0);
+    }
+
+    /// A submission refused by its caller's ledger after its job record was written deletes
+    /// the job, so the refusal leaves no job and no ledger entry behind.
+    #[tokio::test]
+    async fn a_refused_admission_deletes_its_written_job() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = limited_executor(
+            Arc::clone(&job_store),
+            JobLimits {
+                running: 0,
+                pending: 0,
+                stored_bytes: u64::MAX,
+            },
+        );
+        let error = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect_err("no place is free");
+        assert!(
+            matches!(error, Error::QueueFull { pending: 0 }),
+            "{error:?}"
+        );
+        assert_eq!(
+            job_store.list_jobs(None).await.expect("jobs listed").len(),
+            0
+        );
+        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
+        assert_eq!((ledger.running.len(), ledger.pending.len()), (0, 0));
+    }
+
+    /// A scheduler that stopped after admitting a query but before writing its job leaves a
+    /// ledger entry with no job. The sweep keeps it while its job may still be being written,
+    /// and releases it once the grace period has passed.
+    #[tokio::test]
+    async fn the_sweep_releases_an_entry_without_a_job_only_after_the_grace_period() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = limited_executor(Arc::clone(&job_store), JobLimits::default());
+        let now_ms = now_ms_or_zero();
+        let limits = executor.runner.limits;
+        job_store
+            .modify_ledger(OWNER, |ledger| {
+                let recent = ledger.admit("recent", "node-gone", limits, now_ms - 50_000);
+                let stale = ledger.admit(
+                    "stale",
+                    "node-gone",
+                    limits,
+                    now_ms - UNADMITTED_GRACE_MS - 1_000,
+                );
+                ((), recent.is_ok() && stale.is_ok())
+            })
+            .await
+            .expect("ledger written");
+        let live = std::collections::HashSet::from(["node-1".to_string()]);
+
+        executor.reconcile_ledgers(&[], &live).await;
+
+        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
+        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["recent"]);
+        assert_eq!(ledger.pending.len(), 0);
     }
 }

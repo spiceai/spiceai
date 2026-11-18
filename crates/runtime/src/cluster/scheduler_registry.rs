@@ -365,10 +365,8 @@ async fn recover_orphaned_jobs(
         live
     };
 
-    let jobs = match job_executor
-        .list_all_jobs(Some(crate::jobs::JobStatus::Running))
-        .await
-    {
+    // One listing serves both the takeover below and the ledger reconciliation after it.
+    let jobs = match job_executor.list_all_jobs(None).await {
         Ok(jobs) => jobs,
         Err(err) => {
             tracing::warn!("Failed to list jobs during recovery sweep: {err}");
@@ -376,7 +374,10 @@ async fn recover_orphaned_jobs(
         }
     };
 
-    for job in jobs {
+    for job in jobs
+        .iter()
+        .filter(|job| job.status == crate::jobs::JobStatus::Running)
+    {
         let driven = job
             .scheduler_node
             .as_ref()
@@ -387,11 +388,11 @@ async fn recover_orphaned_jobs(
                 scheduler_node = ?job.scheduler_node,
                 "Recovering job orphaned by a lost scheduler"
             );
-            job_executor.resume(&job).await;
+            job_executor.resume(job).await;
         }
     }
 
-    job_executor.reconcile_ledgers(&live).await;
+    job_executor.reconcile_ledgers(&jobs, &live).await;
 }
 
 impl SchedulerRegistryRunner {
