@@ -38,6 +38,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use runtime_request_context::{Extension, RequestContext};
 use spicepod::component::runtime::CorsConfig;
 
 const ALLOWED_HOSTS_DOCS: &str =
@@ -182,6 +183,18 @@ impl RequestOriginPolicy {
     }
 }
 
+/// Marks a request the policy refused, for the request metrics: as for a
+/// request authentication refused, its client dimensions come from headers a
+/// caller chose, so the metrics record only the runtime-defined labels.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RequestOriginRefused;
+
+impl Extension for RequestOriginRefused {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Answers `403` to a request whose `Host` or `Origin` the listener does not
 /// accept, before authentication, routing or a handler runs.
 pub(crate) async fn check_request_origin(
@@ -200,6 +213,9 @@ pub(crate) async fn check_request_origin(
                 .map(|authority| authority.as_str().as_bytes())
         });
     if let Some(message) = policy.refusal(host, req.headers().get(header::ORIGIN)) {
+        if let Some(context) = req.extensions().get::<Arc<RequestContext>>() {
+            context.insert_extension(RequestOriginRefused);
+        }
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": message })),

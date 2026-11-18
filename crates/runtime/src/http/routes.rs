@@ -792,6 +792,7 @@ async fn track_metrics(
     };
     let method = http_method_label(req.method());
 
+    let refused = Arc::clone(&request_context);
     let response = Arc::clone(&request_context)
         .scope(async move {
             // Install a drop guard on the request's cancellation token so
@@ -817,7 +818,10 @@ async fn track_metrics(
         .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let unauthenticated = response.status() == http::StatusCode::UNAUTHORIZED;
+    let unauthenticated = response.status() == http::StatusCode::UNAUTHORIZED
+        || refused
+            .extension::<super::host_policy::RequestOriginRefused>()
+            .is_some();
     let status = http_status_label(response.status().as_u16());
 
     let mut labels = vec![
@@ -826,9 +830,10 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    // This layer wraps the auth layer, so it also sees requests the auth layer
-    // rejected. Their client dimensions come from headers a caller chose without
-    // proving who it is, so a `401` carries only the runtime-defined labels.
+    // This layer wraps the auth layer and the host policy, so it also sees the
+    // requests they rejected. Their client dimensions come from headers a caller
+    // chose without proving who it is, so a `401`, or a `403` from the host
+    // policy, carries only the runtime-defined labels.
     if unauthenticated {
         labels.extend_from_slice(protocol_dimensions);
     } else {
