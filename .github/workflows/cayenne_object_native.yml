@@ -2,21 +2,12 @@
 name: Cayenne object-native
 
 # Checks the object-native metastore model, stores, and conditional writes.
+#
+# Every job builds and runs the checked-out code on the persistent
+# `spiceai-dev-runners` hosts, so the workflow is not triggered on
+# pull_request: a change runs here only once it is in the merge queue, and a
+# manual dispatch runs only on a protected branch.
 on:
-  pull_request:
-    paths:
-      - 'crates/cayenne-metastore-model/**'
-      - 'docs/design/object-native-metastore.md'
-      - 'docs/design/object-native-metastore-technical.md'
-      - 'crates/cayenne/**'
-      - 'crates/cayenne-metastore-actions/**'
-      - 'crates/accelerators/accelerator-cayenne/**'
-      - 'crates/object_store_occ/**'
-      - 'crates/object_store_sim/**'
-      - '.github/workflows/cayenne_object_native.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
   merge_group:
   # Nightly: every run, including the controls.
   schedule:
@@ -51,6 +42,14 @@ env:
 
 jobs:
   changes:
+    # A dispatch runs the workflow and code of the ref it names; only protected
+    # branches may reach the persistent runners that way. Every other job needs
+    # this one, so they are skipped with it.
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      github.ref == 'refs/heads/trunk' ||
+      startsWith(github.ref, 'refs/heads/release-') ||
+      startsWith(github.ref, 'refs/heads/release/')
     environment: secret-free
     runs-on: spiceai-dev-runners
     permissions:
@@ -67,7 +66,7 @@ jobs:
           fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 1 }}
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: paths
-        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        if: github.event_name == 'merge_group'
         with:
           base: ${{ github.event.merge_group.base_sha || github.event.repository.default_branch }}
           filters: |
@@ -105,13 +104,7 @@ jobs:
       group: cayenne-metastore-model-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
     name: Check the metastore model (${{ (github.event_name == 'schedule' || inputs.set == 'all') && 'all' || 'quick' }})
-    # Runs the change's code on persistent self-hosted runners, so fork and
-    # Dependabot pull requests run it only from the merge queue.
-    if: >-
-      needs.changes.outputs.model == 'true' &&
-      (github.event_name != 'pull_request' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]'))
+    if: needs.changes.outputs.model == 'true'
     environment: secret-free
     runs-on: spiceai-dev-runners
     # `quick` took 40 s on a 16-core Mac; `all` is not yet timed.
@@ -166,13 +159,7 @@ jobs:
       group: cayenne-data-store-s3-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
     name: Object-native (rustfs)
-    # Runs the change's code on persistent self-hosted runners, so fork and
-    # Dependabot pull requests run it only from the merge queue.
-    if: >-
-      needs.changes.outputs.stores == 'true' && github.event_name != 'schedule' &&
-      (github.event_name != 'pull_request' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]'))
+    if: needs.changes.outputs.stores == 'true' && github.event_name != 'schedule'
     environment: secret-free
     runs-on: spiceai-dev-runners
     timeout-minutes: 120
@@ -249,13 +236,7 @@ jobs:
       group: cayenne-object-store-occ-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
     name: Object store OCC
-    # Runs the change's code on persistent self-hosted runners, so fork and
-    # Dependabot pull requests run it only from the merge queue.
-    if: >-
-      needs.changes.outputs.object_store_occ == 'true' &&
-      (github.event_name != 'pull_request' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]'))
+    if: needs.changes.outputs.object_store_occ == 'true'
     environment: secret-free
     runs-on: spiceai-dev-runners
     timeout-minutes: 60
