@@ -102,7 +102,7 @@ impl Runtime {
             }
             Err(e) => {
                 metrics::embeddings::LOAD_ERROR.add(1, &[]);
-                if let Some(refused) = llms::provider::refused_redirect(&e) {
+                if let Some(refused) = http_egress::refused_redirect(&e) {
                     let message = super::model::endpoint_redirect_message(
                         "embedding model",
                         &in_embed.name,
@@ -237,12 +237,13 @@ fn embedding_labels(in_embed: &Embeddings) -> [KeyValue; 2] {
     ]
 }
 
-/// The parameter that sets the endpoint of `embedding`.
+/// What sets the endpoint of `embedding` (see [`super::model::endpoint_param`]).
 fn embedding_endpoint_param(embedding: &Embeddings) -> &'static str {
     match embedding.get_prefix() {
-        Some(EmbeddingPrefix::SpiceAi) => "spiceai_endpoint",
-        Some(EmbeddingPrefix::Databricks) => "databricks_endpoint",
-        _ => "endpoint",
+        Some(EmbeddingPrefix::SpiceAi) => "`spiceai_endpoint`",
+        Some(EmbeddingPrefix::Databricks) => "`databricks_endpoint`",
+        Some(EmbeddingPrefix::Google) => "the service account key's `token_uri`",
+        _ => "`endpoint`",
     }
 }
 
@@ -250,7 +251,7 @@ fn embedding_endpoint_param(embedding: &Embeddings) -> &'static str {
 /// retry can clear. A Spicepod change loads the model again.
 fn is_permanent_embedding_failure(err: &crate::Error) -> bool {
     // Only a new endpoint clears a refused redirect.
-    if llms::provider::refused_redirect(err).is_some() {
+    if http_egress::refused_redirect(err).is_some() {
         return true;
     }
     let crate::Error::UnableToInitializeEmbeddingModel { source } = err else {

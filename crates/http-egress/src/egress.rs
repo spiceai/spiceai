@@ -75,6 +75,23 @@ impl Default for Egress {
     }
 }
 
+impl Egress {
+    /// The egress of a client that reaches one endpoint the operator configured and never
+    /// follows it to another origin (see [`crate::origin_bound`]). The endpoint may be on a
+    /// loopback or private address, which stays allowed; a host that first resolved to a
+    /// public address is reached only at public addresses from then on. `reason` completes
+    /// the error for a redirect to another port of an endpoint host that resolved to an
+    /// internal address.
+    #[must_use]
+    pub fn for_configured_endpoint(reason: &str) -> Self {
+        // Every origin change is refused by the redirect policy, so the guard judges no
+        // redirect target of its own: its addresses pin the endpoint's host.
+        let guard =
+            DestinationGuard::new(crate::is_internal_ip, |_: &Url| false, reason).redirects_only();
+        Self::new(Some(guard), DEFAULT_MAX_REDIRECTS)
+    }
+}
+
 impl fmt::Debug for Egress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Egress")

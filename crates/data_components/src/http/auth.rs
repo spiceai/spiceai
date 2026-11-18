@@ -535,12 +535,7 @@ async fn exchange_token(
 /// The error a failed token request becomes: a redirect the egress policy refused is named,
 /// since `reqwest`'s own message for it does not say why.
 fn token_request_error(url: &str, source: reqwest::Error) -> Error {
-    let refused = std::iter::successors(
-        Some(&source as &(dyn std::error::Error + 'static)),
-        |error| error.source(),
-    )
-    .find_map(|error| error.downcast_ref::<http_egress::RedirectRefused>())
-    .cloned();
+    let refused = http_egress::refused_redirect(&source).cloned();
     match refused {
         Some(refused) => Error::TokenRedirectRefused {
             url: url.to_string(),

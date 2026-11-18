@@ -29,7 +29,6 @@ use reqwest::StatusCode;
 use secrecy::SecretString;
 use snafu::Snafu;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Timeout for model list API calls
@@ -134,48 +133,21 @@ pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
     hint
 }
 
-/// The most redirects a hosted model's HTTP client follows, all within its endpoint's origin.
-const MAX_REDIRECTS: usize = 10;
-
 /// A `reqwest` client builder under the egress policy every hosted model's HTTP client applies.
 ///
-/// A model request carries its credential in a header (`Authorization`, `api-key`,
-/// `x-api-key`, …) and the prompt in its body, and a model endpoint has no reason to send either
-/// to another origin. So the client follows a redirect only within the endpoint's origin, and
-/// refuses one that changes the scheme, host or port, or downgrades HTTPS to HTTP, rather than
-/// carrying a custom credential header or a `307`/`308` body there. The endpoint's host is
-/// pinned to the class of its first DNS answer: an endpoint the operator put on a loopback or
-/// private address (a local Ollama, an in-cluster vLLM) stays reachable, and a public endpoint
-/// cannot later resolve to an internal address.
+/// A model request carries its credential in a header and the prompt in its body, and a model
+/// endpoint has no reason to send either to another origin, so the client is
+/// [`http_egress::origin_bound`]: it follows a redirect only within the endpoint's origin, and
+/// the endpoint's host is pinned to the class of its first DNS answer, so an endpoint the
+/// operator put on a loopback or private address (a local Ollama, an in-cluster vLLM) stays
+/// reachable and a public endpoint cannot later resolve to an internal address.
 ///
 /// Each call starts a new egress state, so each client pins the hosts it reaches on its own.
 pub fn guarded_client_builder() -> reqwest::ClientBuilder {
-    // Every origin change is refused, so the guard has no redirect target of its own to judge:
-    // its addresses pin the endpoint's host. A redirect to another port of an endpoint host
-    // that resolved to an internal address is refused with `reason`.
-    let guard = http_egress::DestinationGuard::new(
-        http_egress::is_internal_ip,
-        |_: &url::Url| false,
+    http_egress::origin_bound(
+        reqwest::Client::builder(),
         "a model's client follows a redirect only within its endpoint's origin",
     )
-    .redirects_only();
-    let egress = http_egress::Egress::new(Some(guard), MAX_REDIRECTS);
-    reqwest::Client::builder()
-        .redirect(http_egress::redirect_policy(
-            egress.clone(),
-            http_egress::OnOriginChange::Refuse,
-        ))
-        .dns_resolver(Arc::new(http_egress::Resolver::new(egress)))
-}
-
-/// The redirect a hosted model's client refused, when that is why `error` happened: see
-/// [`guarded_client_builder`].
-#[must_use]
-pub fn refused_redirect<'a>(
-    error: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a http_egress::RedirectRefused> {
-    std::iter::successors(Some(error), |e| e.source())
-        .find_map(|e| e.downcast_ref::<http_egress::RedirectRefused>())
 }
 
 /// Builds an `async-openai` client that sends each request once, under the egress policy of
