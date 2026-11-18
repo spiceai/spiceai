@@ -7502,7 +7502,7 @@ mod tests {
 
     /// The rows a write-back member's envelope builds to, as the `id` text values.
     fn built_ids(envelope: &ChangeEnvelope) -> Vec<i32> {
-        use arrow::array::{Array, AsArray};
+        use arrow::array::AsArray;
         let batch = envelope.change_batch().expect("the envelope builds");
         let data = batch
             .record
