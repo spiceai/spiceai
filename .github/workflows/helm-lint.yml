@@ -31,7 +31,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - id: check
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           filters: |
             code_changes:
@@ -52,7 +52,7 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Helm
-        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.3.1
 

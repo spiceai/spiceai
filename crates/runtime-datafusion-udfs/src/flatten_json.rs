@@ -1045,8 +1045,8 @@ mod tests {
 
     #[test]
     fn malformed_input_yields_zero_rows() {
-        assert!(flatten("not json").is_empty());
-        assert!(flatten("{unterminated").is_empty());
+        assert_eq!(flatten("not json"), [] as [JsonRow; 0]);
+        assert_eq!(flatten("{unterminated"), [] as [JsonRow; 0]);
     }
 
     #[test]
@@ -1080,7 +1080,7 @@ mod tests {
             ..FlattenOptions::default()
         };
         let rows = flatten_with_options(r#"{"a":1}"#, &opts);
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [JsonRow; 0]);
     }
 
     #[test]

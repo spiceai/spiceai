@@ -660,55 +660,95 @@ impl SpiceAI {
     }
 }
 
+/// Most times an append stream resubscribes in a row, each after the upstream
+/// ended the subscription with `DATA_LOSS`, before it gives up.
+const MAX_APPEND_STREAM_RESUBSCRIBES: u32 = 5;
+
+/// A subscription that lasted this long counts as healthy, so the next
+/// `DATA_LOSS` starts the resubscribe budget again.
+const APPEND_STREAM_HEALTHY_SUBSCRIPTION: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether the upstream ended a subscription because the subscriber missed
+/// updates. A new subscription starts with a truncate and a full snapshot, so
+/// resubscribing reconciles the acceleration.
+fn is_resubscribable(error: &arrow_flight::error::FlightError) -> bool {
+    matches!(error, arrow_flight::error::FlightError::Tonic(status) if status.code() == tonic::Code::DataLoss)
+}
+
 pub fn subscribe_to_append_stream(
     mut client: FlightClient,
     table_reference: String,
 ) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
     stream! {
-        // The subscription carries one schema per stream, so the normalizer is resolved from the
-        // first batch and reused for the rest. Without it an accelerated dataset that started on
-        // the conformed scan schema would ingest the producer's non-conforming MAP declaration.
-        let mut normalizer = StreamNormalizer::new();
-        match client.subscribe(&table_reference).await {
-            Ok(mut stream) => {
-                while let Some(decoded_data) = stream.next().await {
-                    match decoded_data {
-                        Ok(decoded_data) => match decoded_data.payload {
-                            DecodedPayload::None | DecodedPayload::Schema(_) => {},
-                            DecodedPayload::RecordBatch(batch) => {
-                                let batch = match normalizer.normalize(batch) {
-                                    Ok(batch) => batch,
-                                    Err(source) => {
-                                        yield Err(cdc::StreamError::Arrow(format!(
-                                            "Failed to read the change stream from Arrow Flight for dataset '{table_reference}' ({source}), so the dataset stops receiving updates. Remove the null map entries at the source, or expose the column as a string with `to_json(<column>)`. See: https://spiceai.org/docs/components/data-connectors"
-                                        )));
-                                        // End the subscription rather than resuming it. The CDC
-                                        // apply loop keeps running after a fatal stream error, so
-                                        // a resumed subscription would apply every later envelope
-                                        // on top of the change this one dropped and leave the
-                                        // acceleration permanently diverged from its source.
-                                        break;
-                                    }
-                                };
-                                match ChangeBatch::try_new(batch).map(|rb| {
-                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
-                                }) {
-                                    Ok(change_batch) => yield Ok(change_batch),
-                                    Err(e) => {
-                                        yield Err(cdc::StreamError::SerdeJsonError(e.to_string()))
-                                    }
+        let mut resubscribes = 0_u32;
+        'subscription: loop {
+            // The subscription carries one schema per stream, so the normalizer is resolved from the
+            // first batch and reused for the rest. Without it an accelerated dataset that started on
+            // the conformed scan schema would ingest the producer's non-conforming MAP declaration.
+            let mut normalizer = StreamNormalizer::new();
+            let subscribed_at = std::time::Instant::now();
+            let mut stream = match client.subscribe(&table_reference).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    yield Err(cdc::StreamError::Flight(e.to_string()));
+                    break 'subscription;
+                }
+            };
+            while let Some(decoded_data) = stream.next().await {
+                match decoded_data {
+                    Ok(decoded_data) => match decoded_data.payload {
+                        DecodedPayload::None | DecodedPayload::Schema(_) => {},
+                        DecodedPayload::RecordBatch(batch) => {
+                            let batch = match normalizer.normalize(batch) {
+                                Ok(batch) => batch,
+                                Err(source) => {
+                                    yield Err(cdc::StreamError::Arrow(format!(
+                                        "Failed to read the change stream from Arrow Flight for dataset '{table_reference}' ({source}), so the dataset stops receiving updates. Remove the null map entries at the source, or expose the column as a string with `to_json(<column>)`. See: https://spiceai.org/docs/components/data-connectors"
+                                    )));
+                                    // End the subscription rather than resuming it. The CDC
+                                    // apply loop keeps running after a fatal stream error, so
+                                    // a resumed subscription would apply every later envelope
+                                    // on top of the change this one dropped and leave the
+                                    // acceleration permanently diverged from its source.
+                                    break 'subscription;
+                                }
+                            };
+                            match ChangeBatch::try_new(batch).map(|rb| {
+                                ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
+                            }) {
+                                Ok(change_batch) => yield Ok(change_batch),
+                                Err(e) => {
+                                    yield Err(cdc::StreamError::SerdeJsonError(e.to_string()))
                                 }
                             }
-                        },
-                        Err(e) => {
-                            yield Err(cdc::StreamError::Flight(e.to_string()));
                         }
+                    },
+                    Err(e) if is_resubscribable(&e) => {
+                        if subscribed_at.elapsed() >= APPEND_STREAM_HEALTHY_SUBSCRIPTION {
+                            resubscribes = 0;
+                        }
+                        if resubscribes >= MAX_APPEND_STREAM_RESUBSCRIBES {
+                            yield Err(cdc::StreamError::Flight(e.to_string()));
+                            break 'subscription;
+                        }
+                        resubscribes += 1;
+                        // A new subscription opens with a truncate and the full snapshot,
+                        // so applying it reconciles whatever this one missed.
+                        tracing::warn!(
+                            "The append stream for dataset '{table_reference}' missed updates from its source ({e}), so it is resubscribing to reload the dataset from a fresh snapshot (attempt {resubscribes} of {MAX_APPEND_STREAM_RESUBSCRIBES})."
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            250 * u64::from(resubscribes),
+                        ))
+                        .await;
+                        continue 'subscription;
+                    }
+                    Err(e) => {
+                        yield Err(cdc::StreamError::Flight(e.to_string()));
                     }
                 }
             }
-            Err(e) => {
-                yield Err(cdc::StreamError::Flight(e.to_string()));
-            }
+            break 'subscription;
         }
     }
 }
@@ -770,6 +810,22 @@ mod tests {
             component: ConnectorComponent::from(&dataset),
             io_runtime: Handle::current(),
         }
+    }
+
+    /// Only an upstream's `DATA_LOSS` (the subscriber missed updates) sends
+    /// the append stream back for a fresh snapshot; any other error ends it.
+    #[test]
+    fn only_data_loss_resubscribes_an_append_stream() {
+        use arrow_flight::error::FlightError;
+        assert!(is_resubscribable(&FlightError::Tonic(Box::new(
+            tonic::Status::data_loss("missed updates")
+        ))));
+        assert!(!is_resubscribable(&FlightError::Tonic(Box::new(
+            tonic::Status::unavailable("upstream down")
+        ))));
+        assert!(!is_resubscribable(&FlightError::ProtocolError(
+            "bad message".to_string()
+        )));
     }
 
     #[tokio::test]

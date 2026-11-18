@@ -880,8 +880,8 @@ mod tests {
         ]);
 
         let (ids, indices) = equality_delete_columns(&schema);
-        assert!(ids.is_empty());
-        assert!(indices.is_empty());
+        assert_eq!(ids, [] as [i32; 0]);
+        assert_eq!(indices, [] as [usize; 0]);
     }
 
     /// `(id, label)` repeat across rows; `price` is what tells them apart — and
@@ -979,7 +979,10 @@ mod tests {
     #[test]
     fn a_delete_with_no_condition_is_allowed() {
         let schema = float_keyed_schema();
-        assert!(unkeyable_predicate_columns(&schema, &key_indices(&schema), &[]).is_empty());
+        assert_eq!(
+            unkeyable_predicate_columns(&schema, &key_indices(&schema), &[]),
+            [] as [String; 0]
+        );
     }
 
     /// A mixed condition is still refused, and every offending column is named
@@ -1306,7 +1309,7 @@ mod tests {
     #[test]
     fn an_empty_schema_yields_an_empty_key() {
         let (ids, indices) = equality_delete_columns(&ArrowSchema::empty());
-        assert!(ids.is_empty());
-        assert!(indices.is_empty());
+        assert_eq!(ids, [] as [i32; 0]);
+        assert_eq!(indices, [] as [usize; 0]);
     }
 }

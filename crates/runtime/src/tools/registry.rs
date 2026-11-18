@@ -57,6 +57,8 @@ static TOOL_REGISTRY_SEARCH_TOOL_CACHE: LazyLock<
 struct ToolRegistrySearchCacheKey {
     runtime_id: usize,
     embedding_model_name: String,
+    /// The loaded model instance, which a Spicepod change to the model replaces.
+    embedding_model_id: usize,
     tools_hash: u64,
 }
 
@@ -322,6 +324,7 @@ async fn cached_tool_registry_search_tool(
     let key = ToolRegistrySearchCacheKey {
         runtime_id: Arc::as_ptr(rt).addr(),
         embedding_model_name: embedding_model_name.to_string(),
+        embedding_model_id: Arc::as_ptr(&embedding_model).cast::<()>().addr(),
         tools_hash: tool_registry_tools_hash(&tools),
     };
 

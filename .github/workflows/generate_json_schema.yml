@@ -46,15 +46,15 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set up make
         if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
-        uses: ./.github/actions/setup-make
+        uses: $/.github/actions/setup-make
 
       - name: Set up cc
         if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
-        uses: ./.github/actions/setup-cc
+        uses: $/.github/actions/setup-cc
 
       - name: Build Cargo project
         if: github.event_name != 'workflow_dispatch' || inputs.run_build
@@ -77,7 +77,7 @@ jobs:
 
       - name: Upload JSON schema artifact
         if: github.event_name != 'workflow_dispatch' || inputs.run_build
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spicepod.schema
           path: .schema/spicepod.schema.json

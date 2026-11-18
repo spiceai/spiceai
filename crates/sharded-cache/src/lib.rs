@@ -602,7 +602,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         self.sub_weight(removed);
         self.window_weight.store(0, Ordering::Relaxed);
         self.protected_weight.store(0, Ordering::Relaxed);
-        for buf in self.touch_buffers.iter() {
+        for buf in &self.touch_buffers {
             buf.0.keys.lock().clear();
         }
         // Release every shard before dropping values. A value destructor that
@@ -617,7 +617,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     #[must_use]
     pub fn iter_keys(&self) -> Vec<u64> {
         let mut keys = Vec::new();
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             keys.extend(shard.0.lock().keys());
         }
         keys
@@ -804,7 +804,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     #[must_use]
     pub fn keys_in_lru_order(&self) -> Vec<u64> {
         let mut keys = Vec::new();
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             keys.extend(shard.0.lock().keys_mru_first());
         }
         keys
@@ -1047,7 +1047,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         if shard.move_window_to_probation(key) {
             let _ =
                 self.window_weight
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                         Some(current.saturating_sub(weight))
                     });
             return true;
@@ -1595,7 +1595,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             counter.fetch_add(add, Ordering::Relaxed);
         } else if net < 0 {
             let sub = u64::try_from(-net).unwrap_or(u64::MAX);
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(sub))
             });
         }
@@ -1613,23 +1613,23 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         if window_lost > 0 {
             let _ =
                 self.window_weight
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                         Some(current.saturating_sub(window_lost))
                     });
         }
         if protected_lost > 0 {
-            let _ = self.protected_weight.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.saturating_sub(protected_lost)),
-            );
+            let _ =
+                self.protected_weight
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(protected_lost))
+                    });
         }
     }
 
     /// Add `weight` to the total only if the total stays within `max_weight`.
     fn reserve_weight(&self, weight: u64) -> bool {
         self.weight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current
                     .checked_add(weight)
                     .filter(|&total| total <= self.max_weight)
@@ -1643,7 +1643,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         // the pairing, not a race worth spinning on.
         let _ = self
             .weight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(amount))
             });
     }

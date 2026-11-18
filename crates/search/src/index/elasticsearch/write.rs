@@ -1165,7 +1165,7 @@ mod tests {
                 Some(vec![3.0, 4.0]),
                 Some(write_util::indexable_shape(2)),
             ];
-            assert!(evicted(&ids, &embeddings).is_empty());
+            assert_eq!(evicted(&ids, &embeddings), [] as [String; 0]);
             assert_eq!(
                 indexed_ids(&ids, &embeddings),
                 vec!["1".to_string(), "2".to_string(), "1".to_string()],
@@ -1215,7 +1215,7 @@ mod tests {
                 Some(vec![5.0, 6.0]),
             ];
 
-            assert!(evicted(&ids, &embeddings).is_empty());
+            assert_eq!(evicted(&ids, &embeddings), [] as [String; 0]);
             assert_eq!(
                 indexed_ids(&ids, &embeddings),
                 vec!["2".to_string(), "1".to_string()],

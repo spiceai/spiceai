@@ -2002,7 +2002,7 @@ mod tests {
     fn test_otlp_to_prometheus_empty() {
         let request = ExportMetricsServiceRequest::default();
         let output = otlp_to_prometheus_text(&request);
-        assert!(output.is_empty());
+        assert_eq!(output, "");
     }
 
     #[test]
