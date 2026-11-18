@@ -2066,7 +2066,7 @@ mod tests {
             uninstall(&fake, &instance_dir, &config_dir).expect("second uninstall"),
             None
         );
-        assert!(fake.calls().is_empty());
+        assert_eq!(fake.calls(), [] as [String; 0]);
     }
 
     #[test]

@@ -117,7 +117,6 @@ impl DebeziumKafka {
         &self.primary_keys
     }
 
-    #[must_use]
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let primary_keys = self.primary_keys.clone();

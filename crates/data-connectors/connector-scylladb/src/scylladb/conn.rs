@@ -1103,7 +1103,7 @@ mod tests {
             .expect("should be BinaryArray");
 
         assert_eq!(bin_col.value(0), &[0x00, 0x01, 0x02, 0xFF]);
-        assert!(bin_col.value(1).is_empty());
+        assert_eq!(bin_col.value(1), [] as [u8; 0]);
         assert!(bin_col.is_null(2));
     }
 

@@ -1445,7 +1445,7 @@ fn try_decompose_struct_eq(
 /// Depth is O(log N) instead of O(N) from a linear fold, avoiding stack overflow.
 fn balanced_or(mut exprs: Vec<vortex::expr::Expression>) -> vortex::expr::Expression {
     use vortex::expr::or;
-    debug_assert!(!exprs.is_empty());
+    debug_assert_ne!(exprs, [] as [vortex::expr::Expression; 0]);
     while exprs.len() > 1 {
         let mut next = Vec::with_capacity(exprs.len().div_ceil(2));
         let mut i = 0;

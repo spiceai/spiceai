@@ -1304,13 +1304,13 @@ checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -6473,12 +6473,14 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-physical-expr",
+ "flate2",
  "futures",
  "object_store 0.13.2",
  "serde_json",
  "snafu",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -10441,7 +10443,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10500,7 +10502,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10515,7 +10517,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -10538,7 +10540,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10554,7 +10556,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10564,7 +10566,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10583,7 +10585,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28#f34efe39c97ab67b9ccac8238bb3cdef7ddfdd28"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
@@ -23695,15 +23697,15 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "verus_builtin"
-version = "0.0.0-2026-09-16-0054"
+version = "0.0.0-2026-11-01-0251"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e4a9e69d45ddbe303075756d3fc2fcc965eb9dc70c80651d0e4458a6af1ed83"
+checksum = "b5cecde3e49b95f670dee0000707b0fe24d3894ffec56d9e6c49f404878b30e9"
 
 [[package]]
 name = "verus_builtin_macros"
-version = "0.0.0-2026-09-20-0158"
+version = "0.0.0-2026-11-01-0251"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "213ca3e8a80925aec251d3f1952a213d6090156b58ad81dccc3a2f1fed77c99f"
+checksum = "94dbd5043818524d73436d4dd20a8f67f8f8c13dc00d2662d643ce994ff2dbb5"
 dependencies = [
  "convert_case 0.4.0",
  "proc-macro2",
@@ -23716,9 +23718,9 @@ dependencies = [
 
 [[package]]
 name = "verus_prettyplease"
-version = "0.0.0-2026-09-06-0133"
+version = "0.0.0-2026-11-01-0251"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71956c0dcf55f57fd5a5335fff16981f7e0912d2e887914518c5a64fe36c063c"
+checksum = "2b2cf0618d8d5ed0cde78122effaf56f5be0a0d0e0f9066735fa9f17d6ba6a4a"
 dependencies = [
  "proc-macro2",
  "verus_syn",
@@ -23726,9 +23728,9 @@ dependencies = [
 
 [[package]]
 name = "verus_state_machines_macros"
-version = "0.0.0-2026-09-06-0133"
+version = "0.0.0-2026-11-01-0251"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f78ea16629331605a440e9e0a259dd3492a78212186ba82253ad0988127407f"
+checksum = "36b7a87f62a49719385cad07ad58ad9d17af29642dd331a5cdc25eba2423b716"
 dependencies = [
  "indexmap 2.14.0",
  "proc-macro2",
@@ -23738,9 +23740,9 @@ dependencies = [
 
 [[package]]
 name = "verus_syn"
-version = "0.0.0-2026-09-06-0133"
+version = "0.0.0-2026-11-01-0251"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d8b53574934e1f608dfccd809ce17f3733d6eb99c14ce8220326121929e1637"
+checksum = "461620a5ec0fb547ba398e42fb25a017bd8764798a32099eed73c77dd979ac39"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -24461,9 +24463,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vstd"
-version = "0.0.0-2026-09-20-0158"
+version = "0.0.0-2026-11-01-0251"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb7a36bbc0193492141eef73272853a5a8d73288bed1ea5344563b0382cdf7c9"
+checksum = "7cfcc2fc379ffbcda31111f1a7da2a34d00bd984407cfa85d1edcf64da38dbd2"
 dependencies = [
  "verus_builtin",
  "verus_builtin_macros",
