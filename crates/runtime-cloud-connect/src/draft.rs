@@ -155,6 +155,9 @@ pub enum Error {
 
     #[snafu(display("Failed to acquire the enrollment transaction: {source}"))]
     AcquireTaskPanicked { source: tokio::task::JoinError },
+
+    #[snafu(display("{source}"))]
+    StateDirectory { source: crate::state_dir::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -218,9 +221,7 @@ impl EnrollmentTransactionLock {
         };
 
         if !directory_is_pinned {
-            std::fs::create_dir_all(config_dir).context(IoSnafu {
-                path: config_dir.to_path_buf(),
-            })?;
+            crate::state_dir::check(config_dir, true).context(StateDirectorySnafu)?;
         }
         // Pin every later draft and identity operation to the directory named
         // at acquisition time. Retargeting a symlink ancestor after this point

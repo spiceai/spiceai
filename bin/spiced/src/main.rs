@@ -230,6 +230,14 @@ fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>
         let bootstrap = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        // The Cloud Connect state directory is checked, and state an earlier
+        // version kept in the config directory moved into it, before anything
+        // reads or writes it: the bootstrap below and the deployment read in
+        // `build_app` both do.
+        if let Err(err) = bootstrap.block_on(spiced::cloud_connect_prepare_state(&args)) {
+            tracing::error!("{err}");
+            std::process::exit(1);
+        }
         // Cloud Connect `--token` bootstrap: enrollment must be durable
         // before the runtime is built, any listener binds, or readiness is
         // reachable — so it runs first, on the throwaway runtime. A terminal

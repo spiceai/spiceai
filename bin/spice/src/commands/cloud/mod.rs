@@ -1544,8 +1544,10 @@ async fn resolve_project_target_with_source(
         (None, OrgSource::Credential)
     };
 
-    let config_dir = CloudConnectConfig::resolve_config_dir(None);
-    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let state_dir =
+        crate::commands::connect::local_state_dir(&CloudConnectConfig::resolve_config_dir(None))
+            .await?;
+    let identity_path = state_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
     let identity = IdentityStore::load_optional_async(identity_path.clone())
         .await
         .map_err(|source| Error::CloudConnectIo {
@@ -3002,6 +3004,7 @@ async fn execute_service(
                 ),
             })?;
     let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
+    crate::commands::connect::local_state_dir(&config_dir).await?;
     crate::commands::connect::service::cli::execute(
         ctx,
         crate::commands::connect::service::cli::ServiceArgs {
@@ -3027,8 +3030,11 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
                     current.display()
                 ),
             })?;
-    let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
-    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let state_dir = crate::commands::connect::local_state_dir(
+        &CloudConnectConfig::resolve_config_dir(Some(&instance_dir)),
+    )
+    .await?;
+    let identity_path = state_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
     let identity = IdentityStore::load_optional_async(identity_path)
         .await
         .map_err(|source| Error::CloudConnectIo {
@@ -3372,8 +3378,10 @@ async fn execute_unlink() -> Result<()> {
                 ),
             })?;
     let requested_config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
+    let requested_state_dir =
+        crate::commands::connect::local_state_dir(&requested_config_dir).await?;
     let mutation_lock =
-        runtime_cloud_connect::MutationLock::acquire(&requested_config_dir, "unlink")
+        runtime_cloud_connect::MutationLock::acquire(&requested_state_dir, "unlink")
             .await
             .map_err(|source| Error::CloudConnectIo {
                 message: format!("acquire Cloud Connect state for unlink: {source}"),
@@ -3398,11 +3406,11 @@ async fn execute_unlink() -> Result<()> {
         })?;
     let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
     let pinned_config = crate::commands::connect::service::PinnedConfigDir::for_lock(
-        display_config_dir.clone(),
+        runtime_cloud_connect::state_dir::state_dir(&display_config_dir),
         &mutation_lock,
     )?;
     let _runtime_lock =
-        runtime_cloud_connect::RuntimeLock::acquire(&config_dir).map_err(|source| {
+        runtime_cloud_connect::RuntimeLock::acquire(&display_config_dir).map_err(|source| {
             Error::CloudConnectIo {
                 message: format!(
                     "{source} Stop the running instance before using `spice cloud unlink`."
@@ -3792,7 +3800,9 @@ async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&s
                 ),
             })?;
     let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
-    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let identity_path = crate::commands::connect::local_state_dir(&config_dir)
+        .await?
+        .join(runtime_cloud_connect::config::IDENTITY_FILE);
     let local_identity = IdentityStore::load_optional_async(identity_path.clone())
         .await
         .map_err(|source| Error::CloudConnectIo {
