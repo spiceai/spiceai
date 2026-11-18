@@ -794,15 +794,29 @@ where
     S: Stream<Item = Result<B, DataFusionError>> + Send,
     B: Borrow<RecordBatch> + Send,
 {
-    let reservation = MemoryConsumer::new("http_buffered_response").register(memory_pool);
-    let data = match collect_reserved(data_stream, &reservation).await {
-        Ok(data) => data,
-        Err(e) => return buffered_error_response(&e),
-    };
-    if let Err(e) = reservation.try_grow(rendered_bytes(format, &data)) {
-        return buffered_error_response(&e);
+    match collect_buffered(data_stream, format, memory_pool).await {
+        Ok((data, reservation)) => render_reserved(data, reservation, cache_status, format).await,
+        Err(e) => buffered_error_response(&e),
     }
-    render_reserved(data, reservation, cache_status, format).await
+}
+
+/// Collects a result that is sent only once complete. Its batches and, for
+/// `text/plain`, the rendered table are reserved from `memory_pool`; hold the
+/// returned reservation until the body is built. Fails with the pool's
+/// resources-exhausted error when the pool refuses.
+async fn collect_buffered<S, B>(
+    data_stream: S,
+    format: ResponseMimeType,
+    memory_pool: &Arc<dyn MemoryPool>,
+) -> Result<(Vec<RecordBatch>, MemoryReservation), DataFusionError>
+where
+    S: Stream<Item = Result<B, DataFusionError>>,
+    B: Borrow<RecordBatch>,
+{
+    let reservation = MemoryConsumer::new("http_buffered_response").register(memory_pool);
+    let data = collect_reserved(data_stream, &reservation).await?;
+    reservation.try_grow(rendered_bytes(format, &data))?;
+    Ok((data, reservation))
 }
 
 /// The bytes rendering `data` as `format` adds beyond its batches: the padded
@@ -833,11 +847,16 @@ async fn render_reserved(
 fn buffered_error_response(e: &DataFusionError) -> Response {
     let kind = SqlErrorKind::of_datafusion_error(e);
     let message = if matches!(kind, SqlErrorKind::ResourcesExhausted) {
-        format!("The query result is too large to buffer in memory for this response. {e}")
+        too_large_to_buffer_message(e)
     } else {
         e.to_string()
     };
     sql_error_response(message, kind)
+}
+
+/// The message for a result the query memory pool refused to buffer.
+fn too_large_to_buffer_message(e: &DataFusionError) -> String {
+    format!("The query result is too large to buffer in memory for this response. {e}")
 }
 
 /// The approximate size of the table [`arrow_to_plain`] renders: every line is

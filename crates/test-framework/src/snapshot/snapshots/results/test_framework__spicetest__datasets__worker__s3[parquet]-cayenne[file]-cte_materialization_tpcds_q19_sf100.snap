@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q19"
 ---
-+----------+--------------------+---------------+-----------------+-----------+
-| brand_id | brand              | i_manufact_id | i_manufact      | ext_price |
-+----------+--------------------+---------------+-----------------+-----------+
-| 1001001  | amalgamalg #1      | 644           | eseesecally     | 349369.14 |
-| 3003001  | exportiexporti #1  | 209           | n stbarable     | 341786.71 |
-| 1002001  | importoamalg #1    | 126           | callyableought  | 336514.96 |
-| 2004001  | edu packimporto #1 | 331           | oughtpripri     | 334975.81 |
-| 3001001  | amalgexporti #1    | 6             | cally           | 318431.83 |
-| 3003001  | exportiexporti #1  | 264           | esecallyable    | 306578.29 |
-| 2002001  | importoimporto #1  | 179           | n stationought  | 305872.54 |
-| 1004001  | edu packamalg #1   | 222           | ableableable    | 295094.27 |
-| 3003002  | exportiexporti #2  | 161           | oughtcallyought | 292261.29 |
-| 5002002  | importoscholar #2  | 503           | pribaranti      | 288187.20 |
-+----------+--------------------+---------------+-----------------+-----------+
++----------+---------------------+---------------+-----------------+-----------+
+| brand_id | brand               | i_manufact_id | i_manufact      | ext_price |
++----------+---------------------+---------------+-----------------+-----------+
+| 1002001  | importoamalg #1     | 126           | callyableought  | 388568.13 |
+| 4004001  | edu packedu pack #1 | 257           | ationantiable   | 341778.35 |
+| 2004001  | edu packimporto #1  | 331           | oughtpripri     | 339251.22 |
+| 3003002  | exportiexporti #2   | 161           | oughtcallyought | 337305.89 |
+| 3001001  | amalgexporti #1     | 6             | cally           | 336667.80 |
+| 3002001  | importoexporti #1   | 287           | ationeingable   | 333016.53 |
+| 1001001  | amalgamalg #1       | 644           | eseesecally     | 332727.87 |
+| 2002001  | importoimporto #1   | 179           | n stationought  | 328620.28 |
+| 1004001  | edu packamalg #1    | 222           | ableableable    | 287703.59 |
+| 3003001  | exportiexporti #1   | 264           | esecallyable    | 285807.22 |
++----------+---------------------+---------------+-----------------+-----------+

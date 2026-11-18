@@ -3,12 +3,17 @@ description: >
   Postgres CDC converges to the source after inserts, updates, deletes, key
   changes and large transactions, across a clean restart and a kill: Cayenne
   under each deletion mode, with file CDC durability, and
-  partitioned on its key, and in memory.
+  partitioned on its key, and in memory. With object-native data, the
+  datasets' files are in the state location, and an instance that loses its
+  directory serves the same rows from the location while the source is down,
+  then resumes CDC once it is back.
 
 sources:
   src: { kind: postgres }
-  # The state location of the object-native-rustfs variant.
+  # The state location of object-native-rustfs and object-native-s3.
   lake: { kind: rustfs }
+  # The same, 20 ms away (object-native-s3-latency).
+  slow-lake: { kind: rustfs, latency: 20ms }
 
 variants:
   sqlite-key:
@@ -54,15 +59,16 @@ variants:
     datasets:
       orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
       customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
-  # `partitioned` with the flag: a partitioned table stays on the SQLite
-  # metastore, and keeps serving its rows across the kill and restart below.
-  partitioned-object-native:
-    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
-    datasets:
-      orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
-      customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
+  # `partitioned` with `cayenne_vnext` enabled fails to load (config-errors
+  # checks the message), so it has no variant here until the object-native
+  # metastore supports `partition_by` (#16308).
   cayenne-memory:
     datasets: { '*': { acceleration: { mode: memory } } }
+  # Object-native data (#16131): data files in the state location, which an
+  # instance that loses its directory serves again without the source.
+  object-native-local: object-native-local
+  object-native-s3: object-native-s3
+  object-native-s3-latency: object-native-s3-latency
 
 spicepod:
   version: v1
@@ -92,6 +98,11 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # Every query is checked against its instance's own source. The instances do
+  # not end with the same rows: the timed churn and the writes under readers
+  # below run on some variants only, for a number of rounds that depends on
+  # timing, so their final answers are not compared with one another.
+  compare-variants: false
 
 steps:
   - source-exec:
@@ -225,3 +236,139 @@ steps:
   # Both tables replicated to the same point.
   - query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment
     eventually: 30s
+
+  # Data in an S3 state location: deletion vectors are objects in the bucket,
+  # none is on local disk, and nothing is at a local `s3:` path.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, min: 1 }
+    only: object-native-s3
+  - assert-files: { lacks: ['(^|/)s3:', '\.arrow$'] }
+    only: object-native-s3
+
+  # 180 s of CDC updates and deletes at a fixed rate: the dataset's objects in
+  # the state location, sampled every 10 s, stay under a bound and do not trend
+  # upward, the data files and deletion vectors stay within the same bound
+  # afterwards, and the table still matches the source. The bounds are a few
+  # compactions' worth of the table (about 20,000 rows), far below what 180 s
+  # of unreclaimed files would leave (#16133).
+  - background:
+      id: churn
+      source-exec: { src: "UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 97 = ${round} % 97; DELETE FROM orders WHERE o_id % 991 = ${round} % 991" }
+      every: 1s
+    only: object-native-s3
+  - sample-objects:
+      source: lake
+      prefix: state/cayenne/v1/datasets/orders-
+      contains: /data/
+      every: 10s
+      for: 180s
+      max-objects: 600
+    only: object-native-s3
+  - stop-background: { id: churn }
+    only: object-native-s3
+  - query: SELECT * FROM orders
+    eventually: 90s
+    only: object-native-s3
+  # After the retention grace, with no further change.
+  - sleep: 20s
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .vortex, max: 400 }
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, max: 200 }
+    only: object-native-s3
+  - assert-log: { lacks: ['falling back to full snapshot rewrite'] }
+    only: object-native-s3
+
+  # Object-native data (#16131): each dataset's files are in the state
+  # location, under its log's data/ folder, and none at a local `s3:` path.
+  - assert-files: { contains: '^state/cayenne/v1/datasets/orders-[^/]+/data/' }
+    only: object-native-local
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /data/, min: 1 }
+    only: object-native-s3
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/orders-, contains: /data/, min: 1 }
+    only: object-native-s3-latency
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: &object-native-data [object-native-local, object-native-s3, object-native-s3-latency]
+
+  # An instance that loses its directory serves the same rows from the
+  # location alone: the source is down, so it cannot load them again.
+  # Expected failures (ledger): a `refresh_mode: changes` dataset is not
+  # registered while its source cannot be reached, so its copy in the location
+  # is not served until the source is back ("table … not found" on every
+  # object-native-data variant). On object-native-local the data files are
+  # under `.spice/data`, which the wipe removes, so `orders` then refuses to
+  # load with "Deletion vector file is missing…" even with the source back
+  # (local data is not in the location yet).
+  - query: SELECT * FROM orders
+    id: orders-before-wipe
+    only: *object-native-data
+  - query: SELECT * FROM customers
+    id: customers-before-wipe
+    only: *object-native-data
+  - stop: {}
+    only: *object-native-data
+  - wipe-instance-dir: { keep: [state] }
+    only: *object-native-data
+  - assert-files: { lacks: '^\.spice/' }
+    only: *object-native-data
+  - stop-source: src
+  - start: { ready: false }
+    only: *object-native-data
+  - query: SELECT * FROM orders
+    expect: { same-as: orders-before-wipe }
+    eventually: 60s
+    only: *object-native-data
+  - query: SELECT * FROM customers
+    expect: { same-as: customers-before-wipe }
+    eventually: 30s
+    only: *object-native-data
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: *object-native-data
+
+  # With the source back, CDC resumes from the position the location holds.
+  - start-source: src
+  - source-exec:
+      src: UPDATE orders SET o_status = 'W' WHERE o_id % 7 = 0
+    only: *object-native-data
+  - query: SELECT * FROM orders
+    eventually: 90s
+    only: *object-native-data
+  - query: SELECT * FROM customers
+    eventually: 30s
+    only: *object-native-data
+
+  # Readers while the change stream writes (#16132): with the data in an
+  # object-store location, with or without 20 ms of latency, no query fails,
+  # and the table still matches the source afterwards. (A local location does
+  # not hold data files yet, so it is not run there.)
+  - background:
+      id: cdc-writes
+      source-exec: { src: "UPDATE orders SET o_total = o_total + 1 WHERE o_id % 13 = ${round} % 13" }
+      every: 200ms
+    only: &object-native-data-in-store [object-native-s3, object-native-s3-latency]
+  - background:
+      id: readers
+      query: SELECT count(*), sum(o_total) FROM orders
+      concurrency: 4
+    only: *object-native-data-in-store
+  - sleep: 30s
+    only: *object-native-data-in-store
+  - stop-background: { id: cdc-writes }
+    only: *object-native-data-in-store
+  - stop-background: { id: readers }
+    only: *object-native-data-in-store
+  - query: SELECT * FROM orders
+    eventually: 60s
+    only: *object-native-data-in-store
+
+  # Losing the directory again, now with the source up and the deletion
+  # vectors of the writes above in the location: the datasets open from the
+  # location and are ready within 60 s, with or without 20 ms of store latency.
+  - stop: {}
+    only: *object-native-data-in-store
+  - wipe-instance-dir: { keep: [state] }
+    only: *object-native-data-in-store
+  - start: { ready-timeout: 60s }
+    only: *object-native-data-in-store
+  - query: SELECT * FROM orders
+    eventually: 30s
+    only: *object-native-data-in-store

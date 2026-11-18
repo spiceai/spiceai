@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q46"
 ---
-+-------------+--------------+---------+-------------+------------------+----------+-----------+
-| c_last_name | c_first_name | ca_city | bought_city | ss_ticket_number | amt      | profit    |
-+-------------+--------------+---------+-------------+------------------+----------+-----------+
-|             |              |         | Franklin    | 35692            | 0.00     | -14641.86 |
-|             |              |         | Georgetown  | 89178            | 5402.56  | -7840.43  |
-|             |              |         | Hopewell    | 151514           | 2696.10  | -12763.40 |
-|             |              |         | Macedonia   | 87545            | 3639.92  | 5277.60   |
-|             |              |         | Mount Olive | 72797            | 14737.45 | -15510.37 |
-|             |              |         | Stringtown  | 86821            | 247.97   | -15458.56 |
-|             |              | Adrian  | Oakwood     | 174956           | 0.00     | 445.65    |
-|             |              | Adrian  | Wildwood    | 107792           | 1042.69  | -15530.35 |
-|             |              | Antioch | Belmont     | 149232           | 2866.05  | -12526.96 |
-|             |              | Antioch | Cedar Grove | 178285           | 11027.62 | -14598.43 |
-+-------------+--------------+---------+-------------+------------------+----------+-----------+
++-------------+--------------+--------------+-------------+------------------+---------+-----------+
+| c_last_name | c_first_name | ca_city      | bought_city | ss_ticket_number | amt     | profit    |
++-------------+--------------+--------------+-------------+------------------+---------+-----------+
+| Aaron       | Charles      | Jamestown    | Red Hill    | 183217           | 2067.37 | -8054.03  |
+| Aaron       | George       | Forest Hills | Woodville   | 6922             | 533.49  | 380.69    |
+| Abbott      | Frederick    | Green Acres  | Oakland     | 7247             | 518.63  | -13290.67 |
+| Abbott      | Genevieve    | Lebanon      | Union Hill  | 222904           | 172.93  | 240.97    |
+| Abbott      | Kathlyn      | Highland     | Providence  | 102224           | 8806.61 | -19167.57 |
+| Abel        | Etta         | Wildwood     | Newport     | 180836           | 903.54  | -2298.17  |
+| Abernathy   | Helen        | Forest Hills | Fairview    | 235211           | 2126.47 | -7349.93  |
+| Abner       | Lane         | Liberty      | Greenville  | 9171             | 370.56  | -11330.10 |
+| Abraham     | Carolyn      | Shiloh       | Ashland     | 132084           | 105.29  | 6341.52   |
+| Abraham     | Michael      | Kingston     | Clifton     | 14263            | 1582.72 | -8885.02  |
++-------------+--------------+--------------+-------------+------------------+---------+-----------+

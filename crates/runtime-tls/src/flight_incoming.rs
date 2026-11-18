@@ -40,12 +40,6 @@ use tokio_stream::wrappers::TcpListenerStream;
 /// at once).
 const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 1024;
 
-/// How long a client has to complete the TLS handshake. Without a deadline, a
-/// connection that never sends a `ClientHello` holds a handshake slot for as
-/// long as it stays open, and once every slot is held the listener stops
-/// accepting connections.
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Build a stream of accepted+handshaked TLS connections suitable for
 /// `tonic::transport::Server::serve_with_incoming`.
 pub fn tls_incoming(
@@ -56,7 +50,7 @@ pub fn tls_incoming(
         listener,
         server_config,
         MAX_CONCURRENT_TLS_HANDSHAKES,
-        TLS_HANDSHAKE_TIMEOUT,
+        crate::TLS_HANDSHAKE_TIMEOUT,
     )
 }
 
@@ -92,16 +86,7 @@ fn tls_incoming_with(
         })
         .map(move |stream| {
             let acceptor = acceptor.clone();
-            async move {
-                tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "the client did not complete the TLS handshake in time",
-                        ))
-                    })
-            }
+            async move { crate::accept_within(&acceptor, stream, handshake_timeout).await }
         })
         .buffer_unordered(max_concurrent_handshakes)
         .filter_map(|res| async move {

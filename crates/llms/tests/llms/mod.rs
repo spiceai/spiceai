@@ -1205,7 +1205,7 @@ async fn a_caller_that_waits_for_a_creation_takes_its_cached_value() {
 
 /// The built-in Anthropic default has to satisfy two things no unit test can check: Anthropic
 /// still serves it, and it still accepts the sampling controls the adapter forwards. Anthropic's
-/// newest generation answers ``temperature` is deprecated for this model.` and rejects the request
+/// newest generation answers `` `temperature` is deprecated for this model. `` and rejects the request
 /// outright (#13564), so a default bumped onto such a model would turn every configuration that
 /// sets `temperature` into a guaranteed 400 — while every test that sets none of these stays green.
 /// This is the guard for that, and it is why the default trails Anthropic's newest model.

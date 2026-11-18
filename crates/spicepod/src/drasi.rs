@@ -334,7 +334,7 @@ tables:
     fn runtime_block_forwards_no_table_by_default() {
         let drasi: RuntimeDrasi =
             yaml::from_str("source_id: spice-runtime").expect("valid runtime drasi config");
-        assert!(drasi.tables.is_empty());
+        assert_eq!(drasi.tables, [] as [RuntimeDrasiTable; 0]);
     }
 
     #[test]
