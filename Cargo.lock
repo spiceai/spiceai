@@ -6290,6 +6290,7 @@ dependencies = [
  "object_store 0.13.2",
  "orc-rust",
  "paste",
+ "redact",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",
  "runtime-component",
@@ -6314,6 +6315,7 @@ name = "data-connector-types"
 version = "2.5.0-unstable"
 dependencies = [
  "globset",
+ "redact",
  "runtime-component",
  "snafu",
 ]
