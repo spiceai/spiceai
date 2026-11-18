@@ -159,10 +159,19 @@ pub fn url_table_destination_guard() -> DestinationGuard {
 /// address, including another port or scheme on a dataset host that resolves to one.
 #[must_use]
 pub fn redirect_destination_guard() -> DestinationGuard {
+    connector_redirect_guard("HTTPS")
+}
+
+/// What the data connector named `connector` refuses for a destination a redirect introduced,
+/// as [`redirect_destination_guard`] does for the HTTPS data connector.
+#[must_use]
+pub fn connector_redirect_guard(connector: &str) -> DestinationGuard {
     DestinationGuard::new(
         is_internal_ip,
         redirect_target_is_internal,
-        "the HTTPS data connector does not follow a redirect to a private, loopback, or link-local address",
+        format!(
+            "the {connector} data connector does not follow a redirect to a private, loopback, or link-local address"
+        ),
     )
 }
 

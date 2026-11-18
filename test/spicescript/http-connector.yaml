@@ -15,7 +15,9 @@ description: >
   dataset's origin keeps the dataset's headers, while one that changes the
   origin (another port on the same host included) is refused before the
   other origin is reached when it is internal, and an OAuth token request
-  never follows its endpoint to another origin.
+  never follows its endpoint to another origin. The GraphQL connector follows
+  the same rule: a redirect within its endpoint's origin keeps its auth
+  header, and one to another internal origin is refused before it is made.
 
 sources:
   api: { kind: mock-http }
@@ -129,6 +131,20 @@ spicepod:
     - from: ${sources.api.url}/files/hop.csv
       name: hop_csv
       params: { file_format: csv }
+    - from: graphql:${sources.api.url}/gql-moved
+      name: gql_moved
+      params:
+        graphql_query: '{ items { id } }'
+        json_pointer: /data/items
+        graphql_auth_header: X-Api-Key
+        graphql_auth_token: k3y
+    - from: graphql:${sources.api.url}/gql-away
+      name: gql_away
+      params:
+        graphql_query: '{ items { id } }'
+        json_pointer: /data/items
+        graphql_auth_header: X-Api-Key
+        graphql_auth_token: k3y
     - from: ${sources.api.url}/files/items.csv
       name: items_deferred
       params: { file_format: csv }
@@ -275,6 +291,23 @@ steps:
           path: /files/hop.csv
           status: 302
           headers: { location: '${sources.elsewhere.url}/files/internal.csv' }
+        - |
+          path: /gql-moved
+          status: 307
+          headers: { location: '${sources.api.url}/gql-new' }
+        - |
+          path: /gql-new
+          status: 401
+          body: missing key
+        - |
+          path: /gql-new
+          headers-match: { x-api-key: k3y }
+          headers: { content-type: application/json }
+          body: '{"data": {"items": [{"id": 1}]}}'
+        - |
+          path: /gql-away
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/gql' }
   - source-exec:
       elsewhere:
         - |
@@ -290,6 +323,10 @@ steps:
           path: /files/internal.csv
           headers: { content-type: text/csv }
           body: "id,secret\n1,internal\n"
+        - |
+          path: /gql
+          headers: { content-type: application/json }
+          body: '{"data": {"items": [{"id": 7}]}}'
   - start: { ready: false }
 
   # Declared columns: nothing is fetched until the dataset is queried.
@@ -365,6 +402,16 @@ steps:
   - assert-status: { dataset: token_moved, status: Error, message-contains: 'Set `auth_token_url` to the URL the token endpoint redirects to' }
     eventually: 30s
   - source-query: { elsewhere: count /collect }
+    expect: { rows: [['0']] }
+
+  # GraphQL: a redirect within the endpoint's origin keeps the auth header; one to another
+  # internal origin is refused before that origin is reached.
+  - query: SELECT id FROM gql_moved
+    expect: { rows: [['1']] }
+    eventually: 30s
+  - assert-status: { dataset: gql_away, status: Error, message-contains: 'the GraphQL data connector does not follow a redirect to a private, loopback, or link-local address' }
+    eventually: 30s
+  - source-query: { elsewhere: count /gql }
     expect: { rows: [['0']] }
 
   # Two 503s, then an answer: retried, and three requests in all.
