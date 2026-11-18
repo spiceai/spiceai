@@ -1,14 +1,17 @@
 name: tool-authorization
 description: >
   Who may call a tool is decided the same way on every path that runs one. A
-  read-write tool (`store_memory`, or any tool of an MCP server) needs a
-  principal with write access: a read-only API key is refused one through
+  read-write tool (`store_memory`, or any tool of an MCP server not declared
+  read-only with `access: read` or `read_only_tools`) needs a principal with
+  write access: a read-only API key is refused one through
   `POST /v1/tools/{name}`, MCP `tools/call` (whose MCP tools are passed through
   to their server), and a model's tool use from chat completions. A refusal
   names the tool and how to get write access, is recorded in
   `runtime.task_history`, and comes before the tool runs: the MCP server never
   sees the call and no memory is written. Read-only tools stay available to
-  every caller, and a read-write key may call every tool. On a runtime without
+  every caller, and a read-write key may call every tool. Each caller is offered
+  only the tools it may call: in `GET /v1/tools`, MCP `tools/list`, and the
+  tools sent to a model, which gets no `tools` when none is left. On a runtime without
   `runtime.auth`, `/v1/tools` refuses anonymous callers, and a model's tool use
   (chat completions, `ai()`) runs read-write tools for a caller without
   credentials only on a listener bound to loopback, where it is the local
@@ -43,10 +46,12 @@ spicepod:
     # so the mock counts the calls that reached the server.
     - name: probe
       from: mcp:python3
+      # `search_alerts` only reads; `serch_*` matches nothing the server reports.
+      read_only_tools: [search_*, serch_*]
       params:
-        mcp_args: |-
+        mcp_args: &probe_server |-
           -u -c '
-          import json, sys, urllib.request
+          import json, os, sys, urllib.request
           for line in sys.stdin:
               message = json.loads(line)
               if "id" not in message:
@@ -55,28 +60,47 @@ spicepod:
               if method == "initialize":
                   result = {"protocolVersion": message["params"]["protocolVersion"], "capabilities": {"tools": {}}, "serverInfo": {"name": "probe", "version": "1"}}
               elif method == "tools/list":
-                  result = {"tools": [{"name": "send_alert", "description": "Send an alert to the on-call channel.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}]}
+                  result = {"tools": [
+                      {"name": "send_alert", "description": "Send an alert to the on-call channel.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
+                      {"name": "search_alerts", "description": "Search the alerts sent so far.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}]}
               elif method == "tools/call":
+                  name = message["params"]["name"]
                   body = json.dumps(message["params"].get("arguments") or {}).encode()
                   try:
-                      urllib.request.urlopen(urllib.request.Request(sys.argv[1], data=body, method="POST"), timeout=10)
+                      urllib.request.urlopen(urllib.request.Request(os.environ.get("REPORT_TO", sys.argv[1]) + ("/alert" if name == "send_alert" else "/search"), data=body, method="POST"), timeout=10)
                   except Exception:
                       pass
-                  result = {"content": [{"type": "text", "text": "sent"}], "isError": False}
+                  result = {"content": [{"type": "text", "text": "sent" if name == "send_alert" else "found"}], "isError": False}
               elif method == "ping":
                   result = {}
               else:
                   print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "Method not found"}}), flush=True)
                   continue
               print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
-          ' ${sources.api.url}/alert
+          ' ${sources.api.url}
+    # The same server, declared read-only as a whole, reporting to `/docs/alert` and
+    # `/docs/search`.
+    - name: docs
+      from: mcp:python3
+      access: read
+      params:
+        mcp_args: *probe_server
+      env:
+        REPORT_TO: ${sources.api.url}/docs
   models:
     - name: m
       from: openai:gpt-4o-mini
       params:
         endpoint: ${sources.api.url}/v1
         openai_api_key: test
-        tools: memory, probe
+        tools: memory, probe, docs
+    # A model whose only tool can write.
+    - name: writes-only
+      from: openai:gpt-4o-mini
+      params:
+        endpoint: ${sources.api.url}/v1
+        openai_api_key: test
+        tools: store_memory
 
 defaults:
   api-key: writer-key
@@ -167,6 +191,82 @@ steps:
       GROUP BY task ORDER BY task
     expect: { rows: [['tool_use::probe__send_alert', '3'], ['tool_use::store_memory', '2']] }
     eventually: 30s
+
+  # --- What a caller is offered, and the MCP tools declared read-only -------------------------
+
+  # `GET /v1/tools` lists only the tools the caller may call: for the read-only key, not
+  # `store_memory` or the probe's `send_alert`, but the probe's `search_alerts`
+  # (`read_only_tools`) and both tools of `docs` (`access: read`).
+  - http: { method: GET, path: /v1/tools, api-key: reader-key }
+    expect:
+      status: 200
+      body-lacks: ['"name":"probe__send_alert"', '"name":"store_memory"']
+      json:
+        - { pointer: /*/name, equals: probe__search_alerts, count: 1 }
+        - { pointer: /*/name, equals: docs__send_alert, count: 1 }
+        - { pointer: /*/name, equals: docs__search_alerts, count: 1 }
+        - { pointer: /*/name, equals: load_memory, count: 1 }
+  - http: { method: GET, path: /v1/tools }
+    expect:
+      status: 200
+      json:
+        - { pointer: /*/name, equals: probe__send_alert, count: 1 }
+        - { pointer: /*/name, equals: store_memory, count: 1 }
+  # MCP `tools/list`, the same way.
+  - http:
+      method: POST
+      path: /v1/mcp
+      api-key: reader-key
+      headers:
+        content-type: application/json
+        accept: application/json, text/event-stream
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/list
+      body: '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"spicescript","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+    expect:
+      status: 200
+      body-contains: '"name":"probe__search_alerts"'
+      body-lacks: ['"name":"probe__send_alert"', '"name":"store_memory"']
+  - http:
+      method: POST
+      path: /v1/mcp
+      headers:
+        content-type: application/json
+        accept: application/json, text/event-stream
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/list
+      body: '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"spicescript","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+    expect:
+      status: 200
+      body-contains: '"name":"probe__send_alert"'
+
+  # The declared read-only tools run for the read-only key and reach their servers; the probe's
+  # `send_alert` still never did.
+  - http: { method: POST, path: /v1/tools/probe__search_alerts, api-key: reader-key, headers: { content-type: application/json }, body: '{"text": "disk"}' }
+    expect: { status: 200, body-contains: found }
+  - http: { method: POST, path: /v1/tools/docs__send_alert, api-key: reader-key, headers: { content-type: application/json }, body: '{"text": "docs"}' }
+    expect: { status: 200, body-contains: sent }
+  - source-query: { api: count /search }
+    expect: { rows: [['1']] }
+  - source-query: { api: count /docs/alert }
+    expect: { rows: [['1']] }
+  - source-query: { api: count /alert }
+    expect: { rows: [['0']] }
+
+  # A model is sent only the tools its caller may call, sorted by name; a caller that may call
+  # none of a model's tools sends the model no `tools` at all.
+  - http: { method: POST, path: /v1/chat/completions, api-key: reader-key, headers: { content-type: application/json }, body: '{"model": "m", "messages": [{"role": "user", "content": "Which tools?"}]}' }
+    expect: { status: 200 }
+  - source-query: { api: json /v1/chat/completions /tools/*/function/name last }
+    expect: { rows: [['["docs__search_alerts","docs__send_alert","load_memory","probe__search_alerts"]']] }
+  - http: { method: POST, path: /v1/chat/completions, headers: { content-type: application/json }, body: '{"model": "m", "messages": [{"role": "user", "content": "Which tools?"}]}' }
+    expect: { status: 200 }
+  - source-query: { api: json /v1/chat/completions /tools/*/function/name last }
+    expect: { rows: [['["docs__search_alerts","docs__send_alert","load_memory","probe__search_alerts","probe__send_alert","store_memory"]']] }
+  - http: { method: POST, path: /v1/chat/completions, api-key: reader-key, headers: { content-type: application/json }, body: '{"model": "writes-only", "messages": [{"role": "user", "content": "Remember this."}]}' }
+    expect: { status: 200 }
+  - source-query: { api: json /v1/chat/completions /tools last }
+    expect: { rows: [['[]']] }
 
   # --- A read-write API key: every tool -------------------------------------------------------
 

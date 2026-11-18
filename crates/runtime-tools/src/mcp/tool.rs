@@ -46,6 +46,10 @@ pub struct McpToolWrapper {
 
     /// Replaces `client` when a call finds its transport closed.
     reconnector: Arc<Reconnector>,
+
+    /// What a call can change, as the server's `tools:` entry declares (see
+    /// [`super::access::McpToolAccess`]).
+    access: ToolAccess,
 }
 
 impl McpToolWrapper {
@@ -54,12 +58,14 @@ impl McpToolWrapper {
         spec: Tool,
         server_name: String,
         reconnector: Arc<Reconnector>,
+        access: ToolAccess,
     ) -> Self {
         Self {
             client,
             spec,
             server_name,
             reconnector,
+            access,
         }
     }
 
@@ -128,9 +134,9 @@ impl SpiceModelTool for McpToolWrapper {
 
     /// The tool can do anything its MCP server can, with the credentials Spice holds for it, and
     /// its annotations (`readOnlyHint`) are the server's own claims, so calling it needs write
-    /// access.
+    /// access unless the operator declares it read-only (`access`, `read_only_tools`).
     fn access(&self) -> ToolAccess {
-        ToolAccess::ReadWrite
+        self.access
     }
 
     async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {

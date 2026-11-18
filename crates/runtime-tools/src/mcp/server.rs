@@ -41,9 +41,9 @@ use std::{
     },
 };
 use tokio::sync::RwLock;
-use tools::SpiceModelTool;
 use tools::naming::{decode_tool_name, encode_tool_name};
 use tools::rename::with_name;
+use tools::{SpiceModelTool, ToolAccess};
 use tracing_futures::Instrument;
 use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 
@@ -535,6 +535,39 @@ impl RuntimeServer {
         tools
     }
 
+    /// The access of the listed tool exposed as `name`; `None` when no tool resolves under it.
+    /// A catalog's listed page answers without a request to its server; a catalog that lists
+    /// only asynchronously (an empty `try_get`) is asked with `get`, as the listing asked it.
+    async fn listed_tool_access(&self, name: &str) -> Option<ToolAccess> {
+        // Clone what is needed under the read lock and drop it before `catalog.get`, which can
+        // wait on the server (see `get_tool`).
+        let (catalog_entry, direct) = {
+            let tools = self.tools.read().await;
+            let catalog_entry = decode_tool_name(name).and_then(|(catalog_name, tool_name)| {
+                match tools.get(&catalog_name) {
+                    Some(Tooling::Catalog { tools: catalog, .. }) => {
+                        Some((Arc::clone(catalog), tool_name))
+                    }
+                    _ => None,
+                }
+            });
+            let direct = match tools.get(name) {
+                Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) => Some(tool.access()),
+                _ => None,
+            };
+            (catalog_entry, direct)
+        };
+        if let Some((catalog, tool_name)) = catalog_entry {
+            if let Some(tool) = listed_gateway_spec(catalog.as_ref(), &tool_name) {
+                return Some(tool.access());
+            }
+            if let Some(tool) = catalog.get(&tool_name).await {
+                return Some(tool.access());
+            }
+        }
+        direct
+    }
+
     fn snapshot_tool(&self, name: &str) -> Option<Tool> {
         // `decode_tool_name` accepts `srv__tool__name` as an alias of
         // canonical `srv__tool_-_name`. Prefer the canonical snapshot
@@ -861,9 +894,27 @@ impl ServerHandler for RuntimeServer {
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        Box::pin(async move { Ok(listed_tools_result(self.publish_listed_tools().await)) })
+        Box::pin(async move {
+            let listed = self.publish_listed_tools().await;
+            // Only the tools this caller may call are listed, by the decision `tools/call`
+            // makes; a call is still authorized on its own.
+            let can_write = match spice_request_context_from_mcp(&context) {
+                Some(spice_ctx) => spice_ctx.scope(tools::caller_can_write()).await,
+                None => false,
+            };
+            if can_write {
+                return Ok(listed_tools_result(listed));
+            }
+            let mut offered = Vec::with_capacity(listed.len());
+            for tool in listed {
+                if self.listed_tool_access(&tool.name).await == Some(ToolAccess::ReadOnly) {
+                    offered.push(tool);
+                }
+            }
+            Ok(listed_tools_result(offered))
+        })
     }
 
     // The resources capability is not advertised, so reject these rather than

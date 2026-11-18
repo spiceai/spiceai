@@ -1,0 +1,64 @@
+name: tool-access-config
+description: >
+  `access` and `read_only_tools` on a `tools:` entry are accepted only where
+  they mean something: on an MCP server's tools, with `access` `read` or
+  `read_write`, and `read_only_tools` as exceptions to `access: read_write`.
+  Every other use fails to load the tool with an error that names it and the
+  fix, and a `read_only_tools` entry that matches no tool the server reports
+  logs a warning.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: tool-access-config
+  tools:
+    - { name: store_memory, from: memory:store, access: read }
+    - { name: sql, from: sql, read_only_tools: [query_*] }
+    - name: tickets
+      from: mcp:python3
+      access: read_write_create
+      params: { mcp_args: &server "-u -c 'import sys; [None for _ in sys.stdin]'" }
+    - name: docs
+      from: mcp:python3
+      access: read
+      read_only_tools: [search_*]
+      params: { mcp_args: *server }
+    # A working server with one tool, `search_tickets`.
+    - name: helpdesk
+      from: mcp:python3
+      read_only_tools: [search_*, serch_*]
+      params:
+        mcp_args: |-
+          -u -c '
+          import json, sys
+          for line in sys.stdin:
+              message = json.loads(line)
+              if "id" not in message:
+                  continue
+              method = message.get("method")
+              if method == "initialize":
+                  result = {"protocolVersion": message["params"]["protocolVersion"], "capabilities": {"tools": {}}, "serverInfo": {"name": "helpdesk", "version": "1"}}
+              elif method == "tools/list":
+                  result = {"tools": [{"name": "search_tickets", "description": "Search tickets.", "inputSchema": {"type": "object", "properties": {}}}]}
+              elif method == "ping":
+                  result = {}
+              else:
+                  print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "Method not found"}}), flush=True)
+                  continue
+              print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+          '
+
+steps:
+  - start: {}
+  - assert-log:
+      count:
+        "ERROR .*Failed to load tool 'store_memory' \\(memory\\): `access` cannot be set on a built-in tool, whose access is fixed\\. Remove `access` from tool 'store_memory'\\. See: https://spiceai\\.org/docs/components/tools": 1
+        "ERROR .*Failed to load tool 'sql' \\(builtin\\): `read_only_tools` cannot be set on a built-in tool, whose access is fixed\\. Remove `read_only_tools` from tool 'sql'\\. See: https://spiceai\\.org/docs/components/tools": 1
+        "ERROR .*Failed to load tool 'tickets' \\(mcp\\): `access` accepts `read` or `read_write` on an MCP tool, got 'read_write_create'\\. See: https://spiceai\\.org/docs/components/tools": 1
+        "ERROR .*Failed to load tool 'docs' \\(mcp\\): `read_only_tools` lists the read-only exceptions to `access: read_write`, and tool 'docs' sets `access: read`, so every tool already only reads\\. Remove `read_only_tools` or set `access: read_write`\\. See: https://spiceai\\.org/docs/components/tools": 1
+        "WARN .*Tool 'helpdesk' \\(mcp\\): `read_only_tools` entry 'serch_\\*' matches no tool the server reports, so it has no effect\\. Check the server's tool names\\. See: https://spiceai\\.org/docs/components/tools": 1
+      lacks: ["entry 'search_\\*' matches no tool"]
+    eventually: 30s

@@ -142,10 +142,14 @@ impl ToolUsingChat {
         }
     }
 
+    /// The runtime tools offered to the model for a caller that `can_write`: every read-only
+    /// tool, and the read-write tools only to a caller with write access, so the model is not
+    /// offered a tool its caller would be refused.
     #[must_use]
-    pub fn runtime_tools(&self) -> Vec<ChatCompletionTool> {
+    pub fn runtime_tools(&self, can_write: bool) -> Vec<ChatCompletionTool> {
         self.tools
             .iter()
+            .filter(|t| can_write || t.access() == ::tools::ToolAccess::ReadOnly)
             .map(|t| ChatCompletionTool {
                 function: FunctionObject {
                     strict: t.strict(),
@@ -367,7 +371,7 @@ impl ToolUsingChat {
             }
 
             // Append spiced runtime tools to the request.
-            let inner_req = self.add_runtime_tools(&req);
+            let inner_req = self.add_runtime_tools(&req).await;
 
             let resp = self.inner_chat.chat_request(inner_req.clone()).await?;
             let usage = resp.usage.clone();
@@ -427,9 +431,14 @@ impl ToolUsingChat {
         .await
     }
 
-    /// Add the spice runtime tools to a list of tools (may contain external tools too), and ensure no duplicates.
-    fn add_runtime_tools(&self, req: &CreateChatCompletionRequest) -> CreateChatCompletionRequest {
-        let mut runtime_tools = self.runtime_tools();
+    /// Add the spice runtime tools the caller of the current request may call to a list of tools
+    /// (may contain external tools too), and ensure no duplicates. A request left with no tools
+    /// sends none, and so no tool choice either.
+    async fn add_runtime_tools(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> CreateChatCompletionRequest {
+        let mut runtime_tools = self.runtime_tools(::tools::caller_can_write().await);
         if let Some(ref request_tools) = req.tools {
             runtime_tools.extend(request_tools.iter().filter_map(|t| match t {
                 ChatCompletionTools::Function(f) => Some(f.clone()),
@@ -440,6 +449,10 @@ impl ToolUsingChat {
         runtime_tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         runtime_tools.dedup_by(|a, b| a.function.name == b.function.name);
         let mut req = req.clone();
+        if runtime_tools.is_empty() {
+            req.tools = None;
+            return without_orphan_tool_choice(req);
+        }
         req.tools = Some(
             runtime_tools
                 .into_iter()
@@ -476,7 +489,7 @@ impl ToolUsingChat {
         }
 
         // Append spiced runtime tools to the request. Avoid clone if no runtime tools.
-        let updated_req = self.add_runtime_tools(&req);
+        let updated_req = self.add_runtime_tools(&req).await;
         let s = self.inner_chat.chat_stream(updated_req.clone()).await?;
 
         Ok(make_a_stream(

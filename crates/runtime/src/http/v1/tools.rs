@@ -25,7 +25,7 @@ use axum::{
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tools::{SpiceModelTool, ToolCallDenied};
+use tools::{SpiceModelTool, ToolAccess, ToolCallDenied};
 
 use crate::{
     Runtime,
@@ -85,8 +85,11 @@ pub(crate) struct SearchToolsQuery {
     )
 ))]
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
+    // Only the tools this caller may call; a call is still authorized on its own.
+    let can_write = ::tools::caller_can_write().await;
     let tools = rt
         .list_all_tools()
+        .filter(|tool| std::future::ready(can_write || tool.access() == ToolAccess::ReadOnly))
         .map(|tool| ListToolElement::from_tool(&tool))
         .collect::<Vec<_>>()
         .await;
@@ -128,8 +131,10 @@ pub(crate) async fn search(
 ) -> Response {
     match tool_registry_prompt_tools(Arc::clone(&rt), query.embedding_model.as_deref()).await {
         Ok(tools) => {
+            let can_write = ::tools::caller_can_write().await;
             let tools = tools
                 .iter()
+                .filter(|tool| can_write || tool.access() == ToolAccess::ReadOnly)
                 .map(ListToolElement::from_tool)
                 .collect::<Vec<_>>();
             (StatusCode::OK, Json(tools)).into_response()

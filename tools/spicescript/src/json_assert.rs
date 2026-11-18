@@ -341,7 +341,7 @@ fn objects_equal(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
 
 /// Every value `pointer` reaches in `root`, where a `*` segment fans out over
 /// an array's elements or an object's members.
-fn resolve<'a>(root: &'a Value, pointer: &str) -> Vec<&'a Value> {
+pub(crate) fn resolve<'a>(root: &'a Value, pointer: &str) -> Vec<&'a Value> {
     let mut current = vec![root];
     if pointer.is_empty() {
         return current;

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use secrecy::SecretString;
-use spicepod::component::tool::Tool;
+use spicepod::component::{access::AccessMode, tool::Tool};
 use std::{collections::HashMap, sync::Arc};
 
 use crate::Runtime;
@@ -145,6 +145,10 @@ pub async fn forge(
         .map_or("builtin", |(a, _b)| a);
 
     // Not held across `construct`: one tool that is slow to construct must not block the others.
+    if let Some(message) = access_config_error(component, from_source) {
+        return Err(Box::new(ToolAccessConfigError { message }));
+    }
+
     let factory = rt.tool_factories().lock().await.get(from_source).cloned();
 
     match factory {
@@ -154,6 +158,56 @@ pub async fn forge(
         })),
     }
 }
+
+/// Where `access` and `read_only_tools` are documented.
+const TOOLS_DOCS: &str = "https://spiceai.org/docs/components/tools";
+
+/// What is wrong with the `access` and `read_only_tools` of `tool`, whose `from` names the
+/// source `kind`, if anything: both apply only to an MCP server's tools (a built-in tool's access
+/// is fixed), `access` there is `read` or `read_write`, and `read_only_tools` lists exceptions
+/// to `access: read_write`.
+#[must_use]
+pub fn access_config_error(tool: &Tool, kind: &str) -> Option<String> {
+    let name = &tool.name;
+    if kind != "mcp" {
+        if tool.access.is_some() {
+            return Some(format!(
+                "Failed to load tool '{name}' ({kind}): `access` cannot be set on a built-in tool, whose access is fixed. Remove `access` from tool '{name}'. See: {TOOLS_DOCS}"
+            ));
+        }
+        if !tool.read_only_tools.is_empty() {
+            return Some(format!(
+                "Failed to load tool '{name}' ({kind}): `read_only_tools` cannot be set on a built-in tool, whose access is fixed. Remove `read_only_tools` from tool '{name}'. See: {TOOLS_DOCS}"
+            ));
+        }
+        return None;
+    }
+    match tool.access {
+        Some(AccessMode::ReadWriteCreate) => Some(format!(
+            "Failed to load tool '{name}' ({kind}): `access` accepts `read` or `read_write` on an MCP tool, got '{}'. See: {TOOLS_DOCS}",
+            AccessMode::ReadWriteCreate.as_str()
+        )),
+        Some(AccessMode::Read) if !tool.read_only_tools.is_empty() => Some(format!(
+            "Failed to load tool '{name}' ({kind}): `read_only_tools` lists the read-only exceptions to `access: read_write`, and tool '{name}' sets `access: read`, so every tool already only reads. Remove `read_only_tools` or set `access: read_write`. See: {TOOLS_DOCS}"
+        )),
+        Some(AccessMode::Read | AccessMode::ReadWrite) | None => None,
+    }
+}
+
+/// A tool's `access` or `read_only_tools` is invalid for its kind (see
+/// [`access_config_error`]). No retry can clear it.
+#[derive(Debug)]
+pub struct ToolAccessConfigError {
+    message: String,
+}
+
+impl std::fmt::Display for ToolAccessConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ToolAccessConfigError {}
 
 /// A tool's `from` names a source no tool factory handles. No retry can clear it.
 #[derive(Debug)]
@@ -194,6 +248,87 @@ mod tests {
     fn tool(from: &str) -> Tool {
         serde_json::from_value(serde_json::json!({"from": from, "name": "t"}))
             .expect("a valid tool")
+    }
+
+    /// `access` and `read_only_tools` are accepted only on an MCP server's tools, with the
+    /// values that mean something there; every mistake names the tool and the fix.
+    #[test]
+    fn access_config_errors() {
+        let with = |name: &str, from: &str, extra: serde_json::Value| -> Tool {
+            let mut tool = serde_json::json!({"from": from, "name": name});
+            if let (Some(tool), Some(extra)) = (tool.as_object_mut(), extra.as_object()) {
+                tool.extend(extra.clone());
+            }
+            serde_json::from_value(tool).expect("a valid tool")
+        };
+        for (tool, kind, expected) in [
+            (
+                with(
+                    "store_memory",
+                    "memory:store",
+                    serde_json::json!({"access": "read"}),
+                ),
+                "memory",
+                Some(
+                    "Failed to load tool 'store_memory' (memory): `access` cannot be set on a built-in tool, whose access is fixed. Remove `access` from tool 'store_memory'. See: https://spiceai.org/docs/components/tools",
+                ),
+            ),
+            (
+                with("sql", "sql", serde_json::json!({"read_only_tools": ["x"]})),
+                "builtin",
+                Some(
+                    "Failed to load tool 'sql' (builtin): `read_only_tools` cannot be set on a built-in tool, whose access is fixed. Remove `read_only_tools` from tool 'sql'. See: https://spiceai.org/docs/components/tools",
+                ),
+            ),
+            (
+                with(
+                    "tickets",
+                    "mcp:https://tickets.example.com/mcp",
+                    serde_json::json!({"access": "read_write_create"}),
+                ),
+                "mcp",
+                Some(
+                    "Failed to load tool 'tickets' (mcp): `access` accepts `read` or `read_write` on an MCP tool, got 'read_write_create'. See: https://spiceai.org/docs/components/tools",
+                ),
+            ),
+            (
+                with(
+                    "docs",
+                    "mcp:https://docs.example.com/mcp",
+                    serde_json::json!({"access": "read", "read_only_tools": ["search_*"]}),
+                ),
+                "mcp",
+                Some(
+                    "Failed to load tool 'docs' (mcp): `read_only_tools` lists the read-only exceptions to `access: read_write`, and tool 'docs' sets `access: read`, so every tool already only reads. Remove `read_only_tools` or set `access: read_write`. See: https://spiceai.org/docs/components/tools",
+                ),
+            ),
+            (
+                with(
+                    "tickets",
+                    "mcp:https://tickets.example.com/mcp",
+                    serde_json::json!({"access": "read_write", "read_only_tools": ["search_*", "get_ticket"]}),
+                ),
+                "mcp",
+                None,
+            ),
+            (
+                with(
+                    "docs",
+                    "mcp:https://docs.example.com/mcp",
+                    serde_json::json!({"access": "read"}),
+                ),
+                "mcp",
+                None,
+            ),
+            (with("sql", "sql", serde_json::json!({})), "builtin", None),
+        ] {
+            assert_eq!(
+                access_config_error(&tool, kind).as_deref(),
+                expected,
+                "{} ({kind})",
+                tool.name
+            );
+        }
     }
 
     #[tokio::test]

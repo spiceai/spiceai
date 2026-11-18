@@ -81,6 +81,14 @@ pub async fn caller_can_write() -> bool {
     AuthRequestContext::auth_principal(context.as_ref()).is_some_and(principal_has_write_access)
 }
 
+/// Whether the caller of the current request may call a tool whose calls have `access`: the
+/// decision [`authorize`] makes, without recording anything. What is offered to a caller (the
+/// tools sent to a model, `/v1/tools`, MCP `tools/list`, `tool_search`) is decided with it, so
+/// an offer and a call cannot disagree; the call is still authorized on its own.
+pub async fn caller_may_call(access: ToolAccess) -> bool {
+    access == ToolAccess::ReadOnly || caller_can_write().await
+}
+
 /// Decides whether the caller of the current request may call `tool`, whose calls have
 /// `access`. The one place that decision is made; see the module docs.
 ///

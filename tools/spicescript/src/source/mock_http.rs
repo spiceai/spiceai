@@ -282,8 +282,36 @@ impl Source for MockHttp {
                     })
                     .collect(),
             }),
+            ["json", path, pointer, rest @ ..] if matches!(rest, [] | ["last"]) => {
+                let requests = matching(path);
+                let requests = if rest.is_empty() {
+                    requests
+                } else {
+                    requests.into_iter().last().into_iter().collect()
+                };
+                Ok(TextResult {
+                    columns: vec![(*pointer).to_string()],
+                    rows: requests
+                        .into_iter()
+                        .map(|r| {
+                            let values = serde_json::from_str::<serde_json::Value>(&r.body)
+                                .ok()
+                                .map(|body| {
+                                    serde_json::Value::Array(
+                                        crate::json_assert::resolve(&body, pointer)
+                                            .into_iter()
+                                            .cloned()
+                                            .collect(),
+                                    )
+                                    .to_string()
+                                });
+                            vec![values]
+                        })
+                        .collect(),
+                })
+            }
             _ => bail!(
-                "a mock HTTP source answers `count <path>`, `log <path>` or `header <path> <name>`, not `{text}`"
+                "a mock HTTP source answers `count <path>`, `log <path>`, `header <path> <name>` or `json <path> <pointer> [last]`, not `{text}`"
             ),
         }
     }

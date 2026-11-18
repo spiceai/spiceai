@@ -168,10 +168,13 @@ impl ToolUsingResponses {
         req
     }
 
+    /// The runtime tools offered to the model for a caller that `can_write` (see
+    /// [`crate::model::tool_use::ToolUsingChat::runtime_tools`]).
     #[must_use]
-    pub fn runtime_tools(&self) -> Vec<ToolDefinition> {
+    pub fn runtime_tools(&self, can_write: bool) -> Vec<ToolDefinition> {
         self.tools
             .iter()
+            .filter(|t| can_write || t.access() == ::tools::ToolAccess::ReadOnly)
             .map(|t| {
                 ToolDefinition::Function(FunctionTool {
                     strict: t.strict(),
@@ -470,7 +473,7 @@ impl ToolUsingResponses {
         }
 
         // Append spiced runtime tools to the request.
-        let mut req = self.add_runtime_tools(&req);
+        let mut req = self.add_runtime_tools(&req).await;
         // The rounds that may still run Spice tools; `None` for no limit.
         let mut tool_rounds_left = recursion_limit;
         // The output of the rounds that ran Spice tools, as the client receives it, and their usage.
@@ -531,7 +534,7 @@ impl ToolUsingResponses {
         }
 
         // Append spiced runtime tools to the request.
-        let req = self.add_runtime_tools(&req);
+        let req = self.add_runtime_tools(&req).await;
 
         let s = self.inner_responses.responses_stream(req.clone()).await?;
 
@@ -584,8 +587,8 @@ impl ToolUsingResponses {
         req
     }
 
-    fn add_runtime_tools(&self, req: &CreateResponse) -> CreateResponse {
-        let mut runtime_tools = self.runtime_tools();
+    async fn add_runtime_tools(&self, req: &CreateResponse) -> CreateResponse {
+        let mut runtime_tools = self.runtime_tools(::tools::caller_can_write().await);
         if runtime_tools.is_empty() {
             tracing::debug!("No runtime tools available, returning original request");
             req.clone()
