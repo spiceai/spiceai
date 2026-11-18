@@ -563,6 +563,8 @@ fn unsafe_archive_entry(
 /// A directory inside `pods_dir` that a package is extracted into, removed
 /// when dropped unless it was moved into place.
 struct Staging {
+    /// The directory it was created in, which it is removed from.
+    pods: InstallDir,
     dir: InstallDir,
     name: std::ffi::OsString,
     moved: bool,
@@ -583,8 +585,14 @@ impl Staging {
                     continue;
                 }
             }
+            let parent = pods.try_clone().map_err(|source| Error::Io {
+                operation: "create directory",
+                path: pods.child_path(&name).display().to_string(),
+                source,
+            })?;
             return match pods.entry(&name) {
                 Ok(Entry::Directory(dir)) => Ok(Self {
+                    pods: parent,
                     dir,
                     name,
                     moved: false,
@@ -613,8 +621,9 @@ impl Staging {
 impl Drop for Staging {
     fn drop(&mut self) {
         if !self.moved {
-            // `remove_dir_all` never follows a link inside the tree it removes.
-            let _ = std::fs::remove_dir_all(self.dir.path());
+            // Relative to the directory it was created in, so a `spicepods`
+            // path swapped for a link since cannot point the removal elsewhere.
+            let _ = self.pods.remove_tree(&self.name);
         }
     }
 }
@@ -1166,6 +1175,46 @@ mod tests {
             )
         );
         assert_eq!(outside_entries(), 0, "nothing may be written outside");
+    }
+
+    /// A refused or failed install removes its staging directory from the
+    /// directory it was created in, even when `spicepods/` has since been
+    /// swapped for a link: the cleanup neither follows the link nor removes an
+    /// entry of the same name wherever it points.
+    #[cfg(unix)]
+    #[test]
+    fn a_staging_directory_is_removed_where_it_was_created() {
+        let project = tempfile::tempdir().expect("create the project");
+        let outside = tempfile::tempdir().expect("create the outside directory");
+        let pods_path = project.path().join("spicepods");
+        let moved_away = project.path().join("spicepods.real");
+        std::fs::create_dir(&pods_path).expect("create the pods directory");
+
+        let pods = InstallDir::open(&pods_path).expect("open the pods directory");
+        let staged = Staging::create(&pods).expect("create the staging directory");
+        let name = staged.name.clone();
+        let file = staged
+            .dir
+            .create_file(std::ffi::OsStr::new("partial.yaml"))
+            .expect("write into the staging directory");
+        drop(file);
+
+        std::fs::rename(&pods_path, &moved_away).expect("move the pods directory away");
+        std::os::unix::fs::symlink(outside.path(), &pods_path).expect("link its path outside");
+        let decoy = outside.path().join(&name);
+        std::fs::create_dir(&decoy).expect("create an outside entry with the staging name");
+        std::fs::write(decoy.join("keep.txt"), "not Spice's\n").expect("write the outside entry");
+
+        drop(staged);
+
+        assert_eq!(
+            std::fs::read_to_string(decoy.join("keep.txt")).expect("the outside entry is kept"),
+            "not Spice's\n"
+        );
+        assert!(
+            !moved_away.join(&name).exists(),
+            "the staging directory must be removed where it was created"
+        );
     }
 
     /// The expansion budget counts the bytes actually written, across entries. A central

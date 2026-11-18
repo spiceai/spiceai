@@ -212,6 +212,42 @@ impl InstallDir {
         }
     }
 
+    /// Remove the entry `name`, and everything in it when it is a directory,
+    /// relative to this directory. A link anywhere in it is removed, never
+    /// followed. A missing entry is not an error.
+    pub(super) fn remove_tree(&self, name: &OsStr) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::AtFlags;
+            match self.entry(name)? {
+                Entry::Missing => Ok(()),
+                Entry::Directory(dir) => {
+                    for (child, is_dir) in dir.list()? {
+                        if is_dir {
+                            dir.remove_tree(&child)?;
+                        } else {
+                            rustix::fs::unlinkat(&dir.fd, child.as_os_str(), AtFlags::empty())?;
+                        }
+                    }
+                    rustix::fs::unlinkat(&self.fd, name, AtFlags::REMOVEDIR).map_err(Into::into)
+                }
+                Entry::Link | Entry::Other => {
+                    rustix::fs::unlinkat(&self.fd, name, AtFlags::empty()).map_err(Into::into)
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.child_path(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path),
+                Ok(_) => std::fs::remove_file(&path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
     /// The names in this directory, each with whether it is a directory (a
     /// link to one is not).
     pub(super) fn list(&self) -> std::io::Result<Vec<(OsString, bool)>> {
