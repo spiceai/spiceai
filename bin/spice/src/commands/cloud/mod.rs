@@ -19,6 +19,7 @@ limitations under the License.
 pub mod bytes;
 pub(crate) mod client;
 pub mod org;
+pub(crate) mod refresh;
 
 use crate::commands::login::LoginOutput;
 use crate::context::RuntimeContext;
@@ -486,8 +487,9 @@ impl fmt::Debug for LoginMethod {
 
 #[derive(Args, Debug)]
 pub struct SubscriptionLoginArgs {
-    /// Don't open a browser; print the URL and a one-time code to enter on
-    /// another device. Useful over SSH or in headless shells.
+    /// Don't open a browser; print the sign-in URL. A browser on another
+    /// machine shows an error page after you approve: paste that page's
+    /// address at the prompt. Useful over SSH or in headless shells.
     #[arg(long)]
     pub device: bool,
 }
@@ -1054,6 +1056,13 @@ pub async fn execute(ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         org::validate_org_name(org)?;
     }
     let org = args.org.as_deref();
+
+    if !matches!(
+        args.command,
+        CloudCommands::Login(_) | CloudCommands::Logout(_)
+    ) {
+        refresh::renew_expiring_sign_ins().await;
+    }
 
     match &args.command {
         CloudCommands::Login(login_args) => execute_login(login_args, org).await,
@@ -1768,7 +1777,7 @@ async fn execute_login_token(args: &TokenLoginArgs, target: &LoginTarget<'_>) ->
         true,
     )?;
 
-    save_token_and_print_login_result(&token, target).await
+    save_token_and_print_login_result(&token, None, target).await
 }
 
 async fn execute_login_api(args: &ApiLoginArgs, target: &LoginTarget<'_>) -> Result<()> {
@@ -1896,6 +1905,18 @@ fn credential_key(org: Option<&str>) -> String {
     }
 }
 
+/// The `merge_auth_config` key the refresh token for [`credential_key`] is
+/// filed under; the inverse of [`org::org_refresh_token_var`].
+fn refresh_credential_key(org: Option<&str>) -> String {
+    let var = match org {
+        Some(org) if !org.is_empty() => org::org_refresh_token_var(org),
+        _ => org::DEFAULT_REFRESH_TOKEN_VAR.to_string(),
+    };
+    var.strip_prefix("SPICE_SPICEAI_")
+        .unwrap_or("REFRESH_TOKEN")
+        .to_string()
+}
+
 /// The `merge_auth_config` key the app API key is filed under.
 ///
 /// Inverse of [`org::org_api_key_var`], for the same reason as
@@ -1919,6 +1940,7 @@ fn api_key_credential_key(org: Option<&str>) -> String {
 /// or replace the default data-plane key.
 fn user_login_values<'a>(
     token: &'a str,
+    refresh_token: Option<&'a str>,
     api_key: Option<&'a str>,
     token_org: Option<&str>,
     store_org: Option<&str>,
@@ -1941,6 +1963,14 @@ fn user_login_values<'a>(
             .iter()
             .map(|org| (credential_key(Some(org)), token)),
     );
+    if let Some(refresh_token) = refresh_token {
+        values.push((refresh_credential_key(None), refresh_token));
+        values.extend(
+            credential_orgs
+                .iter()
+                .map(|org| (refresh_credential_key(Some(org)), refresh_token)),
+        );
+    }
 
     if let Some(api_key) = api_key {
         if store_org.is_none() {
@@ -2032,10 +2062,26 @@ fn persist_login_values(
     if !cloud.is_empty() {
         save_credentials(output, "CLOUD", cloud)?;
     }
+    remove_env_keys(&unpaired_refresh_vars(spiceai))?;
 
     clear_login_shadows(output, spiceai, cloud)?;
     select_login_org(login_org, spiceai)?;
     Ok(())
+}
+
+/// Refresh-token variables beside access tokens this login wrote without one.
+///
+/// A token or API login replaces the access token but not a refresh token
+/// left by an earlier browser sign-in, and renewal must never pair the two.
+fn unpaired_refresh_vars(spiceai: &[(&str, &str)]) -> Vec<String> {
+    let written: BTreeSet<&str> = spiceai.iter().map(|(key, _)| *key).collect();
+    written
+        .iter()
+        .filter(|key| **key == "TOKEN" || key.starts_with("TOKEN_"))
+        .map(|key| format!("REFRESH_{key}"))
+        .filter(|refresh| !written.contains(refresh.as_str()))
+        .map(|refresh| format!("SPICE_SPICEAI_{refresh}"))
+        .collect()
 }
 
 /// Make later commands select the organization authenticated by this login.
@@ -2238,7 +2284,11 @@ fn ensure_login_values_active(spiceai: &[(&str, &str)], cloud: &[(&str, &str)]) 
     Ok(())
 }
 
-async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>) -> Result<()> {
+async fn save_token_and_print_login_result(
+    token: &str,
+    signed_in: Option<&crate::commands::login::session::SignedIn>,
+    target: &LoginTarget<'_>,
+) -> Result<()> {
     let authed_client = CloudClient::with_token_for_org(token, target.requested_org)?;
     let auth_context_result = authed_client.get_auth_context().await;
 
@@ -2262,13 +2312,23 @@ async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>
     } else {
         user_login_org(&authed_client, store_org.as_deref(), token_org.as_deref()).await?
     };
-    let values = user_login_values(
+    let mut values = user_login_values(
         token,
+        signed_in.map(|signed_in| signed_in.grant.refresh_token.as_str()),
         api_key,
         token_org.as_deref(),
         store_org.as_deref(),
         selected_org.as_deref(),
     );
+    if let Some(signed_in) = signed_in {
+        values.push((
+            org::CLIENT_ID_VAR
+                .strip_prefix("SPICE_SPICEAI_")
+                .unwrap_or("CLIENT_ID")
+                .to_string(),
+            signed_in.client_id.as_str(),
+        ));
+    }
     let value_refs: Vec<(&str, &str)> = values
         .iter()
         .map(|(key, value)| (key.as_str(), *value))
@@ -2388,19 +2448,14 @@ async fn print_post_login_org_context(
 }
 
 async fn execute_login_device_flow(open_browser: bool, target: &LoginTarget<'_>) -> Result<()> {
-    use crate::commands::login::session::{BrowserLogin, BrowserLoginOutcome};
-
-    let flow = BrowserLogin::at(client::portal_base_url());
-    if target.output != LoginOutput::Json {
-        flow.announce();
-    }
-    if open_browser {
-        flow.open_browser();
-    }
-    let BrowserLoginOutcome::Granted { access_token, .. } = flow.authenticate().await? else {
-        return Err(Error::DeviceAuthorizationDenied);
-    };
-    save_token_and_print_login_result(&access_token, target).await
+    let signed_in = crate::commands::login::session::sign_in(
+        &client::portal_base_url(),
+        org::read_credential(org::CLIENT_ID_VAR),
+        open_browser,
+        target.requested_org,
+    )
+    .await?;
+    save_token_and_print_login_result(&signed_in.grant.access_token, Some(&signed_in), target).await
 }
 
 fn print_post_login_help() {
@@ -2422,7 +2477,7 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
     match args.scope {
         LogoutScope::All => {
             for org in org::orgs_with_stored_tokens()? {
-                if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
+                if remove_env_keys(&org_credential_keys(&org))? {
                     cleared.push(org);
                 }
             }
@@ -2434,7 +2489,7 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
             if let Some(org) = resolve_org(flag_org)? {
                 ensure_active_org_logout_is_isolated(&org, org::default_token().is_some())?;
                 if org::has_org_token(&org) {
-                    if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
+                    if remove_env_keys(&org_credential_keys(&org))? {
                         cleared.push(org.clone());
                     }
                     org::forget_keychain_org(&org)?;
@@ -2477,11 +2532,22 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Credential variables stored for `org`.
+fn org_credential_keys(org: &str) -> [String; 3] {
+    [
+        org::org_token_var(org),
+        org::org_refresh_token_var(org),
+        org::org_api_key_var(org),
+    ]
+}
+
 /// Credential variables that belong to no particular org.
 fn default_credential_keys() -> Vec<String> {
     vec![
         org::DEFAULT_TOKEN_VAR.to_string(),
+        org::DEFAULT_REFRESH_TOKEN_VAR.to_string(),
         org::DEFAULT_API_KEY_VAR.to_string(),
+        org::CLIENT_ID_VAR.to_string(),
         "SPICE_CLOUD_CLIENT_ID".to_string(),
         "SPICE_CLOUD_CLIENT_SECRET".to_string(),
     ]
@@ -2619,11 +2685,48 @@ fn ensure_keychain_credentials_removed(failures: &[String]) -> Result<()> {
 /// form the reader accepts, leaving such a credential readable but not
 /// removable — so logout reported success while it stayed live.
 fn assigns_any(line: &str, keys: &[String]) -> bool {
-    let Some((lhs, _)) = line.split_once('=') else {
-        return false;
-    };
-    let name = lhs.trim().trim_start_matches("export ").trim();
-    keys.iter().any(|key| key == name)
+    assigned_name(line).is_some_and(|name| keys.iter().any(|key| key == name))
+}
+
+/// The variable an env-file line assigns, if any.
+fn assigned_name(line: &str) -> Option<&str> {
+    let (lhs, _) = line.split_once('=')?;
+    Some(lhs.trim().trim_start_matches("export ").trim())
+}
+
+/// Replace the values of variables the env file already assigns, keeping
+/// every other line byte-for-byte for the same reasons as
+/// [`remove_env_file_keys`].
+pub(crate) fn replace_env_file_values(values: &[(&str, &str)]) -> Result<()> {
+    let env_file = crate::commands::login::env_file_path();
+    let path = env_file.as_path();
+    let content = std::fs::read_to_string(path).map_err(|e| crate::error::Error::ConfigIo {
+        operation: "read",
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    let mut updated = content
+        .lines()
+        .map(|line| {
+            let replacement = assigned_name(line)
+                .and_then(|name| values.iter().find(|(var, _)| *var == name))
+                .zip(line.split_once('='));
+            match replacement {
+                Some(((_, value), (lhs, _))) => format!("{lhs}={value}"),
+                None => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if content.ends_with('\n') {
+        updated.push('\n');
+    }
+    std::fs::write(path, updated).map_err(|e| crate::error::Error::ConfigIo {
+        operation: "write",
+        path: path.to_path_buf(),
+        source: e,
+    })
 }
 
 async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()> {
@@ -5944,6 +6047,7 @@ mod tests {
     fn keychain_login_indexes_every_per_org_token_and_no_other_credential() {
         let values = user_login_values(
             "user-token",
+            None,
             Some("personal-api-key"),
             Some("personal"),
             Some("acme"),
@@ -5961,9 +6065,50 @@ mod tests {
     }
 
     #[test]
+    fn a_login_without_a_refresh_token_removes_the_old_one_beside_its_tokens() {
+        let stale =
+            unpaired_refresh_vars(&[("TOKEN", "pat"), ("TOKEN_ACME", "pat"), ("API_KEY", "key")]);
+        assert_eq!(
+            stale,
+            [
+                org::DEFAULT_REFRESH_TOKEN_VAR.to_string(),
+                org::org_refresh_token_var("acme"),
+            ]
+        );
+
+        let browser = unpaired_refresh_vars(&[("TOKEN", "access"), ("REFRESH_TOKEN", "refresh")]);
+        assert!(browser.is_empty(), "{browser:?}");
+    }
+
+    #[test]
+    fn a_browser_sign_in_stores_its_refresh_token_beside_every_token_copy() {
+        let values = user_login_values(
+            "access",
+            Some("refresh"),
+            None,
+            Some("personal"),
+            Some("acme"),
+            Some("acme"),
+        );
+
+        for org in [None, Some("personal"), Some("acme")] {
+            assert!(values.contains(&(credential_key(org), "access")), "{org:?}");
+            assert!(
+                values.contains(&(refresh_credential_key(org), "refresh")),
+                "{org:?}"
+            );
+        }
+        assert_eq!(
+            format!("SPICE_SPICEAI_{}", refresh_credential_key(Some("acme"))),
+            org::org_refresh_token_var("acme")
+        );
+    }
+
+    #[test]
     fn a_user_login_without_an_app_key_does_not_clear_data_plane_credentials() {
         let values = user_login_values(
             "user-token",
+            None,
             None,
             Some("personal"),
             Some("acme"),
@@ -5980,6 +6125,7 @@ mod tests {
     fn a_cross_org_user_login_does_not_relabel_or_replace_the_data_plane_key() {
         let values = user_login_values(
             "user-token",
+            None,
             Some("personal-api-key"),
             Some("personal"),
             Some("acme"),
@@ -6031,6 +6177,13 @@ mod tests {
         let keys = default_credential_keys();
         assert!(keys.contains(&org::DEFAULT_TOKEN_VAR.to_string()));
         assert!(keys.contains(&org::DEFAULT_API_KEY_VAR.to_string()));
+        assert!(keys.contains(&org::DEFAULT_REFRESH_TOKEN_VAR.to_string()));
+        assert!(keys.contains(&org::CLIENT_ID_VAR.to_string()));
+
+        let org_keys = org_credential_keys("acme");
+        assert!(org_keys.contains(&org::org_token_var("acme")));
+        assert!(org_keys.contains(&org::org_refresh_token_var("acme")));
+        assert!(org_keys.contains(&org::org_api_key_var("acme")));
     }
 
     fn instance(phase: &str, spiced: Option<SpicedStatus>) -> InstanceStatus {
@@ -6528,7 +6681,7 @@ mod tests {
     }
 
     fn persist_user_login(output: LoginOutput, token: &str, org: &str) -> Result<()> {
-        let values = user_login_values(token, None, Some(org), None, Some(org));
+        let values = user_login_values(token, None, None, Some(org), None, Some(org));
         let refs: Vec<(&str, &str)> = values
             .iter()
             .map(|(key, value)| (key.as_str(), *value))
@@ -6627,6 +6780,7 @@ mod tests {
 
         let values = user_login_values(
             "fresh-token",
+            None,
             None,
             Some("personal-org"),
             None,

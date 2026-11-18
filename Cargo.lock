@@ -20306,6 +20306,7 @@ dependencies = [
  "arrow",
  "arrow-json",
  "assert_cmd",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "clap_complete",
