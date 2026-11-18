@@ -2063,10 +2063,10 @@ mod mcp_origin_tests {
             config.allowed_origins
         );
         let status = post_mcp_with_origin(config, Some("http://localhost:5173")).await;
-        assert_ne!(
+        assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
-            "Origin http://localhost:5173 must pass the default CORS * MCP allow-list, got {status}"
+            StatusCode::OK,
+            "Origin http://localhost:5173 must be accepted (HTTP 200) on the default CORS * MCP allow-list, got {status}"
         );
     }
 
