@@ -37,9 +37,11 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::postgres_replication::XidRegistry;
 use data_components::postgres_replication::slot::parse_lsn;
-use data_connector_api::write_back::{DeliveryError, DeliveryResult, WriteBackDeliverer};
+use data_components::postgres_replication::{EchoReadGuard, XidRegistry};
+use data_connector_api::write_back::{
+    DeliveryError, DeliveryResult, ReadFence, WriteBackDeliverer,
+};
 use datafusion::common::Constraints;
 use datafusion::common::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{self, InsertBuilder};
@@ -262,7 +264,11 @@ impl WriteBackDeliverer for PostgresWriteBackDeliverer {
         }
     }
 
-    async fn deliver_upserts(&self, rows: Vec<RecordBatch>) -> DeliveryResult {
+    fn begin_read(&self) -> ReadFence {
+        ReadFence::new(self.registry.begin_read())
+    }
+
+    async fn deliver_upserts(&self, rows: Vec<RecordBatch>, read: ReadFence) -> DeliveryResult {
         let mut db = self.pool.connect_direct().await.map_err(|e| {
             delivery_error(
                 format!(
@@ -369,7 +375,13 @@ impl WriteBackDeliverer for PostgresWriteBackDeliverer {
             // already suppressible. A register failure aborts the delivery: the
             // transaction is dropped (rolled back) rather than committed
             // unsuppressed.
-            self.registry.register(xid8).await.map_err(|e| {
+            // With the fence of the read that produced `rows`, so the echo is
+            // applied for any key that changes through the stream after that read
+            // (#16505). A fence this deliverer did not issue is treated as none.
+            self.registry
+                .register_delivery(xid8, read.downcast_ref::<EchoReadGuard>())
+                .await
+                .map_err(|e| {
                 delivery_error(
                     format!(
                         "Failed to register the delivery transaction for durable write-back to table '{}', so its change echo could not be suppressed; the delivery was aborted rather than risk re-applying it. See: https://spiceai.org/docs/components/data-connectors/postgres",

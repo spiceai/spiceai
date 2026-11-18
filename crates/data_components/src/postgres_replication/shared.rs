@@ -1703,14 +1703,16 @@ impl MemberMailboxReceiver {
             .fetch_sub(item.buffered_bytes(), Ordering::AcqRel);
         self.shared.capacity_notify.notify_one();
         // Echo suppression, decided here rather than in the shared pump: drop
-        // every chunk of this envelope whose xid this member's own registry
-        // recognizes as one of its own write-back deliveries. `contains` is a
+        // the changes of this envelope whose xid this member's own registry
+        // recognizes as one of its own write-back deliveries, except those to a
+        // key that changed through the stream after the delivery read it
+        // (#16505, see `PgChangeRows::drop_echoed`). `contains` is a
         // lock-free mirror read, so this never blocks; a member with no
         // registry (the overwhelming majority of datasets) skips straight past.
         if let (PendingItem::Changes(pending), Some(filter)) =
             (&mut item, self.echo_filter.as_mut())
         {
-            let scan = pending.rows.drop_echoed(&filter.registry);
+            let scan = pending.rows.drop_echoed(&filter.registry, pending.flush_to);
             // A change from a transaction this dataset did not issue means the
             // accelerator is not the only writer of this table, the one condition
             // durable write-back cannot make safe. Report it once: every later
@@ -7660,6 +7662,147 @@ mod tests {
         );
     }
 
+    async fn empty_echo_registry() -> Arc<XidRegistry> {
+        XidRegistry::load(
+            Arc::new(EchoFakeStore::default()),
+            "localhost:5432/db/public.t0".to_string(),
+            "t0".to_string(),
+        )
+        .await
+        .expect("registry loads from an empty store")
+    }
+
+    /// A delivery whose accelerator read was taken after the source write was
+    /// durably applied read the source's row, so its echo carries nothing the
+    /// accelerator lacks and is dropped.
+    #[tokio::test]
+    async fn echo_is_dropped_when_the_read_observed_the_source_write() {
+        let delivery_xid = 4242u32;
+        let registry = empty_echo_registry().await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(7777),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        foreign.commit().await.expect("commit the source write");
+        registry.prune_acked(250).await;
+
+        let read = registry.begin_read();
+        assert_eq!(read.fence(), 250, "the read observes the applied position");
+        registry
+            .register_delivery(u64::from(delivery_xid), Some(&read))
+            .await
+            .expect("register the delivery");
+        drop(read);
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(echo.num_rows_hint(), 0, "the redundant echo is dropped");
+    }
+
+    /// An echo change that was kept is applied, so it is a change to its key that
+    /// a later delivery's read may not have observed either.
+    #[tokio::test]
+    async fn a_kept_echo_change_is_a_change_for_later_deliveries() {
+        let first = 4242u32;
+        let second = 4343u32;
+        let registry = empty_echo_registry().await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        // The first delivery read before the source write to id 5 (fence 0).
+        let first_read = registry.begin_read();
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(7777),
+        )
+        .await;
+        receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error")
+            .commit()
+            .await
+            .expect("commit the source write");
+        registry
+            .register_delivery(u64::from(first), Some(&first_read))
+            .await
+            .expect("register the first delivery");
+        drop(first_read);
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(first),
+        )
+        .await;
+        let first_echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(built_ids(&first_echo), vec![5], "the first echo is applied");
+        first_echo.commit().await.expect("commit the first echo");
+
+        // The second read is fenced past the source write but before the
+        // first echo was applied.
+        registry.prune_acked(250).await;
+        let second_read = registry.begin_read();
+        registry
+            .register_delivery(u64::from(second), Some(&second_read))
+            .await
+            .expect("register the second delivery");
+        drop(second_read);
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            400,
+            Some(second),
+        )
+        .await;
+        let second_echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(
+            built_ids(&second_echo),
+            vec![5],
+            "the second echo is applied: its read did not observe the applied first echo"
+        );
+    }
+
     /// A transaction that is *only* the arbitrated member's echo still advances its
     /// watermark via the zero-row ack — a filtered echo is real source progress.
     #[tokio::test]
@@ -7854,7 +7997,7 @@ mod tests {
             Some(0),
         );
 
-        let scan = rows.drop_echoed(&registry);
+        let scan = rows.drop_echoed(&registry, 0);
 
         assert!(
             scan.dropped.is_empty(),
