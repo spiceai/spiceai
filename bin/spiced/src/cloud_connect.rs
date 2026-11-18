@@ -766,6 +766,7 @@ fn reconcile(active: &App, deployed: App) -> Reconciled {
         runtime,
         management,
         snapshots,
+        refused_components,
     } = deployed;
 
     let mut restart_required = Vec::new();
@@ -792,6 +793,10 @@ fn reconcile(active: &App, deployed: App) -> Reconciled {
         views,
         models,
         functions,
+        // What the deployment's dependencies may not load. It describes the
+        // deployed components, which are reconciled, and a reload logs any it
+        // newly refuses.
+        refused_components,
         // Read at start only to label anonymous telemetry, which is already
         // running: the label keeps the name the instance started under, and
         // nothing else in a running process is built from the app's name. Take
