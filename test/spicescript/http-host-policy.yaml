@@ -30,6 +30,9 @@ spicepod:
 
 defaults:
   compare-variants: false
+  # Lets the runner read dataset status from the api-key variant; the other
+  # variants require no key, and every check below chooses its own.
+  api-key: host-key
 
 steps:
   - source-exec:
