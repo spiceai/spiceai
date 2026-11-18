@@ -24,6 +24,7 @@ limitations under the License.
 
 mod error;
 mod executor;
+mod ledger;
 mod state;
 mod store;
 
@@ -31,6 +32,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 pub use error::{Error, Result};
 pub use executor::JobExecutor;
+pub use ledger::{Limits as JobLimits, MAX_JOB_RESULT_BYTES};
 pub use state::JobErrorCode;
 pub use state::{
     DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobDriver, JobResult, JobResultManifest, JobSchema,
@@ -48,4 +50,10 @@ pub use store::JobStore;
 pub async fn current_job_owner() -> String {
     let context = RequestContext::current(AsyncMarker::new().await);
     context.cache_namespace().storage_id().to_string()
+}
+
+/// Milliseconds since the Unix epoch now.
+#[must_use]
+pub(crate) fn now_ms() -> u64 {
+    state::now_ms_or_zero()
 }

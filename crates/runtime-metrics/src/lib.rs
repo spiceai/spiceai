@@ -22,6 +22,7 @@ pub use opentelemetry::{
 pub use std::sync::LazyLock;
 
 pub mod acceleration;
+pub mod async_queries;
 pub mod catalogs;
 pub mod cluster;
 pub mod component;

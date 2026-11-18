@@ -33,8 +33,10 @@ use crate::jobs::state::JobErrorCode;
 
 use super::Result;
 use super::error::Error;
+use super::ledger::{Admission, Limits as JobLimits, MAX_JOB_RESULT_BYTES, Refusal, StoredEntry};
 use super::state::{JobResult, JobState, JobStatus, now_ms_or_zero};
 use super::store::JobStore;
+use runtime_metrics::async_queries::{self as async_query_metrics, ActiveStatus, RejectionReason};
 
 /// How a job comes to be driven by this scheduler.
 enum Start {
@@ -97,6 +99,26 @@ fn format_seconds(duration: Duration) -> String {
     format!("{seconds}")
 }
 
+/// The error a refused submission gets, counted by reason.
+fn refusal_error(refusal: Refusal) -> Error {
+    match refusal {
+        Refusal::QueueFull { pending } => {
+            async_query_metrics::track_submission_rejected(RejectionReason::QueueFull);
+            Error::QueueFull { pending }
+        }
+        Refusal::ResultBudget {
+            stored_bytes,
+            oldest_expiry_ms,
+        } => {
+            async_query_metrics::track_submission_rejected(RejectionReason::ResultBudget);
+            Error::ResultBudgetFull {
+                stored_bytes,
+                oldest_expiry_ms,
+            }
+        }
+    }
+}
+
 /// Logs how a job's background task ended. A driver that another scheduler
 /// took the job from stops at its next write; that is not a failure.
 fn report_job_end(job_id: &str, result: Result<()>, what: &str) {
@@ -131,6 +153,194 @@ pub struct JobExecutor {
     df: Arc<DataFusion>,
     /// Tracks active jobs by Spice `job_id`
     active_jobs: Arc<RwLock<std::collections::HashMap<String, ActiveJobInfo>>>,
+    /// Starts jobs and keeps each caller's ledger as they start and finish.
+    runner: Runner,
+}
+
+/// A job accepted by this scheduler that waits for its caller's running slot.
+struct PendingJob {
+    owner: String,
+    /// The submitting request's context, which the job runs under. `None` for a public job
+    /// taken over from a scheduler that stopped.
+    context: Option<Arc<RequestContext>>,
+}
+
+/// What starting a job and keeping its caller's ledger needs, shared with the jobs' tasks.
+#[derive(Clone)]
+struct Runner {
+    job_store: Arc<JobStore>,
+    df: Arc<DataFusion>,
+    active_jobs: Arc<RwLock<std::collections::HashMap<String, ActiveJobInfo>>>,
+    /// Jobs this scheduler accepted that wait for a running slot, by job id. A pending job holds
+    /// no task and no query resources.
+    pending: Arc<parking_lot::Mutex<std::collections::HashMap<String, PendingJob>>>,
+    limits: JobLimits,
+}
+
+/// The message a job gets when the scheduler that held it stopped and it cannot be run under
+/// the identity that submitted it.
+const RESUBMIT_MESSAGE: &str = "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.";
+
+/// How long a job may wait between being created and entering its caller's ledger before the
+/// recovery sweep treats it as abandoned by a scheduler that stopped in between.
+const UNADMITTED_GRACE_MS: u64 = 60_000;
+
+impl Runner {
+    /// Starts `job_id` in a task of its own, under `context` when it has one, and releases its
+    /// running slot when it finishes.
+    fn start(&self, job_id: String, owner: String, context: Option<Arc<RequestContext>>) {
+        let runner = self.clone();
+        let span = tracing::info_span!("job_execution", job_id = %job_id);
+        let run = async move {
+            let cancel_token = CancellationToken::new();
+            runner.active_jobs.write().await.insert(
+                job_id.clone(),
+                ActiveJobInfo {
+                    cancel_token: cancel_token.clone(),
+                    query_handle: None,
+                },
+            );
+            async_query_metrics::add_active(ActiveStatus::Running, 1);
+            let result = JobExecutor::execute_job(
+                &runner.job_store,
+                Arc::clone(&runner.df),
+                &job_id,
+                &runner.active_jobs,
+                cancel_token,
+                Start::Submitted,
+            )
+            .await;
+            runner.active_jobs.write().await.remove(&job_id);
+            async_query_metrics::add_active(ActiveStatus::Running, -1);
+            report_job_end(&job_id, result, "Job execution failed");
+            runner.finished(&owner, &job_id).await;
+        }
+        .instrument(span);
+        match context {
+            // Bind the job to the submitting request's context so it runs as the caller's
+            // principal: results-cache namespacing and principal-scoped authz key off it.
+            Some(context) => tokio::spawn(context.scope(run)),
+            None => tokio::spawn(run),
+        };
+    }
+
+    /// Releases `job_id`'s running slot once its state is final, keeps its result in the
+    /// caller's stored-results budget until it expires, and starts the caller's next queued jobs
+    /// this scheduler accepted. A job another scheduler took over keeps its slot.
+    async fn finished(&self, owner: &str, job_id: &str) {
+        let stored = match self.job_store.get_job_ignoring_expiry(job_id).await {
+            Ok(state) if state.is_terminal() => stored_entry(&state),
+            Ok(_) => return,
+            Err(e) => {
+                tracing::debug!(job_id, "Failed to read the finished async query: {e}");
+                None
+            }
+        };
+        let node = self.job_store.node_id().to_string();
+        let limits = self.limits;
+        match self
+            .job_store
+            .modify_ledger(owner, |ledger| {
+                let (changed, promoted) = ledger.finish_and_promote(job_id, stored, &node, limits);
+                (promoted, changed)
+            })
+            .await
+        {
+            Ok(promoted) => self.start_promoted(owner, promoted).await,
+            Err(e) => tracing::warn!(
+                job_id,
+                "Failed to release the running slot of async query '{job_id}': {e}. The recovery sweep releases it."
+            ),
+        }
+    }
+
+    /// Starts the queued jobs of `owner` that this scheduler accepted, while the caller has
+    /// running slots free, in submission order.
+    async fn promote(&self, owner: &str) {
+        let node = self.job_store.node_id().to_string();
+        let limits = self.limits;
+        let promoted = match self
+            .job_store
+            .modify_ledger(owner, |ledger| {
+                let promoted = ledger.promote(&node, limits);
+                let changed = !promoted.is_empty();
+                (promoted, changed)
+            })
+            .await
+        {
+            Ok(promoted) => promoted,
+            Err(e) => {
+                tracing::debug!("Failed to start queued async queries: {e}");
+                return;
+            }
+        };
+        self.start_promoted(owner, promoted).await;
+    }
+
+    /// Starts the queued jobs of `owner` that just got a running slot here.
+    async fn start_promoted(&self, owner: &str, promoted: Vec<String>) {
+        for job_id in promoted {
+            let pending = self.pending.lock().remove(&job_id);
+            async_query_metrics::add_active(ActiveStatus::Pending, -i64::from(pending.is_some()));
+            match pending {
+                Some(job) => self.start(job_id, job.owner, job.context),
+                // Accepted here but no longer known to this process: only a public job can run
+                // without its submitting request.
+                None if owner == super::PUBLIC_JOB_OWNER => {
+                    self.start(job_id, owner.to_string(), None);
+                }
+                None => self.fail_unrunnable(owner, &job_id).await,
+            }
+        }
+    }
+
+    /// Fails a queued job of an authenticated caller that cannot be started under its caller,
+    /// and releases its place.
+    async fn fail_unrunnable(&self, owner: &str, job_id: &str) {
+        tracing::warn!(
+            job_id,
+            "Async query job '{job_id}' was waiting on a scheduler that stopped, and it cannot be run under the identity that submitted it, so it is marked failed; resubmit the query."
+        );
+        if let Err(e) = self
+            .job_store
+            .fail_pending_job(job_id, JobErrorCode::SchedulerUnavailable, RESUBMIT_MESSAGE)
+            .await
+        {
+            tracing::warn!(
+                job_id,
+                "Failed to mark async query job '{job_id}' failed: {e}"
+            );
+        }
+        if let Err(e) = self
+            .job_store
+            .modify_ledger(owner, |ledger| ((), ledger.finish(job_id, None)))
+            .await
+        {
+            tracing::debug!(job_id, "Failed to release the async query's place: {e}");
+        }
+    }
+}
+
+/// The stored-results entry of a finished job: its result bytes until they expire, if it
+/// succeeded.
+fn stored_entry(state: &JobState) -> Option<StoredEntry> {
+    let result = state.result.as_ref()?;
+    Some(StoredEntry {
+        bytes: u64::try_from(result.manifest.total_byte_count).unwrap_or(u64::MAX),
+        expires_at_ms: state.expires_at_ms?,
+    })
+}
+
+/// The result-size limit of a job: the caller's `maximum_size`, or [`MAX_JOB_RESULT_BYTES`]
+/// when it sets none. A larger `maximum_size` is refused rather than lowered.
+fn job_maximum_size(requested: Option<u64>) -> Result<u64> {
+    match requested {
+        None => Ok(MAX_JOB_RESULT_BYTES),
+        Some(requested) if requested > MAX_JOB_RESULT_BYTES => {
+            Err(Error::MaximumSizeAboveLimit { requested })
+        }
+        Some(requested) => Ok(requested),
+    }
 }
 
 impl std::fmt::Debug for JobExecutor {
@@ -145,10 +355,26 @@ impl JobExecutor {
     /// Creates a new job executor.
     #[must_use]
     pub fn new(job_store: Arc<JobStore>, df: Arc<DataFusion>) -> Self {
+        Self::with_limits(job_store, df, JobLimits::default())
+    }
+
+    /// A job executor with per-caller `limits` other than the product limits.
+    #[must_use]
+    pub fn with_limits(job_store: Arc<JobStore>, df: Arc<DataFusion>, limits: JobLimits) -> Self {
+        async_query_metrics::init();
+        let active_jobs = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let runner = Runner {
+            job_store: Arc::clone(&job_store),
+            df: Arc::clone(&df),
+            active_jobs: Arc::clone(&active_jobs),
+            pending: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            limits,
+        };
         Self {
             job_store,
             df,
-            active_jobs: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            active_jobs,
+            runner,
         }
     }
 
@@ -164,57 +390,227 @@ impl JobExecutor {
         // `runtime.query.timeout` bounds every query the runtime's query APIs run, so it bounds
         // an async query too: it is the job's timeout when the caller sets none, and a caller's
         // `timeout_seconds` longer than it is refused before the job is created.
-        let query_timeout = RequestContext::current(AsyncMarker::new().await).query_timeout();
-        request.timeout_seconds = job_timeout_seconds(request.timeout_seconds, query_timeout)?;
-        let state = self.job_store.create_job(request, read_only, owner).await?;
-        let job_id = state.job_id.clone();
+        let context = RequestContext::current(AsyncMarker::new().await);
+        request.timeout_seconds =
+            job_timeout_seconds(request.timeout_seconds, context.query_timeout())?;
+        request.maximum_size = Some(job_maximum_size(request.maximum_size)?);
 
-        // Create cancellation token for this job
-        let cancel_token = CancellationToken::new();
-        {
-            let mut active = self.active_jobs.write().await;
-            active.insert(
-                job_id.clone(),
-                ActiveJobInfo {
-                    cancel_token: cancel_token.clone(),
-                    query_handle: None,
-                },
-            );
+        // The job is created before it enters its caller's ledger, so a ledger entry always has
+        // a job behind it and the recovery sweep can drop an entry whose job is gone.
+        let state = self
+            .job_store
+            .create_job(request, read_only, owner.clone())
+            .await?;
+        let job_id = state.job_id.clone();
+        let node = self.job_store.node_id().to_string();
+        let limits = self.runner.limits;
+        let admission = self
+            .job_store
+            .modify_ledger(&owner, |ledger| {
+                let admission = ledger.admit(&job_id, &node, limits, now_ms_or_zero());
+                let changed = admission.is_ok();
+                (admission, changed)
+            })
+            .await;
+        let admission = match admission {
+            Ok(Ok(admission)) => admission,
+            Ok(Err(refusal)) => {
+                self.discard(&job_id).await;
+                return Err(refusal_error(refusal));
+            }
+            Err(e) => {
+                self.discard(&job_id).await;
+                return Err(e);
+            }
+        };
+
+        match admission {
+            Admission::Run => self.runner.start(job_id, owner, Some(Arc::clone(&context))),
+            Admission::Pending => {
+                self.runner.pending.lock().insert(
+                    job_id,
+                    PendingJob {
+                        owner,
+                        context: Some(context),
+                    },
+                );
+                async_query_metrics::add_active(ActiveStatus::Pending, 1);
+            }
         }
 
-        // Spawn background task to execute the job
-        let job_store = Arc::clone(&self.job_store);
-        let df = Arc::clone(&self.df);
-        let active_jobs = Arc::clone(&self.active_jobs);
-        let job_id_clone = job_id.clone();
-
-        // Bind the job to the submitting request's context so it runs as the
-        // caller's principal — results-cache namespacing and principal-scoped
-        // authz/masking key off it.
-        RequestContext::spawn_current(
-            async move {
-                let result = Self::execute_job(
-                    &job_store,
-                    df,
-                    &job_id_clone,
-                    &active_jobs,
-                    cancel_token,
-                    Start::Submitted,
-                )
-                .await;
-
-                // Remove from active jobs
-                {
-                    let mut active = active_jobs.write().await;
-                    active.remove(&job_id_clone);
-                }
-
-                report_job_end(&job_id_clone, result, "Job execution failed");
-            }
-            .instrument(tracing::info_span!("job_execution", job_id = %job_id)),
-        );
-
         Ok(state)
+    }
+
+    /// Deletes a job that was refused before it could run, best effort.
+    async fn discard(&self, job_id: &str) {
+        if let Err(e) = self.job_store.delete_job(job_id).await {
+            tracing::debug!(job_id, "Failed to delete the refused async query: {e}");
+        }
+    }
+
+    /// Starts the queued jobs this scheduler accepted whose callers have running slots free.
+    /// A slot another scheduler frees is taken here, by the scheduler holding the caller's
+    /// request, so each caller's queued jobs start in submission order across the cluster.
+    pub async fn promote_pending(&self) {
+        let owners: std::collections::BTreeSet<String> = self
+            .runner
+            .pending
+            .lock()
+            .values()
+            .map(|job| job.owner.clone())
+            .collect();
+        for owner in owners {
+            self.runner.promote(&owner).await;
+        }
+    }
+
+    /// Reconciles every caller's ledger with the job states, so a scheduler that stopped
+    /// between writing a job and its ledger leaves nothing behind for long:
+    /// - a slot or place whose job finished or is gone is released, and a succeeded job's
+    ///   result is kept in the budget until it expires;
+    /// - a queued job accepted by a scheduler that is not live is taken over here when its
+    ///   caller is public, and otherwise failed with a request to resubmit, as a running job
+    ///   is; the rest keep their order;
+    /// - a job that never entered its caller's ledger is failed after a grace period.
+    pub async fn reconcile_ledgers(&self, live_nodes: &std::collections::HashSet<String>) {
+        let jobs = match self.job_store.list_jobs(None).await {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::warn!("Failed to list async query jobs to reconcile caller budgets: {e}");
+                return;
+            }
+        };
+        let mut owners: std::collections::BTreeSet<String> = jobs
+            .iter()
+            .map(|job| job.owner_scope().to_string())
+            .collect();
+        match self.job_store.ledger_owners().await {
+            Ok(ledger_owners) => owners.extend(ledger_owners),
+            Err(e) => tracing::debug!("Failed to list caller budgets: {e}"),
+        }
+        let by_id: std::collections::HashMap<&str, &JobState> =
+            jobs.iter().map(|job| (job.job_id.as_str(), job)).collect();
+        let node = self.job_store.node_id().to_string();
+        let now_ms = now_ms_or_zero();
+
+        for owner in owners {
+            let mut orphaned = Vec::new();
+            let mut tracked = std::collections::HashSet::new();
+            let result = self
+                .job_store
+                .modify_ledger(&owner, |ledger| {
+                    orphaned.clear();
+                    tracked.clear();
+                    let mut changed = ledger.prune_expired(now_ms);
+                    let entries: Vec<String> = ledger
+                        .running
+                        .keys()
+                        .cloned()
+                        .chain(ledger.pending.iter().map(|entry| entry.job_id.clone()))
+                        .collect();
+                    for job_id in entries {
+                        match by_id.get(job_id.as_str()) {
+                            Some(job) if !job.is_terminal() => {
+                                tracked.insert(job_id);
+                            }
+                            Some(job) => changed |= ledger.finish(&job_id, stored_entry(job)),
+                            None => changed |= ledger.finish(&job_id, None),
+                        }
+                    }
+                    for job in jobs.iter().filter(|job| job.owner_scope() == owner) {
+                        if let Some(stored) = stored_entry(job)
+                            && stored.expires_at_ms > now_ms
+                            && !ledger.stored.contains_key(&job.job_id)
+                        {
+                            ledger.stored.insert(job.job_id.clone(), stored);
+                            changed = true;
+                        }
+                    }
+                    for entry in &ledger.pending {
+                        if !live_nodes.contains(&entry.node) && entry.node != node {
+                            orphaned.push(entry.job_id.clone());
+                        }
+                    }
+                    if owner == super::PUBLIC_JOB_OWNER {
+                        for job_id in &orphaned {
+                            changed |= ledger.take_over(job_id, &node);
+                        }
+                    }
+                    ((), changed)
+                })
+                .await;
+            if let Err(e) = result {
+                tracing::debug!("Failed to reconcile a caller's async query budget: {e}");
+                continue;
+            }
+
+            for job_id in orphaned {
+                if owner == super::PUBLIC_JOB_OWNER {
+                    tracing::info!(
+                        job_id = %job_id,
+                        "Taking over a queued async query from a scheduler that stopped"
+                    );
+                    if self
+                        .runner
+                        .pending
+                        .lock()
+                        .insert(
+                            job_id,
+                            PendingJob {
+                                owner: owner.clone(),
+                                context: None,
+                            },
+                        )
+                        .is_none()
+                    {
+                        async_query_metrics::add_active(ActiveStatus::Pending, 1);
+                    }
+                } else {
+                    self.runner.fail_unrunnable(&owner, &job_id).await;
+                }
+            }
+
+            // A job that was created but never entered its caller's ledger: its scheduler
+            // stopped in between.
+            for job in jobs.iter().filter(|job| {
+                job.owner_scope() == owner
+                    && job.status == JobStatus::Pending
+                    && !tracked.contains(&job.job_id)
+                    && now_ms.saturating_sub(job.created_at_ms) > UNADMITTED_GRACE_MS
+            }) {
+                if let Err(e) = self
+                    .job_store
+                    .fail_pending_job(
+                        &job.job_id,
+                        JobErrorCode::SchedulerUnavailable,
+                        RESUBMIT_MESSAGE,
+                    )
+                    .await
+                {
+                    tracing::debug!(job_id = %job.job_id, "Failed to fail an abandoned async query: {e}");
+                }
+            }
+            self.runner.promote(&owner).await;
+        }
+
+        // Drop queued jobs this scheduler holds that are no longer in their caller's queue
+        // (cancelled, or failed by another scheduler).
+        let held: Vec<(String, String)> = self
+            .runner
+            .pending
+            .lock()
+            .iter()
+            .map(|(job_id, job)| (job_id.clone(), job.owner.clone()))
+            .collect();
+        for (job_id, owner) in held {
+            let queued = by_id
+                .get(job_id.as_str())
+                .is_some_and(|job| job.status == JobStatus::Pending);
+            if !queued && self.runner.pending.lock().remove(&job_id).is_some() {
+                async_query_metrics::add_active(ActiveStatus::Pending, -1);
+                tracing::debug!(job_id = %job_id, owner = %owner, "Dropped a queued async query that is no longer waiting");
+            }
+        }
     }
 
     /// Re-drives an existing job whose owning scheduler was lost, resuming its
@@ -241,14 +637,20 @@ impl JobExecutor {
             );
             match self
                 .job_store
-                .fail_orphaned_job(
-                    job,
-                    JobErrorCode::SchedulerUnavailable,
-                    "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.",
-                )
+                .fail_orphaned_job(job, JobErrorCode::SchedulerUnavailable, RESUBMIT_MESSAGE)
                 .await
             {
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => {
+                    let owner = job.owner_scope().to_string();
+                    if let Err(e) = self
+                        .job_store
+                        .modify_ledger(&owner, |ledger| ((), ledger.finish(job_id, None)))
+                        .await
+                    {
+                        tracing::debug!(job_id, "Failed to release the async query's slot: {e}");
+                    }
+                    self.runner.promote(&owner).await;
+                }
                 Ok(None) => tracing::debug!(
                     job_id,
                     "Not recovering the job: another scheduler took it over first, or it finished"
@@ -295,10 +697,22 @@ impl JobExecutor {
             return;
         };
 
+        // The job keeps its caller's running slot, now held by this scheduler.
+        let owner = taken.owner_scope().to_string();
+        let node = self.job_store.node_id().to_string();
+        if let Err(e) = self
+            .job_store
+            .modify_ledger(&owner, |ledger| ((), ledger.take_over(job_id, &node)))
+            .await
+        {
+            tracing::debug!(job_id, "Failed to move the async query's slot here: {e}");
+        }
+
         let job_store = Arc::clone(&self.job_store);
         let df = Arc::clone(&self.df);
         let active_jobs = Arc::clone(&self.active_jobs);
         let job_id_owned = job_id.to_string();
+        let runner = self.runner.clone();
 
         tokio::spawn(
             async move {
@@ -318,6 +732,7 @@ impl JobExecutor {
                 }
 
                 report_job_end(&job_id_owned, result, "Job recovery failed");
+                runner.finished(&owner, &job_id_owned).await;
             }
             .instrument(tracing::info_span!("job_recovery", job_id = %job_id)),
         );
@@ -338,7 +753,31 @@ impl JobExecutor {
         }
 
         // Update job state
-        self.job_store.cancel_job(job_id).await
+        let state = self.job_store.cancel_job(job_id).await?;
+
+        // A queued job holds no task to release its place, so it is released here. A running
+        // job releases its slot when its task ends.
+        if self.runner.pending.lock().remove(job_id).is_some() {
+            async_query_metrics::add_active(ActiveStatus::Pending, -1);
+        }
+        let owner = state.owner_scope().to_string();
+        let queued = self
+            .job_store
+            .read_ledger(&owner)
+            .await
+            .is_ok_and(|ledger| ledger.pending.iter().any(|entry| entry.job_id == job_id));
+        if queued
+            && let Err(e) = self
+                .job_store
+                .modify_ledger(&owner, |ledger| ((), ledger.finish(job_id, None)))
+                .await
+        {
+            tracing::debug!(
+                job_id,
+                "Failed to release the cancelled async query's place: {e}"
+            );
+        }
+        Ok(state)
     }
 
     /// Gets the current state of a job submitted by `caller`.
@@ -434,11 +873,30 @@ impl JobExecutor {
     }
 
     /// Deletes, with their result chunks, the jobs whose results expired and the
-    /// jobs that failed or were cancelled at least the result TTL ago.
+    /// jobs that failed or were cancelled at least the result TTL ago, and drops the expired
+    /// results from each caller's stored-results budget.
     ///
-    /// Returns how many were deleted.
+    /// Returns how many jobs were deleted.
     pub async fn cleanup_expired_jobs(&self) -> Result<usize> {
-        self.job_store.cleanup_expired_jobs().await
+        let deleted = self.job_store.cleanup_expired_jobs().await?;
+        let now_ms = now_ms_or_zero();
+        match self.job_store.ledger_owners().await {
+            Ok(owners) => {
+                for owner in owners {
+                    if let Err(e) = self
+                        .job_store
+                        .modify_ledger(&owner, |ledger| ((), ledger.prune_expired(now_ms)))
+                        .await
+                    {
+                        tracing::debug!(
+                            "Failed to drop expired results from a caller's budget: {e}"
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::debug!("Failed to list caller budgets during cleanup: {e}"),
+        }
+        Ok(deleted)
     }
 
     /// Lists every job regardless of who submitted it.
@@ -579,6 +1037,14 @@ impl JobExecutor {
                     Ok(())
                 }
                 JobRun::WriteFailed(e @ Error::JobTakenOver { .. }) => Err(e),
+                JobRun::WriteFailed(e @ Error::MaximumJobSizeExceeded { .. }) => {
+                    tracing::warn!(job_id = %job_id, "{e}");
+                    job_store
+                        .fail_job(job_id, &driver, JobErrorCode::FetchingResultsFailed, e.to_string())
+                        .await?;
+                    job_store.delete_job_chunks(job_id).await;
+                    Ok(())
+                }
                 JobRun::WriteFailed(e) => {
                     job_store
                         .fail_job(job_id, &driver, JobErrorCode::FetchingResultsFailed, e.to_string())
