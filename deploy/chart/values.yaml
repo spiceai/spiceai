@@ -41,6 +41,19 @@ cluster:
 # updateStrategy:
 #   type: RollingUpdate
 
+auth:
+  # api_key: HTTP and Flight require an API key (default).
+  # none:    no API key. Anonymous callers get the runtime's rules for unauthenticated
+  #          callers on a non-loopback listener. Refused with a NodePort or LoadBalancer Service.
+  # Ignored when the Spicepod below configures `runtime.auth` itself.
+  mode: api_key
+  apiKey:
+    # A Secret holding the read-write API key under the entry `api-key`. Empty: on first
+    # install the chart creates `<release>-spiceai-api-key` with a random 32-character key
+    # and keeps it on upgrade and uninstall. Required when the chart is rendered without
+    # access to the cluster (helm template, Argo CD).
+    existingSecret: ''
+
 service:
   # type can be null, ClusterIP, NodePort, or LoadBalancer
   type: null
@@ -52,6 +65,13 @@ service:
   # The selector to use for the service
   # selector:
   #   custom-selector: value
+  # The Service's ports. The default is http (8090) and flight (50051), plus the
+  # cluster port for a scheduler or executor. To scrape metrics through the Service,
+  # list the ports, metrics included:
+  # ports:
+  #   - {port: 8090, name: http}
+  #   - {port: 50051, name: flight}
+  #   - {port: 9090, name: metrics}
 
 serviceAccount:
   # Specifies whether a ServiceAccount should be created

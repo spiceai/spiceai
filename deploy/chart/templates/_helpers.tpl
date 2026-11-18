@@ -179,3 +179,63 @@ periodSeconds: 10
 failureThreshold: 3
 {{- end -}}
 {{- end -}}
+
+{{/*
+The chart's authentication posture:
+  spicepod  the Spicepod configures `runtime.auth` itself, and the chart adds nothing;
+  api_key   the chart supplies an API key from a Secret (the default);
+  none      no API key.
+*/}}
+{{- define "spiceai.authMode" -}}
+{{- $runtime := .Values.spicepod.runtime | default dict -}}
+{{- if hasKey $runtime "auth" -}}
+spicepod
+{{- else -}}
+{{- $mode := (.Values.auth | default dict).mode | default "api_key" -}}
+{{- if not (has $mode (list "api_key" "none")) -}}
+{{- fail (printf "auth.mode is '%s'. Set it to api_key (the default) or none." $mode) -}}
+{{- end -}}
+{{- $mode -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The Secret holding the API key under `api-key`: `auth.apiKey.existingSecret`, or the one the
+chart creates.
+*/}}
+{{- define "spiceai.apiKeySecretName" -}}
+{{- $apiKey := (.Values.auth | default dict).apiKey | default dict -}}
+{{- $apiKey.existingSecret | default (printf "%s-spiceai-api-key" .Release.Name | trunc 63 | trimSuffix "-") -}}
+{{- end -}}
+
+{{/*
+Whether this render can read the cluster: `helm template`, a client-side dry run and Argo CD
+cannot, and `lookup` then answers nothing. Listing Secrets in the release namespace answers a
+list, empty or not, whenever the cluster is readable, including before the namespace exists.
+*/}}
+{{- define "spiceai.clusterReadable" -}}
+{{- if lookup "v1" "Secret" (include "spiceai.namespace" .) "" -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The Spicepod the runtime reads: `spicepod`, plus the `runtime.auth` that reads the chart's API
+key (`auth.mode: api_key`), or the Service's own names in `runtime.allowed_hosts`
+(`auth.mode: none`), so in-cluster clients that address the Service by name are answered.
+*/}}
+{{- define "spiceai.spicepod" -}}
+{{- $pod := deepCopy .Values.spicepod -}}
+{{- $runtime := $pod.runtime | default dict -}}
+{{- $mode := include "spiceai.authMode" . -}}
+{{- if eq $mode "api_key" -}}
+{{- $_ := set $runtime "auth" (dict "api-key" (dict "enabled" true "keys" (list "${ env:SPICE_API_KEY }:rw"))) -}}
+{{- else if eq $mode "none" -}}
+{{- $name := include "spiceai.fullname" . -}}
+{{- $namespace := include "spiceai.namespace" . -}}
+{{- $hosts := concat ($runtime.allowed_hosts | default list) (list $name (printf "%s.%s" $name $namespace) (printf "%s.%s.svc" $name $namespace) (printf "%s.%s.svc.cluster.local" $name $namespace)) -}}
+{{- $_ := set $runtime "allowed_hosts" ($hosts | uniq) -}}
+{{- end -}}
+{{- if $runtime -}}
+{{- $_ := set $pod "runtime" $runtime -}}
+{{- end -}}
+{{- toYaml $pod -}}
+{{- end -}}

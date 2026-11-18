@@ -1,0 +1,3 @@
+auth:
+  apiKey:
+    existingSecret: spice-key

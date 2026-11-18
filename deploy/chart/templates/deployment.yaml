@@ -82,6 +82,21 @@ spec:
           args: {{- . | trim | nindent 12 }}
           {{- end }}
           env:
+            {{- if eq (include "spiceai.authMode" .) "api_key" }}
+            {{- $secret := include "spiceai.apiKeySecretName" . }}
+            {{- if and .Values.auth.apiKey.existingSecret (include "spiceai.clusterReadable" .) }}
+            {{- $existing := lookup "v1" "Secret" (include "spiceai.namespace" .) $secret }}
+            {{- if not (and $existing $existing.data (hasKey $existing.data "api-key")) }}
+            {{- fail (printf "auth.apiKey.existingSecret names '%s', which has no `api-key` entry in namespace '%s'." $secret (include "spiceai.namespace" .)) }}
+            {{- end }}
+            {{- end }}
+            # The API key the rendered Spicepod's `runtime.auth` reads.
+            - name: SPICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: api-key
+            {{- end }}
             {{- if include "spiceai.clusterNode" . }}
             {{- /* Referenced as $(SPICE_POD_IP) by the default --node-advertise-address. */}}
             - name: SPICE_POD_IP
