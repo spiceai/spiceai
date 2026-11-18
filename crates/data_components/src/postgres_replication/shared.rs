@@ -7498,6 +7498,168 @@ mod tests {
         );
     }
 
+    /// The rows a write-back member's envelope builds to, as the `id` text values.
+    fn built_ids(envelope: &ChangeEnvelope) -> Vec<i32> {
+        use arrow::array::{Array, AsArray};
+        let batch = envelope.change_batch().expect("the envelope builds");
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("a change batch carries a data column")
+            .as_struct()
+            .clone();
+        let ids = data
+            .column_by_name("id")
+            .expect("the data struct carries id")
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .clone();
+        (0..ids.len()).map(|row| ids.value(row)).collect()
+    }
+
+    /// #16505: a write at the source reaches the stream *before* the echo of a
+    /// write-back delivery to the same key. Postgres ends with the delivered row
+    /// (its transaction committed last), but the accelerator applied the source's
+    /// write over its own copy, so it no longer holds what the delivery wrote. The
+    /// echo is then the only change that can bring it back in line with the
+    /// source, and dropping it leaves the two holding different rows for good.
+    #[tokio::test]
+    async fn echo_after_a_source_write_to_the_same_key_is_applied() {
+        let delivery_xid = 4242u32;
+        let source_xid = 7777u32;
+        let registry = registry_with_xid(delivery_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        // The direct source write to id 5 commits first ...
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(source_xid),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(built_ids(&foreign), vec![5], "the source write is applied");
+        foreign.commit().await.expect("commit the source write");
+
+        // ... then the write-back delivery to the same key, carrying the row
+        // Postgres now holds.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(
+            built_ids(&echo),
+            vec![5],
+            "the delivery's row for the key the source wrote in between must be applied, or the accelerator keeps the source's older write"
+        );
+    }
+
+    /// The other order needs nothing: the echo of a delivery that reached the
+    /// source before any other write to its keys is dropped, and the later
+    /// source write is applied over it.
+    #[tokio::test]
+    async fn echo_before_a_source_write_is_dropped() {
+        let delivery_xid = 4242u32;
+        let source_xid = 7777u32;
+        let registry = registry_with_xid(delivery_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            200,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(echo.num_rows_hint(), 0, "the echo is dropped");
+        echo.commit().await.expect("commit the ack");
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5")]),
+            300,
+            Some(source_xid),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(built_ids(&foreign), vec![5], "the source write is applied");
+    }
+
+    /// A source write to a *different* key does not make the echo of an unrelated
+    /// delivery necessary: only the keys the source wrote are re-applied.
+    #[tokio::test]
+    async fn echo_keeps_only_the_keys_the_source_wrote() {
+        let delivery_xid = 4242u32;
+        let source_xid = 7777u32;
+        let registry = registry_with_xid(delivery_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "6")]),
+            200,
+            Some(source_xid),
+        )
+        .await;
+        let foreign = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        foreign.commit().await.expect("commit the source write");
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "5"), (100, "6"), (100, "7")]),
+            300,
+            Some(delivery_xid),
+        )
+        .await;
+        let echo = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert_eq!(
+            built_ids(&echo),
+            vec![6],
+            "only the key the source wrote in between is re-applied from the echo"
+        );
+    }
+
     /// A transaction that is *only* the arbitrated member's echo still advances its
     /// watermark via the zero-row ack — a filtered echo is real source progress.
     #[tokio::test]
