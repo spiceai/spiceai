@@ -32,6 +32,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 0 # Fetch all history (including tags) to get the correct cherry-pick commits
 
+      # The inputs are free text from whoever dispatched the run. They reach the
+      # shell only as quoted environment variables, never as `${{ }}` in `run:`
+      # (GitHub pastes that into the script before the shell parses it), and the
+      # script rejects any value that is not a ref name before it runs a command.
+      # `scripts/test_generate_changelog.py` runs this step with hostile inputs.
       - name: Generate Changelog
         shell: bash
         env:
@@ -39,4 +44,4 @@ jobs:
           PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
           RELEASE_BRANCH: ${{ inputs.release_branch }}
         run: |
-          python3 ./scripts/generate_changelog.py $PREVIOUS_RELEASE_TAG $RELEASE_BRANCH
+          python3 ./scripts/generate_changelog.py "$PREVIOUS_RELEASE_TAG" "$RELEASE_BRANCH"
