@@ -632,15 +632,10 @@ mod tests {
     /// Creates a job owned by `owner` directly through the store, so the test
     /// exercises the read path without needing a live distributed executor.
     async fn seed_job(job_store: &JobStore, owner: &str) -> String {
-        seed_job_running(job_store, owner, "SELECT 1").await
-    }
-
-    /// [`seed_job`], for a job that runs `sql`.
-    async fn seed_job_running(job_store: &JobStore, owner: &str, sql: &str) -> String {
         job_store
             .create_job(
                 SubmitQueryRequest {
-                    sql: sql.to_string(),
+                    sql: "SELECT 1".to_string(),
                     parameters: None,
                     timeout_seconds: None,
                     maximum_size: None,
@@ -1011,105 +1006,131 @@ mod tests {
         }
     }
 
-    /// `whoami()`: the request context it runs in, as `<protocol>/<principal>` (`none` when
-    /// there is no principal).
-    #[derive(Debug, PartialEq, Eq, Hash)]
-    struct WhoAmI {
-        signature: datafusion::logical_expr::Signature,
+    /// Object store that records the request context of every write, as
+    /// `<protocol>/<principal>` (`none` when there is no principal), so a test can see whom the
+    /// work that wrote ran as.
+    #[derive(Debug)]
+    struct RecordWriters {
+        inner: Arc<dyn object_store::ObjectStore>,
+        writers: parking_lot::Mutex<Vec<String>>,
     }
 
-    impl datafusion::logical_expr::ScalarUDFImpl for WhoAmI {
-        fn name(&self) -> &'static str {
-            "whoami"
-        }
-
-        fn signature(&self) -> &datafusion::logical_expr::Signature {
-            &self.signature
-        }
-
-        fn return_type(
-            &self,
-            _arg_types: &[arrow::datatypes::DataType],
-        ) -> datafusion::common::Result<arrow::datatypes::DataType> {
-            Ok(arrow::datatypes::DataType::Utf8)
-        }
-
-        fn invoke_with_args(
-            &self,
-            _args: datafusion::logical_expr::ScalarFunctionArgs,
-        ) -> datafusion::common::Result<datafusion::logical_expr::ColumnarValue> {
-            datafusion::common::exec_err!("whoami() runs asynchronously")
+    impl std::fmt::Display for RecordWriters {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordWriters")
         }
     }
 
     #[async_trait::async_trait]
-    impl datafusion::logical_expr::async_udf::AsyncScalarUDFImpl for WhoAmI {
-        async fn invoke_async_with_args(
+    impl object_store::ObjectStore for RecordWriters {
+        async fn get_opts(
             &self,
-            _args: datafusion::logical_expr::ScalarFunctionArgs,
-        ) -> datafusion::common::Result<datafusion::logical_expr::ColumnarValue> {
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
             let context =
                 RequestContext::current(runtime_request_context::AsyncMarker::new().await);
             let principal = AuthRequestContext::auth_principal(context.as_ref())
                 .map_or_else(|| "none".to_string(), |p| p.username().to_string());
-            Ok(datafusion::logical_expr::ColumnarValue::Scalar(
-                datafusion::scalar::ScalarValue::Utf8(Some(format!(
-                    "{}/{principal}",
-                    context.protocol().as_str()
-                ))),
-            ))
+            self.writers
+                .lock()
+                .push(format!("{}/{principal}", context.protocol().as_str()));
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
     /// A job taken over from a lost scheduler runs as its owner did: a caller without
     /// credentials as a client request with no principal, the local operator as itself, and
-    /// neither as the runtime's own work, which may do what a caller cannot.
+    /// neither as the runtime's own work, which may do what a caller cannot. The takeover is
+    /// written by the recovery sweep itself; everything after it runs as the job (here it
+    /// fails, as this test has no scheduler to run it on, and records that it failed).
     #[tokio::test]
     async fn a_resumed_job_runs_as_its_owner() {
-        for (owner, caller, expected) in [
-            (
-                PUBLIC_JOB_OWNER,
-                JobCaller::owning(PUBLIC_JOB_OWNER),
-                "http/none",
-            ),
-            (LOCAL_OPERATOR_ID, JobCaller::local_operator(), "http/local"),
+        for (owner, expected) in [
+            (PUBLIC_JOB_OWNER, "http/none"),
+            (LOCAL_OPERATOR_ID, "http/local"),
         ] {
             let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
             let lost = JobStore::new(Arc::clone(&inner), "test", "node-lost");
-            let job_id = seed_job_running(&lost, owner, "SELECT whoami() AS caller").await;
+            let job_id = seed_job(&lost, owner).await;
             let running = lost
                 .set_job_running(&job_id)
                 .await
                 .expect("the lost scheduler had started the job");
-            let recoverer = Arc::new(JobStore::new(inner, "test", "node-b"));
+            let store = Arc::new(RecordWriters {
+                inner,
+                writers: parking_lot::Mutex::new(Vec::new()),
+            });
+            let recoverer = Arc::new(JobStore::new(
+                Arc::clone(&store) as Arc<dyn object_store::ObjectStore>,
+                "test",
+                "node-b",
+            ));
             let executor = executor(Arc::clone(&recoverer));
-            executor.datafusion().ctx.register_udf(
-                datafusion::logical_expr::async_udf::AsyncScalarUDF::new(Arc::new(WhoAmI {
-                    signature: datafusion::logical_expr::Signature::exact(
-                        vec![],
-                        datafusion::logical_expr::Volatility::Volatile,
-                    ),
-                }))
-                .into_scalar_udf(),
-            );
 
             executor.resume(&running).await;
             let state = wait_until_finished(&recoverer, &job_id).await;
-            assert_eq!(state.status, JobStatus::Succeeded, "{owner}: {state:?}");
-            let batches = executor
-                .get_chunk(&job_id, 0, &caller)
-                .await
-                .expect("the owner reads the result");
-            let callers: Vec<String> = batches
-                .iter()
-                .flat_map(|batch| {
-                    (0..batch.num_rows()).map(|row| {
-                        arrow::util::display::array_value_to_string(batch.column(0), row)
-                            .expect("a string value")
-                    })
-                })
-                .collect();
-            assert_eq!(callers, [expected], "{owner}");
+            assert_eq!(state.status, JobStatus::Failed, "{owner}: {state:?}");
+            let writers = store.writers.lock().clone();
+            assert_eq!(
+                writers.first().map(String::as_str),
+                Some("internal/none"),
+                "{owner}: the takeover is the recovery sweep's own write: {writers:?}"
+            );
+            assert!(
+                writers.len() >= 2,
+                "{owner}: the job wrote after its takeover: {writers:?}"
+            );
+            assert!(
+                writers[1..].iter().all(|writer| writer == expected),
+                "{owner}: every write after the takeover runs as {expected}: {writers:?}"
+            );
         }
     }
 
