@@ -437,7 +437,7 @@ mod tests {
     use spicepod::component::runtime::CorsConfig;
 
     fn allows(policy: &McpOriginPolicy, origin: &str) -> bool {
-        policy.allows(&HeaderValue::from_static(origin))
+        policy.allows(&HeaderValue::from_str(origin).expect("valid Origin header"))
     }
 
     #[test]
