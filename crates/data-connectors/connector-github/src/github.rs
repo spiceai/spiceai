@@ -2279,7 +2279,11 @@ mod log_archive_tests {
     fn an_archive_that_expands_past_the_pool_is_refused() {
         // A couple of megabytes that decompress to 256 MiB, against a 64 MiB pool.
         let archive = archive(256 * MIB);
-        assert!(archive.len() < 4 * MIB, "{} bytes on the wire", archive.len());
+        assert!(
+            archive.len() < 4 * MIB,
+            "{} bytes on the wire",
+            archive.len()
+        );
         let held = reservation(Some(64 * MIB));
         held.try_grow(archive.len()).expect("the archive fits");
 
