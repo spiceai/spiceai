@@ -67,6 +67,8 @@ struct OriginTuple {
     host: String,
     /// The explicit port, else the default port of a known scheme.
     port: Option<u16>,
+    /// rmcp's `:*` suffix: any port matches this entry.
+    any_port: bool,
 }
 
 impl WebOrigin {
@@ -75,9 +77,18 @@ impl WebOrigin {
         if value.eq_ignore_ascii_case("null") {
             return Some(Self::Null);
         }
+        // `:*` is rmcp's any-port suffix, not a valid URI port.
+        let (value, any_port) = match value.strip_suffix(":*") {
+            Some(base) => (base, true),
+            None => (value, false),
+        };
         let uri = http::Uri::try_from(value).ok()?;
         let scheme = uri.scheme_str()?.to_ascii_lowercase();
         let authority = uri.authority()?;
+        // `http://localhost:5173:*` is invalid, same as in rmcp.
+        if any_port && authority.port_u16().is_some() {
+            return None;
+        }
         let port = authority.port_u16().or(match scheme.as_str() {
             "http" | "ws" => Some(80),
             "https" | "wss" => Some(443),
@@ -90,6 +101,7 @@ impl WebOrigin {
                 .to_ascii_lowercase(),
             scheme,
             port,
+            any_port,
         }))
     }
 
@@ -100,7 +112,7 @@ impl WebOrigin {
             (Self::Tuple(allowed), Self::Tuple(origin)) => {
                 allowed.scheme == origin.scheme
                     && allowed.host == origin.host
-                    && (ports == PortMatch::Any || allowed.port == origin.port)
+                    && (ports == PortMatch::Any || allowed.any_port || allowed.port == origin.port)
             }
             _ => false,
         }
@@ -109,10 +121,11 @@ impl WebOrigin {
 
 /// The `Origin` values `/v1/mcp` accepts.
 ///
-/// rmcp treats an allow-list entry without a port as "any port". That suits
-/// the localhost defaults, but an explicit `https://app.example.com` must not
-/// accept `https://app.example.com:8443`, so Spice checks explicit entries
-/// itself. The same policy decides the CORS headers on `/v1/mcp`.
+/// The localhost defaults use rmcp's `:*` any-port suffix. An explicit
+/// `https://app.example.com` must not accept `https://app.example.com:8443`,
+/// so Spice checks explicit entries itself. A user-configured `:*` entry is
+/// honored as any-port; a portless user entry is left as written and keeps
+/// exact-port matching. The same policy decides the CORS headers on `/v1/mcp`.
 #[derive(Debug, Clone)]
 pub(crate) struct McpOriginPolicy {
     allowed: Arc<[WebOrigin]>,
@@ -415,5 +428,57 @@ fn is_priming_event(frame: &Result<Frame<Bytes>, Infallible>) -> bool {
             .data_ref()
             .is_some_and(|data| data.starts_with(b"data: \n") || data.starts_with(b"data:\n")),
         Err(never) => match *never {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spicepod::component::runtime::CorsConfig;
+
+    fn allows(policy: &McpOriginPolicy, origin: &str) -> bool {
+        policy.allows(&HeaderValue::from_static(origin))
+    }
+
+    #[test]
+    fn default_policy_allows_localhost_on_a_non_default_port() {
+        let policy = McpOriginPolicy::new(&CorsConfig::default());
+        assert!(
+            allows(&policy, "http://localhost:5173"),
+            "default MCP origins must still allow a Vite-style localhost port"
+        );
+        assert!(allows(&policy, "http://127.0.0.1:5173"));
+        assert!(allows(&policy, "http://[::1]:5173"));
+        assert!(allows(&policy, "https://localhost:5173"));
+        assert!(
+            !allows(&policy, "https://evil.example"),
+            "default MCP origins must still reject a non-localhost Origin"
+        );
+    }
+
+    #[test]
+    fn explicit_portless_origin_keeps_exact_port_semantics() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["https://app.example.com".to_string()],
+        };
+        let policy = McpOriginPolicy::new(&cors);
+        assert!(allows(&policy, "https://app.example.com"));
+        assert!(allows(&policy, "https://app.example.com:443"));
+        assert!(
+            !allows(&policy, "https://app.example.com:8443"),
+            "a portless user origin must not be rewritten to any-port"
+        );
+    }
+
+    #[test]
+    fn explicit_any_port_suffix_is_honored() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["http://localhost:*".to_string()],
+        };
+        let policy = McpOriginPolicy::new(&cors);
+        assert!(allows(&policy, "http://localhost:5173"));
+        assert!(!allows(&policy, "http://127.0.0.1:5173"));
     }
 }
