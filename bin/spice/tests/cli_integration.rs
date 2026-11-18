@@ -1266,26 +1266,29 @@ mod add {
         assert!(!project.path().join("escaped.txt").exists());
     }
 
-    /// Re-adding never writes through a symbolic link in the install: not a
-    /// linked pod directory, and not a linked directory inside it. Extraction
-    /// never creates links, so one there was put there by someone else.
+    /// `spice add` never writes through a symbolic link on the way to or in
+    /// the install: not a linked `spicepods` directory, not a linked pod
+    /// directory, and not a linked directory inside it. Extraction never
+    /// creates links, so one there was put there by someone else.
     #[cfg(unix)]
     #[test]
     fn test_add_refuses_to_write_through_a_linked_install_directory() {
         for (layout, linked) in [
             ("a directory inside the install", "spicepods/evil/pod/docs"),
             ("the install directory itself", "spicepods/evil/pod"),
+            ("the spicepods directory", "spicepods"),
         ] {
             let project = TempDir::new().expect("create the project");
             let outside = TempDir::new().expect("create the outside directory");
             let pod = project.path().join("spicepods/evil/pod");
-            if linked == "spicepods/evil/pod" {
-                fs::create_dir_all(pod.parent().expect("a parent"))
-                    .expect("create the org directory");
-            } else {
+            let has_earlier_install = linked == "spicepods/evil/pod/docs";
+            if has_earlier_install {
                 fs::create_dir_all(&pod).expect("create the earlier install");
                 fs::write(pod.join("spicepod.yaml"), "earlier\n")
                     .expect("write the earlier install");
+            } else if linked == "spicepods/evil/pod" {
+                fs::create_dir_all(pod.parent().expect("a parent"))
+                    .expect("create the org directory");
             }
             std::os::unix::fs::symlink(outside.path(), project.path().join(linked))
                 .expect("plant the link");
@@ -1311,7 +1314,7 @@ mod add {
                 0,
                 "{layout}: nothing may be written outside the project"
             );
-            if linked != "spicepods/evil/pod" {
+            if has_earlier_install {
                 assert_eq!(
                     fs::read_to_string(pod.join("spicepod.yaml"))
                         .expect("read the earlier install"),

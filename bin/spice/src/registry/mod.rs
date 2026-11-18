@@ -20,6 +20,7 @@ limitations under the License.
 //! - Local file system paths
 //! - Spicerack.org (spicepod registry)
 
+mod install_dir;
 mod local_file;
 mod spicerack;
 

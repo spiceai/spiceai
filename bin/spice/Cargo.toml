@@ -124,6 +124,9 @@ opentelemetry.workspace = true
 [target.'cfg(unix)'.dependencies]
 # `O_NOFOLLOW`/`O_NONBLOCK` for reading credential files without following links.
 libc = "0.2"
+# Directory-descriptor file operations (`openat`, `mkdirat`, `renameat`) so
+# `spice add` never writes a package through a symbolic link.
+rustix = { version = "1.1", features = ["fs"] }
 nix = { version = "0.29", features = ["signal", "process", "term", "user"] }
 
 [build-dependencies]
