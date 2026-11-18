@@ -53,6 +53,7 @@ impl Postgres {
             ports: vec![5432],
             healthcheck: Some(healthcheck("pg_isready -U postgres -h 127.0.0.1")),
             network: None,
+            alias: None,
         })
         .await?;
         Ok(Self { container })

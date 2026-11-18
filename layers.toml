@@ -155,6 +155,7 @@ tier = "foundation"
 
 # Per-crate overrides win over rules.
 [override]
+cayenne-metastore-actions = "foundation"
 cayenne-metastore-model = "foundation"
 # Local model engines register through `llms::register_local_chat_engine!` and only the
 # binaries link them, as with connectors and accelerators: `runtime` must not depend on one.
@@ -233,8 +234,13 @@ connector-postgres-common = "shared-utility"
 # (crates/ libraries whose full normal-dep closure stays within foundation.)
 ansi_colors = "foundation"
 arrow_tools = "foundation"
+aws-identity = "foundation"
+aws-kms-signer = "foundation"
+azure-credential = "foundation"
+azure-key-vault-signer = "foundation"
 aws-sdk-credential-bridge = "foundation"
 backoff = "foundation"
+chrono = "foundation"
 chunking = "foundation"
 # Shared by implementations outside this repo via a git dependency, so its
 # dependency closure has to stay small — foundation is also a budget here.
@@ -260,6 +266,7 @@ libnfs = "foundation"
 llama-cpp = "foundation"
 ns_lookup = "foundation"
 object_store_occ = "foundation"
+object_store_sim = "foundation"
 object_store_spawn = "foundation"
 otel-arrow = "foundation"
 duckdb-oracle = "foundation"

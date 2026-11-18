@@ -9,7 +9,7 @@ on:
         required: false
         type: string
       spicepod_path:
-        description: 'Spicepod file path (relative to repo root, e.g., test/spicepods/streaming/dynamodb/tpch-duckdb.yaml)'
+        description: 'Spicepod file path (relative to repo root, e.g., test/spicepods/streaming/dynamodb-tpch-cayenne.yaml)'
         required: true
         type: string
       queryset:
@@ -58,8 +58,12 @@ on:
         type: string
         default: '500'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-streaming-benchmark:
+    environment: ci
     name: Run DynamoDB streaming benchmark
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 120
@@ -72,7 +76,7 @@ jobs:
           persist-credentials: false
 
       - name: Load secrets from AWS
-        uses: ./.github/actions/load-aws-secrets
+        uses: $/.github/actions/load-aws-secrets
 
       - name: Set spicepod path
         id: set_spicepod_path
@@ -94,15 +98,24 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
-      - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: $/.github/actions/rustfs-credentials
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '7200'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: $/.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
@@ -112,14 +125,15 @@ jobs:
 
       # testoperator generates and checks its data with the DuckDB library installed on the host.
       - name: Set up libduckdb
-        uses: ./.github/actions/setup-libduckdb
+        uses: $/.github/actions/setup-libduckdb
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Run DynamoDB streaming benchmark
         run: |

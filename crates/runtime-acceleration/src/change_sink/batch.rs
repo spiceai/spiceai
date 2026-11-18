@@ -15,12 +15,18 @@ limitations under the License.
 */
 
 //! Logical changes and validated, nonunique replacement scopes.
+//!
+//! Two types describe a write. A producer submits a `ChangeBatch`: one write
+//! of one kind, optionally on a coalescing lane. A backend applies a
+//! `ChangeWrite`: the same data without the lane, after the owner merged the
+//! compatible row writes of one lane into one `RowsWrite`.
 
 use arrow::{
     array::{Array, ArrayRef, RecordBatch, StringArray},
     compute::{cast, kernels::cmp::not_distinct},
     datatypes::{DataType, Schema, SchemaRef},
 };
+use arrow_tools::record_batch::try_cast_to;
 use data_components::cdc;
 use data_components::pk_filter_expr::balanced_binary;
 use std::ops::{ControlFlow, Range};
@@ -33,36 +39,98 @@ use datafusion::{
     logical_expr::{Expr, Operator, col, lit},
 };
 
-/// Input for one ordered submission. Source acknowledgement stays with the producer.
+/// One write that a producer submits. Source acknowledgement stays with the
+/// producer. A row write with a lane can share one backend write with other
+/// writes of the same lane; see `AppendIngress`.
 #[derive(Debug)]
-pub struct ChangeBatch {
-    payload: ChangePayload,
-    append_ingress: Option<Arc<AppendIngress>>,
-}
-
-/// CDC operations or flat row chunks, without source committers.
-#[derive(Debug)]
-pub enum ChangePayload {
-    /// Retains operation codes, before-images, and source timestamps unchanged.
+pub enum ChangeBatch {
+    /// CDC operations from a source, with operation codes, before-images, and
+    /// source timestamps unchanged.
     Cdc(CdcRows),
-    /// All chunks belong to one logical operation, including when the vector is empty.
-    Rows {
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-        /// Each input's scope, covering the chunks in order. Empty for an append
-        /// that imposes no uniqueness on grouping columns.
-        scoped_inputs: Vec<ScopedInput>,
+    /// Flat rows that impose no uniqueness on any grouping columns.
+    Append {
+        rows: Rows,
+        lane: Option<Arc<AppendIngress>>,
+    },
+    /// Rows of one scope that is known to be fresh. Nothing is deleted. The
+    /// backend refuses a unique key that collides with stored rows outside the
+    /// scope, or with another scope in the same write.
+    AppendScoped {
+        rows: ScopedRows,
+        lane: Option<Arc<AppendIngress>>,
+    },
+    /// Delete the stored rows of one scope, then append these rows. This is
+    /// ordered, not atomic: readers can observe the deletion gap, and an append
+    /// failure after the delete can lose the previous rows. An empty replacement
+    /// deletes its scope; it is not a heartbeat.
+    ///
+    /// The caller must establish source completeness, including pagination and
+    /// limits; a finite vector does not prove completeness.
+    Replace {
+        rows: ScopedRows,
+        lane: Option<Arc<AppendIngress>>,
     },
 }
 
-/// One input's scope and exact range of unchanged Arrow chunks. Scoped inputs
-/// cover the chunk vector in order; an empty input retains an empty range.
-/// A fresh input only appends. A replacing input deletes its scope first.
+/// What a backend applies: one write with no lane. The owner builds it from one
+/// `ChangeBatch`, or from several row writes of one lane.
 #[derive(Debug)]
+pub enum ChangeWrite {
+    Cdc(CdcRows),
+    Rows(RowsWrite),
+}
+
+/// Row chunks that all use one schema, including metadata. The chunks belong
+/// to one logical operation, including when the vector is empty.
+#[derive(Debug, Clone)]
+pub struct Rows {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+}
+
+/// Rows that all lie in one scope. The scope and the rows use one schema.
+#[derive(Debug)]
+pub struct ScopedRows {
+    scope: SetKey,
+    rows: Rows,
+}
+
+/// Row writes as a backend applies them. Plain appends and scoped writes never
+/// share one write.
+#[derive(Debug)]
+pub enum RowsWrite {
+    /// One or more plain appends.
+    Unscoped(Rows),
+    /// One or more scoped appends and replacements.
+    Scoped(ScopedWrite),
+}
+
+/// One or more scoped inputs applied as one write: the backend deletes every
+/// replaced scope once, then appends all chunks. The inputs cover the chunks
+/// in order, one range each, and there is at least one input. An input with no
+/// rows keeps an empty range.
+#[derive(Debug, Clone)]
+pub struct ScopedWrite {
+    rows: Rows,
+    inputs: Vec<ScopedInput>,
+}
+
+/// Whether a scoped input deletes its scope before its rows are appended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeKind {
+    /// Only append; the scope is known to hold no stored rows.
+    Fresh,
+    /// Delete the scope's stored rows first.
+    Replace,
+}
+
+/// One input of a `ScopedWrite`: its scope, its exact range of unchanged Arrow
+/// chunks, and its kind.
+#[derive(Debug, Clone)]
 pub struct ScopedInput {
     scope: SetKey,
-    batches: Range<usize>,
-    replaces: bool,
+    chunks: Range<usize>,
+    kind: ScopeKind,
 }
 
 impl ScopedInput {
@@ -73,13 +141,12 @@ impl ScopedInput {
 
     #[must_use]
     pub fn batch_range(&self) -> Range<usize> {
-        self.batches.clone()
+        self.chunks.clone()
     }
 
-    /// Whether the scope's stored rows are deleted before this input's rows are appended.
     #[must_use]
-    pub fn replaces(&self) -> bool {
-        self.replaces
+    pub fn kind(&self) -> ScopeKind {
+        self.kind
     }
 }
 
@@ -127,287 +194,13 @@ impl CdcRows {
             .into_built()
             .map_err(|error| DataFusionError::External(Box::new(error)))
     }
-}
-
-impl ChangeBatch {
-    #[must_use]
-    pub fn cdc(batch: cdc::ChangeBatch) -> Self {
-        Self::cdc_with_ingress(cdc::LazyChangeBatch::ready(batch), None)
-    }
-
-    /// Transfer row ownership without building Arrow arrays on the source task.
-    #[must_use]
-    pub fn cdc_rows(rows: cdc::LazyChangeBatch, ingress: Arc<CdcIngress>) -> Self {
-        Self::cdc_with_ingress(rows, Some(ingress))
-    }
-
-    #[must_use]
-    pub fn cdc_with_ingress(rows: cdc::LazyChangeBatch, ingress: Option<Arc<CdcIngress>>) -> Self {
-        Self {
-            payload: ChangePayload::Cdc(CdcRows { rows, ingress }),
-            append_ingress: None,
-        }
-    }
-
-    /// Append flat rows without imposing uniqueness on any grouping columns.
-    ///
-    /// # Errors
-    /// Returns an error if any batch differs from the supplied schema, including metadata.
-    pub fn append(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<Self> {
-        for batch in &batches {
-            validate_schema(&schema, &batch.schema())?;
-        }
-        Ok(Self {
-            payload: ChangePayload::Rows {
-                schema,
-                batches,
-                scoped_inputs: Vec::new(),
-            },
-            append_ingress: None,
-        })
-    }
-
-    /// Append a proven-fresh logical scope without deleting existing rows.
-    /// Backends must reject conflicting physical keys outside each scope,
-    /// including conflicts between scopes combined into the same append.
-    ///
-    /// # Errors
-    /// Returns an error if schemas differ or any row falls outside the scope.
-    pub fn append_scoped(
-        scope: SetKey,
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Self> {
-        validate_schema(scope.schema(), &schema)?;
-        for batch in &batches {
-            scope.validate_batch(batch)?;
-        }
-        Ok(Self::scoped(scope, schema, batches, false))
-    }
-
-    /// Delete the scope once, then append all chunks as one ordered, non-atomic operation.
-    /// An empty replacement deletes its scope; it is not a heartbeat.
-    ///
-    /// Validates schemas and membership before admission. The caller must establish
-    /// source completeness, including pagination and limits; a finite vector does not
-    /// prove completeness. Readers may observe the deletion gap, and an append failure
-    /// after deletion may leave the previous rows lost.
-    ///
-    /// # Errors
-    /// Returns an error if schemas differ or any row falls outside the scope.
-    pub fn replace_set(
-        scope: SetKey,
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Self> {
-        validate_schema(scope.schema(), &schema)?;
-        for batch in &batches {
-            scope.validate_batch(batch)?;
-        }
-        Ok(Self::scoped(scope, schema, batches, true))
-    }
-
-    fn scoped(scope: SetKey, schema: SchemaRef, batches: Vec<RecordBatch>, replaces: bool) -> Self {
-        let range = 0..batches.len();
-        Self {
-            payload: ChangePayload::Rows {
-                schema,
-                batches,
-                scoped_inputs: vec![ScopedInput {
-                    scope,
-                    batches: range,
-                    replaces,
-                }],
-            },
-            append_ingress: None,
-        }
-    }
-
-    /// Opt rows into this producer lane's bounded owner batching. Clones of one
-    /// writer must retain the same ingress identity. A coalesced burst deletes
-    /// every replaced scope before it appends, so the owner admits a member only
-    /// while no replaced scope in the burst can hold another member's rows.
-    ///
-    /// # Errors
-    /// Returns an error for CDC input.
-    pub fn with_append_ingress(mut self, ingress: Arc<AppendIngress>) -> Result<Self> {
-        if !matches!(self.payload, ChangePayload::Rows { .. }) {
-            return Err(DataFusionError::Plan(
-                "Only Rows writes can join an append batching lane".into(),
-            ));
-        }
-        self.append_ingress = Some(ingress);
-        Ok(self)
-    }
-
-    #[must_use]
-    pub fn append_ingress(&self) -> Option<&Arc<AppendIngress>> {
-        self.append_ingress.as_ref()
-    }
-
-    pub(crate) fn can_merge_append(&self, other: &Self) -> bool {
-        match (&self.payload, &other.payload) {
-            (
-                ChangePayload::Rows {
-                    schema,
-                    batches,
-                    scoped_inputs,
-                },
-                ChangePayload::Rows {
-                    schema: other_schema,
-                    batches: other_batches,
-                    scoped_inputs: other_inputs,
-                },
-            ) => {
-                schema == other_schema
-                    && scoped_inputs.is_empty() == other_inputs.is_empty()
-                    && batches.len().checked_add(other_batches.len()).is_some()
-            }
-            _ => false,
-        }
-    }
-
-    /// Extend only compatible rows. Each scoped range keeps its input identity;
-    /// rows are neither concatenated nor deduplicated here. The caller decides
-    /// whether the members' scopes may share one burst.
-    /// Returns `Break` with the unchanged input at a compatibility boundary.
-    pub(crate) fn merge_append(&mut self, other: Self) -> ControlFlow<Self> {
-        if !self.can_merge_append(&other) {
-            return ControlFlow::Break(other);
-        }
-        if let (
-            ChangePayload::Rows {
-                batches,
-                scoped_inputs,
-                ..
-            },
-            ChangePayload::Rows {
-                batches: other_batches,
-                scoped_inputs: other_inputs,
-                ..
-            },
-        ) = (&mut self.payload, other.payload)
-        {
-            let offset = batches.len();
-            // Preserve the sum of the inputs' charged vector capacities rather
-            // than growing geometrically while the owner retains their claims.
-            batches.reserve_exact(other_batches.len());
-            scoped_inputs.reserve_exact(other_inputs.len());
-            batches.extend(other_batches);
-            scoped_inputs.extend(other_inputs.into_iter().map(|mut input| {
-                input.batches.start += offset;
-                input.batches.end += offset;
-                input
-            }));
-        }
-        ControlFlow::Continue(())
-    }
-
-    #[must_use]
-    pub fn payload(&self) -> &ChangePayload {
-        &self.payload
-    }
-
-    /// Each input's scope and chunk range; empty for CDC and unscoped appends.
-    #[must_use]
-    pub fn scoped_inputs(&self) -> &[ScopedInput] {
-        match &self.payload {
-            ChangePayload::Rows { scoped_inputs, .. } => scoped_inputs,
-            ChangePayload::Cdc(_) => &[],
-        }
-    }
-
-    /// Each scoped input as a batch of its own, in order, sharing the Arrow
-    /// buffers. `None` for CDC input and unscoped appends, which record no members.
-    pub(crate) fn scoped_members(&self) -> Option<Vec<Self>> {
-        let ChangePayload::Rows {
-            schema,
-            batches,
-            scoped_inputs,
-        } = &self.payload
-        else {
-            return None;
-        };
-        if scoped_inputs.is_empty() {
-            return None;
-        }
-        Some(
-            scoped_inputs
-                .iter()
-                .map(|input| Self {
-                    payload: ChangePayload::Rows {
-                        schema: Arc::clone(schema),
-                        batches: batches[input.batches.clone()].to_vec(),
-                        scoped_inputs: vec![ScopedInput {
-                            scope: input.scope.clone(),
-                            batches: 0..input.batches.len(),
-                            replaces: input.replaces,
-                        }],
-                    },
-                    append_ingress: None,
-                })
-                .collect(),
-        )
-    }
-
-    /// One batch holding every member in order, sharing the Arrow buffers.
-    /// `None` when there are no members.
-    pub(crate) fn coalesce_members(members: &[Self]) -> Option<Self> {
-        let (first, rest) = members.split_first()?;
-        let ChangePayload::Rows {
-            schema,
-            batches,
-            scoped_inputs,
-        } = &first.payload
-        else {
-            return None;
-        };
-        let mut merged = Self {
-            payload: ChangePayload::Rows {
-                schema: Arc::clone(schema),
-                batches: batches.clone(),
-                scoped_inputs: scoped_inputs
-                    .iter()
-                    .map(|input| ScopedInput {
-                        scope: input.scope.clone(),
-                        batches: input.batches.clone(),
-                        replaces: input.replaces,
-                    })
-                    .collect(),
-            },
-            append_ingress: None,
-        };
-        for member in rest {
-            let copy = Self::coalesce_members(std::slice::from_ref(member))?;
-            if merged.merge_append(copy).is_break() {
-                return None;
-            }
-        }
-        Some(merged)
-    }
-
-    /// Scopes whose stored rows are deleted before this batch's rows are appended.
-    pub fn replaced_scopes(&self) -> impl Iterator<Item = &SetKey> {
-        self.scoped_inputs()
-            .iter()
-            .filter(|input| input.replaces)
-            .map(|input| &input.scope)
-    }
-
-    #[must_use]
-    pub fn cdc_batch(&self) -> Option<&cdc::ChangeBatch> {
-        match &self.payload {
-            ChangePayload::Cdc(rows) => rows.as_built(),
-            ChangePayload::Rows { .. } => None,
-        }
-    }
 
     /// Whether the operations permit the native upsert-only burst pipeline.
     /// Primary-key changes must include an explicit delete operation; before-images
     /// are not additional operations. Target and schema barriers remain separate.
     #[must_use]
     pub fn permits_pipelined_append(&self) -> bool {
-        let Some(batch) = self.cdc_batch() else {
+        let Some(batch) = self.as_built() else {
             return false;
         };
         if batch.is_heartbeat() || batch.rebuild_from_this_batch() {
@@ -425,58 +218,491 @@ impl ChangeBatch {
             .all(|operation| matches!(operation, Some("c" | "r" | "u")))
     }
 
-    /// Scopes stay attached to their chunk ranges when transforming the payload.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        self.rows.encoded_len()
+    }
+}
+
+impl Rows {
+    /// Rows for one logical operation.
+    ///
+    /// # Errors
+    /// Returns an error if any batch differs from the supplied schema, including metadata.
+    pub fn try_new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<Self> {
+        for batch in &batches {
+            validate_schema(&schema, &batch.schema())?;
+        }
+        Ok(Self { schema, batches })
+    }
+
     #[must_use]
-    pub fn into_payload(self) -> ChangePayload {
-        self.payload
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    #[must_use]
+    pub fn batches(&self) -> &[RecordBatch] {
+        &self.batches
+    }
+
+    #[must_use]
+    pub fn num_rows(&self) -> usize {
+        self.batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .fold(0, usize::saturating_add)
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (SchemaRef, Vec<RecordBatch>) {
+        (self.schema, self.batches)
+    }
+
+    /// Cast every chunk to `target`. The rows then use `target` as their schema.
+    ///
+    /// # Errors
+    /// Returns an error if a chunk cannot be cast.
+    pub fn cast_to(self, target: &SchemaRef) -> Result<Self> {
+        let batches = self
+            .batches
+            .into_iter()
+            .map(|batch| try_cast_to(batch, Arc::clone(target)).map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            schema: Arc::clone(target),
+            batches,
+        })
+    }
+
+    fn accepts(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self
+                .batches
+                .len()
+                .checked_add(other.batches.len())
+                .is_some()
+    }
+
+    /// Append `other`'s chunks and return their range in the merged vector.
+    fn extend(&mut self, other: Self) -> Range<usize> {
+        let start = self.batches.len();
+        // Preserve the sum of the inputs' charged vector capacities rather
+        // than growing geometrically while the owner retains their claims.
+        self.batches.reserve_exact(other.batches.len());
+        self.batches.extend(other.batches);
+        start..self.batches.len()
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        let metadata = self
+            .batches
+            .capacity()
+            .saturating_mul(std::mem::size_of::<RecordBatch>());
+        self.batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .fold(metadata, usize::saturating_add)
+    }
+}
+
+impl ScopedRows {
+    /// Rows for one scope.
+    ///
+    /// # Errors
+    /// Returns an error if schemas differ or any row falls outside the scope.
+    pub fn try_new(scope: SetKey, schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<Self> {
+        validate_schema(scope.schema(), &schema)?;
+        for batch in &batches {
+            scope.validate_batch(batch)?;
+        }
+        Ok(Self {
+            scope,
+            rows: Rows { schema, batches },
+        })
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> &SetKey {
+        &self.scope
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> &Rows {
+        &self.rows
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.rows
+            .estimated_bytes()
+            .saturating_add(std::mem::size_of::<ScopedInput>())
+            .saturating_add(self.scope.estimated_bytes())
+    }
+}
+
+impl ScopedWrite {
+    fn single(rows: ScopedRows, kind: ScopeKind) -> Self {
+        let chunks = 0..rows.rows.batches.len();
+        Self {
+            rows: rows.rows,
+            inputs: vec![ScopedInput {
+                scope: rows.scope,
+                chunks,
+                kind,
+            }],
+        }
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> &Rows {
+        &self.rows
+    }
+
+    /// The inputs in arrival order. Never empty.
+    #[must_use]
+    pub fn inputs(&self) -> &[ScopedInput] {
+        &self.inputs
+    }
+
+    /// Scopes whose stored rows are deleted before the rows are appended.
+    pub fn replaced_scopes(&self) -> impl Iterator<Item = &SetKey> {
+        self.inputs
+            .iter()
+            .filter(|input| input.kind == ScopeKind::Replace)
+            .map(|input| &input.scope)
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Rows, Vec<ScopedInput>) {
+        (self.rows, self.inputs)
+    }
+
+    /// Cast every chunk to `target`. Scopes keep their schema; a backend
+    /// resolves them against its target.
+    ///
+    /// # Errors
+    /// Returns an error if a chunk cannot be cast.
+    pub fn cast_to(self, target: &SchemaRef) -> Result<Self> {
+        Ok(Self {
+            rows: self.rows.cast_to(target)?,
+            inputs: self.inputs,
+        })
+    }
+
+    /// Append `other`'s inputs after this write's inputs. Each range keeps its
+    /// input identity; rows are neither concatenated nor deduplicated here. The
+    /// caller checks `Rows::accepts` and decides whether the scopes may share
+    /// one write.
+    fn extend(&mut self, other: Self) {
+        let offset = self.rows.extend(other.rows).start;
+        self.inputs.reserve_exact(other.inputs.len());
+        self.inputs
+            .extend(other.inputs.into_iter().map(|mut input| {
+                input.chunks.start += offset;
+                input.chunks.end += offset;
+                input
+            }));
+    }
+
+    /// Each input as a write of its own, in order, sharing the Arrow buffers.
+    pub(crate) fn members(&self) -> Vec<Self> {
+        self.inputs
+            .iter()
+            .map(|input| Self {
+                rows: Rows {
+                    schema: Arc::clone(&self.rows.schema),
+                    batches: self.rows.batches[input.chunks.clone()].to_vec(),
+                },
+                inputs: vec![ScopedInput {
+                    scope: input.scope.clone(),
+                    chunks: 0..input.chunks.len(),
+                    kind: input.kind,
+                }],
+            })
+            .collect()
+    }
+
+    /// One write holding every member in order, sharing the Arrow buffers.
+    /// `None` when there are no members or their schemas differ.
+    pub(crate) fn coalesce(members: &[Self]) -> Option<Self> {
+        let (first, rest) = members.split_first()?;
+        let mut merged = first.clone();
+        for member in rest {
+            if !merged.rows.accepts(&member.rows) {
+                return None;
+            }
+            merged.extend(member.clone());
+        }
+        Some(merged)
+    }
+}
+
+impl RowsWrite {
+    #[must_use]
+    pub fn rows(&self) -> &Rows {
+        match self {
+            Self::Unscoped(rows) => rows,
+            Self::Scoped(write) => &write.rows,
+        }
+    }
+
+    #[must_use]
+    pub fn num_rows(&self) -> usize {
+        self.rows().num_rows()
+    }
+
+    /// Each scoped input in order; empty for plain appends.
+    #[must_use]
+    pub fn scoped_inputs(&self) -> &[ScopedInput] {
+        match self {
+            Self::Unscoped(_) => &[],
+            Self::Scoped(write) => &write.inputs,
+        }
+    }
+
+    /// Scopes whose stored rows are deleted before the rows are appended.
+    pub fn replaced_scopes(&self) -> impl Iterator<Item = &SetKey> {
+        self.scoped_inputs()
+            .iter()
+            .filter(|input| input.kind == ScopeKind::Replace)
+            .map(|input| &input.scope)
+    }
+
+    /// Cast every chunk to `target`.
+    ///
+    /// # Errors
+    /// Returns an error if a chunk cannot be cast.
+    pub fn cast_to(self, target: &SchemaRef) -> Result<Self> {
+        match self {
+            Self::Unscoped(rows) => rows.cast_to(target).map(Self::Unscoped),
+            Self::Scoped(write) => write.cast_to(target).map(Self::Scoped),
+        }
+    }
+
+    /// Whether `next` can join this write: the same row kind and schema. Lane,
+    /// limits, and scope overlap are the burst's decision.
+    pub(crate) fn accepts(&self, next: &ChangeBatch) -> bool {
+        match (self, next) {
+            (Self::Unscoped(rows), ChangeBatch::Append { rows: next, .. }) => rows.accepts(next),
+            (
+                Self::Scoped(write),
+                ChangeBatch::AppendScoped { rows: next, .. }
+                | ChangeBatch::Replace { rows: next, .. },
+            ) => write.rows.accepts(&next.rows),
+            _ => false,
+        }
+    }
+
+    /// Extend this write with `next`. Returns `Break` with the unchanged input
+    /// when it cannot join.
+    pub(crate) fn merge(&mut self, next: ChangeBatch) -> ControlFlow<ChangeBatch> {
+        if !self.accepts(&next) {
+            return ControlFlow::Break(next);
+        }
+        match (self, next) {
+            (Self::Unscoped(rows), ChangeBatch::Append { rows: next, .. }) => {
+                rows.extend(next);
+            }
+            (Self::Scoped(write), ChangeBatch::AppendScoped { rows: next, .. }) => {
+                write.extend(ScopedWrite::single(next, ScopeKind::Fresh));
+            }
+            (Self::Scoped(write), ChangeBatch::Replace { rows: next, .. }) => {
+                write.extend(ScopedWrite::single(next, ScopeKind::Replace));
+            }
+            (_, next) => return ControlFlow::Break(next),
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl From<ScopedWrite> for RowsWrite {
+    fn from(write: ScopedWrite) -> Self {
+        Self::Scoped(write)
+    }
+}
+
+impl From<RowsWrite> for ChangeWrite {
+    fn from(write: RowsWrite) -> Self {
+        Self::Rows(write)
+    }
+}
+
+impl From<ChangeBatch> for ChangeWrite {
+    fn from(batch: ChangeBatch) -> Self {
+        batch.into_parts().0
+    }
+}
+
+impl ChangeWrite {
+    /// Whether this write may stage while the previous write still finalizes.
+    /// Only decoded, upsert-only CDC qualifies.
+    #[must_use]
+    pub fn permits_pipelined_append(&self) -> bool {
+        matches!(self, Self::Cdc(rows) if rows.permits_pipelined_append())
+    }
+
+    /// Scopes whose stored rows are deleted before the rows are appended.
+    pub fn replaced_scopes(&self) -> impl Iterator<Item = &SetKey> {
+        let inputs: &[ScopedInput] = match self {
+            Self::Cdc(_) => &[],
+            Self::Rows(write) => write.scoped_inputs(),
+        };
+        inputs
+            .iter()
+            .filter(|input| input.kind == ScopeKind::Replace)
+            .map(|input| &input.scope)
+    }
+}
+
+impl ChangeBatch {
+    #[must_use]
+    pub fn cdc(batch: cdc::ChangeBatch) -> Self {
+        Self::cdc_with_ingress(cdc::LazyChangeBatch::ready(batch), None)
+    }
+
+    /// Transfer row ownership without building Arrow arrays on the source task.
+    #[must_use]
+    pub fn cdc_rows(rows: cdc::LazyChangeBatch, ingress: Arc<CdcIngress>) -> Self {
+        Self::cdc_with_ingress(rows, Some(ingress))
+    }
+
+    #[must_use]
+    pub fn cdc_with_ingress(rows: cdc::LazyChangeBatch, ingress: Option<Arc<CdcIngress>>) -> Self {
+        Self::Cdc(CdcRows { rows, ingress })
+    }
+
+    /// Append flat rows without a lane. See `ChangeBatch::Append`.
+    ///
+    /// # Errors
+    /// Returns an error if any batch differs from the supplied schema, including metadata.
+    pub fn append(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<Self> {
+        Ok(Self::Append {
+            rows: Rows::try_new(schema, batches)?,
+            lane: None,
+        })
+    }
+
+    /// Append a fresh scope without a lane. See `ChangeBatch::AppendScoped`.
+    ///
+    /// # Errors
+    /// Returns an error if schemas differ or any row falls outside the scope.
+    pub fn append_scoped(
+        scope: SetKey,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Self> {
+        Ok(Self::AppendScoped {
+            rows: ScopedRows::try_new(scope, schema, batches)?,
+            lane: None,
+        })
+    }
+
+    /// Replace a scope without a lane. See `ChangeBatch::Replace`.
+    ///
+    /// # Errors
+    /// Returns an error if schemas differ or any row falls outside the scope.
+    pub fn replace_set(
+        scope: SetKey,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Self> {
+        Ok(Self::Replace {
+            rows: ScopedRows::try_new(scope, schema, batches)?,
+            lane: None,
+        })
+    }
+
+    /// The coalescing lane of a row write. CDC input coalesces by its `CdcIngress`.
+    #[must_use]
+    pub fn append_ingress(&self) -> Option<&Arc<AppendIngress>> {
+        match self {
+            Self::Cdc(_) => None,
+            Self::Append { lane, .. }
+            | Self::AppendScoped { lane, .. }
+            | Self::Replace { lane, .. } => lane.as_ref(),
+        }
+    }
+
+    /// The scope and kind of a scoped write; `None` for CDC and plain appends.
+    #[must_use]
+    pub fn scoped_input(&self) -> Option<(&SetKey, ScopeKind)> {
+        match self {
+            Self::Cdc(_) | Self::Append { .. } => None,
+            Self::AppendScoped { rows, .. } => Some((&rows.scope, ScopeKind::Fresh)),
+            Self::Replace { rows, .. } => Some((&rows.scope, ScopeKind::Replace)),
+        }
+    }
+
+    #[must_use]
+    pub fn cdc_batch(&self) -> Option<&cdc::ChangeBatch> {
+        match self {
+            Self::Cdc(rows) => rows.as_built(),
+            _ => None,
+        }
+    }
+
+    /// Separate the write a backend applies from the coalescing lane.
+    #[must_use]
+    pub fn into_parts(self) -> (ChangeWrite, Option<Arc<AppendIngress>>) {
+        match self {
+            Self::Cdc(rows) => (ChangeWrite::Cdc(rows), None),
+            Self::Append { rows, lane } => (ChangeWrite::Rows(RowsWrite::Unscoped(rows)), lane),
+            Self::AppendScoped { rows, lane } => (
+                ChangeWrite::Rows(ScopedWrite::single(rows, ScopeKind::Fresh).into()),
+                lane,
+            ),
+            Self::Replace { rows, lane } => (
+                ChangeWrite::Rows(ScopedWrite::single(rows, ScopeKind::Replace).into()),
+                lane,
+            ),
+        }
+    }
+
+    /// Separate a row write from its lane. Returns `Break` with the unchanged
+    /// input when it is CDC or has no lane.
+    pub(crate) fn into_laned_rows(self) -> ControlFlow<Self, (RowsWrite, Arc<AppendIngress>)> {
+        match self {
+            Self::Append {
+                rows,
+                lane: Some(lane),
+            } => ControlFlow::Continue((RowsWrite::Unscoped(rows), lane)),
+            Self::AppendScoped {
+                rows,
+                lane: Some(lane),
+            } => ControlFlow::Continue((ScopedWrite::single(rows, ScopeKind::Fresh).into(), lane)),
+            Self::Replace {
+                rows,
+                lane: Some(lane),
+            } => {
+                ControlFlow::Continue((ScopedWrite::single(rows, ScopeKind::Replace).into(), lane))
+            }
+            other => ControlFlow::Break(other),
+        }
     }
 
     /// Estimate retained Arrow buffers and scope values, not a bound on process memory.
     /// Shared buffers can be counted more than once.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        match &self.payload {
-            ChangePayload::Cdc(rows) => rows.rows.encoded_len(),
-            ChangePayload::Rows {
-                batches,
-                scoped_inputs,
-                ..
-            } => {
-                let metadata = batches
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<RecordBatch>())
-                    .saturating_add(
-                        scoped_inputs
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<ScopedInput>()),
-                    );
-                let scoped = scoped_inputs
-                    .iter()
-                    .map(|input| input.scope.estimated_bytes())
-                    .fold(metadata, usize::saturating_add);
-                batches
-                    .iter()
-                    .map(RecordBatch::get_array_memory_size)
-                    .fold(scoped, usize::saturating_add)
-            }
+        match self {
+            Self::Cdc(rows) => rows.estimated_bytes(),
+            Self::Append { rows, .. } => rows.estimated_bytes(),
+            Self::AppendScoped { rows, .. } | Self::Replace { rows, .. } => rows.estimated_bytes(),
         }
     }
 
     #[must_use]
     pub fn num_rows(&self) -> usize {
-        match &self.payload {
-            ChangePayload::Cdc(rows) => rows.rows.num_rows_hint(),
-            ChangePayload::Rows { batches, .. } => batches
-                .iter()
-                .map(RecordBatch::num_rows)
-                .fold(0, usize::saturating_add),
+        match self {
+            Self::Cdc(rows) => rows.rows.num_rows_hint(),
+            Self::Append { rows, .. } => rows.num_rows(),
+            Self::AppendScoped { rows, .. } | Self::Replace { rows, .. } => rows.rows.num_rows(),
         }
     }
 
     /// Only native CDC control input can be a heartbeat, not an empty row payload.
     #[must_use]
     pub fn is_heartbeat(&self) -> bool {
-        matches!(&self.payload, ChangePayload::Cdc(rows) if rows.rows.is_heartbeat())
+        matches!(self, Self::Cdc(rows) if rows.rows.is_heartbeat())
     }
 }
 

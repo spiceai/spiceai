@@ -8,7 +8,7 @@ expression: body
 - Quote column names that contain capitals or special characters with double quotes.
 - For tables with schemas and catalogs, use "catalog"."schema"."table", not "catalog.schema.table".
 - Use table and column descriptions, primary keys, foreign keys, unique constraints, and indexes when choosing joins and filters.
-- Apache DataFusion version: 55.2.0.
+- Apache DataFusion version: 55.3.0.
 - Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod.
 
 ## Datasets
@@ -31,7 +31,7 @@ expression: body
 - Indexes:
     - `customer_id`: `customer_id` (enabled, spicepod.acceleration.indexes)
 - Search indexes:
-    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `duckdb_vector_index`. Row id: `order_id`.
+    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `s3_vectors`. Row id: `order_id`.
     - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
 
 ## SQL Functions

@@ -1706,6 +1706,23 @@ mod coding_agents {
     /// bound on something that normally takes milliseconds.
     const BUDGET: Duration = Duration::from_secs(30);
 
+    /// How long `spice orca` waits for Orca to answer before it checks Orca's
+    /// agent commands (`ANSWER_BUDGET` in `commands/coding_agent/orca.rs`). The
+    /// stub Orca starts two Python processes before it answers, which on a
+    /// loaded machine takes longer than [`BUDGET`].
+    const ORCA_ANSWER_BUDGET: Duration = Duration::from_mins(3);
+
+    /// How long `spice orca` gives `orca repo add` once Orca has answered
+    /// (`PROJECT_TIMEOUT` in `commands/coding_agent/orca.rs`).
+    const ORCA_PROJECT_BUDGET: Duration = Duration::from_mins(1);
+
+    /// How long a session waits for the runtime it started to answer `/health`
+    /// before it starts its agent (`HEALTH_BUDGET` in
+    /// `commands/coding_agent/runtime.rs`). The stub runtime is a Python
+    /// process, which on a loaded machine can take longer than [`BUDGET`] to
+    /// start serving.
+    const RUNTIME_HEALTH_BUDGET: Duration = Duration::from_mins(2);
+
     /// A runtime the user started, answering `/health` and `/v1/models` from a
     /// thread of this process. Returns its endpoint.
     fn user_runtime() -> String {
@@ -2113,10 +2130,26 @@ Server((host, int(port)), Handler).serve_forever()
         );
     }
 
-    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + BUDGET;
+    fn wait_for(what: &str, done: impl FnMut() -> bool) {
+        wait_within(BUDGET, what, done);
+    }
+
+    /// Waits for the first session's agent, which starts only once the runtime
+    /// that session launched answers `/health`.
+    fn wait_for_first_agent(lab: &Lab) {
+        wait_within(RUNTIME_HEALTH_BUDGET + BUDGET, "the first agent", || {
+            lab.agent_started("first")
+        });
+    }
+
+    fn wait_within(budget: Duration, what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + budget;
         while !done() {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting {}s for {what}",
+                budget.as_secs()
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -2272,7 +2305,7 @@ Server((host, int(port)), Handler).serve_forever()
         let endpoint = format!("http://{address}");
 
         let mut first = lab.session("first", &endpoint);
-        wait_for("the first agent", || lab.agent_started("first"));
+        wait_for_first_agent(&lab);
         assert!(serving(&address), "the first session started the runtime");
         let mut second = lab.session("second", &endpoint);
         wait_for("the second agent", || lab.agent_started("second"));
@@ -2307,7 +2340,7 @@ Server((host, int(port)), Handler).serve_forever()
         let port = address.rsplit(':').next().expect("a port");
 
         let mut first = lab.session("first", &format!("http://{address}"));
-        wait_for("the first agent", || lab.agent_started("first"));
+        wait_for_first_agent(&lab);
         let mut second = lab.session("second", &format!("http://localhost:{port}"));
         wait_for("the second agent", || lab.agent_started("second"));
 
@@ -2339,7 +2372,7 @@ Server((host, int(port)), Handler).serve_forever()
         let endpoint = format!("http://{address}");
 
         let mut first = lab.session("first", &endpoint);
-        wait_for("the first agent", || lab.agent_started("first"));
+        wait_for_first_agent(&lab);
         let mut second = lab.session("second", &format!("http://[::1]:{port}"));
         let status = second.wait();
         let output = lab.output("second");
@@ -2586,22 +2619,34 @@ if args[:1] == ["status"]:
             "Orca runs Codex CLI with the command 'codex', so Codex CLI sessions in Orca do not use Spice. Set Codex CLI's command in Orca's Settings, under Agents, to `'{}/.spice/orca/bin/spice-agent' codex`.",
             lab.home.display()
         );
-        wait_for("the warning about Codex CLI's command", || {
-            output().contains(&codex_warning)
-        });
+        // `spice orca` starts Orca, and with it `ANSWER_BUDGET`, only once the
+        // runtime it launched answers `/health` and its models are ready, so
+        // the warning can come as late as both waits together, plus `BUDGET`
+        // for the steps between them.
+        wait_within(
+            RUNTIME_HEALTH_BUDGET + ORCA_ANSWER_BUDGET + BUDGET,
+            "the warning about Codex CLI's command",
+            || output().contains(&codex_warning),
+        );
         let project = fs::canonicalize(&lab.app).expect("resolve the project");
-        wait_for("the project to be added", || {
-            orca_calls(root).iter().any(|call| {
-                call["args"]
-                    == serde_json::json!([
-                        "repo",
-                        "add",
-                        "--path",
-                        project.display().to_string(),
-                        "--json"
-                    ])
-            })
-        });
+        // `PROJECT_TIMEOUT` starts after `git rev-parse` finds the project, and
+        // `BUDGET` covers that lookup.
+        wait_within(
+            ORCA_PROJECT_BUDGET + BUDGET,
+            "the project to be added",
+            || {
+                orca_calls(root).iter().any(|call| {
+                    call["args"]
+                        == serde_json::json!([
+                            "repo",
+                            "add",
+                            "--path",
+                            project.display().to_string(),
+                            "--json"
+                        ])
+                })
+            },
+        );
         let profile = lab.home.join(".spice/orca/profile");
         let calls = orca_calls(root);
         assert_eq!(

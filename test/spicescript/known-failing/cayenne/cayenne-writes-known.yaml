@@ -1,8 +1,8 @@
 # Known failing (#15540): in a partitioned Cayenne table with a primary key, a row whose
 # key moves to another partition (an insert, or a source UPDATE of the
 # partition column arriving through change capture) leaves its old version
-# behind, so the key has two rows; and without a primary key, a DELETE whose
-# filter is arithmetic, or that deletes every row, is refused.
+# behind, so the key has two rows; and without a primary key, a DELETE that
+# deletes every row is refused.
 name: cayenne-writes-known
 description: >
   SQL writes to a Cayenne acceleration (`access: read_write`, `write_mode:

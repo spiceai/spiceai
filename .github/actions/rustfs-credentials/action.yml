@@ -1,0 +1,104 @@
+name: RustFS credentials
+description: >-
+  Exchanges the job's GitHub Actions OIDC token for short-lived RustFS credentials (STS
+  AssumeRoleWithWebIdentity). The job needs `permissions: id-token: write`, and RustFS must have a
+  policy for the repository. Pull requests from forks get no OIDC token, so this step fails there.
+
+inputs:
+  endpoint:
+    description: RustFS S3 endpoint.
+    required: true
+  audience:
+    description: OIDC token audience RustFS trusts.
+    required: false
+    default: rustfs-dev-teraswitch
+  duration-seconds:
+    description: Credential lifetime in seconds, from 900 to 43200. It must cover the job's last RustFS request.
+    required: false
+    default: '3600'
+  export-env:
+    description: >-
+      'true' exports AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN to the steps
+      that follow. Use 'false' in a job that also uses other AWS credentials, and pass the outputs
+      where they are needed.
+    required: false
+    default: 'true'
+
+outputs:
+  access-key-id:
+    description: Access key ID (masked).
+    value: ${{ steps.sts.outputs.access-key-id }}
+  secret-access-key:
+    description: Secret access key (masked).
+    value: ${{ steps.sts.outputs.secret-access-key }}
+  session-token:
+    description: Session token (masked).
+    value: ${{ steps.sts.outputs.session-token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Exchange the OIDC token for RustFS credentials
+      id: sts
+      shell: bash
+      env:
+        ENDPOINT: ${{ inputs.endpoint }}
+        AUDIENCE: ${{ inputs.audience }}
+        DURATION_SECONDS: ${{ inputs.duration-seconds }}
+        EXPORT_ENV: ${{ inputs.export-env }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+          echo "::error::No GitHub OIDC token is available. The job needs 'permissions: id-token: write'; pull requests from forks never get one."
+          exit 1
+        fi
+
+        # Bearer tokens go to curl on stdin, so neither is ever on a command line.
+        oidc_token="$(printf 'Authorization: Bearer %s\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" |
+          curl -sSf --retry 3 -H @- --get --data-urlencode "audience=${AUDIENCE}" "${ACTIONS_ID_TOKEN_REQUEST_URL}" |
+          jq -r '.value // empty')"
+        if [[ -z "${oidc_token}" ]]; then
+          echo "::error::GitHub returned no OIDC token."
+          exit 1
+        fi
+        echo "::add-mask::${oidc_token}"
+
+        response="$(printf '%s' "${oidc_token}" | curl -sS --retry 3 -X POST "${ENDPOINT%/}/" \
+          -H 'Content-Type: application/x-www-form-urlencoded' \
+          --data-urlencode 'Action=AssumeRoleWithWebIdentity' \
+          --data-urlencode 'Version=2011-06-15' \
+          --data-urlencode "DurationSeconds=${DURATION_SECONDS}" \
+          --data-urlencode 'WebIdentityToken@-' \
+          -w '\n%{http_code}')"
+        status="${response##*$'\n'}"
+        body="${response%$'\n'*}"
+        xml_value() { sed -n "s:.*<$1>\(.*\)</$1>.*:\1:p" <<<"${body}"; }
+
+        if [[ "${status}" != 200 ]]; then
+          echo "::error::RustFS refused the OIDC token (HTTP ${status}): $(xml_value Code): $(xml_value Message)"
+          exit 1
+        fi
+
+        access_key="$(xml_value AccessKeyId)"
+        secret_key="$(xml_value SecretAccessKey)"
+        session_token="$(xml_value SessionToken)"
+        if [[ -z "${access_key}" || -z "${secret_key}" || -z "${session_token}" ]]; then
+          echo "::error::RustFS returned HTTP 200 without credentials."
+          exit 1
+        fi
+        echo "::add-mask::${access_key}"
+        echo "::add-mask::${secret_key}"
+        echo "::add-mask::${session_token}"
+        {
+          echo "access-key-id=${access_key}"
+          echo "secret-access-key=${secret_key}"
+          echo "session-token=${session_token}"
+        } >>"${GITHUB_OUTPUT}"
+        if [[ "${EXPORT_ENV}" == 'true' ]]; then
+          {
+            echo "AWS_ACCESS_KEY_ID=${access_key}"
+            echo "AWS_SECRET_ACCESS_KEY=${secret_key}"
+            echo "AWS_SESSION_TOKEN=${session_token}"
+          } >>"${GITHUB_ENV}"
+        fi
+        echo "RustFS credentials expire at $(xml_value Expiration)."

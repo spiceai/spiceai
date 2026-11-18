@@ -74,7 +74,10 @@ pub mod caching_eviction;
 mod caching_scan_tests;
 pub mod checkpoint_primary_key;
 pub mod fallback_retention;
-pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
+pub use fallback_retention::{
+    Error as FallbackRetentionKeepError, FallbackRetentionKeep, ensure_no_fallible_implicit_cast,
+};
+pub(crate) mod exact_string_time;
 pub mod federation;
 pub(crate) mod index_rebuild;
 pub mod partition_scope;
@@ -577,6 +580,9 @@ pub struct Builder {
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
     node_local: bool,
+    /// Forwards committed append refreshes to the dataset's `DoExchange`
+    /// subscribers.
+    data_update_publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
 }
 
 impl Builder {
@@ -637,6 +643,7 @@ impl Builder {
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
+            data_update_publisher: None,
             fallback_retention_keep: None,
             append_cursor_store: None,
             node_local: false,
@@ -998,6 +1005,17 @@ impl Builder {
         self
     }
 
+    /// Forward each committed append refresh to the dataset's `DoExchange`
+    /// subscribers, so an append stream from this dataset delivers the rows
+    /// its refreshes append.
+    pub fn data_update_publisher(
+        &mut self,
+        publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
+    ) -> &mut Self {
+        self.data_update_publisher = publisher;
+        self
+    }
+
     /// Provide per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`. These layer on top of the runtime-global
     /// CDC config only for this dataset's changes stream;
@@ -1275,6 +1293,7 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
+        refresher.with_data_update_publisher(self.data_update_publisher);
 
         // Durable federated write-back (#11838): a WriteBack Cayenne table whose
         // commit path marks dirty keys gets a per-table delivery worker that
@@ -2319,7 +2338,14 @@ impl AcceleratedTable {
                 let mut batch_write_tx = self.batch_write_tx.clone().ok_or_else(|| {
                     DataFusionError::Internal("batch_write_tx missing in caching mode".to_string())
                 })?;
+                // Neither reads the accelerator before the origin answers, so the
+                // scan is planned only if a failing fetch needs it.
                 let input = if caching::uses_source_first(
+                    filters,
+                    self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
+                ) || caching::passes_through(
                     filters,
                     self.cache_ttl,
                     self.cache_stale_while_revalidate_ttl,

@@ -959,6 +959,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::CreateDirectory { .. } => "create_directory",
         spice::error::Error::RuntimeExecution { .. } => "runtime_execution",
         spice::error::Error::RuntimeVersion { .. } => "runtime_version",
+        spice::error::Error::NightlyInstall { .. } => "nightly_install",
         spice::error::Error::Environment { .. } => "environment",
         spice::error::Error::InvalidArgument { .. } | spice::error::Error::InvalidUsage { .. } => {
             "invalid_argument"
@@ -1815,6 +1816,34 @@ mod tests {
         assert_eq!(args.message.as_deref(), Some("Summarize loaded datasets"));
     }
 
+    /// `--temperature -1` must reach `chat::execute`'s range check; read as a flag, it fails
+    /// with clap's "unexpected argument '-1'" and the user never learns the valid range.
+    #[test]
+    fn chat_temperature_accepts_a_negative_value() {
+        for argv in [
+            &["spice", "chat", "--temperature", "-1", "-m", "llm"][..],
+            &["spice", "-p", "--temperature", "-1", "-m", "llm", "hello"][..],
+        ] {
+            let cli = parse_normalized(argv);
+            let Commands::Chat(args) = cli.command else {
+                panic!("expected chat command for {argv:?}");
+            };
+            assert_eq!(args.temperature, Some(-1.0), "{argv:?}");
+            assert_eq!(args.model.as_deref(), Some("llm"), "{argv:?}");
+        }
+    }
+
+    /// Only numbers are taken as negative values: a flag after `--temperature` is still a flag.
+    #[test]
+    fn chat_temperature_does_not_swallow_a_following_flag() {
+        let args = normalize_direct_command_args(
+            ["spice", "chat", "--temperature", "-m", "llm"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
     #[test]
     fn direct_prompt_flag_keeps_model_option() {
         let cli = parse_normalized(&["spice", "-p", "--model", "llm", "Summarize loaded datasets"]);
@@ -2178,7 +2207,7 @@ mod tests {
     #[test]
     fn every_argument_after_orca_is_orcas() {
         let cli = parse_normalized(&["spice", "orca"]);
-        assert!(agent_args(&cli.command).is_empty());
+        assert_eq!(agent_args(&cli.command), [] as [String; 0]);
         let cli = parse_normalized(&[
             "spice",
             "--http-endpoint",

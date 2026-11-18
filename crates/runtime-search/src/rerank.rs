@@ -1924,7 +1924,7 @@ mod tests {
 
         // Cap at 0 → no batches returned.
         let none = truncate_batches(vec![batch(&["a"])], 0);
-        assert!(none.is_empty());
+        assert_eq!(none, [] as [RecordBatch; 0]);
 
         // Cap ≥ total → all batches returned unchanged.
         let all = truncate_batches(vec![batch(&["a"]), batch(&["b"])], 10);

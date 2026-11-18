@@ -142,18 +142,25 @@ impl ChangeFlightEncoder {
             self.tracker = DictionaryTracker::new(false);
         }
 
-        let (flight_dictionaries, flight_batch) = self
-            .encoder
-            .encode(
-                record_batch,
-                &mut self.tracker,
-                &self.write_options,
-                &mut self.compression_context,
-            )
-            .map_err(|source| Status::internal(format!("Unable to encode batch: {source}")))?;
+        // A large change batch goes out as several messages, each under a
+        // client's default gRPC receive limit.
+        for slice in arrow_tools::ipc::split_batch_for_flight(
+            record_batch.clone(),
+            arrow_tools::ipc::FLIGHT_TARGET_MESSAGE_BYTES,
+        ) {
+            let (flight_dictionaries, flight_batch) = self
+                .encoder
+                .encode(
+                    &slice,
+                    &mut self.tracker,
+                    &self.write_options,
+                    &mut self.compression_context,
+                )
+                .map_err(|source| Status::internal(format!("Unable to encode batch: {source}")))?;
 
-        flights.extend(flight_dictionaries.into_iter().map(Into::into));
-        flights.push(flight_batch.into());
+            flights.extend(flight_dictionaries.into_iter().map(Into::into));
+            flights.push(flight_batch.into());
+        }
 
         Ok(flights)
     }
@@ -312,7 +319,8 @@ fn do_exchange_response_stream(
             }
 
             for batch in &data_update.data {
-                let change_batch = record_batch_to_change_batch(&table_provider_stream, batch)?;
+                let batch = align_to_snapshot_schema(batch, &snapshot_schema);
+                let change_batch = record_batch_to_change_batch(&table_provider_stream, &batch)?;
                 let flights = encode_and_count(&mut encoder, &change_batch)?;
                 for flight in flights {
                     yield flight;
@@ -344,7 +352,8 @@ fn do_exchange_response_stream(
             }
 
             for batch in &data_update.data {
-                let change_batch = record_batch_to_change_batch(&table_provider_stream, batch)?;
+                let batch = align_to_snapshot_schema(batch, &snapshot_schema);
+                let change_batch = record_batch_to_change_batch(&table_provider_stream, &batch)?;
                 let flights = encode_and_count(&mut encoder, &change_batch)?;
                 for flight in flights {
                     yield flight;
@@ -391,10 +400,10 @@ fn record_batch_to_change_batch(
     let primary_keys = get_primary_keys_from_constraints(&schema, table_provider.constraints())?;
     let primary_keys_array = match primary_keys.as_ref() {
         Some(primary_keys) => get_primary_keys_array(primary_keys, row_count),
-        None => ListArray::new_null(
-            Arc::new(Field::new("item", DataType::Utf8, false)),
-            row_count,
-        ),
+        // An empty key list per row, not a null one. Both mean "no keys", but
+        // an older subscriber reads a batch of null lists as rows with
+        // different keys and writes each row on its own.
+        None => get_primary_keys_array(&[], row_count),
     };
     let data_array = StructArray::from(batch.clone());
     let change_schema = Arc::new(changes_schema(schema.as_ref()));
@@ -412,6 +421,25 @@ fn record_batch_to_change_batch(
             "Unable to convert record batch into change event: {source}"
         ))
     })
+}
+
+/// `batch` in the schema the subscriber's initial snapshot used, when it can be
+/// cast to it. A refresh publishes the rows it read from its source, whose
+/// types the acceleration may store differently; a subscriber resolves its
+/// schema from the first batch it receives, so later batches have to match it.
+fn align_to_snapshot_schema(batch: &RecordBatch, snapshot_schema: &SchemaRef) -> RecordBatch {
+    if batch.schema().fields() == snapshot_schema.fields() {
+        return batch.clone();
+    }
+    match arrow_tools::record_batch::try_cast_to(batch.clone(), Arc::clone(snapshot_schema)) {
+        Ok(aligned) => aligned,
+        Err(error) => {
+            tracing::debug!(
+                "DoExchange data update does not cast to the initial snapshot schema, so it is sent as is: {error}"
+            );
+            batch.clone()
+        }
+    }
 }
 
 fn truncate_change_batch(schema: &SchemaRef) -> Result<RecordBatch, Status> {
@@ -514,6 +542,53 @@ mod tests {
             assert_eq!(values.value(0), "tenant");
             assert_eq!(values.value(1), "id");
         }
+    }
+
+    /// A table without a primary key sends an empty key list per row, not a
+    /// null one, so a subscriber writes a snapshot batch at once instead of one
+    /// row at a time.
+    #[test]
+    fn test_keyless_change_batch_sends_empty_key_lists() {
+        let table_provider: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(test_schema(), vec![vec![]])
+                .expect("mem table should be created"),
+        );
+        let change_batch =
+            record_batch_to_change_batch(&table_provider, &test_batch(vec![1, 2, 3]))
+                .expect("change batch should be built");
+        let keys = change_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("primary keys should be a list");
+
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys.null_count(), 0, "no row has a null key list");
+        assert!((0..keys.len()).all(|row| keys.value_length(row) == 0));
+    }
+
+    /// Rows a refresh publishes in its source's types go out in the types of
+    /// the subscriber's initial snapshot.
+    #[test]
+    fn test_align_to_snapshot_schema_casts_published_rows() {
+        let wide = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let published = RecordBatch::try_new(
+            Arc::clone(&wide),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![7, 8]))],
+        )
+        .expect("published batch should be valid");
+
+        let aligned = align_to_snapshot_schema(&published, &test_schema());
+        assert_eq!(aligned.schema().fields(), test_schema().fields());
+        let ids = aligned
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("aligned ids should be int32");
+        assert_eq!(ids.values().to_vec(), vec![7, 8]);
+
+        let unchanged = align_to_snapshot_schema(&test_batch(vec![1]), &test_schema());
+        assert_eq!(unchanged.num_rows(), 1);
     }
 
     #[test]

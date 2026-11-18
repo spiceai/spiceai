@@ -24,7 +24,8 @@ limitations under the License.
 //!
 //! Required environment for CI:
 //!
-//! * `AWS_SNAPSHOT_KEY` + `AWS_SNAPSHOT_SECRET`, **or**
+//! * `AWS_SNAPSHOT_KEY` + `AWS_SNAPSHOT_SECRET` (+ `AWS_SNAPSHOT_SESSION_TOKEN`
+//!   for short-lived credentials), **or**
 //! * `AWS_PROFILE` configured with read/write access to the test bucket.
 //!
 //! Each test reserves its own UUID-prefixed key range under the shared
@@ -65,8 +66,6 @@ use crate::utils::{register_test_connectors, runtime_ready_check, test_request_c
 use crate::{init_tracing, run_query};
 
 mod cayenne;
-#[cfg(feature = "duckdb")]
-mod duckdb;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
@@ -80,8 +79,6 @@ const SNAPSHOT_REGION: &str = "us-west-2";
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum EngineKind {
     Cayenne,
-    #[cfg(feature = "duckdb")]
-    DuckDB,
     #[cfg(feature = "sqlite")]
     Sqlite,
 }
@@ -90,8 +87,6 @@ impl EngineKind {
     fn engine_name(self) -> &'static str {
         match self {
             Self::Cayenne => "cayenne",
-            #[cfg(feature = "duckdb")]
-            Self::DuckDB => "duckdb",
             #[cfg(feature = "sqlite")]
             Self::Sqlite => "sqlite",
         }
@@ -100,8 +95,6 @@ impl EngineKind {
     fn file_extension(self) -> &'static str {
         match self {
             Self::Cayenne => "cayenne",
-            #[cfg(feature = "duckdb")]
-            Self::DuckDB => "duckdb",
             #[cfg(feature = "sqlite")]
             Self::Sqlite => "sqlite",
         }
@@ -258,13 +251,6 @@ impl SnapshotRefreshFixture {
                     metadata_dir.to_string_lossy().into_owned(),
                 );
             }
-            #[cfg(feature = "duckdb")]
-            EngineKind::DuckDB => {
-                params.insert(
-                    "duckdb_file".to_string(),
-                    local_db_path.to_string_lossy().into_owned(),
-                );
-            }
             #[cfg(feature = "sqlite")]
             EngineKind::Sqlite => {
                 params.insert(
@@ -346,6 +332,10 @@ impl SnapshotRefreshFixture {
                 "s3_secret".to_string(),
                 "${secrets:AWS_SNAPSHOT_SECRET}".to_string(),
             );
+            params.extend(crate::utils::aws_session_token_param(
+                "s3_session_token",
+                "AWS_SNAPSHOT_SESSION_TOKEN",
+            ));
         }
         if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
             params.insert(

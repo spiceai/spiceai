@@ -3,18 +3,19 @@ description: >
   Under query load, with the source rewriting its rows every second and append
   refreshes running against them, `spiced` exits cleanly and promptly on
   SIGTERM, leaves a file acceleration it can reopen, and after a restart
-  serves one row per key: the newest version (upsert, and Cayenne, which keeps
-  the newest by time column whatever `on_conflict` says) or the first (DuckDB's
-  drop). Every query during the load succeeds.
+  serves one row per key: the newest version (Cayenne keeps the newest by time
+  column whatever `on_conflict` says). Every query during the load succeeds.
 
 sources:
   src: { kind: postgres }
 
 matrix:
-  engine: [duckdb, cayenne]
+  engine: [cayenne]
 
 variants:
   default: {}
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1
@@ -61,6 +62,9 @@ spicepod:
 
 defaults:
   expect: { oracle: src }
+  # The timed writer can finish a different number of rounds in each instance,
+  # so their rows differ; every instance is checked against its own source instead.
+  compare-variants: false
 
 steps:
   - source-exec:
@@ -99,7 +103,7 @@ steps:
 
   # SIGTERM while append refreshes are still catching up.
   - stop: {}
-  # A clean shutdown leaves no write-ahead log to replay (DuckDB's `.wal`).
+  # A clean shutdown leaves no write-ahead log to replay.
   - assert-files: { contains: '^\.spice/data/', lacks: '\.wal$' }
   - start: {}
   - query: SELECT * FROM data_full
@@ -109,11 +113,7 @@ steps:
   - query: SELECT * FROM data_upsert
     oracle-sql: SELECT * FROM service_data
     eventually: 60s
-  # DuckDB's drop keeps each key's first version; Cayenne keeps the newest.
-  - query: SELECT * FROM data_drop
-    expect: { same-as: first-versions }
-    eventually: 30s
-    when: { engine: duckdb }
+  # Cayenne keeps each key's newest version whatever `on_conflict` says.
   - query: SELECT * FROM data_drop
     oracle-sql: SELECT * FROM service_data
     eventually: 60s

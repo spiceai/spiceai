@@ -286,7 +286,10 @@ columns:
 
     #[test]
     fn attributes_are_empty_without_corpus() {
-        assert!(corpus_attributes(&AppBuilder::new("t").build()).is_empty());
+        assert_eq!(
+            corpus_attributes(&AppBuilder::new("t").build()),
+            [] as [test_framework::opentelemetry::KeyValue; 0]
+        );
     }
 
     #[test]

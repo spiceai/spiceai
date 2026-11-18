@@ -1,0 +1,82 @@
+name: 'Mint an OpenAI access token'
+description: >-
+  Exchanges this job's GitHub OIDC token for a short-lived OpenAI access token through OpenAI
+  workload identity federation, and exports it, masked, as SPICE_OPENAI_API_KEY for the steps
+  that follow. OpenAI ends the token when the GitHub OIDC token expires, about 300 seconds after
+  this step (`expires_in` is logged), and nothing refreshes it. Run this right before each step
+  that calls OpenAI, and only before a step that ends in that time. The job needs
+  `permissions: id-token: write` and `environment: ci`, whose secrets hold the identifiers.
+inputs:
+  identity-provider-id:
+    description: 'The OpenAI workload identity provider (`idp_...`) that verifies this job''s GitHub OIDC token'
+    required: true
+  service-account-id:
+    description: 'The OpenAI service account the token acts as'
+    required: true
+  audience:
+    description: 'The audience of the GitHub OIDC token; it must match the identity provider''s Audience'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Exchange the GitHub OIDC token for an OpenAI access token
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        IDENTITY_PROVIDER_ID: ${{ inputs.identity-provider-id }}
+        SERVICE_ACCOUNT_ID: ${{ inputs.service-account-id }}
+        AUDIENCE: ${{ inputs.audience }}
+      with:
+        script: |
+          const settings = 'https://platform.openai.com/settings/organization/security/workload-identity-provider';
+          // An earlier step's token may have expired: a failed exchange leaves none behind, so
+          // the step after it reports a missing token rather than an expired one.
+          core.exportVariable('SPICE_OPENAI_API_KEY', '');
+          const inputs = {
+            identity_provider_id: process.env.IDENTITY_PROVIDER_ID,
+            service_account_id: process.env.SERVICE_ACCOUNT_ID,
+            audience: process.env.AUDIENCE,
+          };
+          const missing = Object.entries(inputs).filter(([, value]) => !value).map(([name]) => name);
+          if (missing.length > 0) {
+            core.setFailed(`Failed to mint an OpenAI access token: no ${missing.join(', ')} was given, so no step in this job can call OpenAI. Pass them from the 'ci' environment's OPENAI_* secrets and give the job 'environment: ci'.`);
+            return;
+          }
+
+          let subjectToken;
+          try {
+            subjectToken = await core.getIDToken(inputs.audience);
+          } catch (error) {
+            core.setFailed(`Failed to get this job's GitHub OIDC token, so no OpenAI access token can be minted: ${error.message}. Give the job 'permissions: id-token: write'.`);
+            return;
+          }
+          core.setSecret(subjectToken);
+
+          // RFC 8693 token exchange.
+          const response = await fetch('https://auth.openai.com/oauth/token', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+              subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+              subject_token: subjectToken,
+              identity_provider_id: inputs.identity_provider_id,
+              service_account_id: inputs.service_account_id,
+            }),
+          });
+          const text = await response.text();
+          let body = {};
+          try {
+            body = JSON.parse(text);
+          } catch {
+            // Reported below with the raw text.
+          }
+          if (!response.ok || typeof body.access_token !== 'string') {
+            const reason = body.error?.message ?? body.error_description ?? body.error ?? text.slice(0, 300);
+            const requestId = response.headers.get('x-request-id') ?? 'unknown';
+            core.setFailed(`Failed to exchange this job's GitHub OIDC token for an OpenAI access token (HTTP ${response.status}, request ${requestId}): ${reason}. Verify the identity provider's issuer and audience, and that a service account mapping matches the token's claims: ${settings}`);
+            return;
+          }
+          core.setSecret(body.access_token);
+          core.exportVariable('SPICE_OPENAI_API_KEY', body.access_token);
+          const expiresAt = new Date(Date.now() + body.expires_in * 1000).toISOString();
+          core.info(`Minted an OpenAI access token that expires in ${body.expires_in}s, at ${expiresAt}.`);

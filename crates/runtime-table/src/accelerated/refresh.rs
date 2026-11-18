@@ -135,6 +135,11 @@ pub struct Refresh {
     pub(crate) reload_generation: u64,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
+    /// `period` stands in for `retention_period` (no `refresh_data_window` is set), so
+    /// the load window also keeps rows whose `time_column` is NULL: retention never
+    /// deletes them (`NULL < cutoff` is not true), and dropping them at load would make
+    /// the loaded set disagree with what retention keeps.
+    pub(crate) period_keeps_null_time: bool,
     pub(crate) append_overlap: Option<Duration>,
     /// Keep each key's newest version by `time_column`: only rows newer than the
     /// version of their key already kept (see `refresh_task::latest_by_time`), resolved as the
@@ -337,6 +342,14 @@ impl Refresh {
     #[must_use]
     pub fn period(mut self, period: Duration) -> Self {
         self.period = Some(period);
+        self
+    }
+
+    /// Mark `period` as derived from `retention_period`, so the load window also keeps
+    /// rows whose `time_column` is NULL (retention never deletes them).
+    #[must_use]
+    pub fn period_keeps_null_time(mut self, keeps_null_time: bool) -> Self {
+        self.period_keeps_null_time = keeps_null_time;
         self
     }
 
@@ -837,6 +850,7 @@ impl Default for Refresh {
             reload_generation: 0,
             mode: RefreshMode::Full,
             period: None,
+            period_keeps_null_time: false,
             append_overlap: None,
             versions_by_time: None,
             retry_enabled: false,
@@ -922,6 +936,9 @@ pub struct Refresher {
     initial_status: Option<status::ComponentStatus>,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
+    /// Forwards committed append refreshes to the dataset's `DoExchange`
+    /// subscribers.
+    data_update_publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -985,6 +1002,7 @@ impl Refresher {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
+            data_update_publisher: None,
             initial_status: None,
             append_cursor_store: None,
         }
@@ -1164,6 +1182,16 @@ impl Refresher {
         rules: arrow_tools::type_rewrite::TypeRewriteRules,
     ) -> &mut Self {
         self.engine_type_rewrites = rules;
+        self
+    }
+
+    /// Forward each committed append refresh to the dataset's `DoExchange`
+    /// subscribers.
+    pub fn with_data_update_publisher(
+        &mut self,
+        publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
+    ) -> &mut Self {
+        self.data_update_publisher = publisher;
         self
     }
 
@@ -1449,7 +1477,9 @@ impl Refresher {
             .with_change_sink(self.change_sink.clone())
             .with_cache_write_sender(self.cache_write_sender.clone());
 
-        refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
+        refresh_task_runner = refresh_task_runner
+            .with_cpu_runtime(self.cpu_runtime.clone())
+            .with_data_update_publisher(self.data_update_publisher.clone());
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresh_task_runner =

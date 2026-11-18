@@ -90,31 +90,42 @@ tpch-gen: tpch-init
 
 	@echo "Test data and queries generated successfully."
 
-# tpch-fleet-gen generates the same TPC-H dataset the rest of the benchmark fleet
-# runs on - s3://spiceai-public-datasets/tpch and the hosted MySQL, Iceberg, Glue,
-# Databricks, Snowflake and Spice Cloud copies - which is what
-# crates/test-framework/src/queries/validation/tpch/*.csv holds the expected
-# answers for. That dataset comes from DuckDB's tpch extension, and DuckDB's
-# generator disagrees with tpch-kit's dbgen on the free-text columns (c_address,
-# s_address, and every *_comment): keys, numerics, dates and even the string
-# lengths are identical, but the characters differ. That changes 4 of the 22 TPC-H
-# answers - Q2 and Q20 (s_address), Q10 (c_address), and Q13, whose predicate reads
-# o_comment - so a Postgres database seeded with dbgen data fails result validation
-# on exactly those four queries no matter how correct the engine under test is.
-# dbgen is the officially correct generator (its output matches the TPC-supplied
-# answers in tpch-kit's dbgen/answers/); the fleet's dataset is the one that
-# diverges, tracked separately in #12137. Until that is resolved, seeding from the
-# same generator the answers were produced with is what makes a result mismatch
-# mean a real bug.
+# tpch-fleet-gen generates TPC-H data identical to tpch-kit's dbgen, the TPC's
+# reference generator, whose answers - the TPC-published ones in dbgen/answers/ -
+# are what crates/test-framework/src/queries/validation/tpch/*.csv holds. It runs
+# the tpch extension of a pinned DuckDB CLI instead of building dbgen.
 #
 # Data only - qgen/tpch_queries.sql still comes from tpch-gen.
 # Example: DBGEN_SCALE=1 make tpch-fleet-gen
 TPCH_FLEET_DIR ?= ./tmp/fleet
 
 # Pinned so the generated dataset cannot drift with whatever duckdb happens to be
-# on PATH. v1.5.4's output was verified row-for-row identical to the fleet dataset
-# across all 8 tables (0 rows differing in either direction, 6,001,215 lineitem
-# rows). Override DUCKDB to use an already-installed CLI.
+# on PATH. DuckDB 2.0.0's tpch extension writes dbgen's data: all 8 SF1 tables are
+# row-for-row identical (0 rows differing in either direction, 6,001,215 lineitem
+# rows). DuckDB 1.x writes different free-text columns (c_address, s_address and
+# every *_comment), which changes the answers to Q2, Q10, Q13, Q15 and Q20.
+# Override TPCH_DUCKDB to use an already-installed CLI.
+TPCH_DUCKDB_VERSION ?= v2.0.0
+TPCH_DUCKDB ?= ./tmp/bin-$(TPCH_DUCKDB_VERSION)/duckdb
+
+$(TPCH_DUCKDB):
+	@mkdir -p "$(dir $(TPCH_DUCKDB))"
+	@OS=`uname`; ARCH=`uname -m`; \
+	case "$$OS/$$ARCH" in \
+		Linux/x86_64) ASSET=duckdb-cli-linux-amd64.tar.gz ;; \
+		Linux/aarch64 | Linux/arm64) ASSET=duckdb-cli-linux-arm64.tar.gz ;; \
+		Darwin/*) ASSET=duckdb-cli-osx-universal.tar.gz ;; \
+		*) echo "No DuckDB CLI release asset for $$OS/$$ARCH - install duckdb $(TPCH_DUCKDB_VERSION) and re-run with TPCH_DUCKDB=\`command -v duckdb\`"; exit 1 ;; \
+	esac; \
+	echo "Downloading DuckDB CLI $(TPCH_DUCKDB_VERSION) ($$ASSET)..."; \
+	curl -fsSL --retry 3 -o "$(dir $(TPCH_DUCKDB))duckdb.tar.gz" "https://github.com/duckdb/duckdb/releases/download/$(TPCH_DUCKDB_VERSION)/$$ASSET"
+	@tar -xzf "$(dir $(TPCH_DUCKDB))duckdb.tar.gz" -C "$(dir $(TPCH_DUCKDB))"
+	@rm -f "$(dir $(TPCH_DUCKDB))duckdb.tar.gz"
+	@chmod +x "$(TPCH_DUCKDB)"
+	@"$(TPCH_DUCKDB)" --version
+
+# Pinned so tpcds-fleet-gen's dataset cannot drift with whatever duckdb happens to
+# be on PATH. Override DUCKDB to use an already-installed CLI.
 DUCKDB_VERSION ?= v1.5.4
 DUCKDB ?= ./tmp/bin/duckdb
 
@@ -134,20 +145,20 @@ $(DUCKDB):
 	@chmod +x "$(DUCKDB)"
 	@"$(DUCKDB)" --version
 
-tpch-fleet-gen: $(DUCKDB)
+tpch-fleet-gen: $(TPCH_DUCKDB)
 	@# Check if DBGEN_SCALE is set, else default to 1
 	$(eval DBGEN_SCALE ?= 1)
 	@mkdir -p "$(TPCH_FLEET_DIR)"
 	@rm -f "$(TPCH_FLEET_DIR)"/*.tbl "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
 	@echo "Generating TPC-H scale factor $(DBGEN_SCALE)..."
-	@"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$(DBGEN_SCALE));" > /dev/null
+	@"$(TPCH_DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$(DBGEN_SCALE));" > /dev/null
 	@# QUOTE '' disables CSV quoting so no field is ever wrapped, and the trailing
 	@# empty column reproduces dbgen's trailing '|'; the result is byte-compatible
 	@# with dbgen's .tbl format, so every *-load target reads it unchanged. Tables
 	@# are dropped as they are written to bound peak disk at the larger scales.
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Writing $$table.tbl..."; \
-		"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "\
+		"$(TPCH_DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "\
 			COPY (SELECT *, '' FROM $$table) TO '$(TPCH_FLEET_DIR)/$$table.tbl' (FORMAT CSV, DELIMITER '|', HEADER false, QUOTE ''); \
 			DROP TABLE $$table; \
 			CHECKPOINT;" > /dev/null || exit 1; \

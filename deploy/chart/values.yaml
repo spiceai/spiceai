@@ -6,6 +6,33 @@ image:
   tag: latest-models # 2.5.0-unstable
 replicaCount: 1
 
+# The role spiced runs as (`spiced --role`):
+#   server     The default: serves queries over its own datasets.
+#   sidecar    Serves an application's queries beside it, and sends reads from
+#              a remote Spice runtime as Substrait plans created locally.
+#   scheduler  Plans distributed queries and assigns their tasks to executors.
+#   executor   Joins a scheduler's cluster and runs the tasks it assigns.
+# A cluster is one release with `role: scheduler` and one with `role: executor`.
+role: server
+
+# Cluster settings, used only with `role: scheduler` or `role: executor`.
+cluster:
+  # The scheduler's cluster address. Required for `role: executor`, e.g.
+  # https://spice-scheduler-spiceai:50052 for a scheduler release named spice-scheduler.
+  schedulerAddress: ''
+  # The host or IP other cluster nodes reach this node at. Defaults to the pod IP.
+  advertiseAddress: ''
+  # The port of the cluster's internal gRPC service.
+  port: 50052
+  # Cluster mTLS: a Secret holding `ca.crt`, `tls.crt` and `tls.key`, the layout
+  # cert-manager writes. Each certificate must name the address its node is
+  # reached at: the scheduler Service host, and each node's advertise address.
+  tls:
+    secretName: ''
+  # Run the cluster without mTLS. Use only on a trusted network, for development
+  # and testing: cluster connections are neither authenticated nor encrypted.
+  allowInsecureConnections: false
+
 # Update strategy for the Deployment (used when stateful.enabled is false).
 # strategy:
 #   type: Recreate

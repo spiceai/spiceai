@@ -40,8 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import google.auth
 from google.cloud import bigquery
-from google.oauth2 import service_account
 
 import bigquery_federation as harness
 
@@ -454,7 +454,7 @@ def main() -> int:
     expected_jobs = expected_execution_jobs(queries)
     aliases, tables = fixtures()
     info, credential = harness.credential_info()
-    project = os.environ.get("BIGQUERY_PROJECT_ID", info["project_id"])
+    project = os.environ.get("BIGQUERY_PROJECT_ID") or info["project_id"]
     if not harness.PROJECT_ID_PATTERN.fullmatch(project):
         raise harness.HarnessError("Invalid BIGQUERY_PROJECT_ID")
     driver = harness.required_path("ADBC_BIGQUERY_DRIVER_PATH")
@@ -471,7 +471,7 @@ def main() -> int:
     datasets = {dataset: f"spice_bq_corpus_{stamp}_{dataset}" for dataset, _ in tables}
     client = bigquery.Client(
         project=project,
-        credentials=service_account.Credentials.from_service_account_info(info),
+        credentials=google.auth.load_credentials_from_dict(info, scopes=["https://www.googleapis.com/auth/cloud-platform"])[0],
     )
     created = []
     process = None

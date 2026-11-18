@@ -24,7 +24,7 @@ use runtime_checkpoint_api::{BlobCheckpointStore, CheckpointError};
 use serde::{Deserialize, Serialize};
 
 /// The sidecar table the cursor is checkpointed in, one row per dataset.
-pub const APPEND_CURSOR_TABLE: &str = "spice_sys_append_cursor";
+pub use runtime_checkpoint_api::APPEND_CURSOR_TABLE;
 
 /// What the store holds for one dataset: the commit whose rows are written, and the
 /// commit a write is in flight for.

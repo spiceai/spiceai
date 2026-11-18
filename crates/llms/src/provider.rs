@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn test_format_models_hint_empty() {
         let result = format_models_hint(&[], "test");
-        assert!(result.is_empty());
+        assert_eq!(result, "");
     }
 
     #[test]

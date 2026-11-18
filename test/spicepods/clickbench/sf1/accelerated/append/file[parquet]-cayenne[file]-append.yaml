@@ -1,0 +1,14 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-cayenne[file]-append
+datasets:
+  - from: file:hits_delayed.parquet
+    name: hits
+    time_column: created_at
+    params:
+      file_format: parquet
+    acceleration:
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: 3m

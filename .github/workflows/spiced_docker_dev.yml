@@ -31,7 +31,7 @@ on:
         type: string
         default: ''
       additional_features:
-        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,duckdb). Leave empty for defaults only.'
+        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,oracle). Leave empty for defaults only.'
         required: false
         type: string
         default: ''
@@ -57,7 +57,7 @@ on:
         type: string
         default: ''
       additional_features:
-        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,duckdb). Leave empty for defaults only.'
+        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,oracle). Leave empty for defaults only.'
         required: false
         type: string
         default: ''
@@ -69,8 +69,13 @@ on:
         description: 'The published image tag (echo of the input)'
         value: ${{ jobs.setup.outputs.tag }}
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   setup:
+    environment: secret-free
     runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
@@ -188,6 +193,10 @@ jobs:
     needs: setup
     if: needs.setup.outputs.run_arm64 == 'true'
     runs-on: hosted-linux-arm-runner
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     env:
       RUST_PROFILE: release
 
@@ -230,15 +239,19 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (rust, debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Build ARM64 image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -266,7 +279,7 @@ jobs:
           docker run --rm localhost:5000/spiceai:dev-arm64 --version
 
       - name: Upload ARM64 artifact
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-arm64
           path: /tmp/image-arm64.tar
@@ -275,6 +288,10 @@ jobs:
     needs: setup
     if: needs.setup.outputs.run_amd64 == 'true'
     runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     env:
       RUST_PROFILE: release
 
@@ -298,15 +315,19 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (rust, debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Build AMD64 image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -334,7 +355,7 @@ jobs:
           docker run --rm localhost:5000/spiceai:dev-amd64 --version
 
       - name: Upload AMD64 artifact
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-amd64
           path: /tmp/image-amd64.tar
@@ -343,9 +364,14 @@ jobs:
     needs: [setup, build-amd64, build-arm64]
     if: always() && (needs.build-amd64.result == 'success' || needs.build-arm64.result == 'success')
     runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp
           pattern: image-*
@@ -357,23 +383,27 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before pulling so we use the authenticated
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Start local registry
         run: |
-          docker run -d -p 5000:5000 --restart=always --name registry registry:2
+          docker run -d -p 5000:5000 --restart=always --name registry registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
 
       - name: Login to GitHub Package Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
