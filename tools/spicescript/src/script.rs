@@ -155,6 +155,12 @@ pub struct SourceSpec {
     /// `${instance.host_from_container}`.
     #[serde(default)]
     pub host_network: bool,
+    /// `rustfs` sources: put a toxiproxy in front of the store that delays
+    /// every response by this long, so `spiced` (`${sources.<name>.endpoint}`
+    /// and `.params`) sees a remote store's round trip. The harness's own
+    /// requests (buckets, `assert-objects`) go to the store directly.
+    #[serde(default, with = "opt_duration")]
+    pub latency: Option<Duration>,
 }
 
 /// `sidecar:`: the application sidecar each instance runs beside it.
@@ -505,10 +511,20 @@ pub enum Action {
         rows: Vec<Vec<Value>>,
         timing: Timing,
     },
-    /// Checks the files under the instance's directory, by path relative to it.
+    /// Deletes what `spiced` wrote in the instance's directory (its data,
+    /// `.spice/`, metastore files), as if the instance had lost its disk,
+    /// keeping the harness's own files (the spicepod, `spiced.log`) and the
+    /// paths in `keep`, relative to the directory. Refused while `spiced` or
+    /// an executor runs.
+    WipeInstanceDir {
+        keep: Vec<String>,
+    },
+    /// Checks the files under the instance's directory, by path relative to it,
+    /// and that no directory matches `lacks_dirs` (paths end in `/`).
     AssertFiles {
         contains: Vec<regex::Regex>,
         lacks: Vec<regex::Regex>,
+        lacks_dirs: Vec<regex::Regex>,
     },
     StopBackground {
         id: String,
@@ -533,13 +549,19 @@ pub enum Action {
         mirror: Option<String>,
     },
     /// Require at least `min` objects under a prefix of a files or object
-    /// store source.
+    /// store source, counting only keys containing `contains` when it is set.
     AssertObjects {
         source: String,
         prefix: String,
+        contains: Option<String>,
         min: usize,
+        /// At most this many; `None` for no limit.
+        max: Option<usize>,
         within: Option<Duration>,
     },
+    /// Sample the objects under a prefix as a series over time, and require each
+    /// sample within its bounds and the series not to trend upward.
+    SampleObjects(ObjectSampling),
     /// Wait until a `/metrics` series meets a condition.
     WaitMetric(MetricWait),
     /// Keep a `/metrics` scrape to measure later changes from.
@@ -639,6 +661,22 @@ pub struct ExplainStep {
     pub contains: Vec<String>,
     /// Substrings the plan must not contain.
     pub omits: Vec<String>,
+}
+
+/// `sample-objects`: the object count and bytes under a prefix of a files or
+/// object store source, every `every` for `duration`.
+#[derive(Debug, Clone)]
+pub struct ObjectSampling {
+    pub source: String,
+    pub prefix: String,
+    /// Count only keys containing this text.
+    pub contains: Option<String>,
+    pub every: Duration,
+    pub duration: Duration,
+    /// Every sample holds at most this many objects.
+    pub max_objects: Option<usize>,
+    /// Every sample holds at most this many bytes.
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1562,11 +1600,13 @@ const ACTIONS: &[&str] = &[
     "dbgen",
     "source-query",
     "assert-files",
+    "wipe-instance-dir",
     "stop-background",
     "spice",
     "slt-setup",
     "slt",
     "assert-objects",
+    "sample-objects",
     "wait-metric",
     "mark-metrics",
     "generate",
@@ -1953,16 +1993,40 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
         "assert-files" => {
             let mut inner = Opts::of_mapping(
                 arg,
-                "`assert-files` takes a mapping with `contains` or `lacks`",
+                "`assert-files` takes a mapping with `contains`, `lacks` or `lacks-dirs`",
             )?;
             let contains = inner.patterns("contains")?;
             let lacks = inner.patterns("lacks")?;
+            let lacks_dirs = inner.patterns("lacks-dirs")?;
             inner.finish()?;
             ensure!(
-                !contains.is_empty() || !lacks.is_empty(),
-                "`assert-files` needs `contains` or `lacks`"
+                !contains.is_empty() || !lacks.is_empty() || !lacks_dirs.is_empty(),
+                "`assert-files` needs `contains`, `lacks` or `lacks-dirs`"
             );
-            Action::AssertFiles { contains, lacks }
+            Action::AssertFiles {
+                contains,
+                lacks,
+                lacks_dirs,
+            }
+        }
+        "wipe-instance-dir" => {
+            let mut inner = Opts::of_mapping(
+                arg,
+                "`wipe-instance-dir` takes a mapping: `{}` or `{ keep: [<path>…] }`",
+            )?;
+            let keep = inner.list("keep")?;
+            inner.finish()?;
+            for path in &keep {
+                let relative = Path::new(path);
+                ensure!(
+                    !path.is_empty()
+                        && relative
+                            .components()
+                            .all(|c| matches!(c, std::path::Component::Normal(_))),
+                    "`wipe-instance-dir` keeps paths inside the instance's directory, such as `state`; '{path}' is not one"
+                );
+            }
+            Action::WipeInstanceDir { keep }
         }
         "source-query" => {
             let Value::Object(m) = arg else {
@@ -2284,26 +2348,87 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             })
         }
         "assert-objects" => {
-            let mut inner =
-                Opts::of_mapping(arg, "`assert-objects` takes `source`, `prefix` and `min`")?;
+            let mut inner = Opts::of_mapping(
+                arg,
+                "`assert-objects` takes `source`, `prefix`, `contains`, `min` and `max`",
+            )?;
             let source = inner
                 .string("source")?
                 .context("`assert-objects` needs a `source`")?;
             let prefix = inner.string("prefix")?.unwrap_or_default();
+            let contains = inner.string("contains")?;
+            let max = inner
+                .take("max")
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .context("`max` must be a count")
+                })
+                .transpose()?;
+            // Without `max`, the step asks for objects to exist; with it, `min` is 0.
             let min = match inner.take("min") {
-                None => 1,
+                None => usize::from(max.is_none()),
                 Some(v) => v
                     .as_u64()
                     .and_then(|n| usize::try_from(n).ok())
                     .context("`min` must be a count")?,
             };
+            ensure!(
+                max.is_none_or(|max| min <= max),
+                "`assert-objects` has `min` {min} above `max`"
+            );
             inner.finish()?;
             Action::AssertObjects {
                 source,
                 prefix,
+                contains,
                 min,
+                max,
                 within: opts.duration("eventually")?,
             }
+        }
+        "sample-objects" => {
+            let mut inner = Opts::of_mapping(
+                arg,
+                "`sample-objects` takes `source`, `prefix`, `contains`, `every`, `for`, `max-objects` and `max-bytes`",
+            )?;
+            let source = inner
+                .string("source")?
+                .context("`sample-objects` needs a `source`")?;
+            let prefix = inner.string("prefix")?.unwrap_or_default();
+            let contains = inner.string("contains")?;
+            let every = inner
+                .duration("every")?
+                .context("`sample-objects` needs `every`")?;
+            let duration = inner
+                .duration("for")?
+                .context("`sample-objects` needs `for`")?;
+            ensure!(
+                !every.is_zero() && duration >= every * 6,
+                "`sample-objects` needs at least six samples: `for` must be at least six times `every`"
+            );
+            let count = |v: Value, key: &str| {
+                v.as_u64()
+                    .with_context(|| format!("`{key}` must be a count"))
+            };
+            let max_objects = inner
+                .take("max-objects")
+                .map(|v| count(v, "max-objects").and_then(|n| Ok(usize::try_from(n)?)))
+                .transpose()?;
+            let max_bytes = inner
+                .take("max-bytes")
+                .map(|v| count(v, "max-bytes"))
+                .transpose()?;
+            inner.finish()?;
+            Action::SampleObjects(ObjectSampling {
+                source,
+                prefix,
+                contains,
+                every,
+                duration,
+                max_objects,
+                max_bytes,
+            })
         }
         "generate" => {
             let Value::Object(m) = arg else {
@@ -2792,6 +2917,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sample_objects_takes_its_bounds_and_needs_six_samples() {
+        let script = |step: &str| {
+            Script::parse(&format!(
+                "name: s\nsources: {{ lake: {{ kind: rustfs }} }}\nspicepod: {{}}\nsteps:\n  - sample-objects: {step}"
+            ))
+        };
+        let parsed = script(
+            "{ source: lake, prefix: state/, contains: /data/, every: 10s, for: 60s, max-objects: 400, max-bytes: 1000 }",
+        )
+        .expect("a sample-objects step");
+        let Action::SampleObjects(sampling) = &parsed.steps[0].action else {
+            panic!("expected sample-objects");
+        };
+        assert_eq!(
+            (
+                sampling.source.as_str(),
+                sampling.prefix.as_str(),
+                sampling.contains.as_deref(),
+                sampling.every,
+                sampling.duration,
+                sampling.max_objects,
+                sampling.max_bytes,
+            ),
+            (
+                "lake",
+                "state/",
+                Some("/data/"),
+                Duration::from_secs(10),
+                Duration::from_secs(60),
+                Some(400),
+                Some(1000),
+            )
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                script("{ source: lake, every: 10s, for: 50s }").expect_err("five samples")
+            ),
+            "step 1: `sample-objects` needs at least six samples: `for` must be at least six times `every`"
+        );
+    }
+
+    #[test]
     fn ledger_keys_sort_nested_objects() {
         let arg: Value =
             serde_json::from_str(r#"{"table":"t","seed":1,"options":{"z":2,"a":1},"queries":200}"#)
@@ -2927,6 +3095,52 @@ steps:
     }
 
     #[test]
+    fn wipe_instance_dir_keeps_only_relative_paths() {
+        let script = |arg: &str| {
+            Script::parse(&format!(
+                "name: w\nspicepod: {{}}\nsteps:\n  - stop: {{}}\n  - wipe-instance-dir: {arg}\n"
+            ))
+        };
+        let parsed = script("{}").expect("no paths kept");
+        assert!(matches!(
+            &parsed.steps[1].action,
+            Action::WipeInstanceDir { keep } if keep.is_empty()
+        ));
+        let parsed = script("{ keep: [state, 'meta/x'] }").expect("relative paths");
+        assert!(matches!(
+            &parsed.steps[1].action,
+            Action::WipeInstanceDir { keep } if keep == &["state".to_string(), "meta/x".to_string()]
+        ));
+        for (arg, error) in [
+            ("{ keep: ['/tmp'] }", "'/tmp' is not one"),
+            ("{ keep: ['../x'] }", "'../x' is not one"),
+            ("{ keep: [''] }", "'' is not one"),
+            ("{ keep: state }", "`keep` must be a list"),
+            ("{ remove: [x] }", "unknown option `remove`"),
+            ("[]", "takes a mapping"),
+        ] {
+            let message = format!("{:#}", script(arg).expect_err(arg));
+            assert!(message.contains(error), "{arg}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_rustfs_source_takes_a_latency() {
+        let script = Script::parse(
+            "name: l\nsources: { slow: { kind: rustfs, latency: 20ms } }\nspicepod: {}\nsteps: [{ start: {} }]\n",
+        )
+        .expect("latency parses");
+        assert_eq!(
+            script.sources["slow"].latency,
+            Some(Duration::from_millis(20))
+        );
+        Script::parse(
+            "name: l\nsources: { slow: { kind: rustfs, latency: soon } }\nspicepod: {}\nsteps: [{ start: {} }]\n",
+        )
+        .expect_err("not a duration");
+    }
+
+    #[test]
     fn a_corpus_marks_its_queries_with_its_position() {
         let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/spicescript");
         let script = Script::parse_in(
@@ -2952,7 +3166,7 @@ steps:
             .join("../../test/spicescript/known-failing/cayenne");
         let shared = SharedVariants::find(&group).expect("the suite's variants file parses");
         let script = Script::parse_in(
-            "name: p\nspicepod: {}\nvariants: { federated: federated, cayenne: cayenne-file, arrow: arrow, own: { env: { A: b } } }\nsteps: [ { start: {} } ]",
+            "name: p\nspicepod: {}\nvariants: { federated: federated, cayenne: cayenne-file, mem: cayenne-memory, own: { env: { A: b } } }\nsteps: [ { start: {} } ]",
             &group,
             &shared,
         )
@@ -2963,8 +3177,8 @@ steps:
             serde_json::json!({ "acceleration": { "enabled": true, "engine": "cayenne", "mode": "file" } })
         );
         assert_eq!(
-            script.variants["arrow"].datasets["*"],
-            serde_json::json!({ "acceleration": { "enabled": true, "engine": "arrow" } })
+            script.variants["mem"].datasets["*"],
+            serde_json::json!({ "acceleration": { "enabled": true, "engine": "cayenne", "mode": "memory" } })
         );
         assert_eq!(script.variants["own"].env["A"], "b");
         let err = Script::parse_in(

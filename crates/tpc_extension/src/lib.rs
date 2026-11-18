@@ -33,6 +33,14 @@ pub enum Error {
         source: data_components::adbc_helpers::ManagedDuckDbError,
     },
 
+    #[snafu(display(
+        "Failed to open the DuckDB database '{path}' for the TPC benchmark data: {source}. Check that the `path` parameter names a file Spice can create and write."
+    ))]
+    CreateDatabase {
+        path: String,
+        source: data_components::adbc_helpers::AdbcInitError,
+    },
+
     #[snafu(display("Failed to generate the {benchmark} data with DuckDB: {source}"))]
     Generate {
         benchmark: String,
@@ -159,20 +167,29 @@ impl Extension for TpcExtension {
 fn generate(path: &str, query: &str, benchmark: String) -> Result<(), Error> {
     use adbc_core::{Connection as _, Database as _, Statement as _};
     use data_components::adbc_helpers::{
-        DUCKDB_ADBC_ENTRYPOINT, DUCKDB_DRIVER, ManagedDuckDbError, check_duckdb_version,
-        load_adbc_database, managed_duckdb_options,
+        AdbcInitError, DUCKDB_ADBC_ENTRYPOINT, DUCKDB_DRIVER, ManagedDuckDbError,
+        check_duckdb_version, load_adbc_database, managed_duckdb_options,
     };
 
+    // Only a driver that fails to load means the library is missing; a database
+    // that fails to open (a bad path, no permission) keeps its own cause.
     let database = load_adbc_database(
         DUCKDB_DRIVER,
         Some(DUCKDB_ADBC_ENTRYPOINT),
         managed_duckdb_options(path, false),
     )
-    .map_err(|source| ManagedDuckDbError::MissingLibrary {
-        connector: "duckdb",
-        source,
-    })
-    .context(OpenDuckDbSnafu)?;
+    .map_err(|source| match source {
+        source @ AdbcInitError::LoadDriver { .. } => Error::OpenDuckDb {
+            source: ManagedDuckDbError::MissingLibrary {
+                connector: "duckdb",
+                source,
+            },
+        },
+        source => Error::CreateDatabase {
+            path: path.to_string(),
+            source,
+        },
+    })?;
     check_duckdb_version(&database, "duckdb").context(OpenDuckDbSnafu)?;
 
     let generate = || -> Result<(), adbc_core::error::Error> {
@@ -202,5 +219,23 @@ impl ExtensionFactory for TpcExtensionFactory {
         Box::new(TpcExtension {
             manifest: self.manifest.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use data_components::adbc_helpers::AdbcInitError;
+
+    #[test]
+    fn a_database_that_fails_to_open_names_the_path_not_the_library() {
+        assert_eq!(
+            Error::CreateDatabase {
+                path: "ro/tpch.db".to_string(),
+                source: AdbcInitError::Timeout,
+            }
+            .to_string(),
+            "Failed to open the DuckDB database 'ro/tpch.db' for the TPC benchmark data: ADBC driver initialization timed out after 120 seconds. Check that the `path` parameter names a file Spice can create and write."
+        );
     }
 }

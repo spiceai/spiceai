@@ -20,8 +20,8 @@
 #   TEST_FILTER   nextest filter within the module (default: empty = the whole
 #                 mutation_property_test module, so all convergence tests contend
 #                 with each other like CI). Pass e.g.
-#                 prop_sequential_key_impl_sqlite (fails fastest) or
-#                 prop_concurrent_mixed_key_sqlite to target one test.
+#                 prop_sequential_key_impl_on_data_store (fails fastest) or
+#                 prop_concurrent_mixed_key to target one test.
 #   ITERATIONS    number of times to run the selection (default: 10). The loop
 #                 stops early and exits non-zero on the first failing iteration.
 #

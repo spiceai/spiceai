@@ -26,8 +26,17 @@ limitations under the License.
 //! `${sources.<name>.shared_bucket}` is one bucket every instance of the run
 //! sees, for state that instances share, such as one `runtime.state.location`
 //! for two replicas.
+//!
+//! With `latency:`, a toxiproxy sharing the store's network namespace delays
+//! every response by that long, and `.endpoint` and `.params` reach the store
+//! through it, so `spiced` sees a remote store's round trip. Sharing the
+//! namespace takes no network from Docker's address pools, which concurrent
+//! runs exhaust. The image has no shell, so it is configured through its HTTP
+//! API, not `source-exec`. The harness's own requests go to the store
+//! directly.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -40,15 +49,25 @@ use crate::{
 };
 
 const USER: &str = "spicescript";
-const PASSWORD: &str = "spicescript-secret";
 
-fn spec(name: String) -> ContainerSpec {
+/// A secret of the store's own: 128 bits from two `SipHash` instances that the
+/// standard library keys from the operating system's randomness, so nothing
+/// outside this process can predict it. A fixed one would let anyone who
+/// reaches the store's port, published on every interface for bridged cluster
+/// executors (see `crate::runner::cluster`), read and rewrite its objects.
+fn store_secret() -> String {
+    use std::hash::BuildHasher;
+    let half = || std::collections::hash_map::RandomState::new().hash_one(USER);
+    format!("{:016x}{:016x}", half(), half())
+}
+
+fn spec(name: String, secret: &str) -> ContainerSpec {
     ContainerSpec {
         name,
         image: "rustfs/rustfs:1.0.1".into(),
         env: vec![
             ("RUSTFS_ACCESS_KEY".into(), USER.into()),
-            ("RUSTFS_SECRET_KEY".into(), PASSWORD.into()),
+            ("RUSTFS_SECRET_KEY".into(), secret.into()),
         ],
         command: Some(vec!["/data".into()]),
         ports: vec![9000],
@@ -58,24 +77,88 @@ fn spec(name: String) -> ContainerSpec {
     }
 }
 
+/// The proxy that delays the store's responses, for `latency:`.
+const TOXIPROXY_IMAGE: &str = "ghcr.io/shopify/toxiproxy:2.12.0";
+/// The proxy's API port.
+const TOXIPROXY_API: u16 = 8474;
+/// The port the proxy listens on for the store, beside the store's own 9000.
+const TOXIPROXY_LISTEN: u16 = 9100;
+
 pub struct ObjectStore {
     container: Container,
+    /// The toxiproxy `spiced` reaches the store through, with `latency:`.
+    proxy: Option<Container>,
     /// Where part files are written before they are uploaded.
     staging: PathBuf,
+    /// The secret key of [`USER`], this store's own (see [`store_secret`]).
+    secret: String,
 }
 
 impl ObjectStore {
-    pub async fn start(name: &str, run_id: &str, staging: PathBuf) -> Result<Self> {
-        let container = Container::start(spec(format!("spicescript-{run_id}-{name}"))).await?;
+    pub async fn start(
+        name: &str,
+        run_id: &str,
+        staging: PathBuf,
+        latency: Option<Duration>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&staging)?;
-        Ok(Self { container, staging })
+        let secret = store_secret();
+        let Some(latency) = latency else {
+            let container =
+                Container::start(spec(format!("spicescript-{run_id}-{name}"), &secret)).await?;
+            return Ok(Self {
+                container,
+                proxy: None,
+                staging,
+                secret,
+            });
+        };
+        // The store publishes the proxy's ports too: the proxy runs in its
+        // network namespace and reaches it on the loopback.
+        let mut store = spec(format!("spicescript-{run_id}-{name}"), &secret);
+        store.ports.extend([TOXIPROXY_API, TOXIPROXY_LISTEN]);
+        let container = Container::start(store).await?;
+        let proxy = Container::start(ContainerSpec {
+            name: format!("spicescript-{run_id}-{name}-proxy"),
+            image: TOXIPROXY_IMAGE.into(),
+            env: Vec::new(),
+            command: None,
+            ports: Vec::new(),
+            healthcheck: None,
+            network: Some(format!("container:{}", container.name)),
+            alias: None,
+        })
+        .await?;
+        configure_proxy(container.host_port(TOXIPROXY_API)?, latency)
+            .await
+            .with_context(|| {
+                format!("Failed to put {latency:?} of latency in front of '{name}'")
+            })?;
+        Ok(Self {
+            container,
+            proxy: Some(proxy),
+            staging,
+            secret,
+        })
     }
 
+    /// The store itself, for the harness's own requests.
     fn endpoint(&self) -> Result<String> {
         Ok(format!(
             "http://127.0.0.1:{}",
             self.container.host_port(9000)?
         ))
+    }
+
+    /// Where `spiced` reaches the store: through the proxy, when there is one.
+    fn spiced_endpoint(&self) -> Result<String> {
+        match &self.proxy {
+            Some(_) => Ok(format!(
+                "http://127.0.0.1:{}",
+                self.container.host_port(TOXIPROXY_LISTEN)?
+            )),
+            None => self.endpoint(),
+        }
     }
 
     /// Runs the `aws` CLI against the store; returns what it printed.
@@ -84,7 +167,7 @@ impl ObjectStore {
             .args(args)
             .args(["--endpoint-url", &self.endpoint()?])
             .env("AWS_ACCESS_KEY_ID", USER)
-            .env("AWS_SECRET_ACCESS_KEY", PASSWORD)
+            .env("AWS_SECRET_ACCESS_KEY", &self.secret)
             .env("AWS_DEFAULT_REGION", "us-east-1")
             .env("AWS_EC2_METADATA_DISABLED", "true")
             .output()
@@ -124,6 +207,138 @@ impl ObjectStore {
     }
 }
 
+impl ObjectStore {
+    /// The first key, in key order, under `prefix` that contains `contains`.
+    async fn first_key(&self, bucket: &str, prefix: &str, contains: &str) -> Result<String> {
+        let mut keys = self.keys(bucket, prefix).await?;
+        keys.sort();
+        keys.into_iter()
+            .find(|key| key.contains(contains))
+            .with_context(|| format!("No object under '{prefix}' contains '{contains}'"))
+    }
+}
+
+/// What `source-exec` does to an object store, one command per line, in the
+/// instance's bucket:
+///
+/// - `delete-first <prefix> <contains>` deletes the first key, in key order,
+///   under `<prefix>` that contains `<contains>`;
+/// - `truncate-first <prefix> <contains>` rewrites that object with its first
+///   half;
+/// - `copy <from-prefix> <to-prefix>` copies every object under one prefix to
+///   the same relative key under the other;
+/// - `delete-prefix <prefix>` deletes every object under a prefix.
+#[derive(Debug, PartialEq, Eq)]
+enum ObjectCommand {
+    DeleteFirst { prefix: String, contains: String },
+    TruncateFirst { prefix: String, contains: String },
+    Copy { from: String, to: String },
+    DeletePrefix { prefix: String },
+}
+
+impl ObjectCommand {
+    fn parse(line: &str) -> Result<Self> {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        Ok(match words.as_slice() {
+            ["delete-first", prefix, contains] => Self::DeleteFirst {
+                prefix: (*prefix).to_string(),
+                contains: (*contains).to_string(),
+            },
+            ["truncate-first", prefix, contains] => Self::TruncateFirst {
+                prefix: (*prefix).to_string(),
+                contains: (*contains).to_string(),
+            },
+            ["copy", from, to] => Self::Copy {
+                from: (*from).to_string(),
+                to: (*to).to_string(),
+            },
+            ["delete-prefix", prefix] => Self::DeletePrefix {
+                prefix: (*prefix).to_string(),
+            },
+            _ => bail!(
+                "an object store runs `delete-first <prefix> <contains>`, `truncate-first <prefix> <contains>`, `copy <from-prefix> <to-prefix>` or `delete-prefix <prefix>`, not `{line}`"
+            ),
+        })
+    }
+}
+
+/// `list-objects-v2 --query "Contents[].[Key,Size]" --output text`: one
+/// `key<TAB>size` line per object, or `None` when there are none.
+fn parse_key_sizes(out: &str) -> Result<Vec<(String, u64)>> {
+    out.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "None")
+        .map(|line| {
+            let (key, size) = line
+                .rsplit_once('\t')
+                .with_context(|| format!("unexpected listing line '{line}'"))?;
+            Ok((
+                key.to_string(),
+                size.trim()
+                    .parse()
+                    .with_context(|| format!("unexpected size in '{line}'"))?,
+            ))
+        })
+        .collect()
+}
+
+/// Creates the proxy to the store on its loopback and delays every response
+/// it relays by `latency`, through the toxiproxy API on `api_port`.
+async fn configure_proxy(api_port: u16, latency: Duration) -> Result<()> {
+    let api = format!("http://127.0.0.1:{api_port}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    // The API answers a moment after the container starts.
+    let mut last = None;
+    for _ in 0..80 {
+        match client.get(format!("{api}/version")).send().await {
+            Ok(response) if response.status().is_success() => {
+                last = None;
+                break;
+            }
+            Ok(response) => last = Some(anyhow::anyhow!("status {}", response.status())),
+            Err(e) => last = Some(e.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if let Some(e) = last {
+        return Err(e).context("the toxiproxy API did not answer");
+    }
+    let post = |path: String, body: serde_json::Value| {
+        let client = client.clone();
+        async move {
+            let response = client.post(&path).json(&body).send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!("POST {path}: {status}: {}", response.text().await?);
+            }
+            Ok(())
+        }
+    };
+    post(
+        format!("{api}/proxies"),
+        json!({
+            "name": "store",
+            "listen": format!("0.0.0.0:{TOXIPROXY_LISTEN}"),
+            "upstream": "127.0.0.1:9000",
+            "enabled": true,
+        }),
+    )
+    .await?;
+    post(
+        format!("{api}/proxies/store/toxics"),
+        json!({
+            "name": "latency",
+            "type": "latency",
+            "stream": "downstream",
+            "toxicity": 1.0,
+            "attributes": { "latency": u64::try_from(latency.as_millis())?, "jitter": 0 },
+        }),
+    )
+    .await
+}
+
 /// The bucket shared by every instance; no namespace bucket has this name,
 /// since those begin with the instance's index.
 const SHARED_BUCKET: &str = "shared";
@@ -137,6 +352,23 @@ fn bucket(namespace: &str) -> String {
 impl Source for ObjectStore {
     fn container(&self) -> Option<&Container> {
         Some(&self.container)
+    }
+
+    fn containers(&self) -> Vec<&Container> {
+        std::iter::once(&self.container)
+            .chain(self.proxy.as_ref())
+            .collect()
+    }
+
+    async fn remove(&self) -> Result<()> {
+        let Some(proxy) = &self.proxy else {
+            return self.container.remove().await;
+        };
+        // The proxy first: it lives in the store's network namespace.
+        let proxy_removed = proxy.remove().await;
+        let store_removed = self.container.remove().await;
+        proxy_removed?;
+        store_removed
     }
 
     async fn create_namespace(&self, namespace: &str) -> Result<super::Namespace> {
@@ -170,13 +402,13 @@ impl Source for ObjectStore {
                 .await
                 .with_context(|| format!("Failed to create bucket '{SHARED_BUCKET}'"))?;
         }
-        let endpoint = self.endpoint()?;
+        let endpoint = self.spiced_endpoint()?;
         let mut extra = serde_json::Map::new();
         extra.insert("bucket".into(), json!(bucket));
         extra.insert("shared_bucket".into(), json!(SHARED_BUCKET));
         extra.insert("endpoint".into(), json!(endpoint));
         extra.insert("key".into(), json!(USER));
-        extra.insert("secret".into(), json!(PASSWORD));
+        extra.insert("secret".into(), json!(self.secret));
         Ok(super::Namespace {
             params: json!({
                 "s3_endpoint": endpoint,
@@ -184,15 +416,75 @@ impl Source for ObjectStore {
                 "s3_url_style": "path",
                 "s3_auth": "key",
                 "s3_key": USER,
-                "s3_secret": PASSWORD,
+                "s3_secret": self.secret,
                 "allow_http": "true",
             }),
             extra,
         })
     }
 
-    async fn exec(&self, _namespace: &str, sql: &str) -> Result<()> {
-        bail!("an object store runs no SQL (`{sql}`); generate objects instead")
+    /// Runs object commands, one per line, in this instance's bucket (see
+    /// [`ObjectCommand`]); an object store runs no SQL.
+    async fn exec(&self, namespace: &str, commands: &str) -> Result<()> {
+        let bucket = bucket(namespace);
+        for line in commands
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            match ObjectCommand::parse(line)? {
+                ObjectCommand::DeleteFirst { prefix, contains } => {
+                    let key = self.first_key(&bucket, &prefix, &contains).await?;
+                    self.aws(&["s3", "rm", "--quiet", &format!("s3://{bucket}/{key}")])
+                        .await
+                        .with_context(|| format!("Failed to delete '{key}'"))?;
+                }
+                ObjectCommand::TruncateFirst { prefix, contains } => {
+                    let key = self.first_key(&bucket, &prefix, &contains).await?;
+                    let local = self.staging.join(namespace).join("truncated.object");
+                    if let Some(parent) = local.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let local_text = local.display().to_string();
+                    let remote = format!("s3://{bucket}/{key}");
+                    self.aws(&["s3", "cp", "--quiet", &remote, &local_text])
+                        .await
+                        .with_context(|| format!("Failed to download '{key}'"))?;
+                    let len = std::fs::metadata(&local)?.len();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&local)?
+                        .set_len(len / 2)?;
+                    self.aws(&["s3", "cp", "--quiet", &local_text, &remote])
+                        .await
+                        .with_context(|| format!("Failed to upload the truncated '{key}'"))?;
+                }
+                ObjectCommand::DeletePrefix { prefix } => {
+                    self.aws(&[
+                        "s3",
+                        "rm",
+                        "--recursive",
+                        "--quiet",
+                        &format!("s3://{bucket}/{prefix}"),
+                    ])
+                    .await
+                    .with_context(|| format!("Failed to delete '{prefix}'"))?;
+                }
+                ObjectCommand::Copy { from, to } => {
+                    self.aws(&[
+                        "s3",
+                        "cp",
+                        "--recursive",
+                        "--quiet",
+                        &format!("s3://{bucket}/{from}"),
+                        &format!("s3://{bucket}/{to}"),
+                    ])
+                    .await
+                    .with_context(|| format!("Failed to copy '{from}' to '{to}'"))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn query(&self, _namespace: &str, sql: &str) -> Result<TextResult> {
@@ -215,6 +507,24 @@ impl Source for ObjectStore {
 
     async fn list(&self, namespace: &str, prefix: &str) -> Result<Vec<String>> {
         self.keys(&bucket(namespace), prefix).await
+    }
+
+    async fn sizes(&self, namespace: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let out = self
+            .aws(&[
+                "s3api",
+                "list-objects-v2",
+                "--bucket",
+                &bucket(namespace),
+                "--prefix",
+                prefix,
+                "--query",
+                "Contents[].[Key,Size]",
+                "--output",
+                "text",
+            ])
+            .await?;
+        parse_key_sizes(&out)
     }
 
     /// Writes the part files locally, then uploads them under `<table>/`,
@@ -263,5 +573,60 @@ impl Source for ObjectStore {
         .await
         .with_context(|| format!("Failed to upload the parts of {}", spec.table))?;
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod object_command_tests {
+    use super::ObjectCommand;
+
+    #[test]
+    fn parses_each_command_and_refuses_anything_else() {
+        assert_eq!(
+            ObjectCommand::parse("delete-first state/cayenne/v1/datasets/ .vortex").expect("parse"),
+            ObjectCommand::DeleteFirst {
+                prefix: "state/cayenne/v1/datasets/".into(),
+                contains: ".vortex".into()
+            }
+        );
+        assert_eq!(
+            ObjectCommand::parse("truncate-first state/ _p000").expect("parse"),
+            ObjectCommand::TruncateFirst {
+                prefix: "state/".into(),
+                contains: "_p000".into()
+            }
+        );
+        assert_eq!(
+            ObjectCommand::parse("copy state/ moved/").expect("parse"),
+            ObjectCommand::Copy {
+                from: "state/".into(),
+                to: "moved/".into()
+            }
+        );
+        assert_eq!(
+            ObjectCommand::parse("delete-prefix state/").expect("parse"),
+            ObjectCommand::DeletePrefix {
+                prefix: "state/".into()
+            }
+        );
+        let error = ObjectCommand::parse("SELECT 1").expect_err("not a command");
+        assert!(error.to_string().contains("not `SELECT 1`"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_sizes;
+
+    #[test]
+    fn a_listing_with_sizes_parses_and_an_empty_one_is_empty() {
+        assert_eq!(
+            parse_key_sizes("state/a.vortex\t120\nstate/b/head\t7\n").expect("parse"),
+            vec![
+                ("state/a.vortex".to_string(), 120),
+                ("state/b/head".to_string(), 7)
+            ]
+        );
+        assert_eq!(parse_key_sizes("None\n").expect("parse"), Vec::new());
     }
 }

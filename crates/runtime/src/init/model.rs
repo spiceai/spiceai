@@ -17,6 +17,7 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use crate::model::try_to_evaluate_model;
@@ -37,6 +38,7 @@ use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 use telemetry::timing::TimeMeasurement;
 use tokio::{sync::oneshot, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 #[derive(Debug, Snafu)]
@@ -147,7 +149,9 @@ impl Runtime {
 
         // A node other than the first of a distributed model never reads the weights: the first
         // reads them and sends each node its share, so the files need exist only there.
-        if matches!(source, Some(ModelSource::File)) && !is_distributed_worker(&params) {
+        if matches!(source, Some(ModelSource::File))
+            && distributed_node_rank(&params).is_none_or(|rank| rank == 0)
+        {
             // Verify all referenced local files exist before attempting to load the model and determine its type.
             // Otherwise, we will fail to determine the model type and the error will be confusing.
             if let Err(err) = verify_local_files_exist(m) {
@@ -291,6 +295,13 @@ impl Runtime {
             .write()
             .await
             .insert(m.name.clone(), rate_controller);
+        let node_ranks = self.model_node_ranks();
+        let mut node_ranks = node_ranks.write().await;
+        match distributed_node_rank(params) {
+            Some(rank) => node_ranks.insert(m.name.clone(), rank),
+            None => node_ranks.remove(&m.name),
+        };
+        drop(node_ranks);
         // Last, so a request never finds the capabilities without the handlers.
         let model_capabilities = self.model_capabilities();
         model_capabilities
@@ -329,6 +340,8 @@ impl Runtime {
         let mut rc_map = model_rate_controllers.write().await;
         rc_map.remove(&m.name);
         drop(rc_map);
+
+        self.model_node_ranks().write().await.remove(&m.name);
 
         tracing::info!("Model [{}] has been unloaded", m.name);
         let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();
@@ -388,14 +401,19 @@ impl Runtime {
     /// `loaded`, except on a change to `tools` for those that use the installed app's `tools:`
     /// (`auto`, `all`, `search_registry`), which `loaded` got from the app before this change.
     /// That grouping never includes function tools.
+    ///
+    /// A change to `embeddings` reloads every model that uses tools, including those in
+    /// `loaded`: its tool search embeds with a model chosen from the installed app's
+    /// `embeddings:` when it loads.
     pub(crate) async fn reload_models_using_tools(
         self: &Arc<Self>,
         app: &App,
         tools: &HashSet<String>,
         function_tools: &HashSet<String>,
+        embeddings: &HashSet<String>,
         loaded: &HashSet<String>,
     ) {
-        if tools.is_empty() && function_tools.is_empty() {
+        if tools.is_empty() && function_tools.is_empty() && embeddings.is_empty() {
             return;
         }
         for model in &app.models {
@@ -409,8 +427,10 @@ impl Runtime {
             };
             let reload = match model_tool_use(model) {
                 ToolUse::None => false,
-                ToolUse::Configured(names) => !tools.is_empty() || names_changed(&names),
-                ToolUse::Named(names) => names_changed(&names),
+                ToolUse::Configured(names) => {
+                    !tools.is_empty() || !embeddings.is_empty() || names_changed(&names)
+                }
+                ToolUse::Named(names) => !embeddings.is_empty() || names_changed(&names),
             };
             if reload {
                 tracing::info!(
@@ -479,6 +499,15 @@ impl LoadTasks {
         }
     }
 
+    /// Whether a load of `name` is running.
+    #[cfg(test)]
+    pub(crate) fn is_running(&self, name: &str) -> bool {
+        self.tasks
+            .lock()
+            .get(name)
+            .is_some_and(|task| !task.is_finished())
+    }
+
     /// Stops the load of `name`. When this returns, no attempt to load it is
     /// running and none will start.
     pub(crate) async fn stop(&self, name: &str) {
@@ -487,6 +516,49 @@ impl LoadTasks {
             task.abort();
             // Waits until an attempt in progress is dropped.
             let _ = task.await;
+        }
+    }
+
+    /// Runs `attempt` as the load of `name`, replacing any load of it in progress, and retries
+    /// it with backoff while it returns `true`. The retries end when an attempt returns
+    /// `false`, [`Self::stop`] stops the load, or `shutdown` is cancelled.
+    ///
+    /// Returns after the first attempt, when the load is stopped, or after `wait` with the load
+    /// still running. Returns `false` only in that last case.
+    pub(crate) async fn load_until_loaded<F, Fut>(
+        &self,
+        name: &str,
+        shutdown: CancellationToken,
+        wait: Option<Duration>,
+        attempt: F,
+    ) -> bool
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        self.stop(name).await;
+        let (first_attempt_done, first_attempt) = oneshot::channel();
+        self.start(name, async move {
+            let attempts = async {
+                let mut retry = attempt().await;
+                let _ = first_attempt_done.send(());
+                let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
+                while retry && let Some(delay) = backoff.next_duration() {
+                    tokio::time::sleep(delay).await;
+                    retry = attempt().await;
+                }
+            };
+            tokio::select! {
+                () = attempts => {}
+                () = shutdown.cancelled() => {}
+            }
+        });
+        // Dropped without a send when the load is stopped.
+        if let Some(wait) = wait {
+            tokio::time::timeout(wait, first_attempt).await.is_ok()
+        } else {
+            let _ = first_attempt.await;
+            true
         }
     }
 }
@@ -518,17 +590,26 @@ fn model_error<'a>(
     }
 }
 
-/// Whether this node holds a share of a distributed model for another node, which serves it.
-/// It reads the params with their secrets and environment variables resolved, and parses them
-/// as the model's loader does, so both agree on which node this is.
-fn is_distributed_worker(params: &HashMap<String, SecretString>) -> bool {
-    params.get("distributed_backend").is_some_and(|backend| {
+/// This node's rank in a model split across several nodes (`distributed_backend: ring`), or
+/// `None` for a model that runs on one node. Rank 0 serves the model; every other rank holds a
+/// share of it for rank 0. It reads the params with their secrets and environment variables
+/// resolved, and parses them as the model's loader does, so both agree on which node this is: a
+/// missing or empty `node_rank` is rank 0, and one the loader refuses is `None`.
+fn distributed_node_rank(params: &HashMap<String, SecretString>) -> Option<usize> {
+    let ring = params.get("distributed_backend").is_some_and(|backend| {
         backend.expose_secret().parse::<DistributedBackendSetting>()
             == Ok(DistributedBackendSetting::Ring)
-    }) && params
+    });
+    if !ring {
+        return None;
+    }
+    match params
         .get("node_rank")
-        .and_then(|rank| rank.expose_secret().trim().parse::<usize>().ok())
-        .is_some_and(|rank| rank > 0)
+        .map(|rank| rank.expose_secret().trim())
+    {
+        None | Some("") => Some(0),
+        Some(rank) => rank.parse::<usize>().ok(),
+    }
 }
 
 fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
@@ -714,6 +795,64 @@ mod tests {
         assert!(reloaded_by("auto, lookup", "1", "2").await);
     }
 
+    /// A model's tool search embeds with a model it takes from the installed app when it loads,
+    /// so a change to an embedding model reloads each model that uses tools, and no other model.
+    #[tokio::test]
+    async fn a_change_to_an_embedding_model_reloads_the_models_that_use_tools() {
+        use crate::init::embedding::tests::{Provider as Embedder, embedding, serve};
+
+        let url = serve(&Embedder::accepting()).await;
+        let with_tools = Arc::new(Provider::default());
+        let without_tools = Arc::new(Provider::default());
+        with_tools.accepting.store(true, Ordering::SeqCst);
+        without_tools.accepting.store(true, Ordering::SeqCst);
+        let mut model = model_served_by(&with_tools).await;
+        model
+            .params
+            .insert("tools".to_string(), Value::String("auto".to_string()));
+        let mut plain = model_served_by(&without_tools).await;
+        plain.name = "plain".to_string();
+        let app = |key: &str| {
+            let mut e = embedding("e", &url);
+            e.params
+                .insert("openai_api_key".to_string(), Value::String(key.to_string()));
+            Arc::new(
+                AppBuilder::new("embedding_tool_reload")
+                    .with_embedding(e)
+                    .with_model(model.clone())
+                    .with_model(plain.clone())
+                    .build(),
+            )
+        };
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app(app("k1").as_ref().clone())
+                .build()
+                .await,
+        );
+        rt.load_embeddings().await;
+        Arc::clone(&rt).load_models().await;
+        let loads = (
+            with_tools.requests.load(Ordering::SeqCst),
+            without_tools.requests.load(Ordering::SeqCst),
+        );
+        assert!(
+            loads.0 > 0 && loads.1 > 0,
+            "a model never reached its provider"
+        );
+
+        assert!(Arc::clone(&rt).apply_app(app("k2")).await);
+        assert!(
+            with_tools.requests.load(Ordering::SeqCst) > loads.0,
+            "a change to an embedding model did not reload the model that uses tools"
+        );
+        assert_eq!(
+            without_tools.requests.load(Ordering::SeqCst),
+            loads.1,
+            "a change to an embedding model reloaded a model without tools"
+        );
+    }
+
     /// `auto` never includes function tools, so one named beside it reaches the model by name.
     #[tokio::test]
     async fn a_model_reloads_when_a_function_tool_it_names_beside_auto_changes() {
@@ -843,5 +982,46 @@ mod tests {
             "{rejected}"
         );
         assert!(is_permanent_model_failure(&rejected), "{rejected}");
+    }
+
+    /// The rank `/v1/models` reports, which also decides whether this node reads the weights,
+    /// is the one the loader reads: `parse_distributed_config` takes a missing or empty
+    /// `node_rank` as rank 0 and refuses one that is not a number, and a model without
+    /// `distributed_backend: ring` runs on one node.
+    #[test]
+    fn a_models_node_rank_is_read_as_its_loader_reads_it() {
+        let params = |pairs: &[(&str, &str)]| -> HashMap<String, SecretString> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), SecretString::from((*value).to_string())))
+                .collect()
+        };
+        for (pairs, expected) in [
+            (
+                &[("distributed_backend", "ring"), ("node_rank", "2")][..],
+                Some(2),
+            ),
+            (
+                &[("distributed_backend", "Ring"), ("node_rank", " 1 ")][..],
+                Some(1),
+            ),
+            (&[("distributed_backend", "ring")][..], Some(0)),
+            (
+                &[("distributed_backend", "ring"), ("node_rank", "")][..],
+                Some(0),
+            ),
+            (
+                &[("distributed_backend", "ring"), ("node_rank", "first")][..],
+                None,
+            ),
+            (
+                &[("distributed_backend", "none"), ("node_rank", "1")][..],
+                None,
+            ),
+            (&[("node_rank", "1")][..], None),
+            (&[][..], None),
+        ] {
+            assert_eq!(distributed_node_rank(&params(pairs)), expected, "{pairs:?}");
+        }
     }
 }

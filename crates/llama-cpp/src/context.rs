@@ -318,13 +318,38 @@ impl Context<'_> {
     /// `None` for a sequence the context does not hold.
     #[must_use]
     pub fn partial_state_seq(&self, seq: i32) -> Option<Vec<u8>> {
+        self.state_seq_with(seq, PARTIAL_ONLY)
+    }
+
+    /// Sequence `seq`'s whole state: its attention cache cells with their positions, and any
+    /// recurrent state, as llama.cpp's server saves a prompt to host memory. Restored with
+    /// [`Context::restore_state_seq`] into an empty sequence of a context like this one, it
+    /// decodes as the sequence it was saved from would have. `None` for a sequence the context
+    /// does not hold or that holds nothing.
+    #[must_use]
+    pub fn state_seq(&self, seq: i32) -> Option<Vec<u8>> {
+        self.state_seq_with(seq, 0)
+    }
+
+    /// How many bytes [`Context::state_seq`] would return for sequence `seq`, counted without
+    /// reading any cell's data; 0 for a sequence the context does not hold.
+    #[must_use]
+    pub fn state_seq_size(&self, seq: i32) -> usize {
+        if !self.holds(seq) {
+            return 0;
+        }
+        // SAFETY: `raw` is live while `self` is (see `Context`), `seq` is one of its sequences,
+        // and sizing a sequence's state reads the context without changing it.
+        unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, 0) }
+    }
+
+    fn state_seq_with(&self, seq: i32, flags: sys::llama_state_seq_flags) -> Option<Vec<u8>> {
         if !self.holds(seq) {
             return None;
         }
         // SAFETY: `raw` is live while `self` is (see `Context`), `seq` is one of its sequences,
         // and sizing a sequence's state reads the context without changing it.
-        let size =
-            unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, PARTIAL_ONLY) };
+        let size = unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, flags) };
         let mut state = vec![0u8; size];
         // SAFETY: `raw` is live (see `Context`), and llama.cpp writes at most `size` bytes into
         // `state`, which holds `size` writable bytes.
@@ -334,7 +359,7 @@ impl Context<'_> {
                 state.as_mut_ptr(),
                 size,
                 seq,
-                PARTIAL_ONLY,
+                flags,
             )
         };
         (size > 0 && written == size).then_some(state)
@@ -349,6 +374,23 @@ impl Context<'_> {
     /// Restores a state [`Context::partial_state_seq`] saved into sequence `seq`. Returns false
     /// for a sequence the context does not hold, or when llama.cpp does not read all of it.
     pub fn restore_partial_state_seq(&mut self, seq: i32, state: &[u8]) -> bool {
+        self.restore_state_seq_with(seq, state, PARTIAL_ONLY)
+    }
+
+    /// Restores a state [`Context::state_seq`] saved into sequence `seq`, which must hold
+    /// nothing. Returns false for a sequence the context does not hold, or when llama.cpp does
+    /// not read all of it, as when the cache has no room for its cells; llama.cpp then leaves
+    /// the sequence empty.
+    pub fn restore_state_seq(&mut self, seq: i32, state: &[u8]) -> bool {
+        self.restore_state_seq_with(seq, state, 0)
+    }
+
+    fn restore_state_seq_with(
+        &mut self,
+        seq: i32,
+        state: &[u8],
+        flags: sys::llama_state_seq_flags,
+    ) -> bool {
         if !self.holds(seq) {
             return false;
         }
@@ -361,7 +403,7 @@ impl Context<'_> {
                 state.as_ptr(),
                 state.len(),
                 seq,
-                PARTIAL_ONLY,
+                flags,
             )
         };
         !state.is_empty() && read == state.len()

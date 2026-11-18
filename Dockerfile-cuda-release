@@ -1,13 +1,11 @@
-#syntax=docker/dockerfile:1.7
+#syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 # spiced is built against the CUDA 12.6 toolkit (.github/actions/spiced-cuda-build),
 # and CUDA 12.x runtime libraries are backward compatible with binaries built on
 # an older 12.x toolkit, so any 12.x runtime >= 12.6 works. Keep this on the
-# newest 12.x tag NVIDIA still refreshes.
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04
-ARG CUDA_COMPAT_VERSION=12-9
+# newest 12.x tag NVIDIA still refreshes, and keep both stages on the same image.
 
-FROM ${CUDA_RUNTIME_IMAGE} AS binary
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04@sha256:070f8f2672df1b05b84c0409a5fd1d54ddfd646e5b9d8dee7878131271b563fc AS binary
 
 ARG REL_VERSION
 ARG CUDA_COMPUTE_CAP=80
@@ -57,13 +55,12 @@ RUN set -eux; \
     tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so; \
     rm -f /tmp/libduckdb.tar.gz
 
-FROM ${CUDA_RUNTIME_IMAGE} AS runtime
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04@sha256:070f8f2672df1b05b84c0409a5fd1d54ddfd646e5b9d8dee7878131271b563fc AS runtime
 
 ENV CUDA_NVCC_FLAGS=-fPIE
 
 ARG CARGO_FEATURES=default
 ARG CUDA_COMPUTE_CAP=80
-ARG CUDA_COMPAT_VERSION
 # Set to a unique value per release build so the apt layer is never served
 # from the build cache and picks up the current Ubuntu security updates.
 ARG APT_CACHE_BUST=
@@ -73,11 +70,15 @@ RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
 
 # Upgrade the base image's packages too: the CUDA base tag is not rebuilt for
 # every Ubuntu security update. Only the package lists are removed afterwards
-# so the dpkg database stays intact for image scanners.
+# so the dpkg database stays intact for image scanners. cuda-compat follows the
+# base image's CUDA_VERSION (12.9.2 -> cuda-compat-12-9), so a new base tag
+# cannot pair with the previous minor's compat package.
 RUN echo "apt cache bust: ${APT_CACHE_BUST}" \
+    && : "${CUDA_VERSION:?the CUDA base image sets CUDA_VERSION}" \
+    && cuda_compat_version="$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr . -)" \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes --no-install-recommends \
-    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates libssl3 tzdata "cuda-compat-${CUDA_COMPAT_VERSION}" \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates libssl3 tzdata "cuda-compat-${cuda_compat_version}" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/apt/* /var/log/dpkg.log
 

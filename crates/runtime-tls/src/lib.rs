@@ -25,14 +25,47 @@ limitations under the License.
 pub mod flight_incoming;
 pub mod reload;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use rustls::ServerConfig;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use x509_certificate::X509Certificate;
 
 pub use reload::{
     CertWatcher, ClientTrustPaths, ClientTrustPem, ReloadError, ReloadScope, ReloadableServerCerts,
 };
+
+/// How long a client has to complete the TLS handshake on any listener.
+/// Without a deadline, a connection that never sends a `ClientHello` holds its
+/// task and socket for as long as it stays open.
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs the server side of a TLS handshake, and fails it with
+/// [`io::ErrorKind::TimedOut`] if the client does not complete it within
+/// `handshake_timeout`.
+///
+/// # Errors
+///
+/// Returns the handshake's error, or a timeout error.
+pub async fn accept_within<IO>(
+    acceptor: &TlsAcceptor,
+    stream: IO,
+    handshake_timeout: Duration,
+) -> io::Result<TlsStream<IO>>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the client did not complete the TLS handshake in time",
+            ))
+        })
+}
+
 /// Process-wide TLS reload control plane.
 ///
 /// `TlsControl` is the single owner of the underlying [`CertWatcher`] for

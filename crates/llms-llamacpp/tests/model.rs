@@ -329,6 +329,94 @@ async fn a_streamed_reply_is_the_non_streamed_one() {
     );
 }
 
+/// A streamed reply carries the model's reasoning as it is generated, in `reasoning_content`,
+/// then its answer, and the fragments add up to the non-streamed reply's reasoning and answer
+/// exactly.
+///
+/// The replies are kept short because two greedy runs can take different tokens at a near-tie:
+/// at 1024 tokens they wrote "30 + 12, which is 42" and "30 + 12 = 42" 1739 characters in.
+#[tokio::test]
+async fn a_streamed_reply_carries_the_non_streamed_reasoning() {
+    // Thinks for about 100 tokens, then answers "yes": the stream turns from reasoning to answer.
+    streamed_reasoning_matches("Reply with only the word yes.", 256, Answer::AfterReasoning).await;
+    // Stops at 64 tokens, all of them reasoning: the reply that used to stream nothing at all.
+    streamed_reasoning_matches(
+        "What is 17 + 25? Reply with only the number.",
+        64,
+        Answer::None,
+    )
+    .await;
+}
+
+/// Whether a reply is expected to reach its answer.
+enum Answer {
+    AfterReasoning,
+    None,
+}
+
+async fn streamed_reasoning_matches(prompt: &str, max_tokens: u32, answer: Answer) {
+    let model = qwen3().await;
+    let body = json!({
+        "model": "qwen3",
+        "messages": [{ "role": "user", "content": prompt }],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    });
+    let whole = model
+        .chat_request(request(body.clone()))
+        .await
+        .expect("a reply");
+    let message = &whole.choices[0].message;
+    // Two empty reasonings, or two empty answers, agree and compare nothing.
+    assert!(
+        message
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty()),
+        "{message:?}"
+    );
+    match answer {
+        Answer::AfterReasoning => assert!(
+            message
+                .content
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty()),
+            "{message:?}"
+        ),
+        Answer::None => assert_eq!(message.content.as_deref(), Some(""), "{message:?}"),
+    }
+    let mut streamed_body = body;
+    streamed_body["stream"] = json!(true);
+    let mut stream = model
+        .chat_stream(request(streamed_body))
+        .await
+        .expect("a stream");
+    let (mut reasoning, mut content, mut answer_started) = (String::new(), String::new(), false);
+    while let Some(chunk) = stream.next().await {
+        for choice in chunk.expect("a chunk").choices {
+            let delta = choice.delta;
+            assert!(
+                delta.reasoning_content.is_none() || delta.content.is_none(),
+                "a chunk carries reasoning or answer, never both: {delta:?}"
+            );
+            if let Some(fragment) = delta.reasoning_content {
+                assert!(!fragment.is_empty(), "an empty reasoning fragment");
+                assert!(
+                    !answer_started,
+                    "reasoning after the answer began: {fragment:?}"
+                );
+                reasoning.push_str(&fragment);
+            }
+            if let Some(fragment) = delta.content {
+                answer_started |= !fragment.is_empty();
+                content.push_str(&fragment);
+            }
+        }
+    }
+    assert_eq!(Some(reasoning), message.reasoning_content, "{prompt}");
+    assert_eq!(Some(content), message.content, "{prompt}");
+}
+
 #[tokio::test]
 async fn max_tokens_ends_the_reply_at_its_length() {
     let model = qwen3().await;
@@ -489,10 +577,11 @@ async fn under_tool_choice_none_a_json_schema_reply_keeps_its_schema() {
 #[tokio::test]
 async fn a_model_dropped_under_a_stalled_stream_stops_promptly() {
     // The stream's buffer holds 64 tokens, and only the count drained after the drop shows it
-    // was full. Alone, Qwen3-0.6B decodes 64 tokens in well under a second, but this binary
-    // loads a model per test and runs them at once, and on a contended runner the buffer has
-    // held 48 chunks 3 s after the first. So an attempt whose buffer was not yet full is run
-    // again with twice the wait, until one shows the decode thread blocked on a full buffer.
+    // stopped filling, with the decode thread waiting on the client. Alone, Qwen3-0.6B decodes
+    // 64 tokens in well under a second, but this binary loads a model per test and runs them at
+    // once, and on a contended runner the buffer has held 48 chunks 3 s after the first. So an
+    // attempt whose buffer was still filling is run again with twice the wait, until one shows
+    // the decode thread waiting on a stalled client.
     let mut last = 0;
     for wait in [3, 6, 12, 24, 48].map(std::time::Duration::from_secs) {
         let model = qwen3().await;
@@ -524,7 +613,10 @@ async fn a_model_dropped_under_a_stalled_stream_stops_promptly() {
         while let Some(Ok(_)) = stream.next().await {
             buffered += 1;
         }
-        if buffered >= 64 {
+        // The scheduler decodes for a request only while its buffer has room for one step's
+        // events, 2 x (drafts + 1) + 4 = 6 for this model without drafts, so a stalled client's
+        // buffer stops filling at 64 - 5.
+        if buffered >= llms_llamacpp::STREAM_BUFFER - 5 {
             return;
         }
         last = buffered;

@@ -1217,13 +1217,14 @@ impl ClientDriver {
             "Spice Cloud Connect: received a Spicepod deployment"
         );
 
+        // No payload is how the control plane deploys an app with no secrets.
         let delivered = match cmd.sealed_secret_payload.as_ref() {
-            None => None,
+            None => crate::sealed_secrets::DeliveredSecrets::new(),
             Some(payload) => match self
                 .open_delivered_secrets(payload, command_id, session_key)
                 .await
             {
-                Ok(secrets) => Some(secrets),
+                Ok(secrets) => secrets,
                 Err(err) => {
                     send_command_error(tx, command_id, &err).await;
                     return;
@@ -2457,7 +2458,7 @@ mod tests {
         // No enrollment bundle and no dev CA: native roots alone.
         let trust = server_trust("", None);
         assert!(trust.native_roots);
-        assert!(trust.extra_cas.is_empty());
+        assert_eq!(trust.extra_cas, [] as [&str; 0]);
     }
 
     #[test]

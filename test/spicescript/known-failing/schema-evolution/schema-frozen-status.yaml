@@ -16,6 +16,8 @@ variants:
   block: {}
   append-new-columns: { datasets: { cham: { on_schema_change: append_new_columns } } }
   sync-all-columns: { datasets: { cham: { on_schema_change: sync_all_columns } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 
 spicepod:
   version: v1

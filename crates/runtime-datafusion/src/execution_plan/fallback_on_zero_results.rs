@@ -18,10 +18,15 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::common::TableReference;
+use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
@@ -161,6 +166,57 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 "FallbackOnZeroResultsScanExec expects exactly one input".to_string(),
             ))
         }
+    }
+
+    /// Lets the query's static filters reach the accelerated scan.
+    ///
+    /// An accelerator such as Cayenne applies a data predicate only when the
+    /// physical `FilterPushdown` rule hands it one: `filter_plan` in `execute`
+    /// is built after optimization and never reaches the scan. With the trait
+    /// default, which bars every filter, a lookup decodes the whole table
+    /// before the zero-results check filters it.
+    ///
+    /// Only the `Pre` phase passes filters through. Its filters are static
+    /// predicates over this table, normally the scan's own filters that
+    /// `execute` already applies to the accelerated rows before deciding, so
+    /// the decision is unchanged. Any other static predicate is part of the
+    /// decision as well: zero accelerated rows after it sends the query to the
+    /// source, as `on_zero_results: use_source` describes. A `Post` phase
+    /// filter is a join's or a `TopK`'s runtime filter: it could empty the
+    /// accelerated side for rows the query still needs and send a hit to the
+    /// source, so it is not pushed.
+    fn gather_filters_for_pushdown(
+        &self,
+        phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        match phase {
+            FilterPushdownPhase::Pre => {
+                FilterDescription::from_children(parent_filters, &self.children())
+            }
+            FilterPushdownPhase::Post => Ok(FilterDescription::all_unsupported(
+                &parent_filters,
+                &self.children(),
+            )),
+        }
+    }
+
+    /// Reports every filter as not handled, so the parent `FilterExec` stays.
+    ///
+    /// The filters were pushed into the accelerated input only. The fallback
+    /// scan is planned at execution time from the logical filters, which need
+    /// not be the same expressions, so the parent keeps filtering whichever
+    /// side answered. It filters the few rows a lookup returns.
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::all_unsupported(
+            child_pushdown_result,
+        ))
     }
 
     fn execute(
@@ -496,6 +552,100 @@ mod tests {
                 .indent(true)
                 .to_string();
             insta::assert_snapshot!(plan_display);
+        }
+
+        /// `on_zero_results: use_source` on an accelerator that filters only
+        /// through physical pushdown (Cayenne): without the predicate in the
+        /// scan, a single-row lookup decodes every row of the table.
+        #[test]
+        fn test_query_filter_reaches_accelerated_scan() {
+            use datafusion::logical_expr::Operator;
+            use datafusion::physical_expr::expressions::{binary, col, lit};
+            use datafusion::physical_optimizer::PhysicalOptimizerRule;
+            use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
+            use datafusion::physical_plan::filter::FilterExec;
+
+            let ctx = SessionContext::new();
+            let fallback = Arc::new(FallbackOnZeroResultsScanExec::new(
+                TableReference::bare("test"),
+                single_group_parquet_exec(4),
+                create_fallback_provider(Arc::new(
+                    datafusion::catalog::MemTable::try_new(schema(), vec![vec![]])
+                        .expect("memtable should not panic"),
+                )),
+                TableScanParams {
+                    state: Arc::new(ctx.state()),
+                    projection: None,
+                    filters: vec![],
+                    limit: None,
+                },
+                static_keep_filters(vec![]),
+            ));
+            let predicate = binary(
+                col("a", &schema()).expect("column a exists"),
+                Operator::Eq,
+                lit(42_i64),
+                &schema(),
+            )
+            .expect("valid predicate");
+            let plan: Arc<dyn ExecutionPlan> =
+                Arc::new(FilterExec::try_new(predicate, fallback).expect("valid filter"));
+
+            let state = ctx.state();
+            let optimized = FilterPushdown::new()
+                .optimize(plan, state.config_options())
+                .expect("filter pushdown should succeed");
+            let plan_display = datafusion::physical_plan::displayable(optimized.as_ref())
+                .indent(true)
+                .to_string();
+
+            assert!(
+                plan_display.contains("predicate=a@0 = 42"),
+                "the accelerated scan should receive the query filter:\n{plan_display}"
+            );
+            assert!(
+                plan_display.starts_with("FilterExec: a@0 = 42"),
+                "the filter should stay above the fallback, which may answer from the source:\n{plan_display}"
+            );
+        }
+
+        /// A runtime filter (hash join, `TopK`) must not reach the accelerated
+        /// scan: it could empty it and send a hit to the source.
+        #[test]
+        fn test_post_phase_filter_is_not_pushed() {
+            let ctx = SessionContext::new();
+            let fallback = FallbackOnZeroResultsScanExec::new(
+                TableReference::bare("test"),
+                single_group_parquet_exec(1),
+                create_fallback_provider(Arc::new(
+                    datafusion::catalog::MemTable::try_new(schema(), vec![vec![]])
+                        .expect("memtable should not panic"),
+                )),
+                TableScanParams {
+                    state: Arc::new(ctx.state()),
+                    projection: None,
+                    filters: vec![],
+                    limit: None,
+                },
+                static_keep_filters(vec![]),
+            );
+            let filter = datafusion::physical_expr::expressions::lit(true);
+            let description = fallback
+                .gather_filters_for_pushdown(
+                    FilterPushdownPhase::Post,
+                    vec![filter],
+                    ctx.state().config_options(),
+                )
+                .expect("gather should succeed");
+            let pushed = description.parent_filters();
+            assert_eq!(pushed.len(), 1);
+            assert!(
+                pushed[0].iter().all(|f| matches!(
+                    f.discriminant,
+                    datafusion::physical_plan::filter_pushdown::PushedDown::No
+                )),
+                "a Post phase filter must not be pushed into the accelerated scan"
+            );
         }
     }
 

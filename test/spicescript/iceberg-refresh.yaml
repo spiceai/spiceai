@@ -11,6 +11,8 @@ variants:
   federated: {}
   cayenne:
     datasets: { orders: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  # `cayenne` with the prototype object-native Cayenne metastore.
+  cayenne-object-native: { datasets: { orders: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }, spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
 
 spicepod:
   version: v1
@@ -47,7 +49,7 @@ steps:
         - DELETE FROM orders WHERE id % 7 = 0
         - UPDATE orders SET total = total + 100 WHERE id % 11 = 0
   - refresh: orders
-    only: cayenne
+    only: [cayenne, cayenne-object-native]
   - query: SELECT * FROM orders
     eventually: 30s
   - query: SELECT status, count(*), sum(total), min(placed), max(placed) FROM orders GROUP BY status

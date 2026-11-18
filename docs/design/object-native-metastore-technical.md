@@ -2,12 +2,12 @@
 
 Status: **draft for discussion.** This is the technical companion to the
 [direction document](object-native-metastore.md), which holds the goals, the
-milestones, decisions 1.1–1.10, 2.1–2.2 and 3.1–3.5, and every rejected
+milestones, decisions 1.1–1.14, 2.1–2.2 and 3.1–3.5, and every rejected
 alternative. This document says what to build: the components, the rules each
 follows, and the order of work, with the code each step changes. It is not a
 full specification. Exact rules and their proofs live in the protocol model,
 [`crates/cayenne-metastore-model`](../../crates/cayenne-metastore-model/README.md).
-The user-facing surface is Enhancement [#15760](https://github.com/spiceai/spiceai/issues/15760); nothing here adds a user decision
+The user-facing surface is Enhancement [#16245](https://github.com/spiceai/spiceai/issues/16245); nothing here adds a user decision
 beyond `runtime.state.location`.
 
 **How to read it.** The [Summary](#summary) gives the whole picture. The
@@ -37,6 +37,8 @@ the head's `checkpoint` field the *floor*; run names keep those words.
 *mem-tier* is Cayenne's in-memory write buffer. A *file group* is a set of files
 that share a delete fence; the *bake* merges file groups. *Coverage* and
 `applied_through` are defined under [What the state holds](#what-the-state-holds).
+A dataset's *data path* is the folder its data files live under; in the
+destination it is `datasets/<folder>/data` ([Placement and the data path](#placement-and-the-data-path)).
 
 ## Summary
 
@@ -66,7 +68,7 @@ object it names.
 
 ![The stored objects of one dataset: the lease, the head, batches, records, the checkpoint root, pages and data files, with their paths, fields and references](object-native-metastore-objects.svg)
 
-*Diagram 1: the stored objects of one dataset. Only the head and the lease are ever rewritten. Every other object is written once and becomes visible when the head or a record references it. The dataset state is these objects folded by `apply`, in memory.*
+*Diagram 1: the stored objects of one dataset. Only the head and the lease are ever rewritten. Every other object is written once and becomes visible when the head or a record references it. The data side is described under [Data files](#data-files). The dataset state is these objects folded by `apply`, in memory.*
 
 ## What it builds on
 
@@ -184,12 +186,14 @@ version and the rest re-read and retry, so a dataset completes about one head
 replacement per round trip.
 
 **Local directories: each durable write does its own full flush.** A local
-create or CAS is durable across power loss before it returns. It syncs its
+directory is the local and on-prem path. Its state survives a process crash or
+kill; whether it survives a power loss is an [open decision](#open-decisions).
+A local create or CAS syncs its
 staged file, links or renames it into place, then syncs the directory, both with
 `sync_all`, which Rust's standard library implements with `F_FULLFSYNC` on
 macOS: two full flushes per write. A head is written only after every object it
-references has returned, so a power loss cannot keep a head whose objects are
-gone. A `file://` `runtime.state.location` uses the same writes. A prototype's
+references has returned, so a head is never written ahead of its objects. A `file://` `runtime.state.location` uses the same writes, and so do
+local data files ([Storage](#storage-one-store-per-dataset)). A prototype's
 durable local CAS measured P99 14.4 ms and P99.9 19.3 ms (n = 10,000; 3b06c85377,
 2026-10-28), less than an S3 PUT, so Cayenne has to perform well at object-store
 latency anyway. The cost is cut by committing less often, at acknowledgement
@@ -210,7 +214,7 @@ sequenceDiagram
         Note over M: queryable on this node, not yet committed
     end
     Note over W: commit trigger: a CDC position waiting to be acked (~2 s), a SQL COMMIT, or a freshness bound. Nothing is acknowledged yet
-    W->>S: PUT data/<table_id>/<write_id>_<ordinal>.vortex and objects/<kind>/<owner>-<counter> (parallel)
+    W->>S: PUT data/<table_id>/<write_id>_<n>.vortex and objects/<kind>/<owner>-<counter> (parallel)
     W->>W: guards and the age check against the state at head version V
     opt inline records full
         W->>S: ensure wal/<first commit>-<owner> exists (usually already sealed)
@@ -300,7 +304,7 @@ attempt, while a **new attempt** has a fresh id and may carry re-planned bytes.
   still land.
 - **An unresolved attempt is reported at once; it is final only past the evidence
   horizon.** While an attempt is unresolved, for example because the destination
-  did not respond, Spice logs **commit outcome unknown** ([#15760](https://github.com/spiceai/spiceai/issues/15760)) and resolves it
+  did not respond, Spice logs **commit outcome unknown** and resolves it
   again on the next commit or on restart; the source is not acknowledged
   meanwhile. An attempt still unresolved past the evidence horizon is *final
   unresolved*: it is never retried, as a database reports a connection dropped
@@ -354,7 +358,7 @@ Model: `commit-no-lease`, `commits-commit*`; standbys: `standby`, `standby-three
 ## Readers
 
 - **The head is a cached value,** kept with its ETag and treated as fresh for the
-  dataset's staleness bound S. A query that finds it older refreshes it with a
+  staleness bound S. A query that finds it older refreshes it with a
   conditional GET (`If-None-Match`); concurrent queries share one refresh. A 304
   means nothing changed; a 200 carries the inline records. S3 `GetObject` and GCS and
   Azure reads accept `If-None-Match`, and `object_store` exposes it as
@@ -368,10 +372,12 @@ Model: `commit-no-lease`, `commits-commit*`; standbys: `standby`, `standby-three
   `reads-bounded`, `reads-linearizable`; counting from the response fails:
   `reads-response-time`, and with S = 0 so does serving a GET sent before the
   query started: `reads-tick-only`).
-- **Datasets in use refresh in the background** if queried within the last one
-  or two intervals. Refreshing early is always safe. A dataset nobody queries
-  costs nothing, and a writer never polls its own datasets.
-- **Cost.** Head reads scale with datasets in use per node divided by S. A query
+- **Every instance polls** the head of each dataset it has open about every
+  10 s, so S holds for a query on any instance, and the retention T
+  is sized from it. Refreshing early is always safe, and a writer never polls
+  its own datasets.
+- **Cost.** Head reads scale with datasets open per node divided by the poll
+  interval; an unchanged head costs one GET with no body. A query
   on a stale dataset waits for one head read (not measured; tens of milliseconds
   on S3 Standard). Readers outnumber writers, which is why a poll is one GET.
   Every system surveyed (SlateDB, Lance, Delta Lake, Iceberg) polls; writers
@@ -387,6 +393,18 @@ Model: `commit-no-lease`, `commits-commit*`; standbys: `standby`, `standby-three
 - **A referenced object that is missing is an error, never an empty result**
   (I4). A listed batch missing above the checkpoint is an error, never an empty
   range; a reader older than the checkpoint reopens from it.
+- **A data file the committed state names and the store cannot serve fails the
+  query** with a typed error: `DataFileError::Missing` for a data file or
+  deletion vector that is not in the store, `DataFileError::Unreadable` for one
+  shorter than its commit recorded (`dataset_storage.rs`). The message names the
+  dataset, the file and the data path, says the query fails rather than return
+  partial rows (or rows the dataset deleted), and gives the recovery: start the
+  dataset once with `acceleration.mode: file_create`, which reloads it from its
+  source into a new folder. Spice does not reload on its own: a reload re-reads
+  the whole source and replaces the copy, which the user decides. The text is
+  [#16245](https://github.com/spiceai/spiceai/issues/16245)'s. The scenario
+  `object-native-data.yaml` truncates a data file, then deletes it, and checks
+  the error each time.
 - **Readers consult only the head and what it lists,** so a late write elsewhere,
   such as a stale batch create, cannot change what they read.
 - **A record whose guards fail on apply** is a corruption error that refuses the
@@ -436,7 +454,7 @@ flowchart LR
     B41["wal/41-&lt;owner&gt;<br/>records 41–42"]
 
     OBJ["objects/&lt;kind&gt;/&lt;owner&gt;-&lt;counter&gt;<br/>stats · cold manifest"]
-    VX["data/&lt;table_id&gt;/&lt;write_id&gt;_&lt;ordinal&gt;.vortex<br/>data/&lt;table_id&gt;/delete_&lt;uuidv7&gt;.arrow"]
+    VX["data/&lt;table_id&gt;/&lt;write_id&gt;_&lt;n&gt;.vortex<br/>data/&lt;table_id&gt;/deletions/delete_&lt;uuidv7&gt;.arrow"]
 
     HEAD -->|"1 · GET head"| APPLY
     HEAD -->|"2 · names checkpoint and batches"| ROOT
@@ -471,12 +489,14 @@ Model: `naming`, `naming-no-commit-number`, `commits-storage-no-published-2-exha
 
 Per dataset, a **dataset entry** (name, partitions), and per table:
 
-- **The table entry:** config, schema reference, the `seq` high-water mark, file
-  groups, index runs, and the statistics and cold-manifest references.
+- **The table entry:** config, schema reference, the data path (relative to
+  the destination when it is under it, [decision 1.14](object-native-metastore.md#milestone-1)),
+  the `seq` high-water mark, file groups, index runs, and the statistics and
+  cold-manifest references.
   `CreateTable`, `SetSchema` and `DropTable` change it, each guarded (the name is
   free, the table exists), so a racing or stale writer has no effect. The
   *current snapshot* is the set of live files in no file group; where a stable
-  identity is needed (cache keys, directory names), it is the commit number of
+  identity is needed (cache keys), it is the commit number of
   the last record that replaced that set.
 - **Live files:** path, rows, bytes, min/max `seq`, digest, per-file statistics,
   PK min/max, file group, the adding commit, and `applied_through`: the deletes
@@ -494,7 +514,7 @@ Per dataset, a **dataset entry** (name, partitions), and per table:
 - **Deletion vectors:** path, kind (key or position), the target file of a
   position delete, `seq`, reinsert `seq`, count and size, in pages sorted by
   (`seq`, id); small recent ones are inline in their record. Changed by
-  `AddDeleteFiles`, `RemoveDeleteFiles{ids}` (the orphan sweep) and
+  `AddDeleteFiles`, `RemoveDeleteFiles{ids}` (the deletion-vector sweep) and
   `ClearDeleteFiles{seq_le: d}`, which is guarded by **coverage**: every live
   file, cold files included, whose `min_seq` is at most d has `applied_through`
   of at least d, so no file can still hold a row those deletes hide.
@@ -514,11 +534,11 @@ Per dataset, a **dataset entry** (name, partitions), and per table:
   prefix read. `MarkDirty{pks, seq}` is in **the same record** as the write it
   tracks; `ClearDelivered{pk, seq_le}` removes a marker only if no newer one
   exists for that key ("latest wins").
-- **Statistics:** an object referenced with the commit it is valid as of. Changed
+- **Table statistics:** an object referenced with the commit it is valid as of. Changed
   by `SetTableStats{ref, as_of}`; a schema change that invalidates statistics
   clears the reference in the same record. `apply` drops "exact" on any later
   data-changing record, and each checkpoint stores that, so exactness never needs
-  records that GC removed.
+  records that GC removed. See [Statistics](#statistics).
 - **The PK index:** checkpoint pages with no action of its own. `apply` keeps
   the in-memory keyset current from file and deletion actions, and each
   checkpoint writes the pages that changed. Opening loads the pages and applies
@@ -526,8 +546,12 @@ Per dataset, a **dataset entry** (name, partitions), and per table:
 - **The cold tier:** one cold-manifest object per promotion. A promotion is one
   record: `SetColdManifest{ref}` plus `RemoveFiles` of the promoted warm files,
   with GC rooted in the destination. Today's datalake tier is about where data
-  lives; that belongs to the object-native data Enhancement ([#15818](https://github.com/spiceai/spiceai/issues/15818)). This
+  lives; that belongs to the object-native Enhancement ([#16245](https://github.com/spiceai/spiceai/issues/16245)). This
   design is about object-native metadata.
+- **Retired files:** the files that left the live set and are not deleted
+  yet, each with the commit that removed it. The record that removes a file
+  retires it, and `ForgetRetired` removes it once it is deleted
+  ([Data files: retirement and orphans](#data-files-retirement-and-orphans)).
 - **Source positions,** keyed by (source, partition): `AdvanceSourcePosition`, in
   the same record as the state it covers (decision 1.9). The connectors'
   checkpoint stores become reads of this state plus writes into the next commit,
@@ -629,17 +653,66 @@ Model: `seq-order*`, `seq-order-maintenance-draw`, `seq-order-drawn-cutoff`, `ta
 Within a dataset, a transaction is one record. Across datasets, it is two-phase
 commit, each participant's records written by its own head CAS:
 
-1. Write `transactions/<id>/intent.json`, listing the participants and a deadline.
-2. **Prepare:** a record on each participant.
-3. **Decide** by create-if-absent of `transactions/<id>/decision.json`: `commit`
-   from the coordinator, or `abort` from anyone after the deadline. Exactly one
-   outcome. Clock skew moves only when an abort can happen, and the deadline
-   bounds how long a dead coordinator holds a reservation.
+1. Write `transactions/<id>/intent`, listing each participant with the lease
+   generation the coordinator holds on it, and a deadline.
+2. **Prepare:** a record on each participant, written only by the coordinator
+   under the generation the intent names. A takeover fences it, so no other
+   process ever prepares the transaction.
+3. **Decide** by create-if-absent of `transactions/<id>/decision`: `commit`
+   from the coordinator, or `abort` from the coordinator when its deadline
+   passes with no commit recorded, from anyone after the deadline, or once
+   every participant's head lease is past the one the intent names (no
+   `Prepare` can land any more). Exactly one outcome. Clock skew moves only
+   when an abort can happen, and the deadline bounds how long a coordinator,
+   live or dead, holds a reservation.
 4. **Resolve:** a record on each participant, by the coordinator or any process
    that finds the decision.
+5. **Remove the records**, intent first, then decision. The coordinator removes
+   them once every participant it prepared has resolved and none of its
+   `Prepare`s is in flight. Any other process removes them once storage shows a
+   decision, every participant's head lease past the one the intent names, and
+   no participant holding the transaction prepared, so whoever finishes a dead
+   coordinator's transaction also removes its records, with no clock involved.
+   A decision created after the removal (a late abort) has no intent and no
+   prepared participant, so nothing applies it, and it is removed the same way.
 
 The critical path is 4 round trips to the decision and 5 to both `Resolve`s
 (counted, not measured). This path is rare.
+
+**The coordinator's answer.** `COMMIT` answers within the deadline plus a few
+attempts to record an abort, whatever storage does:
+
+- The coordinator retries recording its commit until the deadline, an internal
+  constant (60 s in the prototype), not a setting. Then it records an abort
+  instead. An attempt still in flight at the deadline is abandoned. If it lands
+  later, the recorded abort refuses it. If it lands after the records are
+  removed, it is a decision with no intent, which nothing applies.
+- It reports the decision it reads while the intent exists. The intent is
+  written once, before any decision, and removed before the decision. So a
+  decision read before the intent is seen is the transaction's only one. A
+  decision read once the intent is gone may have been created after the
+  removal. Without this check, a coordinator whose delayed commit lands after
+  another process aborted the transaction, resolved it and removed its records
+  reports a commit that never happened (model control
+  `transactions-txn-no-intent-check-1-exhaust`).
+- The answers are:
+  - *committed*;
+  - *aborted*: an abort is recorded, or the coordinator never tried to commit,
+    since only it records a commit;
+  - *outcome unknown*: storage confirmed no decision in time, or another
+    process finished the transaction. The error names the transaction and tells
+    the client to check whether its changes are visible before retrying.
+- An unknown outcome leaves the participants prepared. The process keeps their
+  reservations, so other changes to those datasets wait rather than fail. Once
+  storage answers, it finishes the transaction in the background: it records
+  an abort unless a decision exists, resolves each participant, and removes the
+  records. A `Resolve` that fails stops the dataset until a restart applies it,
+  like any uncertain commit, and the recorded outcome stands.
+- **Follow-up, not planned:** a lookup of a transaction's outcome by id, for
+  the case the data cannot answer: a blind update such as
+  `balance = balance - 30` that the client cannot safely retry. It needs
+  decisions kept for a retention window after the records are removed. See
+  [Future work](object-native-metastore.md#future-work-not-planned).
 
 - **Visibility changes only through the head.** Prepared actions become visible
   only at the `Resolve` record, and readers never consult the decision object, so
@@ -660,8 +733,11 @@ The critical path is 4 round trips to the decision and 5 to both `Resolve`s
   else, and copies the decision into the record so replay never reads the
   decision object.
 - **Rejected and late `Prepare`s.** A rejected `Prepare` leads to abort. One that
-  lands after the abort keeps its reservation and roots until a matching abort
-  `Resolve`. Recovery resolves every unresolved id against its decision.
+  lands after the abort (the coordinator's, under its lease) keeps its
+  reservation and roots until a matching abort `Resolve`, and the records stay
+  until then. Recovery resolves every unresolved id against its decision. A
+  participant that holds a transaction prepared while its records are gone is
+  an error, not an abort: its outcome is unknown.
 - **GC and checkpoints.** GC treats an unresolved `Prepare`'s objects as
   referenced, and `Resolve` adds no references. Checkpoints carry unresolved
   `Prepare`s.
@@ -669,7 +745,7 @@ The critical path is 4 round trips to the decision and 5 to both `Resolve`s
   open longer than T may fail and is retried.
 - **Ownership changes** do not invalidate an accepted `Prepare`. The new owner
   inherits every unresolved one, resolves each from its decision, and may abort
-  one past its deadline.
+  one past its deadline or once every participant has been taken over.
 
 Today CDC applies each dataset separately, and this path serves SQL
 `BEGIN … COMMIT` (code inspection). Making a CDC transaction that spans datasets
@@ -684,7 +760,7 @@ in one partition, and recovery that drains pending intents before ingesting
 again. Another writer on the same keys breaks it, which is the case two-phase
 commit serves (model: `intent-roll-forward*`, `intent-roll-forward-partitioned*`).
 
-Model: `transactions-txn*`, `transactions-three-participants*`, `window-txn*`, `concurrent-txn-overlap*`, `concurrent-txn-disjoint*`, `dataset-prepare-*`, `transactions-txn-no-reservation-0-exhaust`, `transactions-txn-no-roots-0-exhaust`, `transactions-txn-no-matching-0-exhaust`, `transactions-txn-no-create-once-0-exhaust`, `transactions-txn-no-reader-log-0-exhaust`.
+Model: `transactions-txn*`, `transactions-three-participants*`, `window-txn*`, `concurrent-txn-overlap*`, `concurrent-txn-disjoint*`, `dataset-prepare-*`, `transactions-txn-no-reservation-0-exhaust`, `transactions-txn-no-roots-0-exhaust`, `transactions-txn-no-fence-check-0-exhaust`, `transactions-txn-no-prepared-check-1-exhaust`, `transactions-txn-no-coordinator-wait-0-exhaust`, `transactions-txn-no-intent-check-1-exhaust`, `transactions-txn-no-matching-0-exhaust`, `transactions-txn-no-create-once-0-exhaust`, `transactions-txn-no-reader-log-0-exhaust`.
 
 ### Source positions and backfill
 
@@ -712,6 +788,396 @@ source-version ordering, not the user-selected version column Milestone 3
 defers. It must be specified before parallel loaders exist.
 
 Model: `source-positions`, `source-ack-before-acceptance`, `source-position-before-data`, `source-position-after-data`, `source-no-redelivery-skip`.
+
+## Data files
+
+Decisions 1.11 to 1.14 set how data files are written and found, and decision
+1.10 reclaims them.
+This section gives the rules and the evidence for them; reclamation is under
+[Garbage collection](#data-files-retirement-and-orphans). A local-disk cache in
+front of the destination is out of scope.
+
+### Storage: one store per dataset
+
+- **A handle per dataset.** A dataset's storage is `{store, prefix,
+  local_root}` (`crates/cayenne/src/dataset_storage.rs`, `DatasetStorage`). The
+  store refuses every path outside the prefix. `local_root` is set only for a
+  local directory (old approach / vnext off).
+- **Registered under a URL of its own.** DataFusion finds the store for a scan
+  or a write by the URL's scheme and host, so the dataset's store is registered
+  in each `RuntimeEnv` the table uses under `cayenne://<table id>/`, and the
+  table addresses its files as `cayenne://<table id>/<object path>`
+  (`DatasetStorage::register`). Nothing is process-wide: two datasets in one
+  bucket, a source that registered a store for that bucket, and the session's
+  shared `file://` store each keep their own entry.
+- **Every data operation goes through the store.** Every read, write, copy,
+  rename, delete and list of a data file or a deletion vector uses it, on S3 and
+  on a local directory. Only host features that need a filesystem path read
+  `local_root`: the free-space probe, storage-class detection, snapshot export,
+  the `mode: file_create` safety checks and page-cache hints. "Is this location
+  local?" is `local_root.is_some()`, decided once when the table opens.
+- **Local files are flushed as the metastore's are.** A data file needs no
+  more durability than the commit that names it, so both use one tier. A local
+  data file is written through a store that syncs the file and every directory
+  the write created, with `sync_all` (`F_FULLFSYNC` on macOS), before the call
+  returns (`object_store_occ/src/durable_local.rs`, `DurableLocalFileSystem`):
+  the same tier as the metastore's [durable local writes](#the-write-path).
+  `object_store` 0.14 adds the same syncs as an option (`with_fsync`). One
+  local store for data and metastore, and whether its flushes survive a power
+  loss, are an [open decision](#open-decisions).
+- **The minimum is one file flush and one directory flush.** At a final key in
+  an existing folder, each file needs a flush of the file and of its directory
+  before the commit names it. The files of one commit in one folder can share
+  one directory flush. A store whose `put` returns durable cannot share it;
+  only a flush at commit can. Not built: the saving is not measured, and it
+  is part of the same open decision.
+- **The local store cleans up after itself.** A local `put` writes
+  `<key>#<n>` and renames it into place. A crash leaves that temp file, and
+  listings hide it. A delete leaves its emptied folder. Today's store removes
+  neither, and the orphan sweep does not see the temp files (unverified, code
+  inspection only). Sweeping both is the store's job, not the data path's,
+  and part of the durable local store ([Open decisions](#open-decisions)).
+- **The location's credentials.** Data in the destination uses the
+  destination's store and credentials (`runtime.state.params`). Datasets are
+  kept apart by prefix.
+
+**Evidence: the interface costs nothing; the flush tier and the layout do.** A
+microbenchmark wrote one 1 MiB data file per operation under each design,
+arms interleaved, n = 10,000 per arm, on a macOS APFS SSD:
+
+| Arm | P50 ms | P99 ms |
+|---|---|---|
+| `std::fs` temp file and rename, no sync | 0.66 | 2.35 |
+| `LocalFileSystem::put` at the final key, no sync | 0.78 | 2.05 |
+| Hand-written temp file, `sync_all`, rename, `sync_all` of the directory | 9.92 | 19.46 |
+| The durable store's `put` at the final key (the same syncs) | 9.48 | 19.74 |
+| Final key, `F_BARRIERFSYNC` of file and directory | 2.27 | 4.51 |
+| Final key, plain `fsync(2)` of file and directory | 1.05 | 2.78 |
+| The staged write with a plain `fsync(2)` | 1.69 | 4.03 |
+| The staged write through the durable store (about six full flushes, a copy and two deletes) | 26.26 | 50.77 |
+
+The store adds nothing measurable over the same calls made by hand (2.05
+against 2.35 ms, 19.74 against 19.46 ms). A full flush adds about 9 ms at P50
+and 17 ms at P99 per file on macOS, whatever the code path, and a staged write
+multiplies it. A 64 KiB run gave the same order. P99.9 differed between runs
+of the same arm, so only P99 is compared. Linux (ext4, XFS) is not measured;
+it matters only for a production local mode, which is not planned.
+
+### Placement and the data path
+
+- **Which datasets.** With an S3-compatible destination, a new dataset whose
+  `refresh_mode` is `full`, `append` or `changes`, with or without a primary
+  key, keeps its data under `datasets/<folder>/data`, beside its log.
+  `<folder>` is a slug of the dataset's name and a UUIDv7.
+- **Which keep their data path.** A new dataset with `refresh_mode` `caching`,
+  `snapshot` or `disabled`, or with `cayenne_file_path`, `cayenne_s3_zone_ids`
+  or `cayenne_datalake_location`, keeps its data path, with an info line that
+  names the reason. A dataset already in the destination that gains one of
+  these settings fails to load with an error that names the setting and
+  `mode: file_create`. A `partition_by` dataset stays on the SQLite metastore,
+  and `mode: memory` keeps its data in memory.
+- **Local directories** hold data the same way. **GCS and Azure
+  destinations** do not hold data yet: a dataset's files stay at its data path.
+- **The table path is the placement record** (decision 1.14). The table entry
+  stores `datasets/<folder>/data` relative to the destination
+  (`path_is_relative`), and a reader resolves it against the URL the catalog was
+  opened at (`state_reader::stored_path`, `resolved_path`). Any other data path
+  is stored as given and keeps working where it is.
+- **Flat per table** (decision 1.11). Files are under `<table_id>/` and
+  deletion vectors under `<table_id>/deletions/`, not in a folder per snapshot.
+  A manifest row stores the path relative to the table; a row written by an
+  earlier build as `<snapshot_id>/<name>` keeps resolving. The retirement
+  record, reader pins and the writer's record work by file, commit or snapshot
+  id, none of which needs a folder, and the orphan sweep lists the data path
+  once either way. A partitioned dataset's child tables are proposed under
+  `data/<parent_table_id>/<child_table_id>/`, so the dataset is one prefix to
+  inspect, with no `col=val` encoding, still to be settled
+  ([Layout](#layout)). **Why:** a folder per snapshot makes every subset
+  compaction copy the files it does not rewrite (about one copy per file in the
+  table), copy its picked files into a scratch folder, and copy late appends
+  while writers wait. On S3 the copies run one at a time, and the copied files'
+  caches go cold. Position deletes name their file, so they do not survive a
+  copy: the folder blocks subset compaction of tables with position deletes
+  ([decision 1.11](object-native-metastore.md#milestone-1)).
+
+### The live set is committed state
+
+- **The rule** (decision 1.12). For a dataset in the destination, the committed
+  snapshot manifests are the only record of its files. Scans, compaction's
+  choice of inputs, sizing, and every manifest a write records take their files
+  from committed state or from what the writer itself wrote
+  (`scans_from_manifest`, `snapshot_files_from_state` in `provider/table.rs`). A
+  manifest that cannot be read fails the scan; an empty manifest is an empty
+  table. Neither falls back to a listing, and no manifest is rebuilt from one.
+- **The writer's record.** What this process wrote and no commit names yet is
+  in the table's uncommitted-files record (`provider/uncommitted_files.rs`):
+  each file the Vortex sink closes, under its snapshot or under the write's own
+  key, and each deletion vector by name from before its upload. A writer reads
+  a snapshot it is still building from that record. The record is also what
+  keeps the [orphan sweep](#data-files-retirement-and-orphans) away from a
+  write in flight. Another instance cannot commit these files: its takeover
+  raised the lease, which fences every commit of this one.
+- **Where listing remains.** Only the orphan sweep lists the data path. No
+  write stages, so recovery has no staging prefix to list.
+
+**Evidence: listing adopts files no commit wrote.** An integration test planted
+a valid Vortex file of 1,000 rows, named by no manifest row, in the live
+snapshot folder, then drove each path. On all 9 configurations (local,
+in-memory and fault-injecting stores; the SQLite metastore with listing scans
+and with manifest scans, and the object-native placement):
+
+- the manifest rebuilt after the next append adopted it: 2,200 rows instead of
+  1,200;
+- subset compaction merged its rows into the output: 13,000 rows instead of
+  12,000;
+- with an empty manifest, the scan's listing fallback showed its rows, and the
+  backfill at reopen wrote it into the manifest;
+- the retired-folder sweep deleted no committed file, but never visited the
+  live folder, so the planted file was never reclaimed.
+
+With a populated manifest and no further write, the object-native placement did
+not show the file. The same test counted 5 LIST requests per append and
+maintenance pass, 12 when the append compacted, 4 at reopen and 0 per scan.
+Staging was the only thing that kept uncommitted files out of the listed
+folder, which writing at final keys removes.
+
+### Writing at final keys
+
+- **An append writes once** (decision 1.11). An append into the current
+  snapshot (a refresh append, an `INSERT`) writes each Vortex file at
+  `<table_id>/<write_id>_<n>.vortex` and commits by naming it in the current
+  snapshot's manifest (`writes_at_final_keys`,
+  `commit_final_key_write`). Until the commit, the files are held under the
+  write's own key in the writer's record, so another writer that records the
+  same snapshot (an inline flush, a mem-tier checkpoint) never commits them. A
+  retry after an unknown outcome writes new keys.
+- **Other writes already wrote once.** Overwrites, compaction outputs and
+  deletion vectors write under new names. A compaction names the files it
+  carries unchanged in place, in its `ReplaceFiles`, so nothing is copied.
+- **A keyed write into a new protected snapshot commits once.** A write that
+  may replace rows (an upsert-mode write, a CDC burst into a keyed table, or
+  any write into a table that holds tombstones) goes into a new protected
+  snapshot, in two stages:
+  - *Stage A* writes the data files and deletion vectors at their final keys
+    under the table, reserves the sequences, and prepares the record.
+    It commits nothing, and it makes nothing visible. The files are in the
+    writer's record, so the orphan sweep keeps away from them.
+  - *Stage B* commits one record. The record carries the snapshot's file
+    names, its sequence, the deletes that hide the rows it replaces, its inline
+    tombstone (already active), and the source position. Then it publishes the
+    rows to queries, and then the source is acknowledged.
+- **Ordering rules for a keyed write.** Nothing a write prepares is committed
+  before its own record. The data goes into the record before the source
+  position, so a position never covers rows that are not there. The record is
+  durable before the rows are visible. Burst N+1 commits only after burst N's
+  record is accepted. If burst N fails, burst N+1 is refused and its prepared
+  state is dropped, never committed alone.
+- **The pipeline stays.** Stage A of burst N+1 runs while burst N's Stage B
+  commits, as it does today. The commit happens outside the listing fence: a
+  scan reads committed state only through the snapshot set it captured, so the
+  fence is held only for the in-memory publish.
+- **Recovery has nothing to finish.** After a crash, a keyed write is either in
+  a committed record or not at all. Files it uploaded with no record are
+  orphans. At open, an inactive tombstone stays inactive, because no record
+  commits one without its replacement rows.
+- **Local directories** write through the durable local store, which writes a
+  temporary file and renames it; Cayenne does not stage.
+- **Why not staging and a copy.** Per staged file, a staged write costs a
+  `CopyObject`, a `DeleteObject`, and the write-ahead file's write, listing
+  and delete. The data does not pass through Spice, but the store copies every
+  byte, so the copy time increases with the file size. The source
+  acknowledgement waits for the copy, so it adds to the CDC lag of keyed
+  tables. A single `CopyObject` copies at most 5 GB; a larger object needs a
+  multipart copy (`UploadPartCopy`). It is billed as a PUT-class request. A
+  copy and the delete that follows it are two requests, not an atomic move, so
+  a crash between them leaves both keys, and the write-ahead file and its
+  recovery code exist only to finish such a move. S3 can return HTTP 200 for a
+  `CopyObject` whose body holds an error, so the client must read the body.
+- **Why not two commits for a keyed write.** A keyed write was split into a
+  commit of the snapshot and its deletes, then a commit of its file names,
+  when the source was acknowledged after the first commit. The first commit
+  then had to be durable alone, and staging let recovery finish the write. The
+  source is now acknowledged after the last commit, so the split has no
+  purpose. With files at final keys, a crash between the two commits leaves
+  the deletes without their replacement rows.
+- **S3 Express One Zone `RenameObject`** is not used. It renames an object in
+  one atomic request, can be conditional on the destination, takes
+  milliseconds, moves no data, has no per-GB charge and no 5 GB limit. It works
+  only in S3 Express One Zone directory buckets, so it cannot replace the copy
+  on general-purpose S3 buckets or other stores, and the `object_store` client
+  does not expose it. With every write at its final key, no write needs a
+  rename (decision 1.11).
+- **Uploads that never commit** are orphans for the
+  [orphan sweep](#data-files-retirement-and-orphans).
+
+**Evidence.** Per one-file append on an object store, the staged write sends a
+listing and an unconditional write for its write-ahead file, a listing and a
+copy to move the file, the commit, and two deletes: about ten billable
+requests, three of them listings, and eight sequential round trips after the
+upload. At its final key it sends the upload and the commit: about five, with
+no listing (counted from the code, not measured). On RustFS (`rustfs:1.0.0`, a
+local disk), a multipart upload in progress was invisible to LIST, GET and
+HEAD, and visible only to `ListMultipartUploads`; an abort left no object;
+`If-None-Match` was honoured on `PutObject` and on `CompleteMultipartUpload`;
+and a `CopyObject` took 0.47–0.51 s at 1 MB and 1.54–1.75 s at 512 MB
+(3 runs each, including about 0.47 s of client start-up). These are not S3
+numbers, and AWS publishes no `CopyObject` latency.
+
+On S3 in us-east-1, one client sent sequential `CopyObject` requests within one
+bucket, 1,000 per size and storage class, with no errors. The client was
+outside AWS, with a round trip of about 85 ms (the P50 of a `HEAD` before each
+copy):
+
+| Size | S3 Standard P50 / P99 / max (ms) | S3 Express One Zone P50 / P99 / max (ms) |
+|---|---|---|
+| 1 KB | 118 / 356 / 496 | 91 / 105 / 439 |
+| 1 MB | 139 / 403 / 494 | 95 / 109 / 135 |
+| 16 MB | 302 / 543 / 766 | 180 / 194 / 470 |
+| 128 MB | 1,428 / 2,235 / 3,135 | 785 / 808 / 1,061 |
+
+The copy time less the round trip grows by about 10 ms per MB on S3 Standard
+(about 95 MB/s for one request) and about 5.5 ms per MB on S3 Express (about
+180 MB/s). The tail on S3 Standard is wide: P99 is 1.6 to 3 times P50. A
+client in the same region would remove most of the fixed part, but not the
+part per MB. A fault-injection test killed a
+change-stream upsert at every storage request and reopened the table from the
+store. With its files at final keys and two commits, a kill before the second
+commit left none of the rows, neither all from before the write nor all from
+after it. With staging, all 11 kill points left the rows all from before or
+all from after, and left no data file that no commit names. The same test is
+the exit check for the single record: every kill point must leave the rows all
+from before or all from after, with the files at final keys. A second form of
+it drives two bursts in flight through the change sink, with their source
+positions, and requires that a saved position never covers missing rows. For a
+one-file keyed burst, counted from the code at 20 ms per request (not
+measured): the staged path sends 9 storage requests and takes about 180 ms per
+burst, and the pipeline is limited by Stage B; the single record sends 5
+requests, takes about 100 ms, and is limited by Stage A. The listing fence is
+held for about 60 ms plus the copy today, and only for the in-memory publish
+with the single record. The lag is to be measured on RustFS with 20 ms of
+latency, at P99 and P99.9 with sample counts. The model's
+`data-files*` runs check the rules ([Data-files model](#data-files-model)).
+
+### Deletion vectors under CDC
+
+A change stream writes deletion vectors at every checkpoint of the mem-tier, so
+their count, not their bytes, sets the cost of commits and of opening a table.
+
+- **One merged key file per checkpoint or seal.** A checkpoint or a seal holds
+  one group of key deletes per mem-tier segment. A table with a dataset store
+  writes them as one file with the columns `row_key`, `deleted_at` and
+  `delete_sequence`, so each key keeps its own sequence, and records the file at
+  the highest one (`write_key_deletion_vectors_by_sequence`). Pure deletes and
+  re-inserted keys commit separately, so a checkpoint writes at most two files.
+  A reader without the `delete_sequence` column would read every key at the
+  file's highest sequence, so the merged file is written only for data with a
+  dataset store, never for data a release without the flag reads.
+- **Read concurrently at open.** A table with a dataset store fetches up to 64
+  deletion vectors at a time from an object store, and 8 from local disk, and
+  decodes them in catalog order (`read_deletion_vectors`,
+  `provider/delete/vector_io.rs`). A read that receives fewer files than the
+  catalog lists is an error, never fewer deletes.
+- **A full rewrite once 64 key deletion vectors exist.** A key-delete table that
+  holds 64 key deletion vectors (`DELETION_VECTOR_RECLAIM_TRIGGER`) rewrites its
+  current snapshot whole, paced, and the compaction's commit drops the vectors
+  at or below its cutoff, so the count stays bounded under a steady stream.
+- **Sealed rows stay inline in the log for now.** A seal makes the mem-tier's
+  rows durable as an inline record. Writing them as a data file instead makes
+  the log smaller but the reopen and the commits slower (measured below), and a
+  sealed row is durable but not yet published, which a data file would need a
+  new state, recovery rules and reclamation for. The log's growth is bounded by
+  deleting log objects
+  and is to be measured under CDC.
+
+**Evidence**, from integration tests over an in-memory store with 20 ms added to
+every request:
+
+- A checkpoint of 40 transactions wrote 80 deletion-vector objects with one file
+  per group, and 2 with merged files, with the same rows before and after a
+  reopen.
+- Opening a table with 200 deletion vectors took 4,717 ms with sequential reads
+  and 237 ms with concurrent reads.
+- One minute of a source at 2,000 rows/s, durable every 2 s (30 commits):
+
+  | Seal | Log per minute | Slowest commit | Reopen |
+  |---|---|---|---|
+  | Rows inline in the log | 11.0 MB | 40 ms | 240 ms |
+  | Rows as a data file | 2.2 MB | 135 ms | 1,787 ms |
+
+  Before the merged files and the concurrent reads, the same run wrote 1,198
+  deletion-vector objects per minute instead of 30, and reopened in 27.6 s
+  instead of 0.24 s.
+
+### The in-memory tier's seal and checkpoint
+
+- **Seal.** A seal writes the mem-tier's rows as an unpublished inline record,
+  the *shadow*, which only recovery reads, and its tombstones as key deletion
+  vectors. With the object-native metastore, its changes and the source
+  position it acknowledges commit as one record.
+- **Checkpoint.** A checkpoint writes the same rows into a new protected
+  snapshot (keyed tables) or into the current snapshot (position-based tables)
+  and records the files in the manifest from the writer's record
+  (`checkpoint_mem_tier_inner`). **The commit that registers the snapshot also
+  clears the seal's shadow of those rows** (I16). If the two were separate
+  commits, a crash between them would leave every sealed row twice, in the
+  shadow and in the snapshot, and the source would not re-deliver them,
+  because the seal already acknowledged them.
+- With the object-native metastore the checkpoint is one log record, committed
+  with the source position it covers at the next acknowledgement point; the
+  source is acknowledged only after it
+  ([Source positions and backfill](#source-positions-and-backfill)).
+
+**Evidence.** A spicescript scenario that kills `spiced` during a compaction
+under CDC found duplicate keys in 9 of 22 sessions with two separate commits,
+and in 0 of 12 with one commit. Two engine tests that reopen the table between
+the two commits read keys `[1, 1, 2, 2, 3, 3, 4, 5]` with separate commits and
+`[1, 2, 3, 4, 5]` with one.
+
+### Statistics
+
+Statistics let the planner prune files and answer some aggregates without
+reading data. A statistic marked exact can become a query's answer, so
+exactness is claimed only when it can be proven; otherwise every statistic is a
+hint (`statistics_to_inexact`).
+
+**What exists.** Per file: row count, byte size, and per column the min and
+max, null count, NaN handling, sum and uncompressed size, all from the Vortex
+footer; there is no per-file distinct count. Per table: the aggregated min and
+max, the live row count with an exact flag, and NDV sketches (HyperLogLog),
+which the writer builds from the rows it writes; a footer holds no distinct
+counts. The PK index is under [What the state holds](#what-the-state-holds).
+
+**What changes.** Today Cayenne's readers create and maintain per-file
+statistics, and a table's statistics record no state they describe. The target
+makes statistics part of the data they describe.
+
+| | Today (Cayenne) | Target | Why |
+|---|---|---|---|
+| **Who writes per-file statistics, and when** | A scan, on a cache miss: it reads the footer, and a background task saves a statistics row for the next process | The writer, in the `AddFiles` or `ReplaceFiles` record that adds the file, from the footer it has just written | Readers write nothing (decision 1.10). In an object-native metastore a reader's save would be an object upload and a log commit; with the writer recording statistics, a reader needs only read access and makes no commit that competes with ingest |
+| **What they describe** | The file with the position deletes known at that moment folded in | The file as written, with no deletes applied | A file never changes, so its statistics never go stale. Today a later process reuses a row that misses newer deletes |
+| **Where they live** | A separate statistics row keyed by (table, snapshot, path), apart from the file's manifest row (`cayenne_snapshot_file_statistics`) | Part of the file's entry, inline in the checkpoint pages of live files, so planning reads no footer | Planning needs statistics before it opens any file, and a footer read is one ranged GET per file whose cache does not survive a restart. One record and one lifecycle; with [flat files](#placement-and-the-data-path) the entry keeps its key across compactions, so nothing is recomputed |
+| **How a scan applies position deletes** | From a live in-memory cache, and the saved per-file row already has them folded in | From the scan's own captured snapshot: each file's row count is lowered by its position deletes, its bounds become inexact and its sum is dropped | A compaction that commits between a scan's capture and its plan cannot change that scan's answer |
+| **How a scan applies key deletes** | Per-file statistics are not changed; the delete filter above the scan marks its output inexact and subtracts an estimate from the table's row count | The same, from the scan's own captured snapshot | A key delete hides rows by key, not by position, so no per-file count can know which rows it hides |
+| **When they leave** | By a prune that keeps only the current snapshot's rows, run after a listing refresh or a partial compaction, separately from the files' removal | Only with the file's entry, in the `ForgetRetired` record that forgets the file; there is no separate statistics action | One rule for a file and everything about it, and no late write can bring back a forgotten file's statistics |
+| **Table statistics** | One row per table (`cayenne_table_statistics`): a statistics blob, the row count, NDV sketches and an exact flag that the writer sets when it saves them; nothing records which state they describe | `SetTableStats{ref, as_of}`; `apply` drops "exact" on any later data-changing record, and each checkpoint stores that; a replaced object is deleted T later, and has a fresh name like every object | Exactness is tied to the commit it describes, so an exact count cannot outlive the data it counted |
+
+**What stays.**
+
+- **The footer is authoritative.** A file whose entry has no statistics, such as
+  one written by an earlier build, is read from its footer, and nothing is
+  written back.
+- **Table statistics describe the latest state only,** as DuckLake's do. A scan
+  of an older snapshot uses per-file statistics.
+- **A schema change** that invalidates statistics clears them in the same
+  record.
+- **No statistic per snapshot or file group.** Pruning is per file; nothing
+  skips a snapshot as a whole, so the [flat layout](#placement-and-the-data-path)
+  loses nothing.
+
+The problems under "Today" are from reading Cayenne's code, not from a run,
+Model invariants
+still to add: statistics exist only for files that are live or retired, and a
+forgotten file has none, each with a negative control.
 
 ## Garbage collection
 
@@ -775,7 +1241,7 @@ retention only delays deleting its inputs.
   loads commit in several records. If this binds, decision 1.10's
   `PREPARE_UPLOAD` record is the fallback, outside Milestone 1.
 
-**Versioned buckets and replication,** which [#15760](https://github.com/spiceai/spiceai/issues/15760) Stage 2 supports:
+**Versioned buckets and replication,** which [#16245](https://github.com/spiceai/spiceai/issues/16245) supports:
 
 - **Data objects replicate in any direction.**
 - **The state has one writable copy.** It may replicate one way, to a copy
@@ -802,13 +1268,175 @@ retention only delays deleting its inputs.
 | A versioned bucket keeps a deleted object's bytes | Deleting without a version id leaves a marker that replicates and removes the replica's copy |
 
 **Milestone 1's form.** GC runs in the writer's process: an idle head's empty
-commit is the writer's, staging protection is an in-memory set, and the
+commit is the writer's, the writer's record of uncommitted uploads is in
+memory, and the
 checkpoint moves with the writer's next commit. A fenced former writer's delayed requests
 can land after failover, so the age check is needed from the start. In
 Milestone 2, GC on another node holds the GC lease (`leases/gc.json`) for its
 empty commits; the layout does not change.
 
 Model: `retention`, `retention-readers`; GC on another node: `retention-remote-gc`, `retention-readers-remote-gc`, `retention-remote-gc-blind-commit` (an unconditional empty commit resurrects a removed object); pending removals rebuilt from a checkpoint: `retention-readers-checkpoint`, `retention-readers-remote-gc-checkpoint`, `retention-readers-checkpoint-root-omits`, `retention-readers-checkpoint-tail-only`, `retention-readers-remote-gc-keep-timestamps`; and `retention-writer-clock`, `retention-list-date`, `retention-reref-published`, `retention-readers-volatile-removals`, `retention-readers-sweep-removed`, `retention-readers-response-time`, `retention-readers-keep-timestamps`, `retention-readers-stale-start`, `retention-readers-no-retention`, `retention-readers-missing-as-empty`, `retention-no-age-check`, `retention-no-margin`, `retention-reuse-found`, `dataset-lifecycle-no-query-log-retention`, `commits-storage-no-published-2-exhaust`.
+
+### Data files: retirement and orphans
+
+Data files and deletion vectors of datasets in the destination follow the
+timed retention above (decision 1.10). Their retirement record is the pending-removal list, the sweep
+deletes by name rather than a listing, and orphans keep a sweep of
+their own (decision 1.12). Log objects below the checkpoint are not deleted yet. The sweeps run in
+the writer's process.
+
+**The retirement record: per file.**
+
+- Each table's state holds `retired`: the files that left the live set and are
+  not deleted yet, each with the commit that removed it. The record that
+  removes a file retires it: `apply` adds every file that a `RemoveFiles` or
+  `ReplaceFiles` removes, and every deletion vector that a `RemoveDeleteFiles`
+  or `ClearDeleteFiles` removes. A compaction, an overwrite and a merge of protected
+  snapshots therefore retire exactly the files they remove. A file they carry
+  stays live and is never retired, so files shared between snapshots need no
+  rule of their own. Delta Lake (`remove` tombstones), DuckLake (`end_snapshot`,
+  then scheduled for deletion) and Iceberg ("the snapshot in which it was
+  deleted") retire files the same way.
+- Checkpoint roots carry the retired set. `ForgetRetired{table_id, files}`
+  takes files out of it: the sweep commits it after deleting them, in one
+  record with the removal of their entries and statistics. `apply` does not
+  check that the files are gone; the sweep's order does.
+- A retired file keeps its entry until it is forgotten, so a scan that captured
+  it just before the commit still reads it.
+
+**The retention, and local pins.**
+
+- The sweep deletes a retired file no earlier than T after it first observes
+  the removal, timed on the sweeping process's clock and kept in memory. A restart or takeover reads the retired set from the state and
+  restarts every timer, which only delays a delete.
+- Every instance confirms its heads about every 10 s, and a query
+  starts from a head confirmed within S. So a query on any instance reads its
+  files for at least T − S. One that runs longer may fail with the
+  [data-file error](#readers), saying to rerun it, never with other rows.
+- A scan on the sweeping instance also pins the commit it captured, taken
+  under the table's listing fence and released when the plan and its streams
+  drop. The sweep keeps every file removed after the oldest pinned commit, so a
+  local query may run past T. Pins are in memory: readers write nothing. A
+  restore point or a snapshot export holds the table's file deletions.
+- **Snapshots share files.** A compaction keeps a file it carries in place, so
+  several snapshots can name one file. Per-file retirement needs nothing more:
+  a carried file is never removed, so it is never retired. At three uploads the
+  model found that a snapshot-level rule keeping only the files live snapshots
+  reference is not enough once files are shared: a later sweep could delete a
+  file a pinned scan still reads ([Data-files model](#data-files-model)). The
+  model is to be rewritten for per-file retirement, keeping that control.
+
+**The retirement sweep.**
+
+- It runs after the table's commits. It does nothing while the table's
+  retirement record is not settled: the log is stopped, a change to the table
+  is not committed yet, or a transaction across datasets reserves the table.
+- It deletes only the files that the retired set names, by name, never by a
+  listing or a prefix.
+- **Deletes are batched.** They go through `delete_stream`, which an S3 store
+  sends as `DeleteObjects` requests of up to 1,000 keys (`delete_in_batches`,
+  `dataset_storage.rs`). The sweep groups retired files into batches of at most
+  1,000 and forgets each batch in one record.
+- **A restart finishes a sweep.** A crash between the deletes and the record
+  leaves the files retired. The next pass, in this process or after a
+  restart, deletes what is left, counts an object already gone as deleted, and
+  forgets them.
+
+**One delete path; no prefix deletes.**
+
+- On the flag-on path, no write, rollback or cleanup deletes a data prefix. A
+  failed write deletes its own uploads by name, or leaves them to the orphan
+  sweep. In a flat layout a prefix could reach the whole table, and a
+  snapshot's files are not under one prefix anyway.
+- Every data-file and deletion-vector delete goes through one check: no live
+  entry and no unresolved `Prepare` names the key. The file's own retired
+  entry does not block it; the retention, pins and holds above do. Only dropping a dataset and
+  `mode: file_create` delete a folder, the dataset's own, after T.
+- A compaction's carried files never enter the writer's record of uncommitted
+  files. They are committed already, and the record protects only uploads not
+  yet committed.
+- Exit criterion: under fault injection, a flag-on table sends no LIST and no
+  delete by prefix outside the orphan sweep and a drop.
+
+**Dropping a dataset.**
+
+- Dropping a dataset writes a `dropped` marker and removes its name. The
+  instance that dropped it then deletes its folder, data and log, in batches,
+  once T has passed, no scan of its tables runs and no restore point
+  is being taken from them. `mode: file_create` deletes the previous folder the
+  same way.
+- If that instance stops first, the next instance that opens the catalog
+  deletes a folder that no name refers to once its marker is older than an
+  hour. This compares the marker's store time with that instance's clock, which
+  the rest of this section avoids ([Open decisions](#open-decisions)).
+
+**Orphans.**
+
+- An orphan is a file that no commit names: an upload whose writer crashed, was
+  fenced or discarded its write, or a deletion vector whose write failed. It
+  never becomes visible.
+- The orphan sweep lists the dataset's data path, the only listing of a
+  dataset's data in normal operation. It deletes an object only when no
+  committed manifest row or deletion names it, no write of this process holds
+  it in the writer's record, it is not a retired file waiting out T (the
+  retired set is read before the listing and again before the deletes), and it
+  is older than one hour on the store's clock.
+- **Every key is classified by file.** A data file or deletion vector anywhere
+  under the data path is a candidate, flat or under a folder from an earlier
+  build. `_lookup_index/` is not, because the lookup index reclaims its own
+  runs.
+- **Age is read against the head.** An object's age is the dataset head's
+  `LastModified` minus the object's own, as decision 1.10 ages uploads. No
+  machine's clock and no time in a name is used, and an object dated after the
+  head counts as young. The sweep runs after a commit, so the head is fresh.
+  A dataset that does not commit makes no new orphans; a crash's leftovers are
+  newer than the last head and wait for the next commit's sweep, which delays
+  them and leaks nothing. So no clock object and no empty commit are needed.
+- **No writer age check.** Decision 1.10's writer refuses an upload older than
+  T_O so that GC cannot delete it under a later commit. Here only the lease
+  holder sweeps, its record holds every key it has not committed, and the
+  lease fences every other writer's commit, so no commit can name a file the
+  sweep deletes. The model checks this with the record and the lease alone
+  (`data-files-intent`), and the floor is a backstop.
+- **Unfinished multipart uploads** under the table's prefix are aborted after
+  the same floor, counted from the time the store says each was initiated
+  (`ListMultipartUploads`, `AbortMultipartUpload`). A listing does not show
+  them, they cost storage, and S3 Express directory buckets have no lifecycle
+  rule that would remove them.
+- **When it runs.** Once when the table opens, then at most once every 15
+  minutes per table, started by the cleanup that follows a commit or by the
+  maintenance tick. It does not run while the
+  table's state cannot be read, while a commit's outcome is unknown, while a
+  transaction across datasets is prepared on the table, while a restore point
+  or another sweep holds the table's file deletions, or while the retirement
+  record is not settled. A read error during a pass stops it before it deletes.
+
+**Deletion vectors: retired like data files.** Deletion vectors at or below
+the table's surviving-sequence floor hide no row in the current state, but a
+query on an older state can still read the files they hide rows in. For a
+dataset in the destination, `RemoveDeleteFiles` and `ClearDeleteFiles` retire
+them, and the retirement sweep deletes them after T, with the same pins and
+holds as data files. A crash leaves them retired, and the next sweep finishes.
+So a deletion vector that is referenced and missing is always the
+[data-file error](#readers), never tolerated. Outside the destination the order stays as it was, the file first
+and then its row, and the loader heals a row whose file is gone.
+
+**Metrics.** Reclaimed files are counted in
+`cayenne_maintenance_reclaimed_files_total`, `…_bytes_total` and `…_rows_total`,
+labelled `{table, op}`: the retirement sweep and the deletion of a dropped
+folder as `op="retired_dir_sweep"` (for a drop, `table` is the dataset's name),
+and the deletion-vector sweep as `op="orphan_dv_sweep"`. Requests to the
+location are in the `state_store_*` metrics that Enhancement
+[#16245](https://github.com/spiceai/spiceai/issues/16245) specifies.
+
+**What this guarantees across instances.** One instance writes and compacts a
+dataset in Milestone 1. A query on any instance, the writer's or another's,
+reads its files for at least T − S, because every instance polls its heads;
+scans on the writer are also pinned. A query that outlives that
+fails with the data-file error, never other rows. Several writers on one
+location are Milestone 2 and later.
+
+Model: the `data-files*` runs ([Data-files model](#data-files-model)).
 
 ## Small writes
 
@@ -849,17 +1477,18 @@ Model: `window-storage*`.
   catalog/                                 # the name registry: a small domain of the same shape
     head
     wal/…
-  datasets/<slug>-<dataset_id>/
+  datasets/<slug>-<uuidv7>/                # the dataset's folder (new_dataset_folder)
     head                                   # mutable, CAS only: commit number, inline records, batch index, checkpoint, lease generation
     wal/<first commit>-<owner>             # batches: immutable records first..last, in order
     checkpoints/<commit>-<owner>           # checkpoint root: table entries and the pages of each collection
     objects/<kind>/<owner>-<counter>       # pages, manifests, deletion-vector lists, stats, PK index, …
-    data/<table_id>/<write_id>_<ordinal>.vortex
-    data/<table_id>/delete_<uuidv7>.arrow
+    data/                                  # the data path, recorded relative to the location
+      <table_id>/<write_id>_<n>.vortex     # flat per table; manifest rows store table-relative paths
+      <table_id>/deletions/delete_<uuidv7>.arrow
     leases/writer.json                     # object_store_occ::lease records
     leases/gc.json
-  transactions/<id>/intent.json            # cross-dataset transactions
-  transactions/<id>/decision.json          # create-if-absent
+  transactions/<id>/intent                 # cross-dataset transactions: participants, their leases, deadline
+  transactions/<id>/decision               # create-if-absent
 ```
 
 - **Fresh names.** Commit numbers in names are zero-padded to 20 digits, so
@@ -880,22 +1509,25 @@ Model: `window-storage*`.
   digest is not the name.
 - **Data files keep their names.** They are not content-addressed: hashing a
   large file means reading it back, and the names are already unique. The
-  dataset folder follows the datalake tier's `datalake_dir_segment`, so datasets
-  are recognizable in the bucket and dropping one is one prefix. A file becomes
-  visible when a record references it, so files never move.
-- **A file reference carries an optional location id,** a `u32` varint; absent
-  means 0, the destination. Milestone 1 writes one only for the temporary
-  local-disk references of step 2. Multiple data locations belong to the
-  object-native data design.
+  dataset folder starts with a slug of the dataset's name, so datasets are
+  recognizable in the bucket and dropping one is one prefix. A file becomes
+  visible when a record references it. No write moves or copies a file after
+  its upload ([Writing at final keys](#writing-at-final-keys)); a compaction
+  names a file it carries unchanged in place.
+- **Flat per table** under the data path, not a folder per snapshot
+  ([Placement and the data path](#placement-and-the-data-path)).
+- **A data path outside the destination is a full URL** (decision 1.14). No
+  file reference carries a location id; multiple data locations are out of
+  scope.
 - **The root folder** `cayenne/v1/` sits beside `results-cache/`,
   `rate-control/`, `cluster/` and `snapshots/`. Its name is on-disk surface
-  ([#15760](https://github.com/spiceai/spiceai/issues/15760)).
+  ([#16245](https://github.com/spiceai/spiceai/issues/16245)).
 
 ```mermaid
 flowchart LR
     W2["spiced instance<br/>(leased writer)"]
     subgraph DEST["destination: s3:// · file:// · mem://"]
-        D2["data/&lt;table_id&gt;/&lt;write_id&gt;_&lt;ordinal&gt;.vortex<br/>data/&lt;table_id&gt;/delete_&lt;uuidv7&gt;.arrow"]
+        D2["data/&lt;table_id&gt;/&lt;write_id&gt;_&lt;n&gt;.vortex<br/>data/&lt;table_id&gt;/deletions/delete_&lt;uuidv7&gt;.arrow"]
         OBJ["objects/&lt;kind&gt;/&lt;owner&gt;-&lt;counter&gt;"]
         HEAD["head<br/>inline records, batch index, checkpoint"]
         WAL["wal/&lt;first commit&gt;-&lt;owner&gt;<br/>batches"]
@@ -918,7 +1550,9 @@ flowchart LR
 ### Encoding
 
 The head, records, batches, checkpoint roots and small pages are **Protocol
-Buffers**, through `prost`. Leases and transaction objects stay JSON. Large
+Buffers**, through `prost`, and so are a transaction's intent and decision,
+which recovery reads to decide what to resolve and remove. Leases stay JSON:
+they are `object_store_occ`'s lease records, shared with its other users. Large
 checkpoint collections (file lists, deletion-vector lists, the PK index) are
 Arrow IPC pages, as delete files are today. Numbered fields give explicit
 evolution rules (add fields, never renumber, reserve removed numbers), digests
@@ -943,7 +1577,7 @@ JSON (unverified, not measured).
 - **Unknown actions are an error.** A reader refuses the dataset with the
   "upgrade Spice or clear the acceleration" message, the role SQLite's
   `user_version` gate plays today.
-- **Upgrade compatibility** is [#15760](https://github.com/spiceai/spiceai/issues/15760)'s rule: a feature is read by release N and
+- **Upgrade compatibility:** a feature is read by release N and
   written from N+1.
 
 Model: `unknown-action-refusal`, `unknown-action-skip`.
@@ -1193,14 +1827,15 @@ way, is Milestone 1 ([Garbage collection](#garbage-collection)).
   are today; data placement follows and is a prerequisite for standbys and the
   replacement.
 - **The surface waits for its review:** the flag (2) and the replacement (8) go
-  through [#15760](https://github.com/spiceai/spiceai/issues/15760), and placement (6) through [#15818](https://github.com/spiceai/spiceai/issues/15818).
+  through [#16245](https://github.com/spiceai/spiceai/issues/16245), and so does placement (6).
 - **Exit criteria** are the runs that must pass before the next step builds on
   it. Kill, restart and failover criteria are spicescript scenarios, driving
   `spiced` from outside against an independent oracle; scenario names are
   proposed.
 - **Tests use an in-memory store** for most suites, so their speed does not
-  depend on fsync and no durability setting ships. Durable local writes are
-  tested separately, including power loss.
+  depend on fsync and no durability setting ships. Local directories are
+  tested for process kill and restart; a power-loss test belongs to the
+  flush-tier [open decision](#open-decisions).
 - **Status** lines come from the prototype's own notes, not from runs in this
   document.
 
@@ -1210,12 +1845,12 @@ flowchart LR
     S2 --> S3["3 · acknowledgement-point<br/>commits, group commit"]
     S3 --> S4["4 · retention and GC"]
     S4 --> S5["5 · object stores,<br/>more sources"]
-    S5 --> S6["6 · data placement ([#15818](https://github.com/spiceai/spiceai/issues/15818))"]
+    S5 --> S6["6 · data placement"]
     S6 --> S7["7 · standbys"]
     S7 --> S8["8 · the replacement:<br/>SQLite removed"]
 ```
 
-*Diagram 6: the Milestone 1 roadmap. The library, then the native catalog behind the flag ([#15760](https://github.com/spiceai/spiceai/issues/15760) Stage 1), then the commit cadence, GC, object stores and more sources, then data placement and standbys, and finally the replacement ([#15760](https://github.com/spiceai/spiceai/issues/15760) Stage 2).*
+*Diagram 6: the Milestone 1 roadmap. The library, then the native catalog behind the flag, then the commit cadence, GC, object stores and more sources, then data placement and standbys, and finally the replacement.*
 
 ### Step 1: the head log in `object_store_occ`
 
@@ -1252,8 +1887,8 @@ flowchart LR
 import, and the remaining sources' positions are step 5.
 
 - **Change:** `ObjectNativeCatalog` implements `MetadataCatalog` over the dataset
-  state and the head log, with no SQL; `cayenne_metastore: object_native` selects
-  it ([#15760](https://github.com/spiceai/spiceai/issues/15760) Stage 1). The record actions (`AddFiles`, `ReplaceFiles`,
+  state and the head log, with no SQL; `runtime.params.cayenne_vnext` selects
+  it. The record actions (`AddFiles`, `ReplaceFiles`,
   `AddDeleteFiles`, `SetTableStats`, `AdvanceSourcePosition`, …), the dataset
   state, `apply` and checkpoint pages. The provider's three downcasts to
   `CayenneCatalog` become trait methods (atomic append, multi-table transaction,
@@ -1273,15 +1908,14 @@ import, and the remaining sources' positions are step 5.
 - **Fixes that shrink the cutover:** a missing referenced file is an error, never
   an empty snapshot (today it reads as empty); `cayenne_insert_record` is
   retired; a missing datalake-tier cold file is an error, so a scan that outlives
-  the grace period fails instead of returning partial rows; a handle closes when
+  the retention T fails instead of returning partial rows; a handle closes when
   its session ends, which today's SQL metastore does not enforce for a dropped
   provider's maintenance loop.
 - **Data files stay where they are today** until step 6, on the writer's local
-  disk. Such references carry an instance-local location id bound to the writing
-  instance's identity, so they are never mistaken for destination files. A
-  restart on the same disk continues from the head; another instance finds
-  references it cannot read and reloads from the source, never serving the
-  dataset without its files.
+  disk, recorded by their absolute path (decision 1.14). A restart on the same
+  disk continues from the head; another instance must find references it
+  cannot read and reload from the source, never serving the dataset without
+  its files.
 - **Exit:**
   - Cayenne's suites against the native catalog, most on an in-memory store,
     each with its own oracle, and a negative control showing the suite goes red
@@ -1313,7 +1947,9 @@ import, and the remaining sources' positions are step 5.
 
 ### Step 4: retention and GC
 
-**Status:** not started in the prototype.
+**Status:** not started for log objects. Data files of
+datasets in the destination use the same retention through their retirement
+record ([Data files: retirement and orphans](#data-files-retirement-and-orphans)).
 
 - **Change:** fresh names for every object; the writer's age check against its
   CAS base; deletion of removed objects T after GC observes the removal; pending
@@ -1329,7 +1965,7 @@ import, and the remaining sources' positions are step 5.
 
 - **Change:** RustFS, then S3, as the destination; MySQL, then the other
   sources' positions; `partition_by`; snapshot export and import to locations
-  outside the destination ([#15760](https://github.com/spiceai/spiceai/issues/15760)); datalake-tier promotion as one record, with
+  outside the destination; datalake-tier promotion as one record, with
   GC rooted in the destination.
 - **Code:** `crates/cayenne` (`datalake_dir_segment`,
   `provider/cold_partition.rs`).
@@ -1349,20 +1985,56 @@ import, and the remaining sources' positions are step 5.
 
 ### Step 6: data placement in the destination
 
-- **Change:** new data and deletion files go under the dataset's `data/` folder
-  in the destination, with local disk as a cache. Cayenne already builds scan
-  URLs for an `s3://` table path (`snapshot_dir_url`), so this is mainly
-  placement and the cache. The staging WAL (`_staging/<id>/_wal.json`) and
-  per-snapshot directories (`<table_id>/<snapshot_id>/`) go away. Where files
-  live is surface ([#15818](https://github.com/spiceai/spiceai/issues/15818)).
-- **Code:** `crates/cayenne` (`snapshot_dir_url`); remove
-  `provider/staging_wal.rs`.
-- **Exit:** a spicescript scenario (proposed `object-metastore-failover.yaml`)
-  with two variants over a rustfs `shared_bucket`: `kill-spiced` the writer, a new
-  instance takes over from the destination alone, answers equal the source
-  oracle, no duplicate or lost row; recovery on a fresh instance without the
-  original data directory; read and write P99 and P99.9 against step 5 on the
-  same rig.
+**Status:** implemented behind the flag for S3-compatible destinations. The
+surface is Enhancement [#16245](https://github.com/spiceai/spiceai/issues/16245). The work is one storage handle, placement and
+committed file sets, CDC, and the data-file lifecycle.
+
+- **Change:** decisions 1.11 to 1.14 and 1.10 for data files, as [Data files](#data-files) and
+  [Data files: retirement and orphans](#data-files-retirement-and-orphans)
+  describe them: a store per dataset for every data operation; data files of
+  `full`, `append` and `changes` datasets under `datasets/<folder>/data`, with
+  the path recorded relative to the destination; the live set from committed
+  state; appends at their final keys; merged deletion vectors read
+  concurrently; and reclamation by a retirement record with the retention T, local reader pins and an
+  orphan sweep.
+- **Code:** `crates/cayenne` (`dataset_storage.rs`, `provider/table.rs`,
+  `provider/uncommitted_files.rs`, `provider/orphan_sweep.rs`,
+  `provider/delete/vector_io.rs`, `metastore/object_native/`);
+  `object_store_occ` (`durable_local.rs`); `accelerators/accelerator-cayenne`
+  (placement, the multipart-upload abort); `runtime-state-location` (the
+  `cayenne_data` meter).
+- **Exit:** the spicescript scenario `object-native-data.yaml`, against the
+  source and a variant with the flag off: every acknowledged append is counted
+  right after it; scans send no LIST; a kill during an append leaves no partial
+  write; an instance that loses its local directory serves every row with the
+  source down; a copy of the destination at another prefix serves the same
+  rows; a truncated, then deleted, data file fails the query with its error,
+  and `mode: file_create` reloads the dataset. Also `append-kill.yaml`,
+  `cayenne-transactions.yaml`, `cayenne-file-create-reload.yaml`,
+  `postgres-cdc-kill-during-compaction.yaml` and the parity scenarios with the
+  object-native data variants; the [data-files model runs](#data-files-model)
+  replayed against the real storage code; and read and write P99 and P99.9
+  against step 5 on the same rig.
+- **Remaining work:**
+  - a keyed write into a new protected snapshot still stages, copies and
+    commits twice. It moves to one record at final keys, with its pipeline
+    kept, as [Writing at final keys](#writing-at-final-keys) describes; the
+    staging path, its write-ahead file and their recovery code are then removed
+    for datasets in the destination. Write-ahead files that earlier builds
+    left with the flag on are not recovered;
+  - two paths still list a dataset's data in the destination: the older
+    snapshot-folder cleanup lists `<table_id>/` and deletes old snapshot
+    prefixes by age, outside the retirement record; and a filtered `DELETE`
+    lists the snapshot folder to find its target files. Both must take their
+    files from committed state, as [the live set](#the-live-set-is-committed-state)
+    requires;
+  - one durable local store for data and the metastore, its flush tier, and
+    data placement on a local directory;
+  - an S3 Express directory bucket as the destination;
+  - several instances on one destination, including reader protection across
+    instances;
+  - partitioned datasets, lookup indexes and `mode: memory`;
+  - the test base.
 
 ### Step 7: standbys
 
@@ -1398,7 +2070,7 @@ import, and the remaining sources' positions are step 5.
 
 ### Step 8: the replacement
 
-- **Change** ([#15760](https://github.com/spiceai/spiceai/issues/15760) Stage 2, the first release users see): the object-native
+- **Change** (the first release users see): the object-native
   metastore replaces SQLite for every Cayenne acceleration. An existing
   acceleration bootstraps from its source once; Spice does not open SQLite
   catalogs, and a warning names the old files. A dataset that sets
@@ -1407,7 +2079,7 @@ import, and the remaining sources' positions are step 5.
   ignored with a warning. Remove the SQLite backend, `MetastoreBackend`, the SQL
   inline tier with its tombstones' two-phase `published` flag, and the flag.
   Accelerations holding data their source no longer has stay on the previous
-  release ([#15492](https://github.com/spiceai/spiceai/issues/15492)).
+  release.
 - **Code:** remove `MetastoreBackend` (`crates/cayenne/src/metastore.rs`,
   `metastore/`), the SQLite backend and `provider/inlined_cache.rs`; `runtime`,
   `runtime-state-location`, and `runtime-acceleration/src/snapshot/` (snapshots
@@ -1463,12 +2135,17 @@ The direction document links here; this is the one list.
 
 | Decision | What decides it | Needed by |
 |---|---|---|
-| What replaces per-dataset `mode: memory` (preferred: nothing; Cayenne holds a small table in memory) | Small tables against `mode: memory` on the same data and hardware (load time, resident memory, query P99 and P99.9), then [#15760](https://github.com/spiceai/spiceai/issues/15760) | Step 8 |
+| What replaces per-dataset `mode: memory` (preferred: nothing; Cayenne holds a small table in memory) | Small tables against `mode: memory` on the same data and hardware (load time, resident memory, query P99 and P99.9), then [#16137](https://github.com/spiceai/spiceai/issues/16137) and [#16245](https://github.com/spiceai/spiceai/issues/16245) | Step 8 |
+| Log-object reclamation: deleting batches, checkpoints and objects below the checkpoint, and whether sealed rows move from inline records to data files (about 11 MB of log per minute at 2,000 rows/s inline, against 2.2 MB with a 7× slower reopen as files) | Log bytes per minute under CDC ([#16132](https://github.com/spiceai/spiceai/issues/16132)); the deletion is [#15995](https://github.com/spiceai/spiceai/issues/15995) | Step 8 |
+| The retention T for data files and deletion vectors (about an hour, as for log objects, or shorter) | Retained bytes per hour at T on a full-refresh and a CDC workload, against query duration at P99 and P99.9 | Step 7 |
+| The orphan floor with a second process sweeping: whether one hour against the head's store time stays safe when a sweep can run outside the writer's process, or the writer's age check of decision 1.10 returns; and aging a dropped folder on a store time instead of an instance's clock | The data-files model with a second sweeping process; [#16133](https://github.com/spiceai/spiceai/issues/16133) and [#16136](https://github.com/spiceai/spiceai/issues/16136) | Step 7 |
+| Local directories: one durable local store for data and metastore, and its flush tier (today a full flush per write, `F_FULLFSYNC` on macOS; an ordered barrier on macOS is the candidate) | Write P99 and P99.9 at each tier, interleaved, and a power-loss test ([#16134](https://github.com/spiceai/spiceai/issues/16134)) | Step 8 |
+| An S3 Express directory bucket as the destination | Request cost, latency and prefix count on real S3 Express ([#16135](https://github.com/spiceai/spiceai/issues/16135)) | Step 8 |
 | Decision 3.4: shift the buffer or stamp at commit | Shift time at P99 and P99.9 against a retry, on Milestone 1's code | Gate before M3 |
 | Checkpoint delta pages | Step 5's checkpoint bytes per committed metadata byte | Step 5 |
 | Small-file format: Vortex only, or also Arrow IPC | The full ingest-and-query workload, counting replicas and compaction debt | Step 5 |
 | An exact-key PK index on by default for caching datasets | Step 5's caching workload; a behavior change, so an Enhancement | Step 8 (retiring the inline tier) |
-| Root folder name | [#15760](https://github.com/spiceai/spiceai/issues/15760) | Step 8 |
+| Root folder name | [#16245](https://github.com/spiceai/spiceai/issues/16245) | Step 8 |
 | Versioned buckets: GC removes noncurrent versions by version id once replicated (preferred), or the docs require a lifecycle rule | Design review | Step 8 (Stage 2 supports versioned buckets) |
 | The backfill rule alongside live CDC | Specification, before parallel loaders exist | M3c |
 | The cluster acceleration flow under shared state | Mapping the current flow | M3d |
@@ -1543,6 +2220,33 @@ the model README maps each to its runs.
 | I10 | A source position becomes durable only together with the state it covers. |
 | I11 | A reader that meets an action it does not understand refuses the dataset; it never skips the action. |
 | I12 | The state at every commit equals running the accepted writes one at a time in commit order, read-dependent writes included, and each key has at most one live row. |
+| I13 | Every data file the committed state names exists in the store; a commit names only files whose upload has returned. |
+| I14 | A reader sees only data files committed at its head version, and an upload whose commit was aborted or abandoned never becomes visible. An unknown outcome resolves all-or-nothing: either every file of the attempt is committed or none is. |
+| I15 | A data file or deletion vector is deleted only after the record that removed it from the live set, and no earlier than T after the sweep observed that removal; never while a scan pins a commit that includes it or a restore point copies it; and a forgotten file leaves nothing behind. |
+| I16 | A row the mem-tier's seal made durable is in exactly one durable place at every commit: the commit that registers a checkpoint's snapshot also clears the seal's shadow of the same rows, so no crash leaves a row both in the shadow and in the snapshot ([The in-memory tier's seal and checkpoint](#the-in-memory-tiers-seal-and-checkpoint)). |
+
+### Data-files model
+
+The `data-files*` runs of the protocol model
+(`crates/cayenne-metastore-model/src/data_files.rs`) check I13 to I15:
+committed files exist; a reader sees only committed files; an aborted or
+abandoned upload is never visible; an unknown outcome resolves all-or-nothing;
+a scan finds every file it needs; a restore point copies every file; and a
+forgotten file leaves nothing behind. Each property has a negative control with
+one safeguard removed, which the checker must reject.
+
+- **Why retirement is per file.** With a file shared between snapshots, a sweep
+  that keeps only the files live snapshots reference can delete a file a pinned
+  scan still reads (`data-files-retire-3-ignores-pinned-references`). Retiring
+  exactly the files a record removes avoids that
+  ([Data files: retirement and orphans](#data-files-retirement-and-orphans)).
+- **Still to model**, each with a
+  negative control: per-file retirement with files shared between snapshots,
+  keeping the control above; the retention T with a reader on another instance;
+  statistics that exist only for live or retired files; and dataset drop and
+  the deletion-vector sweep.
+- **I16** is checked by engine tests and a spicescript scenario, not by the
+  model ([The in-memory tier's seal and checkpoint](#the-in-memory-tiers-seal-and-checkpoint)).
 
 ## Appendix: the store contract
 

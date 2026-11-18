@@ -555,22 +555,16 @@ mod tests {
         assert_eq!(payloads(&candidates), vec!["p0", "p0", "p2"]);
 
         let miss = indexer.probe_key(&pinned(Some(9), "a")).expect("pinned");
-        assert!(
-            index
-                .candidates(&batches, &miss)
-                .expect("miss")
-                .batches
-                .is_empty()
+        assert_eq!(
+            index.candidates(&batches, &miss).expect("miss").batches,
+            [] as [RecordBatch; 0]
         );
 
         let null = indexer.probe_key(&pinned(None, "a")).expect("pinned");
         assert!(null.hashes.is_empty(), "a NULL literal matches no row");
-        assert!(
-            index
-                .candidates(&batches, &null)
-                .expect("null")
-                .batches
-                .is_empty()
+        assert_eq!(
+            index.candidates(&batches, &null).expect("null").batches,
+            [] as [RecordBatch; 0]
         );
 
         assert_eq!(

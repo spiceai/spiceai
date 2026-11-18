@@ -1,5 +1,5 @@
 -- DataFusion built-ins across engines. Every place must answer as DataFusion
--- does locally (the `arrow` variant). Where Spice sends a query to an
+-- does locally (the `cayenne-memory` variant). Where Spice sends a query to an
 -- accelerator, `-- sends <place>: <fragment>` / `-- keeps <place>: <fragment>`
 -- say what the SQL sent must contain or must leave out: a built-in reaches
 -- the engine only in a rendering that answers the same, and stays local where
@@ -248,90 +248,49 @@ SELECT approx_distinct(customer) AS n FROM cust;
 SELECT approx_distinct(1) AS a FROM cust;
 SELECT approx_median(qty) AS m FROM cust;
 
--- SQLite: built-ins it lacks or answers differently stay local
--- keeps sqlite: upper(
+-- Case, concatenation, digests, date parts, patterns and ordered aggregates
 SELECT id, upper(customer) AS u, lower(customer) AS l FROM cust ORDER BY id;
--- keeps sqlite: concat(
 SELECT id, concat(customer, '-', region) AS c FROM cust ORDER BY id;
--- keeps sqlite: concat(
 SELECT id, concat(customer, CAST(NULL AS VARCHAR)) AS c FROM cust ORDER BY id;
--- keeps sqlite: concat(
 SELECT id, concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) AS c FROM cust ORDER BY id;
--- keeps sqlite: concat(
 SELECT id, concat(customer, '') AS c FROM cust ORDER BY id;
--- keeps sqlite: concat(
 SELECT id, concat('', region) AS c FROM cust ORDER BY id;
--- keeps sqlite: to_hex(
 SELECT id, to_hex(id) AS h FROM cust ORDER BY id;
--- keeps sqlite: md5(
 SELECT id, md5(customer) AS d FROM cust ORDER BY id;
--- keeps sqlite: sha256(
 SELECT id, sha256(customer) AS d FROM cust ORDER BY id;
--- keeps sqlite: encode(
 SELECT id, encode(sha256(customer), 'hex') AS h FROM cust ORDER BY id;
--- keeps sqlite: date_part(
 SELECT id, date_part('month', try_cast(ts AS timestamp)) AS m FROM cust ORDER BY id;
--- keeps sqlite: date_part(
 SELECT id, extract(month FROM try_cast(ts AS timestamp)) AS m FROM cust ORDER BY id;
--- keeps sqlite: date_trunc(
 SELECT id, date_trunc('month', try_cast(ts AS timestamp)) AS m FROM cust ORDER BY id;
--- keeps sqlite: LIKE
 SELECT id FROM cust WHERE customer ILIKE '%alice%' ORDER BY id;
--- keeps sqlite: LIKE
 -- expect-empty
 SELECT id FROM cust WHERE customer LIKE '%ALICE%' ORDER BY id;
--- keeps sqlite: regexp_like(
 SELECT id, regexp_like(customer, 'ali') AS m FROM cust ORDER BY id;
--- keeps sqlite: regexp_replace(
 SELECT id, regexp_replace(customer, 'a', 'X') AS r FROM cust ORDER BY id;
--- keeps sqlite: regexp_match(
 SELECT id, regexp_match(customer, '(a)') AS m FROM cust ORDER BY id;
--- keeps sqlite: regexp_instr(
 SELECT id, regexp_instr(customer, 'a') AS i FROM cust ORDER BY id;
--- keeps sqlite: regexp_count(
 SELECT id, regexp_count(customer, 'a') AS c FROM cust ORDER BY id;
--- keeps sqlite: median(
 SELECT median(qty) AS m FROM cust;
--- keeps sqlite: string_agg(
 SELECT string_agg(DISTINCT customer, '|' ORDER BY customer) AS customers FROM cust;
--- keeps sqlite: first_value(
 SELECT first_value(customer ORDER BY id) AS f FROM cust;
--- keeps sqlite: last_value(
 SELECT last_value(customer ORDER BY id) AS l FROM cust;
--- keeps sqlite: nth_value(
 SELECT nth_value(customer, 2 ORDER BY id) AS n FROM cust;
--- keeps sqlite: stddev(
 SELECT stddev(qty) AS s FROM cust;
--- keeps sqlite: var_pop(
 SELECT var_pop(qty) AS v FROM cust;
--- keeps sqlite: corr(
 SELECT corr(qty, id) AS c FROM cust;
--- keeps sqlite: bool_and(
 SELECT bool_and(qty > 10) AS b FROM cust;
--- keeps sqlite: bit_or(
 SELECT bit_or(qty) AS b FROM cust;
--- keeps sqlite: count(
 SELECT count(region, customer) AS n FROM cust;
--- keeps sqlite: stddev(
 SELECT id, stddev(qty) OVER (PARTITION BY region) AS s FROM cust ORDER BY id;
--- keeps sqlite: count(
 SELECT id, count(DISTINCT qty) OVER (PARTITION BY region) AS n FROM cust ORDER BY id;
--- keeps sqlite: lag(
 SELECT id, lag(region) IGNORE NULLS OVER (ORDER BY id) AS r FROM cust ORDER BY id;
--- keeps sqlite: lead(
 SELECT id, lead(region) IGNORE NULLS OVER (ORDER BY id) AS r FROM cust ORDER BY id;
--- keeps sqlite: ROLLUP
 SELECT region, sum(qty) AS s FROM cust GROUP BY ROLLUP(region) ORDER BY region NULLS LAST, s;
--- sends sqlite: GROUP BY
 SELECT region, count(qty) AS n, sum(qty) AS s, min(qty) AS lo, max(qty) AS hi FROM cust GROUP BY region ORDER BY region NULLS LAST;
--- sends sqlite: lag(
 SELECT id, row_number() OVER (ORDER BY id) AS n, lag(region) OVER (ORDER BY id) AS r FROM cust ORDER BY id;
 
--- A correlated subquery above a join: SQLite's LIKE folds ASCII case, so the
--- LIKE stays local while the scans are still sent.
--- keeps sqlite: LIKE
+-- A correlated subquery above a join with a LIKE.
 SELECT p.p_partkey, ps.ps_suppkey, ps.ps_supplycost FROM part p JOIN partsupp ps ON p.p_partkey = ps.ps_partkey WHERE p.p_type LIKE '%BRASS' AND ps.ps_supplycost = (SELECT min(ps2.ps_supplycost) FROM partsupp ps2 WHERE ps2.ps_partkey = p.p_partkey) ORDER BY p.p_partkey, ps.ps_suppkey;
 
--- Constant-only selects: a scan with no column is sent as SELECT 1.
--- sends sqlite: SELECT 1 FROM `cust`
+-- Constant-only selects.
 SELECT upper('a') AS u FROM cust;

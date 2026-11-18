@@ -1,0 +1,92 @@
+name: ordering-window-join-semantics
+description: >
+  A filter on a lossy cast or on integer division of an ORDER BY column keeps
+  the sort, LEAD and LAG with IGNORE NULLS skip NULLs past the cached row, and
+  a sort-merge outer join with a filter returns its NULL-padded rows. Answers
+  are checked against PostgreSQL, or against the upstream DataFusion spec
+  where PostgreSQL has no IGNORE NULLS. These are the wrong answers that
+  DataFusion 55.3.0 fixes (apache/datafusion#25531, #25234, #25472, #26027).
+
+sources:
+  pg: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: ordering-window-join-semantics
+  runtime:
+    query:
+      # Plans the joins below as SortMergeJoinExec.
+      prefer_hash_join: false
+
+defaults:
+  expect: { oracle: pg }
+
+steps:
+  - start: {}
+
+  # A filter on CAST(t AS DATE) must not let the planner treat t as constant and
+  # drop the sort on t (apache/datafusion#25531).
+  - query: >-
+      SELECT id FROM (VALUES (1, TIMESTAMP '2026-01-01 01:00:00'), (2, TIMESTAMP '2026-01-01 02:00:00'), (3, TIMESTAMP '2026-01-01 03:00:00')) AS v(id, t)
+      WHERE CAST(t AS DATE) = DATE '2026-01-01' ORDER BY t DESC LIMIT 3
+  - query: >-
+      SELECT id FROM (VALUES (1, TIMESTAMP '2026-01-01 01:00:00'), (2, TIMESTAMP '2026-01-01 02:00:00'), (3, TIMESTAMP '2026-01-01 03:00:00')) AS v(id, t)
+      WHERE CAST(t AS DATE) = DATE '2026-01-01' ORDER BY t DESC LIMIT 1
+  - explain: >-
+      SELECT id FROM (VALUES (1, TIMESTAMP '2026-01-01 01:00:00'), (2, TIMESTAMP '2026-01-01 02:00:00'), (3, TIMESTAMP '2026-01-01 03:00:00')) AS v(id, t)
+      WHERE CAST(t AS DATE) = DATE '2026-01-01' ORDER BY t DESC LIMIT 3
+    contains: [SortExec]
+
+  # Integer division is not invertible, so a = 2 and a = 3 both satisfy
+  # a / 2 = 1 and the sort on a must stay (apache/datafusion#25234).
+  - query: >-
+      SELECT a FROM (SELECT CAST(column1 AS INT) AS a FROM (VALUES (2), (3))) q
+      WHERE a / CAST(2 AS INT) = CAST(1 AS INT) ORDER BY a DESC LIMIT 2
+  - query: >-
+      SELECT a FROM (SELECT CAST(column1 AS INT) AS a FROM (VALUES (2), (3))) q
+      WHERE a / CAST(2 AS INT) = CAST(1 AS INT) ORDER BY a DESC LIMIT 1
+
+  # PostgreSQL has no IGNORE NULLS; the expected rows are upstream's own
+  # (apache/datafusion#25472, window.slt).
+  - query: >-
+      SELECT column1, column2,
+        LEAD(column2, 2) IGNORE NULLS OVER w AS lead2,
+        LAG(column2, -2, -1) IGNORE NULLS OVER w AS lag_minus2,
+        LAG(column2, 2) IGNORE NULLS OVER w AS lag2,
+        LEAD(column2, -2) IGNORE NULLS OVER w AS lead_minus2
+      FROM (VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, NULL), (6, NULL), (7, 70), (8, 80), (9, NULL)) AS s(column1, column2)
+      WINDOW w AS (ORDER BY column1) ORDER BY column1 LIMIT 9
+    expect:
+      rows:
+        - ['1', '10', '30', '30', null, null]
+        - ['2', '20', '40', '40', null, null]
+        - ['3', '30', '70', '70', '10', '10']
+        - ['4', '40', '80', '80', '20', '20']
+        - ['5', null, '80', '80', '30', '30']
+        - ['6', null, '80', '80', '30', '30']
+        - ['7', '70', null, '-1', '30', '30']
+        - ['8', '80', null, '-1', '40', '40']
+        - ['9', null, null, '-1', '70', '70']
+
+  # A left join whose filter rejects a matched row returns that row NULL-padded
+  # (apache/datafusion#26027). PostgreSQL names VALUES columns column1, column2.
+  - query: >-
+      SELECT a.k, a.v, b.w FROM
+        (SELECT CAST(column1 AS INT) AS k, CAST(column2 AS INT) AS v FROM (VALUES (1, 10), (2, 20), (3, 30), (4, 400)) x) a
+        LEFT JOIN (SELECT CAST(column1 AS INT) AS k, CAST(column2 AS INT) AS w FROM (VALUES (1, 100), (3, 300), (4, 40)) y) b
+        ON a.k = b.k AND a.v < b.w
+      ORDER BY a.k LIMIT 4
+  - query: >-
+      SELECT a.k, a.v, b.w FROM
+        (SELECT CAST(column1 AS INT) AS k, CAST(column2 AS INT) AS v FROM (VALUES (1, 10), (2, 20), (3, 30), (4, 400)) x) a
+        FULL JOIN (SELECT CAST(column1 AS INT) AS k, CAST(column2 AS INT) AS w FROM (VALUES (1, 100), (3, 300), (4, 40)) y) b
+        ON a.k = b.k AND a.v < b.w
+      ORDER BY a.k NULLS LAST, b.w NULLS LAST LIMIT 5
+  - explain: >-
+      SELECT a.k, a.v, b.w FROM
+        (SELECT CAST(column1 AS INT) AS k, CAST(column2 AS INT) AS v FROM (VALUES (1, 10), (2, 20), (3, 30), (4, 400)) x) a
+        LEFT JOIN (SELECT CAST(column1 AS INT) AS k, CAST(column2 AS INT) AS w FROM (VALUES (1, 100), (3, 300), (4, 40)) y) b
+        ON a.k = b.k AND a.v < b.w
+      ORDER BY a.k LIMIT 4
+    contains: [SortMergeJoinExec]
