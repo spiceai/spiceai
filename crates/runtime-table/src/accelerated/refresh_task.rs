@@ -4266,6 +4266,13 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     if let Some(message) = latest_by_time::not_applied_message(&error) {
         return RetryError::permanent(super::Error::RefreshNotApplied { message });
     }
+    // Data a connector refused as a compression bomb would expand as far again, so it
+    // is not asked for again, however the scan marked the failure.
+    if data_components::refusal::is_compression_refusal(&error) {
+        return RetryError::permanent(super::Error::FailedToRefreshDataset {
+            source: find_datafusion_root(error),
+        });
+    }
     if is_retriable_error(&error) || is_object_generation_changed_error(&error) {
         return RetryError::transient(super::Error::UnableToGetDataFromConnector {
             source: find_datafusion_root(error),
@@ -4752,6 +4759,29 @@ mod tests {
         // Should not match partial error names
         assert!(!is_s3_express_upload_speed_error("ClientUpload"));
         assert!(!is_s3_express_upload_speed_error("SpeedTooSlow"));
+    }
+
+    /// A refresh does not ask again for data a connector refused as a compression bomb,
+    /// even when the scan marked the failure retriable.
+    #[test]
+    fn a_compression_refusal_is_a_permanent_refresh_error() {
+        let refusal = http_body_limit::Error::CompressionRatio {
+            codec: http_body_limit::Codec::Gzip,
+            input: http_body_limit::Input::Response,
+            decoded: 67_200_000,
+            received: 33_600,
+        };
+        let typed = http_body_limit::CompressionRefusal::new("refused".to_string(), &refusal)
+            .expect("a compression refusal");
+        let marked =
+            datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error(
+                DataFusionError::External(Box::new(typed)),
+            );
+        assert!(is_retriable_error(&marked), "the scan marks it retriable");
+        assert!(
+            matches!(retry_from_df_error(marked), RetryError::Permanent(_)),
+            "a compression refusal is not asked for again"
+        );
     }
 
     #[test]

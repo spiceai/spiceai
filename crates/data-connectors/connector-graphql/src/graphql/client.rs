@@ -110,6 +110,17 @@ pub(crate) type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send 
 /// `hasNextPage: false`. GitHub never sends this key.
 pub const NESTED_DELIVERED_BEFORE_KEY: &str = "__spice_delivered_before";
 
+/// The error a scan reports for a failed page: a response refused as a compression bomb
+/// keeps its type, so callers classify it as a refusal of the data (see
+/// `data_components::refusal`); any other failure keeps its message.
+fn scan_error(error: Error) -> DataFusionError {
+    if data_components::refusal::is_compression_refusal(&error) {
+        DataFusionError::External(Box::new(error))
+    } else {
+        DataFusionError::Execution(error.to_string())
+    }
+}
+
 pub enum UnnestBehavior {
     Depth(usize),
     Custom(UnnestHandler),
@@ -818,6 +829,10 @@ pub struct GraphQLClient {
     client: reqwest::Client,
     /// The query memory pool every response body is charged to while it is held.
     memory_pool: Arc<dyn MemoryPool>,
+    /// The dataset this client reads for, which a refused response names.
+    dataset: Option<Arc<str>>,
+    /// The connector whose documentation page a refused response links.
+    connector: &'static str,
     endpoint: Url,
     pub(crate) json_pointer: Option<Arc<str>>,
     unnest_parameters: UnnestParameters,
@@ -1031,6 +1046,8 @@ impl GraphQLClient {
         Ok(Self {
             client,
             memory_pool,
+            dataset: None,
+            connector: "graphql",
             endpoint,
             json_pointer,
             unnest_parameters,
@@ -1050,9 +1067,25 @@ impl GraphQLClient {
             http_body_limit::Error::Read { source } => Error::ReqwestInternal { source },
             source => Error::ResponseBody {
                 endpoint: self.endpoint.origin().ascii_serialization(),
+                dataset: self.dataset.as_deref().map_or_else(
+                    || "this dataset".to_string(),
+                    |name| format!("dataset '{name}'"),
+                ),
+                connector: self.connector,
                 source,
             },
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_source(
+        mut self,
+        dataset: Option<Arc<str>>,
+        connector: &'static str,
+    ) -> Self {
+        self.dataset = dataset;
+        self.connector = connector;
+        self
     }
 
     #[must_use]
@@ -1305,15 +1338,18 @@ impl GraphQLClient {
             self.record_adaptive_outcome(RequestOutcome::Success);
         }
 
-        // Read the raw body first so we can classify it before JSON decoding. It is charged,
-        // as decompressed, to the query memory pool as it is read and while it is held
-        // below, so a response the pool cannot hold, however small it was compressed, is
-        // refused instead of exhausting the process.
+        // Read the raw body first so we can classify it before JSON decoding. The client
+        // decodes compressed bodies itself, so one that expands past what real data
+        // compresses to is refused as a compression bomb as it decodes; and the body is
+        // charged, as decompressed, to the query memory pool as it is read and while it is
+        // held below, so a response the pool cannot hold is refused instead of exhausting
+        // the process.
         let reservation = MemoryConsumer::new(format!(
             "GraphQL response from {}",
             self.endpoint.origin().ascii_serialization()
         ))
         .register(&self.memory_pool);
+        let decoded_here = http_body_limit::Encoding::of(&response_headers).is_some();
         let response_bytes =
             http_body_limit::read_bytes(response, http_body_limit::Limit::Reserve(&reservation))
                 .await
@@ -1323,6 +1359,13 @@ impl GraphQLClient {
         // valid UTF-8, so it is charged at its exact length before it is made.
         let response_text = http_body_limit::utf8_lossy(&response_bytes, &reservation)
             .map_err(|source| self.response_body_error(source))?;
+        // A body decoded here, as one `reqwest` decoded transparently would, carries no
+        // length or encoding the classification below should compare it against.
+        let (content_length, content_encoding) = if decoded_here {
+            (None, None)
+        } else {
+            (content_length, content_encoding)
+        };
 
         let header = |name: &str| response_headers.get(name).and_then(|v| v.to_str().ok());
         tracing::debug!(
@@ -1811,7 +1854,7 @@ impl GraphQLClient {
                 query_cost,
             )
             .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(scan_error)?;
 
             let first_page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
             total_rows += first_page_rows;
@@ -1895,7 +1938,7 @@ impl GraphQLClient {
                     query_cost,
                 )
                 .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                .map_err(scan_error)?;
 
                 let page_rows: usize = result.records.iter().map(RecordBatch::num_rows).sum();
                 total_rows += page_rows;
@@ -2598,7 +2641,7 @@ mod tests {
                 DataType::Utf8,
                 true,
             )]))))
-            .build(reqwest::Client::new(), Arc::clone(&pool))
+            .build(reqwest::Client::builder(), Arc::clone(&pool))
             .expect("client to build");
             let query = GraphQLQuery::try_from(Arc::<str>::from("query { items { id } }"))
                 .expect("query to parse")
@@ -2759,7 +2802,7 @@ mod tests {
                 page_size: 2,
             }))
             .build(
-                reqwest::Client::new(),
+                reqwest::Client::builder(),
                 std::sync::Arc::new(
                     datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
                 ),
@@ -2892,7 +2935,7 @@ mod tests {
                 page_size: 2,
             }))
             .build(
-                reqwest::Client::new(),
+                reqwest::Client::builder(),
                 std::sync::Arc::new(
                     datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
                 ),
@@ -3003,7 +3046,7 @@ mod tests {
                 page_size: 2,
             }))
             .build(
-                reqwest::Client::new(),
+                reqwest::Client::builder(),
                 std::sync::Arc::new(
                     datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
                 ),
@@ -3118,7 +3161,7 @@ mod tests {
                 page_size: 2,
             }))
             .build(
-                reqwest::Client::new(),
+                reqwest::Client::builder(),
                 std::sync::Arc::new(
                     datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
                 ),
@@ -3217,7 +3260,7 @@ mod tests {
                 page_size: 2,
             }))
             .build(
-                reqwest::Client::new(),
+                reqwest::Client::builder(),
                 std::sync::Arc::new(
                     datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
                 ),
@@ -3291,7 +3334,7 @@ mod tests {
             .with_json_pointer(Some("/data/view/nodes"))
             .with_schema(schema)
             .build(
-                reqwest::Client::new(),
+                reqwest::Client::builder(),
                 std::sync::Arc::new(
                     datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
                 ),
@@ -4599,7 +4642,7 @@ mod tests {
                 true,
             )]))))
             .build(
-                reqwest::Client::new(),
+                reqwest::Client::builder(),
                 std::sync::Arc::new(
                     datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
                 ),
@@ -4731,7 +4774,7 @@ mod tests {
                 true,
             )]))))
             .build(
-                reqwest::Client::new(),
+                reqwest::Client::builder(),
                 std::sync::Arc::new(
                     datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
                 ),

@@ -20,6 +20,7 @@ use super::{Result, client::GraphQLClient, client::UnnestBehavior};
 use arrow::datatypes::SchemaRef;
 use datafusion::execution::memory_pool::MemoryPool;
 use runtime_rate_control::RateController;
+use snafu::ResultExt;
 use std::sync::Arc;
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
@@ -39,6 +40,8 @@ pub struct GraphQLClientBuilder {
     semaphore: Option<Arc<Semaphore>>,
     auth_header: Option<reqwest::header::HeaderName>,
     nested_pager: Option<super::client::NestedConnectionPager>,
+    dataset: Option<Arc<str>>,
+    connector: &'static str,
 }
 
 impl GraphQLClientBuilder {
@@ -57,6 +60,8 @@ impl GraphQLClientBuilder {
             semaphore: None,
             auth_header: None,
             nested_pager: None,
+            dataset: None,
+            connector: "graphql",
         }
     }
 
@@ -123,18 +128,32 @@ impl GraphQLClientBuilder {
         self
     }
 
-    /// Build the client over `client`. Every response body, as decompressed, is charged
-    /// to `memory_pool`, the runtime's query memory pool, while it is held, so a response
-    /// the pool cannot hold is refused instead of exhausting the process.
+    /// Name the dataset and connector this client reads for, which a refused response
+    /// names and links.
+    #[must_use]
+    pub fn with_source(mut self, dataset: impl Into<Arc<str>>, connector: &'static str) -> Self {
+        self.dataset = Some(dataset.into());
+        self.connector = connector;
+        self
+    }
+
+    /// Build the client over `client`, built here to decode compressed responses itself
+    /// (see `http_body_limit::decode_manually`), so a response that expands past what real
+    /// data compresses to is refused as a compression bomb as it decodes. Every response
+    /// body, as decompressed, is charged to `memory_pool`, the runtime's query memory
+    /// pool, while it is held.
     ///
     /// # Errors
     ///
-    /// Returns an error if the configuration is invalid.
+    /// Returns an error if `client` cannot be built, or the configuration is invalid.
     pub fn build(
         self,
-        client: reqwest::Client,
+        client: reqwest::ClientBuilder,
         memory_pool: Arc<dyn MemoryPool>,
     ) -> Result<GraphQLClient> {
+        let client = http_body_limit::decode_manually(client)
+            .build()
+            .context(super::ReqwestInternalSnafu)?;
         let graphql_client = GraphQLClient::new(
             client,
             memory_pool,
@@ -150,6 +169,8 @@ impl GraphQLClientBuilder {
             self.semaphore,
             self.auth_header,
         )?;
-        Ok(graphql_client.with_nested_pager(self.nested_pager))
+        Ok(graphql_client
+            .with_nested_pager(self.nested_pager)
+            .with_source(self.dataset, self.connector))
     }
 }

@@ -8,7 +8,12 @@ description: >
   body decodes past the limit fails to load with an error that names the
   limit, instead of being decoded into memory. Likewise a gzip JSON document,
   which schema inference parses whole: a small one loads, and one that
-  decodes past the limit fails to load with an error naming the file.
+  decodes past the limit fails to load with an error naming the file. With
+  room in the limit, an input that expands far past what real data in its
+  codec compresses to (400:1 for gzip, 2,000:1 for zstd, past 64 MiB) is
+  refused as a compression bomb, an HTTP response, a GraphQL response and a
+  JSON file alike, while telemetry that zstd compresses past 100:1 loads in
+  full.
 
 sources:
   api: { kind: mock-http }
@@ -35,6 +40,12 @@ spicepod:
       params: &doc { file_format: json, json_format: object, file_compression_type: GZIP }
     - from: ${sources.api.url}/files/large.json.gz
       name: doc_large
+      params: *doc
+    - from: graphql:${sources.api.url}/graphql-zbomb
+      name: gql_zbomb
+      params: { graphql_query: 'query { items { id } }', json_pointer: /data/items }
+    - from: ${sources.api.url}/files/bomb.json.gz
+      name: doc_bomb
       params: *doc
 
 steps:
@@ -85,5 +96,55 @@ steps:
   - assert-status:
       dataset: doc_large
       status: Error
-      message-contains: "large.json.gz' to infer its schema: holding the decoded data would pass the query memory limit"
+      message-contains: "large.json.gz' for dataset 'doc_large': holding the decoded data would pass the query memory limit"
+    eventually: 60s
+
+  # Past 64 MiB decoded, an input that expands far past what real data in its codec
+  # compresses to is refused as a compression bomb, before the memory limit is reached;
+  # real data that compresses well loads in full.
+  - source-exec:
+      api:
+        # 72 MiB of one byte, past the 64 MiB floor: about 1,000:1 under gzip, tens of thousands
+        # to one under zstd.
+        - "{ path: /v1/bomb-gzip, body: 'a', repeat: 75497472, encoding: gzip }"
+        - "{ path: /v1/bomb-zstd, body: 'a', repeat: 75497472, encoding: zstd }"
+        - "{ path: /graphql-zbomb, method: POST, headers: { content-type: application/json }, body: 'a', repeat: 75497472, encoding: zstd }"
+        - "{ path: /files/bomb.json.gz, body: 'a', repeat: 75497472, encoding: gzip }"
+        # Telemetry lines, about 70 MiB, past the floor: about 135:1 under zstd's default
+        # level, past the 100:1 a single threshold once refused, and 44:1 under gzip.
+        - "{ path: /v1/telemetry-zstd, headers: { content-type: application/x-ndjson }, body: \"{\\\"ts\\\":\\\"2026-01-01T00:00:00.{i}Z\\\",\\\"level\\\":\\\"INFO\\\",\\\"service\\\":\\\"checkout\\\",\\\"host\\\":\\\"web-01\\\",\\\"msg\\\":\\\"heartbeat ok\\\",\\\"status\\\":200}\\n\", repeat: 600000, encoding: zstd }"
+        - "{ path: /v1/telemetry-gzip, headers: { content-type: application/x-ndjson }, body: \"{\\\"ts\\\":\\\"2026-01-01T00:00:00.{i}Z\\\",\\\"level\\\":\\\"INFO\\\",\\\"service\\\":\\\"checkout\\\",\\\"host\\\":\\\"web-01\\\",\\\"msg\\\":\\\"heartbeat ok\\\",\\\"status\\\":200}\\n\", repeat: 600000, encoding: gzip }"
+  - restart:
+      ready: false
+      patch: { spicepod: { runtime: { query: { memory_limit: 2GiB } } } }
+  - query: SELECT count(*) FROM api WHERE request_path = '/bomb-gzip'
+    expect-error: "for dataset 'api': the gzip-compressed response expanded more than 400:1"
+    eventually: 60s
+  - query: SELECT count(*) FROM api WHERE request_path = '/bomb-zstd'
+    expect-error: "the zstd-compressed response expanded more than 2,000:1"
+  - query: SELECT count(*) FROM api WHERE request_path = '/bomb-zstd'
+    expect-error: "far past what real data compresses to, so it was refused as a compression bomb. If the data is genuine, have the origin serve it uncompressed or at a lower compression level. See: https://spiceai.org/docs/components/data-connectors/https"
+  - http:
+      path: /v1/sql
+      method: POST
+      headers: { content-type: text/plain }
+      body: SELECT count(*) FROM api WHERE request_path = '/bomb-zstd'
+    expect:
+      status: 422
+      json:
+        - { pointer: /error, matches: "for dataset 'api': the zstd-compressed response expanded more than 2,000:1 .*refused as a compression bomb" }
+        - { pointer: /error, matches: "memory_limit", count: 0 }
+  - query: SELECT count(*) FROM api WHERE request_path = '/telemetry-zstd'
+    expect: { rows: [['600000']] }
+  - query: SELECT count(*) FROM api WHERE request_path = '/telemetry-gzip'
+    expect: { rows: [['600000']] }
+  - assert-status:
+      dataset: gql_zbomb
+      status: Error
+      message-contains: "for dataset 'gql_zbomb': the zstd-compressed response expanded more than 2,000:1"
+    eventually: 60s
+  - assert-status:
+      dataset: doc_bomb
+      status: Error
+      message-contains: "bomb.json.gz' for dataset 'doc_bomb': the gzip-compressed file expanded more than 400:1"
     eventually: 60s

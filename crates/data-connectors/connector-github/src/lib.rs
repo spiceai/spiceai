@@ -447,22 +447,22 @@ impl Github {
 
         let rate_controller = get_github_auth_rate_control(auth_context).await.controller;
 
+        // The GraphQL client decodes compressed responses itself, so one that expands past
+        // what real data compresses to is refused as a compression bomb.
         let client = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_mins(2))
-            .gzip(true)
-            .brotli(true)
-            .zstd(true)
-            .deflate(true)
             .default_headers({
                 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
                 let mut headers = HeaderMap::new();
                 headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 headers
-            })
-            .build()
-            .boxed()?;
+            });
+        let dataset_name = match tbl.get_component() {
+            ConnectorComponent::Dataset(dataset) => dataset.name.to_string(),
+            ConnectorComponent::Catalog(catalog) => catalog.name.clone(),
+        };
 
         let gql_client_params = tbl.get_graphql_values();
 
@@ -477,6 +477,7 @@ impl Github {
         .with_semaphore(Some(Arc::clone(&self.semaphore)))
         .with_rate_controller(Some(rate_controller))
         .with_nested_pager(gql_client_params.nested_pager)
+        .with_source(dataset_name, "github")
         .build(client, Arc::clone(memory_pool))
         .boxed()
     }

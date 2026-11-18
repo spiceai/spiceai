@@ -41,14 +41,18 @@ pub enum Error {
     #[snafu(display("Failed to send GraphQL HTTP request: {source}"))]
     ReqwestInternal { source: reqwest::Error },
 
-    /// The response body could not be read: the query memory pool could not hold it, or
-    /// it could not be read as sent.
+    /// The response body could not be read: refused as a compression bomb, or because the
+    /// query memory pool could not hold it, or it could not be read as sent.
     #[snafu(display(
-        "Failed to read the GraphQL response from {endpoint}: {source}{}",
-        response_body_remedy(source)
+        "Failed to read the GraphQL response from {endpoint} for {dataset}: {source}{}",
+        response_body_remedy(source, connector)
     ))]
     ResponseBody {
         endpoint: String,
+        /// `dataset 'name'`, or `this dataset` when the client has no dataset name.
+        dataset: String,
+        /// The connector whose documentation page the error links.
+        connector: &'static str,
         source: http_body_limit::Error,
     },
 
@@ -215,14 +219,18 @@ pub fn is_retriable_error(error: &Error) -> bool {
 }
 
 /// What to do about a GraphQL response body that was refused, as the end of the
-/// sentence that names it.
-fn response_body_remedy(source: &http_body_limit::Error) -> &'static str {
+/// sentence that names it. A compression bomb's cause already names its fix.
+fn response_body_remedy(source: &http_body_limit::Error, connector: &str) -> String {
     match source {
         http_body_limit::Error::MemoryLimit { .. } => {
             ". Raise `runtime.query.memory_limit`, or request fewer rows per page. \
              See: https://spiceai.org/docs/reference/memory"
+                .to_string()
         }
-        _ => "",
+        http_body_limit::Error::CompressionRatio { .. } => {
+            format!(" See: https://spiceai.org/docs/components/data-connectors/{connector}")
+        }
+        _ => String::new(),
     }
 }
 

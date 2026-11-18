@@ -122,9 +122,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to read the response from {endpoint} for {dataset}: {source}. Ask the \
-        endpoint for an uncompressed response by adding `Accept-Encoding: identity` to \
-        `http_headers`, or request less data per call. \
+        "Failed to read the response from {endpoint} for {dataset}: {source} \
         See: https://spiceai.org/docs/components/data-connectors/https"
     ))]
     CompressionRatio {
@@ -374,8 +372,10 @@ impl From<Error> for DataFusionError {
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
-            // `Plan`, so a refresh does not re-ask: the response will expand as far again.
-            err @ Error::CompressionRatio { .. } => DataFusionError::Plan(err.to_string()),
+            // Typed, so callers classify it as a refusal (see `crate::refusal`): `/v1/sql`
+            // answers 422 and a refresh does not ask again, since the response would expand
+            // as far again.
+            err @ Error::CompressionRatio { .. } => DataFusionError::External(Box::new(err)),
             // The pool's own error kind, so the query fails as any other that ran out of
             // query memory does.
             err @ Error::ResponseMemory { .. } => {

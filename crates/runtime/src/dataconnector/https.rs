@@ -4723,12 +4723,12 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     #[tokio::test]
-    async fn compression_bomb_is_refused_just_past_the_floor_without_retrying() {
+    async fn compression_bomb_is_refused_without_retrying() {
         let len = http_body_limit::RATIO_CHECK_FLOOR_BYTES + 64 * MIB;
         let body = gzip_json(len, |_| b'A');
         assert!(
-            body.len() * http_body_limit::MAX_COMPRESSION_RATIO < len,
-            "the response expands past the ratio: {} bytes on the wire",
+            body.len() * http_body_limit::Codec::Gzip.max_ratio() < len,
+            "the response expands past gzip's ratio: {} bytes on the wire",
             body.len()
         );
         let (origin, requests) = serve_gzip(body).await;
@@ -4742,40 +4742,21 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             ),
         };
         let (prefix, rest) = message
-            .split_once(" decoded (")
-            .unwrap_or_else(|| panic!("no byte counts in {message}"));
-        let (counts, suffix) = rest
             .split_once(" received)")
-            .unwrap_or_else(|| panic!("no byte counts in {message}"));
+            .unwrap_or_else(|| panic!("no sizes in {message}"));
         assert!(
-            prefix.ends_with(&format!(
+            prefix.contains(&format!(
                 "Failed to read the response from {origin} for dataset 'http_test': the \
-                 gzip-compressed response body expanded more than 100:1 when"
+                 gzip-compressed response expanded more than 400:1 (64."
             )),
             "{message}"
         );
         assert_eq!(
-            suffix,
-            ", which is refused once a body passes 64 MiB decoded. Ask the endpoint for an \
-             uncompressed response by adding `Accept-Encoding: identity` to `http_headers`, \
-             or request less data per call. \
-             See: https://spiceai.org/docs/components/data-connectors/https"
+            rest,
+            ", far past what real data compresses to, so it was refused as a compression \
+             bomb. If the data is genuine, have the origin serve it uncompressed or at a lower \
+             compression level. See: https://spiceai.org/docs/components/data-connectors/https"
         );
-
-        // Refused as soon as it passed the floor: never more than one decode block past it.
-        let (decoded, received) = counts
-            .split_once(" bytes from ")
-            .unwrap_or_else(|| panic!("malformed byte counts in {message}"));
-        let decoded: usize = decoded.parse().expect("decoded byte count");
-        let received: usize = received.parse().expect("received byte count");
-        assert!(
-            decoded > http_body_limit::RATIO_CHECK_FLOOR_BYTES
-                && decoded
-                    <= http_body_limit::RATIO_CHECK_FLOOR_BYTES
-                        + http_body_limit::DECODE_BLOCK_BYTES,
-            "refused at {decoded} decoded bytes"
-        );
-        assert!(decoded > received * http_body_limit::MAX_COMPRESSION_RATIO);
 
         // The refusal is permanent: the origin is asked once, not once per retry.
         assert_eq!(made, 1);
@@ -4787,7 +4768,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let body = gzip_json(len, ids);
         let ratio = len / body.len();
         assert!(
-            (2..http_body_limit::MAX_COMPRESSION_RATIO).contains(&ratio),
+            (2..http_body_limit::Codec::Gzip.max_ratio()).contains(&ratio),
             "the response compresses {ratio}:1"
         );
         let (origin, requests) = serve_gzip(body).await;

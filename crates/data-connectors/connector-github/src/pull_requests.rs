@@ -1139,9 +1139,7 @@ mod tests {
                 .brotli(true)
                 .zstd(true)
                 .deflate(true)
-                .default_headers(default_headers)
-                .build()
-                .expect("GitHub-style HTTP client to build");
+                .default_headers(default_headers);
             let client = GraphQLClientBuilder::new(
                 Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
                 params.unnest_behavior,

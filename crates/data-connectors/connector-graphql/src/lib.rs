@@ -28,7 +28,7 @@ use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DEFAULT_SPICE_CLIENT_TIMEOUT, DataConnector,
     DataConnectorError, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
-    default_spice_client,
+    default_spice_client_builder,
 };
 use data_http_rate_control as http_rate_control;
 use data_http_rate_control::{
@@ -244,13 +244,7 @@ impl GraphQL {
             });
         }
 
-        let client = default_spice_client("application/json")
-            .boxed()
-            .map_err(|source| DataConnectorError::InternalWithSource {
-                dataconnector: "graphql".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source,
-            })?;
+        let client = default_spice_client_builder("application/json");
 
         let mut rate_control = http_rate_control::resolve_config_for_component(
             &self.params,
@@ -258,7 +252,7 @@ impl GraphQL {
             &ConnectorComponent::from(dataset),
             "graphql",
         )?;
-        // The GraphQL client is `default_spice_client`, so its request timeout
+        // The GraphQL client is `default_spice_client_builder`'s, so its request timeout
         // is the `client_timeout` equivalent the acquire bound defaults to.
         rate_control.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
         let rate_limiter = self
@@ -291,6 +285,7 @@ impl GraphQL {
         .with_rate_limiter(Some(rate_limiter))
         .with_rate_controller(rate_controller.shared().controller.clone())
         .with_auth_header(auth_header)
+        .with_source(dataset.name.to_string(), "graphql")
         .build(client, memory_pool)
         .boxed();
 

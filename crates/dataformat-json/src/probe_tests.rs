@@ -283,8 +283,8 @@ async fn whole_document_probe_is_held_to_the_query_memory_limit() {
         let message = error.to_string();
         assert!(
             message.starts_with(
-                "Resources exhausted: Failed to read JSON file 'records.json' to infer its \
-                 schema: holding the decoded data would pass the query memory limit"
+                "Resources exhausted: Failed to read JSON file 'records.json': holding the \
+                 decoded data would pass the query memory limit"
             ),
             "{payload:?}: {message}"
         );

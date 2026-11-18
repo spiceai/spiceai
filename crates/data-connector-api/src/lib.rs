@@ -40,7 +40,7 @@ pub mod write_back;
 pub use connector::{
     DATA_CONNECTOR_REGISTRATIONS, DEFAULT_SPICE_CLIENT_TIMEOUT, DataConnector,
     DataConnectorFactory, DataConnectorRegistration, MetricsProviderComponent,
-    NewDataConnectorResult, default_spice_client,
+    NewDataConnectorResult, default_spice_client_builder,
 };
 /// Re-exported so a crate invoking [`register_data_connector!`] can bring
 /// `linkme` into scope with `use data_connector_api::linkme;` instead of taking
