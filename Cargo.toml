@@ -17,6 +17,7 @@ members = [
     "crates/aws-sdk-credential-bridge",
     "crates/backoff",
     "crates/chrono",
+    "crates/chrono-tz",
     "crates/chunking",
     "crates/cloud-connect-crypto",
     "crates/cpu-budget",
@@ -659,6 +660,13 @@ backoff = { path = "crates/backoff" }
 # Dependencies on crates.io `chrono` 0.4 resolve to the workspace crate, which
 # holds the part of chrono 0.4.45 the build uses. See crates/chrono/README.md.
 chrono = { path = "crates/chrono" }
+
+# Dependencies on crates.io `chrono-tz` 0.10 resolve to the workspace crate, which
+# carries a current IANA tz database (crates/chrono-tz/README.md). tera asks for
+# 0.9: `compat/0.9` re-exports the workspace crate under that version, so every
+# time zone conversion in the build reads the same tables.
+chrono-tz = { path = "crates/chrono-tz" }
+chrono-tz-0_9 = { package = "chrono-tz", path = "crates/chrono-tz/compat/0.9" }
 
 
 # Redirect candle-core / kernels / nn / transformers to the spiceai fork;
