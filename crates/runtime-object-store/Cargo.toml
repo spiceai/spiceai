@@ -43,7 +43,9 @@ util = { path = "../util", default-features = false }
 [dev-dependencies]
 axum.workspace = true
 insta = { workspace = true, features = ["json", "redactions"] }
+object_store.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 
 [features]
 ftp = ["dep:suppaftp", "dep:bb8"]
