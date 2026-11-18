@@ -295,9 +295,9 @@ pub fn validate_sql_query_read_only(
     Ok(())
 }
 
-/// The phrase in every refusal [`validate_sql_query_read_only`] gives a request without
-/// credentials, so a caller can recognize one (and answer `403`).
-pub(crate) const ANONYMOUS_READ_ONLY_MARKER: &str = "not allowed for a request without credentials";
+/// How every refusal [`validate_sql_query_read_only`] gives a request without credentials ends
+/// the refused operation's subject.
+const ANONYMOUS_READ_ONLY_MARKER: &str = "not allowed for a request without credentials";
 
 /// Whom a read-only query is read-only for, which decides how a refused operation is explained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

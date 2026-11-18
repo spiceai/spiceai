@@ -178,9 +178,12 @@ pub(crate) async fn require_write_access(req: Request<Body>, next: Next) -> Resp
     next.run(req).await
 }
 
+/// `403` for a query refused because its caller may only read: a read-only key, or a request
+/// without credentials, whose every refusal (a write, a remote function) gives the reason
+/// [`runtime_auth::anonymous::READ_ONLY_BECAUSE`]. `400` for any other error.
 fn status_for_sql_error(message: &str) -> StatusCode {
     if message.contains("read-only SQL context")
-        || message.contains(crate::datafusion::sql_validator::ANONYMOUS_READ_ONLY_MARKER)
+        || message.contains(runtime_auth::anonymous::READ_ONLY_BECAUSE)
     {
         StatusCode::FORBIDDEN
     } else {
@@ -1403,6 +1406,27 @@ mod tests {
         dataaccelerator::AcceleratorEngineRegistry, datafusion::builder::DataFusionBuilder,
         status::RuntimeStatus,
     };
+
+    /// A query refused because its caller may only read answers `403`, whichever check refused
+    /// it; any other failed query answers `400`.
+    #[test]
+    fn read_only_refusals_answer_forbidden() {
+        for message in [
+            "Error during planning: Insert Into operations are not allowed in read-only SQL context.",
+            "Error during planning: INSERT operations are not allowed for a request without credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth",
+            "Execution error: remote function 'remote_rows' needs write access, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth",
+        ] {
+            assert_eq!(
+                status_for_sql_error(message),
+                StatusCode::FORBIDDEN,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            status_for_sql_error("Error during planning: table 'nope' not found"),
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[test]
     fn redact_source_credentials_removes_userinfo() {
