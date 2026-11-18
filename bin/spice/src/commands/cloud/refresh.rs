@@ -49,6 +49,15 @@ impl Store {
 
     /// Replace the values of `SPICE_SPICEAI_*` variables this store holds.
     /// The env file keeps every other line as it is.
+    /// Fail before a refresh token is spent when the new tokens could not be
+    /// written back.
+    fn ensure_writable(self) -> Result<()> {
+        match self {
+            Self::Keychain => Ok(()),
+            Self::EnvFile => super::ensure_env_file_replaceable(),
+        }
+    }
+
     fn write(self, values: &[(&str, &str)]) -> Result<()> {
         match self {
             Self::Keychain => {
@@ -92,7 +101,10 @@ async fn renew_expiring_sign_ins_at(portal: &str) {
     for store in [Store::Keychain, Store::EnvFile] {
         for (token_var, refresh_var) in &pairs {
             if let Err(err) = renew(portal, store, token_var, refresh_var, &pairs).await {
+                // Retrying another copy could present a refresh token this
+                // attempt already rotated, which revokes the sign-in.
                 tracing::debug!("Could not renew the Spice Cloud sign-in in `{token_var}`: {err}");
+                break;
             }
         }
     }
@@ -143,6 +155,7 @@ async fn renew(
     else {
         return Ok(());
     };
+    store.ensure_writable()?;
 
     let grant = session::refresh(portal, &client_id, &refresh).await?;
 
@@ -160,35 +173,48 @@ async fn renew(
     store.write(&values)
 }
 
-/// Hold the machine-wide renewal lock until the returned file is dropped.
+/// [`lock_credentials`] without blocking the async runtime.
 async fn lock() -> Result<std::fs::File> {
-    let path = org::renewal_lock_path()?;
-    tokio::task::spawn_blocking(move || {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).context(ConfigIoSnafu {
-                operation: "create",
-                path: parent.to_path_buf(),
-            })?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .context(ConfigIoSnafu {
-                operation: "open",
-                path: path.clone(),
-            })?;
-        file.lock().context(ConfigIoSnafu {
-            operation: "lock",
-            path,
+    let path = org::credentials_lock_path()?;
+    tokio::task::spawn_blocking(move || lock_credentials_at(path))
+        .await
+        .map_err(|e| crate::error::Error::InvalidArgument {
+            message: format!("The Spice Cloud credential lock task failed: {e}"),
+        })?
+}
+
+/// Hold the machine-wide credential lock until the returned file is dropped.
+/// Every read-modify-write of stored Spice Cloud credentials holds it, so a
+/// renewal cannot write back tokens that a logout or login just changed.
+///
+/// # Errors
+///
+/// Returns an error if the lock file cannot be created or locked.
+pub(crate) fn lock_credentials() -> Result<std::fs::File> {
+    lock_credentials_at(org::credentials_lock_path()?)
+}
+
+fn lock_credentials_at(path: std::path::PathBuf) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context(ConfigIoSnafu {
+            operation: "create",
+            path: parent.to_path_buf(),
         })?;
-        Ok(file)
-    })
-    .await
-    .map_err(|e| crate::error::Error::InvalidArgument {
-        message: format!("The Spice Cloud sign-in renewal lock task failed: {e}"),
-    })?
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .context(ConfigIoSnafu {
+            operation: "open",
+            path: path.clone(),
+        })?;
+    file.lock().context(ConfigIoSnafu {
+        operation: "lock",
+        path,
+    })?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -306,6 +332,29 @@ mod tests {
         assert_eq!(
             login::read_env_var("SPICE_SPICEAI_TOKEN").as_deref(),
             Some("access-2")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn renewal_never_replaces_a_linked_env_file() {
+        let _stores = Stores::new();
+        // Refused before the refresh token is spent.
+        let server = token_endpoint(0).await;
+        let path = login::test_env_file::path();
+        let target = path.with_file_name("linked.env");
+        store_sign_in(&jwt_expiring_in(60));
+        std::fs::rename(&path, &target).expect("move env file");
+        std::os::unix::fs::symlink(&target, &path).expect("link env file");
+
+        renew_expiring_sign_ins_at(&server.uri()).await;
+
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("env file entry")
+                .file_type()
+                .is_symlink(),
+            "the link must not be replaced by a regular file"
         );
     }
 

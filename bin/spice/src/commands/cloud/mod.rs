@@ -2052,6 +2052,7 @@ fn persist_login_values(
         return write_json(&serde_json::Value::Object(result));
     }
 
+    let _lock = refresh::lock_credentials()?;
     if output == LoginOutput::Keychain {
         org::remember_keychain_orgs(&keychain_login_orgs(spiceai))?;
     }
@@ -2471,6 +2472,7 @@ fn print_post_login_help() {
 }
 
 fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
+    let _lock = refresh::lock_credentials()?;
     let mut cleared = Vec::new();
     let mut already_logged_out: Option<String> = None;
 
@@ -2694,12 +2696,47 @@ fn assigned_name(line: &str) -> Option<&str> {
     Some(lhs.trim().trim_start_matches("export ").trim())
 }
 
+/// Refuse an env file that [`replace_env_file_values`] would not replace: a
+/// link, or anything else that is not a regular file.
+pub(crate) fn ensure_env_file_replaceable() -> Result<()> {
+    let env_file = crate::commands::login::env_file_path();
+    let metadata =
+        std::fs::symlink_metadata(&env_file).map_err(|source| crate::error::Error::ConfigIo {
+            operation: "read",
+            path: env_file.clone(),
+            source,
+        })?;
+    if metadata.is_file() {
+        return Ok(());
+    }
+    Err(crate::error::Error::ConfigIo {
+        operation: "write",
+        path: env_file,
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "credentials are written only to a regular file",
+        ),
+    })
+}
+
 /// Replace the values of variables the env file already assigns, keeping
 /// every other line byte-for-byte for the same reasons as
 /// [`remove_env_file_keys`].
+///
+/// The new contents go to an owner-only file beside the env file, which is
+/// then renamed over it, so a concurrent reader sees the old file or the new
+/// one, never a partial one. A link or other non-regular file is refused.
 pub(crate) fn replace_env_file_values(values: &[(&str, &str)]) -> Result<()> {
+    ensure_env_file_replaceable()?;
     let env_file = crate::commands::login::env_file_path();
     let path = env_file.as_path();
+    let io_error = |operation: &'static str| {
+        move |source| crate::error::Error::ConfigIo {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        }
+    };
     let content = std::fs::read_to_string(path).map_err(|e| crate::error::Error::ConfigIo {
         operation: "read",
         path: path.to_path_buf(),
@@ -2722,11 +2759,21 @@ pub(crate) fn replace_env_file_values(values: &[(&str, &str)]) -> Result<()> {
     if content.ends_with('\n') {
         updated.push('\n');
     }
-    std::fs::write(path, updated).map_err(|e| crate::error::Error::ConfigIo {
-        operation: "write",
-        path: path.to_path_buf(),
-        source: e,
-    })
+
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let mut replacement = tempfile::NamedTempFile::new_in(directory).map_err(io_error("write"))?;
+    std::io::Write::write_all(&mut replacement, updated.as_bytes()).map_err(io_error("write"))?;
+    replacement
+        .as_file()
+        .sync_all()
+        .map_err(io_error("write"))?;
+    replacement
+        .persist(path)
+        .map_err(|e| io_error("replace")(e.error))?;
+    Ok(())
 }
 
 async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()> {

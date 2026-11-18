@@ -147,13 +147,14 @@ fn context_path() -> Result<PathBuf> {
     }
 }
 
-/// Lock file that serializes browser sign-in renewals on this machine.
+/// Lock file that serializes Spice Cloud credential changes on this machine:
+/// login, logout and sign-in renewal.
 ///
 /// # Errors
 ///
 /// Returns an error if the home directory cannot be determined.
-pub(super) fn renewal_lock_path() -> Result<PathBuf> {
-    Ok(context_path()?.with_file_name("cloud-refresh.lock"))
+pub(super) fn credentials_lock_path() -> Result<PathBuf> {
+    Ok(context_path()?.with_file_name("cloud-credentials.lock"))
 }
 
 /// Redirects cloud-context helpers to a temporary file in tests.

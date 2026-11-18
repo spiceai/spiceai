@@ -108,8 +108,11 @@ replaces, so renewal never pairs a refresh token with another login's token.
 
 Spice Cloud replaces the refresh token on every use and revokes the whole
 sign-in when an old refresh token is presented again. Renewals therefore take
-an exclusive lock on `~/.spice/cloud-refresh.lock` and read the tokens again
-under it, so concurrent commands use a refresh token once. The sign-in itself
+an exclusive lock on `~/.spice/cloud-credentials.lock` and read the tokens again
+under it, so concurrent commands use a refresh token once. Login and logout
+hold the same lock while they change credentials, so a renewal cannot write
+back tokens they just replaced or removed. The env file is replaced by an
+atomic rename, so a concurrent command never reads a partial file. The sign-in itself
 ends 30 days after it was granted; renewal does not extend it.
 
 ## Method 1 — Subscription Login
