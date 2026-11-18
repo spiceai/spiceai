@@ -1099,7 +1099,7 @@ mod tests {
         // Simulate `reconcile_registry`: take the snapshot (empty, nothing
         // outstanding yet) and resolve it into `statuses` — still empty.
         let outstanding_at_snapshot_time = registry.outstanding_xid8s().await;
-        assert!(outstanding_at_snapshot_time.is_empty());
+        assert_eq!(outstanding_at_snapshot_time, [] as [u64; 0]);
         let statuses = std::collections::HashMap::new();
 
         // A new write-back registers concurrently, after the snapshot was taken

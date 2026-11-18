@@ -407,7 +407,7 @@ fn absent_standalone_detail_differs_from_a_present_empty_restart_list() {
     let detail = present_decoded
         .standalone_runtime
         .expect("an empty detail is still a present detail");
-    assert!(detail.restart_required.is_empty());
+    assert_eq!(detail.restart_required, [] as [String; 0]);
 }
 
 /// The generated types a pre-change peer runs: `Heartbeat` before field 9 and

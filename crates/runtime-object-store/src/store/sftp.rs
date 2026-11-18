@@ -597,7 +597,7 @@ mod tests {
         // `connect_timeout` cannot be reached by parsing the text as a `SocketAddr`.
         let addrs = resolve_addrs("localhost", "22").expect("localhost should resolve");
 
-        assert!(!addrs.is_empty());
+        assert_ne!(addrs, [] as [SocketAddr; 0]);
         for addr in addrs {
             assert_eq!(addr.port(), 22);
             assert!(addr.ip().is_loopback(), "got {addr}");
@@ -703,7 +703,7 @@ mod tests {
         let after = Instant::now();
 
         assert_eq!(endpoint.addr, "localhost:22");
-        assert!(!endpoint.addrs.is_empty());
+        assert_ne!(endpoint.addrs, [] as [SocketAddr; 0]);
 
         let left_to_connect = endpoint
             .deadline

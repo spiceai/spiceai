@@ -1831,7 +1831,7 @@ mod tests {
         assert!(first.data_body.is_empty());
 
         let batches = decode(first, vec![], &schema).await.expect("no batches");
-        assert!(batches.is_empty());
+        assert_eq!(batches, [] as [RecordBatch; 0]);
     }
 
     /// A schema message: the non-empty header a real client is likeliest to send, standing in
@@ -2190,7 +2190,7 @@ mod tests {
         );
         assert_eq!(tonic::Status::from(error).code(), tonic::Code::Unavailable);
         let mut receivers = HashMap::from([("executor-1", rx1)]);
-        assert!(received(&mut receivers).is_empty());
+        assert_eq!(received(&mut receivers), [] as [(String, String); 0]);
     }
 
     /// The SQL recorded for a partition value keeps the form earlier versions

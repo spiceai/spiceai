@@ -84,12 +84,24 @@ const SCHEMA_PROBE_CONCURRENCY: usize = 16;
 /// [`FileSchemaDriftGuard`] fails such a scan, rather than warning, when a registered column
 /// is missing from every scanned file, so the refresh keeps the last loaded data instead of
 /// replacing it with `NULL`s.
+///
+/// An appending refresh adds the rows its scan returns and replaces none, so a source with
+/// no data files yet is an empty append for it rather than an error (see
+/// [`crate::fresh_file_listing::FreshFileListingLayer`]).
 #[derive(Debug, Default, Clone, Copy)]
-pub struct AccelerationRefreshScan;
+pub struct AccelerationRefreshScan {
+    appends: bool,
+}
 
 /// Marks `config` as an acceleration refresh session. See [`AccelerationRefreshScan`].
 pub fn mark_acceleration_refresh(config: &mut SessionConfig) {
-    config.set_extension(Arc::new(AccelerationRefreshScan));
+    config.set_extension(Arc::new(AccelerationRefreshScan { appends: false }));
+}
+
+/// Marks `config` as an acceleration refresh session whose scan results are appended to
+/// the acceleration rather than replacing it. See [`AccelerationRefreshScan`].
+pub fn mark_appending_acceleration_refresh(config: &mut SessionConfig) {
+    config.set_extension(Arc::new(AccelerationRefreshScan { appends: true }));
 }
 
 /// Whether `state` is an acceleration refresh session. See [`AccelerationRefreshScan`].
@@ -99,6 +111,16 @@ pub fn is_acceleration_refresh(state: &dyn Session) -> bool {
         .config()
         .get_extension::<AccelerationRefreshScan>()
         .is_some()
+}
+
+/// Whether `state` is an acceleration refresh session that appends its scan results.
+/// See [`AccelerationRefreshScan`].
+#[must_use]
+pub fn is_appending_acceleration_refresh(state: &dyn Session) -> bool {
+    state
+        .config()
+        .get_extension::<AccelerationRefreshScan>()
+        .is_some_and(|scan| scan.appends)
 }
 
 /// Registered columns missing from every file of one scan.
@@ -409,9 +431,12 @@ impl FileSchemaDriftGuard {
         let mut records = 0usize;
         let (newest, rest) = files.split_at(files.len().min(1));
         for chunk in std::iter::once(newest).chain(rest.chunks(SCHEMA_PROBE_CONCURRENCY)) {
+            // A file that carries every still-missing column ends the search, so its probe
+            // stops at the first record that completes the set instead of reading the file.
+            let wanted = remaining.clone();
             let probes: Vec<_> = chunk
                 .iter()
-                .map(|file| probe_json_file(&self.format, state, store, file, &registered))
+                .map(|file| probe_json_file(&self.format, state, store, file, &registered, &wanted))
                 .collect();
             for probe in futures::future::join_all(probes).await {
                 let probe = probe?;
@@ -516,19 +541,24 @@ pub(crate) fn scanned_files(
 /// changes type across records cannot fail the refresh. `JsonFormat`
 /// (JSONL without a pointer) is probed as `SpiceJsonFormat` JSONL so the
 /// record count uses the same reader as array/pointer scans.
+///
+/// The probe streams the file and stops once it has seen every key in
+/// `wanted`. Its keys and record count then cover only the records read,
+/// which is enough: that file proves every wanted column present.
 async fn probe_json_file(
     format: &Arc<dyn FileFormat>,
     state: &dyn Session,
     store: &Arc<dyn object_store::ObjectStore>,
     file: &ObjectMeta,
     registered: &BTreeSet<String>,
+    wanted: &BTreeSet<String>,
 ) -> DFResult<JsonKeyProbe> {
     let files = std::slice::from_ref(file);
     if let Some(json) = format.as_ref().downcast_ref::<SpiceJsonFormat>() {
         return json
             .clone()
             .with_schema_infer_max_rec(usize::MAX)
-            .probe_keys(state, store, files, registered)
+            .probe_keys(state, store, files, registered, Some(wanted))
             .await;
     }
     if let Some(json) = format.as_ref().downcast_ref::<JsonFormat>() {
@@ -539,7 +569,7 @@ async fn probe_json_file(
             .with_format(Format::Jsonl)
             .with_schema_infer_max_rec(usize::MAX)
             .with_file_compression_type(compression)
-            .probe_keys(state, store, files, registered)
+            .probe_keys(state, store, files, registered, Some(wanted))
             .await;
     }
     Err(DataFusionError::Internal(

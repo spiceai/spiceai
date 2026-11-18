@@ -489,7 +489,10 @@ mod tests {
 
         state.delete("key1").await.expect("delete failed");
         assert_eq!(state.get("key1").await.expect("get failed"), None);
-        assert!(state.list_keys().await.expect("list failed").is_empty());
+        assert_eq!(
+            state.list_keys().await.expect("list failed"),
+            [] as [String; 0]
+        );
 
         // Deleting a missing key is a no-op.
         state.delete("key1").await.expect("delete missing failed");
@@ -953,12 +956,9 @@ mod tests {
         state.refresh().await.expect("refresh failed");
 
         assert!(state.get_cached("key1").is_none());
-        assert!(
-            state
-                .list_keys()
-                .await
-                .expect("list_keys failed")
-                .is_empty()
+        assert_eq!(
+            state.list_keys().await.expect("list_keys failed"),
+            [] as [String; 0]
         );
     }
 

@@ -130,7 +130,7 @@ mod tests {
         let (status, functions) = list_json(rt).await;
 
         assert_eq!(status, StatusCode::OK);
-        assert!(functions.is_empty());
+        assert_eq!(functions, [] as [ListFunctionElement; 0]);
     }
 
     #[tokio::test]

@@ -1152,7 +1152,7 @@ mod tests {
         let draft = load_or_create(dir.path()).expect("create");
 
         assert_eq!(draft.schema_version, DRAFT_SCHEMA_VERSION);
-        assert!(!draft.enrollment_operation_id.is_empty());
+        assert_ne!(draft.enrollment_operation_id, "");
         assert!(draft.csr_pem.contains("CERTIFICATE REQUEST"));
         assert_eq!(draft.instance.runtime_version, "v2.2.0-test");
         assert_eq!(draft.region.as_deref(), Some("us-west-2"));
@@ -1436,7 +1436,7 @@ mod tests {
         drop(abandoned);
 
         let draft = load_or_create(dir.path()).expect("reclaim abandoned lock");
-        assert!(!draft.enrollment_operation_id.is_empty());
+        assert_ne!(draft.enrollment_operation_id, "");
         assert!(path.exists(), "the recovered creator publishes the draft");
         assert!(lock_path.exists(), "the stable lock inode remains in place");
     }

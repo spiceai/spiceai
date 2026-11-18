@@ -878,7 +878,10 @@ mod tests {
         // `enabled: false` alone is a complete, deliberate configuration and
         // must stay silent, or every dataset that turns acceleration off warns.
         let acceleration = acceleration_from_yaml("enabled: false");
-        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -891,7 +894,10 @@ mod tests {
                 mode: memory
             ",
         );
-        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -906,7 +912,10 @@ mod tests {
             ",
         );
         assert!(acceleration.enabled, "enabled defaults to true");
-        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -922,7 +931,10 @@ mod tests {
                 ready_state: on_load
             ",
         );
-        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -1118,12 +1130,7 @@ mod tests {
             yaml::from_str("{}").expect("Failed to parse Acceleration");
 
         assert!(!acceleration.maintained_aggregates.is_enabled());
-        assert!(
-            acceleration
-                .maintained_aggregates
-                .enabled_aggregates()
-                .is_empty()
-        );
+        assert_eq!(acceleration.maintained_aggregates.enabled_aggregates(), []);
     }
 
     #[test]
@@ -1140,12 +1147,7 @@ mod tests {
 
         assert!(!acceleration.maintained_aggregates.is_enabled());
         assert_eq!(acceleration.maintained_aggregates.len(), 1);
-        assert!(
-            acceleration
-                .maintained_aggregates
-                .enabled_aggregates()
-                .is_empty()
-        );
+        assert_eq!(acceleration.maintained_aggregates.enabled_aggregates(), []);
     }
 
     #[test]

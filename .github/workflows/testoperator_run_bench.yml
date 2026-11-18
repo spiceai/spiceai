@@ -183,10 +183,10 @@ jobs:
       # git, unzip); without this they fetch from one archive and one security
       # host with no fallback.
       - name: Configure apt mirrors
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Set up Rust toolchain
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Determine snapshot update mode
         id: determine_update_snapshots
@@ -244,14 +244,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '36000'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -259,7 +259,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -286,7 +286,7 @@ jobs:
 
       - name: Setup spiced
         if: steps.spiced_source.outputs.release != 'true'
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
@@ -296,7 +296,7 @@ jobs:
       - name: Install the released spiced
         if: steps.spiced_source.outputs.release == 'true'
         id: release-spiced
-        uses: ./.github/actions/setup-released-spiced
+        uses: $/.github/actions/setup-released-spiced
         with:
           release: ${{ github.event.inputs.spiced_ref }}
           spicepod_file: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
@@ -307,7 +307,7 @@ jobs:
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -315,7 +315,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
+        uses: $/.github/actions/setup-testoperator-data
         with:
           query_set: ${{ github.event.inputs.query_set }}
 
@@ -430,19 +430,19 @@ jobs:
 
       - name: Setup ODBC
         if: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
-        uses: ./.github/actions/setup-odbc
+        uses: $/.github/actions/setup-odbc
 
       - name: Install Oracle ODPI-C
         if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
-        uses: ./.github/actions/setup-oracle-odpi
+        uses: $/.github/actions/setup-oracle-odpi
 
       - name: Install ADBC BigQuery Driver
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/setup-adbc-bigquery
+        uses: $/.github/actions/setup-adbc-bigquery
 
       - name: Set up BigQuery credentials (workload identity federation)
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/bigquery-credentials
+        uses: $/.github/actions/bigquery-credentials
         with:
           workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
           service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
@@ -450,7 +450,7 @@ jobs:
       # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
       - name: Install libduckdb
         if: ${{ contains(github.event.inputs.spicepod_path, 'duckdb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: ./.github/actions/setup-libduckdb
+        uses: $/.github/actions/setup-libduckdb
 
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
@@ -460,19 +460,19 @@ jobs:
 
       - name: Setup ScyllaDB
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
-        uses: ./.github/actions/setup-scylladb
+        uses: $/.github/actions/setup-scylladb
         with:
           keyspace: tpch_sf1
 
       - name: Install PostgreSQL for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: ./.github/actions/install-postgres
+        uses: $/.github/actions/install-postgres
         with:
           pg-db: ducklake_catalog
 
       - name: Setup CH-benCH PostgreSQL
         if: ${{ github.event.inputs.query_set == 'chbench' }}
-        uses: ./.github/actions/setup-chbench-postgres
+        uses: $/.github/actions/setup-chbench-postgres
         with:
           version: ${{ github.event.inputs.postgres_version || '16' }}
 
@@ -894,7 +894,7 @@ jobs:
         # save_unpushable_snapshots.sh leaves the snapshot commit here when
         # GitHub will not let GITHUB_TOKEN create the snapshot branch.
         if: ${{ failure() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unpushed-snapshots
           path: ${{ runner.temp }}/unpushed-snapshots/
