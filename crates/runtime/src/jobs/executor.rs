@@ -186,6 +186,11 @@ const RESUBMIT_MESSAGE: &str = "The scheduler running this query stopped before 
 /// covers a submission that lands after the sweep listed the jobs.
 const UNADMITTED_GRACE_MS: u64 = 60_000;
 
+/// How long a finished query's release waits for another write of its caller's ledger to carry
+/// it before it is written on its own. A submission arriving meanwhile writes the ledger anyway,
+/// and takes the release along.
+const RELEASE_WINDOW: Duration = Duration::from_millis(10);
+
 /// How long this scheduler keeps a caller's ledger in memory after it last changed it.
 const LEDGER_IDLE: Duration = Duration::from_mins(10);
 
@@ -231,6 +236,11 @@ impl Runner {
     /// Releases `job_id`'s running slot once its state is final, keeps its result in the
     /// caller's stored-results budget until it expires, and starts the caller's next queued jobs
     /// this scheduler accepted. A job another scheduler took over keeps its slot.
+    ///
+    /// The release is queued for the caller's next ledger write, such as its next submission,
+    /// so a submission does not wait behind a write of its own. When no write carries it within
+    /// `RELEASE_WINDOW`, it is written here; at once when a queued job of the caller waits here
+    /// for the slot.
     async fn finished(&self, owner: &str, job_id: &str) {
         let stored = match self.job_store.get_job_ignoring_expiry(job_id).await {
             Ok(state) if state.is_terminal() => stored_entry(&state),
@@ -240,12 +250,20 @@ impl Runner {
                 None
             }
         };
+        self.job_store.queue_release(owner, job_id, stored);
+        if !self.has_pending(owner) {
+            tokio::time::sleep(RELEASE_WINDOW).await;
+            if !self.has_pending(owner) && !self.job_store.has_queued_releases(owner) {
+                return;
+            }
+        }
         let node = self.job_store.node_id().to_string();
         let limits = self.limits;
         match self
             .job_store
             .modify_ledger(owner, |ledger| {
-                let (changed, promoted) = ledger.finish_and_promote(job_id, stored, &node, limits);
+                let promoted = ledger.promote(&node, limits);
+                let changed = !promoted.is_empty();
                 (promoted, changed)
             })
             .await
@@ -256,6 +274,11 @@ impl Runner {
                 "Failed to release the running slot of async query '{job_id}': {e}. The recovery sweep releases it."
             ),
         }
+    }
+
+    /// Whether a queued job of `owner` waits here for a running slot.
+    fn has_pending(&self, owner: &str) -> bool {
+        self.pending.lock().values().any(|job| job.owner == owner)
     }
 
     /// Releases the running slot or queue place of `job_id`, admitted while its job record
@@ -432,20 +455,41 @@ impl JobExecutor {
         let node = self.job_store.node_id().to_string();
         let limits = self.runner.limits;
         let admitted_at_ms = now_ms_or_zero();
+        // The running slots a refused submission found taken.
+        let mut taken = Vec::new();
         let (created, admission) = tokio::join!(
             self.job_store
                 .create_job_with_id(job_id.clone(), request, read_only, owner.clone()),
             self.job_store.modify_ledger(&owner, |ledger| {
+                taken.clear();
                 let admission = ledger.admit(&job_id, &node, limits, admitted_at_ms);
+                if admission.is_err() {
+                    taken.extend(ledger.running.keys().cloned());
+                }
                 let changed = admission.is_ok();
                 (admission, changed)
             }),
         );
         let (state, admission) = match (created, admission) {
             (Ok(state), Ok(Ok(admission))) => (state, admission),
-            (Ok(_), Ok(Err(refusal))) => {
-                self.discard(&job_id).await;
-                return Err(refusal_error(refusal));
+            (Ok(state), Ok(Err(refusal))) => {
+                // A query that finished may still hold its slot until its release lands, here
+                // or on another scheduler. The caller has seen it finish, so its slot is free:
+                // release it and decide again before refusing.
+                match self
+                    .readmit_after_finished(&owner, &job_id, &taken, admitted_at_ms)
+                    .await
+                {
+                    Some(Ok(admission)) => (state, admission),
+                    again => {
+                        self.discard(&job_id).await;
+                        let refusal = match again {
+                            Some(Err(again)) => again,
+                            _ => refusal,
+                        };
+                        return Err(refusal_error(refusal));
+                    }
+                }
             }
             (Ok(_), Err(e)) => {
                 self.discard(&job_id).await;
@@ -474,6 +518,68 @@ impl JobExecutor {
         }
 
         Ok(state)
+    }
+
+    /// The queries among `job_ids` whose job records are final, with the results they keep.
+    async fn finished_among(&self, job_ids: &[String]) -> Vec<(String, Option<StoredEntry>)> {
+        let states = futures::future::join_all(
+            job_ids
+                .iter()
+                .map(|job_id| self.job_store.get_job_ignoring_expiry(job_id)),
+        )
+        .await;
+        states
+            .into_iter()
+            .filter_map(|state| match state {
+                Ok(state) if state.is_terminal() => {
+                    let stored = stored_entry(&state);
+                    Some((state.job_id, stored))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Admits `job_id` again after releasing the slots among `taken` whose queries finished, and
+    /// starting the queued queries this scheduler holds that then get a slot. `None` when none
+    /// of them finished, so the refusal stands.
+    async fn readmit_after_finished(
+        &self,
+        owner: &str,
+        job_id: &str,
+        taken: &[String],
+        admitted_at_ms: u64,
+    ) -> Option<std::result::Result<Admission, Refusal>> {
+        let finished = self.finished_among(taken).await;
+        if finished.is_empty() {
+            return None;
+        }
+        let node = self.job_store.node_id().to_string();
+        let limits = self.runner.limits;
+        let outcome = self
+            .job_store
+            .modify_ledger(owner, |ledger| {
+                let mut changed = false;
+                for (finished_id, stored) in &finished {
+                    changed |= ledger.finish(finished_id, *stored);
+                }
+                let promoted = ledger.promote(&node, limits);
+                changed |= !promoted.is_empty();
+                let admission = ledger.admit(job_id, &node, limits, admitted_at_ms);
+                changed |= admission.is_ok();
+                ((promoted, admission), changed)
+            })
+            .await;
+        match outcome {
+            Ok((promoted, admission)) => {
+                self.runner.start_promoted(owner, promoted).await;
+                Some(admission)
+            }
+            Err(e) => {
+                tracing::debug!(job_id, "Failed to release finished async queries: {e}");
+                None
+            }
+        }
     }
 
     /// Deletes a job that was refused before it could run, best effort.
@@ -1977,6 +2083,146 @@ mod tests {
 
         let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
         assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["recent"]);
+        assert_eq!(ledger.pending.len(), 0);
+    }
+
+    /// A finished query whose release no other ledger write carries within the window writes
+    /// it itself, so its slot is freed either way.
+    #[tokio::test]
+    async fn a_finished_query_releases_its_slot_when_no_other_write_carries_it() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = limited_executor(Arc::clone(&job_store), JobLimits::default());
+        let job_id = seed_job(&job_store, OWNER).await;
+        let limits = executor.runner.limits;
+        let admitted_at_ms = now_ms_or_zero();
+        job_store
+            .modify_ledger(OWNER, |ledger| {
+                let admission = ledger.admit(&job_id, "node-1", limits, admitted_at_ms);
+                ((), admission.is_ok())
+            })
+            .await
+            .expect("admitted");
+        job_store.cancel_job(&job_id).await.expect("cancelled");
+
+        executor.runner.finished(OWNER, &job_id).await;
+
+        assert!(!job_store.has_queued_releases(OWNER));
+        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
+        assert_eq!((ledger.running.len(), ledger.pending.len()), (0, 0));
+    }
+
+    /// An object store whose writes of caller ledgers land `delay` late, as a slow object store's
+    /// would, and serves everything else from memory.
+    #[derive(Debug)]
+    struct SlowLedgerWrites {
+        inner: InMemory,
+        delay: Duration,
+    }
+
+    impl std::fmt::Display for SlowLedgerWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SlowLedgerWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for SlowLedgerWrites {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().contains("/owners/") {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A caller limited to one running query sees its query finish on one scheduler and at once
+    /// submits on another, while the first scheduler's release of the slot has not landed. The
+    /// second scheduler admits it: a query whose job record is final no longer holds a slot.
+    #[tokio::test]
+    async fn a_query_seen_finished_frees_its_slot_on_every_scheduler() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(SlowLedgerWrites {
+            inner: InMemory::new(),
+            delay: Duration::from_millis(300),
+        });
+        let limits = JobLimits {
+            running: 1,
+            pending: 0,
+            stored_bytes: u64::MAX,
+        };
+        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
+        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
+        let scheduler_a = limited_executor(Arc::clone(&store_a), limits);
+        let scheduler_b = limited_executor(Arc::clone(&store_b), limits);
+
+        let first = scheduler_a
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("the first query is admitted on A");
+        // The caller polls until it sees the query end, as a client does.
+        let ended = wait_until_finished(&store_a, &first.job_id).await;
+        assert!(ended.is_terminal());
+
+        let next = scheduler_b
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("the next query is admitted on B at once");
+        assert_ne!(next.job_id, first.job_id);
+        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
+        assert!(
+            !ledger.running.contains_key(&first.job_id),
+            "{:?}",
+            ledger.running
+        );
         assert_eq!(ledger.pending.len(), 0);
     }
 }

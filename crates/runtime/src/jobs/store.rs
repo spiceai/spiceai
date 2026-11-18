@@ -43,7 +43,7 @@ use super::error::{
     ObjectStoreDeleteSnafu, ObjectStoreListSnafu, ObjectStoreReadSnafu, Result,
     SerializeChunkSnafu, SerializeStateSnafu,
 };
-use super::ledger::{Ledger, WRITTEN_BYTES_BATCH};
+use super::ledger::{Ledger, StoredEntry, WRITTEN_BYTES_BATCH};
 use super::state::{
     ColumnSchema, DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobDriver, JobResult, JobResultManifest,
     JobSchema, JobState, JobStatus, now_ms_or_zero,
@@ -79,19 +79,34 @@ pub struct JobStore {
     node_id: String,
     result_ttl: Duration,
     chunk_size: usize,
-    /// One slot per caller this scheduler wrote the ledger of recently. Its lock is held across
-    /// a read-modify-write of the ledger, so this scheduler's own writes take turns instead of
-    /// conflicting and backing off; conditional writes still settle races with other
-    /// schedulers. It keeps the ledger as last written, so the next change is written without
-    /// reading it first.
-    ledger_slots: dashmap::DashMap<String, Arc<tokio::sync::Mutex<LedgerSlot>>>,
+    /// One entry per caller this scheduler wrote the ledger of recently.
+    ledger_slots: dashmap::DashMap<String, Arc<CallerLedger>>,
 }
 
-/// A caller's ledger as this scheduler last wrote or read it, at the version it was written at.
+/// This scheduler's state for one caller's ledger.
+#[derive(Default)]
+struct CallerLedger {
+    /// Held across a read-modify-write of the ledger, so this scheduler's own writes take turns
+    /// instead of conflicting and backing off; conditional writes still settle races with other
+    /// schedulers.
+    write: tokio::sync::Mutex<LedgerSlot>,
+    /// Releases of finished queries not yet written. The next write of the ledger carries them,
+    /// so a release does not take a write of its own when another write comes soon.
+    releases: Mutex<Vec<QueuedRelease>>,
+}
+
+/// A caller's ledger as this scheduler last wrote or read it, at the version it was written at,
+/// so the next change is written without reading it first.
 #[derive(Default)]
 struct LedgerSlot {
     cached: Option<Ledger>,
     used_at: Option<std::time::Instant>,
+}
+
+/// A finished query whose running slot is released by the next write of its caller's ledger.
+struct QueuedRelease {
+    job_id: String,
+    stored: Option<StoredEntry>,
 }
 
 /// Whether a later conditional write can name the version `ledger` was read or written at.
@@ -965,21 +980,32 @@ impl JobStore {
     /// since, that write is refused and the ledger is read and changed again at once; only a
     /// conflict after a fresh read backs off. A change that writes nothing proves nothing about
     /// the copy it saw, such as a refused admission, so it is decided again on a fresh read.
+    ///
+    /// Releases queued with [`JobStore::queue_release`] are applied first and written with the
+    /// change; when the write fails they stay queued.
     pub(crate) async fn modify_ledger<T: Send>(
         &self,
         owner: &str,
-        change: impl FnMut(&mut Ledger) -> (T, bool) + Send,
+        mut change: impl FnMut(&mut Ledger) -> (T, bool) + Send,
     ) -> Result<T> {
-        let slot = Arc::clone(
+        let caller = Arc::clone(
             self.ledger_slots
                 .entry(owner.to_string())
                 .or_default()
                 .value(),
         );
-        let mut slot = slot.lock().await;
+        let mut slot = caller.write.lock().await;
         slot.used_at = Some(std::time::Instant::now());
+        let releases = std::mem::take(&mut *caller.releases.lock());
         let cached = Mutex::new(slot.cached.take());
-        let change = Mutex::new(change);
+        let change = Mutex::new(|ledger: &mut Ledger| {
+            let mut released = false;
+            for release in &releases {
+                released |= ledger.finish(&release.job_id, release.stored);
+            }
+            let (out, changed) = change(ledger);
+            (out, changed || released)
+        });
         let path = self.ledger_path(owner);
         let result = retry_on_conflict(&ConflictRetry::default(), || async {
             let last_written = cached.lock().take();
@@ -1005,6 +1031,14 @@ impl JobStore {
         })
         .await;
         slot.cached = cached.into_inner();
+        drop(change);
+        if result.is_err() && !releases.is_empty() {
+            // Not written: the releases this write carried wait for the next one.
+            let mut queued = caller.releases.lock();
+            let later = std::mem::take(&mut *queued);
+            queued.extend(releases);
+            queued.extend(later);
+        }
         result.map_err(|err| match err {
             RetryOnConflictError::ConflictsExhausted { .. } => {
                 super::error::Error::ConcurrentModification {
@@ -1046,11 +1080,34 @@ impl JobStore {
         }
     }
 
+    /// Queues the release of `job_id`'s running slot, with its result kept until it expires, for
+    /// the next write of `owner`'s ledger.
+    pub(crate) fn queue_release(&self, owner: &str, job_id: &str, stored: Option<StoredEntry>) {
+        let caller = Arc::clone(
+            self.ledger_slots
+                .entry(owner.to_string())
+                .or_default()
+                .value(),
+        );
+        caller.releases.lock().push(QueuedRelease {
+            job_id: job_id.to_string(),
+            stored,
+        });
+    }
+
+    /// Whether `owner` has releases no write of its ledger has carried yet.
+    pub(crate) fn has_queued_releases(&self, owner: &str) -> bool {
+        self.ledger_slots
+            .get(owner)
+            .is_some_and(|caller| !caller.releases.lock().is_empty())
+    }
+
     /// Forgets the ledgers of callers this scheduler has not written for `idle`.
     pub(crate) fn forget_idle_ledgers(&self, idle: Duration) {
-        self.ledger_slots.retain(|_, slot| {
-            Arc::strong_count(slot) > 1
-                || slot.try_lock().map_or(true, |slot| {
+        self.ledger_slots.retain(|_, caller| {
+            Arc::strong_count(caller) > 1
+                || !caller.releases.lock().is_empty()
+                || caller.write.try_lock().map_or(true, |slot| {
                     slot.used_at.is_some_and(|at| at.elapsed() < idle)
                 })
         });
@@ -1330,6 +1387,173 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    /// An object store that counts writes of caller ledgers, and refuses the next one when
+    /// asked to.
+    #[derive(Debug, Default)]
+    struct LedgerWrites {
+        inner: InMemory,
+        writes: std::sync::atomic::AtomicUsize,
+        fail_next: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for LedgerWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LedgerWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for LedgerWrites {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().contains("/owners/") {
+                if self
+                    .fail_next
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(ObjectStoreError::Generic {
+                        store: "LedgerWrites",
+                        source: "injected ledger write failure".into(),
+                    });
+                }
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn admit(job_id: &'static str) -> impl FnMut(&mut Ledger) -> (bool, bool) + Send {
+        move |ledger| {
+            let admitted = ledger
+                .admit(job_id, "node-1", crate::jobs::JobLimits::default(), 0)
+                .is_ok();
+            (admitted, admitted)
+        }
+    }
+
+    /// A finished query's queued release is written by the caller's next ledger write, with
+    /// no write of its own, and keeps the query's result in the budget.
+    #[tokio::test]
+    async fn a_queued_release_rides_on_the_next_ledger_write() {
+        let store = Arc::new(LedgerWrites::default());
+        let job_store = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-1");
+        let owner = "apikey:0123456789abcdef";
+        assert!(
+            job_store
+                .modify_ledger(owner, admit("a"))
+                .await
+                .expect("written")
+        );
+        job_store.queue_release(
+            owner,
+            "a",
+            Some(StoredEntry {
+                bytes: 10,
+                expires_at_ms: 120_000,
+            }),
+        );
+        assert!(job_store.has_queued_releases(owner));
+
+        assert!(
+            job_store
+                .modify_ledger(owner, admit("b"))
+                .await
+                .expect("written")
+        );
+
+        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!job_store.has_queued_releases(owner));
+        let ledger = job_store.read_ledger(owner).await.expect("ledger");
+        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(
+            ledger.stored,
+            std::collections::BTreeMap::from([(120_000, 10)])
+        );
+    }
+
+    /// A queued release carried by a write that fails stays queued, and the next write
+    /// carries it.
+    #[tokio::test]
+    async fn a_queued_release_outlives_a_failed_write() {
+        let store = Arc::new(LedgerWrites::default());
+        let job_store = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-1");
+        let owner = "apikey:0123456789abcdef";
+        assert!(
+            job_store
+                .modify_ledger(owner, admit("a"))
+                .await
+                .expect("written")
+        );
+        job_store.queue_release(owner, "a", None);
+        store
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        job_store
+            .modify_ledger(owner, admit("b"))
+            .await
+            .expect_err("the write fails");
+        assert!(job_store.has_queued_releases(owner));
+        let ledger = job_store.read_ledger(owner).await.expect("ledger");
+        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["a"]);
+
+        assert!(
+            job_store
+                .modify_ledger(owner, admit("c"))
+                .await
+                .expect("written")
+        );
+        assert!(!job_store.has_queued_releases(owner));
+        let ledger = job_store.read_ledger(owner).await.expect("ledger");
+        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["c"]);
     }
 
     /// Four schedulers read a caller's empty ledger at once and each would start its query;
