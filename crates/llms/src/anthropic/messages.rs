@@ -23,6 +23,7 @@ use std::collections::VecDeque;
 use async_openai::config::Config;
 use async_trait::async_trait;
 use bytes::Bytes;
+use http_body_limit::Limit;
 use messages_api::stream::event_type;
 use messages_api::{MessageStream, Messages, MessagesError, MessagesRequest};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -30,12 +31,16 @@ use serde_json::{Map, Value};
 
 use super::{Anthropic, model_not_found_message};
 use crate::config::HostedModelConfig;
+use crate::model_http::Limits;
 
 const ACTION: &str = "answer a Messages API request";
 
 /// Serves the Messages API by forwarding each request to Anthropic.
 pub struct AnthropicMessages {
     http: reqwest::Client,
+    /// The most of an answer held in memory: a whole body once decoded, or one event of a
+    /// stream.
+    max_response_bytes: usize,
     config: HostedModelConfig,
     model: String,
     model_from_default: bool,
@@ -51,8 +56,10 @@ impl Anthropic {
     pub fn messages(&self) -> AnthropicMessages {
         let mut config = self.client.config().clone();
         config.default_headers.remove("anthropic-beta");
+        let limits = Limits::default();
         AnthropicMessages {
-            http: reqwest::Client::new(),
+            http: limits.http_client(),
+            max_response_bytes: limits.max_response_bytes,
             config,
             model: self.model.clone(),
             model_from_default: self.model_from_default,
@@ -120,7 +127,7 @@ impl AnthropicMessages {
         if status.is_success() {
             return Ok(response);
         }
-        let body = response.bytes().await.unwrap_or_default();
+        let body = http_body_limit::read_prefix(response, self.max_response_bytes).await;
         Err(self.explain(MessagesError::from_response(status.as_u16(), &body)))
     }
 
@@ -144,13 +151,16 @@ impl AnthropicMessages {
 
     async fn json(&self, path: &str, request: MessagesRequest) -> Result<Value, MessagesError> {
         let response = self.send(path, request).await?;
-        let body = response.bytes().await.map_err(|e| {
-            MessagesError::api(format!(
-                "Failed to read Anthropic's answer for model '{}': {e}",
-                self.model
-            ))
-            .with_status(502)
-        })?;
+        let limit = Limit::CompressionRatioAndSize(self.max_response_bytes);
+        let body = http_body_limit::read_bytes(response, limit)
+            .await
+            .map_err(|e| {
+                MessagesError::api(format!(
+                    "Failed to read Anthropic's answer for model '{}': {e}",
+                    self.model
+                ))
+                .with_status(502)
+            })?;
         serde_json::from_slice(&body).map_err(|e| {
             MessagesError::api(format!(
                 "Anthropic answered model '{}' with a body that is not JSON: {e}",
@@ -203,7 +213,11 @@ impl Messages for AnthropicMessages {
         request: MessagesRequest,
     ) -> Result<MessageStream, MessagesError> {
         let response = self.send("/messages", request).await?;
-        Ok(event_stream(response, self.model.clone()))
+        Ok(event_stream(
+            response,
+            self.model.clone(),
+            self.max_response_bytes,
+        ))
     }
 
     async fn count_tokens(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
@@ -219,6 +233,8 @@ struct SseDecoder {
     buffer: Vec<u8>,
     /// Whether the last byte was a CR, whose CRLF a LF at the start of the next chunk completes.
     after_cr: bool,
+    /// Where in `buffer` a blank line can start: the bytes before it were searched already.
+    searched: usize,
 }
 
 impl SseDecoder {
@@ -239,9 +255,13 @@ impl SseDecoder {
             }
         }
         let mut events = Vec::new();
-        while let Some(end) = self.buffer.windows(2).position(|pair| pair == b"\n\n") {
-            let block: Vec<u8> = self.buffer.drain(..end + 2).collect();
-            let block = String::from_utf8_lossy(&block[..end]);
+        let mut start = 0;
+        while let Some(at) = self.buffer[self.searched..]
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+        {
+            let end = self.searched + at;
+            let block = String::from_utf8_lossy(&self.buffer[start..end]);
             let data: Vec<&str> = block
                 .lines()
                 .filter_map(|line| line.strip_prefix("data:"))
@@ -250,7 +270,11 @@ impl SseDecoder {
             if !data.is_empty() {
                 events.push(data.join("\n"));
             }
+            start = end + 2;
+            self.searched = start;
         }
+        self.buffer.drain(..start);
+        self.searched = self.buffer.len().saturating_sub(1);
         events
     }
 }
@@ -258,6 +282,8 @@ impl SseDecoder {
 struct StreamState {
     response: reqwest::Response,
     decoder: SseDecoder,
+    /// The most bytes the event being received may hold.
+    max_event_bytes: usize,
     queue: VecDeque<Result<Value, MessagesError>>,
     model: String,
     done: bool,
@@ -292,15 +318,28 @@ impl StreamState {
                 }
             }
         }
+        if !self.done && self.decoder.buffer.len() > self.max_event_bytes {
+            self.done = true;
+            self.queue.push_back(Err(MessagesError::api(format!(
+                "Anthropic streamed an event for model '{}' of more than {} bytes, so the stream \
+                 was ended",
+                self.model, self.max_event_bytes
+            ))));
+        }
     }
 }
 
 /// The events of `response`, a stream Anthropic opened. It ends after `message_stop`, or after
 /// an `error` event, which becomes the stream's error.
-fn event_stream(response: reqwest::Response, model: String) -> MessageStream {
+fn event_stream(
+    response: reqwest::Response,
+    model: String,
+    max_event_bytes: usize,
+) -> MessageStream {
     let state = StreamState {
         response,
         decoder: SseDecoder::default(),
+        max_event_bytes,
         queue: VecDeque::new(),
         model,
         done: false,
@@ -337,7 +376,82 @@ fn event_stream(response: reqwest::Response, model: String) -> MessageStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use serde_json::json;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn an_answer_is_read_up_to_the_cap_and_refused_past_it() {
+        let answer = r#"{"type":"message","content":[]}"#;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(answer, "application/json"))
+            .mount(&server)
+            .await;
+        let messages = |max_response_bytes| AnthropicMessages {
+            http: reqwest::Client::new(),
+            max_response_bytes,
+            config: HostedModelConfig::from_url(&server.uri()),
+            model: "model".to_string(),
+            model_from_default: false,
+            endpoint_from_default: false,
+        };
+
+        messages(answer.len())
+            .create(MessagesRequest::new(Map::new()))
+            .await
+            .expect("an answer of exactly the cap is read");
+        let error = messages(answer.len() - 1)
+            .create(MessagesRequest::new(Map::new()))
+            .await
+            .expect_err("an answer one byte past the cap is refused");
+        assert_eq!(
+            error.message,
+            format!(
+                "Failed to read Anthropic's answer for model 'model': the response body is larger \
+                 than the {} bytes that is read from one HTTP response",
+                answer.len() - 1
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_event_past_the_cap_ends_the_stream() {
+        let small = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        let large = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"text\":\"{}\"}}\n\n",
+            "b".repeat(100)
+        );
+        let chunks: Vec<Result<Bytes, std::io::Error>> = format!("{small}{large}")
+            .as_bytes()
+            .chunks(16)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let response = reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(
+            futures::stream::iter(chunks),
+        )));
+
+        let events: Vec<_> = event_stream(response, "model".to_string(), small.len())
+            .collect()
+            .await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].as_ref().expect("the event under the cap is read"),
+            &json!({"type": "ping"})
+        );
+        let error = events[1]
+            .as_ref()
+            .expect_err("the event past the cap is refused");
+        assert_eq!(
+            error.message,
+            format!(
+                "Anthropic streamed an event for model 'model' of more than {} bytes, so the \
+                 stream was ended",
+                small.len()
+            )
+        );
+    }
 
     #[test]
     fn events_are_decoded_across_chunk_boundaries() {
