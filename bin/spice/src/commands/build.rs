@@ -45,6 +45,12 @@ pub enum BuildError {
     #[snafu(display("its `build.command` is empty"))]
     EmptyCommand,
 
+    #[snafu(display(
+        "its `build.workdir` '{workdir}' is not a directory in '{}', where relative paths in the Spicepod resolve. Run `spice` from the directory those paths are written for, or correct `build.workdir`",
+        base.display()
+    ))]
+    WorkdirNotADirectory { workdir: String, base: PathBuf },
+
     #[snafu(display("`{program}` was not found"))]
     ProgramNotFound { program: String },
 
@@ -251,6 +257,16 @@ fn build_one(
         "Building function '{}' in {workdir_written}: {command}",
         target.function
     );
+    // Starting a program in a directory that does not exist fails the same
+    // way as a program that does not exist; tell them apart first, so a
+    // missing directory is never mistaken for a missing build tool.
+    if !workdir.is_dir() {
+        return WorkdirNotADirectorySnafu {
+            workdir: workdir_written,
+            base: runtime_dir,
+        }
+        .fail();
+    }
     let status = match std::process::Command::new(program)
         .args(args)
         .current_dir(&workdir)

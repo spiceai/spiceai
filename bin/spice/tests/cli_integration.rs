@@ -1796,6 +1796,51 @@ mod build {
         );
         assert!(!app.join("score.wasm").exists(), "{printed}");
     }
+
+    /// A `build.workdir` that does not exist fails the build and names the
+    /// directory. It is never reported as a missing build tool, so `spice run`
+    /// does not fall back to the existing module and start the runtime on it.
+    #[test]
+    fn test_run_stops_at_a_build_workdir_that_does_not_exist() {
+        let project = TempDir::new().expect("create the project");
+        write_project(
+            project.path(),
+            &function_yaml(
+                "score",
+                "./functions/score",
+                "./score.wasm",
+                "\"sh -c 'printf fresh > ../../score.wasm'\"",
+            ),
+            "",
+        );
+        fs::write(project.path().join("score.wasm"), "stale").expect("write a stale module");
+        let bin = TempDir::new().expect("create the runtime directory");
+        let record = bin.path().join("runtime-saw");
+        let spiced = stub_runtime(&bin, &record);
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .env("SPICED_PATH", &spiced)
+            .arg("run")
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        assert_eq!(output.status.code(), Some(1), "{printed}");
+        assert!(
+            printed.contains(&format!(
+                "Failed to build function 'score': its `build.workdir` './functions/score' is not a directory in '{}', where relative paths in the Spicepod resolve. Run `spice` from the directory those paths are written for, or correct `build.workdir`. See: https://spiceai.org/docs/components/functions/wasm",
+                project.path().canonicalize().expect("canonical project").display()
+            )),
+            "{printed}"
+        );
+        assert!(!printed.contains("was not found"), "{printed}");
+        assert!(
+            !record.exists(),
+            "the runtime must not start after a failed build: {printed}"
+        );
+    }
 }
 
 // ============================================================================
