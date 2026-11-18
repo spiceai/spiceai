@@ -160,7 +160,15 @@ async fn start_runtime_with_mtls(
     )
     .expect("valid TlsConfig with client auth");
 
+    // One known series, so a scrape that reaches the registry has an exact
+    // line to look for.
     let registry = prometheus::Registry::new();
+    let probe = prometheus::IntCounter::new(SCRAPE_PROBE, "Scrape probe for the mTLS tests")
+        .expect("valid counter");
+    probe.inc();
+    registry
+        .register(Box::new(probe))
+        .expect("register the scrape probe");
     let app = app::AppBuilder::new("test_app").build();
 
     let rt = Arc::new(
@@ -253,6 +261,9 @@ async fn flight_statement_update(
     while results.message().await?.is_some() {}
     Ok(())
 }
+
+/// The one series the test registry holds.
+const SCRAPE_PROBE: &str = "mtls_public_scrape_probe";
 
 /// The `error` of the 401 that the HTTP and metrics listeners answer under
 /// `client_auth: required` to a request whose connection has no client cert.
@@ -579,9 +590,10 @@ async fn test_public_mtls_required_anonymous_mode() -> Result<(), anyhow::Error>
                 "metrics /metrics with a valid client cert must succeed"
             );
             let text = scrape.text().await.expect("a metrics body");
+            let expected = format!("# TYPE {SCRAPE_PROBE} counter\n{SCRAPE_PROBE} 1\n");
             assert!(
-                text.contains("# TYPE "),
-                "the scrape must return Prometheus text, got: {text}"
+                text.contains(&expected),
+                "the scrape must return the registry's series {expected:?}, got: {text}"
             );
             tracing::info!("metrics: no-cert /health 200, /metrics 401; valid cert /metrics 200");
 
