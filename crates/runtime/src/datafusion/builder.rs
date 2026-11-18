@@ -1305,6 +1305,7 @@ impl DataFusionBuilder {
 
         // Enable URL-based table resolution (e.g., SELECT * FROM 's3://bucket/data.parquet')
         // This is opt-in via `runtime.params.url_tables=enabled`
+        let mut url_tables = None;
         if self.url_tables_enabled {
             let url_table_factory = Arc::new(SpiceUrlTableFactory::new());
             url_table_factory.with_registry(Arc::clone(&spice_object_store_registry));
@@ -1317,6 +1318,7 @@ impl DataFusionBuilder {
 
             // Register the session state with the factory so it can infer schemas
             url_table_factory.with_state(ctx.state_weak_ref());
+            url_tables = Some(url_table_factory);
         }
 
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
@@ -1405,6 +1407,7 @@ impl DataFusionBuilder {
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
+            url_table_factory: url_tables,
             data_writers: RwLock::new(HashSet::new()),
             data_update_broadcaster: crate::dataupdate::DataUpdateBroadcaster::new(),
             writable_catalogs: RwLock::new(HashSet::new()),

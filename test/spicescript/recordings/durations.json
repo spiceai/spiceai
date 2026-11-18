@@ -186,5 +186,6 @@
   "unparse-set-operations": 5,
   "unparse-sort-keys": 14,
   "unsigned-negation": 5,
+  "url-table-credentials": 13,
   "views": 11
 }

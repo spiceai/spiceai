@@ -44,11 +44,11 @@ limitations under the License.
 //! - HTTP/HTTPS: `https://example.com/data.parquet` (for publicly accessible files)
 //!
 //! ## Authentication
-//! Authentication is automatic via:
-//! - AWS IAM roles / instance profiles for S3
-//! - Azure Managed Identity for ABFS
-//! - Google Cloud default credentials for GCS
-//! - Environment variables (`AWS_ACCESS_KEY_ID`, `AZURE_STORAGE_ACCOUNT`, etc.)
+//! A URL table on `s3`, `abfs(s)` or `gs` reads with the credentials of the dataset whose
+//! configured `from` covers the URL (same store and bucket, path at or below the dataset's at a
+//! `/` boundary; the longest `from` wins), and only the objects that dataset reads. Any other
+//! URL is read without credentials, so public data works and the store refuses private data.
+//! The runtime's own cloud identity is never used for a location a query chose.
 //!
 //! ## Partition Inference
 //! Hive-style partitions are automatically inferred from paths:
@@ -57,6 +57,9 @@ limitations under the License.
 //! SELECT * FROM 's3://bucket/data/' WHERE year = '2024' AND month = '01'
 //! ```
 
+use std::error::Error as StdError;
+use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Arc, Weak};
 
@@ -68,11 +71,16 @@ use datafusion::datasource::listing::{
 };
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
+use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion_catalog::UrlTableFactory;
 use parking_lot::RwLock;
 use runtime_object_store::ssrf::URL_TABLE_SCHEME_PREFIX;
 pub use runtime_object_store::ssrf::{
     ALLOW_PRIVATE_HOSTS_ENV, allow_private_hosts, is_blocked_internal_hostname, is_internal_ip,
+};
+use runtime_object_store::url_table::{
+    DATASET_SCOPED_SCHEME_PREFIX, DatasetScope, ObjectLocation, OutsideDatasetScope, ScopedStore,
+    StoreFamily,
 };
 use url::{Url, form_urlencoded};
 
@@ -342,6 +350,82 @@ async fn validate_http_url_with_policy(url_str: &str, allow_private: bool) -> DF
     Ok(())
 }
 
+/// Documentation for URL tables, named in their errors.
+const URL_TABLES_DOCS: &str = "https://spiceai.org/docs/features/query-federation/url-tables";
+
+/// A dataset configured on a cloud object store, as the Spicepod writes it.
+#[derive(Clone, Debug)]
+pub struct DatasetLocation {
+    /// The dataset's name.
+    pub name: String,
+    /// The dataset's `from`, as written.
+    pub from: String,
+    /// The location `from` addresses.
+    pub location: ObjectLocation,
+}
+
+/// The store a dataset reads with and the objects it reads, built from its configuration.
+#[derive(Clone, Debug)]
+pub struct DatasetStoreScope {
+    /// The dataset's object-store URL, with its settings and credentials in the fragment.
+    pub store_url: Url,
+    /// The suffix the dataset lists objects by; see
+    /// [`DatasetScope::new`](runtime_object_store::url_table::DatasetScope::new).
+    pub listing_suffix: String,
+}
+
+/// The datasets URL tables may borrow credentials from.
+#[async_trait]
+pub trait UrlTableDatasets: Send + Sync + fmt::Debug {
+    /// The object-store datasets the Spicepod configures, whatever their load state.
+    async fn locations(&self) -> Vec<DatasetLocation>;
+
+    /// The store and scope of `dataset`, built from its configuration with its secrets
+    /// resolved now.
+    async fn scope(
+        &self,
+        dataset: &str,
+    ) -> Result<DatasetStoreScope, Box<dyn StdError + Send + Sync>>;
+}
+
+/// The status an object store answered an unsigned URL-table read with, when it refused it.
+fn refused_status(error: &DataFusionError) -> Option<&'static str> {
+    std::iter::successors(Some(error as &(dyn StdError + 'static)), |e| (*e).source()).find_map(
+        |error| match error.downcast_ref::<object_store::Error>()? {
+            object_store::Error::PermissionDenied { .. } => Some("403 Forbidden"),
+            object_store::Error::Unauthenticated { .. } => Some("401 Unauthorized"),
+            object_store::Error::NotFound { .. } => Some("404 Not Found"),
+            _ => None,
+        },
+    )
+}
+
+/// The refusal behind `error` when a URL table asked for an object its covering dataset does
+/// not read.
+fn outside_dataset_scope(error: &DataFusionError) -> Option<&OutsideDatasetScope> {
+    std::iter::successors(Some(error as &(dyn StdError + 'static)), |e| (*e).source())
+        .find_map(|error| error.downcast_ref::<OutsideDatasetScope>())
+}
+
+/// `url` without its fragment, for messages.
+fn without_fragment(url: &Url) -> String {
+    let mut shown = url.clone();
+    shown.set_fragment(None);
+    shown.to_string()
+}
+
+/// How a URL table on an object store is read.
+enum ObjectStoreRead {
+    /// With the credentials of the dataset that covers it.
+    Dataset,
+    /// Without credentials. `nearest` is the dataset with the longest `from` on the same
+    /// bucket, for the error that names it.
+    Unsigned {
+        forced: bool,
+        nearest: Option<DatasetLocation>,
+    },
+}
+
 /// A factory that creates [`ListingTable`] providers from object store URLs.
 ///
 /// This enables queries like:
@@ -372,6 +456,9 @@ pub struct SpiceUrlTableFactory {
     /// The session's object-store registry. An `http://` SQL URL registers a
     /// plaintext store here without replacing one a dataset already configured.
     registry: RwLock<Option<Arc<runtime_object_store::registry::SpiceObjectStoreRegistry>>>,
+    /// The datasets object-store URL tables may borrow credentials from. Without them, every
+    /// object-store URL table is read without credentials.
+    datasets: RwLock<Option<Arc<dyn UrlTableDatasets>>>,
 }
 
 impl Default for SpiceUrlTableFactory {
@@ -387,12 +474,18 @@ impl SpiceUrlTableFactory {
         Self {
             state: RwLock::new(None),
             registry: RwLock::new(None),
+            datasets: RwLock::new(None),
         }
     }
 
     /// Set the session state reference for schema inference.
     pub fn with_state(&self, state: Weak<RwLock<SessionState>>) {
         *self.state.write() = Some(state);
+    }
+
+    /// Borrow object-store credentials only from `datasets`.
+    pub fn with_datasets(&self, datasets: Arc<dyn UrlTableDatasets>) {
+        *self.datasets.write() = Some(datasets);
     }
 
     /// Use the same object-store registry the session queries with.
@@ -419,6 +512,17 @@ impl UrlTableFactory for SpiceUrlTableFactory {
         // credentials, and http/https URL tables must not target internal addresses.
         validate_object_store_fragment(url)?;
         validate_http_url_not_internal(url).await?;
+
+        if let Some(parsed) = Url::parse(url)
+            .ok()
+            .filter(|parsed| StoreFamily::of_scheme(parsed.scheme()).is_some())
+        {
+            let (table_url, read) = self.object_store_table_url(&parsed).await?;
+            return self
+                .listing_table(url, table_url, Some((&parsed, &read)))
+                .await
+                .map(Some);
+        }
 
         // An `http://` SQL URL is the operator asking for plaintext, the same
         // way an `http://` dataset does. Register that store after the address
@@ -467,6 +571,166 @@ impl UrlTableFactory for SpiceUrlTableFactory {
             DataFusionError::Plan(format!("Failed to parse URL table '{url}': {e}"))
         })?;
 
+        self.listing_table(url, table_url, None).await.map(Some)
+    }
+}
+
+impl SpiceUrlTableFactory {
+    /// The listing URL an object-store URL table reads `parsed` through, after registering the
+    /// store it reads with: the covering dataset's store, limited to what that dataset reads,
+    /// or a store with no credentials.
+    async fn object_store_table_url(
+        &self,
+        parsed: &Url,
+    ) -> DFResult<(ListingTableUrl, ObjectStoreRead)> {
+        let shown = without_fragment(parsed);
+        let registry = self.registry.read().clone().ok_or_else(|| {
+            DataFusionError::Configuration(format!(
+                "Failed to read URL table '{shown}': object stores are not set up for this runtime"
+            ))
+        })?;
+        let fragment: std::collections::HashMap<String, String> =
+            form_urlencoded::parse(parsed.fragment().unwrap_or_default().as_bytes())
+                .into_owned()
+                .collect();
+        let forced = fragment
+            .get("auth")
+            .is_some_and(|auth| auth.eq_ignore_ascii_case("public"));
+        let location = ObjectLocation::parse(parsed, fragment.get("account").map(String::as_str))
+            .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Failed to read URL table '{shown}': the URL names no bucket or container"
+            ))
+        })?;
+
+        let datasets = self.datasets.read().clone();
+        let locations = match &datasets {
+            Some(datasets) => datasets.locations().await,
+            None => Vec::new(),
+        };
+        // The longest `from` wins; the first in the Spicepod among equals.
+        let covering = locations
+            .iter()
+            .filter(|dataset| !forced && dataset.location.covers(&location))
+            .rev()
+            .max_by_key(|dataset| dataset.location.depth());
+
+        if let (Some(covering), Some(datasets)) = (covering, datasets.as_ref()) {
+            let scope = datasets.scope(&covering.name).await.map_err(|error| {
+                DataFusionError::Plan(format!(
+                    "Failed to read URL table '{shown}': dataset '{}' covers this location, and its credentials could not be loaded: {error}",
+                    covering.name
+                ))
+            })?;
+            let store = registry.build_store(&scope.store_url)?;
+            let scope = DatasetScope::new(&covering.name, &covering.from, &scope.listing_suffix)?;
+            let mut hasher = DefaultHasher::new();
+            covering.name.hash(&mut hasher);
+            let key = Url::parse(&format!(
+                "{DATASET_SCOPED_SCHEME_PREFIX}{}://d{:016x}",
+                parsed.scheme(),
+                hasher.finish()
+            ))
+            .map_err(|e| {
+                DataFusionError::Plan(format!("Failed to read URL table '{shown}': {e}"))
+            })?;
+            registry.register_store(&key, Arc::new(ScopedStore::new(store, scope)));
+            let mut listing = key;
+            listing.set_path(parsed.path());
+            let table_url = ListingTableUrl::parse(listing.as_str()).map_err(|e| {
+                DataFusionError::Plan(format!("Failed to parse URL table '{shown}': {e}"))
+            })?;
+            return Ok((table_url, ObjectStoreRead::Dataset));
+        }
+
+        // No dataset lends credentials: read without any. The store is built from the URL with
+        // the location in it and registered under a key of its own, so two containers of one
+        // Azure account, or two settings for one bucket, never share a store.
+        // The dataset on the same bucket whose `from` shares the most of the URL's path, then
+        // the longest; the first in the Spicepod among equals.
+        let nearest = locations
+            .iter()
+            .filter(|dataset| dataset.location.same_bucket(&location))
+            .rev()
+            .max_by_key(|dataset| {
+                (
+                    dataset.location.shared_depth(&location),
+                    dataset.location.depth(),
+                )
+            })
+            .cloned();
+        let mut target = parsed.clone();
+        target.set_path("");
+        let unsigned = Url::parse(&format!("{URL_TABLE_SCHEME_PREFIX}{target}")).map_err(|e| {
+            DataFusionError::Plan(format!("Failed to read URL table '{shown}': {e}"))
+        })?;
+        let store = registry.build_store(&unsigned)?;
+        let mut hasher = DefaultHasher::new();
+        unsigned.as_str().hash(&mut hasher);
+        let key = Url::parse(&format!(
+            "{DATASET_SCOPED_SCHEME_PREFIX}{}://u{:016x}",
+            parsed.scheme(),
+            hasher.finish()
+        ))
+        .map_err(|e| DataFusionError::Plan(format!("Failed to read URL table '{shown}': {e}")))?;
+        registry.register_store(&key, store);
+        let mut listing = key;
+        listing.set_path(parsed.path());
+        let table_url = ListingTableUrl::parse(listing.as_str()).map_err(|e| {
+            DataFusionError::Plan(format!("Failed to parse URL table '{shown}': {e}"))
+        })?;
+        Ok((table_url, ObjectStoreRead::Unsigned { forced, nearest }))
+    }
+
+    /// The error a failed object-store URL table read becomes, naming why it had or lacked
+    /// credentials.
+    fn object_store_read_error(
+        parsed: &Url,
+        read: &ObjectStoreRead,
+        error: &DataFusionError,
+    ) -> Option<DataFusionError> {
+        let shown = without_fragment(parsed);
+        if let Some(refused) = outside_dataset_scope(error) {
+            return Some(DataFusionError::Plan(format!(
+                "Failed to read URL table '{shown}': {refused}. Query the object through a dataset that reads it. See: {URL_TABLES_DOCS}"
+            )));
+        }
+        let ObjectStoreRead::Unsigned { forced, nearest } = read else {
+            return None;
+        };
+        let status = refused_status(error)?;
+        let message = if *forced {
+            format!(
+                "Failed to read URL table '{shown}': `auth=public` reads it without credentials, and the object store refused the request ({status}). Remove `auth=public` to read with the credentials of a dataset whose `from` covers this location. See: {URL_TABLES_DOCS}"
+            )
+        } else {
+            let near = nearest.as_ref().map_or_else(String::new, |dataset| {
+                format!(" (dataset '{}' covers '{}')", dataset.name, dataset.from)
+            });
+            format!(
+                "Failed to read URL table '{shown}': no dataset's `from` covers this location{near}, so it was read without credentials, and the object store refused the request ({status}). To query a private location, add a dataset whose `from` covers it. See: {URL_TABLES_DOCS}"
+            )
+        };
+        Some(DataFusionError::Plan(message))
+    }
+
+    /// The listing table for `table_url`, with its options, partitions and schema inferred.
+    /// `object_store` is the URL table's object-store URL and how it was read, for the errors
+    /// that explain a refused read.
+    async fn listing_table(
+        &self,
+        url: &str,
+        table_url: ListingTableUrl,
+        object_store: Option<(&Url, &ObjectStoreRead)>,
+    ) -> DFResult<Arc<dyn TableProvider>> {
+        let explain = |error: DataFusionError, fallback: String| {
+            object_store
+                .and_then(|(parsed, read)| Self::object_store_read_error(parsed, read, &error))
+                .unwrap_or_else(|| DataFusionError::Plan(fallback))
+        };
+        let url =
+            object_store.map_or_else(|| url.to_string(), |(parsed, _)| without_fragment(parsed));
+
         // Get the session state for schema inference
         // We need to clone it because we can't hold RwLockReadGuard across await points
         let state: SessionState = {
@@ -490,9 +754,10 @@ impl UrlTableFactory for SpiceUrlTableFactory {
             .infer_options(&state)
             .await
             .map_err(|e| {
-                DataFusionError::Plan(format!(
+                let fallback = format!(
                     "Failed to access URL table '{url}': {e}. Verify the path exists and credentials are configured."
-                ))
+                );
+                explain(e, fallback)
             })?;
 
         // Infer partitions from the path (e.g., year=2023/month=01/)
@@ -500,16 +765,16 @@ impl UrlTableFactory for SpiceUrlTableFactory {
             .infer_partitions_from_path(&state)
             .await
             .map_err(|e| {
-                DataFusionError::Plan(format!(
-                    "Failed to infer partitions for URL table '{url}': {e}"
-                ))
+                let fallback = format!("Failed to infer partitions for URL table '{url}': {e}");
+                explain(e, fallback)
             })?;
 
         // Infer schema from the files
         let config = config.infer_schema(&state).await.map_err(|e| {
-            DataFusionError::Plan(format!(
+            let fallback = format!(
                 "Failed to infer schema for URL table '{url}': {e}. Verify the path contains valid data files."
-            ))
+            );
+            explain(e, fallback)
         })?;
 
         // Create the listing table
@@ -518,7 +783,7 @@ impl UrlTableFactory for SpiceUrlTableFactory {
         })?;
 
         tracing::debug!("Created ListingTable for URL: {url}");
-        Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
+        Ok(Arc::new(table) as Arc<dyn TableProvider>)
     }
 }
 
