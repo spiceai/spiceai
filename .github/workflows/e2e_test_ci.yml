@@ -175,11 +175,16 @@ jobs:
       # The compiler cache is the RustFS-backed sccache bucket that the integration and
       # chDB builds on this pool already use. A failure here (a RustFS outage) must not
       # fail the build: without credentials `setup-sccache` disables the cache and the
-      # compile runs uncached. The lifetime covers the job's 200-minute bound, because the
-      # cache server signs its requests with these credentials until the compile ends.
+      # compile runs uncached. A stalled RustFS must not hold the build either: the
+      # action's `curl` calls carry no overall timeout, so a server that accepts the
+      # connection and never answers would otherwise keep this step running until the
+      # job's 200-minute bound cancels the build. The token exchange takes seconds, so
+      # two minutes is a stall. The lifetime covers the job's bound, because the cache
+      # server signs its requests with these credentials until the compile ends.
       - name: Get RustFS credentials
         id: rustfs
         continue-on-error: true
+        timeout-minutes: 2
         uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
