@@ -47,17 +47,26 @@ impl Store {
         }
     }
 
-    /// Replace the values of `SPICE_SPICEAI_*` variables this store holds.
-    /// The env file keeps every other line as it is.
-    /// Fail before a refresh token is spent when the new tokens could not be
-    /// written back.
-    fn ensure_writable(self) -> Result<()> {
+    /// Prepare the write before a refresh token is spent. Tokens that cannot
+    /// be written back leave the spent refresh token in the store, and
+    /// presenting it again revokes the sign-in.
+    fn prepare_write(self) -> Result<Writer> {
         match self {
-            Self::Keychain => Ok(()),
-            Self::EnvFile => super::ensure_env_file_replaceable(),
+            Self::Keychain => Ok(Writer::Keychain),
+            Self::EnvFile => Ok(Writer::EnvFile(super::EnvFileReplacement::prepare()?)),
         }
     }
+}
 
+/// A prepared write of renewed tokens to one store.
+enum Writer {
+    Keychain,
+    EnvFile(super::EnvFileReplacement),
+}
+
+impl Writer {
+    /// Replace the values of `SPICE_SPICEAI_*` variables in the store. The
+    /// env file keeps every other line as it is.
     fn write(self, values: &[(&str, &str)]) -> Result<()> {
         match self {
             Self::Keychain => {
@@ -67,7 +76,7 @@ impl Store {
                     .collect();
                 login::save_credentials(LoginOutput::Keychain, "SPICEAI", &keys)
             }
-            Self::EnvFile => super::replace_env_file_values(values),
+            Self::EnvFile(replacement) => replacement.replace_values(values),
         }
     }
 }
@@ -155,7 +164,7 @@ async fn renew(
     else {
         return Ok(());
     };
-    store.ensure_writable()?;
+    let writer = store.prepare_write()?;
 
     let grant = session::refresh(portal, &client_id, &refresh).await?;
 
@@ -170,7 +179,7 @@ async fn renew(
             values.push((refresh_var.as_str(), grant.refresh_token.as_str()));
         }
     }
-    store.write(&values)
+    writer.write(&values)
 }
 
 /// [`lock_credentials`] without blocking the async runtime.
@@ -355,6 +364,37 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the link must not be replaced by a regular file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn renewal_spends_no_refresh_token_when_the_env_directory_is_read_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _stores = Stores::new();
+        let server = token_endpoint(0).await;
+        store_sign_in(&jwt_expiring_in(60));
+        let path = login::test_env_file::path();
+        let directory = path.parent().expect("env file directory").to_path_buf();
+        let original = std::fs::metadata(&directory)
+            .expect("directory")
+            .permissions();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555))
+            .expect("make directory read-only");
+
+        // A privileged user is not held to directory permissions; nothing to prove then.
+        let probe = directory.join("probe");
+        if std::fs::File::create(&probe).is_err() {
+            renew_expiring_sign_ins_at(&server.uri()).await;
+        } else {
+            let _ = std::fs::remove_file(&probe);
+        }
+
+        std::fs::set_permissions(&directory, original).expect("restore directory");
+        assert_eq!(
+            login::read_env_var("SPICE_SPICEAI_REFRESH_TOKEN").as_deref(),
+            Some("refresh-1")
         );
     }
 

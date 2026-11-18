@@ -2696,84 +2696,89 @@ fn assigned_name(line: &str) -> Option<&str> {
     Some(lhs.trim().trim_start_matches("export ").trim())
 }
 
-/// Refuse an env file that [`replace_env_file_values`] would not replace: a
-/// link, or anything else that is not a regular file.
-pub(crate) fn ensure_env_file_replaceable() -> Result<()> {
-    let env_file = crate::commands::login::env_file_path();
-    let metadata =
-        std::fs::symlink_metadata(&env_file).map_err(|source| crate::error::Error::ConfigIo {
-            operation: "read",
-            path: env_file.clone(),
-            source,
-        })?;
-    if metadata.is_file() {
-        return Ok(());
-    }
-    Err(crate::error::Error::ConfigIo {
-        operation: "write",
-        path: env_file,
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "credentials are written only to a regular file",
-        ),
-    })
+/// A replacement for the env file, created before its contents are known.
+///
+/// [`Self::prepare`] refuses a link or any other non-regular file and creates
+/// an owner-only file beside the env file, so the caller learns that the env
+/// file can be replaced before it spends anything it cannot get back.
+/// [`Self::replace_values`] writes the new contents there and renames the file
+/// over the env file, so a concurrent reader sees the old file or the new one,
+/// never a partial one.
+pub(crate) struct EnvFileReplacement {
+    path: std::path::PathBuf,
+    file: tempfile::NamedTempFile,
 }
 
-/// Replace the values of variables the env file already assigns, keeping
-/// every other line byte-for-byte for the same reasons as
-/// [`remove_env_file_keys`].
-///
-/// The new contents go to an owner-only file beside the env file, which is
-/// then renamed over it, so a concurrent reader sees the old file or the new
-/// one, never a partial one. A link or other non-regular file is refused.
-pub(crate) fn replace_env_file_values(values: &[(&str, &str)]) -> Result<()> {
-    ensure_env_file_replaceable()?;
-    let env_file = crate::commands::login::env_file_path();
-    let path = env_file.as_path();
-    let io_error = |operation: &'static str| {
-        move |source| crate::error::Error::ConfigIo {
-            operation,
-            path: path.to_path_buf(),
+impl EnvFileReplacement {
+    pub(crate) fn prepare() -> Result<Self> {
+        let path = crate::commands::login::env_file_path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|source| Error::ConfigIo {
+            operation: "read",
+            path: path.clone(),
             source,
+        })?;
+        if !metadata.is_file() {
+            return Err(Error::ConfigIo {
+                operation: "write",
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "credentials are written only to a regular file",
+                ),
+            });
         }
-    };
-    let content = std::fs::read_to_string(path).map_err(|e| crate::error::Error::ConfigIo {
-        operation: "read",
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-
-    let mut updated = content
-        .lines()
-        .map(|line| {
-            let replacement = assigned_name(line)
-                .and_then(|name| values.iter().find(|(var, _)| *var == name))
-                .zip(line.split_once('='));
-            match replacement {
-                Some(((_, value), (lhs, _))) => format!("{lhs}={value}"),
-                None => line.to_string(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if content.ends_with('\n') {
-        updated.push('\n');
+        let directory = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        };
+        let file =
+            tempfile::NamedTempFile::new_in(&directory).map_err(|source| Error::ConfigIo {
+                operation: "create",
+                path: directory,
+                source,
+            })?;
+        Ok(Self { path, file })
     }
 
-    let directory = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => std::path::Path::new("."),
-    };
-    let mut replacement = tempfile::NamedTempFile::new_in(directory).map_err(io_error("write"))?;
-    std::io::Write::write_all(&mut replacement, updated.as_bytes()).map_err(io_error("write"))?;
-    replacement
-        .as_file()
-        .sync_all()
-        .map_err(io_error("write"))?;
-    replacement
-        .persist(path)
-        .map_err(|e| io_error("replace")(e.error))?;
-    Ok(())
+    /// Replace the values of variables the env file already assigns, keeping
+    /// every other line byte-for-byte for the same reasons as
+    /// [`remove_env_file_keys`].
+    pub(crate) fn replace_values(mut self, values: &[(&str, &str)]) -> Result<()> {
+        let path = self.path;
+        let io_error = |operation: &'static str| {
+            let path = path.clone();
+            move |source| Error::ConfigIo {
+                operation,
+                path,
+                source,
+            }
+        };
+        let content = std::fs::read_to_string(&path).map_err(io_error("read"))?;
+
+        let mut updated = content
+            .lines()
+            .map(|line| {
+                let replacement = assigned_name(line)
+                    .and_then(|name| values.iter().find(|(var, _)| *var == name))
+                    .zip(line.split_once('='));
+                match replacement {
+                    Some(((_, value), (lhs, _))) => format!("{lhs}={value}"),
+                    None => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if content.ends_with('\n') {
+            updated.push('\n');
+        }
+
+        std::io::Write::write_all(&mut self.file, updated.as_bytes()).map_err(io_error("write"))?;
+        self.file.as_file().sync_all().map_err(io_error("write"))?;
+        self.file
+            .persist(&path)
+            .map_err(|e| io_error("replace")(e.error))?;
+        Ok(())
+    }
 }
 
 async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()> {
