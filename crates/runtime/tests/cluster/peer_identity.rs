@@ -97,7 +97,7 @@ async fn channel_as(harness: &ClusterHarness, node_name: &str) -> Channel {
 
 /// A TLS channel to `address` that verifies the server's certificate against
 /// `server_name`, presenting `node_name`'s certificate.
-async fn connect_verifying(
+pub(super) async fn connect_verifying(
     pki: &PkiConfig,
     node_name: &str,
     address: std::net::SocketAddr,
