@@ -16,11 +16,12 @@ limitations under the License.
 
 //! Spicerack.org registry for Spicepods.
 
+use super::install_dir::{Entry, InstallDir};
 use super::{Error, Result, ZipExtractionSnafu};
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Base URL for spicerack API.
 fn get_spicerack_base_url() -> String {
@@ -375,23 +376,103 @@ fn install_archive(
     };
     check_declared_size(&archive, response.pod, limits)?;
 
-    let pods_dir_existed = pods_dir.exists();
-    std::fs::create_dir_all(pods_dir).map_err(|e| Error::Io {
-        operation: "create directory",
-        path: pods_dir.display().to_string(),
-        source: e,
-    })?;
-    let installed =
-        stage_archive(&mut archive, pods_dir, response.pod, limits).and_then(|staged| {
-            let dest_dir = pods_dir.join(pod_path);
-            promote(staged, pods_dir, &dest_dir, response.pod)?;
-            Ok(dest_dir)
-        });
+    let pods_dir_existed = std::fs::symlink_metadata(pods_dir).is_ok();
+    let installed = open_pods_dir(pods_dir, response.pod).and_then(|pods| {
+        let staged = stage_archive(&mut archive, &pods, response.pod, limits)?;
+        promote(staged, &pods, pod_path, response.pod)
+    });
     if installed.is_err() && !pods_dir_existed {
         // Only removes the directory if nothing else landed in it.
         let _ = std::fs::remove_dir(pods_dir);
     }
     installed
+}
+
+/// The error for an install path that is a symbolic link, naming it relative
+/// to the project directory.
+fn linked_install_path(pod: &str, pods: &InstallDir, path: &Path) -> Error {
+    let project = pods.path().parent().unwrap_or(pods.path());
+    Error::LinkedInstallPath {
+        pod: pod.to_string(),
+        path: path
+            .strip_prefix(project)
+            .unwrap_or(path)
+            .display()
+            .to_string(),
+    }
+}
+
+/// Open `pods_dir`, creating it when it is missing. It is reached from the
+/// project directory without following a link: one at `spicepods` would put
+/// every package wherever it points.
+fn open_pods_dir(pods_dir: &Path, pod: &str) -> Result<InstallDir> {
+    let io_error = |source| Error::Io {
+        operation: "create directory",
+        path: pods_dir.display().to_string(),
+        source,
+    };
+    let (Some(project), Some(name)) = (pods_dir.parent(), pods_dir.file_name()) else {
+        return Err(io_error(std::io::Error::from(
+            std::io::ErrorKind::InvalidInput,
+        )));
+    };
+    std::fs::create_dir_all(project).map_err(io_error)?;
+    let project = InstallDir::open(project).map_err(io_error)?;
+    child_dir(&project, name, false).map_err(|failure| match failure {
+        ChildDirFailure::Link => Error::LinkedInstallPath {
+            pod: pod.to_string(),
+            path: Path::new(name).display().to_string(),
+        },
+        ChildDirFailure::Io(source) => io_error(source),
+    })
+}
+
+/// Why [`child_dir`] could not open a directory.
+enum ChildDirFailure {
+    /// The name is a symbolic link.
+    Link,
+    Io(std::io::Error),
+}
+
+/// Open the directory `name` in `parent`, creating it when it is missing.
+fn child_dir(
+    parent: &InstallDir,
+    name: &std::ffi::OsStr,
+    private: bool,
+) -> std::result::Result<InstallDir, ChildDirFailure> {
+    // A second look covers a directory created by someone else between the
+    // first look and the create.
+    for _ in 0..2 {
+        match parent.entry(name).map_err(ChildDirFailure::Io)? {
+            Entry::Directory(dir) => return Ok(dir),
+            Entry::Link => return Err(ChildDirFailure::Link),
+            Entry::Other => {
+                return Err(ChildDirFailure::Io(std::io::Error::from(
+                    std::io::ErrorKind::NotADirectory,
+                )));
+            }
+            Entry::Missing => {
+                parent
+                    .create_dir(name, private)
+                    .map_err(ChildDirFailure::Io)?;
+            }
+        }
+    }
+    Err(ChildDirFailure::Io(std::io::Error::from(
+        std::io::ErrorKind::NotFound,
+    )))
+}
+
+/// The normal components of `path`, or `None` when it has any other kind
+/// (`..`, a root, a prefix).
+fn normal_components(path: &Path) -> Option<Vec<&std::ffi::OsStr>> {
+    path.components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The error for a body the zip reader rejected.
@@ -458,25 +539,99 @@ fn check_declared_size<R: Read + std::io::Seek>(
     Ok(())
 }
 
-/// Extract every entry into a new directory inside `pods_dir`, streaming each
-/// one to disk and stopping once the archive has expanded past its limit.
+/// The error for archive entry `index`, whose name cannot be written inside
+/// the Spicepod directory. The name is quoted on one line and bounded.
+fn unsafe_archive_entry(
+    pod: &str,
+    index: usize,
+    name: zip::result::ZipResult<std::borrow::Cow<'_, str>>,
+) -> Error {
+    Error::UnsafeArchiveEntry {
+        pod: pod.to_string(),
+        entry: name.map_or_else(
+            |_| format!("#{index}"),
+            |name| {
+                name.chars()
+                    .take(256)
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect()
+            },
+        ),
+    }
+}
+
+/// A directory inside `pods_dir` that a package is extracted into, removed
+/// when dropped unless it was moved into place.
+struct Staging {
+    dir: InstallDir,
+    name: std::ffi::OsString,
+    moved: bool,
+}
+
+impl Staging {
+    /// Create a new owner-only directory in `pods`.
+    fn create(pods: &InstallDir) -> Result<Self> {
+        let mut last_error = None;
+        for _ in 0..8 {
+            let name =
+                std::ffi::OsString::from(format!(".spice-add-{}", uuid::Uuid::new_v4().simple()));
+            match pods.create_dir(&name, true) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(source) => {
+                    last_error = Some(source);
+                    continue;
+                }
+            }
+            return match pods.entry(&name) {
+                Ok(Entry::Directory(dir)) => Ok(Self {
+                    dir,
+                    name,
+                    moved: false,
+                }),
+                Ok(_) => Err(Error::Io {
+                    operation: "create directory",
+                    path: pods.child_path(&name).display().to_string(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotADirectory),
+                }),
+                Err(source) => Err(Error::Io {
+                    operation: "create directory",
+                    path: pods.child_path(&name).display().to_string(),
+                    source,
+                }),
+            };
+        }
+        Err(Error::Io {
+            operation: "create directory",
+            path: pods.path().display().to_string(),
+            source: last_error
+                .unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+        })
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.moved {
+            // `remove_dir_all` never follows a link inside the tree it removes.
+            let _ = std::fs::remove_dir_all(self.dir.path());
+        }
+    }
+}
+
+/// Extract every entry into a new directory inside `pods`, streaming each one
+/// to disk and stopping once the archive has expanded past its limit.
 ///
-/// The directory is new and only this function writes to it, so no entry can
-/// be redirected by a link that was already there.
+/// The directory is new, owner-only, and only this function writes to it, and
+/// every entry is created relative to it, so no entry can be redirected by a
+/// link.
 fn stage_archive<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
-    pods_dir: &Path,
+    pods: &InstallDir,
     pod: &str,
     limits: &ArchiveLimits,
-) -> Result<tempfile::TempDir> {
-    let staging = tempfile::Builder::new()
-        .prefix(".spice-add-")
-        .tempdir_in(pods_dir)
-        .map_err(|e| Error::Io {
-            operation: "create directory",
-            path: pods_dir.display().to_string(),
-            source: e,
-        })?;
+) -> Result<Staging> {
+    let staging = Staging::create(pods)?;
 
     let mut remaining = limits.expanded_bytes;
     for i in 0..archive.len() {
@@ -487,38 +642,42 @@ fn stage_archive<R: Read + std::io::Seek>(
         // name this platform reserves). Either way the entry cannot be written
         // where the archive says, so the package is not installed in part.
         let Some(file_name) = entry.enclosed_name() else {
-            return Err(Error::UnsafeArchiveEntry {
-                pod: pod.to_string(),
-                entry: entry.name().map_or_else(
-                    |_| format!("#{i}"),
-                    |name| {
-                        name.chars()
-                            .take(256)
-                            .map(|c| if c.is_control() { ' ' } else { c })
-                            .collect()
-                    },
-                ),
-            });
+            return Err(unsafe_archive_entry(pod, i, entry.name()));
         };
-        let dest_path = staging.path().join(&file_name);
+        let Some(components) = normal_components(&file_name) else {
+            return Err(unsafe_archive_entry(pod, i, entry.name()));
+        };
+        let dest_path = staging.dir.path().join(&file_name);
 
-        if entry.is_dir() {
-            std::fs::create_dir_all(&dest_path).map_err(|e| Error::Io {
+        let (parents, leaf) = if entry.is_dir() {
+            (components.as_slice(), None)
+        } else {
+            match components.split_last() {
+                Some((leaf, parents)) => (parents, Some(*leaf)),
+                None => return Err(unsafe_archive_entry(pod, i, entry.name())),
+            }
+        };
+        let mut dir = staging.dir.try_clone().map_err(|e| Error::Io {
+            operation: "create directory",
+            path: dest_path.display().to_string(),
+            source: e,
+        })?;
+        for name in parents {
+            dir = child_dir(&dir, name, false).map_err(|failure| Error::Io {
                 operation: "create directory",
                 path: dest_path.display().to_string(),
-                source: e,
+                source: match failure {
+                    ChildDirFailure::Link => {
+                        std::io::Error::from(std::io::ErrorKind::NotADirectory)
+                    }
+                    ChildDirFailure::Io(source) => source,
+                },
             })?;
+        }
+        let Some(leaf) = leaf else {
             continue;
-        }
-
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::Io {
-                operation: "create directory",
-                path: parent.display().to_string(),
-                source: e,
-            })?;
-        }
-        let mut outfile = std::fs::File::create(&dest_path).map_err(|e| Error::Io {
+        };
+        let mut outfile = dir.create_file(leaf).map_err(|e| Error::Io {
             operation: "create file",
             path: dest_path.display().to_string(),
             source: e,
@@ -550,130 +709,159 @@ fn stage_archive<R: Read + std::io::Seek>(
     Ok(staging)
 }
 
-/// Move a fully extracted Spicepod to `dest_dir`.
+/// Move a fully extracted Spicepod to `pod_path` inside `pods`, returning
+/// where it was installed.
 ///
 /// A first install renames the whole directory into place. Re-installing over
 /// an existing directory keeps today's behavior of writing the package's files
 /// over it, now only after the package has been extracted in full.
 ///
-/// Nothing is written through a symbolic link: every directory between
-/// `pods_dir` and `dest_dir`, and every directory inside an existing install
-/// that the package would write into, is checked first. Extraction never
-/// creates a link, so one there was put there by someone else, and following it
-/// would write the package outside the Spicepod directory.
-fn promote(staged: tempfile::TempDir, pods_dir: &Path, dest_dir: &Path, pod: &str) -> Result<()> {
-    let linked = |path: &Path| Error::LinkedInstallPath {
-        pod: pod.to_string(),
-        path: path
-            .strip_prefix(pods_dir.parent().unwrap_or(pods_dir))
-            .unwrap_or(path)
-            .display()
-            .to_string(),
+/// Nothing is written through a symbolic link. Every directory from `pods` to
+/// the install, and every directory inside an existing install that the
+/// package writes into, is opened without following a link, and each file is
+/// moved relative to the directory it was opened as. All of them are checked
+/// before anything is moved, so a link already there installs nothing; one
+/// swapped in while the package is being moved fails the install at that
+/// directory, and nothing is written through it.
+fn promote(mut staged: Staging, pods: &InstallDir, pod_path: &str, pod: &str) -> Result<PathBuf> {
+    let dest_path = pods.path().join(pod_path);
+    let invalid = || Error::Io {
+        operation: "install",
+        path: dest_path.display().to_string(),
+        source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
     };
-    if let Ok(relative) = dest_dir.strip_prefix(pods_dir) {
-        let mut path = pods_dir.to_path_buf();
-        for component in relative.components() {
-            path.push(component);
-            if is_symlink(&path) {
-                return Err(linked(&path));
-            }
-        }
-    }
-    if let Some(path) = first_linked_directory(staged.path(), dest_dir) {
-        return Err(linked(&path));
-    }
+    let components = normal_components(Path::new(pod_path)).ok_or_else(invalid)?;
+    let (leaf, parents) = components.split_last().ok_or_else(invalid)?;
 
-    if let Some(parent) = dest_dir.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::Io {
-            operation: "create directory",
-            path: parent.display().to_string(),
-            source: e,
+    let mut parent = pods.try_clone().map_err(|e| Error::Io {
+        operation: "create directory",
+        path: pods.path().display().to_string(),
+        source: e,
+    })?;
+    for name in parents {
+        parent = child_dir(&parent, name, false).map_err(|failure| match failure {
+            ChildDirFailure::Link => linked_install_path(pod, pods, &parent.child_path(name)),
+            ChildDirFailure::Io(source) => Error::Io {
+                operation: "create directory",
+                path: parent.child_path(name).display().to_string(),
+                source,
+            },
         })?;
     }
 
-    match std::fs::symlink_metadata(dest_dir) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let staged = staged.keep();
-            std::fs::rename(&staged, dest_dir).map_err(|e| {
-                let _ = std::fs::remove_dir_all(&staged);
-                Error::Io {
+    let inspect_error = |source| Error::Io {
+        operation: "inspect",
+        path: dest_path.display().to_string(),
+        source,
+    };
+    match parent.entry(leaf).map_err(inspect_error)? {
+        Entry::Missing => {
+            pods.rename(&staged.name, &parent, leaf)
+                .map_err(|e| Error::Io {
                     operation: "install",
-                    path: dest_dir.display().to_string(),
+                    path: dest_path.display().to_string(),
                     source: e,
-                }
-            })
+                })?;
+            staged.moved = true;
         }
-        Err(e) => Err(Error::Io {
-            operation: "inspect",
-            path: dest_dir.display().to_string(),
-            source: e,
-        }),
-        Ok(_) => move_entries(staged.path(), dest_dir),
+        Entry::Link => return Err(linked_install_path(pod, pods, &parent.child_path(leaf))),
+        Entry::Other => {
+            return Err(Error::Io {
+                operation: "install",
+                path: dest_path.display().to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::NotADirectory),
+            });
+        }
+        Entry::Directory(dest) => {
+            if let Some(path) = first_linked_directory(&staged.dir, &dest)? {
+                return Err(linked_install_path(pod, pods, &path));
+            }
+            move_entries(&staged.dir, &dest)?;
+        }
     }
-}
-
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    Ok(dest_path)
 }
 
 /// The first directory under `to` that a move of `from`'s tree would write
 /// into and that is a symbolic link, if any.
-fn first_linked_directory(from: &Path, to: &Path) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(from).ok()?;
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+fn first_linked_directory(from: &InstallDir, to: &InstallDir) -> Result<Option<PathBuf>> {
+    for (name, is_dir) in list(from)? {
+        if !is_dir {
             continue;
         }
-        let target = to.join(entry.file_name());
-        if is_symlink(&target) {
-            return Some(target);
-        }
-        if let Some(linked) = first_linked_directory(&entry.path(), &target) {
-            return Some(linked);
+        match to.entry(&name).map_err(|e| Error::Io {
+            operation: "inspect",
+            path: to.child_path(&name).display().to_string(),
+            source: e,
+        })? {
+            Entry::Link => return Ok(Some(to.child_path(&name))),
+            Entry::Directory(target) => {
+                let source = staged_dir(from, &name)?;
+                if let Some(linked) = first_linked_directory(&source, &target)? {
+                    return Ok(Some(linked));
+                }
+            }
+            // Nothing below a missing directory exists yet, and a file where
+            // the package has a directory fails the move itself.
+            Entry::Missing | Entry::Other => {}
         }
     }
-    None
+    Ok(None)
 }
 
 /// Move every file under `from` to the same relative path under `to`.
-fn move_entries(from: &Path, to: &Path) -> Result<()> {
-    let entries = std::fs::read_dir(from).map_err(|e| Error::Io {
-        operation: "read directory",
-        path: from.display().to_string(),
-        source: e,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| Error::Io {
-            operation: "read directory",
-            path: from.display().to_string(),
-            source: e,
-        })?;
-        let source = entry.path();
-        let target = to.join(entry.file_name());
-        let is_dir = entry
-            .file_type()
-            .map_err(|e| Error::Io {
-                operation: "inspect",
-                path: source.display().to_string(),
-                source: e,
-            })?
-            .is_dir();
+fn move_entries(from: &InstallDir, to: &InstallDir) -> Result<()> {
+    for (name, is_dir) in list(from)? {
+        let target_path = to.child_path(&name);
         if is_dir {
-            std::fs::create_dir_all(&target).map_err(|e| Error::Io {
-                operation: "create directory",
-                path: target.display().to_string(),
-                source: e,
-            })?;
-            move_entries(&source, &target)?;
-        } else {
-            std::fs::rename(&source, &target).map_err(|e| Error::Io {
+            let target = child_dir(to, &name, false).map_err(|failure| Error::Io {
                 operation: "install",
-                path: target.display().to_string(),
+                path: target_path.display().to_string(),
+                source: match failure {
+                    // Checked before anything was moved, so a link here was
+                    // swapped in since; nothing is written through it.
+                    ChildDirFailure::Link => {
+                        std::io::Error::other("it became a symbolic link during the install")
+                    }
+                    ChildDirFailure::Io(source) => source,
+                },
+            })?;
+            move_entries(&staged_dir(from, &name)?, &target)?;
+        } else {
+            from.rename(&name, to, &name).map_err(|e| Error::Io {
+                operation: "install",
+                path: target_path.display().to_string(),
                 source: e,
             })?;
         }
     }
     Ok(())
+}
+
+/// The names in a directory of the extracted package.
+fn list(dir: &InstallDir) -> Result<Vec<(std::ffi::OsString, bool)>> {
+    dir.list().map_err(|e| Error::Io {
+        operation: "read directory",
+        path: dir.path().display().to_string(),
+        source: e,
+    })
+}
+
+/// The subdirectory `name` of the extracted package.
+fn staged_dir(dir: &InstallDir, name: &std::ffi::OsStr) -> Result<InstallDir> {
+    match dir.entry(name) {
+        Ok(Entry::Directory(staged)) => Ok(staged),
+        Ok(_) => Err(Error::Io {
+            operation: "read directory",
+            path: dir.child_path(name).display().to_string(),
+            source: std::io::Error::from(std::io::ErrorKind::NotADirectory),
+        }),
+        Err(source) => Err(Error::Io {
+            operation: "read directory",
+            path: dir.child_path(name).display().to_string(),
+            source,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -894,6 +1082,92 @@ mod tests {
         }
     }
 
+    /// Once an install directory has been opened, the package goes into that
+    /// directory whatever happens to its path afterwards. A directory above it
+    /// swapped for a link does not redirect the move, and a directory inside the
+    /// install that becomes a link before the package reaches it fails the
+    /// install without anything written through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_link_during_an_install_is_never_written_through() {
+        const README: &str = "written by the package\n";
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("spicepod.yaml", options)
+            .expect("start manifest entry");
+        writer
+            .write_all(MANIFEST.as_bytes())
+            .expect("write manifest entry");
+        writer
+            .start_file("docs/README.md", options)
+            .expect("start docs entry");
+        writer
+            .write_all(README.as_bytes())
+            .expect("write docs entry");
+        let body = writer.finish().expect("finish archive").into_inner();
+
+        let project = tempfile::tempdir().expect("create the project");
+        let outside = tempfile::tempdir().expect("create the outside directory");
+        let pods_path = project.path().join("spicepods");
+        let install = pods_path.join("evil").join("pod");
+        let moved_away = pods_path.join("evil").join("pod.real");
+        std::fs::create_dir_all(install.join("docs")).expect("create the earlier install");
+
+        let pods = InstallDir::open(&pods_path).expect("open the pods directory");
+        let open_install = || {
+            let org = child_dir(&pods, std::ffi::OsStr::new("evil"), false)
+                .unwrap_or_else(|_| panic!("open the org directory"));
+            child_dir(&org, std::ffi::OsStr::new("pod"), false)
+                .unwrap_or_else(|_| panic!("open the install directory"))
+        };
+        let stage = || {
+            let mut archive =
+                zip::ZipArchive::new(Cursor::new(body.clone())).expect("open archive");
+            stage_archive(&mut archive, &pods, "evil/pod", &ArchiveLimits::SPICEPOD)
+                .unwrap_or_else(|err| panic!("stage the package: {err}"))
+        };
+        let outside_entries = || {
+            std::fs::read_dir(outside.path())
+                .expect("list the outside directory")
+                .count()
+        };
+
+        // The install's path leads outside once it has been opened.
+        let dest = open_install();
+        let staged = stage();
+        std::fs::rename(&install, &moved_away).expect("move the install away");
+        std::os::unix::fs::symlink(outside.path(), &install).expect("link its path outside");
+        move_entries(&staged.dir, &dest)
+            .unwrap_or_else(|err| panic!("move into the directory that was opened: {err}"));
+        assert_eq!(
+            std::fs::read_to_string(moved_away.join("docs").join("README.md"))
+                .expect("read the installed file"),
+            README
+        );
+        assert_eq!(outside_entries(), 0, "nothing may be written outside");
+
+        // A directory inside the install becomes a link before it is reached.
+        std::fs::remove_file(&install).expect("remove the link");
+        std::fs::rename(&moved_away, &install).expect("put the install back");
+        let dest = open_install();
+        let staged = stage();
+        let docs = install.join("docs");
+        std::fs::remove_dir_all(&docs).expect("remove the docs directory");
+        std::os::unix::fs::symlink(outside.path(), &docs).expect("link it outside");
+        let err = move_entries(&staged.dir, &dest)
+            .expect_err("a directory that became a link is not written through");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Failed to install '{}': it became a symbolic link during the install",
+                docs.display()
+            )
+        );
+        assert_eq!(outside_entries(), 0, "nothing may be written outside");
+    }
+
     /// The expansion budget counts the bytes actually written, across entries. A central
     /// directory can leave the total unknown (entries written with data descriptors), so the
     /// count is the bound that always holds - and an archive that crosses it leaves nothing
@@ -916,7 +1190,9 @@ mod tests {
             entries: 10,
             expanded_bytes: 2560,
         };
-        let err = stage_archive(&mut archive, pods_dir.path(), "test/pod", &limits)
+        let pods = InstallDir::open(pods_dir.path()).expect("open pods dir");
+        let err = stage_archive(&mut archive, &pods, "test/pod", &limits)
+            .map(|_| ())
             .expect_err("3 KiB of entries cannot fit a 2560-byte budget");
 
         assert_eq!(

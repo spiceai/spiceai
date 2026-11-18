@@ -20333,6 +20333,7 @@ dependencies = [
  "runtime-api-types",
  "runtime-cloud-connect",
  "runtime-secrets",
+ "rustix 1.1.4",
  "rustls",
  "rustyline",
  "secrecy",
