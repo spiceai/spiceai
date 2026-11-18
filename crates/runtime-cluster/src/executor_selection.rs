@@ -154,7 +154,7 @@ mod tests {
 
         let result = select_executors(&required, &available);
         assert!(result.is_ok());
-        assert!(result.expect("should be ok").is_empty());
+        assert_eq!(result.expect("should be ok"), [] as [String; 0]);
     }
 
     #[test]

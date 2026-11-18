@@ -37,7 +37,7 @@ limitations under the License.
 //!   manager that serializes the two instead misses the first bound by the
 //!   length of the query, and the query then ends by finishing rather than by
 //!   being cancelled.
-//! * **Reported, not asserted** — `Connection::cancel` also takes a different
+//! * **Reported, not asserted** — `Connection::cancel` is also issued without a
 //!   lock and so can be called concurrently, but a driver is free to scope it to
 //!   the connection rather than to the statement, in which case it does not end
 //!   the query. The `BigQuery` driver scopes it that way.
@@ -182,7 +182,7 @@ fn statement_cancel_during_execute() {
         .set_sql_query(uncached(&config.sql, "statement"))
         .expect("the query should be set");
 
-    let mut canceller = statement.clone();
+    let canceller = statement.get_cancel_handle();
     let started = Instant::now();
     let executor = std::thread::spawn(move || {
         let result = statement.execute();
@@ -194,7 +194,7 @@ fn statement_cancel_during_execute() {
 
     std::thread::sleep(config.wait_before_cancel);
     let cancel_started = Instant::now();
-    let cancel_result = canceller.cancel();
+    let cancel_result = canceller.try_cancel();
     let cancel_took = cancel_started.elapsed();
 
     let (execute_took, execute_outcome) = executor
@@ -238,8 +238,8 @@ fn statement_cancel_during_execute() {
     );
 }
 
-/// `Connection::cancel` takes a different lock than `Statement::execute`, so it
-/// can at least be *called* while a query runs. This measures whether calling it
+/// `Connection::cancel` is issued without the lock `Statement::execute` holds,
+/// so it can at least be *called* while a query runs. This measures whether calling it
 /// actually ends the query.
 #[test]
 fn connection_cancel_during_execute() {
@@ -256,7 +256,7 @@ fn connection_cancel_during_execute() {
         .set_sql_query(uncached(&config.sql, "connection"))
         .expect("the query should be set");
 
-    let mut canceller = connection.clone();
+    let canceller = connection.get_cancel_handle();
     let started = Instant::now();
     let executor = std::thread::spawn(move || {
         let result = statement.execute();
@@ -268,7 +268,7 @@ fn connection_cancel_during_execute() {
 
     std::thread::sleep(config.wait_before_cancel);
     let cancel_started = Instant::now();
-    let cancel_result = canceller.cancel();
+    let cancel_result = canceller.try_cancel();
     let cancel_took = cancel_started.elapsed();
 
     let (execute_took, execute_error) = executor

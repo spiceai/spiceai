@@ -105,11 +105,11 @@ runs:
 
     - name: Setup Rust
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
-      uses: ./.github/actions/setup-rust
+      uses: $/.github/actions/setup-rust
 
     - name: Setup cc
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')) && steps.detect-os.outputs.os == 'linux'
-      uses: ./.github/actions/setup-cc
+      uses: $/.github/actions/setup-cc
 
     # Reports only whether an sccache endpoint was configured, which decides
     # whether `setup-sccache` runs. It deliberately does not export a
@@ -132,7 +132,7 @@ runs:
 
     - name: Set up sccache
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')) && steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
-      uses: ./.github/actions/setup-sccache
+      uses: $/.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
         minio_access_key: ${{ inputs.minio_access_key }}
@@ -141,7 +141,7 @@ runs:
 
     - name: Set up make
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
-      uses: ./.github/actions/setup-make
+      uses: $/.github/actions/setup-make
 
     - name: Build spicepod-validator
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')

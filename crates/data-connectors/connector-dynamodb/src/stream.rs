@@ -1677,7 +1677,7 @@ mod tests {
             let result = streams_to_dynamodb_attribute(&input);
 
             if let DynamoDbAttributeValue::L(l) = result {
-                assert!(l.is_empty());
+                assert_eq!(l, [] as [aws_sdk_dynamodb::types::AttributeValue; 0]);
             } else {
                 panic!("Expected L variant");
             }
@@ -1701,7 +1701,7 @@ mod tests {
             let result = streams_to_dynamodb_attribute(&input);
 
             if let DynamoDbAttributeValue::Ss(ss) = result {
-                assert!(ss.is_empty());
+                assert_eq!(ss, [] as [String; 0]);
             } else {
                 panic!("Expected Ss variant");
             }

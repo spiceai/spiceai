@@ -1,4 +1,4 @@
-FROM spark:3.5.6@sha256:d8a757b4a4a07e3807a072b018be6b10d83370d14a5ae3426847b4674b9b9d54
+FROM spark:4.1.4@sha256:1d89b302e585e0de2b1034e50fad2ae6e21d09d6a1682037111654365a56bca3
 USER root
 WORKDIR /data
 RUN apt-get update && apt-get install wget -y && wget https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -O /usr/local/bin/mc && \

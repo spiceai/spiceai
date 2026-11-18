@@ -1033,7 +1033,7 @@ mod tests {
     ///   different free-text columns than `dbgen`, so Q2, Q10, Q13 and Q20 cannot
     ///   match the answer files.
     ///
-    /// - The four `ClickBench` arms whose acceleration holds only part of the
+    /// - The three `ClickBench` arms whose acceleration holds only part of the
     ///   source, because a runner cannot hold all of it: their `refresh_sql` keeps
     ///   a subset, while the `__test_reference.*` clone drops acceleration and
     ///   reads every row, so it answers a different question. A `LIMIT` subset
@@ -1045,7 +1045,6 @@ mod tests {
         "clickbench/sf1/accelerated/s3[parquet]-arrow.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-arrow-partitioned.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-cayenne[memory].yaml",
-        "clickbench/sf1/accelerated/s3[parquet]-sqlite[memory].yaml",
         "tpch/sf1/accelerated/databricks[delta_lake]-cayenne[file].yaml",
         "tpch/sf1/federated/adbc[bigquery].yaml",
         "tpch/sf1/federated/databricks[catalog].yaml",

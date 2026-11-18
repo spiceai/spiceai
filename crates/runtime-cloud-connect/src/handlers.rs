@@ -263,15 +263,16 @@ pub struct SpicepodDeployment<'a> {
     pub config_dir: &'a Path,
     /// The spicepod to apply, verbatim.
     pub spicepod_yaml: &'a str,
-    /// App secrets that rode the same dispatch, already opened (see
+    /// The app's secrets that rode the same dispatch, already opened (see
     /// [`crate::sealed_secrets`]). They arrive *with* the spicepod because a
     /// component resolves its secrets as it loads: values that landed
     /// afterwards would arrive after the components referencing them had
     /// already tried.
     ///
-    /// `None` means the deployment carried none, which is distinct from an
-    /// empty map — an app whose secrets were all removed.
-    pub delivered_secrets: Option<DeliveredSecrets>,
+    /// Every deployment carries the app's full set. A dispatch with no sealed
+    /// payload deploys an app that has no secrets, so its set is empty and the
+    /// secrets an earlier deployment delivered are withdrawn.
+    pub delivered_secrets: DeliveredSecrets,
     /// The app this instance's telemetry is attributed to. It rides the
     /// deployment because the instance cannot derive it and the control plane
     /// already knows it; a handle that exports metrics records it and stamps it
@@ -408,10 +409,7 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         &self,
         deployment: SpicepodDeployment<'_>,
     ) -> Result<serde_json::Value, CommandError> {
-        if deployment
-            .delivered_secrets
-            .is_some_and(|secrets| !secrets.is_empty())
-        {
+        if !deployment.delivered_secrets.is_empty() {
             // `Unsupported`, not `Failed`: this adapter will never be able to
             // apply secrets, so a retry cannot help and the control plane should
             // not schedule one.
@@ -760,7 +758,7 @@ mod tests {
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: "version: v2\nkind: Spicepod\nname: default-apply\n",
-                delivered_secrets: None,
+                delivered_secrets: crate::sealed_secrets::DeliveredSecrets::new(),
                 app_id: None,
             })
             .await
@@ -794,7 +792,7 @@ mod tests {
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: "version: v2\nkind: Spicepod\nname: refused\n",
-                delivered_secrets: Some(secrets),
+                delivered_secrets: secrets,
                 app_id: None,
             })
             .await
@@ -811,7 +809,10 @@ mod tests {
 
     #[test]
     fn noop_runtime_handle_advertises_nothing() {
-        assert!(advertised_capabilities(&NoopRuntimeHandle).is_empty());
+        assert_eq!(
+            advertised_capabilities(&NoopRuntimeHandle),
+            [] as [String; 0]
+        );
     }
 
     #[test]

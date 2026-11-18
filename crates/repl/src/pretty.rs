@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn test_format_batches_expanded_empty() {
         let formatted = format_batches_expanded(&[]).expect("formatting should succeed");
-        assert!(formatted.is_empty());
+        assert_eq!(formatted, "");
     }
 
     #[test]

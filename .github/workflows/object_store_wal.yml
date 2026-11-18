@@ -51,7 +51,7 @@ jobs:
       - name: Check the merge group for WAL changes
         id: changes
         if: github.event_name == 'merge_group'
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           filters: |
             code_changes:
@@ -165,10 +165,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
       # The dev runner image has no C toolchain, and rustc links through cc. The
       # Macs already have one.
-      - uses: ./.github/actions/setup-cc
+      - uses: $/.github/actions/setup-cc
         if: runner.os == 'Linux'
       # The dev runner image has python3 but no pip. The macOS runners carry
       # Homebrew interpreters, and installing one through setup-python needs sudo.
@@ -428,7 +428,7 @@ jobs:
       # history, dispatch this workflow on the branch.
       - name: Retain histories and backing stores
         if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wal-e2e-${{ matrix.os }}-${{ matrix.store }}
           path: wal-e2e-artifacts/

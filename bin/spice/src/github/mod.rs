@@ -18,6 +18,9 @@ limitations under the License.
 
 pub mod nightly;
 mod release;
+mod verify;
+
+use verify::{ALLOW_UNVERIFIED_ENV, SHA256SUMS};
 
 pub use release::{
     Arch, ReleaseAsset, RepoRelease, SystemType, download_release_asset,
@@ -38,6 +41,8 @@ const RUNTIME_REPO: &str = "spiceai";
 pub struct GitHubClient {
     client: Client,
     token: Option<String>,
+    /// Root of the REST API that the release URLs are built on.
+    api_base: String,
     pub owner: String,
     pub repo: String,
 }
@@ -72,9 +77,18 @@ impl GitHubClient {
         Self {
             client,
             token,
+            api_base: GITHUB_API_BASE.to_string(),
             owner: owner.to_string(),
             repo: repo.to_string(),
         }
+    }
+
+    /// The same client, building its release URLs on `api_base` instead of the public API.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_api_base(mut self, api_base: &str) -> Self {
+        self.api_base = api_base.to_string();
+        self
     }
 
     /// Whether requests carry a GitHub token.
@@ -254,8 +268,8 @@ impl GitHubClient {
     #[must_use]
     pub fn releases_url(&self) -> String {
         format!(
-            "{GITHUB_API_BASE}/repos/{}/{}/releases",
-            self.owner, self.repo
+            "{}/repos/{}/{}/releases",
+            self.api_base, self.owner, self.repo
         )
     }
 
@@ -263,6 +277,12 @@ impl GitHubClient {
     #[must_use]
     pub fn latest_release_url(&self) -> String {
         format!("{}/latest", self.releases_url())
+    }
+
+    /// Get the API URL of the release tagged `tag`.
+    #[must_use]
+    pub fn release_by_tag_url(&self, tag: &str) -> String {
+        format!("{}/tags/{}", self.releases_url(), urlencoding::encode(tag))
     }
 }
 
@@ -294,6 +314,34 @@ pub enum GitHubError {
     Io {
         message: String,
     },
+    /// The release's `SHA256SUMS` does not list the asset.
+    ChecksumNotListed {
+        asset: String,
+        tag: String,
+    },
+    /// The release lists `SHA256SUMS`, but it could not be downloaded.
+    ChecksumsUnavailable {
+        asset: String,
+        tag: String,
+        cause: String,
+    },
+    /// The release records no sha256 for the asset.
+    Unverifiable {
+        asset: String,
+        reason: String,
+    },
+    /// The download's sha256 is not the one the release records.
+    ChecksumMismatch {
+        asset: String,
+        expected: String,
+        actual: String,
+        source: String,
+    },
+    /// `gh attestation verify` rejected the download.
+    AttestationFailed {
+        asset: String,
+        log: String,
+    },
 }
 
 impl std::fmt::Display for GitHubError {
@@ -321,6 +369,31 @@ impl std::fmt::Display for GitHubError {
                 "Download of {name} did not complete: expected {expected} bytes but received {received}. Check the network connection and any proxy between this machine and GitHub, then run the command again."
             ),
             Self::Io { message } => write!(f, "IO error: {message}"),
+            Self::ChecksumNotListed { asset, tag } => write!(
+                f,
+                "Cannot verify {asset}: the {SHA256SUMS} of release {tag} does not list it, so it was not installed."
+            ),
+            Self::ChecksumsUnavailable { asset, tag, cause } => write!(
+                f,
+                "Cannot verify {asset}: release {tag} publishes {SHA256SUMS}, but downloading it failed ({cause}), so it was not installed. Run the command again later."
+            ),
+            Self::Unverifiable { asset, reason } => write!(
+                f,
+                "Cannot verify {asset}: {reason}, so it was not installed. To install it without verification, set {ALLOW_UNVERIFIED_ENV}=1 and run the command again."
+            ),
+            Self::ChecksumMismatch {
+                asset,
+                expected,
+                actual,
+                source,
+            } => write!(
+                f,
+                "Checksum mismatch for {asset}: expected sha256 {expected} ({source}), downloaded {actual}. The download is corrupt or was altered, so it was not installed."
+            ),
+            Self::AttestationFailed { asset, log } => write!(
+                f,
+                "The build attestation of {asset} did not verify, so it was not installed: {log}"
+            ),
         }
     }
 }

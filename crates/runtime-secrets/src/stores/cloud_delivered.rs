@@ -84,9 +84,7 @@ impl CloudDeliveredSecretStore {
         Self::default()
     }
 
-    /// Replace the delivered set. Called on every deployment that carries
-    /// secrets, including one that carries none — an app whose secrets were all
-    /// removed must stop resolving them.
+    /// Replace the delivered set. A name not in `values` stops resolving.
     pub fn replace(&self, values: BTreeMap<String, Zeroizing<Vec<u8>>>) {
         *self.values.write() = Arc::new(values);
     }
@@ -286,7 +284,7 @@ mod tests {
         store.replace(values(&[("dropped", b"1"), ("kept", b"2")]));
 
         let update = store.install_new(&values(&[("kept", b"2")]));
-        assert!(update.installed.is_empty());
+        assert_eq!(update.installed, [] as [String; 0]);
         assert_eq!(update.pending, vec!["dropped"]);
         assert_eq!(store.names(), vec!["dropped", "kept"]);
     }
@@ -353,6 +351,6 @@ mod tests {
     fn starts_empty() {
         let store = CloudDeliveredSecretStore::new();
         assert!(store.is_empty());
-        assert!(store.names().is_empty());
+        assert_eq!(store.names(), [] as [String; 0]);
     }
 }

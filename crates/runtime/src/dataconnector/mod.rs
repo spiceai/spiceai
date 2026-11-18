@@ -514,6 +514,7 @@ mod tests {
             Arc::clone(&inner),
             Arc::new(RwLock::new(std::collections::HashMap::new())),
             Arc::new(RwLock::new(Secrets::default())),
+            crate::status::RuntimeStatus::new(),
         );
         assert!(
             embedding.supports_durable_write_back_delivery(),

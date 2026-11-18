@@ -74,6 +74,7 @@ limitations under the License.
 pub(crate) mod append_commit;
 pub(crate) mod append_stage;
 pub(crate) mod clustering;
+mod cold_file_stats;
 pub(crate) mod cold_partition;
 pub(crate) mod cold_pk_prune;
 pub(crate) mod column_stats;

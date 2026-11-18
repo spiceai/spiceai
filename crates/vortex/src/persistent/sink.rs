@@ -3441,7 +3441,7 @@ mod tests {
 
         // The run is consumed: finishing again emits nothing.
         sorter.finish()?;
-        assert!(drain(&mut sorter)?.is_empty());
+        assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         Ok(())
     }
 
@@ -3454,7 +3454,7 @@ mod tests {
         let mut sorter = run_sorter(u64::try_from(budget)?, &pool);
 
         sorter.push(one_col_batch(&schema, (100..200).rev().collect()))?;
-        assert!(drain(&mut sorter)?.is_empty());
+        assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         sorter.push(one_col_batch(&schema, (0..100).rev().collect()))?;
         let out = drain(&mut sorter)?;
         assert_eq!(
@@ -3478,7 +3478,7 @@ mod tests {
         let keys: Vec<i64> = (0..total).map(|i| (i * 7919) % total).collect();
         for chunk in keys.chunks(keys.len().div_ceil(64)) {
             sorter.push(one_col_batch(&schema, chunk.to_vec()))?;
-            assert!(drain(&mut sorter)?.is_empty());
+            assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         }
         sorter.finish()?;
         let out = drain(&mut sorter)?;
@@ -3509,7 +3509,7 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(one_batch * 3 / 2));
         let mut sorter = run_sorter(u64::MAX, &pool);
         sorter.push(first)?;
-        assert!(drain(&mut sorter)?.is_empty());
+        assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         sorter.push(second)?;
         let out = drain(&mut sorter)?;
         assert_eq!(
@@ -3528,7 +3528,7 @@ mod tests {
             vec![Some(6), Some(4), Some(5)]
         );
         sorter.finish()?;
-        assert!(drain(&mut sorter)?.is_empty());
+        assert_eq!(drain(&mut sorter)?, [] as [RecordBatch; 0]);
         Ok(())
     }
 

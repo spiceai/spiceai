@@ -703,13 +703,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let reader = ServiceLogReader::new(dir.path());
         let (lines, cursor) = reader.read_history(100).expect("read history");
-        assert!(lines.is_empty());
+        assert_eq!(lines, [] as [String; 0]);
         assert_eq!(cursor, FollowCursor::pending());
 
         // An existing but empty live file is the same answer.
         let _log = RotatingLog::open(dir.path()).expect("open the log");
         let (lines, _) = reader.read_history(100).expect("read history");
-        assert!(lines.is_empty());
+        assert_eq!(lines, [] as [String; 0]);
     }
 
     #[cfg(unix)]
