@@ -54,8 +54,12 @@ pub mod wire;
 // crate boundary, which the in-crate definition never had to allow.
 #[snafu(visibility(pub))]
 pub enum Error {
+    /// The provider's error can quote the request URL, built from the model's `endpoint`,
+    /// so URL credentials are removed from it: the message is logged and reported by
+    /// `/v1/models`.
     #[snafu(display(
-        "Failed to check the status of the model. An error occurred: {source} Verify the model configuration."
+        "Failed to check the status of the model. An error occurred: {} Verify the model configuration.",
+        redact::redact_message_credentials(&source.to_string())
     ))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -655,6 +659,19 @@ mod tests {
 
     use super::{ApiErrorKind, Chat, Error, Result, SqlGeneration, message_to_content};
     use async_openai::error::ApiError;
+
+    /// A provider error quoting the request URL keeps the URL, without its credentials, and
+    /// the `)` that closes it.
+    #[test]
+    fn health_check_message_leaves_out_url_credentials() {
+        let error = Error::HealthCheckError {
+            source: "http error: error sending request for url (http://127.0.0.1:1/v1?api_key=abc123/chat/completions)".into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Failed to check the status of the model. An error occurred: http error: error sending request for url (http://127.0.0.1:1/v1?api_key=***) Verify the model configuration."
+        );
+    }
 
     /// The message is logged and reported by `/v1/models`, so a credential in the URL a
     /// model's `from` names stays out of it, and the rest of the source stays in.

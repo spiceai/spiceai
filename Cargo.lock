@@ -11890,6 +11890,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "rand 0.10.1",
+ "redact",
  "regex",
  "reqwest 0.13.4",
  "reqwest-eventsource",
