@@ -1351,17 +1351,27 @@ mod tests {
         }
     }
 
+    /// The allowed fragment keys pass validation: the URL gets as far as choosing its store,
+    /// which a factory with no object-store registry cannot do.
     #[tokio::test]
     async fn object_store_url_tables_accept_the_allowed_fragment_keys() {
-        for url in [
-            "s3://bucket/data.parquet",
-            "s3://bucket/data/#region=us-east-1&auth=public&url_style=path&client_timeout=30s",
-            "abfss://container/data/#account=myaccount",
-            "gs://bucket/data/#client_timeout=10s",
+        for (url, shown) in [
+            ("s3://bucket/data.parquet", "s3://bucket/data.parquet"),
+            (
+                "s3://bucket/data/#region=us-east-1&auth=public&url_style=path&client_timeout=30s",
+                "s3://bucket/data/",
+            ),
+            (
+                "abfss://container/data/#account=myaccount",
+                "abfss://container/data/",
+            ),
+            ("gs://bucket/data/#client_timeout=10s", "gs://bucket/data/"),
         ] {
             assert_eq!(
                 try_new_without_state(url).await,
-                "Invalid or Unsupported Configuration: Session state not available for URL table creation",
+                format!(
+                    "Invalid or Unsupported Configuration: Failed to read URL table '{shown}': object stores are not set up for this runtime"
+                ),
                 "{url}"
             );
         }
@@ -1415,19 +1425,52 @@ mod tests {
             .sum()
     }
 
+    /// With the allowed fragment keys and `auth=public`, an S3 URL table reads through a store
+    /// of its own, built without credentials, and never through the session's store for the
+    /// same bucket, which a dataset may have registered with its credentials.
     #[tokio::test]
-    async fn s3_url_table_with_allowed_fragment_builds() {
-        let (ctx, _) = session_with_csv("s3://bucket", "data/items.csv").await;
+    async fn s3_url_table_with_allowed_fragment_reads_through_an_unsigned_store_of_its_own() {
+        let (ctx, registry) = session_with_csv("s3://bucket", "data/items.csv").await;
         let factory = SpiceUrlTableFactory::new();
+        factory.with_registry(registry);
         factory.with_state(ctx.state_weak_ref());
 
-        let table = factory
-            .try_new("s3://bucket/data/items.csv#region=us-east-1&auth=public")
+        let parsed = Url::parse("s3://bucket/data/items.csv#region=us-east-1&auth=public")
+            .expect("valid URL");
+        let (table_url, read) = factory
+            .object_store_table_url(&parsed)
             .await
-            .expect("the table builds")
-            .expect("the URL is a URL table");
+            .expect("the URL table's store is set up");
 
-        assert_eq!(row_count(&ctx, table).await, 2);
+        assert!(
+            matches!(
+                read,
+                ObjectStoreRead::Unsigned {
+                    forced: true,
+                    nearest: None
+                }
+            ),
+            "`auth=public` reads without credentials"
+        );
+        let store_url = table_url.object_store();
+        assert!(
+            store_url
+                .as_str()
+                .starts_with("spice-url-table-dataset+s3://u"),
+            "{store_url}"
+        );
+        assert_eq!(table_url.prefix().as_ref(), "data/items.csv");
+        let runtime_env = ctx.runtime_env();
+        let table_store = runtime_env
+            .object_store(&store_url)
+            .expect("the URL table's store is registered");
+        let session_store = runtime_env
+            .object_store(
+                datafusion::execution::object_store::ObjectStoreUrl::parse("s3://bucket")
+                    .expect("valid store URL"),
+            )
+            .expect("the session's store is registered");
+        assert!(!Arc::ptr_eq(&table_store, &session_store));
     }
 
     /// An `http` URL table reads through the store registered under the URL table scheme, not
