@@ -437,7 +437,7 @@ mod tests {
         )));
     }
 
-    /// The enforcement point: whatever path DataFusion lists or reads, the store answers only
+    /// The enforcement point: whatever path `DataFusion` lists or reads, the store answers only
     /// with the objects the dataset reads, and writes nothing.
     #[tokio::test]
     async fn a_scoped_store_serves_only_the_datasets_objects() {
