@@ -49,6 +49,13 @@ pub struct ReadyQuery {
     #[serde(default)]
     pub min_ready_executors_percent: Option<u8>,
 
+    /// When `true`, a component that failed to load (status `Error`) does not hold readiness back:
+    /// the runtime reports ready once every other component has loaded, so the healthy datasets
+    /// can be served while the failed one reports its error. A component still on its first load
+    /// still blocks. Defaults to `false`, where every component must have loaded.
+    #[serde(default)]
+    pub allow_unhealthy: bool,
+
     /// When `true`, the response body becomes a multi-line diagnostic listing the result of each
     /// gate. The HTTP status code is unchanged. Useful for `kubectl describe` / curl debugging.
     #[serde(default)]
@@ -88,6 +95,15 @@ impl ReadyQuery {
 /// readinessProbe:
 ///  httpGet:
 ///    path: /v1/ready
+///    port: 8090
+/// ```
+///
+/// To route traffic to the healthy datasets of a runtime where one dataset failed to load, while
+/// still waiting for every dataset to finish its first load:
+/// ```yaml
+/// readinessProbe:
+///  httpGet:
+///    path: /v1/ready?allow_unhealthy=true
 ///    port: 8090
 /// ```
 ///
@@ -135,7 +151,11 @@ pub(crate) async fn get(
             .into_response();
     }
 
-    let components_ok = status.is_ready();
+    let components_ok = if query.allow_unhealthy {
+        status.is_ready_allowing_unhealthy()
+    } else {
+        status.is_ready()
+    };
 
     // We may not need executor counts; only fetch them when a gate is active. The 400 above
     // ensures we only reach this branch with a registry in hand when a gate is active.
@@ -382,6 +402,7 @@ mod tests {
                 min_ready_executors: Some(1),
                 min_ready_executors_percent: None,
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -400,6 +421,7 @@ mod tests {
                 min_ready_executors: Some(3),
                 min_ready_executors_percent: None,
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -419,6 +441,7 @@ mod tests {
                 min_ready_executors: Some(3),
                 min_ready_executors_percent: None,
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -436,6 +459,7 @@ mod tests {
                 min_ready_executors: Some(0),
                 min_ready_executors_percent: None,
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -452,6 +476,7 @@ mod tests {
                 min_ready_executors: None,
                 min_ready_executors_percent: Some(20),
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -470,6 +495,7 @@ mod tests {
                 min_ready_executors: None,
                 min_ready_executors_percent: Some(20),
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -485,6 +511,7 @@ mod tests {
                 min_ready_executors: None,
                 min_ready_executors_percent: Some(20),
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -503,6 +530,7 @@ mod tests {
                 min_ready_executors: Some(3),
                 min_ready_executors_percent: Some(20),
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -518,6 +546,7 @@ mod tests {
                 min_ready_executors: None,
                 min_ready_executors_percent: Some(150),
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -533,6 +562,7 @@ mod tests {
                 min_ready_executors: Some(1),
                 min_ready_executors_percent: None,
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -550,6 +580,7 @@ mod tests {
                 min_ready_executors: Some(0),
                 min_ready_executors_percent: Some(0),
                 verbose: false,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -568,6 +599,7 @@ mod tests {
                 min_ready_executors: Some(3),
                 min_ready_executors_percent: Some(80),
                 verbose: true,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -593,6 +625,7 @@ mod tests {
                 min_ready_executors: Some(3),
                 min_ready_executors_percent: None,
                 verbose: true,
+                allow_unhealthy: false,
             }),
         )
         .await;
@@ -602,5 +635,41 @@ mod tests {
         assert!(body.contains("[+]"), "body: {body}");
         assert!(body.trim_end().ends_with("ready"), "body: {body}");
         assert!(!body.trim_end().ends_with("not ready"), "body: {body}");
+    }
+
+    fn status_settled_with_one_failed_dataset() -> Arc<RuntimeStatus> {
+        use datafusion::sql::TableReference;
+        use runtime_status::{ComponentStatus, RuntimeReadyState};
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        status.update_dataset(&TableReference::bare("nation"), ComponentStatus::Ready);
+        status.update_dataset(
+            &TableReference::bare("region_missing"),
+            ComponentStatus::error_with_message("secret not found"),
+        );
+        status
+    }
+
+    #[tokio::test]
+    async fn allow_unhealthy_reports_ready_when_only_failed_datasets_remain() {
+        let response = get(
+            Extension(status_settled_with_one_failed_dataset()),
+            Extension(None),
+            Query(ReadyQuery::default()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = get(
+            Extension(status_settled_with_one_failed_dataset()),
+            Extension(None),
+            Query(ReadyQuery {
+                allow_unhealthy: true,
+                ..ReadyQuery::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, "ready");
     }
 }

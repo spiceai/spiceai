@@ -48,6 +48,13 @@ pub enum RuntimeReadyState {
     OnRegistration,
 }
 
+/// Whether a component in `Error` holds back [`RuntimeStatus`] readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnhealthyComponents {
+    Block,
+    Allow,
+}
+
 /// Why a readiness wait returned.
 ///
 /// Every `wait_for_*` helper races the awaited status against the runtime's
@@ -471,6 +478,27 @@ impl RuntimeStatus {
     /// - The runtime is in the process of shutting down.
     #[must_use]
     pub fn is_ready(&self) -> bool {
+        self.is_ready_with(UnhealthyComponents::Block)
+    }
+
+    /// Like [`Self::is_ready`], but a component currently in `Error` does not
+    /// hold readiness back under `OnLoad`: the runtime counts as ready once
+    /// every other component has been ready at least once, so a single failed
+    /// dataset no longer keeps the whole runtime out of service. A component
+    /// still on its first load (`Initializing`, or `Refreshing` before it was
+    /// ever ready) still blocks. Under `OnRegistration` this is the same as
+    /// [`Self::is_ready`], which already treats `Error` as ready-enough.
+    ///
+    /// Backs `GET /v1/ready?allow_unhealthy=true`, which an orchestrator can use
+    /// as its readiness probe to route traffic to the healthy components of a
+    /// runtime whose load has settled with some components failed, while
+    /// `GET /v1/ready` keeps reporting full readiness.
+    #[must_use]
+    pub fn is_ready_allowing_unhealthy(&self) -> bool {
+        self.is_ready_with(UnhealthyComponents::Allow)
+    }
+
+    fn is_ready_with(&self, unhealthy: UnhealthyComponents) -> bool {
         if self.is_shutdown() {
             return false;
         }
@@ -513,6 +541,10 @@ impl RuntimeStatus {
                 statuses
                     .iter()
                     .filter(|(_, state)| !matches!(state.status, ComponentStatus::Disabled))
+                    .filter(|(_, state)| {
+                        unhealthy == UnhealthyComponents::Block
+                            || !matches!(state.status, ComponentStatus::Error(_))
+                    })
                     .all(|(component, _)| ever_ready.contains(component))
             }
             // OnRegistration readiness: treat Error/Disabled/Initializing as ready-enough.
@@ -1118,6 +1150,60 @@ mod tests {
         // Removing `bad` from the Spicepod disables it.
         status.update_dataset(&bad, ComponentStatus::Disabled);
         assert!(status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_skips_a_failed_component_on_load() {
+        let status = RuntimeStatus::new();
+        let good = TableReference::bare("good");
+        let slow = TableReference::bare("slow");
+        let bad = TableReference::bare("bad");
+
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&good, ComponentStatus::Ready);
+        status.update_dataset(&slow, ComponentStatus::Initializing);
+        status.update_dataset(
+            &bad,
+            ComponentStatus::error_with_message("secret not found"),
+        );
+        // A dataset still on its first load blocks both checks.
+        assert!(!status.is_ready());
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        status.update_dataset(&slow, ComponentStatus::Ready);
+        // Settled with one failed dataset: full readiness stays false, the
+        // unhealthy-tolerant check passes.
+        assert!(!status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
+
+        // A retry that puts the failed dataset back on its first load blocks again.
+        status.update_dataset(&bad, ComponentStatus::Initializing);
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        // Recovery makes both checks pass.
+        status.update_dataset(&bad, ComponentStatus::Ready);
+        assert!(status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_requires_a_registered_component_and_respects_shutdown() {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        let bad = TableReference::bare("bad");
+        status.update_dataset(
+            &bad,
+            ComponentStatus::error_with_message("secret not found"),
+        );
+        // Every component failed: nothing is still loading, so the runtime is
+        // reachable and each dataset reports its own error.
+        assert!(status.is_ready_allowing_unhealthy());
+
+        status.mark_shutdown();
+        assert!(!status.is_ready_allowing_unhealthy());
     }
 
     #[tokio::test]
