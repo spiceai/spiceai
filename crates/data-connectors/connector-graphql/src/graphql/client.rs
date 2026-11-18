@@ -1319,13 +1319,10 @@ impl GraphQLClient {
                 .await
                 .map_err(|source| self.response_body_error(source))?;
         let http_elapsed = http_started.elapsed();
-        // The text is a second copy of the body, charged before it is made.
-        reservation
-            .try_grow(response_bytes.len())
-            .map_err(|source| {
-                self.response_body_error(http_body_limit::Error::MemoryLimit { source })
-            })?;
-        let response_text = String::from_utf8_lossy(&response_bytes).into_owned();
+        // The text is a second copy of the body, and longer than it where a byte is not
+        // valid UTF-8, so it is charged at its exact length before it is made.
+        let response_text = http_body_limit::utf8_lossy(&response_bytes, &reservation)
+            .map_err(|source| self.response_body_error(source))?;
 
         let header = |name: &str| response_headers.get(name).and_then(|v| v.to_str().ok());
         tracing::debug!(
@@ -2567,6 +2564,104 @@ mod tests {
             assert!(
                 err.to_string().contains("/data/healthCheckProbe"),
                 "the message names the path that did not resolve: {err}"
+            );
+        }
+    }
+
+    /// A byte that is not valid UTF-8 becomes U+FFFD, three bytes of text. The body and
+    /// its text are held together while the response is parsed, so a response needs
+    /// room in the query memory pool for both.
+    mod response_text_memory {
+        use std::sync::Arc;
+
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use url::Url;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::graphql::builder::GraphQLClientBuilder;
+        use crate::graphql::client::{GraphQLQuery, UnnestBehavior};
+
+        const INVALID: usize = 1024 * 1024;
+
+        async fn fetch(server: &MockServer, limit: usize) -> (Result<String, String>, usize) {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Depth(0),
+            )
+            .with_json_pointer(Some("/data/items"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .build(reqwest::Client::new(), Arc::clone(&pool))
+            .expect("client to build");
+            let query = GraphQLQuery::try_from(Arc::<str>::from("query { items { id } }"))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/items"));
+            let result = client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .map_err(|error| error.to_string())
+                .map(|result| {
+                    let batch = result.records.first().expect("one batch");
+                    batch
+                        .column_by_name("id")
+                        .expect("the id column")
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("a string column")
+                        .value(0)
+                        .to_string()
+                });
+            (result, pool.reserved())
+        }
+
+        #[tokio::test]
+        async fn a_body_whose_text_outgrows_it_is_held_to_the_pool() {
+            let mut body = br#"{"data":{"items":[{"id":""#.to_vec();
+            body.extend(std::iter::repeat_n(0xff_u8, INVALID));
+            body.extend_from_slice(br#""}]}}"#);
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_bytes(body.clone()),
+                )
+                .mount(&server)
+                .await;
+            // The text is the body with each invalid byte three bytes long.
+            let text = body.len() + 2 * INVALID;
+
+            for limit in [3 * INVALID, body.len() + text - 1] {
+                match fetch(&server, limit).await {
+                    (Ok(id), _) => panic!(
+                        "a {}-byte body whose text is {text} bytes was parsed under a \
+                         {limit}-byte limit (its id alone is {} bytes)",
+                        body.len(),
+                        id.len()
+                    ),
+                    (Err(message), reserved) => {
+                        assert!(
+                            message.contains(
+                                "holding the decoded data would pass the query memory limit"
+                            ),
+                            "{message}"
+                        );
+                        assert_eq!(reserved, 0, "a refused response holds nothing");
+                    }
+                }
+            }
+
+            let (id, _) = fetch(&server, body.len() + text).await;
+            assert_eq!(
+                id.expect("a pool with room for the body and its text parses it"),
+                "\u{FFFD}".repeat(INVALID)
             );
         }
     }

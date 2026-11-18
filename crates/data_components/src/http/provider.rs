@@ -2223,18 +2223,31 @@ impl HttpTableProvider {
                         })
                     }
                 })?;
-        // `text()` copies the body into a `String` while the body is still held, so the
-        // copy is charged before it is made; once the body is released, the charge is
-        // what the text holds.
-        reservation.try_grow(reservation.size()).map_err(|source| {
-            RetryError::Permanent(memory_error(http_body_limit::Error::MemoryLimit { source }))
-        })?;
-        let content = response
-            .text()
+        // The text is decoded while the body is still held, and in a legacy charset or
+        // with invalid UTF-8 it is longer than the body, so it is charged at its exact
+        // length before it is made; once the body is released, the charge is what the
+        // text holds.
+        let content = http_body_limit::text(response, &reservation)
             .io_wait()
             .await
-            .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
-        reservation.resize(content.capacity());
+            .map_err(|e| match e {
+                http_body_limit::Error::Read { source } => {
+                    RetryError::transient(Error::http_request(endpoint, source))
+                }
+                source @ http_body_limit::Error::MemoryLimit { .. } => {
+                    RetryError::Permanent(memory_error(source))
+                }
+                source => RetryError::Permanent(Error::ResponseDecode {
+                    endpoint: endpoint_label(endpoint),
+                    dataset: dataset_subject(dataset_name),
+                    source,
+                }),
+            })?;
+        reservation
+            .try_resize(content.capacity())
+            .map_err(|source| {
+                RetryError::Permanent(memory_error(http_body_limit::Error::MemoryLimit { source }))
+            })?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -4852,6 +4865,62 @@ mod response_cache_tests {
             "x".repeat(1024),
             "each key serves its own entry"
         );
+    }
+
+    /// Text can need more room than the body it is decoded from: windows-1252 0x80 is
+    /// U+20AC, three bytes of UTF-8 for each byte received. The body and its text are
+    /// held together while it is decoded, so a response needs room for both, and the
+    /// pool is never held past its limit.
+    #[tokio::test]
+    async fn a_response_whose_text_outgrows_its_body_is_held_to_the_pool() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+        const BODY: usize = 1024 * 1024;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/legacy"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json; charset=windows-1252")
+                    .insert_header("cache-control", "no-store")
+                    .set_body_bytes(vec![0x80_u8; BODY]),
+            )
+            .mount(&origin)
+            .await;
+        let provider = provider_for(&origin);
+
+        for limit in [3 * BODY - 1, 4 * BODY - 1] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            match provider
+                .get_response("/legacy", None, None, None, None, &pool)
+                .await
+            {
+                Ok(served) => panic!(
+                    "a {BODY}-byte body decoding to {} bytes of text was held under a \
+                     {limit}-byte limit; the pool holds {} bytes",
+                    served.content.len(),
+                    pool.reserved()
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message
+                            .contains("holding the decoded data would pass the query memory limit"),
+                        "{message}"
+                    );
+                }
+            }
+            assert_eq!(pool.reserved(), 0, "a refused response holds nothing");
+        }
+
+        let limit = 4 * BODY;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let served = provider
+            .get_response("/legacy", None, None, None, None, &pool)
+            .await
+            .expect("a pool with room for the body and its text holds the response");
+        assert_eq!(served.content, "\u{20AC}".repeat(BODY));
+        assert_eq!(pool.reserved(), served.content.len());
     }
 
     /// The invariant the admission path exists to hold: a response the origin

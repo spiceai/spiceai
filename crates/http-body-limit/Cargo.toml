@@ -16,8 +16,11 @@ bytes.workspace = true
 # `MemoryReservation`, so a body that carries data is charged to the query memory pool.
 datafusion-common.workspace = true
 datafusion-execution.workspace = true
+# The charset decoding `reqwest`'s `Response::text` does, so `text` decodes exactly as it.
+encoding_rs.workspace = true
 futures.workspace = true
 http.workspace = true
+mime = "0.3.17"
 reqwest.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["io-util"] }

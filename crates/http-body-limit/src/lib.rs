@@ -44,8 +44,10 @@ limitations under the License.
 //! as an uncompressed one: still held to its [`Limit`], but without the ratio check.
 
 mod expansion;
+mod text;
 
 pub use expansion::{Limit, read_to_end};
+pub use text::{text, utf8_lossy};
 
 use std::io;
 use std::pin::Pin;
