@@ -64,25 +64,27 @@ pub enum Error {
 
 /// The message for a model or embedding model named `name` that failed to load because its
 /// endpoint redirected where a model's client does not go: to another origin, or from HTTPS to
-/// HTTP. `param` is the parameter that sets the endpoint.
+/// HTTP. `setting` names what sets the endpoint, such as `` `endpoint` ``.
 pub(crate) fn endpoint_redirect_message(
     kind: &str,
     name: &str,
-    param: &str,
+    setting: &str,
     refused: &http_egress::RedirectRefused,
 ) -> String {
     format!(
-        "Failed to load {kind} '{name}': {refused}. Set `{param}` to the URL the endpoint redirects to. See: https://spiceai.org/docs/components/models"
+        "Failed to load {kind} '{name}': {refused}. Set {setting} to the URL the endpoint redirects to. See: https://spiceai.org/docs/components/models"
     )
 }
 
-/// The parameter that sets the endpoint of a model served from `source`.
+/// What sets the endpoint of a model served from `source`: the parameter, or for a Google
+/// model, whose own endpoint is fixed, the token endpoint its service account key names.
 pub(crate) fn endpoint_param(source: Option<&ModelSource>) -> &'static str {
     match source {
-        Some(ModelSource::SpiceAI) => "spiceai_endpoint",
-        Some(ModelSource::Databricks) => "databricks_endpoint",
-        Some(ModelSource::TypeSafe) => "typesafe_endpoint",
-        _ => "endpoint",
+        Some(ModelSource::SpiceAI) => "`spiceai_endpoint`",
+        Some(ModelSource::Databricks) => "`databricks_endpoint`",
+        Some(ModelSource::TypeSafe) => "`typesafe_endpoint`",
+        Some(ModelSource::Google) => "the service account key's `token_uri`",
+        _ => "`endpoint`",
     }
 }
 
@@ -92,7 +94,7 @@ fn with_redirect_cause(name: &str, source: Option<&ModelSource>, err: Error) -> 
     let Error::FailedToLoadLLM { source: cause, .. } = &err else {
         return err;
     };
-    match llms::provider::refused_redirect(cause.as_ref()) {
+    match http_egress::refused_redirect(cause.as_ref()) {
         Some(refused) => Error::EndpointRedirectRefused {
             name: name.to_string(),
             param: endpoint_param(source),
@@ -688,13 +690,17 @@ mod redirect_message_tests {
         );
         assert_eq!(
             endpoint_param(Some(&ModelSource::SpiceAI)),
-            "spiceai_endpoint"
+            "`spiceai_endpoint`"
         );
         assert_eq!(
             endpoint_param(Some(&ModelSource::Databricks)),
-            "databricks_endpoint"
+            "`databricks_endpoint`"
         );
-        assert_eq!(endpoint_param(Some(&ModelSource::OpenAi)), "endpoint");
+        assert_eq!(
+            endpoint_param(Some(&ModelSource::Google)),
+            "the service account key's `token_uri`"
+        );
+        assert_eq!(endpoint_param(Some(&ModelSource::OpenAi)), "`endpoint`");
     }
 }
 

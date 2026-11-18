@@ -105,6 +105,31 @@ pub fn redirect_policy(egress: Egress, on_origin_change: OnOriginChange) -> Poli
     })
 }
 
+/// Configures `builder` for a client whose requests carry credentials or a body that belong
+/// to the origin each request is sent to, such as a token request or a model request: under
+/// [`Egress::for_configured_endpoint`], `reqwest` follows a redirect only within that origin,
+/// refuses one that changes the scheme, host or port or downgrades HTTPS to HTTP, and
+/// resolves every host through the egress, so the configured endpoint's host is pinned to the
+/// class of its first DNS answer.
+///
+/// A refused redirect fails the request with a [`RedirectRefused`] that
+/// [`refused_redirect`] finds in the error's source chain.
+pub fn origin_bound(builder: ClientBuilder, reason: &str) -> ClientBuilder {
+    let egress = Egress::for_configured_endpoint(reason);
+    builder
+        .redirect(redirect_policy(egress.clone(), OnOriginChange::Refuse))
+        .dns_resolver(Arc::new(Resolver::new(egress)))
+}
+
+/// The redirect an egress policy refused, when that is why `error` happened.
+#[must_use]
+pub fn refused_redirect<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a RedirectRefused> {
+    std::iter::successors(Some(error), |e| e.source())
+        .find_map(|e| e.downcast_ref::<RedirectRefused>())
+}
+
 /// Why [`send`] did not return a response.
 #[derive(Debug, Snafu)]
 pub enum SendError {
