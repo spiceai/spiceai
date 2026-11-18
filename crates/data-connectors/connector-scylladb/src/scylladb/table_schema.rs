@@ -363,6 +363,6 @@ mod tests {
         );
 
         assert_eq!(schema.clustering_key(), None);
-        assert!(schema.clustering_keys().is_empty());
+        assert_eq!(schema.clustering_keys(), [] as [String; 0]);
     }
 }

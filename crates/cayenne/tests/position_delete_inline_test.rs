@@ -246,7 +246,7 @@ async fn no_pk_delete_removes_inline_rows_without_writing_a_file(
         3,
         "the rows start in the inline memtable"
     );
-    assert!(files_on_disk(&fixture.data_path).0.is_empty());
+    assert_eq!(files_on_disk(&fixture.data_path).0, [] as [PathBuf; 0]);
 
     assert_eq!(
         delete(&ctx, "DELETE FROM inline_delete WHERE id = 2").await?,

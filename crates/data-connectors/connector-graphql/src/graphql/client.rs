@@ -3197,7 +3197,7 @@ mod tests {
                 &json!({"data": {"view": {"nodes": null}}}),
             );
 
-            assert!(result.records.is_empty());
+            assert_eq!(result.records, [] as [RecordBatch; 0]);
             assert_eq!(result.schema, schema);
         }
 
@@ -4924,7 +4924,7 @@ mod tests {
             fn respond(&self, _request: &Request) -> ResponseTemplate {
                 if self
                     .remaining_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                         left.checked_sub(1)
                     })
                     .is_ok()

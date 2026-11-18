@@ -72,7 +72,7 @@ jobs:
       # so without this step the job would go red — the right direction, but not
       # a useful signal.
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Run tests
         # Invoked through 'bash' rather than as a path so the job does not depend

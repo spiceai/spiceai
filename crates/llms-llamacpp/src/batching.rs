@@ -61,8 +61,9 @@ use llama_cpp::{Batch, Context, DraftKind, DraftRequest, Model, Mtp, Token};
 use tokio::sync::mpsc;
 
 use super::{
-    CachedPrompt, DECODE_STOPPED, Decoder, Event, HOST_CACHE_BYTES, Job, Output, PROMPT_BATCH,
-    Picker, PromptCache, Target, read_prompt, read_tokens, send_unless_stopping, shared_prefix,
+    CHECKPOINT_BEFORE_END, CachedPrompt, DECODE_STOPPED, Decoder, Event, HOST_CACHE_BYTES, Job,
+    Output, PROMPT_BATCH, Picker, PromptCache, Target, read_prompt, read_tokens,
+    send_unless_stopping, shared_prefix,
 };
 
 /// How long the decode thread waits when every running request waits on its client.
@@ -336,7 +337,12 @@ struct Running<'v> {
     /// Every token the sequence holds: the prompt, then the reply's.
     history: Vec<Token>,
     prompt_tokens: usize,
-    /// The token sampled last and already sent, which the next step decodes at `history.len()`.
+    /// How many of `history`'s last tokens, all the prompt's, the next step reads before the
+    /// reply begins (see [`start`]). Until it has, no token is sampled, and the sequence holds the
+    /// tokens before them only.
+    unread: usize,
+    /// The token sampled last and already sent, which the next step decodes at `history.len()`;
+    /// while `unread` is not zero, the prompt's last token, which nothing decodes as `id`.
     id: Token,
     /// The caller's cache namespace, which the tokens of a preempted request are saved under.
     namespace: runtime_request_context::CacheNamespace,
@@ -365,6 +371,9 @@ struct Row {
     real: usize,
     /// Whether the head drafted anything, which owes an accept.
     drafted: bool,
+    /// How many of the request's unread prompt tokens the row reads in place of a draft; zero for
+    /// a row that verifies one.
+    reads: usize,
 }
 
 /// The room a request's client buffer needs before a step decodes for it: each token a step can
@@ -544,7 +553,30 @@ fn admit<'m, S: Shared<'m>>(
             *tick,
         );
         let argmax = split && greedy_alone(slots);
-        start(model, shared, argmax, &mut slots[free], job, eog, tick);
+        // Beside requests that step next, the read's end joins their step: a prompt the cache
+        // holds but for its last few tokens, as a conversation's next turn mostly is, then costs
+        // a few more tokens in a pass the model makes anyway, not a pass of its own.
+        let steps_beside = slots.iter().enumerate().any(|(index, slot)| {
+            index != free
+                && slot
+                    .running
+                    .as_ref()
+                    .is_some_and(|running| running.events.capacity() >= headroom)
+        });
+        let defer = if steps_beside {
+            (shared.n_draft() + 1).max(CHECKPOINT_BEFORE_END)
+        } else {
+            0
+        };
+        start(
+            model,
+            shared,
+            (argmax, defer),
+            &mut slots[free],
+            job,
+            eog,
+            tick,
+        );
     }
 }
 
@@ -582,7 +614,8 @@ fn displace_stalled<'m, S: Shared<'m>>(
         .enumerate()
         .filter_map(|(index, slot)| {
             let running = slot.running.as_ref()?;
-            (running.events.capacity() < headroom).then_some((
+            // one reading its prompt's end has no token sampled to resume from (see [`victim`])
+            (running.events.capacity() < headroom && running.unread == 0).then_some((
                 index,
                 running.admitted,
                 running.history.len(),
@@ -1048,11 +1081,13 @@ fn greedy_alone(slots: &[Slot<'_>]) -> bool {
 /// Reads `job`'s prompt into `slot`'s sequence and samples its first token, which it sends;
 /// the request then decodes with the others from the next step, unless that token ended it.
 /// With `argmax`, every running request picks greedily alone on a split model, and the prompt
-/// is read with the argmax output on when this request does too.
+/// is read with the argmax output on when this request does too. A read whose end is at most
+/// `defer` tokens leaves them to the next step, which reads them beside the running requests'
+/// drafts and samples the first token then (see [`read_tokens`]).
 fn start<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
-    argmax: bool,
+    (argmax, defer): (bool, usize),
     slot: &mut Slot<'m>,
     job: Job,
     eog: &[Token],
@@ -1091,12 +1126,10 @@ fn start<'m, S: Shared<'m>>(
         &mut slot.cache,
         (&prompt, &namespace),
         &out.stopping,
+        defer,
     );
-    let (history, batch) = match read {
-        Ok((history, batch, cached)) => {
-            out.cached = cached;
-            (history, batch)
-        }
+    let read = match read {
+        Ok(read) => read,
         Err(message) => {
             target.clear();
             slot.cache.forget();
@@ -1104,24 +1137,40 @@ fn start<'m, S: Shared<'m>>(
             return;
         }
     };
-    if let Err(message) = shared.begin(slot.seq, &history) {
-        fail(shared, slot, &events, &stopping, message);
-        return;
-    }
-    let id = picker.sample(shared.context(), batch.n_tokens() - 1, out.in_content());
+    out.cached = read.cached;
+    let unread = read.tokens.len() - read.decoded;
+    let id = if unread > 0 {
+        // the next step reads the prompt's end, and samples the first token from it
+        read.tokens[read.tokens.len() - 1]
+    } else {
+        if let Err(message) = shared.begin(slot.seq, &read.tokens) {
+            fail(shared, slot, &events, &stopping, message);
+            return;
+        }
+        picker.sample(
+            shared.context(),
+            read.batch.n_tokens() - 1,
+            out.in_content(),
+        )
+    };
     *tick += 1;
     let running = Running {
         out,
         picker,
-        prompt_tokens: history.len(),
-        history,
+        prompt_tokens: read.tokens.len(),
+        history: read.tokens,
+        unread,
         id,
         namespace,
         admitted: *tick,
         events,
         stopping,
     };
-    sent(model, shared, slot, running, tick);
+    if unread > 0 {
+        slot.running = Some(running);
+    } else {
+        sent(model, shared, slot, running, tick);
+    }
 }
 
 /// Sends a running request's sampled token, then keeps it running, or finishes it when the
@@ -1195,8 +1244,10 @@ fn fail<'m, S: Shared<'m>>(
 }
 
 /// One step: drafts for every running request whose client has room, verifies all their
-/// drafts in one batch, and sends what each accepted. A request preempted for the step's room
-/// joins `preempted`. Returns false when no request could step.
+/// drafts in one batch, and sends what each accepted. A request admitted since the last step
+/// with its prompt's end unread reads it in the same batch, and sends its first token. A
+/// request preempted for the step's room joins `preempted`. Returns false when no request could
+/// step.
 fn step<'m, S: Shared<'m>>(
     model: &'m Model,
     shared: &mut S,
@@ -1252,6 +1303,11 @@ fn step<'m, S: Shared<'m>>(
                 .iter()
                 .filter_map(|&index| slots[index].running.as_ref())
                 .map(|running| {
+                    // the unread end of a prompt is in its history, which the running cells
+                    // count already
+                    if running.unread > 0 {
+                        return 0;
+                    }
                     let past = running.history.len();
                     1 + shared.n_draft().min(n_ctx.saturating_sub(past + 1))
                 })
@@ -1275,9 +1331,17 @@ fn step<'m, S: Shared<'m>>(
     if stepping.is_empty() {
         return false;
     }
+    // A request reading its prompt's end has no token to draft after yet.
+    let reading = |index: usize| {
+        slots[index]
+            .running
+            .as_ref()
+            .is_some_and(|running| running.unread > 0)
+    };
     let drafts = {
         let requests: Vec<DraftRequest<'_>> = stepping
             .iter()
+            .filter(|&&index| !reading(index))
             .filter_map(|&index| {
                 let slot = &slots[index];
                 let running = slot.running.as_ref()?;
@@ -1292,19 +1356,57 @@ fn step<'m, S: Shared<'m>>(
         shared.draft(&requests)
     };
     let drafts = match drafts {
-        Ok(drafts) => drafts,
+        Ok(drafts) => {
+            let mut drafts = drafts.into_iter();
+            stepping
+                .iter()
+                .map(|&index| {
+                    if reading(index) {
+                        Vec::new()
+                    } else {
+                        drafts.next().unwrap_or_default()
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
         Err(message) => {
             fail_all(shared, slots, &stepping, &message);
             return true;
         }
     };
-    let mut batch = Batch::new(PROMPT_BATCH.max(stepping.len() * (shared.n_draft() + 1)));
+    let row_tokens = (shared.n_draft() + 1).max(CHECKPOINT_BEFORE_END);
+    let mut batch = Batch::new(PROMPT_BATCH.max(stepping.len() * row_tokens));
     let mut rows = Vec::with_capacity(stepping.len());
     for (&index, mut draft) in stepping.iter().zip(drafts) {
         let slot = &slots[index];
         let Some(running) = &slot.running else {
             continue;
         };
+        if running.unread > 0 {
+            // A model split across nodes outputs every token of the row, as a verify row does,
+            // so a step reading a prompt's end beside one request's draft keeps the batch shape
+            // of two requests' drafts, and its graph.
+            let from = running.history.len() - running.unread;
+            let offset = batch.n_tokens();
+            let added = (from..running.history.len()).try_for_each(|pos| {
+                let last = pos + 1 == running.history.len();
+                let at = i32::try_from(pos).unwrap_or(i32::MAX);
+                batch.add_seq(running.history[pos], at, slot.seq, split || last)
+            });
+            if let Err(e) = added {
+                fail_all(shared, slots, &stepping, &e.to_string());
+                return true;
+            }
+            rows.push(Row {
+                slot: index,
+                offset,
+                draft,
+                real: 0,
+                drafted: false,
+                reads: running.unread,
+            });
+            continue;
+        }
         let past = running.history.len();
         let n_past = i32::try_from(past).unwrap_or(i32::MAX);
         let drafted = !draft.is_empty();
@@ -1356,6 +1458,7 @@ fn step<'m, S: Shared<'m>>(
             draft,
             real,
             drafted,
+            reads: 0,
         });
     }
     // The decode outputs a row for every request in it, and the argmax output (which has no
@@ -1377,6 +1480,21 @@ fn step<'m, S: Shared<'m>>(
         let Some(mut running) = slot.running.take() else {
             continue;
         };
+        if row.reads > 0 {
+            // the row read the prompt's end, whose last logits predict the first token
+            if let Err(message) = shared.begin(slot.seq, &running.history) {
+                fail(shared, slot, &running.events, &running.stopping, message);
+                continue;
+            }
+            let index = row.offset + i32::try_from(row.reads - 1).unwrap_or(i32::MAX);
+            running.id = running
+                .picker
+                .sample(shared.context(), index, running.out.in_content());
+            running.unread = 0;
+            slot.cache.ends_in_steps.fetch_add(1, Ordering::Relaxed);
+            sent(model, shared, slot, running, tick);
+            continue;
+        }
         running.history.push(running.id);
         let mut accepted: usize = 0;
         let next = loop {
@@ -1447,7 +1565,7 @@ fn fail_all<'m, S: Shared<'m>>(
 /// client is not reading, which hold their cells without stepping, the one admitted last; else
 /// the one admitted last of all.
 fn victim(slots: &[Slot<'_>], headroom: usize) -> Option<usize> {
-    let running: Vec<(usize, bool, u64)> = slots
+    let running: Vec<(usize, bool, u64, bool)> = slots
         .iter()
         .enumerate()
         .filter_map(|(index, slot)| {
@@ -1456,16 +1574,20 @@ fn victim(slots: &[Slot<'_>], headroom: usize) -> Option<usize> {
                 index,
                 running.events.capacity() < headroom,
                 running.admitted,
+                running.unread > 0,
             ))
         })
         .collect();
     if running.len() < 2 {
         return None;
     }
+    // A request whose prompt's end is unread has no token sampled to resume from, and it holds
+    // no more cells than it was admitted with.
     running
         .into_iter()
-        .max_by_key(|&(_, stalled, admitted)| (stalled, admitted))
-        .map(|(index, _, _)| index)
+        .filter(|&(_, _, _, reading)| !reading)
+        .max_by_key(|&(_, stalled, admitted, _)| (stalled, admitted))
+        .map(|(index, _, _, _)| index)
 }
 
 /// Preempts `slot`'s request for room: its tokens leave the shared cache as an idle prompt's
@@ -1478,6 +1600,10 @@ fn preempt<'m, S: Shared<'m>>(
     tick: u64,
 ) -> Option<Running<'m>> {
     let running = slot.running.take()?;
+    debug_assert_eq!(
+        running.unread, 0,
+        "a request reading its prompt's end is never preempted"
+    );
     slot.cache.keep(
         &mut InSeq {
             shared: &mut *shared,
@@ -1526,6 +1652,7 @@ fn resume<'m, S: Shared<'m>>(
             &mut slot.cache,
             (&running.history, &running.namespace),
             &running.out.stopping,
+            0,
         );
         if let Err(message) = read {
             target.clear();

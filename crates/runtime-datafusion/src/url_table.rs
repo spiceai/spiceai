@@ -743,7 +743,7 @@ mod tests {
 
         // Test that catalog_names works
         let names = dynamic_list.catalog_names();
-        assert!(names.is_empty());
+        assert_eq!(names, [] as [String; 0]);
 
         // Register a catalog
         let catalog = Arc::new(MemoryCatalogProvider::new());

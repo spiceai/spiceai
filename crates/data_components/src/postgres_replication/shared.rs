@@ -2302,7 +2302,6 @@ fn implicitly_published_release_message(
 ///
 /// Mirrors [`super::start_replication_stream`]'s lazy contract — setup runs on
 /// first poll and setup errors surface through the stream.
-#[must_use]
 pub fn subscribe(input: ReplicationStreamInput) -> ChangesStream {
     Box::pin(
         stream::once(async move { subscribe_inner(input).await }).flat_map(|result| match result {
@@ -6441,10 +6440,9 @@ mod tests {
         let (source, _) = test_source_with_members(0);
         source.install_reservations(&shared_setup(100, true, &["t0"]));
         assert!(source.ack.slot(&key("t0")).is_none());
-        assert!(
-            source
-                .take_expired_reservations(std::time::Duration::ZERO)
-                .is_empty()
+        assert_eq!(
+            source.take_expired_reservations(std::time::Duration::ZERO),
+            [] as [(String, String); 0]
         );
     }
 

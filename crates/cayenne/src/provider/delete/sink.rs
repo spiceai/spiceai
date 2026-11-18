@@ -368,20 +368,22 @@ fn cleanup_uncommitted_delete_paths_blocking(paths: Vec<std::path::PathBuf>) {
 /// not line up two-by-two: the main listing applies re-inserts with no sequence cutoff
 /// (`apply_deletion_filter_with_insert_records`), a protected snapshot ignores them and
 /// has a cutoff (`apply_partial_deletion_filter`), and the COLD tier ignores them with
-/// NO cutoff (`apply_deletion_filter`). Deriving the mode from "is there a cutoff" gets
-/// cold wrong, and cold is the case where it costs a row: its files hold fully
-/// superseded data, so treating a re-inserted key as live there matches the stale value
-/// and tombstones the key — deleting the replacement that never matched the predicate.
+/// its files' sequence as the cutoff (`apply_cold_deletion_filter`). Deriving the mode
+/// from "is there a cutoff" alone is not enough, and cold is the case where it costs a
+/// row: its files hold superseded data, so treating a re-inserted key as live there
+/// matches the stale value and tombstones the key — deleting the replacement that never
+/// matched the predicate.
 #[derive(Clone)]
 pub(crate) struct DeleteScanSource {
     /// Only deletions NEWER than this apply to these rows. `None` — every deletion
-    /// applies — for the main listing and the cold tier.
+    /// applies — for the main listing; a cold-tier source carries the sequence
+    /// its files were written at.
     pub(crate) min_delete_seq: Option<i64>,
     /// Whether a key re-inserted after its delete reads as live again.
     pub(crate) insert_records: InsertRecordHandling,
     pub(crate) table: DeleteScanTable,
     /// The deletion index as it stood when `table` was captured, taken under the same
-    /// `listing_fence` read. `None` for a source captured without one (the cold tier).
+    /// `listing_fence` read. `None` for a source captured without one.
     ///
     /// A row's liveness is only meaningful against the index its source was captured
     /// with. A seq-prefix bake or a current-snapshot compaction folds the rows a
@@ -625,8 +627,14 @@ impl StagedPkDelete {
     }
 
     /// Number of rows this delete removes: one per key. Every key it holds is
-    /// the key of a row its scan found live, so a key written again after an
-    /// earlier delete counts, and a key with no live row is never in it.
+    /// the key of a row its scan found live in the source it was read from,
+    /// against that source's own cutoff (see
+    /// [`CayenneDeletionSink::is_live_int64_pk`]), so a key written again after
+    /// an earlier delete counts, and a key deleted before this delete began, or a
+    /// superseded version, never reaches this set. Judging the keys again against
+    /// the whole-table index cannot be right for every source: a datalake file's
+    /// rows are live by its sequence cutoff, and a composite-key upsert's
+    /// tombstone carries no re-insert record.
     fn new_count(&self) -> usize {
         match self {
             Self::Int64 { new_pks, .. } => new_pks.len(),
@@ -665,8 +673,9 @@ pub struct CayenneDeletionSink {
     /// A protected snapshot carries `max_delete_seq_at_creation`: only deletes NEWER than
     /// that apply to its rows, which is precisely what tells a superseded version from
     /// the row that replaced it. Without it, a key-based delete can match a version an
-    /// upsert already retired and tombstone the KEY, taking the live row with it. `None`
-    /// is the base case — the current snapshot and cold-tier files, where every delete
+    /// upsert already retired and tombstone the KEY, taking the live row with it. A
+    /// cold-tier source carries the sequence its files were written at, for the same
+    /// reason. `None` is the base case — the current snapshot, where every delete
     /// applies.
     additional_scan_tables: Vec<DeleteScanSource>,
     /// How the main listing table treats an upsert's re-insert marker. Carried from the
@@ -1052,8 +1061,8 @@ impl CayenneDeletionSink {
     }
 
     /// Whether an Int64-keyed row from a snapshot whose deletions are visible above
-    /// `min_delete_seq` is still live. `None` is the base case — the current snapshot and
-    /// cold tier, where every delete applies.
+    /// `min_delete_seq` is still live. `None` is the base case — the current snapshot,
+    /// where every delete applies.
     ///
     /// Delegates to the read path's own predicate rather than probing the index directly:
     /// a bare `get_with_min_seq(..).is_none()` is only half the rule, and misses that a

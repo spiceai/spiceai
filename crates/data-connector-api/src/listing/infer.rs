@@ -220,7 +220,7 @@ mod tests {
         let table_url = ListingTableUrl::parse("memory://data").expect("Failed to parse table URL");
         let result = infer_partitions_with_types_from_files(&table_url, &files)
             .expect("Expected empty partitions");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [(String, DataType); 0]);
     }
 
     #[test]

@@ -126,7 +126,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust toolchain
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Set spicepod path
         id: set_spicepod_path
@@ -185,14 +185,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '9000'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -213,7 +213,7 @@ jobs:
 
       - name: Setup spiced
         if: steps.spiced_source.outputs.release != 'true'
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
@@ -222,7 +222,7 @@ jobs:
       - name: Install the released spiced
         if: steps.spiced_source.outputs.release == 'true'
         id: release-spiced
-        uses: ./.github/actions/setup-released-spiced
+        uses: $/.github/actions/setup-released-spiced
         with:
           release: ${{ github.event.inputs.spiced_ref }}
           spicepod_file: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
@@ -278,13 +278,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
 
       # On spiceai-dev-xlarge-runners a dedicated in-cluster PostgreSQL pod is used,
       # so skip the local docker Postgres there.
       - name: Setup CH-benCH PostgreSQL
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
-        uses: ./.github/actions/setup-chbench-postgres
+        uses: $/.github/actions/setup-chbench-postgres
         with:
           version: ${{ github.event.inputs.source_version || '16' }}
 
@@ -293,7 +293,7 @@ jobs:
       # so skip the local docker MySQL there.
       - name: Setup CH-benCH MySQL
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
-        uses: ./.github/actions/setup-chbench-mysql
+        uses: $/.github/actions/setup-chbench-mysql
         with:
           version: ${{ github.event.inputs.source_version || '8.4' }}
 
@@ -480,7 +480,7 @@ jobs:
       # Upload the under-load diagnostics dir
       - name: Upload HTAP diagnostics
         if: always() && github.event.inputs.collect_diagnostics == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: htap-diagnostics-sf${{ github.event.inputs.scale_factor }}-${{ github.run_id }}
           path: htap-diagnostics/
@@ -521,7 +521,7 @@ jobs:
       # waterfall can be re-run offline against different thresholds.
       - name: Upload metrics dump + run log
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: htap-metrics-sf${{ github.event.inputs.scale_factor }}-${{ github.run_id }}
           path: |

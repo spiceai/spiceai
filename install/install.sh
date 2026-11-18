@@ -135,7 +135,9 @@ SPICE_ATTESTATION_SIGNER='^https://github\.com/spiceai/spiceai/\.github/workflow
 
 # Saves a URL to a file, sending GITHUB_TOKEN when it is set. Fails on an HTTP error. A request
 # that times out or gets a 408, 429 or 5xx is tried up to 3 more times, a second apart, so a
-# brief GitHub error doesn't stop the install. A 404, such as the SHA256SUMS of a release
+# brief GitHub error doesn't stop the install. curl stops retrying when the next try would start
+# more than 10 seconds after the first, so a rate limit whose Retry-After asks for a longer wait
+# fails at once instead of stalling the install. A 404, such as the SHA256SUMS of a release
 # without one, is not retried.
 verifyFetch() {
     local url="$1"
@@ -147,7 +149,7 @@ verifyFetch() {
         if [ -n "${GITHUB_TOKEN:-}" ]; then
             auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
         fi
-        curl --fail -sSL --retry 3 --retry-delay 1 "${auth[@]}" "$url" -o "$out"
+        curl --fail -sSL --retry 3 --retry-delay 1 --retry-max-time 10 "${auth[@]}" "$url" -o "$out"
     else
         if [ -n "${GITHUB_TOKEN:-}" ]; then
             auth=(--header="Authorization: Bearer $GITHUB_TOKEN")

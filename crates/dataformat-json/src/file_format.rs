@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt::{self, Debug};
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -37,7 +37,6 @@ use arrow::json;
 use arrow::json::reader::{ValueIter, infer_json_schema_from_iterator};
 
 use async_trait::async_trait;
-use bytes::Buf;
 use datafusion::common::parsers::CompressionTypeVariant;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
@@ -62,8 +61,10 @@ use datafusion::{
 use datafusion_datasource::decoder::Decoder;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::source::DataSource;
+use futures::TryStreamExt;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore, ObjectStoreExt};
 use snafu::prelude::*;
+use tokio_util::io::{StreamReader, SyncIoBridge};
 
 #[derive(Debug, Clone)]
 pub struct SpiceJsonOptions {
@@ -222,6 +223,9 @@ impl SpiceJsonFormat {
     /// target, or blank JSONL. An empty object (`{}` / `[{}]`) is one record
     /// with no keys, which is not the same as zero records.
     ///
+    /// JSONL and array bodies are streamed (see [`Self::probe_file`]), so
+    /// inference reads only as far as `schema_infer_max_rec` records.
+    ///
     /// # Errors
     ///
     /// Returns the error reading a file, decompressing it, extracting a JSON
@@ -232,41 +236,19 @@ impl SpiceJsonFormat {
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> Result<JsonSchemaProbe> {
+        let max_records = self.max_probe_records();
         let mut schemas = Vec::new();
-        let mut records_to_read = self
-            .options
-            .schema_infer_max_rec
-            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
         let mut record_count = 0;
-        let file_compression_type = FileCompressionType::from(self.options.compression);
         for object in objects {
-            let mut take_while = || {
-                let should_take = records_to_read > 0;
-                if should_take {
-                    records_to_read -= 1;
-                    record_count += 1;
-                }
-                should_take
-            };
-
-            let r = store.as_ref().get(&object.location).await?;
-            let raw_buf = match r.payload {
-                GetResultPayload::File(file, _) => {
-                    let mut decoder = file_compression_type.convert_read(file)?;
-                    let mut raw_buf = Vec::new();
-                    decoder.read_to_end(&mut raw_buf)?;
-                    raw_buf
-                }
-                GetResultPayload::Stream(_) => {
-                    let data = r.bytes().await?;
-                    let mut decoder = file_compression_type.convert_read(data.reader())?;
-                    let mut raw_buf = Vec::new();
-                    decoder.read_to_end(&mut raw_buf)?;
-                    raw_buf
-                }
-            };
-            schemas.push(self.schema_from_raw_buf(&raw_buf, &mut take_while)?);
-            if records_to_read == 0 {
+            let budget = max_records - record_count;
+            let (schema, records) = self
+                .probe_file(store, &object.location, move |format, body| {
+                    format.schema_from_body(body, budget)
+                })
+                .await?;
+            schemas.push(schema);
+            record_count += records;
+            if record_count >= max_records {
                 break;
             }
         }
@@ -285,6 +267,13 @@ impl SpiceJsonFormat {
     /// a name in `registered` is skipped so `{"user": null}` does not look like
     /// a rename of `user.name`.
     ///
+    /// With `until_found`, the probe stops after the first record at which
+    /// every key in it has been seen, so the returned keys and count cover
+    /// only the records read up to there. Without it, the probe reads up to
+    /// `schema_infer_max_rec` records. JSONL and array bodies are streamed
+    /// either way (see [`Self::probe_file`]), so reading every record of a
+    /// large file does not hold the file in memory.
+    ///
     /// The count is `0` for an empty array, an empty pointer target, or blank
     /// JSONL. An empty object (`{}` / `[{}]`) is one record with no keys.
     ///
@@ -299,47 +288,162 @@ impl SpiceJsonFormat {
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
         registered: &BTreeSet<String>,
+        until_found: Option<&BTreeSet<String>>,
     ) -> Result<JsonKeyProbe> {
-        let mut keys = BTreeSet::new();
-        let mut records_to_read = self
-            .options
-            .schema_infer_max_rec
-            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
-        let mut record_count = 0;
-        let file_compression_type = FileCompressionType::from(self.options.compression);
+        let max_records = self.max_probe_records();
+        let registered = Arc::new(registered.clone());
+        let mut probe = JsonKeyProbe {
+            keys: BTreeSet::new(),
+            record_count: 0,
+        };
         for object in objects {
-            let mut take_while = || {
-                let should_take = records_to_read > 0;
-                if should_take {
-                    records_to_read -= 1;
-                    record_count += 1;
-                }
-                should_take
-            };
-
-            let r = store.as_ref().get(&object.location).await?;
-            let raw_buf = match r.payload {
-                GetResultPayload::File(file, _) => {
-                    let mut decoder = file_compression_type.convert_read(file)?;
-                    let mut raw_buf = Vec::new();
-                    decoder.read_to_end(&mut raw_buf)?;
-                    raw_buf
-                }
-                GetResultPayload::Stream(_) => {
-                    let data = r.bytes().await?;
-                    let mut decoder = file_compression_type.convert_read(data.reader())?;
-                    let mut raw_buf = Vec::new();
-                    decoder.read_to_end(&mut raw_buf)?;
-                    raw_buf
-                }
-            };
-            self.collect_keys_from_raw_buf(&raw_buf, &mut take_while, registered, &mut keys)?;
-            if records_to_read == 0 {
+            let budget = max_records - probe.record_count;
+            let missing: Option<BTreeSet<String>> =
+                until_found.map(|wanted| wanted.difference(&probe.keys).cloned().collect());
+            let registered = Arc::clone(&registered);
+            let file = self
+                .probe_file(store, &object.location, move |format, body| {
+                    format.keys_from_body(body, budget, &registered, missing.as_ref())
+                })
+                .await?;
+            probe.record_count += file.record_count;
+            probe.keys.extend(file.keys);
+            if probe.record_count >= max_records
+                || until_found.is_some_and(|wanted| wanted.is_subset(&probe.keys))
+            {
                 break;
             }
         }
 
-        Ok(JsonKeyProbe { keys, record_count })
+        Ok(probe)
+    }
+
+    fn max_probe_records(&self) -> usize {
+        self.options
+            .schema_infer_max_rec
+            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD)
+    }
+
+    /// Runs `probe` over the decompressed body of `location` on a blocking
+    /// thread.
+    ///
+    /// The object is pulled through the decompressor only as far as `probe`
+    /// reads it. A JSONL or array body therefore never holds the compressed or
+    /// the decompressed file in memory, and a probe that stops early stops the
+    /// download. Only a body that must be parsed whole is buffered (see
+    /// [`ProbeBody::Document`]).
+    async fn probe_file<T, F>(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        location: &object_store::path::Path,
+        probe: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Self, ProbeBody) -> Result<T> + Send + 'static,
+    {
+        let reader: Box<dyn Read + Send> = match store.as_ref().get(location).await?.payload {
+            GetResultPayload::File(file, _) => Box::new(file),
+            GetResultPayload::Stream(stream) => Box::new(SyncIoBridge::new(StreamReader::new(
+                stream.map_err(std::io::Error::other),
+            ))),
+        };
+        let format = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let decoded =
+                FileCompressionType::from(format.options.compression).convert_read(reader)?;
+            let body = format.open_body(decoded)?;
+            probe(&format, body)
+        })
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+    }
+
+    /// Classifies a decompressed body as streamable records or a whole
+    /// document. A leading UTF-8 BOM and whitespace are consumed either way.
+    fn open_body(&self, reader: Box<dyn Read + Send>) -> Result<ProbeBody> {
+        let mut reader = BufReader::new(reader);
+        let opens_array = body_opens_a_json_array(&mut reader)?;
+        if self.options.json_pointer.is_none() {
+            let streams_array = match self.options.format {
+                Format::Jsonl => return Ok(ProbeBody::Records(Box::new(reader))),
+                Format::Array => true,
+                Format::Auto | Format::Json => opens_array,
+                Format::Object | Format::Soda => false,
+            };
+            if streams_array {
+                return Ok(ProbeBody::Records(Box::new(ArrayToNdjson::try_new(
+                    reader,
+                )?)));
+            }
+        }
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        Ok(ProbeBody::Document(buf))
+    }
+
+    /// The schema of up to `max_records` records of `body`, and how many
+    /// records it read.
+    fn schema_from_body(&self, body: ProbeBody, max_records: usize) -> Result<(Schema, usize)> {
+        let mut records = 0;
+        let mut take_while = || {
+            let take = records < max_records;
+            records += usize::from(take);
+            take
+        };
+        let schema = match body {
+            ProbeBody::Records(mut reader) => {
+                let iter = ValueIter::new(&mut reader, None);
+                self.flattened(infer_json_schema_from_iterator(
+                    iter.take_while(|_| take_while()),
+                )?)
+            }
+            ProbeBody::Document(buf) => self.schema_from_raw_buf(&buf, &mut take_while)?,
+        };
+        Ok((schema, records))
+    }
+
+    /// The keys of up to `max_records` records of `body`, stopping early once
+    /// every key in `until_found` has been seen in a streamed body.
+    fn keys_from_body(
+        &self,
+        body: ProbeBody,
+        max_records: usize,
+        registered: &BTreeSet<String>,
+        until_found: Option<&BTreeSet<String>>,
+    ) -> Result<JsonKeyProbe> {
+        let mut keys = BTreeSet::new();
+        let mut records = 0;
+        let mut take_while = || {
+            let take = records < max_records;
+            records += usize::from(take);
+            take
+        };
+        match body {
+            ProbeBody::Records(mut reader) => {
+                let flatten_separator = self.options.flatten_json.as_deref();
+                for value in ValueIter::new(&mut reader, None).take_while(|_| take_while()) {
+                    collect_record_keys(&value?, flatten_separator, registered, &mut keys);
+                    if until_found.is_some_and(|wanted| wanted.is_subset(&keys)) {
+                        break;
+                    }
+                }
+            }
+            ProbeBody::Document(buf) => {
+                self.collect_keys_from_raw_buf(&buf, &mut take_while, registered, &mut keys)?;
+            }
+        }
+        Ok(JsonKeyProbe {
+            keys,
+            record_count: records,
+        })
+    }
+
+    fn flattened(&self, schema: Schema) -> Schema {
+        match &self.options.flatten_json {
+            Some(separator) => unnest_struct_schema(&schema, separator),
+            None => schema,
+        }
     }
 
     fn collect_keys_from_raw_buf(
@@ -438,6 +542,17 @@ impl SpiceJsonFormat {
             schema
         })
     }
+}
+
+/// One file's decompressed body, as a probe reads it.
+enum ProbeBody {
+    /// One JSON value per line, read only as far as the probe consumes it:
+    /// JSONL, or a top-level array converted to JSONL as it streams.
+    Records(Box<dyn BufRead + Send>),
+    /// A document parsed whole: a single object, a SODA response, a
+    /// `json_pointer` target, or `json`/`auto` input that does not open with
+    /// `[`. These formats cannot yield a record before the document ends.
+    Document(Vec<u8>),
 }
 
 /// Schema inferred from a JSON source plus how many records were inspected.
@@ -944,6 +1059,59 @@ fn collect_json_keys_for_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Yields `head`, then fails every later read: a body that cannot be read
+    /// to the end, as a probe that buffered the whole file would.
+    struct FailsAfter {
+        head: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.head.read(buf)? {
+                0 => Err(std::io::Error::other("read past the probed records")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    fn fails_after(head: &str) -> Box<dyn Read + Send> {
+        Box::new(FailsAfter {
+            head: std::io::Cursor::new(head.as_bytes().to_vec()),
+        })
+    }
+
+    #[test]
+    fn streamed_key_probe_never_reads_past_the_record_that_completes_the_wanted_keys() {
+        let wanted: BTreeSet<String> = ["a", "b"].map(String::from).into();
+        for (format, head) in [
+            (Format::Jsonl, "{\"a\":1}\n{\"b\":2}\n"),
+            (Format::Array, "[{\"a\":1},{\"b\":2},"),
+            (Format::Auto, "[{\"a\":1,\"b\":2},"),
+        ] {
+            let json = SpiceJsonFormat::default().with_format(format);
+            let body = json.open_body(fails_after(head)).expect("open body");
+            let probe = json
+                .keys_from_body(body, usize::MAX, &BTreeSet::new(), Some(&wanted))
+                .expect("the probe stops before the unreadable remainder");
+            assert_eq!(probe.keys, wanted, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn document_formats_still_read_the_whole_body() {
+        for format in [Format::Object, Format::Soda, Format::Auto] {
+            let json = SpiceJsonFormat::default().with_format(format);
+            assert!(
+                json.open_body(fails_after("{\"a\":1}")).is_err(),
+                "{format:?} parses the document whole, so it reads to the end"
+            );
+        }
+        let pointer = SpiceJsonFormat::default()
+            .with_format(Format::Array)
+            .with_json_pointer("/data".to_string());
+        assert!(pointer.open_body(fails_after("[{\"a\":1}")).is_err());
+    }
 
     #[test]
     fn test_format_parse_jsonl() {

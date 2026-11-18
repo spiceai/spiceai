@@ -450,7 +450,7 @@ mod tests {
         let (kept, _kept_keys, _metadata, evicted) =
             filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
 
-        assert!(evicted.is_empty());
+        assert_eq!(evicted, [] as [String; 0]);
         assert_eq!(kept.len(), 3);
     }
 
@@ -606,7 +606,7 @@ mod tests {
         let (filtered_embeddings, filtered_keys, _, evicted) =
             filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
 
-        assert!(evicted.is_empty());
+        assert_eq!(evicted, [] as [String; 0]);
         assert_eq!(
             filtered_embeddings,
             vec![Some(vec![1.0, 2.0])],
@@ -632,7 +632,7 @@ mod tests {
             filtered_embeddings.is_empty(),
             "storing the earlier row would write the stale vector back over its own delete"
         );
-        assert!(filtered_keys.is_empty());
+        assert_eq!(filtered_keys, [] as [Option<String>; 0]);
     }
 
     #[test]

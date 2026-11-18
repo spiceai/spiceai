@@ -1452,7 +1452,7 @@ mod tests {
         .await;
 
         assert!(!announced.has_changed().expect("sender alive"));
-        assert!(queue.deleted().is_empty());
+        assert_eq!(queue.deleted(), [] as [String; 0]);
     }
 
     #[tokio::test]

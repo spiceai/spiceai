@@ -410,7 +410,7 @@ mod tests {
     async fn a_query_with_no_equality_filter_has_no_bindings() {
         let t =
             template_from_plan(&plan_of("SELECT count(*) FROM orders").await).expect("template");
-        assert!(t.bindings.is_empty());
+        assert_eq!(t.bindings, [] as [WarmupBinding; 0]);
         assert!(distinct_keys_sql(&t).is_none());
         assert!(
             template_can_warm(&t),

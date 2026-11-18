@@ -712,8 +712,14 @@ impl VectorSearchUDTFProvider {
         col: &str,
         cfg: &EmbeddingColumnConfig,
     ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
-        let models = self.embedding_models.read().await;
-        let Some(embedding_model) = models.get(&cfg.model_name) else {
+        // Not held while embedding, so a model load or reload does not wait on the provider.
+        let embedding_model = self
+            .embedding_models
+            .read()
+            .await
+            .get(&cfg.model_name)
+            .cloned();
+        let Some(embedding_model) = embedding_model else {
             return Err(Box::from(format!(
                 "Column '{col}' in '{}' requires '{}' embedding model, but is not available.",
                 self.args.tbl, cfg.model_name

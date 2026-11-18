@@ -854,7 +854,7 @@ fn remove_manifest_in_directory(
     // The same bounded read the load path uses, so the type, link-count and
     // size limits an uninstall re-checks cannot drift from the ones a load
     // applies. An absent manifest is the idempotent case, not a failure.
-    let Some((bytes, metadata)) = read_manifest_in_directory(directory).map_err(&io_error)? else {
+    let Some((bytes, metadata)) = read_manifest_in_directory(directory).map_err(io_error)? else {
         return directory.sync_all().map_err(io_error);
     };
     let mode = metadata.permissions().mode() & 0o7777;

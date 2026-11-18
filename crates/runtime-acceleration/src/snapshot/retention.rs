@@ -233,7 +233,7 @@ mod tests {
                 ),
             ])
         );
-        assert!(retention.expired.is_empty());
+        assert_eq!(retention.expired, [] as [String; 0]);
     }
 
     /// After a rollback the current snapshot can be the oldest; it stays at any

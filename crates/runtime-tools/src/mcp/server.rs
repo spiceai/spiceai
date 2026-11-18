@@ -24,7 +24,7 @@ use rmcp::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
         Implementation, ListResourceTemplatesRequestMethod, ListResourceTemplatesResult,
         ListResourcesRequestMethod, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-        ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+        ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
     },
     service::RequestContext,
 };
@@ -787,8 +787,14 @@ impl RuntimeServer {
             }
         };
 
-        // Tools such as `sql` already return JSON as a string; re-encoding it
-        // would make clients parse the text into a string instead of the data.
+        // A tool that declares an `outputSchema` returns an object matching it, which MCP
+        // carries as `structuredContent` and, for clients that read only text, as JSON text.
+        if resolved.tool.output_schema().is_some() && result.is_object() {
+            return Ok(CallToolResult::structured(result).into());
+        }
+
+        // Tools such as `table_schema` return text; re-encoding it as JSON would make clients
+        // parse the text into a string instead of reading it.
         let text = match result {
             Value::String(text) => text,
             other => serde_json::to_string(&other)
@@ -800,8 +806,8 @@ impl RuntimeServer {
 }
 
 impl ServerHandler for RuntimeServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "Spice.ai Open Source",
                 env!("CARGO_PKG_VERSION"),
@@ -998,7 +1004,11 @@ fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModel
     let description: Option<Cow<'static, str>> =
         tool.description().map(|s| Cow::Owned(s.into_owned()));
     let schema = to_map(tool.parameters().unwrap_or_else(empty_input_schema));
-    Tool::new_with_raw(name.into(), description, schema)
+    let definition = Tool::new_with_raw(name.into(), description, schema);
+    match tool.output_schema() {
+        Some(output_schema) => definition.with_raw_output_schema(Arc::new(to_map(output_schema))),
+        None => definition,
+    }
 }
 
 /// 1 MiB cap for a `tools/call` payload we will execute or forward.
@@ -3199,8 +3209,8 @@ mod tests {
     struct SchemaLessServer;
 
     impl ServerHandler for SchemaLessServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
                 .with_protocol_version(ProtocolVersion::V_2026_07_28)
         }
 
@@ -3322,8 +3332,9 @@ mod tests {
         );
     }
 
-    /// rmcp caches `get_tool == None`. A later registry update is invisible
-    /// until Streamable HTTP is rebuilt (the HTTP layer watches snapshot epoch).
+    /// rmcp looks a tool's schema up per request, so a tool registered after
+    /// a miss is validated by the existing Streamable HTTP service at once,
+    /// and by a service rebuilt when the snapshot epoch moves.
     #[tokio::test]
     async fn rebuilt_service_validates_after_tool_registers_following_a_miss() {
         let tools = Arc::new(RwLock::new(HashMap::new()));
@@ -3357,7 +3368,7 @@ mod tests {
         assert_ne!(
             json.pointer("/error/code").and_then(Value::as_i64),
             Some(-32020),
-            "a miss must skip HeaderMismatch so the cached None is load-bearing: {status} {json}"
+            "an unregistered tool has no schema, so a miss must skip HeaderMismatch: {status} {json}"
         );
         let epoch_after_miss = schemas.epoch();
 
@@ -3377,10 +3388,15 @@ mod tests {
 
         let (status, json) =
             post_tools_call(&service, "deploy", Some("us-west1"), "eu-west1").await;
-        assert_ne!(
+        assert_eq!(
+            status,
+            http::StatusCode::BAD_REQUEST,
+            "the existing StreamableHttpService must validate Mcp-Param once the tool appears: {status} {json}"
+        );
+        assert_eq!(
             json.pointer("/error/code").and_then(Value::as_i64),
             Some(-32020),
-            "the same StreamableHttpService must keep the cached miss: {status} {json}"
+            "expected HeaderMismatch (-32020) from the existing service, got {json}"
         );
 
         let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -3407,10 +3423,9 @@ mod tests {
         );
     }
 
-    /// rmcp caches `get_tool` per name. After `deploy` rewrites
-    /// `x-mcp-header` from `Region` to `Zone`, the existing
-    /// `StreamableHttpService` still validates `mcp-param-region`; a
-    /// rebuilt service validates `mcp-param-zone`.
+    /// rmcp looks a tool's schema up per request. After `deploy` rewrites
+    /// `x-mcp-header` from `Region` to `Zone`, both the existing
+    /// `StreamableHttpService` and a rebuilt one validate `mcp-param-zone`.
     #[tokio::test]
     async fn rebuilt_service_validates_after_same_name_schema_identity_change() {
         let mut tools = HashMap::new();
@@ -3475,10 +3490,9 @@ mod tests {
 
         let (status, json) =
             post_tools_call_param(&service, "deploy", "zone", Some("us-west1"), "us-west1").await;
-        assert_eq!(
-            json.pointer("/error/code").and_then(Value::as_i64),
-            Some(-32020),
-            "existing StreamableHttpService must still validate mcp-param-region: {status} {json}"
+        assert!(
+            status.is_success() && json.get("error").is_none(),
+            "the existing StreamableHttpService must validate mcp-param-zone after the schema rewrite: {status} {json}"
         );
 
         let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -3784,10 +3798,10 @@ mod tests {
         );
     }
 
-    /// A proxied catalog TTL refresh used to update only the catalog
-    /// cache. Streamable HTTP kept validating `mcp-param-region` until a
-    /// gateway `tools/list`. Publishing the cache into the snapshot and
-    /// rebuilding the service validates `mcp-param-zone` without that list.
+    /// A proxied catalog TTL refresh publishes the catalog cache into the
+    /// snapshot. Streamable HTTP then validates `mcp-param-zone` without a
+    /// gateway `tools/list`, in the existing service (rmcp looks the schema
+    /// up per request) and in a rebuilt one.
     #[tokio::test]
     async fn rebuilt_service_validates_after_catalog_cache_schema_identity_change() {
         let exposed = encode_tool_name("srv", "deploy");
@@ -3855,10 +3869,9 @@ mod tests {
 
         let (status, json) =
             post_tools_call_param(&service, &exposed, "zone", Some("us-west1"), "us-west1").await;
-        assert_eq!(
-            json.pointer("/error/code").and_then(Value::as_i64),
-            Some(-32020),
-            "existing StreamableHttpService must still validate mcp-param-region: {status} {json}"
+        assert!(
+            status.is_success() && json.get("error").is_none(),
+            "the existing StreamableHttpService must validate mcp-param-zone after the catalog cache rewrite: {status} {json}"
         );
 
         let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -4417,6 +4430,93 @@ mod tests {
     /// `request` as a real `/v1/mcp` request reaches rmcp: authenticated, here
     /// with a read-write API key. For tests of something other than auth, which
     /// would otherwise be refused for having no principal.
+    /// A tool that returns a tool result object, and declares its `outputSchema` or not.
+    struct RowsTool {
+        name: &'static str,
+        declares_schema: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for RowsTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.name)
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+        fn output_schema(&self) -> Option<Value> {
+            self.declares_schema.then(crate::result::result_schema)
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({"columns": ["n"], "rows": [[1]]}))
+        }
+    }
+
+    /// A tool with an `outputSchema` lists it, and answers with its object as `structuredContent`
+    /// and the same JSON as its one text block, for clients that read only text. A tool without
+    /// one answers with the text alone.
+    #[tokio::test]
+    async fn a_tool_with_an_output_schema_answers_with_structured_content() {
+        let mut tools = HashMap::new();
+        for (name, declares_schema) in [("rows", true), ("plain_rows", false)] {
+            tools.insert(
+                name.to_string(),
+                Tooling::Tool(Arc::new(RowsTool {
+                    name,
+                    declares_schema,
+                }) as Arc<dyn SpiceModelTool>),
+            );
+        }
+        let service = mcp_http_service(RuntimeServer::new(Arc::new(RwLock::new(tools))));
+
+        let (status, listed) = post_tools_list(&service).await;
+        assert!(status.is_success(), "tools/list: {status} {listed}");
+        let output_schema = |name: &str| {
+            listed
+                .pointer("/result/tools")
+                .and_then(Value::as_array)
+                .and_then(|tools| tools.iter().find(|tool| tool["name"] == name))
+                .map(|tool| tool["outputSchema"].clone())
+        };
+        assert_eq!(output_schema("rows"), Some(crate::result::result_schema()));
+        assert_eq!(output_schema("plain_rows"), Some(Value::Null));
+
+        let object = json!({"columns": ["n"], "rows": [[1]]});
+        let text_of = |called: &Value| -> Value {
+            let content = called["result"]["content"]
+                .as_array()
+                .expect("content blocks");
+            assert_eq!(content.len(), 1, "{called}");
+            assert_eq!(content[0]["type"], "text", "{called}");
+            serde_json::from_str(content[0]["text"].as_str().expect("text")).expect("JSON text")
+        };
+
+        let (status, called) = post_tools_call_param(&service, "rows", "region", None, "x").await;
+        assert!(status.is_success(), "tools/call rows: {status} {called}");
+        assert_eq!(called["result"]["structuredContent"], object, "{called}");
+        assert_eq!(text_of(&called), object);
+        assert_ne!(called["result"]["isError"], json!(true), "{called}");
+
+        let (status, called) =
+            post_tools_call_param(&service, "plain_rows", "region", None, "x").await;
+        assert!(
+            status.is_success(),
+            "tools/call plain_rows: {status} {called}"
+        );
+        assert_eq!(
+            called["result"]["structuredContent"],
+            Value::Null,
+            "{called}"
+        );
+        assert_eq!(text_of(&called), object);
+    }
+
     fn authenticated<B>(mut request: http::Request<B>) -> http::Request<B> {
         insert_spice_ctx(&mut request, spice_ctx_with_api_key("test-key:rw"));
         request
@@ -4709,16 +4809,20 @@ mod tests {
             "message": "Unknown tool: no_such_tool"
         });
 
+        // An unknown tool is a JSON-RPC protocol error answered in-band, in an
+        // HTTP 200: MCP's Streamable HTTP transport keeps 400 for a mismatched
+        // header, an unsupported protocol version or malformed `_meta`, and a
+        // client that gets a 400 may fall back to the legacy `initialize`.
         let (status, json) = post_tools_call_with_spice_ctx(
             &service,
             "no_such_tool",
             Some(spice_ctx_with_api_key("test-key:rw")),
         )
         .await;
-        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(status, http::StatusCode::OK, "{json}");
         assert_eq!(json.get("error"), Some(&expected), "{json}");
 
-        // A legacy session reports the same error, in an HTTP 200.
+        // A legacy session reports the same error, also in an HTTP 200.
         let session_id = initialize_legacy_mcp_session(&service).await;
         let (status, json) = post_legacy_tools_call_with_session(
             &service,
