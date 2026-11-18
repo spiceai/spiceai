@@ -99,37 +99,33 @@ Whether the role joins a cluster: a scheduler or an executor.
 {{- end -}}
 
 {{/*
-Executors run as a StatefulSet behind a headless Service so each pod has a stable
-DNS name its certificate can cover with one wildcard SAN (see
-https://spiceai.org/docs/features/distributed-query). A StatefulSet is also used
-when `stateful.enabled` requests one for any role.
+Cluster nodes (schedulers and executors) run as a StatefulSet behind a headless
+Service, so each pod has a stable DNS name its certificate can cover with one
+wildcard SAN (see https://spiceai.org/docs/features/distributed-query). A
+StatefulSet is also used when `stateful.enabled` requests one for any role.
 */}}
 {{- define "spiceai.useStatefulSet" -}}
-{{- if or .Values.stateful.enabled (eq (include "spiceai.role" .) "executor") -}}true{{- end -}}
+{{- if or .Values.stateful.enabled (include "spiceai.clusterNode" .) -}}true{{- end -}}
 {{- end -}}
 
 {{/*
-The headless Service that gives executor pods their stable per-pod DNS names.
+The headless Service that gives cluster node pods their stable per-pod DNS names.
 */}}
 {{- define "spiceai.headlessServiceName" -}}
 {{- printf "%s-headless" (include "spiceai.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/*
-The address a cluster node advertises to its peers by default. An executor
-advertises its stable per-pod DNS name,
+The address a cluster node advertises to its peers: its stable per-pod DNS name,
 `$(POD_NAME).<headless-service>.<namespace>.svc.cluster.local`, which a wildcard
-certificate `*.<headless-service>.<namespace>.svc.cluster.local` covers. A
-scheduler advertises its pod IP, as before. `cluster.advertiseAddress` overrides
-both.
+certificate `*.<headless-service>.<namespace>.svc.cluster.local` covers.
+`cluster.advertiseAddress` overrides it.
 */}}
 {{- define "spiceai.advertiseAddress" -}}
 {{- if .Values.cluster.advertiseAddress -}}
 {{- .Values.cluster.advertiseAddress -}}
-{{- else if eq (include "spiceai.role" .) "executor" -}}
-{{- printf "$(POD_NAME).%s.%s.svc.cluster.local" (include "spiceai.headlessServiceName" .) (include "spiceai.namespace" .) -}}
 {{- else -}}
-$(SPICE_POD_IP)
+{{- printf "$(POD_NAME).%s.%s.svc.cluster.local" (include "spiceai.headlessServiceName" .) (include "spiceai.namespace" .) -}}
 {{- end -}}
 {{- end -}}
 

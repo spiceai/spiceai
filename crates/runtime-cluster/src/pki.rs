@@ -257,9 +257,9 @@ impl ClusterPkiBundle {
 
     /// Records how this node is reached by its peers — its kind, instance
     /// identity, and advertise host — so a later certificate reload that drops
-    /// the host name is rejected (see [`Self::reload_now`]). An executor sets it
-    /// once its cluster configuration resolves (spiceai/spiceai#16481); a
-    /// scheduler does not, so its reloads are not tied to its advertise address.
+    /// the host name is rejected (see [`Self::reload_now`]). Each scheduler and
+    /// executor sets it once its cluster configuration resolves
+    /// (spiceai/spiceai#16481).
     pub fn set_advertise_identity(
         &self,
         node_kind: impl Into<String>,

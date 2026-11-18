@@ -498,11 +498,95 @@ async fn a_reloaded_certificate_that_drops_the_advertise_address_is_not_loaded()
                 connect_verifying(pki, "probe", cluster_address, "127.0.0.1")
                     .await
                     .expect("the renewed certificate names the advertise address");
+
+                // The scheduler follows the same rule: it advertises 127.0.0.1, so
+                // a renewal naming only `localhost` is not loaded, and one that
+                // names 127.0.0.1 is.
+                let scheduler_port: u16 = harness
+                    .scheduler_cluster_address()
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.trim_end_matches('/').parse().ok())
+                    .expect("scheduler cluster port");
+                let scheduler_address =
+                    std::net::SocketAddr::from(([127, 0, 0, 1], scheduler_port));
+                let scheduler_tls = harness
+                    .scheduler
+                    .datafusion()
+                    .cluster_config
+                    .tls_config()
+                    .expect("scheduler runs with cluster mTLS")
+                    .clone();
+                let scheduler_bundle = scheduler_tls.bundle_for_tests();
+                let scheduler_loaded = scheduler_bundle.fingerprint();
+                let rejected_before = reload_count_for_tests(ReloadScope::Cluster, "parse_error");
+                let (cert, key) = certificate_naming_only(pki, "scheduler", &["localhost"]);
+                replace_file(&pki.client_key_path("scheduler"), &key);
+                replace_file(&pki.client_cert_path("scheduler"), &cert);
+                scheduler_bundle.force_reload_for_tests();
+                assert_eq!(
+                    scheduler_bundle.fingerprint(),
+                    scheduler_loaded,
+                    "the scheduler keeps the certificate that names its advertise address"
+                );
+                assert!(scheduler_tls.self_certificate_names_host("127.0.0.1"));
+                connect_verifying(pki, "probe", scheduler_address, "127.0.0.1")
+                    .await
+                    .expect("the scheduler still presents a certificate naming its address");
+                assert!(
+                    reload_count_for_tests(ReloadScope::Cluster, "parse_error") > rejected_before,
+                    "the scheduler read the rotated certificate and refused it"
+                );
+                pki.create_client_cert("scheduler")
+                    .expect("renew the scheduler's certificate");
+                scheduler_bundle.force_reload_for_tests();
+                assert_ne!(
+                    scheduler_bundle.fingerprint(),
+                    scheduler_loaded,
+                    "the scheduler loads a renewal that names its advertise address"
+                );
                 Ok::<(), anyhow::Error>(())
             }
             .await;
             harness.shutdown().await;
             result
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scheduler_starts_only_with_a_certificate_naming_its_advertise_address()
+-> Result<(), anyhow::Error> {
+    let _ = CryptoProvider::install_default(aws_lc_rs::default_provider());
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async move {
+            configure_test_datafusion();
+            // Executors connect to a scheduler at the address it advertises, so a
+            // scheduler whose certificate does not name that address refuses to
+            // start. The harness issues the scheduler `CN=scheduler`, naming
+            // `localhost` and 127.0.0.1 only.
+            let started = ClusterHarness::builder()
+                .scheduler_advertise_address(UNNAMED_ADDRESS)
+                .start()
+                .await;
+            let Err(error) = started else {
+                anyhow::bail!(
+                    "the scheduler started advertising an address its certificate does not name"
+                );
+            };
+            let startup_message = advertise_address_mismatch_message(
+                MismatchSite::Startup,
+                "scheduler",
+                "scheduler",
+                "CN=scheduler",
+                UNNAMED_ADDRESS,
+            );
+            assert!(
+                error.to_string().contains(&startup_message),
+                "startup error carries the message: {error}"
+            );
+            Ok(())
         })
         .await
 }

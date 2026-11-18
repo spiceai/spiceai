@@ -371,6 +371,27 @@ mod tests {
             ),
             "Failed to reload the cluster certificate of executor 'executor-1': its cluster certificate (CN=executor-1) does not name its advertise address '10.0.0.7', so other cluster nodes cannot connect to it. Issue a certificate that names it, for example `spice cluster tls add executor-1 --host 10.0.0.7`, or set `--node-advertise-address` to a name the certificate covers. See: https://spiceai.org/docs/features/distributed-query"
         );
+        // A scheduler gets the same messages with its own kind.
+        assert_eq!(
+            advertise_address_mismatch_message(
+                MismatchSite::Startup,
+                "scheduler",
+                "spice-scheduler-0",
+                "CN=spice-scheduler",
+                "spice-scheduler-0.spice-scheduler-spiceai-headless.default.svc.cluster.local",
+            ),
+            "Failed to start scheduler 'spice-scheduler-0': its cluster certificate (CN=spice-scheduler) does not name its advertise address 'spice-scheduler-0.spice-scheduler-spiceai-headless.default.svc.cluster.local', so other cluster nodes cannot connect to it. Issue a certificate that names it, for example `spice cluster tls add spice-scheduler-0 --host spice-scheduler-0.spice-scheduler-spiceai-headless.default.svc.cluster.local`, or set `--node-advertise-address` to a name the certificate covers. See: https://spiceai.org/docs/features/distributed-query"
+        );
+        assert_eq!(
+            advertise_address_mismatch_message(
+                MismatchSite::Reload,
+                "scheduler",
+                "spice-scheduler-0",
+                "CN=spice-scheduler",
+                "10.0.0.9",
+            ),
+            "Failed to reload the cluster certificate of scheduler 'spice-scheduler-0': its cluster certificate (CN=spice-scheduler) does not name its advertise address '10.0.0.9', so other cluster nodes cannot connect to it. Issue a certificate that names it, for example `spice cluster tls add spice-scheduler-0 --host 10.0.0.9`, or set `--node-advertise-address` to a name the certificate covers. See: https://spiceai.org/docs/features/distributed-query"
+        );
         assert_eq!(
             registration_address_mismatch_message("executor-1", "CN=executor-1", "10.0.0.7:50052",),
             "Refused to register executor 'executor-1': it advertises '10.0.0.7:50052', which its cluster certificate (CN=executor-1) does not name, so other cluster nodes could not connect to it. Issue each node a certificate that names its `--node-advertise-address`. See: https://spiceai.org/docs/features/distributed-query"

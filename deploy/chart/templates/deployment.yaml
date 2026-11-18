@@ -16,9 +16,9 @@ spec:
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   {{- if include "spiceai.useStatefulSet" . }}
-  {{- /* Executors use the headless Service so each pod gets a stable DNS name; a
-         stateful non-cluster role keeps the main Service as before. */}}
-  {{- if eq (include "spiceai.role" .) "executor" }}
+  {{- /* Cluster nodes use the headless Service so each pod gets a stable DNS name;
+         a stateful non-cluster role keeps the main Service as before. */}}
+  {{- if include "spiceai.clusterNode" . }}
   serviceName: {{ template "spiceai.headlessServiceName" . }}
   {{- else }}
   serviceName: {{ template "spiceai.fullname" .  }}
@@ -89,20 +89,17 @@ spec:
           {{- end }}
           env:
             {{- if include "spiceai.clusterNode" . }}
-            {{- /* Referenced as $(SPICE_POD_IP) by a scheduler's default
-                   --node-advertise-address. */}}
+            {{- /* Available to a `cluster.advertiseAddress` override as $(SPICE_POD_IP). */}}
             - name: SPICE_POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            {{- if eq (include "spiceai.role" .) "executor" }}
-            {{- /* Referenced as $(POD_NAME) by an executor's per-pod DNS advertise
+            {{- /* Referenced as $(POD_NAME) by the default per-pod DNS advertise
                    address. */}}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            {{- end }}
             {{- end }}
             {{- /*
               The pod's own CPU request, so spiced sizes its thread pools and query
