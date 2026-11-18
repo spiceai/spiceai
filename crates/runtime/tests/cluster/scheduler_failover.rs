@@ -341,7 +341,10 @@ where
     let start = Instant::now();
     loop {
         let state = je
-            .get_status(job_id, runtime::jobs::PUBLIC_JOB_OWNER)
+            .get_status(
+                job_id,
+                &runtime::jobs::JobCaller::owning(runtime::jobs::PUBLIC_JOB_OWNER),
+            )
             .await
             .map_err(|e| anyhow::Error::msg(format!("get_status: {e}")))?;
         if pred(&state) {
@@ -455,7 +458,11 @@ async fn run_failover(recovery_timeout: Duration) -> Result<(), anyhow::Error> {
 
     // Results are correct: COUNT(*) == NAMES_ROWS.
     let chunks = s2_je
-        .get_chunk(&job_id, 0, runtime::jobs::PUBLIC_JOB_OWNER)
+        .get_chunk(
+            &job_id,
+            0,
+            &runtime::jobs::JobCaller::owning(runtime::jobs::PUBLIC_JOB_OWNER),
+        )
         .await
         .map_err(|e| anyhow::Error::msg(format!("get_chunk: {e}")))?;
     let count: i64 = chunks

@@ -224,7 +224,10 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
 
             for _ in 0..30 {
                 let job_status = job_executor
-                    .get_status(&result.job_id, runtime::jobs::PUBLIC_JOB_OWNER)
+                    .get_status(
+                        &result.job_id,
+                        &runtime::jobs::JobCaller::owning(runtime::jobs::PUBLIC_JOB_OWNER),
+                    )
                     .await
                     .expect("should get job status");
                 println!("job state: {job_status:?}");
@@ -235,7 +238,10 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
             }
 
             let job_status = job_executor
-                .get_status(&result.job_id, runtime::jobs::PUBLIC_JOB_OWNER)
+                .get_status(
+                    &result.job_id,
+                    &runtime::jobs::JobCaller::owning(runtime::jobs::PUBLIC_JOB_OWNER),
+                )
                 .await
                 .expect("should get job status");
             assert!(
@@ -244,7 +250,11 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
             );
 
             let job_results = job_executor
-                .get_chunk(&result.job_id, 0, runtime::jobs::PUBLIC_JOB_OWNER)
+                .get_chunk(
+                    &result.job_id,
+                    0,
+                    &runtime::jobs::JobCaller::owning(runtime::jobs::PUBLIC_JOB_OWNER),
+                )
                 .await
                 .expect("should get job results");
             let pretty = datafusion::arrow::util::pretty::pretty_format_batches(&job_results)
