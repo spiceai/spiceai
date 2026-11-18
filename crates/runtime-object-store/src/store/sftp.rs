@@ -23,6 +23,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use bytes::Bytes;
 use chrono::DateTime;
 use futures::StreamExt;
@@ -31,7 +32,7 @@ use object_store::{
     Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
-use ssh2::Session;
+use ssh2::{HashType, HostKeyType, Session};
 
 use super::common::{
     DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
@@ -39,6 +40,9 @@ use super::common::{
 };
 
 const STORE_NAME: &str = "SFTP";
+
+const HOST_KEY_FINGERPRINT_PARAM: &str = "sftp_host_key_fingerprint";
+const SFTP_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/sftp";
 
 /// Wall-clock bound for one connection attempt — name resolution, TCP connect, SSH handshake
 /// and password authentication together — when `client_timeout` is not configured.
@@ -49,12 +53,97 @@ const STORE_NAME: &str = "SFTP";
 /// in the same window.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The SHA-256 digest of the host key an SFTP server must present before any credentials
+/// are sent to it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HostKeyFingerprint([u8; 32]);
+
+impl HostKeyFingerprint {
+    /// Parse the `SHA256:<base64>` form that `ssh-keygen -lf` prints.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming `sftp_host_key_fingerprint` when `value` is absent, empty or
+    /// not a SHA-256 fingerprint in that form.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Err(format!(
+                "Missing required parameter `{HOST_KEY_FINGERPRINT_PARAM}`. Set it to the SHA256 fingerprint of the SFTP server's host key, for example the output of `ssh-keyscan <host> | ssh-keygen -lf -`. See: {SFTP_DOCS}"
+            ));
+        };
+
+        // The value is not echoed back: a malformed value may be a full public key.
+        value
+            .strip_prefix("SHA256:")
+            .and_then(|encoded| STANDARD_NO_PAD.decode(encoded.trim_end_matches('=')).ok())
+            .and_then(|digest| <[u8; 32]>::try_from(digest).ok())
+            .map(Self)
+            .ok_or_else(|| {
+                format!(
+                    "Invalid `{HOST_KEY_FINGERPRINT_PARAM}`. Expected a SHA256 fingerprint in the form `SHA256:<base64>`, as printed by `ssh-keygen -lf`. See: {SFTP_DOCS}"
+                )
+            })
+    }
+
+    /// Accept the host key the server presented during the handshake only if its SHA-256
+    /// digest is this fingerprint.
+    fn verify(&self, session: &Session, addr: &str) -> object_store::Result<()> {
+        let Some(presented) = session.host_key_hash(HashType::Sha256) else {
+            return Err(handle_error(format!(
+                "The SFTP server at {addr} presented no host key, so the connection was refused before authentication."
+            )));
+        };
+        self.check(presented, session.host_key().map(|(_, kind)| kind), addr)
+    }
+
+    fn check(
+        &self,
+        presented: &[u8],
+        kind: Option<HostKeyType>,
+        addr: &str,
+    ) -> object_store::Result<()> {
+        if presented == self.0 {
+            return Ok(());
+        }
+
+        Err(handle_error(format!(
+            "The SFTP server at {addr} presented the {} host key SHA256:{}, which does not match `{HOST_KEY_FINGERPRINT_PARAM}` ({self}), so the connection was refused before authentication. Verify the server's host key and update `{HOST_KEY_FINGERPRINT_PARAM}`. See: {SFTP_DOCS}",
+            host_key_type_name(kind),
+            STANDARD_NO_PAD.encode(presented),
+        )))
+    }
+}
+
+impl std::fmt::Display for HostKeyFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SHA256:{}", STANDARD_NO_PAD.encode(self.0))
+    }
+}
+
+impl std::fmt::Debug for HostKeyFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+/// The key type label `ssh-keygen -lf` prints beside each fingerprint.
+fn host_key_type_name(kind: Option<HostKeyType>) -> &'static str {
+    match kind {
+        Some(HostKeyType::Rsa) => "RSA",
+        Some(HostKeyType::Dss) => "DSA",
+        Some(HostKeyType::Ecdsa256 | HostKeyType::Ecdsa384 | HostKeyType::Ecdsa521) => "ECDSA",
+        Some(HostKeyType::Ed25519) => "ED25519",
+        Some(HostKeyType::Unknown) | None => "unknown",
+    }
+}
+
 #[derive(Clone)]
 struct SFTPClientConfig {
     user: String,
     password: String,
     host: String,
     port: String,
+    host_key_fingerprint: HostKeyFingerprint,
     timeout: Option<Duration>,
 }
 
@@ -65,6 +154,7 @@ impl std::fmt::Debug for SFTPClientConfig {
             .field("password", &"[REDACTED]")
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("host_key_fingerprint", &self.host_key_fingerprint)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -76,6 +166,7 @@ impl SFTPClientConfig {
         password: String,
         host: String,
         port: String,
+        host_key_fingerprint: HostKeyFingerprint,
         timeout: Option<Duration>,
     ) -> Self {
         Self {
@@ -83,6 +174,7 @@ impl SFTPClientConfig {
             password,
             host,
             port,
+            host_key_fingerprint,
             timeout,
         }
     }
@@ -127,6 +219,7 @@ impl SFTPClientConfig {
         // `DEFAULT_CONNECT_TIMEOUT` and `client_timeout` describe.
         session.set_timeout(remaining_session_timeout_ms(bound, started.elapsed())?);
         session.handshake().map_err(handle_error)?;
+        self.host_key_fingerprint.verify(&session, &endpoint.addr)?;
         session.set_timeout(remaining_session_timeout_ms(bound, started.elapsed())?);
         session
             .userauth_password(&self.user, &self.password)
@@ -154,10 +247,18 @@ impl SFTPObjectStore {
         password: String,
         host: String,
         port: String,
+        host_key_fingerprint: HostKeyFingerprint,
         timeout: Option<Duration>,
     ) -> Self {
         Self {
-            config: Arc::new(SFTPClientConfig::new(user, password, host, port, timeout)),
+            config: Arc::new(SFTPClientConfig::new(
+                user,
+                password,
+                host,
+                port,
+                host_key_fingerprint,
+                timeout,
+            )),
         }
     }
 
@@ -591,6 +692,107 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    /// `ssh-keygen -lf` output for a throwaway Ed25519 key.
+    const OPENSSH_FINGERPRINT: &str = "SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ4";
+    /// `shasum -a 256` of the same key's public blob.
+    const OPENSSH_DIGEST: [u8; 32] = [
+        0x1c, 0x06, 0x0a, 0x46, 0x50, 0x31, 0x20, 0xd7, 0x47, 0x3c, 0xe4, 0x19, 0xe5, 0x7e, 0x74,
+        0xb6, 0x9b, 0x18, 0xc6, 0x10, 0xc6, 0xab, 0x11, 0xb6, 0x07, 0x22, 0x8b, 0xd2, 0x2c, 0x43,
+        0x75, 0x0e,
+    ];
+
+    fn test_fingerprint() -> HostKeyFingerprint {
+        HostKeyFingerprint(OPENSSH_DIGEST)
+    }
+
+    #[test]
+    fn host_key_fingerprint_reads_the_form_ssh_keygen_prints() {
+        for value in [
+            OPENSSH_FINGERPRINT.to_string(),
+            format!("  {OPENSSH_FINGERPRINT}\n"),
+            format!("{OPENSSH_FINGERPRINT}="),
+        ] {
+            let fingerprint = HostKeyFingerprint::parse(Some(&value))
+                .expect("an OpenSSH SHA256 fingerprint should parse");
+            assert_eq!(fingerprint, test_fingerprint(), "parsing {value:?}");
+            assert_eq!(fingerprint.to_string(), OPENSSH_FINGERPRINT);
+        }
+    }
+
+    #[test]
+    fn a_missing_host_key_fingerprint_is_refused() {
+        for value in [None, Some(""), Some("   ")] {
+            let error = HostKeyFingerprint::parse(value)
+                .expect_err("a missing fingerprint must not allow a connection");
+            assert_eq!(
+                error,
+                "Missing required parameter `sftp_host_key_fingerprint`. Set it to the SHA256 fingerprint of the SFTP server's host key, for example the output of `ssh-keyscan <host> | ssh-keygen -lf -`. See: https://spiceai.org/docs/components/data-connectors/sftp",
+                "parsing {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_host_key_fingerprint_is_refused() {
+        // The public key the fingerprint above was taken from.
+        let public_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAD/ravtbyepCYQJSRjWRj2AIrVVfEUlYlTW/ovYGPEU";
+        for value in [
+            // No algorithm prefix.
+            "HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ4",
+            // Lowercase prefix.
+            "sha256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ4",
+            // The legacy MD5 form.
+            "MD5:1c:06:0a:46:50:31:20:d7:47:3c:e4:19:e5:7e:74:b6",
+            // Not base64.
+            "SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDd!!",
+            // A SHA-1 length digest.
+            "SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhA",
+            // One byte short of a SHA-256 digest.
+            "SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ",
+            "SHA256:",
+            public_key,
+        ] {
+            let error = HostKeyFingerprint::parse(Some(value))
+                .expect_err("a malformed fingerprint must not allow a connection");
+            assert_eq!(
+                error,
+                "Invalid `sftp_host_key_fingerprint`. Expected a SHA256 fingerprint in the form `SHA256:<base64>`, as printed by `ssh-keygen -lf`. See: https://spiceai.org/docs/components/data-connectors/sftp",
+                "parsing {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_presented_host_key_matching_the_fingerprint_is_accepted() {
+        test_fingerprint()
+            .check(
+                &OPENSSH_DIGEST,
+                Some(HostKeyType::Ed25519),
+                "sftp.example.com:22",
+            )
+            .expect("the configured host key should be accepted");
+    }
+
+    #[test]
+    fn a_presented_host_key_that_differs_is_refused() {
+        let mut presented = OPENSSH_DIGEST;
+        presented[31] ^= 1;
+
+        let error = test_fingerprint()
+            .check(
+                &presented,
+                Some(HostKeyType::Ecdsa256),
+                "sftp.example.com:22",
+            )
+            .expect_err("a different host key must not be accepted");
+
+        assert_eq!(
+            error.to_string(),
+            "Generic SFTP error: The SFTP server at sftp.example.com:22 presented the ECDSA host key SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ8, which does not match `sftp_host_key_fingerprint` (SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ4), so the connection was refused before authentication. Verify the server's host key and update `sftp_host_key_fingerprint`. See: https://spiceai.org/docs/components/data-connectors/sftp"
+        );
+    }
+
     #[test]
     fn resolve_addrs_accepts_a_named_host() {
         // A named host is the ordinary case, and the address form this feeds
@@ -767,6 +969,7 @@ mod tests {
             "password".to_string(),
             "127.0.0.1".to_string(),
             "22".to_string(),
+            test_fingerprint(),
             None,
         );
         let endpoint = ResolvedEndpoint {
@@ -806,6 +1009,7 @@ mod tests {
             "password".to_string(),
             addr.ip().to_string(),
             addr.port().to_string(),
+            test_fingerprint(),
             Some(Duration::from_millis(500)),
         );
         let endpoint = config
@@ -844,6 +1048,7 @@ mod tests {
             "password".to_string(),
             "sftp.example.com".to_string(),
             "22".to_string(),
+            test_fingerprint(),
             None,
         );
         assert_eq!(format!("{store}"), "SFTP");
@@ -856,6 +1061,7 @@ mod tests {
             "pass".to_string(),
             "localhost".to_string(),
             "22".to_string(),
+            test_fingerprint(),
             Some(Duration::from_mins(1)),
         );
         assert_eq!(config.host, "localhost");

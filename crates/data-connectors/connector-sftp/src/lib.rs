@@ -61,6 +61,11 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("user").secret(),
         ParameterSpec::component("pass").secret(),
         ParameterSpec::component("port").description("The port to connect to."),
+        ParameterSpec::component("host_key_fingerprint")
+            .description("The SHA256 fingerprint of the SFTP server's host key, in the form `SHA256:<base64>` that `ssh-keygen -lf` prints. The connection is refused before authentication when the server presents a different key.")
+            .examples(&["SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ4"])
+            .help_link("https://spiceai.org/docs/components/data-connectors/sftp")
+            .required(),
         ParameterSpec::runtime("client_timeout")
             .description("The timeout setting for SFTP client."),
     ]);
@@ -125,7 +130,13 @@ impl ListingTableConnector for SFTP {
 
         sftp_url.set_fragment(Some(&listing::build_fragments(
             &self.params,
-            vec!["port", "user", "pass", "client_timeout"],
+            vec![
+                "port",
+                "user",
+                "pass",
+                "host_key_fingerprint",
+                "client_timeout",
+            ],
         )));
 
         Ok(sftp_url)
