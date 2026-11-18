@@ -52,7 +52,8 @@ spicepod:
           '
 
 steps:
-  - start: {}
+  # The runtime stays not ready while a tool is in error, as for any tool that fails to load.
+  - start: { ready: false }
   - assert-log:
       count:
         "ERROR .*Failed to load tool 'store_memory' \\(memory\\): `access` cannot be set on a built-in tool, whose access is fixed\\. Remove `access` from tool 'store_memory'\\. See: https://spiceai\\.org/docs/components/tools": 1
