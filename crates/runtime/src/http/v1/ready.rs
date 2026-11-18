@@ -52,7 +52,8 @@ pub struct ReadyQuery {
     /// When `true`, a component that failed to load (status `Error`) does not hold readiness back:
     /// the runtime reports ready once every other component has loaded, so the healthy datasets
     /// can be served while the failed one reports its error. A component still on its first load
-    /// still blocks. Defaults to `false`, where every component must have loaded.
+    /// still blocks, and a runtime whose datasets have all failed stays not ready. Defaults to
+    /// `false`, where every component must have loaded.
     #[serde(default)]
     pub allow_unhealthy: bool,
 
@@ -671,5 +672,27 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_string(response).await, "ready");
+    }
+
+    #[tokio::test]
+    async fn allow_unhealthy_stays_not_ready_when_every_dataset_failed() {
+        use datafusion::sql::TableReference;
+        use runtime_status::{ComponentStatus, RuntimeReadyState};
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        status.update_dataset(
+            &TableReference::bare("region_missing"),
+            ComponentStatus::error_with_message("secret not found"),
+        );
+        let response = get(
+            Extension(status),
+            Extension(None),
+            Query(ReadyQuery {
+                allow_unhealthy: true,
+                ..ReadyQuery::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

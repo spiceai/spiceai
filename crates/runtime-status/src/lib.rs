@@ -489,6 +489,11 @@ impl RuntimeStatus {
     /// ever ready) still blocks. Under `OnRegistration` this is the same as
     /// [`Self::is_ready`], which already treats `Error` as ready-enough.
     ///
+    /// One guard: under `OnLoad`, when the Spicepod has at least one (non-disabled)
+    /// dataset and every dataset is in `Error`, the runtime stays not ready, so
+    /// a runtime with nothing to serve is never routed to. A partly broken
+    /// runtime serves.
+    ///
     /// Backs `GET /v1/ready?allow_unhealthy=true`, which an orchestrator can use
     /// as its readiness probe to route traffic to the healthy components of a
     /// runtime whose load has settled with some components failed, while
@@ -534,6 +539,25 @@ impl RuntimeStatus {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
+
+                // Tolerating failed components must not report a runtime ready when it has
+                // nothing to serve: if the Spicepod has datasets and every one of them failed,
+                // stay not ready.
+                if unhealthy == UnhealthyComponents::Allow {
+                    let mut datasets = statuses
+                        .iter()
+                        .filter(|(component, state)| {
+                            component.starts_with("dataset:")
+                                && !matches!(state.status, ComponentStatus::Disabled)
+                        })
+                        .peekable();
+                    if datasets.peek().is_some()
+                        && datasets
+                            .all(|(_, state)| matches!(state.status, ComponentStatus::Error(_)))
+                    {
+                        return false;
+                    }
+                }
 
                 // OnLoad readiness: a component counts as ready if it has been ready at least once.
                 // All registered components must appear in the ever-ready set before we report ready,
@@ -1193,17 +1217,50 @@ mod tests {
         status.set_ready_state(RuntimeReadyState::OnLoad);
         assert!(!status.is_ready_allowing_unhealthy());
 
+        let good = TableReference::bare("good");
         let bad = TableReference::bare("bad");
+        status.update_dataset(&good, ComponentStatus::Ready);
         status.update_dataset(
             &bad,
             ComponentStatus::error_with_message("secret not found"),
         );
-        // Every component failed: nothing is still loading, so the runtime is
-        // reachable and each dataset reports its own error.
         assert!(status.is_ready_allowing_unhealthy());
 
         status.mark_shutdown();
         assert!(!status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_stays_not_ready_when_every_dataset_failed() {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        let a = TableReference::bare("a");
+        let b = TableReference::bare("b");
+
+        status.update_dataset(&a, ComponentStatus::error_with_message("secret not found"));
+        status.update_dataset(&b, ComponentStatus::error_with_message("bucket not found"));
+        // A ready non-dataset component does not make up for every dataset failing.
+        status.update_component_status("model:m", ComponentStatus::Ready);
+        assert!(!status.is_ready());
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        // One dataset recovers: the runtime has something to serve.
+        status.update_dataset(&a, ComponentStatus::Ready);
+        assert!(status.is_ready_allowing_unhealthy());
+
+        // A disabled dataset is not counted: the only remaining dataset failed.
+        status.update_dataset(&a, ComponentStatus::Disabled);
+        assert!(!status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_without_datasets_tolerates_a_failed_component() {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        status.update_component_status("model:ok", ComponentStatus::Ready);
+        status.update_component_status("model:bad", ComponentStatus::error_with_message("x"));
+        assert!(!status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
     }
 
     #[tokio::test]
