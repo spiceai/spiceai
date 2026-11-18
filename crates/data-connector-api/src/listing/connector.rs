@@ -18,7 +18,9 @@ use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::csv_header_projection::HeaderProjectedCsvFormat;
-use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
+use data_components::file_schema_drift::{
+    FileSchemaDriftGuard, FileSchemaDriftLayer, is_appending_acceleration_refresh,
+};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -214,7 +216,10 @@ impl ListingTableTemplate {
 }
 
 /// Fails a scan whose listing has no data file, so a full refresh cannot persist
-/// an empty result over a deleted or emptied source.
+/// an empty result over a deleted or emptied source. An appending acceleration refresh
+/// ([`is_appending_acceleration_refresh`]) is not rejected: it replaces no data, so a
+/// source with no files yet appends zero rows, and a dataset whose source starts empty
+/// becomes ready instead of failing every refresh until the first file arrives.
 #[derive(Debug)]
 struct RejectEmptyListingLayer {
     table_path: ListingTableUrl,
@@ -348,7 +353,7 @@ impl TableLayer for RejectEmptyListingLayer {
         let skips_listing = self.pruning.as_ref().is_some_and(|pruning| {
             pruning.answers_without_listing(args.filters().unwrap_or_default())
         });
-        if !skips_listing {
+        if !skips_listing && !is_appending_acceleration_refresh(state) {
             self.ensure_data_files(state).await?;
         }
         below.scan_with_args(state, args).await
@@ -5533,6 +5538,85 @@ mod tests {
                 "{extension}"
             );
         }
+    }
+
+    /// A session marked as an acceleration refresh, appending or not, with `facts`
+    /// registered over `dir` behind the empty-listing guard.
+    fn refresh_session(dir: &std::path::Path, appends: Option<bool>) -> SessionContext {
+        let mut config = datafusion::prelude::SessionConfig::new();
+        match appends {
+            Some(true) => {
+                data_components::file_schema_drift::mark_appending_acceleration_refresh(
+                    &mut config,
+                );
+            }
+            Some(false) => {
+                data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+            }
+            None => {}
+        }
+        let table_path =
+            ListingTableUrl::parse(format!("{}/", dir.display())).expect("listing table url");
+        let options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let listing = Arc::new(
+            ListingTable::try_new(
+                ListingTableConfig::new(table_path.clone())
+                    .with_listing_options(options)
+                    .with_schema(schema),
+            )
+            .expect("create listing table"),
+        );
+        let provider = reject_empty_listing(
+            listing,
+            None,
+            table_path,
+            "facts".to_string(),
+            ".parquet".to_string(),
+        );
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("facts", provider)
+            .expect("register table");
+        ctx
+    }
+
+    /// An empty listing fails an ordinary query and a full refresh, which would replace the
+    /// acceleration with nothing. An appending refresh replaces nothing, so it reads the
+    /// empty source as zero rows rather than failing until the first file arrives.
+    #[tokio::test]
+    async fn an_appending_refresh_reads_an_empty_source_as_zero_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("part-0.parquet");
+        write_id_file(&file, &[1, 2, 3]);
+        let query = refresh_session(dir.path(), None);
+        let full = refresh_session(dir.path(), Some(false));
+        let append = refresh_session(dir.path(), Some(true));
+        std::fs::remove_file(&file).expect("empty the source");
+
+        for (session, ctx) in [("query", &query), ("full refresh", &full)] {
+            let err = id_rows(ctx)
+                .await
+                .expect_err("an empty listing is an error outside an appending refresh")
+                .to_string();
+            assert!(
+                err.contains("No data files are yet available for dataset facts"),
+                "{session}: expected the missing-source error, got {err:?}"
+            );
+        }
+        assert_eq!(
+            id_rows(&append)
+                .await
+                .expect("an appending refresh reads an empty source"),
+            0
+        );
+
+        write_id_file(&file, &[1, 2, 3, 4, 5]);
+        assert_eq!(id_rows(&append).await.expect("a new file is read"), 5);
     }
 
     /// The S3 single-object table (`S3SingleFileCached`) does not go through `wrap`,

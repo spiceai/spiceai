@@ -762,9 +762,6 @@ pub struct Refresher {
     initial_status: Option<status::ComponentStatus>,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
-    /// Forwards committed append refreshes to the dataset's `DoExchange`
-    /// subscribers.
-    data_update_publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -828,7 +825,6 @@ impl Refresher {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
-            data_update_publisher: None,
             initial_status: None,
             append_cursor_store: None,
         }
@@ -1008,16 +1004,6 @@ impl Refresher {
         rules: arrow_tools::type_rewrite::TypeRewriteRules,
     ) -> &mut Self {
         self.engine_type_rewrites = rules;
-        self
-    }
-
-    /// Forward each committed append refresh to the dataset's `DoExchange`
-    /// subscribers.
-    pub fn with_data_update_publisher(
-        &mut self,
-        publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
-    ) -> &mut Self {
-        self.data_update_publisher = publisher;
         self
     }
 
@@ -1301,9 +1287,7 @@ impl Refresher {
             .with_change_sink(self.change_sink.clone())
             .with_cache_write_sender(self.cache_write_sender.clone());
 
-        refresh_task_runner = refresh_task_runner
-            .with_cpu_runtime(self.cpu_runtime.clone())
-            .with_data_update_publisher(self.data_update_publisher.clone());
+        refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresh_task_runner =

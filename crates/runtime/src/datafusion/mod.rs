@@ -4312,12 +4312,6 @@ impl DataFusion {
         accelerated_table_builder.cdc_apply_runtime(self.cdc_apply_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
-        accelerated_table_builder.data_update_publisher(Some(
-            crate::dataupdate::DataUpdatePublisher::new(
-                self.data_update_broadcaster.clone(),
-                qualify_dataset_reference(self.normalize_table_reference(dataset.name.clone())),
-            ),
-        ));
         accelerated_table_builder.cdc_param_overrides(
             crate::accelerated::refresh_task::changes::extract_cdc_param_overrides(
                 &acceleration_settings.params,
@@ -9477,41 +9471,5 @@ mod tests {
                 "no refresh was ever recorded, and none can be now the table is gone"
             );
         }
-    }
-}
-
-/// The fully qualified name a dataset registers under, which is the name its
-/// `DoExchange` subscribers are keyed by. A dataset's accelerated table is
-/// built before the dataset registers, so normalizing its name then can still
-/// leave it bare. A bare or partial name registers in the default catalog and
-/// schema, the same defaults `get_table_provider` resolves with.
-fn qualify_dataset_reference(table_reference: TableReference) -> TableReference {
-    match table_reference {
-        TableReference::Full { .. } => table_reference,
-        TableReference::Partial { schema, table } => {
-            TableReference::full(SPICE_DEFAULT_CATALOG, schema, table)
-        }
-        TableReference::Bare { table } => {
-            TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, table)
-        }
-    }
-}
-
-#[cfg(test)]
-mod qualify_dataset_reference_tests {
-    use super::*;
-
-    #[test]
-    fn a_dataset_publishes_under_the_name_it_registers_with() {
-        assert_eq!(
-            qualify_dataset_reference(TableReference::bare("events")),
-            TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "events")
-        );
-        assert_eq!(
-            qualify_dataset_reference(TableReference::partial("audit", "events")),
-            TableReference::full(SPICE_DEFAULT_CATALOG, "audit", "events")
-        );
-        let placed = TableReference::full("pg", "public", "events");
-        assert_eq!(qualify_dataset_reference(placed.clone()), placed);
     }
 }
