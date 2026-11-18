@@ -330,7 +330,11 @@ pub(crate) async fn submit(
         Err(resp) => return resp,
     };
     let result = executor
-        .submit(request, read_only, crate::jobs::current_job_owner().await)
+        .submit(
+            request,
+            read_only,
+            crate::jobs::current_job_caller().await.owner().to_string(),
+        )
         .await;
 
     match result {
@@ -376,7 +380,7 @@ pub(crate) async fn get_query(
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let caller = crate::jobs::current_job_owner().await;
+    let caller = crate::jobs::current_job_caller().await;
     let result = executor.get_status(&query_id, &caller).await;
 
     match result {
@@ -428,7 +432,7 @@ pub(crate) async fn get_status(
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let caller = crate::jobs::current_job_owner().await;
+    let caller = crate::jobs::current_job_caller().await;
     let result = executor.get_status(&query_id, &caller).await;
 
     match result {
@@ -493,7 +497,7 @@ pub(crate) async fn get_results(
     }
 
     // First check the job state
-    let caller = crate::jobs::current_job_owner().await;
+    let caller = crate::jobs::current_job_caller().await;
     let state = match executor.get_status(&query_id, &caller).await {
         Ok(s) => s,
         Err(e) => return error_to_response(&e),
@@ -592,7 +596,7 @@ pub(crate) async fn get_chunk(
         Err(resp) => return resp,
     };
     // First check the job state to get manifest
-    let caller = crate::jobs::current_job_owner().await;
+    let caller = crate::jobs::current_job_caller().await;
     let state = match executor.get_status(&query_id, &caller).await {
         Ok(s) => s,
         Err(e) => return error_to_response(&e),
@@ -663,7 +667,7 @@ pub(crate) async fn cancel(
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let caller = crate::jobs::current_job_owner().await;
+    let caller = crate::jobs::current_job_caller().await;
     let result = executor.cancel(&query_id, &caller).await;
 
     match result {
@@ -711,11 +715,11 @@ pub(crate) async fn cancel_active(
         }
     };
 
-    let caller = crate::jobs::current_job_owner().await;
+    let caller = crate::jobs::current_job_caller().await;
     if rt
         .df
         .query_cancel_registry()
-        .cancel_owned(parsed_uuid, &caller)
+        .cancel_owned(parsed_uuid, caller.owner())
     {
         return (
             StatusCode::OK,
@@ -751,10 +755,10 @@ pub(crate) async fn cancel_active(
     )
 ))]
 pub(crate) async fn list_active(Extension(rt): Extension<Arc<Runtime>>) -> Response {
-    let caller = crate::jobs::current_job_owner().await;
+    let caller = crate::jobs::current_job_caller().await;
     let registry = rt.df.query_cancel_registry();
     let queries: Vec<ActiveQuerySummary> = registry
-        .list_for(&caller)
+        .list_for(caller.owner())
         .into_iter()
         .map(|info| ActiveQuerySummary {
             query_id: info.query_id.to_string(),
@@ -809,7 +813,7 @@ pub(crate) async fn list(
         _ => None,
     });
 
-    let caller = crate::jobs::current_job_owner().await;
+    let caller = crate::jobs::current_job_caller().await;
     match executor.list_jobs(status_filter, &caller).await {
         Ok(jobs) => {
             let limit = query.limit.unwrap_or(100);
@@ -1206,7 +1210,7 @@ mod tests {
                 key: "writer-a".to_string(),
             }) as AuthPrincipalRef)
             .expect("auth principal should be set");
-        let caller_scope: Arc<str> = Arc::from(context.cache_namespace().storage_id());
+        let caller_scope: Arc<str> = Arc::from(context.caller_namespace().storage_id());
 
         let mine = Uuid::from_u128(1);
         let theirs = Uuid::from_u128(2);

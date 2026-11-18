@@ -73,8 +73,10 @@ pub(crate) async fn do_put(
                     "Allowing unauthenticated statement DoPut on executor in mTLS scheduler-trusted mode"
                 );
             } else {
-                return Err(Status::unauthenticated(
-                    "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
+                // No principal: a request without credentials, which a listener beyond
+                // loopback serves read-only (`runtime.auth` refuses one before it gets here).
+                return Err(Status::permission_denied(
+                    runtime_auth::anonymous::write_route_refusal(),
                 ));
             }
         }

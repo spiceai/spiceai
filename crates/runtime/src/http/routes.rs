@@ -84,7 +84,7 @@ use axum::{
     response::IntoResponse,
     routing::{Router, get, post},
 };
-use runtime_auth::{AuthRequestContext, layer::http::AuthLayer};
+use runtime_auth::{AnonymousAccess, AuthRequestContext, layer::http::AuthLayer};
 use tokio::time::Instant;
 use tower_http::cors::{AllowHeaders, AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -420,6 +420,8 @@ pub(crate) fn routes(
     metrics_tls: bool,
     #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,
 ) -> Router {
+    // Without `runtime.auth`, how this listener serves a request without credentials.
+    let anonymous_access = AnonymousAccess::of_listener(&config.http_bind_address);
     // Routes that need a principal with write access. The check is a route layer so it runs
     // after authentication and before each handler's body extractors.
     let write_router = Router::new()
@@ -677,6 +679,13 @@ pub(crate) fn routes(
         // In front of authentication: the Gemini routes also take the key in `x-goog-api-key`.
         authenticated_router = authenticated_router
             .route_layer(middleware::from_fn(v1::gemini::accept_google_api_key));
+    } else {
+        // Without `runtime.auth`, a request without credentials (no client certificate either)
+        // is the local operator on a loopback-only listener, and read-only on any other.
+        authenticated_router =
+            authenticated_router.route_layer(middleware::from_fn(move |req, next| {
+                serve_anonymous_request(anonymous_access, req, next)
+            }));
     }
 
     // mTLS route gate. Wired onto the authenticated router *before* the
@@ -737,6 +746,22 @@ pub(crate) fn routes(
     // rewrite then replaces `Access-Control-Allow-Headers` with the closed
     // MCP set plus requested `Mcp-Param-*` names — not every requested header.
     router.layer(middleware::from_fn(allow_mcp_param_cors_headers))
+}
+
+/// Gives a request without credentials the access `anonymous_access` decides for this listener
+/// (see `runtime_auth::anonymous`): the local operator's principal, or none.
+async fn serve_anonymous_request(
+    anonymous_access: AnonymousAccess,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    if let Some(context) = req
+        .extensions()
+        .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+    {
+        anonymous_access.apply(req.headers(), context.as_ref());
+    }
+    next.run(req).await
 }
 
 async fn track_metrics(

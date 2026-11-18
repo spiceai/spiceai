@@ -44,6 +44,18 @@ pub trait AuthPrincipal {
     fn stable_id(&self) -> Option<Cow<'_, str>> {
         None
     }
+
+    /// Whether query results computed for this principal may be cached in, and served from, the
+    /// results cache that callers without credentials share. Only a principal that reads exactly
+    /// what those callers read may say so: the local operator does, as every caller of a runtime
+    /// without `runtime.auth` reads every dataset, and the results cache never stores what
+    /// differs between callers (`runtime` tables, and functions that are not immutable, such as
+    /// `current_user()`). What it owns keeps its `stable_id` scope.
+    ///
+    /// The default, `false`, keeps the principal's results to itself, which is always safe.
+    fn results_cache_is_shared(&self) -> bool {
+        false
+    }
 }
 /// Whether `principal` may write: it is in the `write` or `read_write` group, as a read-write
 /// API key and a verified mTLS client are. The one definition of write access a tool call is

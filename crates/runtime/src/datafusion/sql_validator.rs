@@ -257,55 +257,123 @@ fn validate_ddl_operation(
 /// by Spice's custom planner cannot bypass the read-only guarantee. Any new
 /// write-capable extension node type MUST be added to [`WRITE_CAPABLE_EXTENSION_NAMES`].
 ///
+/// Each refusal is explained for `caller`: a read-only key, or a request without credentials.
+///
 /// # Returns
 /// * `Ok(())` if the plan contains only read operations.
 /// * `Err(DataFusionError)` if the plan contains any write, schema-mutating, or
 ///   session-mutating operation.
-pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusionError> {
+pub fn validate_sql_query_read_only(
+    plan: &LogicalPlan,
+    caller: ReadOnlyCaller,
+) -> Result<(), DataFusionError> {
     plan.apply_with_subqueries(|node| match node {
-        LogicalPlan::Ddl(ddl) => plan_err!(
-            "DDL operation '{}' is not allowed in read-only SQL context.",
-            ddl.name()
-        ),
-        LogicalPlan::Dml(dml) => plan_err!(
-            "{} operations are not allowed in read-only SQL context.",
-            dml.name()
-        ),
-        LogicalPlan::Copy(_) => {
-            plan_err!("COPY operations are not allowed in read-only SQL context.")
+        LogicalPlan::Ddl(ddl) => Err(caller.refusal(&format!("DDL operation '{}' is", ddl.name()))),
+        LogicalPlan::Dml(dml) => Err(caller.refusal(&match caller {
+            // Today's wording names the plan node, which a read-only key's callers match on.
+            ReadOnlyCaller::Principal => format!("{} operations are", dml.name()),
+            ReadOnlyCaller::Anonymous => format!("{} operations are", sql_statement_of(&dml.op)),
+        })),
+        LogicalPlan::Copy(_) => Err(caller.refusal("COPY operations are")),
+        LogicalPlan::Statement(stmt) => {
+            Err(caller.refusal(&format!("Statement '{}' is", stmt.name())))
         }
-        LogicalPlan::Statement(stmt) => plan_err!(
-            "Statement '{}' is not allowed in read-only SQL context.",
-            stmt.name()
-        ),
         LogicalPlan::Extension(ext) => {
             let name = ext.node.name();
             if WRITE_CAPABLE_EXTENSION_NAMES.contains(&name) {
-                plan_err!(
-                    "Write-capable extension plan '{name}' is not allowed in read-only SQL context."
-                )
+                Err(caller.refusal(&format!("Write-capable extension plan '{name}' is")))
             } else {
-                validate_no_code_executing_functions(node)?;
+                validate_no_code_executing_functions(node, caller)?;
                 Ok(TreeNodeRecursion::Continue)
             }
         }
         _ => {
-            validate_no_code_executing_functions(node)?;
+            validate_no_code_executing_functions(node, caller)?;
             Ok(TreeNodeRecursion::Continue)
         }
     })?;
     Ok(())
 }
 
-fn validate_no_code_executing_functions(plan: &LogicalPlan) -> Result<(), DataFusionError> {
+/// The phrase in every refusal [`validate_sql_query_read_only`] gives a request without
+/// credentials, so a caller can recognize one (and answer `403`).
+pub(crate) const ANONYMOUS_READ_ONLY_MARKER: &str = "not allowed for a request without credentials";
+
+/// Whom a read-only query is read-only for, which decides how a refused operation is explained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadOnlyCaller {
+    /// A principal without write access, or a query that is read-only for another reason.
+    Principal,
+    /// A request without credentials that reached Spice over the network or through a proxy,
+    /// which is served read-only.
+    Anonymous,
+}
+
+impl ReadOnlyCaller {
+    /// The caller of `context`: a request from a client that carries no principal is
+    /// anonymous; the runtime's own work is not.
+    #[must_use]
+    pub fn of(context: &runtime_request_context::RequestContext) -> Self {
+        if runtime_auth::AuthRequestContext::auth_principal(context).is_none()
+            && !matches!(
+                context.protocol(),
+                runtime_request_context::Protocol::Internal
+            )
+        {
+            Self::Anonymous
+        } else {
+            Self::Principal
+        }
+    }
+
+    /// The refusal of `subject`, an operation the plan contains with its verb (`DELETE
+    /// operations are`), for this caller.
+    fn refusal(self, subject: &str) -> DataFusionError {
+        match self {
+            Self::Principal => {
+                DataFusionError::Plan(format!("{subject} not allowed in read-only SQL context."))
+            }
+            Self::Anonymous => DataFusionError::Plan(format!(
+                "{subject} {ANONYMOUS_READ_ONLY_MARKER}, which this runtime serves read-only {}. {}",
+                runtime_auth::anonymous::READ_ONLY_BECAUSE,
+                runtime_auth::anonymous::HOW_TO_WRITE,
+            )),
+        }
+    }
+}
+
+/// The SQL that writes with `op`, as a caller would name the statement. A write `DataFusion`
+/// adds later is named as its plan node is.
+fn sql_statement_of(op: &datafusion::logical_expr::WriteOp) -> &str {
+    use datafusion::logical_expr::{WriteOp, dml::InsertOp};
+    match op {
+        WriteOp::Insert(InsertOp::Append) => "INSERT",
+        WriteOp::Insert(InsertOp::Overwrite) => "INSERT OVERWRITE",
+        WriteOp::Insert(InsertOp::Replace) => "REPLACE",
+        WriteOp::Delete => "DELETE",
+        WriteOp::Update => "UPDATE",
+        WriteOp::Ctas => "CREATE TABLE AS",
+        WriteOp::Truncate => "TRUNCATE",
+        WriteOp::MergeInto(_) => "MERGE",
+        other => other.name(),
+    }
+}
+
+fn validate_no_code_executing_functions(
+    plan: &LogicalPlan,
+    caller: ReadOnlyCaller,
+) -> Result<(), DataFusionError> {
     for expr in plan.expressions() {
         expr.apply(|expr| {
             if let Expr::ScalarFunction(function) = expr {
                 let function_name = function.func.name();
                 if crate::datafusion::udf::is_code_executing_function(function_name) {
-                    return plan_err!(
-                        "Function '{function_name}' requires a read-write API key and is not allowed in read-only SQL context."
-                    );
+                    return Err(caller.refusal(&match caller {
+                        ReadOnlyCaller::Principal => {
+                            format!("Function '{function_name}' requires a read-write API key and")
+                        }
+                        ReadOnlyCaller::Anonymous => format!("Function '{function_name}' is"),
+                    }));
                 }
             }
             Ok(TreeNodeRecursion::Continue)
@@ -1003,7 +1071,8 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        validate_sql_query_read_only(&plan).expect("SELECT must be allowed in read-only context");
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
+            .expect("SELECT must be allowed in read-only context");
     }
 
     #[tokio::test]
@@ -1017,12 +1086,58 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let err = validate_sql_query_read_only(&plan)
+        let err = validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("INSERT must be rejected in read-only context");
         assert!(
             err.to_string().contains("read-only"),
             "error should cite read-only context, got: {err}"
         );
+    }
+
+    /// A request without credentials is told which statement was refused, why, and how to get
+    /// write access; a read-only key keeps today's wording, which names the plan node.
+    #[tokio::test]
+    async fn read_only_refusals_name_the_statement_for_a_request_without_credentials() {
+        let df = create_test_datafusion();
+        let because_and_how = "which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth";
+
+        for (sql, statement) in [
+            ("INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)", "INSERT"),
+            ("DELETE FROM tbl_writable WHERE id = 1", "DELETE"),
+            (
+                "UPDATE tbl_writable SET name = 'bar' WHERE id = 1",
+                "UPDATE",
+            ),
+        ] {
+            let plan = df
+                .ctx
+                .state()
+                .create_logical_plan(sql)
+                .await
+                .expect("plan should be created");
+            let LogicalPlan::Dml(dml) = &plan else {
+                panic!("{sql} plans as DML: {plan}");
+            };
+            let err = validate_sql_query_read_only(&plan, ReadOnlyCaller::Anonymous)
+                .expect_err("a write is refused to a request without credentials");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Error during planning: {statement} operations are not allowed for a request without credentials, {because_and_how}"
+                ),
+                "{sql}"
+            );
+            let err = validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
+                .expect_err("a write is refused to a read-only key");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Error during planning: {} operations are not allowed in read-only SQL context.",
+                    dml.name()
+                ),
+                "{sql}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1057,7 +1172,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let err = validate_sql_query_read_only(&plan)
+        let err = validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("code-executing functions must be rejected");
         assert!(
             err.to_string().contains("read-write API key"),
@@ -1076,7 +1191,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("DELETE must be rejected in read-only context");
     }
 
@@ -1091,7 +1206,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("UPDATE must be rejected in read-only context");
     }
 
@@ -1108,7 +1223,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("INSERT into a writable catalog must be rejected in read-only context");
     }
 
@@ -1123,7 +1238,8 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        validate_sql_query_read_only(&plan).expect_err("DDL must be rejected in read-only context");
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
+            .expect_err("DDL must be rejected in read-only context");
     }
 
     #[tokio::test]
@@ -1137,7 +1253,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let err = validate_sql_query_read_only(&plan)
+        let err = validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("COPY must be rejected in read-only context");
         assert!(
             err.to_string().contains("COPY"),
@@ -1158,7 +1274,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("PREPARE must be rejected in read-only context");
     }
 
@@ -1183,7 +1299,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("EXECUTE must be rejected in read-only context");
     }
 
@@ -1203,7 +1319,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("DEALLOCATE must be rejected in read-only context");
     }
 
@@ -1272,7 +1388,7 @@ mod tests {
                     name: banned_name,
                 }),
             });
-            let err = validate_sql_query_read_only(&plan)
+            let err = validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
                 .err()
                 .unwrap_or_else(|| {
                     panic!("extension '{banned_name}' must be rejected in read-only context")
@@ -1293,7 +1409,7 @@ mod tests {
                 name: "IndexTableScanNode",
             }),
         });
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect("non-write extension must be allowed in read-only context");
     }
 
@@ -1320,7 +1436,7 @@ mod tests {
             .await
             .expect("plan should be created via Spice planner");
 
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("INSERT via Spice planner must be rejected in read-only context");
     }
 }

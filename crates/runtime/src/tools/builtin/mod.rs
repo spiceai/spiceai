@@ -27,8 +27,9 @@ mod tests {
     //!
     //!   * `ReadWrite` principal → INSERT succeeds.
     //!   * `ReadOnly` principal  → INSERT rejected with "read-only SQL context".
-    //!   * No principal (auth disabled) → INSERT rejected with "read-only SQL context",
-    //!     including when a model calls the tool from a chat completion or a response.
+    //!   * No principal (a request without credentials on a listener beyond loopback) →
+    //!     INSERT rejected as not allowed for a request without credentials, including when a
+    //!     model calls the tool from a chat completion or a response.
     use crate::{
         datafusion::{DataFusion, builder::DataFusionBuilder},
         model::{ToolUsingChat, ToolUsingResponses},
@@ -58,12 +59,14 @@ mod tests {
 
     const INSERT_SQL: &str = "INSERT INTO audit (id, name) VALUES (1, 'unit-test')";
 
-    /// The `sql` tool's error for an INSERT it runs read-only.
-    const READ_ONLY_REJECTION: &str = "Query execution failed: External error: Failed to execute query: Error during planning: Insert Into operations are not allowed in read-only SQL context.";
+    /// The `sql` tool's error for an INSERT by a request without credentials, which it runs
+    /// read-only.
+    const ANONYMOUS_REJECTION: &str = "Query execution failed: External error: Failed to execute query: Error during planning: INSERT operations are not allowed for a request without credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth";
 
-    /// The tool result a model receives when the `sql` tool rejects its INSERT.
+    /// The tool result a model receives when the `sql` tool rejects the INSERT of a request
+    /// without credentials.
     fn rejected_tool_result() -> String {
-        format!("Failed to call the tool sql. An error occurred: {READ_ONLY_REJECTION}")
+        format!("Failed to call the tool sql. An error occurred: {ANONYMOUS_REJECTION}")
     }
 
     fn test_schema() -> Arc<Schema> {
@@ -202,7 +205,7 @@ mod tests {
             .scope(async { run_insert(&tool).await })
             .await
             .expect_err("INSERT with no principal must be blocked");
-        assert_eq!(err.to_string(), READ_ONLY_REJECTION);
+        assert_eq!(err.to_string(), ANONYMOUS_REJECTION);
         assert_audit_is_empty(&df).await;
     }
 

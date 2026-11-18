@@ -162,6 +162,16 @@ where
             || app.as_ref().and_then(|a| a.runtime.mcp.clone()),
             |r| r.mcp.clone(),
         );
+    // Without `runtime.auth` and a required client certificate, a request may arrive without
+    // credentials; this listener's bind address decides how it is served.
+    let serves_anonymous_requests = auth_provider.is_none()
+        && !tls_config.as_ref().is_some_and(|tls| {
+            matches!(
+                tls.client_auth,
+                runtime_tls::ClientAuthEnforcement::Required
+            )
+        });
+    let anonymous_listener = config.http_bind_address;
     let auth_layer = auth_provider.map(AuthLayer::new);
     let routes = routes::routes(
         &rt,
@@ -179,6 +189,9 @@ where
         .await
         .context(UnableToBindServerToPortSnafu)?;
     tracing::info!("Spice Runtime HTTP listening on {bind_address:?}");
+    if serves_anonymous_requests {
+        log_anonymous_access("HTTP", &anonymous_listener);
+    }
 
     runtime_metrics::spiced_runtime::HTTP_SERVER_START.add(1, &[]);
 
@@ -235,6 +248,19 @@ where
     tracing::debug!("Stopped");
 
     Ok(())
+}
+
+/// Logs how `listener` (`HTTP`, `Flight`), bound to `bind_address`, serves requests without
+/// credentials on a runtime without `runtime.auth`: as the local operator (INFO), or read-only
+/// (WARN).
+pub(crate) fn log_anonymous_access(listener: &str, bind_address: &std::net::SocketAddr) {
+    let access = runtime_auth::AnonymousAccess::of_listener(bind_address);
+    let line = access.startup_line(listener, bind_address);
+    if access.startup_line_warns() {
+        tracing::warn!("{line}");
+    } else {
+        tracing::info!("{line}");
+    }
 }
 
 /// Disables Nagle's algorithm on an accepted connection.

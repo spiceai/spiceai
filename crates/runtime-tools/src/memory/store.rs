@@ -390,8 +390,8 @@ mod tests {
         );
     }
 
-    /// A request with no principal on a runtime that authenticates callers (the default until
-    /// the runtime starts serving) is the runtime's own work, and may not write memories either.
+    /// A request with no principal (anonymous, on a listener beyond loopback) may not write
+    /// memories either.
     #[tokio::test]
     async fn store_memory_rejects_request_without_principal() {
         let engine = Arc::new(RecordingQueryEngine::new());
@@ -406,7 +406,7 @@ mod tests {
             .await;
         assert_eq!(
             err.to_string(),
-            "Failed to call tool 'store_memory': the tool can change data or act outside Spice, and the request has no credentials. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth"
+            "Failed to call tool 'store_memory': the tool can change data or act outside Spice, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth"
         );
         assert_eq!(
             engine.write_calls(),

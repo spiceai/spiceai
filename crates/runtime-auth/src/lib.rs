@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod anonymous;
 pub mod api_key;
 pub mod error;
 pub mod layer;
 pub mod mtls;
 mod traits;
 
+pub use anonymous::{AnonymousAccess, LocalPrincipal};
 pub use mtls::{ChannelIdentity, IdentitySource, MtlsPrincipal};
 pub use traits::*;

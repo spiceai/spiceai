@@ -117,8 +117,10 @@ impl EndpointAuth {
         self
     }
 
-    /// The startup warning for an `app` whose data any caller can change, or `None` when this
-    /// runtime authenticates callers or nothing in `app` is writable. A dataset or catalog with
+    /// The startup warning for an `app` whose data any process on this machine can change, as
+    /// the local operator on a loopback-only listener, or `None` when this runtime
+    /// authenticates callers or nothing in `app` is writable. The caller logs it only when a
+    /// listener is loopback-only. A dataset or catalog with
     /// write access is writable, and so is an accelerated dataset, through its refresh and CDC
     /// endpoints.
     #[must_use]
@@ -161,7 +163,7 @@ impl EndpointAuth {
         }
 
         Some(format!(
-            "`runtime.auth` is not configured, so any caller who can reach this runtime can modify {}. Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth",
+            "`runtime.auth` is not configured, so any process on this machine can modify {}. Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth",
             writable.join(", ")
         ))
     }
@@ -420,7 +422,7 @@ mod tests {
         assert_eq!(
             warning_for(&app, ClientAuthMode::None).await.as_deref(),
             Some(
-                "`runtime.auth` is not configured, so any caller who can reach this runtime can modify dataset 'orders' (`access: read_write`), dataset 'trips' (accelerated), catalog 'lake' (`access: read_write_create`). Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth"
+                "`runtime.auth` is not configured, so any process on this machine can modify dataset 'orders' (`access: read_write`), dataset 'trips' (accelerated), catalog 'lake' (`access: read_write_create`). Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth"
             )
         );
     }
@@ -433,7 +435,7 @@ mod tests {
         assert_eq!(
             warning_for(&app, ClientAuthMode::Request).await.as_deref(),
             Some(
-                "`runtime.auth` is not configured, so any caller who can reach this runtime can modify dataset 'trips' (accelerated). Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth"
+                "`runtime.auth` is not configured, so any process on this machine can modify dataset 'trips' (accelerated). Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth"
             )
         );
     }
