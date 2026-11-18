@@ -3429,7 +3429,7 @@ fn cloud_connect_login_endpoint(
         _ => Err(Error::cloud_with_hint(
             CloudErrorCode::InvalidRequest,
             format!(
-                "This directory's Cloud Connect identity uses the Spice Cloud endpoint {identity_endpoint}, but the configured Spice Cloud endpoint is {configured_endpoint}. Spice sends your login only to the configured Spice Cloud endpoint."
+                "This directory's Cloud Connect identity uses the Spice Cloud endpoint {identity_endpoint:?}, but the configured Spice Cloud endpoint is {configured_endpoint:?}. Spice sends your login only to the configured Spice Cloud endpoint."
             ),
             "To use a different Spice Cloud, set SPICE_CLOUD_API_URL.",
         )),
@@ -6065,6 +6065,20 @@ mod tests {
                 "the error names the setting: {message}"
             );
         }
+    }
+
+    #[test]
+    fn cloud_connect_login_error_escapes_the_identity_endpoint() {
+        let err = cloud_connect_login_endpoint(
+            Some("https://identity.example\n\u{1b}[2Kanother line"),
+            "https://api.spice.ai",
+        )
+        .expect_err("a different endpoint must not receive the login");
+        let message = err.to_string();
+        assert!(
+            !message.contains('\n') && !message.contains('\u{1b}'),
+            "control characters from the identity file are escaped: {message:?}"
+        );
     }
 
     #[test]
