@@ -13,9 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::result::{current_budget, encode_batches, result_schema};
 use crate::utils::parameters;
-use arrow::util::pretty::pretty_format_batches;
-use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
 use async_trait::async_trait;
 use datafusion::common::TableReference;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
@@ -96,6 +95,10 @@ impl SpiceModelTool for SampleDataTool {
         }
     }
 
+    fn output_schema(&self) -> Option<Value> {
+        Some(result_schema())
+    }
+
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let params = self.method.parse_args(arg).boxed()?;
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name().to_string(), input = format!("{params}"), sample_method = self.method.name());
@@ -109,14 +112,15 @@ impl SpiceModelTool for SampleDataTool {
                 }
             }
 
-            let mut batch = params.sample(Arc::clone(&self.df)).await?;
-
-            // truncate large text fields
-            batch = truncate_string_columns(&batch, 512)?;
-            batch = truncate_numeric_column_length(&batch, 8)?;
-
-            let serial = pretty_format_batches(&[batch]).boxed()?;
-            Ok(Value::String(format!("{serial}")))
+            let budget = current_budget();
+            // One row past the budget tells the encoder whether the sample has more rows than
+            // it can show; sampling more than that would be read and thrown away.
+            let batch = params
+                .clone()
+                .with_row_limit(budget.max_rows().saturating_add(1))
+                .sample(Arc::clone(&self.df))
+                .await?;
+            Ok(encode_batches(&batch.schema(), &[batch], budget)?.into_value()?)
         }
         .instrument(span.clone())
         .await;

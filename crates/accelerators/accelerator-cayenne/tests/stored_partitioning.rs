@@ -18,11 +18,6 @@ limitations under the License.
 //! different partitioning than its `partition_by`. Cayenne does not
 //! re-partition stored data, so opening it would serve none of its rows.
 
-#![expect(
-    clippy::expect_used,
-    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
-)]
-
 use std::{path::Path, sync::Arc};
 
 use accelerator_cayenne::CayenneAccelerator;
@@ -277,7 +272,7 @@ async fn a_partition_created_after_a_kept_change_takes_the_stored_settings() {
     .expect("catalog");
     catalog.init().await.expect("init catalog");
     let parent = catalog.get_table("t").await.expect("the stored table");
-    assert!(parent.primary_key.is_empty());
+    assert_eq!(parent.primary_key, [] as [String; 0]);
     let stored_root = parent.path.trim_end_matches('/').to_string();
     let partitions = catalog
         .get_partitions(&parent.table_id)

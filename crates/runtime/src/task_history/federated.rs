@@ -868,6 +868,6 @@ mod tests {
             false,
         )]));
         let result = sort_batches_by_start_time(&[], &schema).expect("empty input should succeed");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [RecordBatch; 0]);
     }
 }

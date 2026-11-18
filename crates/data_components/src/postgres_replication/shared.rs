@@ -2302,7 +2302,6 @@ fn implicitly_published_release_message(
 ///
 /// Mirrors [`super::start_replication_stream`]'s lazy contract — setup runs on
 /// first poll and setup errors surface through the stream.
-#[must_use]
 pub fn subscribe(input: ReplicationStreamInput) -> ChangesStream {
     Box::pin(
         stream::once(async move { subscribe_inner(input).await }).flat_map(|result| match result {
@@ -2643,8 +2642,13 @@ async fn attach_member(
     // replay from re-delivering commits the acceleration durably holds (see
     // `AckSlot::seat_recorded` for why re-delivery loses writes on a durable
     // write-back dataset).
+    //
+    // A rebuild whose position is still sound seats it too: the re-read already
+    // holds every change at or below it, and replaying them after the dataset is
+    // ready serves older states of the table (see
+    // `RebuildCause::keeps_recorded_position`).
     if let (Some(slot), super::RecordedPosition::At(resumed)) = (&ack_slot, &watermark)
-        && !rebuild_via_consumer
+        && rebuild_cause.is_none_or(super::RebuildCause::keeps_recorded_position)
     {
         slot.seat_recorded(resumed.lsn);
     }
@@ -6436,10 +6440,9 @@ mod tests {
         let (source, _) = test_source_with_members(0);
         source.install_reservations(&shared_setup(100, true, &["t0"]));
         assert!(source.ack.slot(&key("t0")).is_none());
-        assert!(
-            source
-                .take_expired_reservations(std::time::Duration::ZERO)
-                .is_empty()
+        assert_eq!(
+            source.take_expired_reservations(std::time::Duration::ZERO),
+            [] as [(String, String); 0]
         );
     }
 

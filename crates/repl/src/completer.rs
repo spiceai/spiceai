@@ -877,10 +877,10 @@ mod tests {
         let helper = create_test_editor_helper();
 
         let completions = get_completions(&helper, "xyz", 3);
-        assert!(completions.is_empty());
+        assert_eq!(completions, [] as [String; 0]);
 
         let completions = get_completions(&helper, "qwerty", 6);
-        assert!(completions.is_empty());
+        assert_eq!(completions, [] as [String; 0]);
     }
 
     #[test]

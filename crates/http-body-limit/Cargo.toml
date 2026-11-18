@@ -24,7 +24,7 @@ tokio-util = { workspace = true, features = ["io"] }
 brotli = "8.0.2"
 flate2 = "1.1"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
-zstd = "0.13"
+zstd = "0.13.5"
 
 [lints]
 workspace = true

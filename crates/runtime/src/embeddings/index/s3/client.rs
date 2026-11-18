@@ -503,7 +503,7 @@ mod tests {
         // within TTL should use cache
         let output = client.list_indexes(&input).await.expect("test assertion");
 
-        assert!(!output.indexes().is_empty());
+        assert_ne!(output.indexes(), []);
         assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 1);
         resume();
     }
@@ -531,7 +531,7 @@ mod tests {
         // miss cache and call client again
         let output = client.list_indexes(&input).await.expect("test assertion");
 
-        assert!(!output.indexes().is_empty());
+        assert_ne!(output.indexes(), []);
         assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
         resume();
     }
@@ -553,7 +553,7 @@ mod tests {
 
         let output = client.list_indexes(&input).await.expect("test assertion");
 
-        assert!(!output.indexes().is_empty());
+        assert_ne!(output.indexes(), []);
         assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
     }
 
@@ -581,7 +581,7 @@ mod tests {
             .expect("test assertion");
         let output = client.list_indexes(&input).await.expect("test assertion");
 
-        assert!(!output.indexes().is_empty());
+        assert_ne!(output.indexes(), []);
         assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
         resume();
     }
@@ -611,7 +611,7 @@ mod tests {
             .await
             .expect("test assertion");
 
-        assert!(!output.indexes().is_empty());
+        assert_ne!(output.indexes(), []);
         assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
         resume();
     }
@@ -641,10 +641,10 @@ mod tests {
         let _ = client.list_indexes(&input2).await.expect("test assertion");
 
         let result = client.list_indexes(&input1).await.expect("test assertion");
-        assert!(!result.indexes().is_empty());
+        assert_ne!(result.indexes(), []);
 
         let result = client.list_indexes(&input2).await.expect("test assertion");
-        assert!(!result.indexes().is_empty());
+        assert_ne!(result.indexes(), []);
 
         assert_eq!(mock_client.get_list_indexes_call_count("bucket1"), 1);
         assert_eq!(mock_client.get_list_indexes_call_count("bucket2"), 1);

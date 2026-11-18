@@ -32,9 +32,8 @@ use datafusion::{
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-use runtime_acceleration::change_sink::ChangeSink;
-use runtime_acceleration::change_sink::SetKey;
 use runtime_acceleration::change_sink::batching::{AppendIngress, CoalescingLimits};
+use runtime_acceleration::change_sink::{ChangeBatch, ChangeSink, ScopedRows, SetKey};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -415,14 +414,13 @@ fn cache_write(
         })
         .into_iter()
         .collect();
+    let rows = ScopedRows::try_new(scope, Arc::clone(schema), rows).expect("cache write");
+    let lane = Some(Arc::clone(lane));
     if replaces {
-        ChangeBatch::replace_set(scope, Arc::clone(schema), rows)
+        ChangeBatch::Replace { rows, lane }
     } else {
-        ChangeBatch::append_scoped(scope, Arc::clone(schema), rows)
+        ChangeBatch::AppendScoped { rows, lane }
     }
-    .expect("cache write")
-    .with_append_ingress(Arc::clone(lane))
-    .expect("append lane")
 }
 
 type StoredResponse = (String, String, Option<String>, String);
@@ -650,14 +648,15 @@ async fn cache_replacements_by_key_match_the_scope_delete() {
     );
 }
 
-/// The prefix of `dataset`'s object-native log in the catalog at `catalog/`.
+/// The prefix of `dataset`'s object-native log in the catalog at
+/// `state/cayenne/v1/catalog/`.
 async fn object_native_log(
     store: &Arc<dyn object_store::ObjectStore>,
     dataset: &str,
 ) -> object_store::path::Path {
     cayenne::metastore::object_native::dataset_log_at(
         Arc::clone(store),
-        &object_store::path::Path::from("catalog"),
+        &object_store::path::Path::from("state/cayenne/v1/catalog"),
         dataset,
     )
     .await
@@ -710,30 +709,40 @@ async fn an_object_native_durable_cdc_write_commits_its_position_with_its_data()
         array::{ListArray, StructArray},
         buffer::OffsetBuffer,
     };
-    use cayenne::metastore::object_native::ObjectNativeCatalog;
+    use cayenne::metastore::object_native::{ObjectNativeCatalog, new_dataset_folder};
 
     let ctx = SessionContext::new();
-    let dir = tempfile::tempdir().expect("table directory");
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let catalog = Arc::new(
-        ObjectNativeCatalog::create(
+        ObjectNativeCatalog::open_or_create_at(
             Arc::clone(&store),
-            object_store::path::Path::from("catalog"),
+            object_store::path::Path::from("state/cayenne/v1/catalog"),
+            "s3://bucket/state/cayenne/v1",
         )
         .await
         .expect("object-native catalog"),
+    );
+    // A placed table: its data path is its dataset folder in the location.
+    let data_url = format!(
+        "s3://bucket/{}/{}/data",
+        catalog.datasets_prefix(),
+        new_dataset_folder("positions")
     );
     let table = Arc::new(
         CayenneTableProviderBuilder::new(
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
             ctx.runtime_env(),
         )
+        .with_object_store(cayenne::metadata::ObjectStoreConfig {
+            url: url::Url::parse(&data_url).expect("data url"),
+            store: Arc::clone(&store),
+        })
         .create(CreateTableOptions {
             table_name: "positions".into(),
             schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
             primary_key: vec!["id".into()],
             on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".into()]))),
-            base_path: dir.path().join("data").to_string_lossy().into_owned(),
+            base_path: data_url.clone(),
             partition_column: None,
             vortex_config: VortexConfig {
                 cdc_durability: CdcDurability::File,

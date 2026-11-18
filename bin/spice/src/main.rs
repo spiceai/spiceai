@@ -2207,7 +2207,7 @@ mod tests {
     #[test]
     fn every_argument_after_orca_is_orcas() {
         let cli = parse_normalized(&["spice", "orca"]);
-        assert!(agent_args(&cli.command).is_empty());
+        assert_eq!(agent_args(&cli.command), [] as [String; 0]);
         let cli = parse_normalized(&[
             "spice",
             "--http-endpoint",

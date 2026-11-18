@@ -262,7 +262,7 @@ async fn full_refresh_acceleration_adopts_changed_settings_on_restart() -> Resul
             let ids = fixture.ids_after_restart("trips", &full).await?;
             assert_eq!(ids, vec![1, 1, 2, 2, 3]);
             let built = fixture.stored("trips").await?;
-            assert!(built.vortex_config.sort_columns.is_empty());
+            assert_eq!(built.vortex_config.sort_columns, [] as [String; 0]);
 
             // A sort order is a layout setting: the existing acceleration is reused (same
             // table) and records the new setting.
@@ -609,7 +609,7 @@ async fn a_changed_primary_key_rebuilds_an_acceleration_served_before_its_source
     anyhow::ensure!(built, "building the acceleration, got {observed:?}");
     checkpointed?;
     let first = stored().await?;
-    assert!(first.primary_key.is_empty());
+    assert_eq!(first.primary_key, [] as [String; 0]);
 
     // The source changes, and the dataset restarts with a primary key while the source
     // answers: the acceleration is rebuilt and loads the source's new value.
@@ -785,7 +785,7 @@ async fn a_changed_primary_key_is_held_while_every_read_of_the_source_fails()
     anyhow::ensure!(built, "building the acceleration, got {observed:?}");
     checkpointed?;
     let first = stored().await?;
-    assert!(first.primary_key.is_empty());
+    assert_eq!(first.primary_key, [] as [String; 0]);
 
     // The source changes, and the dataset restarts with a primary key while the source
     // still builds its table but fails every read of it. A rebuilt acceleration could
@@ -808,7 +808,7 @@ async fn a_changed_primary_key_is_held_while_every_read_of_the_source_fails()
     );
     let held = stored().await?;
     assert_eq!(held.table_id, first.table_id);
-    assert!(held.primary_key.is_empty());
+    assert_eq!(held.primary_key, [] as [String; 0]);
 
     // Once the source can be read, the next restart rebuilds with the new key and loads
     // the source's new value.
@@ -1010,7 +1010,7 @@ async fn an_accelerated_view_rebuilds_for_a_changed_primary_key_on_restart()
     let unkeyed = ids_after_restart(view(None), vec![1, 1, 2, 2, 3]).await?;
     assert_eq!(unkeyed, [1, 1, 2, 2, 3]);
     let first = fixture.stored("trips_view").await?;
-    assert!(first.primary_key.is_empty());
+    assert_eq!(first.primary_key, [] as [String; 0]);
 
     // Restarted with a primary key: the acceleration is rebuilt and reloads one row
     // per key.
@@ -1168,7 +1168,7 @@ async fn an_accelerated_view_is_held_while_every_read_of_its_source_fails()
     anyhow::ensure!(built, "building the view's acceleration, got {observed:?}");
     checkpoint?;
     let first = stored().await?;
-    assert!(first.primary_key.is_empty());
+    assert_eq!(first.primary_key, [] as [String; 0]);
 
     // The source changes, and the view restarts with a primary key while the source still
     // builds its table but fails every read of it. A rebuilt acceleration could not
@@ -1190,7 +1190,7 @@ async fn an_accelerated_view_is_held_while_every_read_of_its_source_fails()
     );
     let held = stored().await?;
     assert_eq!(held.table_id, first.table_id);
-    assert!(held.primary_key.is_empty());
+    assert_eq!(held.primary_key, [] as [String; 0]);
 
     // Once the source can be read, the next restart rebuilds with the new key and loads
     // the source's new value.
@@ -1250,7 +1250,7 @@ async fn a_changed_primary_key_is_held_while_the_refresh_sql_fails() -> Result<(
     );
     let held = fixture.stored("trips").await?;
     assert_eq!(held.table_id, first.table_id);
-    assert!(held.primary_key.is_empty());
+    assert_eq!(held.primary_key, [] as [String; 0]);
 
     // Without that row the refresh SQL runs again, and the next restart rebuilds.
     fixture.write_source(CSV)?;

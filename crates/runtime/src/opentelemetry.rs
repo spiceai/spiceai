@@ -2063,9 +2063,15 @@ mod tests {
             vec!["tier".to_string()]
         );
         // No new columns -> empty (no evolution trigger).
-        assert!(detect_added_columns(&existing, &existing).is_empty());
+        assert_eq!(
+            detect_added_columns(&existing, &existing),
+            [] as [String; 0]
+        );
         // A subset (missing column) reports nothing added, even though it differs.
-        assert!(detect_added_columns(&incoming, &existing).is_empty());
+        assert_eq!(
+            detect_added_columns(&incoming, &existing),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -3007,7 +3013,7 @@ mod tests {
             Field::new("a", DataType::Utf8, true),
             Field::new("b", DataType::Int64, true),
         ]);
-        assert!(duplicate_column_names(&well_formed).is_empty());
+        assert_eq!(duplicate_column_names(&well_formed), [] as [&str; 0]);
     }
 
     /// A metric table can hold two columns of the same name, because Arrow permits duplicate
@@ -3566,7 +3572,7 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
         assert_eq!(status.message(), "API key does not allow write access");
         assert_eq!(engine.rows_written(), 0);
-        assert!(engine.tables_written().is_empty());
+        assert_eq!(engine.tables_written(), [] as [String; 0]);
     }
 
     /// A read-write API key still stores the export.

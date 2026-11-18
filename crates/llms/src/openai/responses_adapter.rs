@@ -815,6 +815,7 @@ fn chat_stream_choice(
     ChatChoiceStream {
         index,
         delta: ChatCompletionStreamResponseDelta {
+            reasoning_content: None,
             content,
             function_call: None,
             tool_calls,
