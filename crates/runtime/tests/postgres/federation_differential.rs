@@ -156,6 +156,8 @@ const REMOTE_SCANS: [&str; 2] = ["VirtualExecutionPlan", "SqlExec"];
 struct Operator<'a> {
     name: &'a str,
     depth: usize,
+    /// The operator's whole line, with its details.
+    line: &'a str,
 }
 
 /// The physical plan text in `plan`, an `EXPLAIN` answer.
@@ -176,6 +178,7 @@ fn operators(physical: &str) -> Vec<Operator<'_>> {
             Some(Operator {
                 name,
                 depth: line.len() - line.trim_start().len(),
+                line,
             })
         })
         .collect()
@@ -183,7 +186,7 @@ fn operators(physical: &str) -> Vec<Operator<'_>> {
 
 /// Each operator of `operators` with no child, a source its rows come from,
 /// with the names of the operators above it.
-fn leaves<'a>(operators: &[Operator<'a>]) -> Vec<(&'a str, Vec<&'a str>)> {
+fn leaves<'o, 'a>(operators: &'o [Operator<'a>]) -> Vec<(&'o Operator<'a>, Vec<&'a str>)> {
     let mut above: Vec<&Operator<'a>> = Vec::new();
     let mut leaves = Vec::new();
     for (i, op) in operators.iter().enumerate() {
@@ -194,7 +197,7 @@ fn leaves<'a>(operators: &[Operator<'a>]) -> Vec<(&'a str, Vec<&'a str>)> {
             .get(i + 1)
             .is_none_or(|next| next.depth <= op.depth)
         {
-            leaves.push((op.name, above.iter().map(|parent| parent.name).collect()));
+            leaves.push((op, above.iter().map(|parent| parent.name).collect()));
         }
         above.push(op);
     }
@@ -601,57 +604,49 @@ const CAYENNE_SCAN: &str = "CayenneAccelerationExec";
 const CONSTANT_SOURCES: [&str; 2] = ["PlaceholderRowExec", "EmptyExec"];
 
 /// Checks that every source of the physical plan in `plan`, an `EXPLAIN`
-/// answer, is read through a [`CAYENNE_SCAN`] or is one of
-/// [`CONSTANT_SOURCES`]. A Cayenne side with any other source answered from
-/// somewhere else, and its agreement says nothing about Cayenne.
-fn check_cayenne_sources(plan: &[Row]) -> Result<(), String> {
+/// answer, is one `accepts` admits, given the operators above it, or is one of
+/// [`CONSTANT_SOURCES`]. A side with any other source answered from somewhere
+/// other than `what`, and its agreement says nothing about it.
+fn check_sources(
+    plan: &[Row],
+    accepts: impl Fn(&Operator, &[&str]) -> bool,
+    what: &str,
+) -> Result<(), String> {
     let physical = physical_plan(plan)?;
-    let other: Vec<&str> = leaves(&operators(&physical))
+    let operators = operators(&physical);
+    let other: Vec<&str> = leaves(&operators)
         .into_iter()
-        .filter(|(leaf, above)| {
-            *leaf != CAYENNE_SCAN
-                && !above.contains(&CAYENNE_SCAN)
-                && !CONSTANT_SOURCES.contains(leaf)
-        })
-        .map(|(leaf, _)| leaf)
+        .filter(|(leaf, above)| !accepts(leaf, above) && !CONSTANT_SOURCES.contains(&leaf.name))
+        .map(|(leaf, _)| leaf.name)
         .collect();
     if other.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "the plan reads {other:?}, not only the Cayenne acceleration ({CAYENNE_SCAN}):\n{physical}"
+            "the plan reads {other:?}, not only {what}:\n{physical}"
         ))
     }
 }
 
-/// Checks that every source of the physical plan in `plan`, an `EXPLAIN`
-/// answer, is SQL sent to the `SQLite` acceleration, or is one of
-/// [`CONSTANT_SOURCES`]. A `SQLite` side with any other source answered from
-/// somewhere else, and its agreement says nothing about `SQLite`.
+/// Checks that every source of the physical plan in `plan` is read through a
+/// [`CAYENNE_SCAN`], so a Cayenne side answers from what Cayenne stored.
+fn check_cayenne_sources(plan: &[Row]) -> Result<(), String> {
+    check_sources(
+        plan,
+        |leaf, above| leaf.name == CAYENNE_SCAN || above.contains(&CAYENNE_SCAN),
+        "the Cayenne acceleration (CayenneAccelerationExec)",
+    )
+}
+
+/// Checks that every source of the physical plan in `plan` is SQL sent to the
+/// `SQLite` acceleration, so a `SQLite` side answers from `SQLite`.
 #[cfg(feature = "sqlite")]
 fn check_sqlite_sources(plan: &[Row]) -> Result<(), String> {
-    let physical = physical_plan(plan)?;
-    let other: Vec<&str> = leaves(&operators(&physical))
-        .into_iter()
-        .filter(|(leaf, _)| !REMOTE_SCANS.contains(leaf) && !CONSTANT_SOURCES.contains(leaf))
-        .map(|(leaf, _)| leaf)
-        .collect();
-    let not_sqlite = physical.lines().any(|line| {
-        REMOTE_SCANS.contains(
-            &line
-                .trim_start()
-                .split([':', ' '])
-                .next()
-                .unwrap_or_default(),
-        ) && !line.contains("name=sqlite")
-    });
-    if other.is_empty() && !not_sqlite {
-        Ok(())
-    } else {
-        Err(format!(
-            "the plan reads {other:?} or SQL sent elsewhere, not only the SQLite acceleration:\n{physical}"
-        ))
-    }
+    check_sources(
+        plan,
+        |leaf, _| REMOTE_SCANS.contains(&leaf.name) && leaf.line.contains("name=sqlite"),
+        "the SQLite acceleration",
+    )
 }
 
 async fn compare_case(
@@ -788,7 +783,9 @@ async fn federated_and_accelerated_postgres_answers_match_postgres() -> Result<(
                     .map_err(|e| anyhow::anyhow!(e))?;
                 let physical = physical_plan(&plan).map_err(|e| anyhow::anyhow!(e))?;
                 anyhow::ensure!(
-                    physical.contains("PartitionedUnionExec"),
+                    operators(&physical)
+                        .iter()
+                        .any(|op| op.name == "PartitionedUnionExec"),
                     "{} sets `partition_by` but its scan reads no partitions:\n{physical}",
                     subject.items
                 );
