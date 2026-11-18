@@ -639,7 +639,7 @@ mod tests {
     }
 
     fn status_settled_with_one_failed_dataset() -> Arc<RuntimeStatus> {
-        use datafusion::sql::TableReference;
+        use datafusion::common::TableReference;
         use runtime_status::{ComponentStatus, RuntimeReadyState};
         let status = RuntimeStatus::new();
         status.set_ready_state(RuntimeReadyState::OnLoad);
@@ -676,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn allow_unhealthy_stays_not_ready_when_every_dataset_failed() {
-        use datafusion::sql::TableReference;
+        use datafusion::common::TableReference;
         use runtime_status::{ComponentStatus, RuntimeReadyState};
         let status = RuntimeStatus::new();
         status.set_ready_state(RuntimeReadyState::OnLoad);
