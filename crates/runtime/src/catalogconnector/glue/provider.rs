@@ -44,6 +44,7 @@ use parking_lot::Mutex;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -111,6 +112,9 @@ pub struct GlueCatalogProvider {
     catalog_id: Option<String>,
     databases: RwLock<HashMap<DatabaseName, Arc<dyn SchemaProvider>>>,
     unreadable_warnings: UnreadableWarnings,
+    /// Spacing for the per-database warnings about tables kept after a failed
+    /// load and databases whose tables could not be listed.
+    degraded_warnings: UnreadableWarnings,
 }
 
 impl fmt::Debug for GlueCatalogProvider {
@@ -165,17 +169,22 @@ impl GlueCatalogProvider {
             catalog_id: catalog.catalog_id.clone(),
             parameters,
             unreadable_warnings: UnreadableWarnings::default(),
+            degraded_warnings: UnreadableWarnings::default(),
         })
     }
 
-    /// Builds the schema provider for one database, and reports the summary of
-    /// the tables it holds that Spice cannot read. The summary is returned
-    /// rather than logged here so that `refresh` can decide it against the rest
-    /// of the catalog, once the whole snapshot is known to have succeeded.
+    /// Builds the schema provider for one database, and reports the summaries of
+    /// the tables it holds that Spice cannot read or could not reload. The
+    /// summaries are returned rather than logged here so that `refresh` can
+    /// decide them against the rest of the catalog, once the whole snapshot is
+    /// known to have succeeded.
+    ///
+    /// `previous` is this database's schema from the previous refresh, if any.
     async fn create_schema_provider(
         &self,
         database: String,
-    ) -> Result<(Arc<dyn SchemaProvider>, Option<UnreadableSummary>)> {
+        previous: Option<Arc<dyn SchemaProvider>>,
+    ) -> Result<SchemaBuild> {
         let mut tables_builder = self.client.get_tables().database_name(&database);
 
         if let Some(catalog_id) = &self.catalog_id {
@@ -184,63 +193,79 @@ impl GlueCatalogProvider {
 
         let mut paginator = tables_builder.into_paginator().send();
 
-        let mut tables = HashMap::new();
+        let mut listed = Vec::new();
         let mut unreadable = UnreadableTables::default();
 
         while let Some(maybe_get_tables_output) = paginator.next().await {
             let get_tables_output = maybe_get_tables_output.context(GetTablesSnafu {
                 database: database.clone(),
             })?;
-            let some_tables = get_tables_output
-                .table_list
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|t| is_registrable(&self.selector, &database, t, &mut unreadable))
-                .collect::<Vec<_>>();
-
-            for table in some_tables {
-                let mut parameters = self.parameters.parameters.clone();
-                if let Some(catalog_id) = &self.catalog_id {
-                    parameters.insert("catalog_id".to_string(), catalog_id.clone().into());
-                }
-
-                let connector = GlueDataConnector::new(
-                    parameters,
-                    Some(Arc::clone(&self.app)),
-                    self.parameters.io_runtime.clone(),
-                );
-                let from = format!("{database}.{}", table.name());
-                let runtime = Arc::clone(&self.runtime);
-                let dataset = DatasetBuilder::try_new(from, table.name())
-                    .boxed()
-                    .context(CreatingDatasetSnafu {
-                        dataset: table.name().to_string(),
-                    })?
-                    .with_app(Arc::clone(&self.app))
-                    .with_runtime(runtime)
-                    .build()
-                    .boxed()
-                    .context(CreatingDatasetSnafu {
-                        dataset: table.name().to_string(),
-                    })?;
-                let context = RuntimeConnectorContext::for_dataset(&dataset);
-                let table_provider = connector
-                    .read_provider(&context, &dataset)
-                    .await
-                    .boxed()
-                    .context(CreatingDatasetSnafu {
-                        dataset: table.name().to_string(),
-                    })?;
-                tables.insert(table.name, table_provider);
-            }
+            listed.extend(
+                get_tables_output
+                    .table_list
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|t| is_registrable(&self.selector, &database, t, &mut unreadable))
+                    .map(|t| t.name),
+            );
         }
 
-        let summary = unreadable.summary(&self.catalog_name, &database);
+        let mut kept = UnreadableTables::default();
+        let (tables, builds) = build_tables(
+            &database,
+            listed,
+            previous.as_deref(),
+            &mut unreadable,
+            &mut kept,
+            |table| self.table_provider(&database, table),
+        )
+        .await;
 
-        let tables = RwLock::new(tables);
-        let schema_provider = GlueSchemaProvider { tables };
+        Ok(SchemaBuild {
+            provider: Arc::new(GlueSchemaProvider {
+                tables: RwLock::new(tables),
+            }),
+            unreadable: unreadable.summary(&self.catalog_name, &database),
+            kept: kept.kept_summary(&self.catalog_name, &database),
+            builds,
+        })
+    }
 
-        Ok((Arc::new(schema_provider), summary))
+    async fn table_provider(
+        &self,
+        database: &str,
+        table: String,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let mut parameters = self.parameters.parameters.clone();
+        if let Some(catalog_id) = &self.catalog_id {
+            parameters.insert("catalog_id".to_string(), catalog_id.clone().into());
+        }
+
+        let connector = GlueDataConnector::new(
+            parameters,
+            Some(Arc::clone(&self.app)),
+            self.parameters.io_runtime.clone(),
+        );
+        let from = format!("{database}.{table}");
+        let runtime = Arc::clone(&self.runtime);
+        let dataset = DatasetBuilder::try_new(from, &table)
+            .boxed()
+            .context(CreatingDatasetSnafu {
+                dataset: table.clone(),
+            })?
+            .with_app(Arc::clone(&self.app))
+            .with_runtime(runtime)
+            .build()
+            .boxed()
+            .context(CreatingDatasetSnafu {
+                dataset: table.clone(),
+            })?;
+        let context = RuntimeConnectorContext::for_dataset(&dataset);
+        connector
+            .read_provider(&context, &dataset)
+            .await
+            .boxed()
+            .context(CreatingDatasetSnafu { dataset: table })
     }
 
     async fn validate_parameters(parameters: &mut ConnectorParams) -> Result<()> {
@@ -287,8 +312,15 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
 
         let mut paginator = databases_builder.into_paginator().send();
 
+        let previous = match self.databases.read() {
+            Ok(dbs) => dbs.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         let mut databases = HashMap::new();
         let mut unreadable = HashMap::new();
+        let mut degraded = HashMap::new();
+        let mut listed = Loads::default();
+        let mut built = Loads::default();
 
         while let Some(maybe_get_databases_output) = paginator.next().await {
             let get_databases_output = maybe_get_databases_output.context(GetDatabasesSnafu)?;
@@ -306,15 +338,48 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
                     continue;
                 }
 
-                let (schema_provider, summary) =
-                    self.create_schema_provider(db.name().to_string()).await?;
-
-                if let Some(summary) = summary {
-                    unreadable.insert(db.name.clone(), summary);
+                let previous_schema = previous.get(&db.name).cloned();
+                match self
+                    .create_schema_provider(db.name.clone(), previous_schema.clone())
+                    .await
+                {
+                    Ok(schema) => {
+                        listed.loaded += 1;
+                        built.merge(schema.builds);
+                        if let Some(summary) = schema.unreadable {
+                            unreadable.insert(db.name.clone(), summary);
+                        }
+                        if let Some(summary) = schema.kept {
+                            degraded.insert(db.name.clone(), summary);
+                        }
+                        databases.insert(db.name, schema.provider);
+                    }
+                    Err(err) => {
+                        degraded.insert(
+                            db.name.clone(),
+                            database_failure(
+                                &self.catalog_name,
+                                &db.name,
+                                &err,
+                                previous_schema.is_some(),
+                            ),
+                        );
+                        if let Some(schema_provider) = previous_schema {
+                            databases.insert(db.name, schema_provider);
+                        }
+                        listed.fail(err);
+                    }
                 }
-                databases.insert(db.name, schema_provider);
             }
         }
+
+        // When every database, or every table, this refresh tried to load
+        // failed, the source cannot be read at all (credentials, permissions):
+        // fail the refresh rather than register the catalog empty.
+        if let Some(err) = listed.total_failure().or_else(|| built.total_failure()) {
+            return Err(Box::new(err));
+        }
+
         {
             let mut dbs = match self.databases.write() {
                 Ok(dbs) => dbs,
@@ -327,6 +392,9 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
         // Only now that the whole snapshot succeeded is `unreadable` the
         // complete picture, so this is where the warning state may move.
         for summary in self.unreadable_warnings.reconcile(&unreadable) {
+            tracing::warn!("{summary}");
+        }
+        for summary in self.degraded_warnings.reconcile(&degraded) {
             tracing::warn!("{summary}");
         }
 
@@ -381,15 +449,15 @@ fn is_selected(selector: &TableSelector, database: &str, table: &str) -> bool {
     true
 }
 
-/// Whether Spice can read `table`'s storage format, recording it in `unreadable`
-/// when it cannot.
+/// Whether Spice can read `table` (its storage format and where it is stored),
+/// recording it in `unreadable` when it cannot.
 ///
-/// [`InputFormat::try_from`] names the table, and for an unsupported format the
-/// format too, in a structured error. The reason goes to `debug!` per table,
+/// [`InputFormat::of_listing`] names the table, and for an unsupported format
+/// or location that too, in a structured error. The reason goes to `debug!` per table,
 /// matching [`is_selected`] one line up; [`UnreadableTables::summary`] is what an
 /// operator sees by default.
 fn is_readable(database: &str, table: &Table, unreadable: &mut UnreadableTables) -> bool {
-    match InputFormat::try_from(table) {
+    match InputFormat::of_listing(table) {
         Ok(_) => true,
         Err(err) => {
             // Both the table name and the error's text carry Glue-controlled
@@ -422,6 +490,117 @@ fn is_registrable(
     unreadable: &mut UnreadableTables,
 ) -> bool {
     is_selected(selector, database, table.name()) && is_readable(database, table, unreadable)
+}
+
+/// Builds a provider for each of `database`'s `tables` with `build`.
+///
+/// A table whose provider cannot be built keeps the provider `previous`
+/// registered for it, recorded in `kept`, so a failure on one refresh does not
+/// drop a table that was being served. A table with no earlier provider is left
+/// out and recorded in `unreadable`. Either way the other tables still register.
+async fn build_tables<F, Fut>(
+    database: &str,
+    tables: Vec<TableName>,
+    previous: Option<&dyn SchemaProvider>,
+    unreadable: &mut UnreadableTables,
+    kept: &mut UnreadableTables,
+    build: F,
+) -> (HashMap<TableName, Arc<dyn TableProvider>>, Loads)
+where
+    F: Fn(TableName) -> Fut,
+    Fut: Future<Output = Result<Arc<dyn TableProvider>>>,
+{
+    let mut providers = HashMap::new();
+    let mut builds = Loads::default();
+    for table in tables {
+        let err = match build(table.clone()).await {
+            Ok(provider) => {
+                providers.insert(table, provider);
+                builds.loaded += 1;
+                continue;
+            }
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        tracing::debug!(
+            database = %database.escape_debug(),
+            table = %table.escape_debug(),
+            "Cannot load Glue table: {}",
+            message.escape_debug()
+        );
+        let previous_provider = match previous {
+            Some(schema) => schema.table(&table).await.ok().flatten(),
+            None => None,
+        };
+        if let Some(provider) = previous_provider {
+            kept.record_failure(&table, &message);
+            providers.insert(table, provider);
+        } else {
+            unreadable.record_failure(&table, &message);
+        }
+        builds.fail(err);
+    }
+    (providers, builds)
+}
+
+/// One database's schema from a refresh, with the summaries an operator is
+/// shown about it and the table loads `refresh` counts.
+struct SchemaBuild {
+    provider: Arc<dyn SchemaProvider>,
+    /// The tables Spice cannot read, which are not registered.
+    unreadable: Option<UnreadableSummary>,
+    /// The tables that failed to load and keep their previous provider.
+    kept: Option<UnreadableSummary>,
+    builds: Loads,
+}
+
+/// How many databases or tables a refresh loaded, and the first that failed.
+#[derive(Default)]
+struct Loads {
+    loaded: usize,
+    first_error: Option<Error>,
+}
+
+impl Loads {
+    fn fail(&mut self, err: Error) {
+        self.first_error.get_or_insert(err);
+    }
+
+    fn merge(&mut self, other: Loads) {
+        self.loaded += other.loaded;
+        if self.first_error.is_none() {
+            self.first_error = other.first_error;
+        }
+    }
+
+    /// The first failure, when there was one and nothing loaded.
+    fn total_failure(self) -> Option<Error> {
+        if self.loaded == 0 {
+            self.first_error
+        } else {
+            None
+        }
+    }
+}
+
+/// The warning for a database whose tables could not be listed, spaced like
+/// the table summaries. The fingerprint changes only when the database goes
+/// from kept to dropped or back.
+fn database_failure(catalog: &str, database: &str, err: &Error, kept: bool) -> UnreadableSummary {
+    let outcome = if kept {
+        "it keeps the tables it had"
+    } else {
+        "it is not registered"
+    };
+    UnreadableSummary {
+        fingerprint: u64::from(kept),
+        message: format!(
+            "Catalog '{}': cannot list the tables in Glue database '{}', so {outcome}: {}",
+            catalog.escape_debug(),
+            database.escape_debug(),
+            err.to_string().escape_debug()
+        ),
+    }
 }
 
 /// When each database's standing "cannot read these tables" warning was last
@@ -517,6 +696,10 @@ struct UnreadableTables {
     /// line. Accumulated per name rather than stored per name, so a database of
     /// ten thousand unreadable tables costs the same eight bytes as one.
     fingerprint: u64,
+    /// The first table whose provider failed to build, with its error, both
+    /// escaped. The summary names it so the reason is visible without debug
+    /// logging.
+    first_failure: Option<(String, String)>,
 }
 
 /// One database's unreadable-table warning: the line an operator sees, and the
@@ -559,6 +742,18 @@ impl UnreadableTables {
         }
     }
 
+    /// Records `table` as [`Self::record`] does, for a table whose provider
+    /// failed to build with `error`.
+    fn record_failure(&mut self, table: &str, error: &str) {
+        self.record(table);
+        if self.first_failure.is_none() {
+            self.first_failure = Some((
+                table.escape_debug().to_string(),
+                error.escape_debug().to_string(),
+            ));
+        }
+    }
+
     /// The one line an operator sees for the tables this database holds that
     /// Spice cannot read, or `None` when it can read all of them.
     ///
@@ -574,16 +769,7 @@ impl UnreadableTables {
         }
 
         let total = self.total;
-        let named = self
-            .sample
-            .iter()
-            .map(|table| format!("'{table}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let elided = match total - self.sample.len() {
-            0 => String::new(),
-            n => format!(", and {n} more"),
-        };
+        let described = self.described();
 
         // Escaped for the same reason the table names are, and it has to be done
         // here rather than left to the caller: these two sit on the same log line
@@ -593,7 +779,7 @@ impl UnreadableTables {
         let database = database.escape_debug();
 
         let message = format!(
-            "Catalog '{catalog}': skipping {total} Glue table(s) in database '{database}' that Spice cannot read: {named}{elided}. \
+            "Catalog '{catalog}': skipping {total} Glue table(s) in database '{database}' that Spice cannot read: {described} \
             They are not registered, so queries against them will not resolve. \
             Spice reads Glue tables stored as {SUPPORTED_INPUT_FORMATS}; run with debug logging for the reason each table was skipped, \
             or name them in the catalog's `exclude` patterns to suppress this warning. \
@@ -604,6 +790,47 @@ impl UnreadableTables {
             fingerprint: self.fingerprint,
             message,
         })
+    }
+
+    /// The one line an operator sees for the tables in this database that
+    /// failed to load and keep the provider an earlier refresh built, or `None`
+    /// when there are none. Spaced like [`Self::summary`].
+    fn kept_summary(&self, catalog: &str, database: &str) -> Option<UnreadableSummary> {
+        if self.total == 0 {
+            return None;
+        }
+        let total = self.total;
+        let described = self.described();
+        let catalog = catalog.escape_debug();
+        let database = database.escape_debug();
+        Some(UnreadableSummary {
+            fingerprint: self.fingerprint,
+            message: format!(
+                "Catalog '{catalog}': cannot reload {total} Glue table(s) in database '{database}': {described} \
+                They keep the definition they were last loaded with. \
+                For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue"
+            ),
+        })
+    }
+
+    /// The sampled names, a count of the rest and the first failure, as a
+    /// summary lists them.
+    fn described(&self) -> String {
+        let named = self
+            .sample
+            .iter()
+            .map(|table| format!("'{table}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let elided = match self.total - self.sample.len() {
+            0 => String::new(),
+            n => format!(", and {n} more"),
+        };
+        let failure = match &self.first_failure {
+            Some((table, error)) => format!(" Loading '{table}' failed: {error}."),
+            None => String::new(),
+        };
+        format!("{named}{elided}.{failure}")
     }
 }
 
@@ -618,6 +845,10 @@ mod tests {
     /// `compile_globset`. Hand-populating a `CatalogSpec` instead would skip the
     /// compile step the user's patterns actually travel.
     fn selector(include: &[&str], exclude: &[&str]) -> TableSelector {
+        table_selector(&catalog_spec(include, exclude))
+    }
+
+    fn catalog_spec(include: &[&str], exclude: &[&str]) -> crate::component::catalog::CatalogSpec {
         let catalog = spicepod_catalog::Catalog {
             from: "glue".to_string(),
             name: "glue".to_string(),
@@ -633,11 +864,228 @@ mod tests {
             acceleration: None,
         };
 
-        table_selector(
-            &CatalogBuilder::try_from(catalog)
-                .expect("a catalog with valid glob patterns should build")
-                .into_spec(),
+        CatalogBuilder::try_from(catalog)
+            .expect("a catalog with valid glob patterns should build")
+            .into_spec()
+    }
+
+    fn empty_table() -> Arc<dyn TableProvider> {
+        Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+            datafusion::arrow::datatypes::Schema::empty(),
+        )))
+    }
+
+    fn schema_of(tables: &[(&str, &Arc<dyn TableProvider>)]) -> Arc<dyn SchemaProvider> {
+        Arc::new(GlueSchemaProvider {
+            tables: RwLock::new(
+                tables
+                    .iter()
+                    .map(|(name, table)| ((*name).to_string(), Arc::clone(table)))
+                    .collect(),
+            ),
+        })
+    }
+
+    /// A table whose provider fails to build is left out and named, with its
+    /// error, in the database's summary. A table registered before keeps its
+    /// provider and is named in its own summary. A table no longer listed is
+    /// gone. The other tables register.
+    #[tokio::test]
+    async fn a_table_that_fails_to_load_does_not_fail_its_database() {
+        let built = empty_table();
+        let kept_provider = empty_table();
+        let previous = schema_of(&[("returns", &kept_provider), ("dropped", &empty_table())]);
+        let mut unreadable = UnreadableTables::default();
+        let mut kept = UnreadableTables::default();
+
+        let (tables, builds) = build_tables(
+            "sales",
+            vec!["orders".into(), "spark_events".into(), "returns".into()],
+            Some(previous.as_ref()),
+            &mut unreadable,
+            &mut kept,
+            |table| {
+                let built = Arc::clone(&built);
+                async move {
+                    if table == "orders" {
+                        Ok(built)
+                    } else {
+                        Err(Error::CreatingDataset {
+                            dataset: table,
+                            source: "access denied".into(),
+                        })
+                    }
+                }
+            },
         )
+        .await;
+
+        let mut names: Vec<_> = tables.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["orders", "returns"]);
+        assert!(
+            Arc::ptr_eq(&tables["returns"], &kept_provider),
+            "a table that fails to reload keeps its provider"
+        );
+        assert_eq!(builds.loaded, 1);
+        assert!(builds.first_error.is_some());
+
+        assert_eq!(unreadable.sample, ["spark_events"]);
+        let message = unreadable
+            .summary("glue", "sales")
+            .expect("a failed table has a summary")
+            .message;
+        assert!(
+            message.contains(
+                "Loading 'spark_events' failed: Cannot create dataset for table `spark_events`."
+            ) && message.contains("access denied"),
+            "{message}"
+        );
+
+        assert_eq!(kept.sample, ["returns"]);
+        let message = kept
+            .kept_summary("glue", "sales")
+            .expect("a kept table has a summary")
+            .message;
+        assert!(
+            message.contains("cannot reload 1 Glue table(s) in database 'sales': 'returns'.")
+                && message.contains("Loading 'returns' failed"),
+            "{message}"
+        );
+    }
+
+    /// A Glue API served on localhost with two databases holding no tables,
+    /// `sales` and `hr`. Glue refuses to list the tables of the databases in
+    /// `denied`.
+    async fn glue_api(denied: &'static [&'static str]) -> String {
+        use axum::{
+            Router,
+            body::Body,
+            http::{HeaderMap, Response},
+            routing::post,
+        };
+
+        fn reply(denied: &[&str], headers: &HeaderMap, body: &str) -> Response<Body> {
+            let target = headers
+                .get("x-amz-target")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            let is_denied = denied.iter().any(|db| body.contains(&format!("\"{db}\"")));
+            let (status, error_type, body) = match target {
+                "AWSGlue.GetDatabases" => (
+                    200,
+                    None,
+                    r#"{"DatabaseList":[{"Name":"sales"},{"Name":"hr"}]}"#,
+                ),
+                "AWSGlue.GetTables" if is_denied => (
+                    400,
+                    Some("AccessDeniedException"),
+                    r#"{"__type":"AccessDeniedException","Message":"denied"}"#,
+                ),
+                "AWSGlue.GetTables" => (200, None, r#"{"TableList":[]}"#),
+                _ => (400, Some("InvalidInputException"), "{}"),
+            };
+            let mut response = Response::builder()
+                .status(status)
+                .header("content-type", "application/x-amz-json-1.1");
+            if let Some(error_type) = error_type {
+                response = response.header("x-amzn-errortype", error_type);
+            }
+            response.body(Body::from(body)).expect("response builds")
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local address"));
+        let router =
+            Router::new().route(
+                "/",
+                post(move |headers: HeaderMap, body: String| async move {
+                    reply(denied, &headers, &body)
+                }),
+            );
+        tokio::spawn(axum::serve(listener, router).into_future());
+        endpoint
+    }
+
+    async fn glue_provider(endpoint: &str) -> GlueCatalogProvider {
+        use aws_sdk_glue::config::{BehaviorVersion, Credentials, Region, retry::RetryConfig};
+
+        let config = aws_sdk_glue::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .retry_config(RetryConfig::disabled())
+            .build();
+        let spec = catalog_spec(&[], &[]);
+        GlueCatalogProvider {
+            client: Client::from_conf(config),
+            selector: table_selector(&spec),
+            runtime: Arc::new(Runtime::builder().build().await),
+            app: Arc::new(app::AppBuilder::new("test").build()),
+            parameters: ConnectorParams {
+                parameters: crate::parameters::Parameters::new(
+                    Vec::new(),
+                    "glue",
+                    crate::dataconnector::glue::PARAMETERS.as_slice(),
+                ),
+                unsupported_type_action: None,
+                component: crate::dataconnector::ConnectorComponent::Catalog(Arc::new(spec)),
+                io_runtime: tokio::runtime::Handle::current(),
+            },
+            catalog_name: "glue".to_string(),
+            catalog_id: None,
+            databases: RwLock::new(HashMap::new()),
+            unreadable_warnings: UnreadableWarnings::default(),
+            degraded_warnings: UnreadableWarnings::default(),
+        }
+    }
+
+    /// A database whose tables Glue refuses to list is left out, or keeps the
+    /// tables it had, and the other databases still refresh.
+    #[tokio::test]
+    async fn a_database_that_cannot_be_listed_does_not_fail_the_catalog() {
+        let provider = glue_provider(&glue_api(&["hr"]).await).await;
+
+        provider.refresh().await.expect("the first load succeeds");
+        assert_eq!(provider.schema_names(), ["sales"]);
+
+        let hr = schema_of(&[("staff", &empty_table())]);
+        provider
+            .databases
+            .write()
+            .expect("lock")
+            .insert("hr".to_string(), Arc::clone(&hr));
+        provider.refresh().await.expect("the refresh succeeds");
+
+        let mut names = provider.schema_names();
+        names.sort();
+        assert_eq!(names, ["hr", "sales"]);
+        assert!(
+            Arc::ptr_eq(&provider.schema("hr").expect("hr is kept"), &hr),
+            "a database that cannot be listed keeps its tables"
+        );
+    }
+
+    /// When Glue refuses to list the tables of every database, the catalog is
+    /// not registered empty: the load fails, as it does when Glue cannot be
+    /// reached.
+    #[tokio::test]
+    async fn a_catalog_whose_databases_all_fail_does_not_load() {
+        let provider = glue_provider(&glue_api(&["sales", "hr"]).await).await;
+
+        let err = provider
+            .refresh()
+            .await
+            .expect_err("a catalog Spice cannot list at all fails to load");
+        assert!(
+            err.to_string()
+                .contains("Cannot retrieve tables from Glue database"),
+            "{err}"
+        );
+        assert_eq!(provider.schema_names(), Vec::<String>::new());
     }
 
     /// The bug this change fixes (#12634): the connector compiled `exclude` and
@@ -746,9 +1194,16 @@ mod tests {
     /// whose `input_format` is what the connector reads to decide whether it can
     /// read the table at all. `None` builds the descriptor without one.
     fn glue_table(name: &str, input_format: Option<&str>) -> Table {
+        glue_table_at(name, input_format, Some(&format!("s3://bucket/{name}/")))
+    }
+
+    fn glue_table_at(name: &str, input_format: Option<&str>, location: Option<&str>) -> Table {
         let mut descriptor = aws_sdk_glue::types::StorageDescriptor::builder();
         if let Some(input_format) = input_format {
             descriptor = descriptor.input_format(input_format);
+        }
+        if let Some(location) = location {
+            descriptor = descriptor.location(location);
         }
         Table::builder()
             .name(name)
@@ -770,6 +1225,18 @@ mod tests {
     /// An Iceberg table is identified by a table parameter rather than by a
     /// storage descriptor, so it has neither of the fields the other formats use.
     fn iceberg_table(name: &str) -> Table {
+        Table::builder()
+            .name(name)
+            .parameters("table_type", "ICEBERG")
+            .parameters(
+                "metadata_location",
+                format!("s3://bucket/{name}/metadata/00000.metadata.json"),
+            )
+            .build()
+            .expect("a Glue table with a name")
+    }
+
+    fn iceberg_table_without_metadata(name: &str) -> Table {
         Table::builder()
             .name(name)
             .parameters("table_type", "ICEBERG")
@@ -1083,28 +1550,37 @@ mod tests {
             unreadable.sample
         );
 
-        // The ways `InputFormat::try_from` refuses a table: an unsupported
-        // format, a storage descriptor carrying no format, no descriptor, and
-        // Hive ACID/transactional ORC.
+        // The ways `InputFormat::of_listing` refuses a table: an unsupported
+        // format, a storage descriptor carrying no format, no descriptor, Hive
+        // ACID/transactional ORC, a location that is not `s3://`, no location,
+        // and an Iceberg table with no `metadata_location`.
         for refused in [
             glue_table("archive", Some(AVRO)),
             glue_table("headerless", None),
             table_without_storage_descriptor("legacy"),
             transactional_orc_table("acid_orders"),
+            glue_table_at(
+                "spark_events",
+                Some(PARQUET),
+                Some("s3a://bucket/spark_events/"),
+            ),
+            glue_table_at("unplaced", Some(PARQUET), None),
+            iceberg_table_without_metadata("ledger_v2"),
         ] {
             assert!(!is_readable("public", &refused, &mut unreadable));
         }
 
-        assert_eq!(unreadable.total, 4);
+        assert_eq!(unreadable.total, 7);
         assert_eq!(
             unreadable.sample,
             vec![
                 "archive".to_string(),
                 "headerless".to_string(),
                 "legacy".to_string(),
-                "acid_orders".to_string()
+                "acid_orders".to_string(),
+                "spark_events".to_string()
             ],
-            "every table the connector cannot read must be named"
+            "every table the connector cannot read must be named, up to the sample size"
         );
     }
 
