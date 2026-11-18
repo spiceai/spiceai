@@ -156,7 +156,7 @@
   "schema-ddl": 31,
   "search": 4,
   "search-hybrid": 6,
-  "secret-redaction": 9,
+  "secret-redaction": 23,
   "served-while-source-down": 48,
   "settings-evolution": 73,
   "sidecar-cluster": 129,
