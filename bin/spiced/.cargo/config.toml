@@ -12,13 +12,13 @@ rustflags = ["-C", "target-cpu=native"]
 linker = "clang"
 rustflags = ["-C", "target-feature=+neon,+fp16,+fhm", "-Clink-arg=-fuse-ld=lld"]
 
-# Pinned to the oldest Apple Silicon generation rather than `native`. Every macOS CI
-# host shares one sccache bucket, and sccache keys a compile on the literal
-# `-C target-cpu=native`, not on the CPU it resolves to. An object that an M3 or M4
-# compiled with `bf16` or `i8mm` instructions then reaches an M1 as a cache hit, and
-# a build script or `spiced` linked from it dies with SIGILL. A binary built natively
-# on a newer host also dies on the M1 machines the E2E jobs run it on. `apple-m1` is
-# rustc's default for this target, so this matches the release build, and it keeps
-# NEON, FP16 and FHM for gemm-f16.
+# Pinned to the oldest Apple Silicon generation rather than `native`. macOS CI builds
+# share one sccache bucket, and sccache keys a compile on the literal
+# `-C target-cpu=native`, not on the CPU it resolves to. An object that a newer chip
+# compiled with `bf16` or `i8mm` instructions then reaches an M1-class host as a cache
+# hit, and a build script or `spiced` linked from it dies with SIGILL. A binary built
+# natively on a newer host also dies on the M1-class runners the E2E jobs run it on.
+# `apple-m1` is rustc's default for this target, so this matches the release build,
+# and it keeps NEON, FP16 and FHM for gemm-f16.
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=apple-m1"]
