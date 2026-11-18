@@ -1167,11 +1167,15 @@ async fn create_instances(
             } else {
                 loopback_ip
             };
+            // A read-write API key of this instance's own, for a client that cannot be told
+            // the script's (a CDC sink). `spiced` requires it when this runner binds it beyond
+            // loopback; see `wide_listener` below.
+            let instance_api_key = format!("spicescript-{run_id}-{index}");
             let context = json!({
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
-                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port_on(node_ip)?,
+                "instance": { "name": label, "dir": dir.display().to_string(), "api_key": instance_api_key, "port": crate::docker::free_port_on(node_ip)?,
                     "executor_port": crate::docker::free_port_on(node_ip)?, "http_port": http_port,
                     "flight_port": crate::docker::free_port_on(node_ip)?,
                     "host_from_container": host_from_container },
@@ -1183,6 +1187,18 @@ async fn create_instances(
                 .with_context(|| format!("variant '{variant_name}'"))?;
             let mut spicepod = template::substitute(&spicepod, &context)?;
             disable_results_cache_unless_configured(&mut spicepod);
+            // This runner binds `spiced` beyond loopback where a container could not reach it
+            // otherwise (a rootless daemon, a bridge container). Without `runtime.auth` such a
+            // listener serves a caller without credentials read-only, so the runner configures
+            // the instance's own read-write key there, as a user exposing `spiced` would, and
+            // sends it with every step that names no other.
+            let wide_listener = rootless_reach || bridge.is_some();
+            let injected_api_key = (wide_listener
+                && spicepod.pointer("/runtime/auth").is_none_or(Value::is_null))
+            .then(|| {
+                require_api_key(&mut spicepod, &instance_api_key);
+                instance_api_key.clone()
+            });
             let spiced_args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
             let mut spiced_args: Vec<String> = serde_json::from_value(spiced_args)?;
             let cluster = runs_cluster(script, options);
@@ -1352,10 +1368,11 @@ async fn create_instances(
                 spiced.set_http_port(port);
             }
             spiced.set_http_on_every_interface(rootless_reach);
+            spiced.set_every_interface(variant.listen == crate::script::Listen::EveryInterface);
             if let Some(port) = port("flight_port") {
                 spiced.set_flight_port(port);
             }
-            spiced.set_api_key(script.defaults.api_key.clone())?;
+            spiced.set_api_key(script.defaults.api_key.clone().or(injected_api_key))?;
             spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
             if let Some((scheduler, _)) = &cluster_args {
                 spiced_args.extend(scheduler.iter().cloned());
@@ -1831,6 +1848,25 @@ fn disable_results_cache_unless_configured(spicepod: &mut Value) {
         .or_insert_with(|| json!({ "enabled": false }));
 }
 
+/// Configures `runtime.auth` on `spicepod` with one read-write API key, `key`.
+fn require_api_key(spicepod: &mut Value, key: &str) {
+    let Value::Object(root) = spicepod else {
+        return;
+    };
+    let runtime = root
+        .entry("runtime")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !runtime.is_object() {
+        *runtime = Value::Object(Map::new());
+    }
+    if let Value::Object(runtime) = runtime {
+        runtime.insert(
+            "auth".to_string(),
+            json!({ "api-key": { "enabled": true, "keys": [format!("{key}:rw")] } }),
+        );
+    }
+}
+
 /// Applies a start's `patch:` to the instance's spicepod, for this and every
 /// later start.
 fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<()> {
@@ -1840,6 +1876,10 @@ fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<(
     ensure!(
         patch.env.is_empty(),
         "a start's `patch` cannot change `env`; an instance's environment is fixed when it is created"
+    );
+    ensure!(
+        patch.listen == crate::script::Listen::Loopback,
+        "a start's `patch` cannot change `listen`; set it on a variant"
     );
     let resolved = VariantSpec {
         spicepod: patch
@@ -1858,6 +1898,7 @@ fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<(
             .map(|(k, v)| Ok((k.clone(), template::substitute(v, &instance.context)?)))
             .collect::<Result<_>>()?,
         env: patch.env.clone(),
+        listen: patch.listen,
         when: Map::new(),
     };
     template::apply_variant(&mut instance.spicepod, &resolved)?;

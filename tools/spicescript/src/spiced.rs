@@ -51,6 +51,9 @@ pub struct Spiced {
     /// Serves HTTP on every interface, not only loopback, for a container
     /// that cannot reach this machine's loopback.
     http_on_every_interface: bool,
+    /// Serves HTTP, Flight, metrics and OpenTelemetry on every interface (`listen:
+    /// every-interface` on a variant).
+    every_interface: bool,
     flight: u16,
     metrics: u16,
     otel: u16,
@@ -186,6 +189,7 @@ impl Spiced {
             env_removed: Vec::new(),
             http: free_port()?,
             http_on_every_interface: false,
+            every_interface: false,
             flight: free_port()?,
             metrics: free_port()?,
             otel: free_port()?,
@@ -239,6 +243,12 @@ impl Spiced {
     /// machine only at its routable address, can post to it.
     pub fn set_http_on_every_interface(&mut self, every: bool) {
         self.http_on_every_interface = every;
+    }
+
+    /// Serves HTTP, Flight, metrics and OpenTelemetry on every interface (`0.0.0.0`) rather
+    /// than only loopback, for a script about what a listener beyond loopback serves.
+    pub fn set_every_interface(&mut self, every: bool) {
+        self.every_interface = every;
     }
 
     /// Serves Flight on `port`, one a script was told in advance
@@ -381,12 +391,19 @@ impl Spiced {
             .container
             .as_ref()
             .is_some_and(|run| run.bridge.is_some());
-        let host = if bridged { "0.0.0.0" } else { "127.0.0.1" };
+        let host = if bridged || self.every_interface {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
         let child = command
             .arg("--telemetry-enabled=false")
             .args([
                 "--http",
-                &http_listen(self.http_on_every_interface || bridged, self.http),
+                &http_listen(
+                    self.http_on_every_interface || bridged || self.every_interface,
+                    self.http,
+                ),
             ])
             .args(["--flight", &format!("{host}:{}", self.flight)])
             .args(["--metrics", &format!("{host}:{}", self.metrics)])

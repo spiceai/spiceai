@@ -9,13 +9,21 @@ description: >
   `runtime.task_history`, and comes before the tool runs: the MCP server never
   sees the call and no memory is written. Read-only tools stay available to
   every caller, and a read-write key may call every tool. On a runtime without
-  `runtime.auth`, `/v1/tools` refuses anonymous callers and a model's tool use
-  (chat completions, `ai()`) runs read-write tools for them, as every caller
-  may write there. A mock model asks for each tool call; a stdio MCP server
+  `runtime.auth`, `/v1/tools` refuses anonymous callers, and a model's tool use
+  (chat completions, `ai()`) runs read-write tools for a caller without
+  credentials only on a listener bound to loopback, where it is the local
+  operator: on `0.0.0.0`, or through a proxy (`X-Forwarded-For`), such a caller
+  is refused them. A mock model asks for each tool call; a stdio MCP server
   reports every call it receives to a mock HTTP endpoint.
 
 sources:
   api: { kind: mock-http }
+
+# Where `spiced` listens decides what a caller without credentials may do (the phase without
+# `runtime.auth`), so the variants answer differently there.
+variants:
+  loopback: {}
+  every-interface: { listen: every-interface }
 
 spicepod:
   version: v1
@@ -72,6 +80,7 @@ spicepod:
 
 defaults:
   api-key: writer-key
+  compare-variants: false
 
 steps:
   - source-exec:
@@ -241,7 +250,8 @@ steps:
   - http: { method: POST, path: /v1/tools/store_memory, api-key: none, headers: { content-type: application/json }, body: '{"thoughts": ["direct"]}' }
     expect: { status: 401 }
 
-  # A model's tool use, from chat completions and from `ai()`, runs the read-write tools.
+  # A model's tool use, from chat completions and from `ai()`, runs the read-write tools for the
+  # local operator (loopback), and is refused them on `0.0.0.0`.
   - source-exec:
       api:
         - |
@@ -322,19 +332,56 @@ steps:
     expect: { rows: [['1']] }
     eventually: 30s
 
-  # The mock still counts the read-write key's two calls (`reset` removes routes, not the log),
-  # and the anonymous chat's call; anonymous chat and `ai()` each wrote a memory; nothing was
-  # refused.
+  # Through a proxy, a loopback request is a network caller: refused the read-write tool.
+  - source-exec:
+      api:
+        - |
+          path: /v1/chat/completions
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"remember","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_remember","type":"function","function":{"name":"store_memory","arguments":"{\"thoughts\":[\"proxied chat\"]}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+    only: loopback
+  - http: { method: POST, path: /v1/chat/completions, api-key: none, headers: { content-type: application/json, x-forwarded-for: 192.0.2.60 }, body: '{"model": "m", "messages": [{"role": "user", "content": "Remember this."}]}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /choices/0/message/content, equals: done }
+    only: loopback
+
+  # The mock still counts the read-write key's two calls (`reset` removes routes, not the log).
+  # The local operator's chat reached the MCP server and it and its `ai()` each wrote a memory;
+  # its proxied chat was refused. On `0.0.0.0` every anonymous read-write call was refused.
   - source-query: { api: count /alert }
     expect: { rows: [['3']] }
+    only: loopback
   - query: SELECT value FROM llm_memory ORDER BY value
     api-key: none
     expect: { rows: [['anonymous ai'], ['anonymous chat']] }
+    only: loopback
   - query: >-
-      SELECT count(*) AS n FROM runtime.task_history
-      WHERE error_message LIKE 'Failed to call tool %'
+      SELECT task, count(*) AS n FROM runtime.task_history
+      WHERE error_message LIKE 'Failed to call tool % the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy%'
+      GROUP BY task ORDER BY task
+    api-key: none
+    expect: { rows: [['tool_use::store_memory', '1']] }
+    eventually: 30s
+    only: loopback
+  - source-query: { api: count /alert }
+    expect: { rows: [['2']] }
+    only: every-interface
+  - query: SELECT count(*) AS n FROM llm_memory
     api-key: none
     expect: { rows: [['0']] }
+    only: every-interface
+  - query: >-
+      SELECT task, count(*) AS n FROM runtime.task_history
+      WHERE error_message LIKE 'Failed to call tool % the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy%'
+      GROUP BY task ORDER BY task
+    api-key: none
+    expect: { rows: [['tool_use::probe__send_alert', '1'], ['tool_use::store_memory', '2']] }
+    eventually: 30s
+    only: every-interface
 
   # --- A worker's scheduled prompt runs for the operator --------------------------------------
 

@@ -228,7 +228,10 @@ with each other, and each ran the writes separately.
 **Variants** are [JSON merge patches](https://www.rfc-editor.org/rfc/rfc7386).
 `spicepod:` patches the whole spicepod, and `datasets:` patches datasets by name
 (`*` for all), since a merge patch replaces a list wholesale. A variant may also
-set `env:` for `spiced`, whose values take the same placeholders, and `when: { <matrix key>: <value> }` to exist only in some
+set `env:` for `spiced`, whose values take the same placeholders, `listen: every-interface` to
+bind its HTTP, Flight, metrics and OpenTelemetry listeners to `0.0.0.0` instead of loopback (for
+what a listener beyond loopback serves; the runner still reaches it at loopback, and adds no
+`runtime.auth`), and `when: { <matrix key>: <value> }` to exist only in some
 combinations. Variants run in alphabetical order, and the first is the one the
 others are compared with.
 
@@ -253,8 +256,23 @@ file_format: parquet }`.
 [sidecar](#sidecars) to read from), `${instance.host_from_container}` (the
 host such a container reaches `spiced` at: `host.docker.internal`, or this machine's routable address
 when a rootless Docker daemon runs a `host-network` source, since its containers cannot reach this
-machine's loopback; `spiced` then serves HTTP on every interface), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
+machine's loopback; `spiced` then serves HTTP on every interface), `${instance.api_key}` (a
+read-write API key of the instance's own, for a client the runner cannot hand the script's key,
+such as a CDC sink in a container), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
 Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
+
+When the runner itself binds `spiced` beyond loopback (for a rootless Docker daemon, or in a
+bridge container), `spiced` serves a caller without credentials read-only there, so a spicepod
+without `runtime.auth` gets one: `${instance.api_key}` as its only, read-write, key, which every
+step that names no other key sends. Elsewhere the key is unused, and a spicepod without
+`runtime.auth` stays without it. A client in a container must send the key too. Debezium Server
+3.1's HTTP sink cannot (a header set with the `InsertHeader` transform arrives JSON-encoded, and
+its JWT option sends `Bearer: <token>`), so the scripts that run it (`debezium-direct.yaml`,
+`debezium-offset-recovery.yaml`, `feed-chaos.yaml`) start a small relay in the Debezium container
+(`ApiKeyRelay.java`, which the container's `command` writes): Debezium posts to the relay on the
+container's loopback, and the relay forwards to `spiced` with `X-API-Key` added, as a sidecar
+proxy adding a credential would. A request the relay cannot forward is dropped, so Debezium sees
+the connection fail, as it would posting to `spiced` directly.
 
 ### Steps
 
