@@ -563,7 +563,7 @@ fn unsafe_archive_entry(
 /// A directory inside `pods_dir` that a package is extracted into, removed
 /// when dropped unless it was moved into place.
 struct Staging {
-    /// The directory it was created in, which it is removed from.
+    /// The directory it was created in, which its entry is removed from.
     pods: InstallDir,
     dir: InstallDir,
     name: std::ffi::OsString,
@@ -621,9 +621,13 @@ impl Staging {
 impl Drop for Staging {
     fn drop(&mut self) {
         if !self.moved {
-            // Relative to the directory it was created in, so a `spicepods`
-            // path swapped for a link since cannot point the removal elsewhere.
-            let _ = self.pods.remove_tree(&self.name);
+            // Its contents are removed through its own descriptor, and its
+            // entry in the directory it was created in only while that entry is
+            // still this directory. A `spicepods` swapped for a link, or another
+            // directory renamed to the staging name, is never removed instead.
+            if self.dir.clear().is_ok() {
+                let _ = self.pods.remove_empty_dir_if_same(&self.name, &self.dir);
+            }
         }
     }
 }
@@ -1214,6 +1218,42 @@ mod tests {
         assert!(
             !moved_away.join(&name).exists(),
             "the staging directory must be removed where it was created"
+        );
+
+        // Inside `spicepods`, the staging directory is moved aside and another
+        // pod's directory is renamed to its name. Only the staging directory's
+        // own contents are removed.
+        let pods = InstallDir::open(&moved_away).expect("open the pods directory");
+        let staged = Staging::create(&pods).expect("create the staging directory");
+        let name = staged.name.clone();
+        drop(
+            staged
+                .dir
+                .create_file(std::ffi::OsStr::new("partial.yaml"))
+                .expect("write into the staging directory"),
+        );
+        let other_pod = moved_away.join("other-pod");
+        std::fs::create_dir(&other_pod).expect("create another pod");
+        std::fs::write(other_pod.join("spicepod.yaml"), "installed\n")
+            .expect("write the other pod");
+        std::fs::rename(moved_away.join(&name), moved_away.join("moved-staging"))
+            .expect("move the staging directory aside");
+        std::fs::rename(&other_pod, moved_away.join(&name))
+            .expect("rename the other pod to the staging name");
+
+        drop(staged);
+
+        assert_eq!(
+            std::fs::read_to_string(moved_away.join(&name).join("spicepod.yaml"))
+                .expect("the other pod is kept"),
+            "installed\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(moved_away.join("moved-staging"))
+                .expect("list the moved staging directory")
+                .count(),
+            0,
+            "the staging directory's own contents are removed wherever it now is"
         );
     }
 

@@ -212,10 +212,49 @@ impl InstallDir {
         }
     }
 
+    /// Remove everything in this directory, through its descriptor, so the
+    /// contents removed are this directory's wherever its path now leads. A
+    /// link in it is removed, never followed.
+    pub(super) fn clear(&self) -> std::io::Result<()> {
+        for (child, _) in self.list()? {
+            self.remove_tree(&child)?;
+        }
+        Ok(())
+    }
+
+    /// Remove the empty directory entry `name` here, but only while it is
+    /// still `dir`: an entry renamed to `name` since is left alone.
+    pub(super) fn remove_empty_dir_if_same(
+        &self,
+        name: &OsStr,
+        dir: &InstallDir,
+    ) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::AtFlags;
+            let expected = rustix::fs::fstat(&dir.fd)?;
+            match rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(found) if found.st_dev == expected.st_dev && found.st_ino == expected.st_ino => {
+                    rustix::fs::unlinkat(&self.fd, name, AtFlags::REMOVEDIR).map_err(Into::into)
+                }
+                Ok(_) | Err(rustix::io::Errno::NOENT) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            match std::fs::remove_dir(self.child_path(name)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            }
+        }
+    }
+
     /// Remove the entry `name`, and everything in it when it is a directory,
     /// relative to this directory. A link anywhere in it is removed, never
     /// followed. A missing entry is not an error.
-    pub(super) fn remove_tree(&self, name: &OsStr) -> std::io::Result<()> {
+    fn remove_tree(&self, name: &OsStr) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use rustix::fs::AtFlags;
