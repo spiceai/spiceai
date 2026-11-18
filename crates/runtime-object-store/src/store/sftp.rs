@@ -34,11 +34,17 @@ use object_store::{
 use ssh2::Session;
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
-    process_directory_entries_shallow, resolve_range,
+    DirEntry, build_byte_range, build_object_meta, generic_error, guard_buffered_read,
+    process_directory_entries, process_directory_entries_shallow, reserve_within, resolve_range,
 };
 
 const STORE_NAME: &str = "SFTP";
+
+/// Bytes asked of one `read` call while buffering an object range.
+///
+/// libssh2 sizes its read-ahead at four times the caller's buffer, capped at four channel
+/// windows (8 MiB), so a 2 MiB chunk gets the same read-ahead as one buffer of the whole range.
+const READ_CHUNK: usize = 2 * 1024 * 1024;
 
 /// Wall-clock bound for one connection attempt — name resolution, TCP connect, SSH handshake
 /// and password authentication together — when `client_timeout` is not configured.
@@ -392,6 +398,28 @@ fn connect_within(
     }
 }
 
+/// Read at most `limit` bytes from `reader`, stopping early at end of file.
+///
+/// The buffer grows with the bytes that arrive, never past `limit`, so an object whose
+/// reported size exceeds what it holds costs only what it holds.
+fn read_up_to(reader: &mut impl Read, limit: usize) -> object_store::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let mut chunk = vec![0u8; limit.min(READ_CHUNK)];
+    while buffer.len() < limit {
+        let want = (limit - buffer.len()).min(chunk.len());
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => {
+                reserve_within(STORE_NAME, &mut buffer, n, limit)?;
+                buffer.extend_from_slice(&chunk[..n]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(handle_error(error)),
+        }
+    }
+    Ok(buffer)
+}
+
 /// Express `bound` as the millisecond count [`Session::set_timeout`] takes.
 ///
 /// ssh2 reads `0` as "wait forever", so a sub-millisecond bound is raised to 1ms rather
@@ -489,22 +517,10 @@ impl ObjectStore for SFTPObjectStore {
             }
 
             let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
+            let limit = guard_buffered_read(STORE_NAME, data_to_read)?;
 
-            // Seek to start position
             file.seek(SeekFrom::Start(start)).map_err(handle_error)?;
-
-            // Read all requested data
-            #[expect(clippy::cast_possible_truncation)]
-            let mut buffer = vec![0u8; data_to_read as usize];
-            let mut total_read = 0;
-            while total_read < buffer.len() {
-                let n = file.read(&mut buffer[total_read..]).map_err(handle_error)?;
-                if n == 0 {
-                    break;
-                }
-                total_read += n;
-            }
-            buffer.truncate(total_read);
+            let buffer = read_up_to(&mut file, limit)?;
 
             Ok::<_, object_store::Error>((object_meta, start, end, buffer))
         })
@@ -835,6 +851,65 @@ mod tests {
         );
 
         drop(listener);
+    }
+
+    /// Hands out at most `step` bytes per `read`, the way an SFTP server answers a large
+    /// request with several shorter replies.
+    struct ShortReads<'a> {
+        data: &'a [u8],
+        step: usize,
+    }
+
+    impl Read for ShortReads<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.step).min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_up_to_returns_what_the_object_holds_when_it_is_shorter_than_reported() {
+        let data: Vec<u8> = (0..=255).collect();
+        let mut reader = ShortReads {
+            data: &data,
+            step: 10,
+        };
+
+        let read = read_up_to(&mut reader, 1_000_000).expect("reading to end of file succeeds");
+
+        assert_eq!(read, data);
+        assert!(
+            read.capacity() < 1_000_000,
+            "the buffer must follow the bytes that arrived, not the requested length, got capacity {}",
+            read.capacity()
+        );
+    }
+
+    #[test]
+    fn read_up_to_stops_at_the_limit_when_the_object_holds_more() {
+        let data: Vec<u8> = (0..=255).collect();
+        let mut reader = ShortReads {
+            data: &data,
+            step: 10,
+        };
+
+        let read = read_up_to(&mut reader, 95).expect("a bounded read succeeds");
+
+        assert_eq!(read, data[..95]);
+        assert_eq!(read.capacity(), 95);
+    }
+
+    #[test]
+    fn read_up_to_spans_several_chunks_without_losing_bytes() {
+        let data: Vec<u8> = (0..READ_CHUNK * 2 + 17)
+            .map(|i| u8::try_from(i % 251).expect("a value below 251 fits in u8"))
+            .collect();
+
+        let read = read_up_to(&mut data.as_slice(), data.len()).expect("a multi-chunk read");
+
+        assert_eq!(read, data);
     }
 
     #[test]
