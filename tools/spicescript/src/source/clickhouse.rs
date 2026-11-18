@@ -53,6 +53,7 @@ impl ClickHouse {
                 "clickhouse-client --user {USER} --password {PASSWORD} --query 'SELECT 1'"
             ))),
             network: None,
+            alias: None,
         })
         .await?;
         Ok(Self { container })

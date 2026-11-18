@@ -125,9 +125,7 @@ fn remove_all() {
             continue;
         };
         // Only the process this runner started, not one that reused its pid.
-        if crate::reap::command_line(raw)
-            .is_some_and(|c| c.contains(&format!("--http 127.0.0.1:{port}")))
-        {
+        if crate::reap::command_line(raw).is_some_and(|c| crate::spiced::serves_http_on(&c, port)) {
             let _ = nix::sys::signal::kill(Pid::from_raw(raw), Signal::SIGKILL);
         }
     }

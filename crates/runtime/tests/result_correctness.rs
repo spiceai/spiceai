@@ -19,11 +19,11 @@ limitations under the License.
 //!
 //! | Spice side | Standalone oracle |
 //! |------------|-------------------|
-//! | `DuckDB` accelerator (`DataAccelerator`) | `duckdb` crate |
 //! | `SQLite` accelerator (`DataAccelerator`) | `rusqlite` crate |
 //!
 //! The micro tests here reach the accelerator `TableProvider` directly; `surfaces` runs the
-//! same SQL through a Spicepod-built runtime, in-process and over HTTP and Flight SQL.
+//! same SQL through a Spicepod-built runtime, in-process and over HTTP and Flight SQL, and
+//! compares it with both `rusqlite` and the installed `DuckDB` library (`duckdb-oracle`).
 //!
 //! Cayenne vs standalone oracles live under `crates/cayenne/tests/result_correctness_*`.
 //! Standalone DuckDB↔SQLite agreement (no Spice) lives under
@@ -42,7 +42,6 @@ limitations under the License.
 // Accelerator engines are their own crates and self-register through a linkme slice, and the
 // linker drops an unreferenced slice static, so a test exercising Cayenne names the crate
 // itself rather than relying on another module to.
-#[cfg(not(windows))]
 use accelerator_cayenne as _;
 
 use std::collections::HashMap;
@@ -522,21 +521,13 @@ mod sqlite_accel {
 }
 
 // ---------------------------------------------------------------------------
-// Spice DuckDB accelerator ↔ standalone duckdb crate
+// Standalone DuckDB oracle, through the installed DuckDB library
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "duckdb")]
-mod duckdb_accel {
-    use super::{
-        compare, create_cmd, insert_batch, make_dim, make_fact, micro_queries, spice_query,
-        write_parquet,
-    };
-    use accelerator_duckdb::DuckDBAccelerator;
+mod standalone_duckdb {
+    use super::write_parquet;
     use arrow::array::RecordBatch;
-    use data_accelerator_api::DataAccelerator;
-    use datafusion::datasource::TableProvider;
-    use duckdb::Connection;
-    use std::sync::Arc;
+    use duckdb_oracle::Connection;
 
     pub(super) fn load_standalone_duckdb(
         tables: &[(&str, RecordBatch)],
@@ -547,7 +538,7 @@ mod duckdb_accel {
         }
         let temp = tempfile::tempdir().expect("duckdb temp");
         let db = temp.path().join("oracle.duckdb");
-        let conn = Connection::open(&db).expect("open");
+        let conn = Connection::open(&db).unwrap_or_else(|e| panic!("open the DuckDB oracle: {e}"));
         for (name, _) in tables {
             let path = stage.path().join(format!("{name}.parquet"));
             conn.execute_batch(&format!(
@@ -565,51 +556,6 @@ mod duckdb_accel {
         conn: &Connection,
         sql: &str,
     ) -> Result<Vec<RecordBatch>, String> {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let batches: Vec<RecordBatch> = stmt.query_arrow([]).map_err(|e| e.to_string())?.collect();
-        Ok(batches)
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn spice_duckdb_accel_vs_standalone_duckdb_micro() {
-        let fact = make_fact(2_048, 64);
-        let dim = make_dim(256);
-
-        let accel = DuckDBAccelerator::new();
-        let t_table = accel
-            .create_external_table(create_cmd("t", fact.schema()), None, vec![], None)
-            .await
-            .expect("create t");
-        let d_table = accel
-            .create_external_table(create_cmd("d", dim.schema()), None, vec![], None)
-            .await
-            .expect("create d");
-        insert_batch(&t_table, fact.clone()).await;
-        insert_batch(&d_table, dim.clone()).await;
-        let spice_tables: Vec<(String, Arc<dyn TableProvider>)> =
-            vec![("t".into(), t_table), ("d".into(), d_table)];
-
-        let (_tmp, conn) = load_standalone_duckdb(&[("t", fact), ("d", dim)]);
-
-        let mut fails = Vec::new();
-        for q in micro_queries() {
-            let spice = spice_query(&spice_tables, &q.sql)
-                .await
-                .unwrap_or_else(|e| panic!("spice sql {}: {e}", q.name));
-            let standalone = standalone_query(&conn, &q.sql)
-                .unwrap_or_else(|e| panic!("duckdb sql {}: {e}", q.name));
-            let status = compare(&q, &spice, &standalone);
-            eprintln!(
-                "spice-duckdb-accel vs standalone-duckdb / {} -> {status}",
-                q.name
-            );
-            if !status.starts_with("PASS") {
-                fails.push(format!("{}: {status}", q.name));
-            }
-        }
-        assert!(
-            fails.is_empty(),
-            "Spice DuckDB accelerator vs standalone DuckDB failures: {fails:#?}"
-        );
+        conn.query(sql).map_err(|e| e.to_string())
     }
 }

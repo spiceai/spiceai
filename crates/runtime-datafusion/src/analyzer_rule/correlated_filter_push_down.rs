@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! Filter pushdown for the federation analyzer that keeps a correlated
-//! subquery predicate above a join whose sides it spans.
+//! subquery predicate above a join when its hidden references require that scope.
 //!
 //! The federation analyzer pushes filters down *before* the optimizer
 //! decorrelates subqueries. `DataFusion`'s `PushDownFilter` decides which join
@@ -65,8 +65,9 @@ pub fn federation_analyzer_rule() -> FederationAnalyzerRule {
 }
 
 /// [`PushDownFilterFederation`] that holds a correlated subquery predicate
-/// above a join when the predicate spans both sides and the join does not
-/// federate to a single source. Every other filter is handed to the inner rule
+/// above a join when hidden outer references invalidate the inner rule's
+/// placement and the join does not federate to a single source. Every other
+/// filter is handed to the inner rule
 /// unchanged.
 #[derive(Default, Debug)]
 pub struct CorrelatedFilterPushDown {
@@ -158,7 +159,7 @@ fn split_held_predicates(plan: &LogicalPlan) -> Result<Option<SplitFilter>> {
     let mut held = vec![];
     let mut pushable = vec![];
     for conjunct in predicates.iter().flat_map(|p| split_conjunction(p)) {
-        if spans_join_sides(conjunct, join)? {
+        if needs_join_scope(conjunct, join)? {
             held.push(conjunct.clone());
         } else {
             pushable.push(conjunct.clone());
@@ -192,13 +193,12 @@ fn subquery_of(expr: &Expr) -> Option<&Subquery> {
     }
 }
 
-/// Whether `predicate` holds a correlated subquery and, once the outer
-/// references inside its subqueries are counted, needs columns from both sides
-/// of `join` or names a column neither side has. Holding such a predicate is
-/// always correct: it stays where the query wrote it.
-fn spans_join_sides(predicate: &Expr, join: &Join) -> Result<bool> {
+/// Whether hidden outer references make a side the inner rule could choose
+/// insufficient for this predicate. Holding it above the join preserves scope.
+fn needs_join_scope(predicate: &Expr, join: &Join) -> Result<bool> {
     let mut correlated = false;
-    let mut columns: HashSet<Column> = predicate.column_refs().into_iter().cloned().collect();
+    let direct_columns: HashSet<Column> = predicate.column_refs().into_iter().cloned().collect();
+    let mut columns = direct_columns.clone();
     predicate.apply(|expr| {
         if let Some(subquery) = subquery_of(expr)
             && !subquery.outer_ref_columns.is_empty()
@@ -216,7 +216,16 @@ fn spans_join_sides(predicate: &Expr, join: &Join) -> Result<bool> {
     let right = join.right.schema();
     let all_left = columns.iter().all(|column| left.has_column(column));
     let all_right = columns.iter().all(|column| right.has_column(column));
-    Ok(!all_left && !all_right)
+    let direct_all_left = direct_columns.iter().all(|column| left.has_column(column));
+    let direct_all_right = direct_columns.iter().all(|column| right.has_column(column));
+    // The inner rule can choose either side when the direct reference set is
+    // empty. Hidden outer references must not invalidate that placement.
+    Ok(match (all_left, all_right) {
+        (true, true) => false,
+        (true, false) => direct_all_right,
+        (false, true) => direct_all_left,
+        (false, false) => true,
+    })
 }
 
 /// Every outer reference inside `subquery`, including those of subqueries
@@ -474,6 +483,29 @@ mod tests {
         assert!(
             analyzed.contains("Filter: part.p_brand = Utf8(\"Brand#23\")"),
             "the conjuncts that belong to one side still have to be pushed to it:\n{analyzed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exists_reading_only_the_right_join_side_keeps_its_scope() {
+        let ctx = context(
+            AnalyzerRulesBuilder::new().build(),
+            "one_source",
+            "one_source",
+            false,
+        );
+        let sql = "SELECT part.p_brand, count(*) FROM part JOIN lineitem l1 ON part.p_partkey = l1.l_partkey             WHERE EXISTS (SELECT 1 FROM lineitem l2 WHERE l2.l_partkey = l1.l_partkey AND l2.l_quantity <> l1.l_quantity)             AND NOT EXISTS (SELECT 1 FROM lineitem l3 WHERE l3.l_partkey = l1.l_partkey AND l3.l_quantity > l1.l_quantity)             GROUP BY part.p_brand";
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan correlated predicates")
+            .into_optimized_plan()
+            .expect("optimize predicates without losing their outer references");
+        assert_eq!(
+            unbound_join_column(&plan),
+            None,
+            "{}",
+            plan.display_indent()
         );
     }
 

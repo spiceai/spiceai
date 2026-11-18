@@ -166,7 +166,6 @@ where
 /// 5. INSERT after full delete to verify table is still usable
 /// 6. DROP TABLE and verify it is inaccessible, then re-create
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -557,7 +556,6 @@ async fn ddl_lifecycle_drop(harness: &ClusterHarness) -> Result<(), anyhow::Erro
 /// - DELETE on one table does not affect the other
 /// - Aggregations over `JOINed` data are correct
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -722,7 +720,6 @@ async fn multi_table_join_verify(harness: &ClusterHarness) -> Result<(), anyhow:
 ///
 /// Also tests same-named tables in different schemas to verify namespace correctness.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -883,7 +880,6 @@ async fn schema_isolation_verify(harness: &ClusterHarness) -> Result<(), anyhow:
 /// - Pure upsert (all conflicts) preserves row count
 /// - DELETE on PK tables works correctly
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -1088,7 +1084,6 @@ async fn pk_upsert_delete(harness: &ClusterHarness) -> Result<(), anyhow::Error>
 /// - AVG, MIN, MAX, SUM with NULL values
 /// - WHERE IS NULL / IS NOT NULL filtering
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -1146,7 +1141,6 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
 // This is a separate codepath from the single-node path in
 // `cayenne_catalog_ddl/mod.rs`.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -1284,7 +1278,6 @@ async fn test_distributed_cayenne_merge_basic() -> Result<(), anyhow::Error> {
 // IN-list approach would corrupt (US,B) and (EU,A). The distributed path
 // must preserve unmatched rows the same way.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -1420,7 +1413,6 @@ async fn test_distributed_cayenne_merge_composite_key_no_cross_product() -> Resu
 // Test: MERGE with zero matches in cluster mode — target unchanged
 // =============================================================================
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -1536,7 +1528,6 @@ async fn test_distributed_cayenne_merge_zero_match() -> Result<(), anyhow::Error
 // error without losing data. Distributed variant of the single-node
 // `cayenne_catalog_merge_duplicate_source_keys_rejected` test.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -1649,7 +1640,6 @@ async fn test_distributed_cayenne_merge_duplicate_source_keys_rejected() -> Resu
 // Test: DML on a string-partitioned table in cluster mode
 // =============================================================================
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -1779,7 +1769,6 @@ async fn test_distributed_cayenne_string_partition_dml() -> Result<(), anyhow::E
 // The table must have a PRIMARY KEY: the position-based deletion path doesn't
 // yet support no-predicate delete-all on PK-less Cayenne tables.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -1875,7 +1864,6 @@ async fn test_distributed_cayenne_dml_no_where() -> Result<(), anyhow::Error> {
 // Table is `PARTITION BY region`; the DML filter is on `sku`, which forces the
 // scheduler to forward the predicate to every partition/executor.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -2106,7 +2094,6 @@ async fn null_agg_filters(harness: &ClusterHarness) -> Result<(), anyhow::Error>
 /// 3. Start a 2nd executor (late join)
 /// 4. Verify the 2nd executor registered and the cluster can still query the table
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"
@@ -2238,7 +2225,6 @@ async fn test_distributed_cayenne_late_join_ddl_replay() -> Result<(), anyhow::E
 // while bare `PARTITION BY <col>` (covered by the other tests) kept working.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 #[cfg_attr(
     not(feature = "spicebench"),
     ignore = "requires the spicebench feature"

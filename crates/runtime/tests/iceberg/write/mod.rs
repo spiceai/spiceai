@@ -16,7 +16,10 @@ limitations under the License.
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{register_test_connectors, runtime_ready_check, test_request_context},
+    utils::{
+        aws_session_token_param, register_test_connectors, runtime_ready_check,
+        test_request_context,
+    },
 };
 use anyhow::Context;
 use app::AppBuilder;
@@ -228,6 +231,10 @@ fn get_iceberg_params() -> Params {
             ),
         ]
         .into_iter()
+        .chain(aws_session_token_param(
+            "iceberg_s3_session_token",
+            "AWS_ICEBERG_SESSION_TOKEN",
+        ))
         .collect(),
     )
 }
@@ -263,6 +270,10 @@ fn get_glue_params() -> Params {
             ("glue_auth".to_string(), "key".to_string()),
         ]
         .into_iter()
+        .chain(aws_session_token_param(
+            "glue_session_token",
+            "AWS_ICEBERG_SESSION_TOKEN",
+        ))
         .collect(),
     )
 }

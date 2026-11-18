@@ -1475,7 +1475,8 @@ pub(crate) fn flight_sql_table_provider(
             schema,
             Arc::new(CookieStore::new()),
         )
-        .with_statistics(statistics),
+        .with_statistics(statistics)
+        .with_spice_sql(true),
     ) as Arc<dyn TableProvider>
 }
 
@@ -1865,7 +1866,7 @@ mod tests {
         );
 
         let executors = registry.connected_executors().await;
-        assert!(executors.is_empty());
+        assert_eq!(executors, [] as [String; 0]);
     }
 
     #[tokio::test]
@@ -1907,7 +1908,7 @@ mod tests {
         let reconnected = registry.register("exec-a".to_string(), "run-2", tx3).await;
         assert_eq!(reconnected.registration, ExecutorRegistration::Reconnected);
         assert!(registry.unregister("exec-a", reconnected.connection).await);
-        assert!(registry.connected_executors().await.is_empty());
+        assert_eq!(registry.connected_executors().await, [] as [String; 0]);
     }
 
     /// A restart drops the endpoint the earlier run registered, so the executor
@@ -1937,7 +1938,7 @@ mod tests {
 
         registry.register("exec-a".to_string(), "run-2", tx2).await;
         assert_eq!(registry.flight_sql_clients_count().await, 0);
-        assert!(registry.ready_executor_addresses_sync().is_empty());
+        assert_eq!(registry.ready_executor_addresses_sync(), [] as [String; 0]);
 
         registry
             .insert_flight_sql_client(
@@ -2019,7 +2020,7 @@ mod tests {
             )
             .await;
         assert!(registry.unregister("exec-a", earlier.connection).await);
-        assert!(registry.connected_executors().await.is_empty());
+        assert_eq!(registry.connected_executors().await, [] as [String; 0]);
         assert_eq!(
             registry.ready_executor_addresses_sync(),
             ["127.0.0.1:50102"]
@@ -2045,7 +2046,7 @@ mod tests {
                 .await
         );
         assert!(registry.unregister("exec-a", earlier.connection).await);
-        assert!(registry.connected_executors().await.is_empty());
+        assert_eq!(registry.connected_executors().await, [] as [String; 0]);
         assert_eq!(
             registry.ready_executor_addresses_sync(),
             ["127.0.0.1:50102"]
@@ -2113,7 +2114,10 @@ mod tests {
                 )
                 .await
         );
-        assert!(later_scheduler.ready_executor_addresses_sync().is_empty());
+        assert_eq!(
+            later_scheduler.ready_executor_addresses_sync(),
+            [] as [String; 0]
+        );
     }
 
     /// A scheduler that starts after a process was replaced, and sees the
@@ -2385,7 +2389,7 @@ mod tests {
             } else {
                 let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
                 assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
-                assert!(registry.ready_executor_addresses_sync().is_empty());
+                assert_eq!(registry.ready_executor_addresses_sync(), [] as [String; 0]);
                 assert!(insert_replacement_endpoint().await);
             }
             assert_eq!(
@@ -2570,7 +2574,10 @@ mod tests {
         let registry = make_registry().await;
         let result = registry.request_metrics_from_all().await;
         assert!(result.is_ok());
-        assert!(result.expect("should succeed").is_empty());
+        assert_eq!(
+            result.expect("should succeed"),
+            [] as [(String, Vec<u8>); 0]
+        );
     }
 
     #[tokio::test]
@@ -3249,9 +3256,9 @@ mod tests {
     async fn test_ddl_log_empty() {
         let registry = make_registry().await;
         let (stmts, version) = registry.ddl_snapshot().await;
-        assert!(stmts.is_empty());
+        assert_eq!(stmts, [] as [String; 0]);
         assert_eq!(version, 0);
-        assert!(registry.ddl_statements_since(0).await.is_empty());
+        assert_eq!(registry.ddl_statements_since(0).await, [] as [String; 0]);
     }
 
     #[tokio::test]
@@ -3290,9 +3297,9 @@ mod tests {
             vec!["stmt1", "stmt2"]
         );
         assert_eq!(registry.ddl_statements_since(2).await, vec!["stmt2"]);
-        assert!(registry.ddl_statements_since(3).await.is_empty());
+        assert_eq!(registry.ddl_statements_since(3).await, [] as [String; 0]);
         // Beyond end returns empty
-        assert!(registry.ddl_statements_since(100).await.is_empty());
+        assert_eq!(registry.ddl_statements_since(100).await, [] as [String; 0]);
     }
 
     /// Spawn a tiny fake executor: receives `SchedulerControlMessage`s from

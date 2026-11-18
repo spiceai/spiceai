@@ -31,7 +31,6 @@ use common::lookup_index::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use cayenne::MetadataCatalog;
 use datafusion::execution::memory_pool::{
     GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };

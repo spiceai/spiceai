@@ -28,8 +28,5 @@ tracing.workspace = true
 [features]
 datafusion = ["dep:datafusion"]
 
-[target.'cfg(windows)'.dependencies]
-winver = "1.0.0"
-
 [lints]
 workspace = true

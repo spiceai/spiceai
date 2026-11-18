@@ -116,8 +116,7 @@ impl Model2Vec {
                     kind: "embedding model",
                     name: component.to_string(),
                     docs_url: DOCS_URL,
-                    // Spice loads an embedding model once.
-                    retried: false,
+                    retried: true,
                 };
                 let dir = download(requester, model, hub, options.subfolder.as_deref())
                     .await
@@ -665,14 +664,6 @@ mod tests {
 
         assert_eq!(
             local_model_path("~/model")
-                .expect("home-relative model path should resolve")
-                .expect("home-relative model path should be treated as local"),
-            home_dir_path.join("model")
-        );
-
-        #[cfg(windows)]
-        assert_eq!(
-            local_model_path("~\\model")
                 .expect("home-relative model path should resolve")
                 .expect("home-relative model path should be treated as local"),
             home_dir_path.join("model")

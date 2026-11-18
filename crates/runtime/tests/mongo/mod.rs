@@ -17,19 +17,14 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::SystemTime;
 
-#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 use arrow::array::{Array, Int32Array, StringArray};
-#[cfg(not(target_os = "windows"))]
 use common::make_mongodb_cayenne_change_stream_dataset;
 use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_container};
-#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 use common::{get_mongodb_replica_set_client, start_mongodb_replica_set_docker_container};
-#[cfg(feature = "duckdb")]
 use common::{
     make_mongodb_change_stream_dataset, make_mongodb_change_stream_dataset_inferred,
     make_mongodb_inference_dataset, make_mongodb_widen_dataset,
 };
-#[cfg(feature = "duckdb")]
 use datafusion::assert_batches_eq;
 use mongodb::{Collection, bson::doc};
 
@@ -37,7 +32,6 @@ use chrono::{DateTime, Utc};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 use crate::utils::wait_until_true;
 use crate::utils::{register_test_connectors, run_query, test_request_context};
 
@@ -126,7 +120,6 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
 /// index) for the non-CDC extended schema-inference test. The secondary indexes
 /// exercise the `listIndexes` inference path; the implicit `_id_` index must be
 /// dropped as the inferred primary key.
-#[cfg(feature = "duckdb")]
 async fn init_mongodb_inventory_db(port: u16) -> Result<(), anyhow::Error> {
     let client = get_mongodb_client(port).await?;
     let database = client.database("testdb");
@@ -155,7 +148,6 @@ async fn init_mongodb_inventory_db(port: u16) -> Result<(), anyhow::Error> {
 }
 
 #[instrument]
-#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 async fn init_mongodb_change_stream_db(port: u16) -> Result<(), anyhow::Error> {
     tracing::debug!("INIT CHANGE STREAM DB: test");
     let client = get_mongodb_replica_set_client(port).await?;
@@ -178,7 +170,6 @@ async fn init_mongodb_change_stream_db(port: u16) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 async fn change_stream_rows(rt: &Arc<Runtime>) -> Result<Vec<(i32, String)>, anyhow::Error> {
     let batches = run_query(rt, "SELECT _id, name FROM change_stream_users ORDER BY _id").await?;
     let mut rows = Vec::new();
@@ -440,14 +431,13 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
         .await
 }
 
-/// Non-CDC counterpart to `mongodb_change_streams_infer_primary_key`: a `DuckDB`
+/// Non-CDC counterpart to `mongodb_change_streams_infer_primary_key`: a `Cayenne`
 /// full-refresh dataset loads end-to-end against a real `MongoDB` with always-on
 /// schema inference. The catalog query (`listIndexes`/`collStats`) runs on the server
-/// and the inferred settings applied for `DuckDB` + full refresh (the `_id` sort
+/// and the inferred settings applied for `Cayenne` + full refresh (the `_id` sort
 /// order; physical constraints are intentionally skipped for this engine/mode) are
 /// accepted by the accelerator — a correct row count proves none of those steps
 /// errored. (Precise value-level mapping is covered by unit tests.)
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,connector_mongodb=debug,info"));
@@ -489,7 +479,7 @@ async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Erro
             // The full extended-inference pipeline must succeed end-to-end: the MongoDB
             // catalog query runs against the real server, and the inferred `_id`
             // primary key, secondary indexes, and `_id` sort are all accepted by the
-            // DuckDB accelerator. A correct row count proves the dataset loaded.
+            // Cayenne accelerator. A correct row count proves the dataset loaded.
             let results = run_query(&rt, "SELECT COUNT(*) AS n FROM inventory").await?;
             assert_batches_eq!(
                 &[
@@ -508,7 +498,6 @@ async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Erro
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyhow::Error> {
     assert_change_streams_apply_insert_update_delete(
@@ -520,7 +509,6 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
 
 /// Cayenne applies Change Streams with `primary_key: _id` and no `on_conflict`: it keeps
 /// one row per primary key on its own.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mongodb_change_streams_cayenne_primary_key_only() -> Result<(), anyhow::Error> {
     assert_change_streams_apply_insert_update_delete(
@@ -530,7 +518,6 @@ async fn mongodb_change_streams_cayenne_primary_key_only() -> Result<(), anyhow:
     .await
 }
 
-#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 async fn assert_change_streams_apply_insert_update_delete(
     app_name: &str,
     make_dataset: fn(&str, &str, u16) -> spicepod::component::dataset::Dataset,
@@ -630,7 +617,6 @@ async fn assert_change_streams_apply_insert_update_delete(
 /// `MongoDB` Streams (`refresh_mode: changes`) work with always-on schema inference
 /// and no explicit `primary_key`/`on_conflict`: inference supplies `_id` as the
 /// primary key plus the matching upsert, which the change-stream path requires.
-#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -725,7 +711,6 @@ async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error>
 /// Seed the `widen` collection with two documents carrying only `{_id, name}`,
 /// then (when `with_country`) add a third document that also has a `country`
 /// field — the additive change the restart re-infers and evolves.
-#[cfg(feature = "duckdb")]
 async fn seed_mongodb_widen_collection(port: u16, with_country: bool) -> Result<(), anyhow::Error> {
     let client = get_mongodb_client(port).await?;
     let database = client.database("testdb");
@@ -751,12 +736,11 @@ async fn seed_mongodb_widen_collection(port: u16, with_country: bool) -> Result<
 }
 
 /// Builds and loads a runtime for the `MongoDB` widening dataset (file-backed
-/// `DuckDB` so the acceleration survives the restart). Re-registers connectors
+/// `Cayenne` so the acceleration survives the restart). Re-registers connectors
 /// each call since a prior `shutdown()` clears them.
-#[cfg(feature = "duckdb")]
 async fn build_mongodb_widen_runtime(
     port: u16,
-    duckdb_file: &str,
+    cayenne_path: &str,
 ) -> Result<Arc<Runtime>, anyhow::Error> {
     register_test_connectors().await;
     let app = AppBuilder::new("mongodb_schema_evolution_widening")
@@ -764,7 +748,7 @@ async fn build_mongodb_widen_runtime(
             "widen",
             "widen",
             port,
-            duckdb_file,
+            cayenne_path,
         ))
         .build();
     configure_test_datafusion();
@@ -781,11 +765,10 @@ async fn build_mongodb_widen_runtime(
 
 /// Restart-time widening for a `MongoDB` source: a `country` field that appears in
 /// newly inserted documents is re-inferred on restart and adopted into the
-/// file-backed `DuckDB` acceleration under `on_schema_change: sync_all_columns`
+/// file-backed `Cayenne` acceleration under `on_schema_change: sync_all_columns`
 /// (additive widening), instead of the dataset deferring on the prior schema
 /// (the `block` default). `MongoDB` schema inference unions fields across the
 /// sampled documents, so the field surfaces as a nullable column.
-#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,connector_mongodb=debug,info"));
@@ -794,7 +777,7 @@ async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::E
     test_request_context()
         .scope(async {
             let temp_dir = tempfile::tempdir()?;
-            let duckdb_file = temp_dir
+            let cayenne_path = temp_dir
                 .path()
                 .join("mongo_widen.duckdb")
                 .to_string_lossy()
@@ -813,7 +796,7 @@ async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::E
             .await?;
 
             // Phase 1: initial load infers {_id, name}.
-            let rt = build_mongodb_widen_runtime(port, &duckdb_file).await?;
+            let rt = build_mongodb_widen_runtime(port, &cayenne_path).await?;
             let batches = run_query(&rt, "SELECT _id, name FROM widen ORDER BY _id").await?;
             let rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
             assert_eq!(rows, 2, "expected 2 rows in the initial MongoDB load");
@@ -828,7 +811,7 @@ async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::E
             // (existing rows preserved) rather than re-fetching, so the proof is that the
             // column is now in the registered schema and queryable — under `block` this
             // query would error (the column would not be registered).
-            let rt = build_mongodb_widen_runtime(port, &duckdb_file).await?;
+            let rt = build_mongodb_widen_runtime(port, &cayenne_path).await?;
             let batches =
                 run_query(&rt, "SELECT _id, name, country FROM widen ORDER BY _id").await?;
             let has_country = batches

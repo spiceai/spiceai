@@ -50,8 +50,8 @@ pub async fn open_model(
 }
 
 /// Opens `paths` of `repo` (`org/name`), a repository of `kind`, at `revision` for
-/// `requester`, with `hub`'s settings. Only those paths are described, so the repository is
-/// never listed (see [`Snapshot::open_paths`]).
+/// `requester`, with `hub`'s settings. Only those paths are kept, and a warm load costs at most
+/// one request (see [`Snapshot::open_paths`]).
 ///
 /// # Errors
 ///
@@ -91,15 +91,12 @@ async fn settings(
 /// The safetensors index of a sharded model, `model.safetensors.index.json`.
 pub const SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
 
-/// The shard files a safetensors index names, sorted, each of which `listed` must accept.
+/// The shard files a safetensors index names, sorted.
 ///
 /// # Errors
 ///
 /// Returns why the index cannot be used, worded to follow its file name.
-pub fn safetensors_shards(
-    index: &str,
-    listed: impl Fn(&str) -> bool,
-) -> Result<Vec<String>, String> {
+pub fn safetensors_shards(index: &str) -> Result<Vec<String>, String> {
     let index: serde_json::Value =
         serde_json::from_str(index).map_err(|_| "is not valid JSON".to_string())?;
     let map = index
@@ -116,9 +113,6 @@ pub fn safetensors_shards(
     if shards.is_empty() {
         return Err("names no weight files".to_string());
     }
-    if let Some(missing) = shards.iter().find(|shard| !listed(shard)) {
-        return Err(format!("names '{missing}', which is not in the repo"));
-    }
     Ok(shards)
 }
 
@@ -126,8 +120,8 @@ pub fn safetensors_shards(
 ///
 /// # Errors
 ///
-/// Returns an error if the index cannot be downloaded or read, or names a file the repository
-/// does not have.
+/// Returns an error if the index cannot be downloaded or read, or names a file the snapshot does
+/// not hold: one the repository lacks, or, read from the cache alone, one the cache lacks.
 pub async fn read_shards(snapshot: &Snapshot) -> Result<Vec<String>, DownloadError> {
     let index = snapshot.fetch_quietly(&[SAFETENSORS_INDEX]).await?;
     let index = index.first().cloned().unwrap_or_default();
@@ -137,8 +131,15 @@ pub async fn read_shards(snapshot: &Snapshot) -> Result<Vec<String>, DownloadErr
             format!("'{SAFETENSORS_INDEX}' could not be read ({error})"),
         )
     })?;
-    safetensors_shards(&contents, |shard| snapshot.file(shard).is_some())
-        .map_err(|why| DownloadError::unusable(snapshot, format!("'{SAFETENSORS_INDEX}' {why}")))
+    let shards = safetensors_shards(&contents)
+        .map_err(|why| DownloadError::unusable(snapshot, format!("'{SAFETENSORS_INDEX}' {why}")))?;
+    if let Some(missing) = shards.iter().find(|shard| snapshot.file(shard).is_none()) {
+        return Err(DownloadError::missing(
+            snapshot,
+            format!("'{missing}', which '{SAFETENSORS_INDEX}' names"),
+        ));
+    }
+    Ok(shards)
 }
 
 #[cfg(test)]
@@ -153,26 +154,22 @@ mod tests {
     fn an_index_names_its_shards() {
         let index = r#"{"metadata":{},"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors","c":"model-00001-of-00002.safetensors"}}"#;
         assert_eq!(
-            safetensors_shards(index, |_| true),
+            safetensors_shards(index),
             Ok(owned(&[
                 "model-00001-of-00002.safetensors",
                 "model-00002-of-00002.safetensors"
             ]))
         );
         assert_eq!(
-            safetensors_shards(index, |shard| shard != "model-00002-of-00002.safetensors"),
-            Err("names 'model-00002-of-00002.safetensors', which is not in the repo".to_string())
-        );
-        assert_eq!(
-            safetensors_shards("{}", |_| true),
+            safetensors_shards("{}"),
             Err("has no `weight_map`".to_string())
         );
         assert_eq!(
-            safetensors_shards(r#"{"weight_map":{}}"#, |_| true),
+            safetensors_shards(r#"{"weight_map":{}}"#),
             Err("names no weight files".to_string())
         );
         assert_eq!(
-            safetensors_shards("not json", |_| true),
+            safetensors_shards("not json"),
             Err("is not valid JSON".to_string())
         );
     }

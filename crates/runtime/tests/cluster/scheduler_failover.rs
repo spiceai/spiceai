@@ -56,7 +56,7 @@ use arrow::datatypes::Int64Type;
 use ballista_scheduler::state::executor_manager::ExecutorManager;
 use runtime::auth::EndpointAuth;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::config::{ClusterConfig, ClusterRole, Config};
+use runtime::config::{ClusterConfig, Config, Role};
 use runtime::http_types::SubmitQueryRequest;
 use runtime::jobs::{JobExecutor, JobState, JobStatus};
 use runtime::{Result as RuntimeResult, Runtime};
@@ -140,7 +140,7 @@ async fn build_scheduler(
         http_bind_address: format!("127.0.0.1:{http}").parse().expect("http addr"),
         flight_bind_address: format!("127.0.0.1:{flight}").parse().expect("flight addr"),
         cluster: ClusterConfig {
-            role: Some(ClusterRole::Scheduler),
+            role: Some(Role::Scheduler),
             node_bind_address: cluster_addr.parse().expect("cluster addr"),
             node_advertise_address: Some("127.0.0.1".to_string()),
             node_mtls_ca_certificate_file: Some(pki.ca_cert_path.to_string_lossy().to_string()),
@@ -195,7 +195,7 @@ async fn build_executor(
         http_bind_address: format!("127.0.0.1:{http}").parse().expect("http addr"),
         flight_bind_address: format!("127.0.0.1:{flight}").parse().expect("flight addr"),
         cluster: ClusterConfig {
-            role: Some(ClusterRole::Executor),
+            role: Some(Role::Executor),
             node_bind_address: format!("127.0.0.1:{cluster}")
                 .parse()
                 .expect("cluster addr"),
@@ -479,7 +479,6 @@ async fn run_failover(recovery_timeout: Duration) -> Result<(), anyhow::Error> {
 /// Graceful loss (SIGTERM): the scheduler deregisters on shutdown, so recovery
 /// is fast (no heartbeat-TTL wait).
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn recovers_job_after_scheduler_loss_sigterm() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
@@ -494,7 +493,6 @@ async fn recovers_job_after_scheduler_loss_sigterm() -> Result<(), anyhow::Error
 /// expiry — would require a subprocess harness and is not covered here. The
 /// larger timeout reflects the TTL-expiry budget that path would need.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn recovers_job_after_scheduler_loss_sigkill() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
@@ -615,7 +613,6 @@ async fn run_runtime_state_layout() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn runtime_state_scheduler_writes_under_cluster_folder() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()

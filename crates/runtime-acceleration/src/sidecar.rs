@@ -27,7 +27,7 @@ limitations under the License.
 //! sidecar (its connection plus the dataset name) and hands back the stores; the
 //! runtime asks the engine for a sidecar and never learns which engine answered. That
 //! is what keeps the engines off the runtime's dependency graph: without this seam the
-//! runtime has to name `DuckDBAccelerator`/`SqliteAccelerator`/`TursoAccelerator` to
+//! runtime has to name `SqliteAccelerator` or `PostgresAccelerator` to
 //! borrow their connection pools.
 //!
 //! The store traits themselves live in `runtime-checkpoint-api`, which is deliberately
@@ -37,8 +37,7 @@ limitations under the License.
 //!
 //! # Not every engine hosts every store
 //!
-//! `caching_engine` is `DuckDB`-only, and the in-memory engines (`arrow`,
-//! `partitioned_arrow`) host nothing at all. A store an engine cannot provide is
+//! The in-memory engines (`arrow`, `partitioned_arrow`) host nothing at all. A store an engine cannot provide is
 //! reported as [`CheckpointError::Store`] rather than skipped, so a connector that
 //! needs one fails loudly at registration instead of silently running stateless and
 //! re-bootstrapping on every restart.
@@ -71,7 +70,7 @@ pub enum OpenOption {
 /// engine's connection, so every method below is a pure lookup rather than another
 /// round of resolution.
 ///
-/// Implemented once per engine in the `runtime-checkpoint-{duckdb,sqlite,turso,postgres}`
+/// Implemented once per engine in the `runtime-checkpoint-{sqlite,postgres}`
 /// crates. **Every method must be answered explicitly** — an engine that cannot host a
 /// store returns [`CheckpointError::Store`] naming itself, so adding a store to this
 /// trait cannot silently no-op on an engine that forgot to implement it.
@@ -138,17 +137,6 @@ pub trait AcceleratorSidecar: Send + Sync {
         &self,
         snapshot_behavior: SnapshotBehavior,
     ) -> Result<Arc<dyn DatasetCheckpointer>, CheckpointError>;
-
-    /// Records that the caching engine fetched this dataset just now.
-    ///
-    /// `DuckDB`-only: it is the only engine Spice serves cached results from, so every
-    /// other engine reports it cannot.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CheckpointError::Store`] when the marker cannot be written, or when
-    /// this engine does not serve cached results.
-    async fn update_caching_engine_fetched_at(&self) -> Result<(), CheckpointError>;
 }
 
 /// Reports that `engine` does not host the `store` sidecar.
@@ -159,7 +147,7 @@ pub trait AcceleratorSidecar: Send + Sync {
 pub fn unsupported_sidecar(engine: &str, store: &str) -> CheckpointError {
     CheckpointError::Store {
         source: format!(
-            "The {engine} accelerator does not store {store} state. Accelerate this dataset with an engine that does (duckdb, sqlite, turso, or postgres), or remove the setting that needs it. See: https://spiceai.org/docs/components/data-accelerators"
+            "The {engine} accelerator does not store {store} state. Accelerate this dataset with an engine that does (cayenne, sqlite, or postgres), or remove the setting that needs it. See: https://spiceai.org/docs/components/data-accelerators"
         )
         .into(),
     }

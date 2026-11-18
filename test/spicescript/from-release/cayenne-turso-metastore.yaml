@@ -1,0 +1,53 @@
+name: cayenne-turso-metastore
+description: >
+  Run with `--from` a release that has the Turso Cayenne metastore (v2.4 or
+  earlier). The release loads a dataset with `cayenne_metastore: turso`; the
+  build under test then refuses that catalog with the fix, whether or not the
+  dataset still sets the param, while the rest of the pod serves, and SQLite
+  never opens the Turso catalog.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-turso-metastore
+  datasets:
+    - { from: 'postgres:public.t', name: healthy, params: '${sources.src.params}' }
+    - from: postgres:public.t
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        params: { cayenne_metastore: turso, cayenne_file_path: '${instance.dir}/data', cayenne_metadata_dir: '${instance.dir}/meta' }
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 1000) g" }
+  - start: {}
+  - query: SELECT count(*) AS n FROM orders
+    expect: { rows: [['1000']] }
+  - assert-files: { contains: ['^meta/cayenne\.db-log$'] }
+  - stop: {}
+
+  # The build under test, still naming the Turso metastore.
+  - upgrade: { ready: false }
+  - query: SELECT count(*) AS n FROM healthy
+    expect: { rows: [['1000']] }
+    eventually: 30s
+  - assert-status: { dataset: orders, status: Error, message-contains: "/meta/cayenne.db' was written by the Turso metastore, which is no longer supported, so it cannot be opened. Stop Spice, remove `cayenne_metastore` from every dataset that sets it, delete the Cayenne metastore directory '" }
+    eventually: 30s
+
+  # Dropping the param is not enough: the catalog on disk is still Turso's.
+  - restart:
+      ready: false
+      patch: { datasets: { orders: { acceleration: { params: { cayenne_metastore: null } } } } }
+  - query: SELECT count(*) AS n FROM healthy
+    expect: { rows: [['1000']] }
+    eventually: 30s
+  - assert-status: { dataset: orders, status: Error, message-contains: "/meta/cayenne.db' was written by the Turso metastore, which is no longer supported" }
+    eventually: 30s
+  # SQLite never opened it: opening a database in WAL mode creates `-shm`.
+  - assert-files: { contains: ['^meta/cayenne\.db-log$'], lacks: ['^meta/cayenne\.db-shm$'] }

@@ -12,6 +12,12 @@ sources:
 matrix:
   src: [postgres, mysql]
 
+# The spicepod as written, and the same with the prototype object-native Cayenne
+# metastore in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod
@@ -34,6 +40,9 @@ spicepod:
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
 
 defaults:
+  # Background writes draw random values, so each instance holds different rows;
+  # every instance is checked against the source instead.
+  compare-variants: false
   spiced-args: [--pods-watcher-enabled]
   cluster-partition-by: { '*': id }
   expect: { oracle: src }

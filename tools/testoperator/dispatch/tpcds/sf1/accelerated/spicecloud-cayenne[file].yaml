@@ -1,0 +1,12 @@
+# Validates query results over data loaded from Spice Cloud into Cayenne, a load
+# no other automated test makes. Weekly and bench only: the Cayenne accelerator
+# itself is benchmarked from file[parquet].
+schedule: weekly
+tests:
+  bench:
+    spicepod_path: accelerated/spicecloud-cayenne[file].yaml
+    query_set: tpcds
+
+    runner_type: spiceai-dev-runners
+    ready_wait: 300
+    validate_results: true

@@ -865,6 +865,9 @@ fn try_rewrite_oversized_join(
         // HashJoinInputs cannot spill and are what OOMed Q97 at SF-100 after
         // the Cayenne side had already become `SortMergeJoinExec`.
         if *hash_join.join_type() == JoinType::Full && input_is_aggregate(hash_join.left()) {
+            if join_touches_cayenne(hash_join) {
+                return partitioned_sort_merge_rewrite(hash_join);
+            }
             return finish_sort_merge_rewrite(hash_join, true);
         }
         if !join_touches_cayenne(hash_join) {
@@ -930,13 +933,7 @@ fn try_rewrite_oversized_join(
             if !should_spill_unknown_size_join(hash_join) {
                 return Ok(None);
             }
-            // A HAVING-filtered build keeps its partitions, but only where the
-            // coalesced rewrite applies, so the same joins spill either way.
-            let coalesced = finish_sort_merge_rewrite(hash_join, true)?;
-            if coalesced.is_none() || !input_is_filtered_aggregate(hash_join.left()) {
-                return Ok(coalesced);
-            }
-            return Ok(finish_sort_merge_rewrite(hash_join, false)?.or(coalesced));
+            return partitioned_sort_merge_rewrite(hash_join);
         };
         fire
     } else {
@@ -1127,6 +1124,21 @@ fn finish_sort_merge_rewrite(
     );
 
     Ok(Some(join))
+}
+
+/// Sort-merge `hash_join` with each input partition sorted on its own thread,
+/// for an aggregate build that reads Cayenne. Coalescing would sort each whole
+/// side on one thread (TPC-DS Q51's `FULL JOIN` and Q78's `ss`/`ws` join, and
+/// TPC-H Q18's `HAVING` build). Applies only where the coalesced rewrite does,
+/// so the set of joins that spill is the same either way.
+fn partitioned_sort_merge_rewrite(
+    hash_join: &HashJoinExec,
+) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+    let coalesced = finish_sort_merge_rewrite(hash_join, true)?;
+    if coalesced.is_none() {
+        return Ok(None);
+    }
+    Ok(finish_sort_merge_rewrite(hash_join, false)?.or(coalesced))
 }
 
 /// `filter` with its columns reordered so every left-side column precedes every
@@ -1461,26 +1473,6 @@ fn input_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// instead and are not gated on an aggregate build.
 fn should_spill_unknown_size_join(hash_join: &HashJoinExec) -> bool {
     !is_unknown_size_self_join(hash_join) && input_is_aggregate(hash_join.left())
-}
-
-/// Whether an input is a `FilterExec` over an aggregate (a `HAVING` clause),
-/// through unary wrappers. Such a build side can keep anywhere from a handful
-/// of groups (TPC-H Q18 keeps 624 of 15M orders at SF-10) to all of them, so
-/// it still sort-merges, but keeps its partitions: coalescing would sort the
-/// whole probe side (all of Q18's `orders`) on one thread. Coalescing stays
-/// for unfiltered aggregate builds (TPC-DS Q78).
-fn input_is_filtered_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.is::<AggregateExec>() {
-        return false;
-    }
-    let children = plan.children();
-    if children.len() != 1 {
-        return false;
-    }
-    if plan.is::<datafusion_physical_plan::filter::FilterExec>() {
-        return input_is_aggregate(children[0]);
-    }
-    input_is_filtered_aggregate(children[0])
 }
 
 /// `__test_reference` Q78 Left-joins file scans inside each CTE body
@@ -4776,10 +4768,10 @@ mod tests {
     }
 
     #[test]
-    fn having_filtered_aggregate_build_sort_merges_without_coalescing() {
+    fn aggregate_build_sort_merges_without_coalescing() {
         // The build can still be large, so it spills, but sorting each side on
-        // one thread made Q18 slow. The same build without the HAVING filter
-        // keeps coalescing (TPC-DS Q78).
+        // one thread made TPC-H Q18 (HAVING build) and TPC-DS Q78 (unfiltered
+        // build) slow.
         let (grouped, having) = q18_aggregate_builds();
         let config =
             config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
@@ -4803,10 +4795,16 @@ mod tests {
 
         let optimized =
             optimize_anti_join_sort_merge_with_config(q18_semi_join(grouped, None), &config);
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "an unfiltered aggregate build must sort-merge in place, got:\n{}",
+            displayable(optimized.as_ref()).indent(true)
+        );
+        assert_eq!(optimized.output_partitioning().partition_count(), 8);
         for input in sort_merge_sort_inputs(&optimized) {
             assert!(
-                input.is::<CoalescePartitionsExec>(),
-                "an unfiltered unknown-size aggregate build must coalesce, got:\n{}",
+                input.is::<RepartitionExec>(),
+                "an unfiltered aggregate build must sort each partition, got:\n{}",
                 displayable(optimized.as_ref()).indent(true)
             );
         }
@@ -5576,70 +5574,68 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_size_sort_merge_coalesces_partitioned_inputs() {
-        // TPC-DS Q78 at SF-100: 20 partitioned ExternalSorters exhausted the
-        // greedy 107.5 GB pool. Unknown-size aggregate joins must coalesce
-        // to one partition before the spillable sort.
-        let left_schema = channel_schema("cs_item_sk", "cs_qty");
-        let right_schema = channel_schema("ss_item_sk", "ss_qty");
-        let left = hash_repartition(
-            grouped_count_over(
-                cayenne_file_exec_with_num_rows(&left_schema, "cs.vortex", Precision::Absent),
-                "cs_item_sk",
-            ),
-            "cs_item_sk",
-            8,
-        );
+    /// TPC-DS Q51 shape: `FULL JOIN` of two aggregates over Cayenne,
+    /// hash-partitioned 8 ways.
+    fn q51_full_join(
+        left_leaf: Arc<dyn ExecutionPlan>,
+        right_leaf: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let left = hash_repartition(grouped_count_over(left_leaf, "ws_item_sk"), "ws_item_sk", 8);
         let right = hash_repartition(
-            grouped_count_over(
-                cayenne_file_exec_with_num_rows(&right_schema, "ss.vortex", Precision::Absent),
-                "ss_item_sk",
-            ),
+            grouped_count_over(right_leaf, "ss_item_sk"),
             "ss_item_sk",
             8,
         );
-        let join = Arc::new(hash_join_with_join_type(
+        Arc::new(hash_join_with_join_type(
             left,
             right,
-            "cs_item_sk",
+            "ws_item_sk",
             "ss_item_sk",
-            JoinType::Inner,
+            JoinType::Full,
             NullEquality::NullEqualsNothing,
-        ));
+        ))
+    }
+
+    #[test]
+    fn full_outer_aggregate_join_sorts_each_partition_only_over_cayenne() {
+        // Coalescing made TPC-DS Q51 sort both sides on one thread. The
+        // `--validate` oracle of the same join reads no Cayenne and keeps
+        // coalescing.
+        let left_schema = channel_schema("ws_item_sk", "ws_qty");
+        let right_schema = channel_schema("ss_item_sk", "ss_qty");
         let config =
             config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
 
-        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
-        assert_eq!(
-            optimized.output_partitioning().partition_count(),
-            8,
-            "coalesced sort-merge must restore the original partition count"
+        let optimized = optimize_anti_join_sort_merge_with_config(
+            q51_full_join(
+                cayenne_file_exec_with_num_rows(&left_schema, "ws.vortex", Precision::Absent),
+                cayenne_file_exec_with_num_rows(&right_schema, "ss.vortex", Precision::Absent),
+            ),
+            &config,
         );
-        let wrapper_children = optimized.children();
-        let smj_node = if optimized.is::<SortMergeJoinExec>() {
-            Arc::clone(&optimized)
-        } else {
-            Arc::clone(
-                wrapper_children
-                    .first()
-                    .expect("repartition wrapper must have a child"),
-            )
-        };
-        let smj = smj_node
-            .downcast_ref::<SortMergeJoinExec>()
-            .expect("unknown-size aggregate join must become sort-merge");
-        for (side, child) in smj.children().iter().enumerate() {
-            let sort = child
-                .downcast_ref::<SortExec>()
-                .unwrap_or_else(|| panic!("sort-merge input {side} must be SortExec"));
-            let sort_children = sort.children();
-            let sort_input = sort_children
-                .first()
-                .unwrap_or_else(|| panic!("SortExec {side} must have an input"));
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "got:\n{}",
+            displayable(optimized.as_ref()).indent(true)
+        );
+        assert_eq!(optimized.output_partitioning().partition_count(), 8);
+        for input in sort_merge_sort_inputs(&optimized) {
             assert!(
-                sort_input.is::<CoalescePartitionsExec>(),
-                "sort-merge input {side} must coalesce before sorting"
+                input.is::<RepartitionExec>(),
+                "a Cayenne full-outer aggregate join must sort each partition, got:\n{}",
+                displayable(optimized.as_ref()).indent(true)
+            );
+        }
+
+        let optimized = optimize_anti_join_sort_merge_with_config(
+            q51_full_join(inlined_exec(&left_schema), inlined_exec(&right_schema)),
+            &config,
+        );
+        for input in sort_merge_sort_inputs(&optimized) {
+            assert!(
+                input.is::<CoalescePartitionsExec>(),
+                "the oracle full-outer aggregate join must coalesce, got:\n{}",
+                displayable(optimized.as_ref()).indent(true)
             );
         }
     }

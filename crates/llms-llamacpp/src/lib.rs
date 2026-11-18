@@ -17,7 +17,8 @@ limitations under the License.
 //! Serves a single-node GGUF model with llama.cpp.
 //!
 //! The prompt is the one the mistral.rs engine would send: the same messages
-//! ([`message_to_mistral`]) rendered by the same chat-template code
+//! ([`message_to_mistral`], fitted to the template by [`ContentSupport`]) rendered by the
+//! same chat-template code
 //! ([`apply_chat_template_to`]), with `reasoning_effort` checked by the same
 //! [`ReasoningSupport`]. llama.cpp only runs the forward passes and samples.
 //!
@@ -29,6 +30,7 @@ limitations under the License.
 
 use std::{
     collections::{HashMap, VecDeque},
+    fmt::Write as _,
     num::NonZeroU32,
     ops::Range,
     path::{Path, PathBuf},
@@ -50,7 +52,8 @@ use async_openai::{
         ChatCompletionRequestMessage, ChatCompletionResponseMessage, ChatCompletionResponseStream,
         ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionRequest,
         CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
-        FunctionCall, FunctionCallStream, FunctionType, ResponseFormat, Role, StopConfiguration,
+        FunctionCall, FunctionCallStream, FunctionType, PromptTokensDetails, ResponseFormat, Role,
+        StopConfiguration,
     },
 };
 use async_trait::async_trait;
@@ -65,7 +68,8 @@ use mistralrs_core::reasoning_parsers::{
     TagReasoningContext,
     harmony::is_harmony_template,
     tag_based::{
-        THINK_OPEN_TAG, is_channel_tag_template, is_gemma_turn_template, is_think_tag_template,
+        MISTRAL_THINK_OPEN_TAG, THINK_OPEN_TAG, is_channel_tag_template, is_gemma_turn_template,
+        is_mistral_think_template, is_think_tag_template,
     },
 };
 use mistralrs_core::{
@@ -80,13 +84,15 @@ use llms::chat::mistral::{
     ReasoningControls, ReasoningSupport, convert_tool, reasoning_controls, request_tool_choice,
 };
 use llms::chat::{
-    Chat, Error as ChatError, LocalModelOptions, PagedAttentionMode, Result, message_to_mistral,
-    nsql::SqlGeneration,
+    Chat, ContentSupport, Error as ChatError, LocalModelOptions, PagedAttentionMode, Result,
+    gguf_files, message_to_mistral, nsql::SqlGeneration,
 };
 use llms::streaming_utils::generate_stream_id;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
+mod batching;
 mod distributed;
+mod harmony;
 
 llms::register_local_chat_engine!(
     LLAMA_CPP,
@@ -95,8 +101,15 @@ llms::register_local_chat_engine!(
         serves: serves_weights,
         distributed: Some(llama_cpp::rpc::splits_by_tensor),
         load: load_weights,
+        free_memory,
     }
 );
+
+/// The memory free for a model, for choosing a quantization: on llama.cpp's GPUs, or on a
+/// machine without one, the memory this process can still use.
+fn free_memory() -> Option<u64> {
+    llama_cpp::gpu_free_memory(Backend::get()).or_else(runtime_resources::get_available_memory)
+}
 
 /// llama.cpp serves a model whose weights are all GGUF files: shards of one model, and an
 /// optional MTP draft head.
@@ -131,6 +144,26 @@ fn load_weights<'a>(
 
 /// Tokens decoded per forward pass while reading the prompt.
 const PROMPT_BATCH: usize = 512;
+
+/// The most requests one model decodes together, as llama-server's default slot count is a few:
+/// a model serves this many unless its memory holds fewer ([`concurrent_context`]). A step's
+/// batch holds each one's next token and draft, which stays well within the context's batch
+/// size (`PROMPT_BATCH`).
+const MAX_CONCURRENT: u32 = 8;
+
+/// The memory a model leaves free on its GPUs (the machine's, on a unified-memory GPU) once its
+/// context is created with room for its open requests: a ceiling that leaves less is halved,
+/// so the requests' state never takes what the machine needs to keep running.
+const MIN_FREE_AFTER_CONTEXT: u64 = 2 << 30;
+
+/// The most host memory a model's idle prompts take, as llama.cpp's server bounds its prompt cache
+/// in RAM (`--cache-ram`, 8 GiB by default). A prompt is saved out of the shared cache when
+/// another request needs its sequence, and restored when a request continues it, so a request
+/// with another prefix (a coding agent's permission check or subagent, another conversation)
+/// leaves a conversation's prompt for its next turn instead of replacing it. Saved prompts also
+/// keep within half the memory the process can still use when each is saved: on a machine whose
+/// GPU shares its memory, what the cache takes the model's own buffers no longer have.
+const HOST_CACHE_BYTES: u64 = 8 << 30;
 
 /// The context size when the model sets no `context_length`.
 const DEFAULT_CONTEXT: u32 = 8192;
@@ -183,8 +216,9 @@ fn draft_len(kind: DraftKind, mtp: i32) -> i32 {
     }
 }
 
-/// How many streamed tokens may wait for a slow client before decoding pauses.
-const STREAM_BUFFER: usize = 64;
+/// How many streamed tokens may wait for a slow client before decoding pauses. Tests read it
+/// to send a reply longer than a client that stops reading can buffer.
+pub const STREAM_BUFFER: usize = 64;
 
 /// The most choices one request may ask for, as `OpenAI`'s `n` allows.
 const MAX_CHOICES: u8 = 128;
@@ -206,11 +240,20 @@ pub struct LlamaCpp {
     model_name: String,
     template: Template,
     special: SpecialTokens,
+    /// The markers of the Harmony replies the template asks for, when it asks for them.
+    harmony: Option<harmony::Markers>,
     reasoning_support: ReasoningSupport,
+    /// Which shapes of a message's content each of the model's chat templates reads.
+    content_support: ContentSupport,
     counter: AtomicUsize,
+    /// See [`Loaded::context_window`].
+    context_window: u32,
     /// How many prompt tokens the last request read from the KV cache, which the decode thread
     /// sets.
     reused_prompt_tokens: Arc<AtomicUsize>,
+    /// How many requests read their prompt's end in a step beside other requests, which the
+    /// decode thread counts.
+    prompt_ends_in_steps: Arc<AtomicUsize>,
 }
 
 /// A model's chat template: one, or named ones from a `tokenizer_config.json`, which a request
@@ -230,8 +273,14 @@ struct Loaded {
     /// `general.architecture`, as the GGUF names it.
     architecture: Option<String>,
     special: SpecialTokens,
+    /// The Harmony markers, when the vocabulary holds them.
+    harmony: Option<harmony::Markers>,
+    /// The context llama.cpp created, in tokens: what one request can hold.
+    context_window: u32,
     /// How many prompt tokens each request reads from the KV cache, as the thread sets it.
     reused_prompt_tokens: Arc<AtomicUsize>,
+    /// How many requests read their prompt's end in a step, as the thread counts them.
+    prompt_ends_in_steps: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -262,6 +311,9 @@ struct Job {
     reasoning: Option<TagReasoningContext>,
     /// Reads tool calls out of the content, when the request offers tools.
     tools: Option<ToolCallingMatcher>,
+    /// Reads a Harmony reply, which carries its reasoning, content and tool calls in its own
+    /// messages, in place of `reasoning` and `tools`.
+    harmony: Option<harmony::Reader>,
     /// Whether `tool_choice` requires a tool call, so a reply without one fails.
     require_tool_call: bool,
     /// Set when the decode thread is stopping, which ends the request.
@@ -318,6 +370,8 @@ enum Event {
 struct Outcome {
     finish: FinishReason,
     prompt_tokens: u32,
+    /// How many of the prompt's tokens were read from the cache rather than decoded.
+    cached_tokens: u32,
     completion_tokens: u32,
 }
 
@@ -351,16 +405,10 @@ impl LlamaCpp {
                 });
             }
         }
-        // An MTP head ships as its own GGUF (`mtp-*.gguf`); it drafts for the model, so it is
-        // loaded beside it rather than as one of its shards.
-        let (drafts, trunk): (Vec<_>, Vec<_>) = weights
-            .iter()
-            .cloned()
-            .partition(|w| is_mtp_head(w) || DraftKind::dflash_of(w).is_some());
-        let first = first_shard(&trunk).ok_or_else(|| ChatError::LocalModelNotFound {
+        let (first, draft) = model_and_draft(weights);
+        let first = first.ok_or_else(|| ChatError::LocalModelNotFound {
             expected_path: String::new(),
         })?;
-        let draft = drafts.into_iter().next();
         let n_ctx = options
             .context_length
             .and_then(|length| u32::try_from(length).ok())
@@ -387,6 +435,10 @@ impl LlamaCpp {
         let (freed_tx, freed_rx) = std_mpsc::channel::<()>();
         let name = options.reasoning.model_name.to_string();
         let file = file_name(&first);
+        let concurrent = options
+            .concurrent_requests
+            .map_or(MAX_CONCURRENT, NonZeroU32::get)
+            .min(MAX_CONCURRENT);
         thread::Builder::new()
             .name("llama-cpp".to_string())
             .spawn(move || {
@@ -395,7 +447,7 @@ impl LlamaCpp {
                     &first,
                     draft.as_deref(),
                     &devices,
-                    n_ctx,
+                    (n_ctx, concurrent),
                     ready_tx,
                     &jobs_rx,
                 );
@@ -430,7 +482,7 @@ impl LlamaCpp {
                     "the GGUF file carries no chat template, and the model sets no `chat_template`"
                         .into(),
             })?;
-        check_reply_format(&template, loaded.architecture, file)?;
+        let harmony = check_reply_format(&template, loaded.architecture, loaded.harmony, file)?;
 
         let model_name = options.reasoning.model_name.to_string();
         let reasoning_support = {
@@ -449,6 +501,30 @@ impl LlamaCpp {
                         enable_thinking,
                         effort,
                         Vec::new(),
+                        true,
+                    )
+                    .ok()
+                })
+            })
+            .await
+            .unwrap_or_default()
+        };
+        // Each template a request may render with is probed with no tools: tools choose
+        // between named templates, and a template reads content alike with or without them.
+        let content_support = {
+            let template = template.clone();
+            let special = loaded.special.clone();
+            tokio::task::spawn_blocking(move || {
+                ContentSupport::from_renders(|messages, with_tools| {
+                    let chosen = chosen_template(&template, with_tools).ok()?;
+                    render(
+                        &Either::Left(chosen.to_string()),
+                        &special,
+                        messages,
+                        None,
+                        None,
+                        Vec::new(),
+                        true,
                     )
                     .ok()
                 })
@@ -470,9 +546,13 @@ impl LlamaCpp {
             model_name,
             template,
             special: loaded.special,
+            harmony,
             reasoning_support,
+            content_support,
             counter: AtomicUsize::new(0),
+            context_window: loaded.context_window,
             reused_prompt_tokens: loaded.reused_prompt_tokens,
+            prompt_ends_in_steps: loaded.prompt_ends_in_steps,
         })
     }
 
@@ -484,19 +564,54 @@ impl LlamaCpp {
         self.reused_prompt_tokens.load(Ordering::Relaxed)
     }
 
+    /// How many requests read the end of their prompt in a step beside the running requests,
+    /// rather than in a decode of its own. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn prompt_ends_in_steps(&self) -> usize {
+        self.prompt_ends_in_steps.load(Ordering::Relaxed)
+    }
+
+    /// The prompt `req` renders, as a request decodes it. For tests.
+    #[doc(hidden)]
+    pub fn render_prompt(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> std::result::Result<String, OpenAIError> {
+        let reasoning = reasoning_controls(
+            req.reasoning_effort.as_ref(),
+            &self.reasoning_support,
+            &self.model_name,
+        )
+        .map_err(OpenAIError::InvalidArgument)?;
+        let tools = req.tools.iter().flatten().map(convert_tool).collect();
+        self.prompt(&req.messages, reasoning, tools, true)
+    }
+
+    /// The conversation as the chat template renders it, with its generation prompt when
+    /// `generation_prompt`.
     fn prompt(
         &self,
         messages: &[ChatCompletionRequestMessage],
         reasoning: ReasoningControls,
         tools: Vec<Tool>,
+        generation_prompt: bool,
     ) -> std::result::Result<String, OpenAIError> {
+        let mut messages = messages
+            .iter()
+            .map(message_to_mistral)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|part| OpenAIError::InvalidArgument(part.refusal(&self.model_name)))?;
+        self.content_support
+            .rewrite(&mut messages, !tools.is_empty());
         render(
             &self.template,
             &self.special,
-            messages.iter().map(message_to_mistral).collect(),
+            messages,
             reasoning.enable_thinking,
             reasoning.reasoning_effort,
             tools,
+            generation_prompt,
         )
         .map_err(|e| {
             OpenAIError::InvalidArgument(format!("Failed to render the chat template: {e}"))
@@ -528,13 +643,22 @@ impl LlamaCpp {
         // The template this request renders with, for what its markup decides.
         let template = chosen_template(&self.template, !tools.is_empty())
             .map_err(OpenAIError::InvalidArgument)?;
-        let grammar = content_grammar(
-            &self.model_name,
-            template,
-            req.response_format.as_ref(),
-            &callable,
-            &obliged,
-        )?;
+        let content = || {
+            content_grammar(
+                &self.model_name,
+                template,
+                req.response_format.as_ref(),
+                &callable,
+                &obliged,
+            )
+        };
+        // Harmony is read only when the template this request renders with writes it: named
+        // templates may mix a Harmony one with one that is not.
+        let markers = request_markers(self.harmony, template);
+        // A required Harmony call has a grammar of its own (below); otherwise the content's
+        // grammar holds the reply.
+        let harmony_call_held = markers.is_some() && !obliged.is_empty();
+        let content = if harmony_call_held { None } else { content()? };
         // Each choice reads its own reply, so each has its own reader.
         let matchers = (0..choices)
             .map(|_| {
@@ -554,8 +678,40 @@ impl LlamaCpp {
             .first()
             .and_then(Option::as_ref)
             .is_some_and(ToolCallingMatcher::requires_tool_call);
-        let ban_eog = require_tool_call && grammar.is_none();
-        let prompt = self.prompt(&req.messages, reasoning, tools)?;
+        let ban_eog = require_tool_call && !harmony_call_held && content.is_none();
+        let nameable = nameable_tools(&callable, &obliged);
+        let held = if !obliged.is_empty() {
+            harmony::Held::Call
+        } else if content.is_some() {
+            harmony::Held::Reply
+        } else {
+            harmony::Held::Nothing
+        };
+        let prompt = self.prompt(&req.messages, reasoning, tools.clone(), true)?;
+        // Every choice's reply starts where the prompt leaves it, so the prompt is read once,
+        // from what the generation prompt adds after the conversation the template renders
+        // without it (`harmony::reply_text`).
+        let reader = markers.map(|markers| {
+            let conversation = self
+                .prompt(&req.messages, reasoning, tools.clone(), false)
+                .ok();
+            harmony::Reader::new(markers, nameable, held).after(harmony::reply_text(
+                &markers,
+                &prompt,
+                conversation.as_deref(),
+            ))
+        });
+        // A Harmony grammar holds the reply by the vocabulary's markers, from where the prompt
+        // leaves it.
+        let grammar = match &reader {
+            Some(reader) if harmony_call_held => {
+                Some(harmony_call(reader.markers(), &obliged, reader.opened())?)
+            }
+            Some(reader) => {
+                content.map(|reply| harmony_reply(reader.markers(), &reply, reader.opened()))
+            }
+            None => content,
+        };
         let stop = match &req.stop {
             Some(StopConfiguration::String(s)) => vec![s.clone()],
             Some(StopConfiguration::StringArray(s)) => s.clone(),
@@ -566,6 +722,7 @@ impl LlamaCpp {
         let mut receivers = Vec::with_capacity(choices);
         for tools in matchers {
             let (events, rx) = mpsc::channel(STREAM_BUFFER);
+            let harmony = reader.clone();
             let job = Job {
                 reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),
@@ -582,7 +739,8 @@ impl LlamaCpp {
                     ban_eog,
                 },
                 stop: stop.clone(),
-                tools,
+                tools: tools.filter(|_| harmony.is_none()),
+                harmony,
                 require_tool_call,
                 stopping: Arc::clone(&self.decoder.stopping),
                 events,
@@ -605,6 +763,15 @@ impl Chat for LlamaCpp {
         None
     }
 
+    /// The context llama.cpp runs the model with: `context_length`, or the default. It caps
+    /// no answer below that.
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        llms::chat::TokenLimits {
+            context_window: (self.context_window > 0).then_some(u64::from(self.context_window)),
+            max_output_tokens: None,
+        }
+    }
+
     async fn health(&self) -> Result<()> {
         // A model that loaded is healthy; the decode thread lives as long as `self`.
         Ok(())
@@ -622,6 +789,7 @@ impl Chat for LlamaCpp {
             choices,
             index: 0,
             first: true,
+            prompt: None,
             completion_tokens: 0,
             done: false,
         };
@@ -632,12 +800,26 @@ impl Chat for LlamaCpp {
                 if state.done {
                     return None;
                 }
-                // A streamed delta has no reasoning field, so reasoning is not streamed, as on
-                // the mistral.rs engine; it is in a non-streamed response's `reasoning_content`.
                 let item = loop {
                     let (index, first) = (state.index, state.first);
                     match state.choices.front_mut()?.recv().await {
-                        Some(Event::Reasoning(_)) => {}
+                        // A fragment of nothing carries nothing, so a streamed
+                        // `reasoning_content` is never empty.
+                        Some(Event::Reasoning(reasoning)) if reasoning.is_empty() => {}
+                        Some(Event::Reasoning(reasoning)) => {
+                            state.first = false;
+                            break Ok(chunk(
+                                &id,
+                                &model,
+                                created,
+                                index,
+                                first,
+                                Some(Text::Reasoning(reasoning)),
+                                None,
+                                None,
+                                None,
+                            ));
+                        }
                         Some(Event::Content(content)) => {
                             state.first = false;
                             break Ok(chunk(
@@ -646,7 +828,7 @@ impl Chat for LlamaCpp {
                                 created,
                                 index,
                                 first,
-                                Some(content),
+                                Some(Text::Answer(content)),
                                 None,
                                 None,
                                 None,
@@ -673,6 +855,7 @@ impl Chat for LlamaCpp {
                         }
                         Some(Event::Done(outcome)) => {
                             state.choices.pop_front();
+                            let prompt = *state.prompt.get_or_insert(outcome);
                             state.completion_tokens = state
                                 .completion_tokens
                                 .saturating_add(outcome.completion_tokens);
@@ -681,9 +864,7 @@ impl Chat for LlamaCpp {
                             state.done = state.choices.is_empty();
                             state.index += 1;
                             state.first = true;
-                            let usage = state
-                                .done
-                                .then(|| usage(outcome.prompt_tokens, state.completion_tokens));
+                            let usage = state.done.then(|| usage(&prompt, state.completion_tokens));
                             break Ok(chunk(
                                 &id,
                                 &model,
@@ -721,7 +902,7 @@ impl Chat for LlamaCpp {
         req: CreateChatCompletionRequest,
     ) -> std::result::Result<CreateChatCompletionResponse, OpenAIError> {
         let mut choices = Vec::new();
-        let (mut prompt_tokens, mut completion_tokens) = (0, 0_u32);
+        let (mut prompt, mut completion_tokens) = (None, 0_u32);
         let namespace = caller().await;
         for (index, mut rx) in (0..).zip(self.submit(&req, &namespace)?) {
             let (mut reasoning, mut content, mut tool_calls) =
@@ -755,8 +936,8 @@ impl Chat for LlamaCpp {
                 function_call: None,
                 audio: None,
             };
-            // Every choice reads the same prompt, which counts once.
-            prompt_tokens = outcome.prompt_tokens;
+            // Every choice reads the same prompt, which counts once, as the first read it.
+            prompt.get_or_insert(outcome);
             completion_tokens = completion_tokens.saturating_add(outcome.completion_tokens);
             choices.push(ChatChoice {
                 index,
@@ -771,7 +952,7 @@ impl Chat for LlamaCpp {
             created: now(),
             model: req.model,
             choices,
-            usage: Some(usage(prompt_tokens, completion_tokens)),
+            usage: prompt.map(|prompt| usage(&prompt, completion_tokens)),
             service_tier: None,
             system_fingerprint: None,
         })
@@ -785,6 +966,8 @@ struct StreamState {
     index: u32,
     /// Whether the front choice has sent nothing yet, so its next chunk names the role.
     first: bool,
+    /// The first choice's outcome, whose prompt the usage counts.
+    prompt: Option<Outcome>,
     /// The completion tokens of the choices streamed so far.
     completion_tokens: u32,
     done: bool,
@@ -814,7 +997,8 @@ fn tool_call(call: &ToolCallResponse) -> ChatCompletionMessageToolCalls {
     })
 }
 
-/// Renders a conversation the way the mistral.rs engine does.
+/// Renders a conversation the way the mistral.rs engine does, with the template's generation
+/// prompt when `generation_prompt`.
 fn render(
     template: &Template,
     special: &SpecialTokens,
@@ -822,10 +1006,11 @@ fn render(
     enable_thinking: Option<bool>,
     reasoning_effort: Option<TemplateReasoningEffort>,
     tools: Vec<Tool>,
+    generation_prompt: bool,
 ) -> std::result::Result<String, String> {
     apply_chat_template_to(
         messages,
-        true,
+        generation_prompt,
         enable_thinking,
         reasoning_effort,
         &ChatTemplateValue(template.clone()),
@@ -837,13 +1022,15 @@ fn render(
     .map_err(|e| e.to_string())
 }
 
-/// The decode thread: loads the model, reports readiness, then runs jobs in order.
+/// The decode thread: loads the model, reports readiness, then runs jobs: one at a time, in
+/// order, or up to `concurrent` together, each in its own sequence of one shared cache, with
+/// idle prompts saved to host memory for later requests to continue ([`HOST_CACHE_BYTES`]).
 fn serve(
     name: &str,
     path: &Path,
     draft: Option<&Path>,
     devices: &[llama_cpp::rpc::Device],
-    n_ctx: Option<NonZeroU32>,
+    (n_ctx, concurrent): (Option<NonZeroU32>, u32),
     ready: oneshot::Sender<std::result::Result<Loaded, ChatError>>,
     jobs: &std_mpsc::Receiver<Job>,
 ) {
@@ -919,12 +1106,13 @@ fn serve(
     let snapshots = head.map_or(0, |(_, kind)| {
         u32::try_from(draft_len(kind, mtp_len)).unwrap_or(0)
     });
-    let context_params = ContextParams::default()
+    let params = ContextParams::default()
         .with_n_ctx(n_ctx)
         .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
         .with_n_rs_seq(snapshots);
-    let context = match model.new_context(backend, &context_params) {
-        Ok(context) => context,
+    let ceiling = concurrent;
+    let (context, concurrent) = match concurrent_context(&model, backend, params, ceiling) {
+        Ok(created) => created,
         Err(e) => {
             let _ = ready.send(Err(failed(format!(
                 "llama.cpp could not create a context: {e}"
@@ -932,9 +1120,17 @@ fn serve(
             return;
         }
     };
+    let layout = cache_layout(model.architecture().as_deref());
+    if ceiling > 1 {
+        tracing::info!(
+            "{}",
+            concurrency_note(name, (concurrent, ceiling), context.n_ctx(), layout)
+        );
+    }
+    let context_window = context.n_ctx();
     let mut decoder = match head {
         None => Decoder::Plain(context),
-        Some((head, kind)) => match mtp(head, kind, context, mtp_len) {
+        Some((head, kind)) => match mtp(head, kind, context, (mtp_len, concurrent)) {
             Ok(spec) => Decoder::Mtp(Box::new(spec)),
             Err(message) => {
                 let _ = ready.send(Err(failed(message)));
@@ -952,36 +1148,37 @@ fn serve(
         Decoder::Plain(context) => context.truncation(),
         Decoder::Mtp(spec) => spec.target_mut().truncation(),
     };
-    let mut cache = PromptCache::new(name, truncation);
+    let cache = PromptCache::new(name, truncation);
     let loaded = Loaded {
         template: model.chat_template(),
         architecture: model.architecture(),
         special,
+        harmony: harmony::Markers::find(vocab),
+        context_window,
         reused_prompt_tokens: Arc::clone(&cache.reused),
+        prompt_ends_in_steps: Arc::clone(&cache.ends_in_steps),
     };
     // Ruled out while a required tool call is outstanding.
     let eog = vocab.eog_tokens();
     if ready.send(Ok(loaded)).is_err() {
         return;
     }
-    while let Ok(job) = jobs.recv() {
-        // A client that has gone, as one that stopped reading before a later choice's turn,
-        // is not decoded for.
-        if job.events.is_closed() {
-            continue;
-        }
-        let events = job.events.clone();
-        let stopping = Arc::clone(&job.stopping);
-        let result = match &mut decoder {
-            Decoder::Plain(context) => generate(&model, context, &mut cache, job, &eog),
-            Decoder::Mtp(spec) => generate_mtp(&model, spec, split, &mut cache, job, &eog),
-        };
-        let event = match result {
-            Ok(outcome) => Event::Done(outcome),
-            Err(message) => Event::Failed(message),
-        };
-        send_unless_stopping(&events, &stopping, event);
+    let mut caches = vec![cache];
+    while caches.len() < usize::try_from(concurrent).unwrap_or(usize::MAX) {
+        let mut more = PromptCache::new(name, truncation);
+        more.reused = Arc::clone(&caches[0].reused);
+        more.ends_in_steps = Arc::clone(&caches[0].ends_in_steps);
+        caches.push(more);
     }
+    let running = usize::try_from(concurrent).unwrap_or(1);
+    batching::serve(
+        &model,
+        &mut decoder,
+        split,
+        (caches, running, layout),
+        jobs,
+        &eog,
+    );
 }
 
 /// Sends `event` to its client, waiting while the client's buffer is full, and returns whether
@@ -1147,21 +1344,31 @@ fn load_error(path: &Path, error: llama_cpp::Error) -> ChatError {
     }
 }
 
-/// A Harmony reply (gpt-oss) is read token by token rather than as text, which this engine
-/// does not do, so a model whose chat template writes one is refused rather than served with
-/// its channel markup in the content.
+/// A Harmony reply (gpt-oss) is read token by token, by its markers, so a model whose chat
+/// template writes one is served only when its vocabulary holds every marker as one token, and
+/// refused otherwise rather than served with its channel markup in the content. Returns the
+/// markers a Harmony template's replies are read by.
 fn check_reply_format(
     template: &Template,
     architecture: Option<String>,
+    markers: Option<harmony::Markers>,
     file: String,
-) -> Result<()> {
-    if templates(template).any(is_harmony_template) {
-        return Err(ChatError::UnsupportedArchitecture {
+) -> Result<Option<harmony::Markers>> {
+    if !templates(template).any(is_harmony_template) {
+        return Ok(None);
+    }
+    markers
+        .map(Some)
+        .ok_or_else(|| ChatError::UnsupportedArchitecture {
             architecture: architecture.unwrap_or_else(|| "gpt-oss".to_string()),
             file,
-        });
-    }
-    Ok(())
+        })
+}
+
+/// The markers a request's reply is read by: the model's, when the template the request renders
+/// with writes Harmony, and none for a template that does not.
+fn request_markers(markers: Option<harmony::Markers>, template: &str) -> Option<harmony::Markers> {
+    markers.filter(|_| is_harmony_template(template))
 }
 
 /// The file an error names: its name, or the whole path when it has none.
@@ -1184,11 +1391,14 @@ fn mtp<'m>(
     draft_model: &'m Model,
     kind: DraftKind,
     context: Context<'m>,
-    mtp_len: i32,
+    (mtp_len, concurrent): (i32, u32),
 ) -> std::result::Result<Mtp<'m>, String> {
-    let params = ContextParams::default()
-        .with_n_ctx(NonZeroU32::new(context.n_ctx()))
-        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX));
+    let params = shared_cache(
+        ContextParams::default()
+            .with_n_ctx(NonZeroU32::new(context.n_ctx()))
+            .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX)),
+        concurrent,
+    );
     Mtp::new(
         context,
         draft_model,
@@ -1203,6 +1413,85 @@ fn mtp<'m>(
     .map_err(|e| format!("llama.cpp could not start drafting: {e}"))
 }
 
+/// A context for up to `ceiling` requests at once, and how many it holds: the ceiling, halved
+/// while llama.cpp cannot create the context, or creates it leaving less than
+/// [`MIN_FREE_AFTER_CONTEXT`] free, down to one request, whose context is created as it stands.
+fn concurrent_context<'m>(
+    model: &'m Model,
+    backend: &Backend,
+    params: ContextParams,
+    ceiling: u32,
+) -> llama_cpp::Result<(Context<'m>, u32)> {
+    let mut concurrent = ceiling.max(1);
+    loop {
+        match model.new_context(backend, &shared_cache(params, concurrent)) {
+            Ok(context)
+                if concurrent == 1
+                    || free_memory().is_none_or(|free| free >= MIN_FREE_AFTER_CONTEXT) =>
+            {
+                return Ok((context, concurrent));
+            }
+            Err(e) if concurrent == 1 => return Err(e),
+            // a context that leaves too little free is dropped here, so its memory is free for
+            // the smaller one
+            Ok(_) | Err(_) => concurrent /= 2,
+        }
+    }
+}
+
+/// How the cache of a model of `architecture` holds concurrent requests' sequences: llama.cpp's
+/// DeepSeek-V4 cache keeps a stream of the whole context per sequence even when asked for a
+/// unified one.
+fn cache_layout(architecture: Option<&str>) -> batching::CacheLayout {
+    match architecture {
+        Some("deepseek4" | "deepseek41") => batching::CacheLayout::PerSequence,
+        _ => batching::CacheLayout::Unified,
+    }
+}
+
+/// The line a model logs at load for how many requests it serves at once, `(serves, ceiling)`,
+/// with `n_ctx` tokens of context: shared by them, or each request's own when its cache is laid
+/// out per sequence.
+fn concurrency_note(
+    model: &str,
+    (serves, ceiling): (u32, u32),
+    n_ctx: u32,
+    layout: batching::CacheLayout,
+) -> String {
+    let per_request = layout == batching::CacheLayout::PerSequence;
+    let requests = if serves == 1 { "request" } else { "requests" };
+    let lowered = if serves < ceiling {
+        format!(", not {ceiling}")
+    } else {
+        String::new()
+    };
+    let context = if per_request {
+        format!(", each with its whole {n_ctx}-token context")
+    } else {
+        String::new()
+    };
+    let rest = if serves < ceiling {
+        ": more would not fit beside its weights, so further requests wait".to_string()
+    } else if per_request {
+        String::new()
+    } else {
+        format!(" from {n_ctx} tokens of shared context memory; one request can use all of it")
+    };
+    format!(
+        "Model '{model}' serves up to {serves} {requests} at once{lowered}{context}{rest}. See: https://spiceai.org/docs/components/models"
+    )
+}
+
+/// `params` for a context that holds `concurrent` sequences on one cache of `n_ctx` cells, so any
+/// one of them can still use the whole context; one sequence, as `params` stands, for one.
+fn shared_cache(params: ContextParams, concurrent: u32) -> ContextParams {
+    if concurrent > 1 {
+        params.with_n_seq_max(concurrent).with_kv_unified(true)
+    } else {
+        params
+    }
+}
+
 /// What prompt reading needs from either engine.
 trait Target<'m> {
     fn context(&self) -> &Context<'m>;
@@ -1214,6 +1503,21 @@ trait Target<'m> {
     fn clear(&mut self);
     /// Called after every target decode; the MTP head reads the batch's hidden states.
     fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String>;
+    /// Whether a draft head reads the target's hidden states, pairing each token with the state
+    /// at the position before it: a cut cache then needs the head's state for the position before
+    /// the cut (`head_state`), or the next read's first token pairs with none.
+    fn has_head(&self) -> bool;
+    /// The draft head's state that cutting the caches back does not restore, for the position
+    /// after the last one it read; `None` without a head.
+    fn head_state(&mut self) -> Option<Vec<u8>>;
+    /// Restores what `head_state` returned; false when the head does not take it.
+    fn restore_head_state(&mut self, state: &[u8]) -> bool;
+    /// The sequence of the shared cache this target reads prompts into and generates in.
+    fn seq(&self) -> i32;
+    /// The sequence's state that a truncation cannot restore (`Context::partial_state_seq`).
+    fn partial_state(&self) -> Option<Vec<u8>>;
+    /// Restores what `partial_state` returned; false when llama.cpp does not read all of it.
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool;
 }
 
 impl<'m> Target<'m> for Context<'m> {
@@ -1231,6 +1535,24 @@ impl<'m> Target<'m> for Context<'m> {
     }
     fn decoded(&mut self, _: &Batch) -> std::result::Result<(), String> {
         Ok(())
+    }
+    fn has_head(&self) -> bool {
+        false
+    }
+    fn head_state(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+    fn restore_head_state(&mut self, _: &[u8]) -> bool {
+        false
+    }
+    fn seq(&self) -> i32 {
+        0
+    }
+    fn partial_state(&self) -> Option<Vec<u8>> {
+        Context::partial_state(self)
+    }
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        Context::restore_partial_state(self, state)
     }
 }
 
@@ -1251,6 +1573,27 @@ impl<'m> Target<'m> for Mtp<'m> {
     fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String> {
         self.process(batch).map_err(|e| e.to_string())
     }
+    fn has_head(&self) -> bool {
+        // Only an MTP head pairs a token with the hidden state before it and carries that state
+        // from one read to the next. A DFlash or DSpark drafter reads its features from the batch
+        // in hand, and keeps no state to save, so its prompt cache reuses what it shares.
+        self.kind() == DraftKind::Mtp
+    }
+    fn head_state(&mut self) -> Option<Vec<u8>> {
+        self.state(0).ok().flatten()
+    }
+    fn restore_head_state(&mut self, state: &[u8]) -> bool {
+        self.restore_state(0, state).is_ok()
+    }
+    fn seq(&self) -> i32 {
+        0
+    }
+    fn partial_state(&self) -> Option<Vec<u8>> {
+        self.target().partial_state()
+    }
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        self.target_mut().restore_partial_state(state)
+    }
 }
 
 /// What the KV cache holds from the last request, so the next one decodes only the part of its
@@ -1263,13 +1606,23 @@ struct PromptCache {
     /// The tokens in the KV cache, in order: the last prompt, then the reply tokens decoded
     /// after it. Empty while a request runs, so one that fails leaves nothing to reuse.
     tokens: Vec<Token>,
+    /// How many of `tokens` are the last prompt; the rest are its reply's.
+    prompt: usize,
     /// The cache namespace of the caller whose request left `tokens` and the checkpoints.
     namespace: Option<CacheNamespace>,
     /// For a cache that cannot be cut back to any position, as a recurrent state or a
     /// compressed cache cannot.
     checkpoints: Option<Checkpoints>,
+    /// For a cache that can be cut back to any position, with a draft head: the head's state
+    /// after the last prompt's first tokens, saved where a checkpoint would be, the position after
+    /// it first. The next prompt reuses the cache up to there, or up to all of it (where the head's
+    /// live state is), so its read pairs its first token with the right hidden state.
+    head_stash: Option<(usize, Vec<u8>)>,
     /// How many prompt tokens the last request read from the cache.
     reused: Arc<AtomicUsize>,
+    /// How many requests read their prompt's end in a step beside the running requests, which
+    /// every sequence's cache shares.
+    ends_in_steps: Arc<AtomicUsize>,
     /// What saving a checkpoint costs against reading prompt tokens again.
     cost: CheckpointCost,
 }
@@ -1279,9 +1632,12 @@ impl PromptCache {
         Self {
             model: name.to_string(),
             tokens: Vec::new(),
+            prompt: 0,
             namespace: None,
             checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
+            head_stash: None,
             reused: Arc::default(),
+            ends_in_steps: Arc::default(),
             cost: CheckpointCost::default(),
         }
     }
@@ -1302,8 +1658,10 @@ impl PromptCache {
         namespace: &CacheNamespace,
     ) -> usize {
         let mut cached = std::mem::take(&mut self.tokens);
+        let mut stash = self.head_stash.take();
         if self.namespace.as_ref() != Some(namespace) {
             cached.clear();
+            stash = None;
             if let Some(checkpoints) = &mut self.checkpoints {
                 checkpoints.clear();
             }
@@ -1324,12 +1682,29 @@ impl PromptCache {
         // as many of them as it has tokens, so after a shorter decode a rollback can restore a
         // snapshot that predates it.
         let truncates = self.checkpoints.is_none() || shared == cached.len();
-        let reused = if shared > 0 && truncates && truncate_to(target, shared) {
-            shared
+        // A draft head pairs a read's first token with the target's hidden state at the position
+        // before it. It holds that state for the end of the cache, so a cut there is exact; a cut
+        // anywhere else stops where the head's state was stashed, or reads the prompt from 0.
+        let (cut, head) = if truncates && target.has_head() && shared < cached.len() {
+            match stash {
+                Some((at, state)) if at <= shared => (at, Some(state)),
+                _ => (0, None),
+            }
+        } else {
+            (shared, None)
+        };
+        let reused = if cut > 0
+            && truncates
+            && truncate_to(target, cut)
+            && head
+                .as_ref()
+                .is_none_or(|state| target.restore_head_state(state))
+        {
+            cut
         } else if let Some(at) = self
             .checkpoints
             .as_ref()
-            .and_then(|checkpoints| checkpoints.restore(target.context_mut()))
+            .and_then(|checkpoints| checkpoints.restore(target))
             && truncate_to(target, at)
         {
             at
@@ -1341,9 +1716,15 @@ impl PromptCache {
             0
         };
         tracing::debug!(
-            "Model '{}' reused {reused} of its {} prompt tokens from the previous request's cache.",
+            "Model '{}' reused {reused} of its {} prompt tokens from the previous request's cache, which shared {shared} of them; {} read again{}.",
             self.model,
-            tokens.len()
+            tokens.len(),
+            shared - reused.min(shared),
+            if target.has_head() && reused > 0 && reused < shared {
+                ", where the draft head holds its state"
+            } else {
+                ""
+            }
         );
         self.reused.store(reused, Ordering::Relaxed);
         reused
@@ -1357,10 +1738,26 @@ impl PromptCache {
         (self.checkpoints.is_some() && at > start && self.cost.pays(at - start)).then_some(at)
     }
 
-    fn save_checkpoint(&mut self, context: &Context<'_>, n_tokens: usize) {
+    /// Where reading a prompt of `len` tokens from `start` on stashes the draft head's state, for
+    /// a cache that can be cut anywhere and so keeps no checkpoints: where a checkpoint would be,
+    /// before the generation prompt the next turn's prompt does not repeat.
+    fn head_stash_at<'m>(
+        &self,
+        target: &impl Target<'m>,
+        start: usize,
+        len: usize,
+    ) -> Option<usize> {
+        if self.checkpoints.is_some() || !target.has_head() {
+            return None;
+        }
+        let at = len.checked_sub(CHECKPOINT_BEFORE_END)?;
+        (at > start).then_some(at)
+    }
+
+    fn save_checkpoint<'m>(&mut self, target: &mut impl Target<'m>, n_tokens: usize) {
         if let Some(checkpoints) = &mut self.checkpoints {
             let started = Instant::now();
-            if let Some(bytes) = checkpoints.save(context, n_tokens) {
+            if let Some(bytes) = checkpoints.save(target, n_tokens) {
                 let took = started.elapsed();
                 self.cost.saved(took);
                 tracing::debug!(
@@ -1377,13 +1774,161 @@ impl PromptCache {
         self.cost.read(tokens, took);
     }
 
-    /// Records `tokens` as what the caches hold for the next request, after truncating them to
-    /// `tokens`, which drops any drafts verified after them. A cache that cannot roll back that
-    /// far leaves nothing to reuse.
-    fn keep<'m>(&mut self, target: &mut impl Target<'m>, tokens: Vec<Token>) {
+    /// Takes what the cache knows about its sequence's cells, leaving it empty, for cells saved
+    /// out of the shared cache; `None` when it holds nothing to reuse.
+    fn take(&mut self) -> Option<CachedPrompt> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+        Some(CachedPrompt {
+            tokens: std::mem::take(&mut self.tokens),
+            prompt: std::mem::take(&mut self.prompt),
+            namespace: self.namespace.take(),
+            checkpoints: self
+                .checkpoints
+                .as_mut()
+                .map(|checkpoints| std::mem::take(&mut checkpoints.0))
+                .unwrap_or_default(),
+            head_stash: self.head_stash.take(),
+        })
+    }
+
+    /// A copy of what [`PromptCache::take`] would take, leaving the cache as it is; `None` when
+    /// it holds nothing to reuse.
+    fn copy(&self) -> Option<CachedPrompt> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+        Some(CachedPrompt {
+            tokens: self.tokens.clone(),
+            prompt: self.prompt,
+            namespace: self.namespace.clone(),
+            checkpoints: self
+                .checkpoints
+                .as_ref()
+                .map(|checkpoints| checkpoints.0.clone())
+                .unwrap_or_default(),
+            head_stash: self.head_stash.clone(),
+        })
+    }
+
+    /// Gives back what [`PromptCache::take`] took, for its cells restored into this cache's
+    /// sequence.
+    fn put(&mut self, prompt: CachedPrompt) {
+        self.tokens = prompt.tokens;
+        self.prompt = prompt.prompt;
+        self.namespace = prompt.namespace;
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.0 = prompt.checkpoints;
+        }
+        self.head_stash = prompt.head_stash;
+    }
+
+    /// How many of `tokens` the cache would give a request from the caller in `namespace`
+    /// before reading the rest: the prefix they share, or nothing when that is less than half
+    /// of the last prompt the cache holds. Taking a cache it shares only a little with, such as
+    /// a chat template's opening tokens with another conversation, would throw away more than
+    /// the request reuses, so llama-server chooses a slot by prompt similarity too. The share is
+    /// measured against the prompt, not its reply: the next turn of a conversation shares the
+    /// prompt, while the template renders the reply again, and a reply longer than its prompt
+    /// would otherwise leave the next turn nothing.
+    fn shares(&self, tokens: &[Token], namespace: &CacheNamespace) -> usize {
+        if self.namespace.as_ref() != Some(namespace) {
+            return 0;
+        }
+        shared_prefix(&self.tokens, self.prompt, tokens)
+    }
+
+    /// Forgets everything the cache held, for a sequence whose cells were emptied: by a request
+    /// that failed, or to make room for another request's sequence.
+    fn forget(&mut self) {
+        self.tokens.clear();
+        self.head_stash = None;
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.clear();
+        }
+    }
+
+    /// Gives a request that continues all of `tokens` without reading any of them, as a preempted
+    /// request resumes with its next token already sampled, the cache as it stands: true when it
+    /// holds exactly `tokens` from the caller in `namespace`.
+    fn resume(&mut self, tokens: &[Token], namespace: &CacheNamespace) -> bool {
+        if self.namespace.as_ref() == Some(namespace) && self.tokens == tokens {
+            self.tokens.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records `tokens`, a prompt of `prompt` tokens and then its reply's, as what the caches
+    /// hold for the next request, after truncating them to `tokens`, which drops any drafts
+    /// verified after them. A cache that cannot roll back that far leaves nothing to reuse.
+    fn keep<'m>(&mut self, target: &mut impl Target<'m>, tokens: Vec<Token>, prompt: usize) {
         if truncate_to(target, tokens.len()) {
+            self.prompt = prompt.min(tokens.len());
             self.tokens = tokens;
         }
+    }
+}
+
+/// What a prompt cache knows about the cells its sequence held, moved out with them when they
+/// are saved to host memory ([`PromptCache::take`]).
+struct CachedPrompt {
+    tokens: Vec<Token>,
+    /// How many of `tokens` are the prompt; the rest are its reply's.
+    prompt: usize,
+    namespace: Option<CacheNamespace>,
+    checkpoints: Vec<Checkpoint>,
+    head_stash: Option<(usize, Vec<u8>)>,
+}
+
+impl CachedPrompt {
+    /// The host memory its checkpoints and draft-head state take.
+    fn bytes(&self) -> usize {
+        let checkpoints: usize = self
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.state.len() + checkpoint.head.as_ref().map_or(0, Vec::len))
+            .sum();
+        checkpoints + self.head_stash.as_ref().map_or(0, |(_, state)| state.len())
+    }
+
+    fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// A copy for a request that continues only its first `n` tokens: whatever its checkpoints
+    /// and draft-head stash past them hold, the request's read drops.
+    fn up_to(&self, n: usize) -> CachedPrompt {
+        CachedPrompt {
+            tokens: self.tokens.clone(),
+            prompt: self.prompt,
+            namespace: self.namespace.clone(),
+            checkpoints: self
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.n_tokens <= n)
+                .cloned()
+                .collect(),
+            head_stash: self.head_stash.clone().filter(|(at, _)| *at <= n),
+        }
+    }
+}
+
+/// How many of `tokens` a cache holding `cached`, a prompt of `prompt` tokens and then its
+/// reply's, gives a request: the prefix they share, or nothing when that is less than half of
+/// the prompt (see [`PromptCache::shares`]).
+fn shared_prefix(cached: &[Token], prompt: usize, tokens: &[Token]) -> usize {
+    let shared = cached
+        .iter()
+        .zip(tokens)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if 2 * shared >= prompt.min(cached.len()) {
+        shared
+    } else {
+        0
     }
 }
 
@@ -1393,22 +1938,30 @@ impl PromptCache {
 #[derive(Default)]
 struct Checkpoints(Vec<Checkpoint>);
 
+#[derive(Clone)]
 struct Checkpoint {
     /// How many tokens the state follows.
     n_tokens: usize,
     state: Vec<u8>,
+    /// The draft head's state at the same point, if there is a head.
+    head: Option<Vec<u8>>,
 }
 
 impl Checkpoints {
     /// Saves `context`'s state after its first `n_tokens` tokens, which follow every earlier
     /// checkpoint's, and returns its size in bytes; `None` when llama.cpp saves nothing.
-    fn save(&mut self, context: &Context<'_>, n_tokens: usize) -> Option<usize> {
-        let state = context.partial_state()?;
+    fn save<'m>(&mut self, target: &mut impl Target<'m>, n_tokens: usize) -> Option<usize> {
+        let state = target.partial_state()?;
+        let head = target.head_state();
         if self.0.len() == MAX_CHECKPOINTS {
             self.0.remove(0);
         }
-        let bytes = state.len();
-        self.0.push(Checkpoint { n_tokens, state });
+        let bytes = state.len() + head.as_ref().map_or(0, Vec::len);
+        self.0.push(Checkpoint {
+            n_tokens,
+            state,
+            head,
+        });
         Some(bytes)
     }
 
@@ -1420,11 +1973,14 @@ impl Checkpoints {
     /// Restores the latest checkpoint into `context`, and returns how many tokens it follows.
     /// `None` when there is none, or llama.cpp could not restore it, which leaves `context`'s
     /// cache empty.
-    fn restore(&self, context: &mut Context<'_>) -> Option<usize> {
+    fn restore<'m>(&self, target: &mut impl Target<'m>) -> Option<usize> {
         let latest = self.0.last()?;
-        context
-            .restore_partial_state(&latest.state)
-            .then_some(latest.n_tokens)
+        let restored = target.restore_partial_state(&latest.state)
+            && latest
+                .head
+                .as_ref()
+                .is_none_or(|head| target.restore_head_state(head));
+        restored.then_some(latest.n_tokens)
     }
 
     fn clear(&mut self) {
@@ -1475,50 +2031,95 @@ fn count(tokens: usize) -> f64 {
     f64::from(u32::try_from(tokens).unwrap_or(u32::MAX))
 }
 
-/// Tokenizes the prompt and decodes the part of it the cache does not already hold, returning
-/// the tokens and the batch whose last logits predict the first generated token.
+/// A prompt [`read_prompt`] read.
+struct PromptRead {
+    tokens: Vec<Token>,
+    /// The batch of the read's last decode, whose last logits predict the token after the
+    /// decoded ones.
+    batch: Batch,
+    /// How many of the tokens the cache held.
+    cached: usize,
+    /// How many of the tokens are decoded: all of them, unless the read left their end for the
+    /// caller to decode (see [`read_tokens`]).
+    decoded: usize,
+}
+
+/// Tokenizes the prompt and decodes the part of it the cache does not already hold, but for an
+/// end of at most `defer` tokens that [`read_tokens`] may leave to the caller.
 fn read_prompt<'m>(
     model: &Model,
     target: &mut impl Target<'m>,
     cache: &mut PromptCache,
     (prompt, namespace): (&str, &CacheNamespace),
     stopping: &AtomicBool,
-) -> std::result::Result<(Vec<Token>, Batch), String> {
+    defer: usize,
+) -> std::result::Result<PromptRead, String> {
     let tokens = model
         .vocab()
         .tokenize(prompt, false, true)
         .map_err(|e| e.to_string())?;
-    let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
     if tokens.is_empty() {
         return Err("the rendered prompt is empty".to_string());
     }
+    let (batch, cached, decoded) =
+        read_tokens(target, cache, (&tokens, namespace), stopping, defer)?;
+    Ok(PromptRead {
+        tokens,
+        batch,
+        cached,
+        decoded,
+    })
+}
+
+/// Decodes the part of `tokens` the cache does not already hold, returning the batch whose last
+/// logits predict the token after the decoded ones, how many of the tokens the cache held, and
+/// how many are decoded.
+///
+/// The read's last span, after any checkpoint, is left undecoded when it is at most `defer`
+/// tokens, for a caller that decodes it beside other sequences' tokens: in a decode of its own,
+/// a few tokens cost a whole pass of the model.
+fn read_tokens<'m>(
+    target: &mut impl Target<'m>,
+    cache: &mut PromptCache,
+    (tokens, namespace): (&[Token], &CacheNamespace),
+    stopping: &AtomicBool,
+    defer: usize,
+) -> std::result::Result<(Batch, usize, usize), String> {
+    let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
     if tokens.len() >= n_ctx {
         return Err(format!(
             "the prompt is {} tokens, and the model's context holds {n_ctx}. Shorten the conversation, or raise `context_length`.",
             tokens.len()
         ));
     }
-    let start = cache.reuse(target, &tokens, namespace);
+    let start = cache.reuse(target, tokens, namespace);
     let mut batch = Batch::new(PROMPT_BATCH);
     // The prompt is read in two spans split at the checkpoint, so the state saved there
     // follows exactly the tokens before it; without one, the first span is empty.
     let checkpoint = cache.checkpoint_at(start, tokens.len());
-    let split = checkpoint.unwrap_or(start);
+    let stash_at = cache.head_stash_at(&*target, start, tokens.len());
+    let split = checkpoint.or(stash_at).unwrap_or(start);
     // Each span is timed to its computation's end, so the reading's cost and the save's stay
     // apart; sampling, and the save itself, wait for that computation anyway.
     let started = Instant::now();
-    decode_span(target, &mut batch, &tokens, start..split, stopping)?;
+    decode_span(target, &mut batch, tokens, start..split, stopping)?;
     target.context_mut().synchronize();
     let mut read = started.elapsed();
     if let Some(at) = checkpoint {
-        cache.save_checkpoint(target.context(), at);
+        cache.save_checkpoint(&mut *target, at);
+    } else if let Some(at) = stash_at {
+        cache.head_stash = target.head_state().map(|state| (at, state));
+    }
+    if tokens.len() - split <= defer {
+        cache.read(split - start, read);
+        return Ok((batch, start, split));
     }
     let resumed = Instant::now();
-    decode_span(target, &mut batch, &tokens, split..tokens.len(), stopping)?;
+    decode_span(target, &mut batch, tokens, split..tokens.len(), stopping)?;
     target.context_mut().synchronize();
     read += resumed.elapsed();
     cache.read(tokens.len() - start, read);
-    Ok((tokens, batch))
+    Ok((batch, start, tokens.len()))
 }
 
 /// Decodes `tokens[span]` at their positions, in batches of at most `PROMPT_BATCH`, asking for
@@ -1539,7 +2140,9 @@ fn decode_span<'m>(
         for (pos, &token) in (from..to).zip(&tokens[from..to]) {
             let last = pos + 1 == tokens.len();
             let pos = i32::try_from(pos).map_err(|e| e.to_string())?;
-            batch.add(token, pos, last).map_err(|e| e.to_string())?;
+            batch
+                .add_seq(token, pos, target.seq(), last)
+                .map_err(|e| e.to_string())?;
         }
         target
             .context_mut()
@@ -1561,12 +2164,15 @@ struct Output {
     produced: u32,
     reasoning: Option<TagReasoningContext>,
     tools: Option<ToolSplit>,
+    harmony: Option<harmony::Reader>,
     require_tool_call: bool,
     /// Whether tool calls were sent; nothing is sent after them.
     called: bool,
     /// Why reading the tool calls failed, which fails the request.
     failure: Option<String>,
     stopping: Arc<AtomicBool>,
+    /// How many prompt tokens the request read from the cache.
+    cached: usize,
 }
 
 impl Output {
@@ -1579,34 +2185,121 @@ impl Output {
             produced: 0,
             reasoning: job.reasoning,
             tools: job.tools.map(ToolSplit::new),
+            harmony: job.harmony,
             require_tool_call: job.require_tool_call,
             called: false,
             failure: None,
             stopping: job.stopping,
+            cached: 0,
         };
         (job.prompt, job.sampling, output)
     }
 
-    /// Whether generation has left any reasoning block, so `response_format` applies.
+    /// The reply's text the prompt wrote, for the grammar to be advanced over before the reply
+    /// goes on from where the prompt left it.
+    fn pending(&self) -> &str {
+        self.harmony.as_ref().map_or("", harmony::Reader::pending)
+    }
+
+    /// Starts the reply where the prompt left it when it `goes_on` from there, sending the
+    /// text the prompt began the opened message with first; otherwise from a header.
+    fn begin(&mut self, goes_on: bool) {
+        if let Some(reader) = self.harmony.as_mut() {
+            let begun = reader.begin(goes_on);
+            // A client that is gone is found at the next send, as it is for any other.
+            self.route(&begun);
+        }
+    }
+
+    /// Whether generation has left any reasoning block, so `response_format` applies: in a
+    /// Harmony reply, whether it is in its final message.
     fn in_content(&self) -> bool {
-        !self
-            .reasoning
-            .as_ref()
-            .is_some_and(TagReasoningContext::is_in_think_block)
+        match &self.harmony {
+            Some(reader) => reader.in_grammar(),
+            None => !self
+                .reasoning
+                .as_ref()
+                .is_some_and(TagReasoningContext::is_in_think_block),
+        }
+    }
+
+    /// The end-of-generation tokens a required tool call rules out: all of `eog` but the one
+    /// that ends a Harmony reply with a call.
+    fn ruled_out(&self, eog: &[Token]) -> Vec<Token> {
+        let call = self.harmony.as_ref().map(|reader| reader.markers().call());
+        eog.iter().copied().filter(|&t| Some(t) != call).collect()
     }
 
     /// Sends one sampled token, or returns why generation ends.
     fn token(&mut self, model: &Model, token: Token) -> Option<FinishReason> {
+        let vocab = model.vocab();
+        self.read(token, vocab.is_eog(token), || {
+            vocab.token_to_piece(token, true)
+        })
+    }
+
+    /// Sends one sampled token, which ends generation when `eog` and otherwise reads as
+    /// `piece`, or returns why generation ends.
+    fn read(
+        &mut self,
+        token: Token,
+        eog: bool,
+        piece: impl FnOnce() -> Vec<u8>,
+    ) -> Option<FinishReason> {
         if self.stopping.load(Ordering::Relaxed) {
             self.failure = Some(DECODE_STOPPED.to_string());
             return Some(FinishReason::Stop);
         }
-        let vocab = model.vocab();
-        if vocab.is_eog(token) {
+        // A Harmony marker is read before anything else, because two of them end generation
+        // and one of those completes a tool call.
+        if self
+            .harmony
+            .as_ref()
+            .is_some_and(|r| r.marks(token, self.stops.held()))
+        {
+            return self.mark(token, eog);
+        }
+        if eog {
             return Some(FinishReason::Stop);
         }
         self.produced += 1;
-        self.bytes(&vocab.token_to_piece(token, true))
+        let piece = piece();
+        if let Some(reader) = self.harmony.as_mut()
+            && reader.in_header()
+        {
+            // A header names a channel and a recipient, which no stop sequence applies to.
+            reader.text(&String::from_utf8_lossy(&piece));
+            return self.spent();
+        }
+        self.bytes(&piece)
+    }
+
+    /// Reads a Harmony marker, which ends generation when `eog`.
+    fn mark(&mut self, token: Token, eog: bool) -> Option<FinishReason> {
+        // What the stop matcher and the character assembly still hold belongs to the message
+        // the marker closes.
+        let mut held = self.stops.finish();
+        held.push_str(&String::from_utf8_lossy(&std::mem::take(&mut self.pending)));
+        if let Some(finish) = self.route(&held) {
+            return Some(finish);
+        }
+        let reader = self.harmony.as_mut()?;
+        // A marker that does not end generation is a completion token, whatever it does.
+        if !eog {
+            self.produced += 1;
+        }
+        match reader.mark(token) {
+            harmony::Mark::Next => self.spent(),
+            harmony::Mark::Call(call) => Some(self.calls(None, vec![call])),
+            harmony::Mark::Done => Some(FinishReason::Stop),
+        }
+    }
+
+    /// Whether the token budget is spent.
+    fn spent(&self) -> Option<FinishReason> {
+        self.limit
+            .is_some_and(|limit| self.produced as usize >= limit)
+            .then_some(FinishReason::Length)
     }
 
     /// Sends the text a token's bytes complete, or returns why generation ends.
@@ -1625,9 +2318,7 @@ impl Output {
         if stopped {
             return Some(FinishReason::Stop);
         }
-        self.limit
-            .is_some_and(|limit| self.produced as usize >= limit)
-            .then_some(FinishReason::Length)
+        self.spent()
     }
 
     /// Whether the client is still there to take `event`.
@@ -1640,6 +2331,15 @@ impl Output {
     fn route(&mut self, text: &str) -> Option<FinishReason> {
         if self.called || text.is_empty() {
             return None;
+        }
+        if let Some(reader) = self.harmony.as_mut() {
+            return match reader.text(text) {
+                harmony::Text::Reasoning => {
+                    (!self.send(Event::Reasoning(text.to_string()))).then_some(FinishReason::Stop)
+                }
+                harmony::Text::Content => self.content(text.to_string()),
+                harmony::Text::Held => None,
+            };
         }
         let (reasoning, content) = match self.reasoning.as_mut() {
             Some(parser) => {
@@ -1709,6 +2409,12 @@ impl Output {
             }
         }
         if !self.called
+            && self.failure.is_none()
+            && let Some(call) = self.harmony.as_mut().and_then(harmony::Reader::finish)
+        {
+            finish = self.calls(None, vec![call]);
+        }
+        if !self.called
             && let Some(parser) = self.reasoning.as_mut()
         {
             parser.finalize();
@@ -1740,6 +2446,7 @@ impl Output {
         Ok(Outcome {
             finish,
             prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+            cached_tokens: u32::try_from(self.cached).unwrap_or(u32::MAX),
             completion_tokens: self.produced,
         })
     }
@@ -1755,6 +2462,8 @@ const TOOL_CALL_OPENERS: &[&str] = &[
     "<|tool_call_start|>",
     "<｜tool▁calls▁begin｜>",
     "<｜tool▁call▁begin｜>",
+    "<｜DSML｜",
+    "<atem:function_calls>",
 ];
 
 /// Holds back content that may be the start of a tool call, and reads complete calls out of
@@ -1797,9 +2506,6 @@ impl ToolSplit {
                 return Ok(ToolPush::Calls(content.filter(|c| !c.is_empty()), calls));
             }
         }
-        if possible && !complete {
-            return Ok(ToolPush::Hold);
-        }
         // A tool-call opener spelled across tokens (as a grammar makes a model spell it) is
         // not a call yet, so its unfinished start stays held until it resolves either way.
         let keep = TOOL_CALL_OPENERS
@@ -1808,6 +2514,21 @@ impl ToolSplit {
             .max()
             .unwrap_or(0);
         let cut = self.held.len() - keep;
+        if possible && !complete {
+            // The engine also reports a possible call when the text only ends partway through
+            // an opener. The text before that unfinished opener is content unless it could
+            // itself start a call, so it goes out now and only the opener's start is held.
+            if keep == 0 || cut == 0 {
+                return Ok(ToolPush::Hold);
+            }
+            let (before_possible, before_complete) = self
+                .matcher
+                .prefix_could_be_tool(&self.held[..cut])
+                .map_err(|e| e.to_string())?;
+            if before_possible || before_complete {
+                return Ok(ToolPush::Hold);
+            }
+        }
         Ok(ToolPush::Content(self.held.drain(..cut).collect()))
     }
 
@@ -1839,16 +2560,24 @@ struct Picker<'v> {
     /// Whether each chain starts with the penalties, which then also hear of the tokens the
     /// other chain picks.
     penalized: bool,
+    /// Whether the grammar was advanced over all of the reply's text the prompt wrote, so the
+    /// reply goes on from where the prompt left it.
+    goes_on: bool,
 }
 
 impl<'v> Picker<'v> {
     /// `window` is how many generated tokens the penalties remember: the context's length
-    /// covers a whole reply.
+    /// covers a whole reply. The grammar is advanced over `pending`, the reply's text the
+    /// prompt wrote, when it allows each of its tokens in turn; on the first it does not, it
+    /// is built again at its root, and [`Picker::goes_on`] is false. Each token is checked
+    /// before the grammar is told of it, because llama.cpp aborts on a token a grammar
+    /// rejects.
     fn new(
         vocab: Vocab<'v>,
         sampling: &Sampling,
         eog: &[Token],
         window: u32,
+        pending: &str,
     ) -> std::result::Result<Self, String> {
         let frequency = sampling.frequency_penalty.unwrap_or(0.0);
         let presence = sampling.presence_penalty.unwrap_or(0.0);
@@ -1874,15 +2603,49 @@ impl<'v> Picker<'v> {
             samplers.extend(draw(sampling));
             Ok(Sampler::chain(samplers))
         };
+        let mut constrained = sampling
+            .grammar
+            .as_deref()
+            .map(|g| chain(Some(g)))
+            .transpose()?;
+        let mut goes_on = true;
+        if let (Some(grammar), Some(fed)) = (sampling.grammar.as_deref(), constrained.as_mut())
+            && !pending.is_empty()
+        {
+            // The grammar follows the penalties and the end-of-generation ban in its chain.
+            let at = i32::from(penalized) + i32::from(sampling.ban_eog);
+            let tokens = vocab
+                .tokenize(pending, false, true)
+                .map_err(|e| e.to_string())?;
+            goes_on = tokens.into_iter().all(|token| {
+                let allowed = fed.allows_at(at, token);
+                if allowed {
+                    fed.accept_at(at, token);
+                }
+                allowed
+            });
+            if !goes_on {
+                constrained = Some(chain(Some(grammar))?);
+            }
+        }
         Ok(Self {
             free: chain(None)?,
-            constrained: sampling
-                .grammar
-                .as_deref()
-                .map(|g| chain(Some(g)))
-                .transpose()?,
+            constrained,
             penalized,
+            goes_on,
         })
+    }
+
+    /// Whether the reply goes on from where the prompt left it: false only when the grammar
+    /// would not be advanced over the reply's text the prompt wrote.
+    fn goes_on(&self) -> bool {
+        self.goes_on
+    }
+
+    /// Whether every token of the reply is the greedy sampler's pick alone: no penalties, no
+    /// end-of-generation ban and no grammar, which a context's argmax output does not apply.
+    fn picks_greedily(&self) -> bool {
+        self.free.is_greedy() && self.constrained.is_none()
     }
 
     fn sample(&mut self, context: &Context<'_>, index: i32, in_content: bool) -> Token {
@@ -1916,169 +2679,24 @@ fn draw<'v>(sampling: &Sampling) -> Vec<Sampler<'v>> {
     }
 }
 
-/// Runs one request, one token per forward pass.
-fn generate(
-    model: &Model,
-    context: &mut Context<'_>,
-    cache: &mut PromptCache,
-    job: Job,
-    eog: &[Token],
-) -> std::result::Result<Outcome, String> {
-    let namespace = job.namespace.clone();
-    let (prompt, sampling, mut out) = Output::new(job);
-    let vocab = model.vocab();
-    let mut picker = Picker::new(vocab, &sampling, eog, context.n_ctx())?;
-    // `tokens` grows by every reply token decoded, so it is always what the cache holds.
-    let (mut tokens, mut batch) =
-        read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
-    let prompt_tokens = tokens.len();
-    let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
-    let finish = loop {
-        let token = picker.sample(context, batch.n_tokens() - 1, out.in_content());
-        if let Some(finish) = out.token(model, token) {
-            break finish;
-        }
-        if tokens.len() + 1 >= n_ctx {
-            break FinishReason::Length;
-        }
-        batch.clear();
-        let pos = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
-        batch.add(token, pos, true).map_err(|e| e.to_string())?;
-        context.decode(&batch).map_err(|e| e.to_string())?;
-        tokens.push(token);
-    };
-    cache.keep(context, tokens);
-    out.finish(finish, prompt_tokens)
-}
-
-/// Runs one request with MTP drafting: each forward pass verifies the last token plus up
-/// to its draft length of drafted ones, and keeps the drafts the target would have sampled.
-///
-/// A model `split` across nodes verifies every drafted token even when the request has fewer
-/// left, so each verify batch keeps one shape: a shorter batch at a request's end rebuilds the
-/// verify graph twice (to the short shape and back), which over RPC re-serializes every rank's
-/// graph. Tokens past the limit are verified but never emitted.
-fn generate_mtp(
-    model: &Model,
-    spec: &mut Mtp<'_>,
-    split: bool,
-    cache: &mut PromptCache,
-    job: Job,
-    eog: &[Token],
-) -> std::result::Result<Outcome, String> {
-    let namespace = job.namespace.clone();
-    let (prompt, sampling, mut out) = Output::new(job);
-    let vocab = model.vocab();
-    let mut picker = Picker::new(vocab, &sampling, eog, spec.target().n_ctx())?;
-    // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
-    // hidden state at each prompt position before `begin`; its cache keeps the positions the
-    // target's reuses.
-    let (mut history, mut batch) =
-        read_prompt(model, spec, cache, (&prompt, &namespace), &out.stopping)?;
-    spec.begin(&history).map_err(|e| e.to_string())?;
-    let n_ctx = usize::try_from(spec.target().n_ctx()).unwrap_or(usize::MAX);
-    let prompt_tokens = history.len();
-    let mut n_past = i32::try_from(prompt_tokens).map_err(|e| e.to_string())?;
-    let mut id = picker.sample(spec.target(), batch.n_tokens() - 1, out.in_content());
-    let full_draft = split;
-    let finish = 'generate: loop {
-        if let Some(finish) = out.token(model, id) {
-            break finish;
-        }
-        let past = usize::try_from(n_past).unwrap_or(usize::MAX);
-        if past + 1 >= n_ctx {
-            break FinishReason::Length;
-        }
-        let mut draft = spec
-            .draft(n_past, id, &history)
-            .map_err(|e| e.to_string())?;
-        // `accept` is owed exactly when the head drafted something.
-        let drafted = !draft.is_empty();
-        draft.truncate(if full_draft {
-            n_ctx - past - 1
-        } else {
-            out.remaining().min(n_ctx - past - 1)
-        });
-        // The tokens the head drafted; with `full_draft` a shorter draft is padded to the head's
-        // length so every verify batch keeps one shape, and only these can be accepted.
-        let real = draft.len();
-        if full_draft && real > 0 {
-            let want = spec.n_max().min(n_ctx - past - 1);
-            if real < want {
-                let last = draft[real - 1];
-                draft.resize(want, last);
-            }
-        }
-        // Drafting wrote its positions into the head's cache, and processing the verify batch
-        // writes them again, so they go first.
-        truncate_cache(spec.draft_mut(), n_past)?;
-
-        batch.clear();
-        batch.add(id, n_past, true).map_err(|e| e.to_string())?;
-        for (i, &token) in draft.iter().enumerate() {
-            let at = n_past + 1 + i32::try_from(i).map_err(|e| e.to_string())?;
-            batch.add(token, at, true).map_err(|e| e.to_string())?;
-        }
-        spec.target_mut()
-            .decode(&batch)
-            .map_err(|e| e.to_string())?;
-        spec.process(&batch).map_err(|e| e.to_string())?;
-        history.push(id);
-
-        let mut accepted: usize = 0;
-        let next = loop {
-            let index = i32::try_from(accepted).map_err(|e| e.to_string())?;
-            let token = picker.sample(spec.target(), index, out.in_content());
-            if accepted < real && token == draft[accepted] {
-                accepted += 1;
-                // An accepted draft was decoded in the verify batch, so the cache holds it
-                // whether or not it ends the reply, and the next request may reuse it.
-                history.push(token);
-                if let Some(finish) = out.token(model, token) {
-                    break 'generate finish;
-                }
-            } else {
-                break token;
-            }
-        };
-        n_past += 1 + i32::try_from(accepted).map_err(|e| e.to_string())?;
-        if drafted {
-            spec.accept(u16::try_from(accepted).unwrap_or(u16::MAX))
-                .map_err(|e| e.to_string())?;
-        }
-        // The rejected drafts leave both caches.
-        truncate_cache(spec, n_past)?;
-        id = next;
-    };
-    // The prompt and the reply tokens before the one that finished it.
-    cache.keep(spec, history);
-    out.finish(finish, prompt_tokens)
-}
-
-/// Removes sequence 0's cache entries from position `from` on. A context that cannot roll
-/// back that far, such as a recurrent layer with too few state snapshots, fails the request
-/// instead of decoding on from a state that still holds the removed tokens.
-fn truncate_cache<'m>(target: &mut impl Target<'m>, from: i32) -> std::result::Result<(), String> {
-    if target.truncate(from) {
-        Ok(())
-    } else {
-        Err(format!(
-            "llama.cpp could not roll its cache back to position {from}"
-        ))
-    }
-}
-
 /// Truncates every cache `target` keeps to its first `n` tokens; false when one cannot roll
 /// back that far.
 fn truncate_to<'m>(target: &mut impl Target<'m>, n: usize) -> bool {
     i32::try_from(n).is_ok_and(|from| target.truncate(from))
 }
 
-/// Whether a file is an MTP draft head, by the `mtp-` name the GGUF publishers give them.
-fn is_mtp_head(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("mtp-"))
+/// The GGUF the model is opened from and its draft head's, from the files it resolved to. A draft
+/// head ships as its own GGUF (an MTP head, told by the name the repository's files were
+/// resolved with, or a `DFlash` drafter); it drafts for the model, so it is loaded beside it rather
+/// than as one of its shards, and a sharded one opens from its first shard.
+fn model_and_draft(weights: &[PathBuf]) -> (Option<PathBuf>, Option<PathBuf>) {
+    let (drafts, trunk): (Vec<_>, Vec<_>) = weights.iter().cloned().partition(|w| {
+        w.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(gguf_files::is_draft_head)
+            || DraftKind::dflash_of(w).is_some()
+    });
+    (first_shard(&trunk), first_shard(&drafts))
 }
 
 /// The GGUF a sharded model is opened from: the `-00001-of-` file, or the only file.
@@ -2168,6 +2786,11 @@ impl StopMatcher {
         (emit, false)
     }
 
+    /// The text held back as the possible start of a stop sequence.
+    fn held(&self) -> &str {
+        &self.held
+    }
+
     fn finish(&mut self) -> String {
         std::mem::take(&mut self.held)
     }
@@ -2188,9 +2811,9 @@ fn longest_suffix_prefix(text: &str, pattern: &str) -> usize {
 
 /// The parser that tells a reply's reasoning apart from its answer, chosen from the chat
 /// template and the rendered prompt as the mistral.rs engine chooses it: Gemma 4's channel
-/// tags, `<think>` tags (starting inside the block when the prompt opens it), or the Gemma
-/// family's `<unused94>` thought tokens. A template that marks no reasoning gets none, and
-/// the whole reply is content.
+/// tags, `<think>` tags or Mistral's `[THINK]` tokens (each starting inside the block when the
+/// prompt opens it), or the Gemma family's `<unused94>` thought tokens. A template that marks
+/// no reasoning gets none, and the whole reply is content.
 fn reasoning_parser(template: &str, prompt: &str) -> Option<TagReasoningContext> {
     let harmony = is_harmony_template(template);
     if is_channel_tag_template(template) && !harmony {
@@ -2204,6 +2827,12 @@ fn reasoning_parser(template: &str, prompt: &str) -> Option<TagReasoningContext>
             TagReasoningContext::new_in_think_block()
         } else {
             TagReasoningContext::new_think_tags()
+        })
+    } else if is_mistral_think_template(template) && !harmony {
+        Some(if prompt.trim_end().ends_with(MISTRAL_THINK_OPEN_TAG) {
+            TagReasoningContext::new_in_mistral_think_block()
+        } else {
+            TagReasoningContext::new_mistral_think()
         })
     } else if is_gemma_turn_template(template) {
         Some(TagReasoningContext::new_gemma_thought())
@@ -2236,6 +2865,17 @@ fn callable_tools<'t>(choice: Option<&ToolChoice>, tools: &'t [Tool]) -> Vec<&'t
         Some(ToolChoice::AllowedTools(allowed)) => allowed_tools(allowed, tools),
         _ => tools.iter().collect(),
     }
+}
+
+/// The names a Harmony reply's call may take: the tools `tool_choice` obliges a call to, when
+/// it obliges one, as a named choice does; otherwise the callable ones.
+fn nameable_tools(callable: &[&Tool], obliged: &[&Tool]) -> Vec<String> {
+    let tools = if obliged.is_empty() {
+        callable
+    } else {
+        obliged
+    };
+    tools.iter().map(|t| t.function.name.clone()).collect()
 }
 
 /// The tools among `tools` that `allowed` names.
@@ -2302,15 +2942,103 @@ fn content_grammar(
     Ok(Some(either_grammar(&call, &reply)))
 }
 
+/// The grammar of a whole Harmony reply that must call one of `tools`: any reasoning, then a
+/// `commentary` message addressed to the tool, its arguments held to the tool's schema, as
+/// llama.cpp's server forces one. Each marker is its token, never text spelling it. The
+/// grammar goes on from where the prompt leaves the reply, `opened`.
+fn harmony_call(
+    markers: &harmony::Markers,
+    tools: &[&Tool],
+    opened: &harmony::Opened,
+) -> std::result::Result<String, OpenAIError> {
+    let [start, channel, message, end, _] = markers.terminals();
+    let mut grammar = harmony_rules(markers);
+    let mut calls = Vec::with_capacity(tools.len());
+    for (i, tool) in tools.iter().enumerate() {
+        let prefix = format!("tool{i}-");
+        let arguments = json_grammar(&arguments_schema(tool), "tools")?;
+        grammar.push_str(&prefix_rules(&arguments, &prefix));
+        let name = serde_json::Value::String(tool.function.name.clone());
+        calls.push(format!("{name} constrain? {message} {prefix}root"));
+    }
+    grammar.push_str("call ::= ");
+    grammar.push_str(&calls.join(" | "));
+    grammar.push('\n');
+    let call = format!("{channel} \"commentary to=functions.\" call");
+    let after_analysis = format!("reasoning {end} {start} \"assistant\" {call}");
+    let root = match opened {
+        harmony::Opened::Channel => {
+            format!("\"analysis\" {message} {after_analysis} | \"commentary to=functions.\" call")
+        }
+        harmony::Opened::AnalysisHeader => format!("{message} {after_analysis}"),
+        harmony::Opened::Analysis => after_analysis,
+        harmony::Opened::Call(name) => match tools.iter().position(|t| t.function.name == *name) {
+            Some(i) => format!("tool{i}-root"),
+            None => format!("analysis? {call}"),
+        },
+        // The reader goes on from no other message under a required call.
+        harmony::Opened::Header | harmony::Opened::FinalHeader | harmony::Opened::Final => {
+            format!("analysis? {call}")
+        }
+    };
+    let _ = writeln!(grammar, "root ::= {root}");
+    Ok(grammar)
+}
+
+/// The grammar of a whole Harmony reply held to a `response_format`: analysis messages, then
+/// a final message whose body is `reply`'s JSON, as llama.cpp's server holds one. A preamble
+/// is ruled out, since its text would be content outside the schema. The grammar goes on
+/// from where the prompt leaves the reply, `opened`.
+fn harmony_reply(markers: &harmony::Markers, reply: &str, opened: &harmony::Opened) -> String {
+    let [start, channel, message, end, _] = markers.terminals();
+    let mut grammar = harmony_rules(markers);
+    grammar.push_str(&prefix_rules(reply, "reply-"));
+    let whole = format!("analysis* {channel} \"final\" constrain? {message} reply-root");
+    let after_analysis = format!("reasoning {end} {start} \"assistant\" {whole}");
+    let root = match opened {
+        harmony::Opened::Channel => format!(
+            "\"analysis\" {message} {after_analysis} | \"final\" constrain? {message} reply-root"
+        ),
+        harmony::Opened::AnalysisHeader => format!("{message} {after_analysis}"),
+        harmony::Opened::FinalHeader => format!("constrain? {message} reply-root"),
+        harmony::Opened::Analysis => after_analysis,
+        harmony::Opened::Final => "reply-root".to_string(),
+        // The reader goes on from no call under a `response_format`.
+        harmony::Opened::Header | harmony::Opened::Call(_) => whole,
+    };
+    let _ = writeln!(grammar, "root ::= {root}");
+    grammar
+}
+
+/// The rules both Harmony grammars share: an analysis message and the role header of the
+/// message after it, and a header's optional content type.
+fn harmony_rules(markers: &harmony::Markers) -> String {
+    let [start, channel, message, end, constrain] = markers.terminals();
+    let mut rules = String::new();
+    let _ = writeln!(
+        rules,
+        "analysis ::= {channel} \"analysis\" {message} reasoning {end} {start} \"assistant\""
+    );
+    // The text between markers holds no `<|`, so it cannot spell one either.
+    rules.push_str("reasoning ::= ([^<] | \"<\" [^|])*\n");
+    let _ = writeln!(rules, "constrain ::= \" \" {constrain}? [A-Za-z0-9_-]+");
+    rules
+}
+
+/// A tool's arguments schema: its parameters, or any object.
+fn arguments_schema(tool: &Tool) -> serde_json::Value {
+    tool.function.parameters.as_ref().map_or_else(
+        || serde_json::json!({ "type": "object" }),
+        |p| serde_json::Value::Object(p.clone().into_iter().collect()),
+    )
+}
+
 /// The JSON schema of a call to one of `tools`, with the arguments held to the tool's schema.
 fn call_schema(tools: &[&Tool]) -> serde_json::Value {
     let calls: Vec<serde_json::Value> = tools
         .iter()
         .map(|tool| {
-            let arguments = tool.function.parameters.as_ref().map_or_else(
-                || serde_json::json!({ "type": "object" }),
-                |p| serde_json::Value::Object(p.clone().into_iter().collect()),
-            );
+            let arguments = arguments_schema(tool);
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2435,6 +3163,13 @@ fn completion_limit(req: &CreateChatCompletionRequest) -> Option<usize> {
         .and_then(|limit| usize::try_from(limit).ok())
 }
 
+/// The text one streamed chunk carries: a fragment of the reasoning or of the answer, never both,
+/// in `reasoning_content` or `content`.
+enum Text {
+    Reasoning(String),
+    Answer(String),
+}
+
 #[expect(
     deprecated,
     reason = "`function_call` and `system_fingerprint` are deprecated fields of a chunk"
@@ -2449,13 +3184,19 @@ fn chunk(
     created: u32,
     index: u32,
     first: bool,
-    content: Option<String>,
+    text: Option<Text>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
     finish_reason: Option<FinishReason>,
     usage: Option<CompletionUsage>,
 ) -> CreateChatCompletionStreamResponse {
+    let (reasoning_content, content) = match text {
+        Some(Text::Reasoning(reasoning)) => (Some(reasoning), None),
+        Some(Text::Answer(answer)) => (None, Some(answer)),
+        None => (None, None),
+    };
     let delta = ChatCompletionStreamResponseDelta {
         content,
+        reasoning_content,
         function_call: None,
         tool_calls,
         role: first.then_some(Role::Assistant),
@@ -2478,14 +3219,18 @@ fn chunk(
     }
 }
 
-/// A reply's usage: its prompt, which counts once however many choices read it, and the
-/// completion tokens of every choice.
-fn usage(prompt_tokens: u32, completion_tokens: u32) -> CompletionUsage {
+/// A reply's usage: its prompt, which counts once however many choices read it, with how many
+/// of its tokens the first choice read from the cache, and the completion tokens of every
+/// choice.
+fn usage(prompt: &Outcome, completion_tokens: u32) -> CompletionUsage {
     CompletionUsage {
-        prompt_tokens,
+        prompt_tokens: prompt.prompt_tokens,
         completion_tokens,
-        total_tokens: prompt_tokens.saturating_add(completion_tokens),
-        prompt_tokens_details: None,
+        total_tokens: prompt.prompt_tokens.saturating_add(completion_tokens),
+        prompt_tokens_details: Some(PromptTokensDetails {
+            audio_tokens: None,
+            cached_tokens: Some(prompt.cached_tokens),
+        }),
         completion_tokens_details: None,
     }
 }
@@ -2520,6 +3265,59 @@ fn api_error(message: &str) -> OpenAIError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The load line for how many requests a model serves at once, in each of its forms.
+    #[test]
+    fn the_concurrency_line_says_how_many_requests_and_what_context() {
+        assert_eq!(
+            concurrency_note("glm", (8, 8), 131_072, batching::CacheLayout::Unified),
+            "Model 'glm' serves up to 8 requests at once from 131072 tokens of shared context memory; one request can use all of it. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            concurrency_note("qwen", (4, 8), 131_072, batching::CacheLayout::Unified),
+            "Model 'qwen' serves up to 4 requests at once, not 8: more would not fit beside its weights, so further requests wait. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            concurrency_note(
+                "deepseek",
+                (8, 8),
+                131_072,
+                batching::CacheLayout::PerSequence
+            ),
+            "Model 'deepseek' serves up to 8 requests at once, each with its whole 131072-token context. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            concurrency_note(
+                "deepseek",
+                (1, 8),
+                131_072,
+                batching::CacheLayout::PerSequence
+            ),
+            "Model 'deepseek' serves up to 1 request at once, not 8, each with its whole 131072-token context: more would not fit beside its weights, so further requests wait. See: https://spiceai.org/docs/components/models"
+        );
+    }
+
+    /// An MTP head named in upper case is a draft head here as in the repository's files: a
+    /// sharded one is opened as the draft, from its first shard, and never as the model ahead of
+    /// the model's own file (Copilot's case on #15590).
+    #[test]
+    fn an_upper_case_mtp_head_drafts_for_the_model() {
+        let weights: Vec<PathBuf> = [
+            "MTP/MTP-Model-Q8_0-00002-of-00002.gguf",
+            "MTP/MTP-Model-Q8_0-00001-of-00002.gguf",
+            "Model-Q4_K_M.gguf",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(
+            model_and_draft(&weights),
+            (
+                Some(PathBuf::from("Model-Q4_K_M.gguf")),
+                Some(PathBuf::from("MTP/MTP-Model-Q8_0-00001-of-00002.gguf"))
+            )
+        );
+    }
 
     /// Measured on three DGX Sparks (GLM-5.3, the PR build): a 29-token prompt read in 270 ms,
     /// and a checkpoint saved in 300 ms. A checkpoint is worth saving only over a prefix that
@@ -2583,6 +3381,7 @@ mod tests {
             reasoning,
             require_tool_call: matcher.requires_tool_call(),
             tools: Some(matcher),
+            harmony: None,
             stopping: Arc::default(),
             events,
         };
@@ -2683,6 +3482,13 @@ mod tests {
         out.finish(FinishReason::Stop, 1)
             .expect("the request succeeds");
         assert_eq!(sent(rx).concat(), "c:a c:<b");
+        // The same holds for the openers the engine's parser added later (DeepSeek DSML).
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        assert_eq!(out.route("a <｜DS"), None);
+        assert_eq!(out.route("x"), None);
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(sent(rx).concat(), "c:a c:<｜DSx");
     }
 
     #[test]
@@ -2906,6 +3712,7 @@ mod tests {
             stop: Vec::new(),
             reasoning: reasoning_parser(template, prompt),
             tools: None,
+            harmony: None,
             require_tool_call: false,
             stopping: Arc::default(),
             events,
@@ -2954,6 +3761,28 @@ mod tests {
         assert_eq!(split(GEMMA4, "user\nHi", &["42"]), ["c:42"]);
     }
 
+    /// The reasoning markers of a Mistral reasoning model's chat template: Magistral's, and
+    /// Mistral Large 4's, which writes earlier turns' reasoning as `[THINK]...[/THINK]`.
+    const MISTRAL_THINK: &str = "{{- '[THINK]' ~ block['thinking'] -}}{{- '[/THINK]' -}}";
+
+    #[test]
+    fn mistral_reasoning_is_split_at_its_think_tokens() {
+        // regression: Mistral Large 4's reasoning came back as content, its tags included
+        assert_eq!(
+            split(
+                MISTRAL_THINK,
+                "[INST]Hi[/INST]",
+                &["[TH", "INK]why[/THI", "NK]42"]
+            ),
+            ["r:why", "c:42"]
+        );
+        // a prompt that opens the block starts the reply inside it
+        assert_eq!(
+            split(MISTRAL_THINK, "[INST]Hi[/INST][THINK]", &["why[/THINK]42"]),
+            ["r:why", "c:42"]
+        );
+    }
+
     #[test]
     fn a_template_that_marks_no_reasoning_keeps_the_reply_as_content() {
         assert_eq!(
@@ -2963,28 +3792,744 @@ mod tests {
     }
 
     const HARMONY: &str = "{{ '<|start|>assistant<|channel|>final<|message|>' }}{{ '<|end|>' }}";
+    const HARMONY_MARKERS: harmony::Markers = harmony::TEST_MARKERS;
+
+    /// Named templates may mix a Harmony template with one that is not: a request rendered
+    /// with the other reads its reply as text, which a Harmony reader would hold as a header.
+    #[test]
+    fn only_a_request_whose_template_writes_harmony_reads_harmony() {
+        assert_eq!(
+            request_markers(Some(HARMONY_MARKERS), HARMONY),
+            Some(HARMONY_MARKERS)
+        );
+        let chatml = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{% endfor %}";
+        assert_eq!(request_markers(Some(HARMONY_MARKERS), chatml), None);
+        assert_eq!(request_markers(None, HARMONY), None);
+    }
+
+    /// An `Output` reading a Harmony reply that may call `tools`, with `stop` sequences and a
+    /// token `limit`, and what it sends.
+    fn harmony_output(
+        tools: &[&str],
+        stop: &[&str],
+        limit: Option<usize>,
+    ) -> (Output, mpsc::Receiver<Event>) {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let tools = tools.iter().map(ToString::to_string).collect();
+        let job = Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit,
+            sampling: Sampling::default(),
+            stop: stop.iter().map(ToString::to_string).collect(),
+            reasoning: None,
+            tools: None,
+            harmony: Some(harmony::Reader::new(
+                HARMONY_MARKERS,
+                tools,
+                harmony::Held::Nothing,
+            )),
+            require_tool_call: false,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, out) = Output::new(job);
+        (out, rx)
+    }
+
+    /// Generates `reply`: each marker as its token, which ends generation if it is
+    /// `<|return|>` or `<|call|>`, and other text a character per token. Returns why generation
+    /// ended, and after how many tokens.
+    fn generate_harmony(out: &mut Output, reply: &str) -> (Option<FinishReason>, usize) {
+        let ending = [Token(5), Token(6)];
+        let mut tokens = Vec::new();
+        for (marker, text) in harmony::spell(reply) {
+            match marker {
+                Some(token) => tokens.push((token, text)),
+                None => tokens.extend(text.chars().map(|c| (Token(100), c.to_string()))),
+            }
+        }
+        for (n, (token, text)) in tokens.into_iter().enumerate() {
+            if let Some(finish) = out.read(token, ending.contains(&token), || text.into_bytes()) {
+                return (Some(finish), n + 1);
+            }
+        }
+        (None, 0)
+    }
+
+    /// `sent`, with each run of one kind of event as one.
+    fn joined(sent: Vec<String>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for event in sent {
+            match out.last_mut() {
+                Some(last)
+                    if last.starts_with("r:") && event.starts_with("r:")
+                        || last.starts_with("c:") && event.starts_with("c:") =>
+                {
+                    last.push_str(&event[2..]);
+                }
+                _ => out.push(event),
+            }
+        }
+        out
+    }
 
     #[test]
-    fn a_harmony_model_is_refused_as_an_unsupported_architecture() {
+    fn a_harmony_reply_sends_its_reasoning_then_its_answer() {
+        let (mut out, rx) = harmony_output(&[], &[], None);
+        let reply = "<|channel|>analysis<|message|>Add them.<|end|><|start|>assistant<|channel|>final<|message|>2 + 2 = 4<|return|>";
+        let (finish, n) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        let outcome = out
+            .finish(FinishReason::Stop, 9)
+            .expect("the request succeeds");
+        // every token but the `<|return|>` that ends the reply
+        assert_eq!(outcome.completion_tokens as usize, n - 1);
+        assert_eq!(
+            joined(sent(rx)),
+            ["r:Add them.".to_string(), "c:2 + 2 = 4".to_string()]
+        );
+    }
+
+    /// A gpt-oss-style template whose generation prompt goes on from `<|start|>assistant` with
+    /// `OPENS`, as a custom template may. An earlier turn's reply is a final message, closed
+    /// with `<|end|>`, as gpt-oss's own template renders one.
+    const HARMONY_OPENS: &str = "{% for m in messages %}<|start|>{{ m.role }}{% if m.role == 'assistant' %}<|channel|>final{% endif %}<|message|>{{ m.content }}<|end|>{% endfor %}{% if add_generation_prompt %}<|start|>assistantOPENS{% endif %}";
+
+    /// The engine serving `template`, and the job it queues for a request with the fields
+    /// `request` sets (a question about France's capital, by default), and what that job sends.
+    fn harmony_job(
+        template: String,
+        request: serde_json::Value,
+    ) -> (LlamaCpp, String, Sampling, Output, mpsc::Receiver<Event>) {
+        let (jobs, queued) = std_mpsc::channel();
+        let llama = LlamaCpp {
+            decoder: DecodeThread {
+                model: "gpt-oss".to_string(),
+                jobs: Some(jobs),
+                stopping: Arc::default(),
+                freed: None,
+            },
+            model_name: "gpt-oss".to_string(),
+            template: Either::Left(template),
+            special: SpecialTokens::default(),
+            harmony: Some(HARMONY_MARKERS),
+            reasoning_support: ReasoningSupport::default(),
+            content_support: ContentSupport::default(),
+            counter: AtomicUsize::new(0),
+            context_window: 0,
+            reused_prompt_tokens: Arc::default(),
+            prompt_ends_in_steps: Arc::default(),
+        };
+        let mut req = serde_json::json!({
+            "model": "gpt-oss",
+            "messages": [{ "role": "user", "content": "What is the capital of France?" }],
+        });
+        if let (Some(req), serde_json::Value::Object(fields)) = (req.as_object_mut(), request) {
+            req.extend(fields);
+        }
+        let req: CreateChatCompletionRequest = serde_json::from_value(req).expect("a request");
+        let receivers = llama
+            .submit(&req, &CacheNamespace::Public)
+            .expect("the request is queued");
+        let rx = receivers.into_iter().next().expect("one choice");
+        let (prompt, sampling, out) = Output::new(queued.try_recv().expect("its job"));
+        (llama, prompt, sampling, out, rx)
+    }
+
+    /// What a Harmony model's `reply` sends when the template's generation prompt goes on from
+    /// `<|start|>assistant` with `opens`, for a request with the fields `request` sets, or why
+    /// the request fails, and the `root` rule of the request's grammar, if it has one. The
+    /// request is queued as the engine queues it, so the reply is read from where the engine
+    /// starts reading it.
+    fn harmony_reply_after(
+        opens: &str,
+        request: serde_json::Value,
+        reply: &str,
+    ) -> (std::result::Result<Vec<String>, String>, Option<String>) {
+        let (_llama, prompt, sampling, mut out, rx) =
+            harmony_job(HARMONY_OPENS.replace("OPENS", opens), request);
+        // These cases leave the grammar nothing to be advanced over, which the decode thread
+        // would do before the reply starts.
+        assert_eq!(out.pending(), "", "{opens:?}");
+        out.begin(true);
+        assert!(
+            prompt.ends_with(&format!("<|end|><|start|>assistant{opens}")),
+            "the generation prompt goes on with {opens:?}: {prompt:?}"
+        );
+        let root = sampling.grammar.as_deref().and_then(|grammar| {
+            grammar
+                .lines()
+                .find_map(|line| line.strip_prefix("root ::= "))
+                .map(ToString::to_string)
+        });
+        let finish = generate_harmony(&mut out, reply)
+            .0
+            .expect("the reply ends at `<|return|>` or `<|call|>`");
+        let sent = out.finish(finish, 1).map(|_| joined(sent(rx)));
+        (sent, root)
+    }
+
+    /// A stock gpt-oss template ends its generation prompt at `<|start|>assistant`, so the
+    /// reply writes its first message's header. A custom one may go on to name that message's
+    /// channel or to open its body, as `<|start|>assistant<|channel|>final<|message|>` does,
+    /// and the reply goes on from there.
+    #[test]
+    fn a_harmony_reply_goes_on_from_where_the_generation_prompt_leaves_it() {
+        let rest = "Recall it.<|end|><|start|>assistant<|channel|>final<|message|>Paris<|return|>";
+        let read = [
+            ("", format!("<|channel|>analysis<|message|>{rest}")),
+            ("<|channel|>final<|message|>", "Paris<|return|>".to_string()),
+            ("<|channel|>analysis<|message|>", rest.to_string()),
+            ("<|channel|>analysis", format!("<|message|>{rest}")),
+        ]
+        .map(|(opens, reply)| {
+            harmony_reply_after(opens, serde_json::json!({}), &reply)
+                .0
+                .expect("the request succeeds")
+        });
+        let answer = || vec!["r:Recall it.".to_string(), "c:Paris".to_string()];
+        assert_eq!(
+            read,
+            [answer(), vec!["c:Paris".to_string()], answer(), answer()]
+        );
+    }
+
+    /// A grammar that holds a reply, to a `response_format` or to a required call, goes on from
+    /// where the generation prompt leaves the reply rather than making it write a header
+    /// inside a message the prompt opened. A message the grammar cannot go on from, such as a
+    /// final message before a required call, keeps the grammar of a whole reply, and the reply
+    /// is read from its first header.
+    #[test]
+    fn a_harmony_grammar_goes_on_from_where_the_generation_prompt_leaves_it() {
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let required = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"],
+                    },
+                },
+            }],
+            "tool_choice": "required",
+        });
+        // a second turn, after an earlier structured reply
+        let mut second_turn = structured.clone();
+        second_turn["messages"] = serde_json::json!([
+            { "role": "user", "content": "What is the capital of France?" },
+            { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+            { "role": "user", "content": "And of Italy?" },
+        ]);
+        let json = "{\"capital\":\"Paris\"}";
+        let final_json = format!("<|channel|>final<|message|>{json}<|return|>");
+        let call =
+            "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"Paris\"}<|call|>";
+        let cases = [
+            ("", &structured, final_json.clone()),
+            (
+                "<|channel|>final<|message|>",
+                &structured,
+                format!("{json}<|return|>"),
+            ),
+            (
+                "<|channel|>analysis<|message|>",
+                &structured,
+                format!("Recall it.<|end|><|start|>assistant{final_json}"),
+            ),
+            (
+                "<|channel|>",
+                &structured,
+                format!("final<|message|>{json}<|return|>"),
+            ),
+            (
+                "<|channel|>final",
+                &structured,
+                format!("<|message|>{json}<|return|>"),
+            ),
+            (
+                "<|channel|>analysis",
+                &structured,
+                format!("<|message|>Recall it.<|end|><|start|>assistant{final_json}"),
+            ),
+            ("<|channel|>commentary<|message|>", &structured, final_json),
+            ("", &required, call.to_string()),
+            (
+                "<|channel|>analysis<|message|>",
+                &required,
+                format!("Look it up.<|end|><|start|>assistant{call}"),
+            ),
+            (
+                "<|channel|>commentary to=functions.get_weather<|message|>",
+                &required,
+                "{\"city\":\"Paris\"}<|call|>".to_string(),
+            ),
+            (
+                "<|channel|>",
+                &required,
+                call["<|channel|>".len()..].to_string(),
+            ),
+            (
+                "<|channel|>analysis",
+                &required,
+                format!("<|message|>Look it up.<|end|><|start|>assistant{call}"),
+            ),
+            ("<|channel|>final<|message|>", &required, call.to_string()),
+            (
+                "<|channel|>final<|message|>",
+                &second_turn,
+                format!("{json}<|return|>"),
+            ),
+        ];
+        let read: Vec<_> = cases
+            .iter()
+            .map(|(opens, request, reply)| harmony_reply_after(opens, (*request).clone(), reply))
+            .collect();
+        let structured_root = "analysis* <[2]> \"final\" constrain? <[3]> reply-root";
+        let after_analysis = format!("<[4]> <[1]> \"assistant\" {structured_root}");
+        let call_root = "<[2]> \"commentary to=functions.\" call";
+        let answer = || vec![format!("c:{json}")];
+        let called = || vec!["t:get_weather({\"city\":\"Paris\"})".to_string()];
+        let expected = [
+            (answer(), structured_root.to_string()),
+            (answer(), "reply-root".to_string()),
+            (
+                vec!["r:Recall it.".to_string(), format!("c:{json}")],
+                format!("reasoning {after_analysis}"),
+            ),
+            (
+                answer(),
+                format!(
+                    "\"analysis\" <[3]> reasoning {after_analysis} | \"final\" constrain? <[3]> reply-root"
+                ),
+            ),
+            (answer(), "constrain? <[3]> reply-root".to_string()),
+            (
+                vec!["r:Recall it.".to_string(), format!("c:{json}")],
+                format!("<[3]> reasoning {after_analysis}"),
+            ),
+            (answer(), structured_root.to_string()),
+            (called(), format!("analysis? {call_root}")),
+            (
+                [vec!["r:Look it up.".to_string()], called()].concat(),
+                format!("reasoning <[4]> <[1]> \"assistant\" {call_root}"),
+            ),
+            (called(), "tool0-root".to_string()),
+            (
+                called(),
+                format!(
+                    "\"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\" {call_root} | \"commentary to=functions.\" call"
+                ),
+            ),
+            (
+                [vec!["r:Look it up.".to_string()], called()].concat(),
+                format!("<[3]> reasoning <[4]> <[1]> \"assistant\" {call_root}"),
+            ),
+            (called(), format!("analysis? {call_root}")),
+            (answer(), "reply-root".to_string()),
+        ];
+        assert_eq!(
+            read,
+            expected
+                .into_iter()
+                .map(|(sent, root)| (Ok(sent), Some(root)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The reply goes on from what the template's generation prompt adds after the
+    /// conversation, whose messages the template closes: an earlier turn's final message ends
+    /// there, and the markers a prefill's JSON spells, `<|end|><|start|>` included, are the
+    /// prefill's, for a structured reply and a required call alike. A template that adds its
+    /// opened message whether or not a generation prompt is asked for is read whole.
+    #[test]
+    fn a_harmony_prefill_after_earlier_turns_keeps_the_markers_its_json_spells() {
+        let second_turn = |mut request: serde_json::Value| {
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "What is the capital of France?" },
+                { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+                { "role": "user", "content": "And of Italy?" },
+            ]);
+            request
+        };
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let required = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                    },
+                },
+            }],
+            "tool_choice": "required",
+        });
+        let prefill = "<|channel|>final<|message|>{\"note\":\"<|end|><|start|>\",\"capital\":\"Ro";
+        let call = "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"<|end|><|start|>Ro";
+        let pending = |template: String, request: serde_json::Value| {
+            let (_llama, _, _, out, _) = harmony_job(template, request);
+            out.pending().to_string()
+        };
+        let opens = |opened: &str| HARMONY_OPENS.replace("OPENS", opened);
+        // always adds `<|start|>assistant` and the prefill
+        let ignores_generation_prompt = |opened: &str| {
+            format!(
+                "{{% for m in messages %}}<|start|>{{{{ m.role }}}}<|message|>{{{{ m.content }}}}<|end|>{{% endfor %}}<|start|>assistant{opened}"
+            )
+        };
+        assert_eq!(
+            [
+                pending(opens(prefill), second_turn(structured.clone())),
+                pending(opens(call), second_turn(required)),
+                pending(ignores_generation_prompt(prefill), structured),
+            ],
+            [prefill, call, prefill]
+        );
+    }
+
+    /// A template may write the reply's role header whatever is asked for and add the rest of
+    /// the generation prompt only when asked, so what the generation prompt adds starts no
+    /// message: the reply then goes on from the message the conversation leaves open, after
+    /// an earlier turn's closed final message, with and without a grammar. A `<|start|>` the
+    /// body of that message spells is the body's, whether the generation prompt adds it or the
+    /// template writes it whatever is asked for, and so are the markers an earlier message
+    /// spells.
+    #[test]
+    fn a_harmony_header_split_across_the_generation_prompt_is_read_whole() {
+        let split = |always: &str, added: &str| {
+            format!(
+                "{{% for m in messages %}}<|start|>{{{{ m.role }}}}{{% if m.role == 'assistant' %}}<|channel|>final{{% endif %}}<|message|>{{{{ m.content }}}}<|end|>{{% endfor %}}<|start|>assistant{always}{{% if add_generation_prompt %}}{added}{{% endif %}}"
+            )
+        };
+        let second_turn = |mut request: serde_json::Value| {
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "What is the capital of France?" },
+                { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+                { "role": "user", "content": "And of Italy?" },
+            ]);
+            request
+        };
+        let read = |template: String, request: serde_json::Value, reply: &str| {
+            let (_llama, _, sampling, mut out, rx) = harmony_job(template, request);
+            let root = sampling.grammar.as_deref().and_then(|grammar| {
+                grammar
+                    .lines()
+                    .find_map(|line| line.strip_prefix("root ::= "))
+                    .map(ToString::to_string)
+            });
+            let pending = out.pending().to_string();
+            out.begin(true);
+            let finish = generate_harmony(&mut out, reply)
+                .0
+                .expect("the reply ends at `<|return|>`");
+            let sent = out.finish(finish, 1).map(|_| joined(sent(rx)));
+            (sent, root, pending)
+        };
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let spelled_pair = serde_json::json!({
+            "messages": [{ "role": "user", "content": "Say <|end|><|start|> verbatim." }],
+        });
+        let opened = "<|channel|>final<|message|>";
+        let rome = |content: &str| -> (
+            std::result::Result<Vec<String>, String>,
+            Option<String>,
+            String,
+        ) { (Ok(vec![content.to_string()]), None, String::new()) };
+        assert_eq!(
+            [
+                read(split("", opened), serde_json::json!({}), "Rome<|return|>"),
+                read(
+                    split("", opened),
+                    second_turn(structured),
+                    "{\"capital\":\"Rome\"}<|return|>"
+                ),
+                // a `<|start|>` in the body the generation prompt adds
+                read(
+                    split("", "<|channel|>final<|message|>Note: <|start|>!"),
+                    serde_json::json!({}),
+                    "Rome<|return|>"
+                ),
+                // a `<|start|>` in the body the template writes whatever is asked for
+                read(
+                    split("<|channel|>final<|message|>Note: <|start|>", "!"),
+                    serde_json::json!({}),
+                    "Rome<|return|>"
+                ),
+                // the pair an earlier message spells
+                read(split("", opened), spelled_pair, "Rome<|return|>"),
+            ],
+            [
+                rome("c:Rome"),
+                (
+                    Ok(vec!["c:{\"capital\":\"Rome\"}".to_string()]),
+                    Some("reply-root".to_string()),
+                    String::new()
+                ),
+                rome("c:Note: <|start|>!Rome"),
+                rome("c:Note: <|start|>!Rome"),
+                rome("c:Rome"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_harmony_call_ends_the_reply_with_its_arguments() {
+        let (mut out, rx) = harmony_output(&["get_weather"], &[], None);
+        let reply = "<|channel|>analysis<|message|>Look it up.<|end|><|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 9)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(
+            joined(sent(rx)),
+            [
+                "r:Look it up.".to_string(),
+                "t:get_weather({\"city\":\"Paris\"})".to_string()
+            ]
+        );
+    }
+
+    /// `<|end|>` can close a call whose arguments are complete JSON, and it does not end
+    /// generation in the vocabulary, so it is a completion token like any other marker; only
+    /// the `<|return|>` or `<|call|>` that ends a reply is not counted.
+    #[test]
+    fn an_end_that_closes_a_harmony_call_counts_as_a_completion_token() {
+        let (mut out, rx) = harmony_output(&["f"], &[], None);
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|end|>";
+        let (finish, n) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 1)
+            .expect("the request succeeds");
+        assert_eq!(
+            outcome.completion_tokens as usize, n,
+            "every token, `<|end|>` included"
+        );
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_stop_sequence_applies_to_a_harmony_body_but_not_its_header() {
+        let (mut out, rx) = harmony_output(&[], &["final"], None);
+        let reply = "<|channel|>analysis<|message|>r<|end|><|start|>assistant<|channel|>final<|message|>the final word<|return|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["r:r".to_string(), "c:the ".to_string()]);
+    }
+
+    #[test]
+    fn text_a_stop_sequence_holds_back_goes_out_before_the_next_harmony_message() {
+        // `x` may start the stop sequence, so it is held until the marker closes its message
+        let (mut out, rx) = harmony_output(&[], &["xyz"], None);
+        let reply = "<|channel|>analysis<|message|>abx<|end|><|start|>assistant<|channel|>final<|message|>c<|return|>";
+        generate_harmony(&mut out, reply);
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["r:abx".to_string(), "c:c".to_string()]);
+    }
+
+    #[test]
+    fn a_harmony_reply_counts_its_markers_against_the_budget() {
+        // `<|channel|>`, the five tokens of `final` and `<|message|>` leave two of nine
+        let (mut out, rx) = harmony_output(&[], &[], Some(9));
+        let reply = "<|channel|>final<|message|>abcdef<|return|>";
+        assert_eq!(
+            generate_harmony(&mut out, reply),
+            (Some(FinishReason::Length), 9)
+        );
+        out.finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["c:ab".to_string()]);
+    }
+
+    #[test]
+    fn a_harmony_call_cut_off_after_complete_arguments_is_still_made() {
+        // `<|channel|>`, `commentary to=functions.f` (25 characters), `<|message|>` and `{}`
+        let (mut out, rx) = harmony_output(&["f"], &[], Some(29));
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|call|>";
+        assert_eq!(
+            generate_harmony(&mut out, reply),
+            (Some(FinishReason::Length), 29)
+        );
+        let outcome = out
+            .finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_named_tool_choice_is_the_only_name_a_harmony_call_may_take() {
+        let tool = |name: &str| {
+            let mut tool = weather_tool();
+            tool.function.name = name.to_string();
+            tool
+        };
+        let (f, g) = (tool("f"), tool("g"));
+        assert_eq!(nameable_tools(&[&f, &g], &[&f]), ["f".to_string()]);
+        assert_eq!(
+            nameable_tools(&[&f, &g], &[]),
+            ["f".to_string(), "g".to_string()]
+        );
+        // a call to the other tool is dropped, so a required call is not made
+        let (events, _rx) = mpsc::channel(STREAM_BUFFER);
+        let (_, _, mut output) = Output::new(Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit: None,
+            sampling: Sampling::default(),
+            stop: Vec::new(),
+            reasoning: None,
+            tools: None,
+            harmony: Some(harmony::Reader::new(
+                HARMONY_MARKERS,
+                nameable_tools(&[&f, &g], &[&f]),
+                harmony::Held::Nothing,
+            )),
+            require_tool_call: true,
+            stopping: Arc::default(),
+            events,
+        });
+        let reply = "<|channel|>commentary to=functions.g<|message|>{}<|call|>";
+        assert_eq!(
+            generate_harmony(&mut output, reply).0,
+            Some(FinishReason::Stop)
+        );
+        assert_eq!(
+            output.finish(FinishReason::Stop, 1).map(|o| o.finish),
+            Err("Tool choice was required but no tools were called.".to_string())
+        );
+    }
+
+    #[test]
+    fn a_required_harmony_call_is_forced_by_a_grammar_over_the_whole_reply() {
+        let tool = weather_tool();
+        let grammar = harmony_call(&HARMONY_MARKERS, &[&tool], &harmony::Opened::Header)
+            .expect("the tool's schema converts");
+        // the test vocabulary's markers are tokens 1 to 7, matched as tokens
+        assert!(
+            grammar.ends_with("root ::= analysis? <[2]> \"commentary to=functions.\" call\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.starts_with(
+                "analysis ::= <[2]> \"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\"\n"
+            ),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("call ::= \"get_weather\" constrain? <[3]> tool0-root\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("constrain ::= \" \" <[7]>? [A-Za-z0-9_-]+\n"),
+            "{grammar}"
+        );
+        assert!(
+            !grammar.contains("<|"),
+            "no marker is written as text: {grammar}"
+        );
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+        // nor does a Harmony template make one without its markers
+        assert_eq!(
+            content_grammar("m", HARMONY, None, &[&tool], &[&tool]).expect("no grammar"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_structured_harmony_reply_is_held_from_its_first_header() {
+        let reply = content_grammar("m", HARMONY, Some(&answer_schema()), &[], &[])
+            .expect("the schema converts")
+            .expect("a json_schema format has a grammar");
+        let grammar = harmony_reply(&HARMONY_MARKERS, &reply, &harmony::Opened::Header);
+        // analysis messages, then the final one: no preamble, whose text would be content
+        assert!(
+            grammar.ends_with("root ::= analysis* <[2]> \"final\" constrain? <[3]> reply-root\n"),
+            "{grammar}"
+        );
+        assert!(!grammar.contains("commentary"), "{grammar}");
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+    }
+
+    #[test]
+    fn a_harmony_call_ends_where_its_arguments_do_though_a_stop_sequence_holds_their_end() {
+        // `}x` may begin at the closing `}`, which is held back when `<|end|>` comes
+        let (mut out, rx) = harmony_output(&["f"], &["}x"], None);
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|end|><|start|>assistant<|channel|>final<|message|>no<|return|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        out.finish(FinishReason::ToolCalls, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_required_harmony_call_leaves_only_its_call_marker_possible() {
+        let (out, _rx) = harmony_output(&["f"], &[], None);
+        assert_eq!(
+            out.ruled_out(&[Token(5), Token(6), Token(99)]),
+            [Token(5), Token(99)]
+        );
+        let (out, _rx) = output(ToolChoice::Auto, None);
+        assert_eq!(out.ruled_out(&[Token(6)]), [Token(6)]);
+    }
+
+    #[test]
+    fn a_harmony_model_is_refused_only_when_its_vocabulary_lacks_the_markers() {
         let refused = check_reply_format(
             &Either::Left(HARMONY.to_string()),
             Some("gpt-oss".to_string()),
+            None,
             "gpt-oss-20b-mxfp4.gguf".to_string(),
         )
-        .expect_err("a Harmony template is refused");
+        .expect_err("a Harmony template without its markers is refused");
         assert_eq!(
             refused.to_string(),
             "Architecture 'gpt-oss' in gpt-oss-20b-mxfp4.gguf is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
         );
         assert!(reasoning_parser(HARMONY, "").is_none());
-        check_reply_format(
-            &Either::Left(THINKS.to_string()),
+        assert_eq!(
+            check_reply_format(
+                &Either::Left(HARMONY.to_string()),
+                Some("gpt-oss".to_string()),
+                Some(HARMONY_MARKERS),
+                "gpt-oss-20b-mxfp4.gguf".to_string(),
+            )
+            .expect("a Harmony template with its markers"),
+            Some(HARMONY_MARKERS)
+        );
+        assert_eq!(
+            check_reply_format(
+                &Either::Left(THINKS.to_string()),
+                None,
+                Some(HARMONY_MARKERS),
+                "qwen.gguf".to_string(),
+            )
+            .expect("a think-tag template"),
             None,
-            "qwen.gguf".to_string(),
-        )
-        .expect("a think-tag template");
+            "only a Harmony template's replies are read by the markers"
+        );
         check_reply_format(
             &Either::Left(GEMMA4.to_string()),
+            None,
             None,
             "gemma.gguf".to_string(),
         )
@@ -2992,7 +4537,7 @@ mod tests {
     }
 
     /// Named templates are chosen as the mistral.rs engine chooses them, and a Harmony template
-    /// among them is refused as a lone one is.
+    /// among them is read as a lone one is.
     #[test]
     fn named_templates_are_chosen_as_mistral_rs_chooses() {
         let entry = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
@@ -3025,7 +4570,7 @@ mod tests {
             entry(&[("name", "tool_use"), ("template", HARMONY)]),
         ]);
         assert!(matches!(
-            check_reply_format(&harmony, None, "gpt-oss.gguf".to_string()),
+            check_reply_format(&harmony, None, None, "gpt-oss.gguf".to_string()),
             Err(ChatError::UnsupportedArchitecture { .. })
         ));
     }
@@ -3111,6 +4656,7 @@ mod tests {
             stop: vec!["STOP".to_string()],
             reasoning: None,
             tools: None,
+            harmony: None,
             require_tool_call: false,
             stopping: Arc::default(),
             events,

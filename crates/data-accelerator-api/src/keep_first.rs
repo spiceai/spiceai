@@ -1074,7 +1074,7 @@ mod tests {
         let rows = write_and_read("do_nothing:id", &pk(), input, &SessionContext::new())
             .await
             .expect("write succeeds");
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [(Option<i32>, String); 0]);
     }
 
     /// The admitted keys are charged to the memory pool of the session that

@@ -45,6 +45,7 @@ use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::E
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::checked_arithmetic::with_plain_arithmetic_writes;
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -1205,7 +1206,7 @@ async fn build_write_back_deliverer(
     // Version gate: `pg_current_xact_id()` is PG13+, `txid_current()` its
     // PG10–12 equivalent. Read the server version at setup so delivery does
     // not re-decide per pass.
-    let conn = postgres.pool.connect_direct().await.map_err(&setup_error)?;
+    let conn = postgres.pool.connect_direct().await.map_err(setup_error)?;
     let server_version_num: i32 = conn
         .conn
         .query_one("SELECT current_setting('server_version_num')::int4", &[])
@@ -1299,7 +1300,11 @@ impl DataConnector for Postgres {
         {
             Ok(provider) => {
                 let provider = enrich_with_postgres_metadata(&self.pool, dataset, provider).await;
-                Some(ensure_changes_primary_key(dataset, &provider).map(|()| provider))
+                // PostgreSQL evaluates the `UPDATE` and `DELETE` this provider renders.
+                Some(
+                    ensure_changes_primary_key(dataset, &provider)
+                        .map(|()| with_plain_arithmetic_writes(provider)),
+                )
             }
             Err(e) => {
                 if let Some(err_source) = e.source() {
@@ -1553,7 +1558,7 @@ mod inferred_schema_tests {
             schema.primary_key,
             vec!["warehouse_id".to_string(), "sku".to_string()]
         );
-        assert!(schema.indexes.is_empty());
+        assert_eq!(schema.indexes, [] as [InferredIndex; 0]);
         // No clustered index → sort falls back to the primary key, ascending.
         assert_eq!(
             schema.sort_columns,
@@ -1863,7 +1868,7 @@ mod inferred_schema_tests {
             &no_stats(),
         );
 
-        assert!(schema.primary_key.is_empty());
+        assert_eq!(schema.primary_key, [] as [String; 0]);
         assert_eq!(schema.sort_columns, vec![asc("region")]);
     }
 
@@ -1986,7 +1991,7 @@ mod inferred_schema_tests {
             columns: vec![Some("region".to_string()), None],
         };
         let schema = inferred_schema_from_indexes(&BTreeMap::new(), Some(&expr_key), &no_stats());
-        assert!(schema.shard_key.is_empty());
+        assert_eq!(schema.shard_key, [] as [String; 0]);
     }
 
     #[test]

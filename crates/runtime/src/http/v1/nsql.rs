@@ -16,7 +16,10 @@ limitations under the License.
 use crate::{
     Runtime,
     datafusion::request_context_extension::get_current_datafusion,
-    http::v1::{ResponseMetadata, ResponseMimeType, to_http_response},
+    http::v1::{
+        ResponseMetadata, ResponseMimeType, SqlErrorKind, collect_buffered, to_http_response,
+        too_large_to_buffer_message,
+    },
     model::{
         LLMChatCompletionsModelStore,
         nsql::{
@@ -338,11 +341,11 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
                             "function": "vector_search",
                             "syntax": "vector_search(sales.orders, 'query text', customer_id)",
                             "model": "embed_model",
-                            "engine": "duckdb_vector_index",
+                            "engine": "s3_vectors",
                             "row_id_columns": ["order_id"],
                             "vector_size": 384,
                             "chunked": false,
-                            "index": {"name": "duckdb_vector_index", "columns": ["customer_id", "order_id"], "kind": "duckdb_vector_index", "source": "runtime_index"},
+                            "index": {"name": "s3_vector_index", "columns": ["customer_id", "order_id"], "kind": "s3_vector_index", "source": "runtime_index"},
                             "required_columns": ["customer_id", "order_id"],
                             "notes": []
                         }],
@@ -613,6 +616,7 @@ async fn handle_nsql_query(
     payload: Request,
 ) -> (StatusCode, HeaderMap, String) {
     let df = get_current_datafusion(&context);
+    let memory_pool = Arc::clone(&df.ctx.runtime_env().memory_pool);
     let headers = HeaderMap::new();
 
     // NSQL-scoped cancellation token (child of the request token). Used for
@@ -743,16 +747,32 @@ async fn handle_nsql_query(
                 match query_result {
                     Ok(result) => {
                         let cache_status = result.cache_status;
-                        match result.collect_batches().await {
-                            Ok(data) => {
+                        let format = ResponseMimeType::from_accept_header(accept.as_ref());
+                        match collect_buffered(result.data, format, &memory_pool).await {
+                            Ok((data, _reservation)) => {
                                 return to_http_response(
                                     data,
                                     cache_status,
-                                    ResponseMimeType::from_accept_header(accept.as_ref()),
+                                    format,
                                     ResponseMetadata::empty().with_sql(&cleaned_query),
                                 )
                                 .instrument(span.clone())
                                 .await;
+                            }
+                            // Running out of query memory is the runtime's capacity, not an
+                            // error in the SQL for the model to correct.
+                            Err(e)
+                                if matches!(
+                                    SqlErrorKind::of_datafusion_error(&e),
+                                    SqlErrorKind::ResourcesExhausted
+                                ) =>
+                            {
+                                tracing::debug!("Error collecting query results: {e}");
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    headers,
+                                    too_large_to_buffer_message(&e),
+                                );
                             }
                             Err(e) => {
                                 if num_retries >= DEFAULT_NSQL_RETRIES {
@@ -866,7 +886,7 @@ mod tests {
             Volatility as FunctionVolatility,
         },
         model::Model,
-        runtime::{Functions, Runtime as SpicepodRuntime},
+        runtime::{Functions, Query as SpicepodQuery, Runtime as SpicepodRuntime},
     };
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
@@ -1062,10 +1082,12 @@ mod tests {
     }
 
     /// Loads `nsql_model`, an `openai:` model served at `endpoint` with the Spicepod `params`
-    /// given, the way the runtime loads a Spicepod model, and sends `request` to `POST /v1/nsql`.
+    /// given, the way the runtime loads a Spicepod model, and sends `request` to `POST /v1/nsql`
+    /// on a runtime with the `runtime.query` settings given.
     async fn post_nsql_to_openai_model(
         endpoint: &str,
         params: &[(&str, &str)],
+        query: Option<SpicepodQuery>,
         request: serde_json::Value,
     ) -> (StatusCode, String) {
         let mut model = Model::new("openai:gpt-test", "nsql_model");
@@ -1085,8 +1107,9 @@ mod tests {
             })
             .collect();
 
-        let rt = Arc::new(Runtime::builder().build().await);
-        *rt.app().write().await = Some(Arc::new(app_with_models(vec![model.clone()])));
+        let mut app = app_with_models(vec![model.clone()]);
+        app.runtime.query = query;
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
         // Loading a Spicepod registers `list_udfs`, which the NSQL context lists functions from.
         let df = rt.datafusion();
         df.ctx.register_udtf(
@@ -1156,6 +1179,7 @@ mod tests {
         let (status, body) = post_nsql_to_openai_model(
             &endpoint,
             &[("reasoning_effort", "high")],
+            None,
             json!({ "query": "how many rows", "model": "nsql_model", "reasoning_effort": "low" }),
         )
         .await;
@@ -1187,6 +1211,7 @@ mod tests {
             let (status, body) = post_nsql_to_openai_model(
                 &endpoint,
                 params,
+                None,
                 json!({ "query": "how many rows", "model": "nsql_model" }),
             )
             .await;
@@ -1201,6 +1226,64 @@ mod tests {
                 sent_reasoning_efforts(&mut sent),
                 vec![expected],
                 "model params: {params:?}"
+            );
+        }
+    }
+
+    /// The result of the generated SQL is held to `runtime.query.memory_limit` while the response
+    /// is built: under 32 MiB a small result is served, and 6,000,000 rows (about 46 MiB) are
+    /// refused with 503 without asking the model for another query.
+    #[tokio::test]
+    async fn generated_query_result_is_held_to_the_query_memory_limit() {
+        let query = SpicepodQuery {
+            memory_limit: Some("32MiB".to_string()),
+            // One partition keeps the NSQL context's own sort within the limit on any host.
+            target_partitions: Some(1),
+            ..SpicepodQuery::default()
+        };
+        let cases: [(&'static [&'static str], StatusCode); 2] = [
+            (&["SELECT value FROM generate_series(1, 3)"], StatusCode::OK),
+            (
+                &["SELECT value FROM generate_series(1, 6000000)"],
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+
+        for (answers, expected_status) in cases {
+            let (endpoint, mut sent) = serve_scripted_chat_completions(answers).await;
+
+            let (status, body) = post_nsql_to_openai_model(
+                &endpoint,
+                &[],
+                Some(query.clone()),
+                json!({ "query": "list the numbers", "model": "nsql_model" }),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                expected_status,
+                "{answers:?}: {}",
+                body.chars().take(200).collect::<String>()
+            );
+            if expected_status == StatusCode::OK {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&body)
+                        .expect("response body should be JSON rows"),
+                    json!([{ "value": 1 }, { "value": 2 }, { "value": 3 }])
+                );
+            } else {
+                assert!(
+                    body.starts_with(
+                        "The query result is too large to buffer in memory for this response."
+                    ),
+                    "{answers:?}: the error names the cause: `{body}`"
+                );
+            }
+            assert_eq!(
+                std::iter::from_fn(|| sent.try_recv().ok()).count(),
+                1,
+                "{answers:?}: the model is asked once"
             );
         }
     }
@@ -1288,11 +1371,12 @@ mod tests {
         assert_eq!(body["context"], json!("context"));
         assert_eq!(body["sql"]["engine"], json!("Apache DataFusion"));
         assert_eq!(body["sql"]["dialect"], json!("PostgreSQL"));
-        assert!(
+        assert_eq!(
             body["datasets"]
                 .as_array()
                 .expect("datasets should be an array")
-                .is_empty()
+                .as_slice(),
+            [] as [serde_json::Value; 0]
         );
     }
 
@@ -1320,7 +1404,7 @@ mod tests {
         assert_eq!(options.sampling_limit, DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT);
         assert!(!options.include_examples);
         assert_eq!(options.examples_limit, DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT);
-        assert!(request.datasets.is_empty());
+        assert_eq!(request.datasets, [] as [String; 0]);
     }
 
     #[test]
@@ -1461,7 +1545,7 @@ mod tests {
 - Indexes:
     - `customer_id`: `customer_id` (enabled, spicepod.acceleration.indexes)
 - Search indexes:
-    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `duckdb_vector_index`. Row id: `order_id`.
+    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `s3_vectors`. Row id: `order_id`.
     - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
         ";
         let sample_context_blocks = vec![
@@ -1584,16 +1668,16 @@ mod tests {
                     function: "vector_search".to_string(),
                     syntax: "vector_search(sales.orders, 'query text', customer_id)".to_string(),
                     model: "embed_model".to_string(),
-                    engine: Some("duckdb_vector_index".to_string()),
+                    engine: Some("s3_vectors".to_string()),
                     row_id_columns: vec!["order_id".to_string()],
                     vector_size: Some(384),
                     chunked: false,
                     input_mode: Some("scalar".to_string()),
                     required_columns: vec!["customer_id".to_string(), "order_id".to_string()],
                     index: Some(NsqlIndexContext {
-                        name: Some("duckdb_vector_index".to_string()),
+                        name: Some("s3_vector_index".to_string()),
                         columns: vec!["customer_id".to_string(), "order_id".to_string()],
-                        kind: "duckdb_vector_index".to_string(),
+                        kind: "s3_vector_index".to_string(),
                         source: "runtime_index".to_string(),
                     }),
                     notes: vec![],
@@ -1733,7 +1817,10 @@ mod tests {
             vec![test_user_function_info("Registered_Fn")],
         );
 
-        assert!(entries.is_empty());
+        assert_eq!(
+            entries,
+            [] as [crate::model::nsql::UserFunctionContextEntry; 0]
+        );
     }
 
     // regression test for #14394

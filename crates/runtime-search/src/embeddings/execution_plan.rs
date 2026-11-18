@@ -1045,7 +1045,6 @@ fn build_embedding_pool(
     Ok(pool)
 }
 
-#[expect(clippy::float_cmp)]
 #[cfg(test)]
 mod tests {
     use crate::embeddings::execution_plan::get_vectors;

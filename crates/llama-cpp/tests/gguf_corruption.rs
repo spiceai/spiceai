@@ -80,22 +80,41 @@ fn seed_gguf() -> Vec<u8> {
     bytes
 }
 
-/// A GGUF header for a `llama` model: `pairs` of string and u32 keys, and no tensors.
-fn llama_header(strings: &[(&str, &str)], numbers: &[(&str, u32)]) -> Vec<u8> {
+/// A GGUF metadata value of one of the types the headers below need.
+enum Kv<'a> {
+    Str(&'a str),
+    U32(u32),
+    F32(f32),
+    Bool(bool),
+}
+
+/// A GGUF header of `pairs` of keys and values, and no tensors.
+fn gguf_header(pairs: &[(&str, Kv)]) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"GGUF");
     bytes.extend_from_slice(&3u32.to_le_bytes());
     bytes.extend_from_slice(&0u64.to_le_bytes());
-    bytes.extend_from_slice(&((strings.len() + numbers.len()) as u64).to_le_bytes());
-    for (key, value) in strings {
+    bytes.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
+    for (key, value) in pairs {
         put_string(&mut bytes, key);
-        bytes.extend_from_slice(&8u32.to_le_bytes());
-        put_string(&mut bytes, value);
-    }
-    for (key, value) in numbers {
-        put_string(&mut bytes, key);
-        bytes.extend_from_slice(&4u32.to_le_bytes());
-        bytes.extend_from_slice(&value.to_le_bytes());
+        match value {
+            Kv::Str(text) => {
+                bytes.extend_from_slice(&8u32.to_le_bytes());
+                put_string(&mut bytes, text);
+            }
+            Kv::U32(number) => {
+                bytes.extend_from_slice(&4u32.to_le_bytes());
+                bytes.extend_from_slice(&number.to_le_bytes());
+            }
+            Kv::F32(number) => {
+                bytes.extend_from_slice(&6u32.to_le_bytes());
+                bytes.extend_from_slice(&number.to_le_bytes());
+            }
+            Kv::Bool(flag) => {
+                bytes.extend_from_slice(&7u32.to_le_bytes());
+                bytes.push(u8::from(*flag));
+            }
+        }
     }
     bytes
 }
@@ -107,18 +126,14 @@ fn llama_header(strings: &[(&str, &str)], numbers: &[(&str, u32)]) -> Vec<u8> {
 fn an_unknown_classifier_activation_fails_the_load_instead_of_aborting() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let path = dir.path().join("classifier.gguf");
-    let bytes = llama_header(
-        &[
-            ("general.architecture", "llama"),
-            ("tokenizer.ggml.model", "none"),
-            ("llama.classifier.activation", "bogus"),
-        ],
-        &[
-            ("llama.context_length", 64),
-            ("llama.embedding_length", 8),
-            ("llama.block_count", 1),
-        ],
-    );
+    let bytes = gguf_header(&[
+        ("general.architecture", Kv::Str("llama")),
+        ("tokenizer.ggml.model", Kv::Str("none")),
+        ("llama.classifier.activation", Kv::Str("bogus")),
+        ("llama.context_length", Kv::U32(64)),
+        ("llama.embedding_length", Kv::U32(8)),
+        ("llama.block_count", Kv::U32(1)),
+    ]);
     std::fs::write(&path, bytes).expect("the file is written");
 
     let refused = refusal(&path).expect("the file does not load");
@@ -126,6 +141,123 @@ fn an_unknown_classifier_activation_fails_the_load_instead_of_aborting() {
     assert!(
         refused.contains("unsupported classifier activation"),
         "the failed check is the reason: {refused}"
+    );
+}
+
+/// The fork checks DeepSeek-V4's `attention.output_group_count` while loading its
+/// hyperparameters, since the attention heads are divided among that many groups: a GGUF that
+/// gives 0 fails its load there, and never reaches a division by zero.
+#[test]
+fn a_zero_output_group_count_fails_a_deepseek_load() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("deepseek41.gguf");
+    let bytes = gguf_header(&[
+        ("general.architecture", Kv::Str("deepseek41")),
+        ("tokenizer.ggml.model", Kv::Str("none")),
+        ("deepseek41.context_length", Kv::U32(64)),
+        ("deepseek41.embedding_length", Kv::U32(8)),
+        ("deepseek41.block_count", Kv::U32(1)),
+        ("deepseek41.attention.head_count", Kv::U32(2)),
+        ("deepseek41.attention.layer_norm_rms_epsilon", Kv::F32(1e-6)),
+        ("deepseek41.attention.q_lora_rank", Kv::U32(8)),
+        ("deepseek41.attention.sliding_window", Kv::U32(8)),
+        ("deepseek41.expert_feed_forward_length", Kv::U32(8)),
+        ("deepseek41.expert_shared_count", Kv::U32(1)),
+        ("deepseek41.expert_weights_scale", Kv::F32(1.0)),
+        ("deepseek41.expert_weights_norm", Kv::Bool(true)),
+        ("deepseek41.swiglu_clamp_exp", Kv::F32(10.0)),
+        ("deepseek41.attention.indexer.head_count", Kv::U32(2)),
+        ("deepseek41.attention.indexer.key_length", Kv::U32(8)),
+        ("deepseek41.attention.indexer.top_k", Kv::U32(4)),
+        ("deepseek41.attention.output_group_count", Kv::U32(0)),
+        ("deepseek41.attention.output_lora_rank", Kv::U32(8)),
+        (
+            "deepseek41.attention.compress_rope_freq_base",
+            Kv::F32(10_000.0),
+        ),
+        ("deepseek41.hyper_connection.count", Kv::U32(2)),
+        (
+            "deepseek41.hyper_connection.sinkhorn_iterations",
+            Kv::U32(2),
+        ),
+        ("deepseek41.hyper_connection.epsilon", Kv::F32(1e-6)),
+        ("deepseek41.hash_layer_count", Kv::U32(0)),
+    ]);
+    std::fs::write(&path, bytes).expect("the file is written");
+
+    let refused = refusal(&path).expect("the file does not load");
+
+    assert_eq!(
+        reason(&refused),
+        "llama_model_load: error loading model: error loading model hyperparameters: \
+         DeepSeek-V4 attention.output_group_count must be > 0",
+        "the zero group count is the reason: {refused}"
+    );
+}
+
+/// GGML type 43 was the fork's gather-only `MXFP8` (one `E8M0` scale and 32 `E4M3` codes per 32
+/// values) before llama.cpp v1.0.0 gave the number to `F8_E4M3` (one byte per value). A tensor
+/// written as `MXFP8` and read last as `F8_E4M3` passes the offset checks, which only see a tensor
+/// that another follows, so the fork refuses a data section that runs past its tensors instead of
+/// loading the wrong values.
+#[test]
+fn a_tensor_written_as_the_old_type_43_fails_the_load_instead_of_reading_as_f8_e4m3() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("mxfp8-last.gguf");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&2u64.to_le_bytes()); // tensors
+    bytes.extend_from_slice(&4u64.to_le_bytes()); // key-value pairs
+    put_string(&mut bytes, "general.architecture");
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    put_string(&mut bytes, "llama");
+    put_string(&mut bytes, "llama.block_count");
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    put_string(&mut bytes, "llama.embedding_length");
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    put_string(&mut bytes, "general.alignment");
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&32u32.to_le_bytes());
+    // An F32 [8, 4] tensor (128 bytes), then a type 43 [64, 2] tensor laid out as MXFP8: four
+    // blocks of 33 bytes, 132 bytes padded to 160, where F8_E4M3 takes 128.
+    put_string(&mut bytes, "token_embd.weight");
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&8u64.to_le_bytes());
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    put_string(&mut bytes, "output.weight");
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&64u64.to_le_bytes());
+    bytes.extend_from_slice(&2u64.to_le_bytes());
+    bytes.extend_from_slice(&43u32.to_le_bytes());
+    bytes.extend_from_slice(&128u64.to_le_bytes());
+    while !bytes.len().is_multiple_of(32) {
+        bytes.push(0);
+    }
+    bytes.extend(std::iter::repeat_n(0u8, 8 * 4 * 4));
+    for _ in 0..4 {
+        // scale 2^0, and 32 codes of 1.0
+        bytes.push(127);
+        bytes.extend(std::iter::repeat_n(0x38u8, 32));
+    }
+    while !bytes.len().is_multiple_of(32) {
+        bytes.push(0);
+    }
+    std::fs::write(&path, bytes).expect("the file is written");
+
+    let refused = refusal(&path).expect("the file does not load");
+
+    assert_eq!(
+        reason(&refused),
+        "gguf_init_from_reader: the data section holds 288 bytes but its tensors take 256, so a \
+         tensor's type is not the one it was written with (GGML type 43 was MXFP8 in \
+         spiceai/llama.cpp before v1.0.0, and is F8_E4M3 since). Convert the model again with \
+         this release",
+        "the data section check is the reason: {refused}"
     );
 }
 

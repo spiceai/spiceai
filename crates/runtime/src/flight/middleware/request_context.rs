@@ -275,11 +275,20 @@ mod tests {
     }
 
     async fn observe(service: &mut RequestContextMiddleware<ObserveContext>) {
-        let request = http::Request::builder()
+        observe_with(service, &[]).await;
+    }
+
+    async fn observe_with(
+        service: &mut RequestContextMiddleware<ObserveContext>,
+        headers: &[(&str, &str)],
+    ) {
+        let mut request = http::Request::builder()
             .uri("/arrow.flight.protocol.FlightService/DoGet")
-            .header(http::header::USER_AGENT, "spice-test/1.0")
-            .body(Body::empty())
-            .expect("request builds");
+            .header(http::header::USER_AGENT, "spice-test/1.0");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(Body::empty()).expect("request builds");
 
         service
             .call(request)
@@ -356,5 +365,75 @@ mod tests {
         );
         assert_eq!(observed[1].query_timeout, http_context.query_timeout());
         assert_eq!(observed[1].cache_control, http_context.cache_control());
+    }
+
+    /// A Flight client's `cache-control: no-cache` metadata revalidates under
+    /// the cache key a plain request on the same app reads, so its fresh result
+    /// replaces the entry later requests are served, as it does over HTTP.
+    #[tokio::test]
+    async fn flight_no_cache_revalidates_under_the_request_cache_key() {
+        for (configured, key_type) in [
+            (ConfiguredCacheKeyType::Plan, CacheKeyType::Default),
+            (ConfiguredCacheKeyType::Sql, CacheKeyType::Raw),
+        ] {
+            let app = Arc::new(RwLock::new(Some(app_with(
+                "30s",
+                configured,
+                UserAgentCollection::Full,
+                1024,
+            ))));
+            let df = Arc::new(
+                DataFusionBuilder::new(
+                    RuntimeStatus::new(),
+                    Arc::new(AcceleratorEngineRegistry::new()),
+                    Handle::current(),
+                )
+                .build(),
+            );
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let mut service = RequestContextLayer::new(
+                Arc::clone(&app),
+                df,
+                Arc::new(RwLock::new(secrets::Secrets::new())),
+            )
+            .layer(ObserveContext {
+                observed: Arc::clone(&observed),
+            });
+
+            observe(&mut service).await;
+            observe_with(&mut service, &[("cache-control", "no-cache")]).await;
+            observe_with(
+                &mut service,
+                &[("cache-control", "no-cache"), ("spice-cache-key", "k1")],
+            )
+            .await;
+
+            let mut http_headers = http::HeaderMap::new();
+            http_headers.insert(
+                http::header::CACHE_CONTROL,
+                http::HeaderValue::from_static("no-cache"),
+            );
+            let http_context = RequestContext::builder(Protocol::Http)
+                .with_app_opt(app.read().await.as_ref().map(Arc::clone))
+                .from_headers(&http_headers)
+                .build();
+
+            let observed: Vec<CacheControl> = observed
+                .lock()
+                .expect("observations mutex is not poisoned")
+                .iter()
+                .map(|o| o.cache_control)
+                .collect();
+            assert_eq!(
+                observed,
+                vec![
+                    CacheControl::Cache(key_type),
+                    CacheControl::Revalidate(key_type),
+                    CacheControl::Revalidate(CacheKeyType::ClientSupplied),
+                ],
+                "{configured:?}"
+            );
+            assert_eq!(observed[1], http_context.cache_control(), "{configured:?}");
+        }
     }
 }

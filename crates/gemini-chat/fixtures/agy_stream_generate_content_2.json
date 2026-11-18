@@ -1,0 +1,27 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "<USER_REQUEST>\nReply with exactly the word: pong\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-26T17:11:21-07:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to qwen. No need to comment on this change if the user doesn"
+        }
+      ]
+    }
+  ],
+  "systemInstruction": {
+    "role": "user",
+    "parts": [
+      {
+        "text": "<identity>\nYou are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\nYou are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, "
+      }
+    ]
+  },
+  "generationConfig": {
+    "maxOutputTokens": 16384,
+    "thinkingConfig": {
+      "includeThoughts": true,
+      "thinkingBudget": 0
+    }
+  }
+}

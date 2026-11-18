@@ -46,7 +46,9 @@ use datafusion::physical_plan::{
 use data_components::flightsql::{
     FlightSqlClient, FlightSqlExec, query_to_stream, trace_parent_from_task_context,
 };
-use data_components::sql_expr::to_sql_preserving_precedence;
+use data_components::sql_expr::{
+    numeric_literal_to_spice_sql, to_spice_sql, to_sql_preserving_precedence,
+};
 use flight_client::cookie::CookieStore;
 use futures::StreamExt;
 
@@ -136,6 +138,7 @@ pub struct PartialAggregationFlightSqlExec {
     table_reference: TableReference,
     /// Filter expressions from the source `FlightSqlExec` (become the WHERE clause).
     source_filters: Vec<Expr>,
+    spice_sql: bool,
     /// Group-by expressions and their output names.
     group_by: PhysicalGroupBy,
     /// Aggregate function expressions.
@@ -191,6 +194,7 @@ impl PartialAggregationFlightSqlExec {
         Self {
             table_reference: source.table_reference().clone(),
             source_filters: source.filters().to_vec(),
+            spice_sql: source.uses_spice_sql(),
             group_by,
             aggr_exprs,
             output_schema,
@@ -239,6 +243,7 @@ impl PartialAggregationFlightSqlExec {
             &self.group_by,
             &self.aggr_exprs,
             &self.column_substitutions,
+            self.spice_sql,
             self.input_schema.as_ref(),
         )
     }
@@ -412,6 +417,7 @@ fn build_aggregate_sql(
     group_by: &PhysicalGroupBy,
     aggr_exprs: &[Arc<AggregateFunctionExpr>],
     column_substitutions: &[Arc<dyn PhysicalExpr>],
+    spice_sql: bool,
     input_schema: &Schema,
 ) -> Result<AggregateQuery> {
     // Phase 1: collect all SQL fragments (before dedup) and their dedup keys.
@@ -422,9 +428,12 @@ fn build_aggregate_sql(
     // physical expression so that non-trivial group-bys (e.g. date_trunc(...))
     // are correctly pushed down.
     for (expr, _name) in group_by.expr() {
-        let expr_sql = physical_expr_to_sql(expr, column_substitutions).ok_or_else(|| {
-            DataFusionError::Internal("Failed to convert group-by expression to SQL".to_string())
-        })?;
+        let expr_sql =
+            physical_expr_to_sql(expr, column_substitutions, spice_sql).ok_or_else(|| {
+                DataFusionError::Internal(
+                    "Failed to convert group-by expression to SQL".to_string(),
+                )
+            })?;
         group_by_cols.push(expr_sql.clone());
         all_fragments.push(SqlFragment {
             sql: expr_sql.clone(),
@@ -452,8 +461,8 @@ fn build_aggregate_sql(
                         exprs.len()
                     )));
                 }
-                let arg_sql =
-                    physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
+                let arg_sql = physical_expr_to_sql(&exprs[0], column_substitutions, spice_sql)
+                    .ok_or_else(|| {
                         DataFusionError::Internal("Failed to convert count arg to SQL".to_string())
                     })?;
                 all_fragments.push(SqlFragment {
@@ -468,8 +477,8 @@ fn build_aggregate_sql(
                         exprs.len()
                     )));
                 }
-                let arg_sql =
-                    physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
+                let arg_sql = physical_expr_to_sql(&exprs[0], column_substitutions, spice_sql)
+                    .ok_or_else(|| {
                         DataFusionError::Internal(format!(
                             "Failed to convert {func_name} arg to SQL"
                         ))
@@ -497,8 +506,8 @@ fn build_aggregate_sql(
                     exprs.len()
                 )));
             }
-            let arg_sql =
-                physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
+            let arg_sql = physical_expr_to_sql(&exprs[0], column_substitutions, spice_sql)
+                .ok_or_else(|| {
                     DataFusionError::Internal("Failed to convert avg arg to SQL".to_string())
                 })?;
             // AVG decomposes into SUM + COUNT. The partial state has exactly
@@ -607,7 +616,11 @@ fn build_aggregate_sql(
     let where_clauses: Vec<String> = source_filters
         .iter()
         .map(|f| {
-            to_sql_preserving_precedence(f).map_err(|e| DataFusionError::Internal(e.to_string()))
+            if spice_sql {
+                to_spice_sql(f)
+            } else {
+                to_sql_preserving_precedence(f)
+            }
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -723,6 +736,7 @@ fn find_top_level_as(s: &str) -> Option<usize> {
 pub(super) fn physical_expr_to_sql(
     expr: &Arc<dyn PhysicalExpr>,
     column_substitutions: &[Arc<dyn PhysicalExpr>],
+    spice_sql: bool,
 ) -> Option<String> {
     use datafusion::physical_expr::expressions::{
         BinaryExpr, CastExpr, Column, Literal, NegativeExpr,
@@ -735,25 +749,31 @@ pub(super) fn physical_expr_to_sql(
         if let Some(subst) = column_substitutions.get(col.index()) {
             // Substituted expressions reference the scan schema directly,
             // so recurse without further substitutions.
-            return physical_expr_to_sql(subst, &[]);
+            return physical_expr_to_sql(subst, &[], spice_sql);
         }
         return Some(quote_ident(col.name()));
     }
     if let Some(lit) = any.downcast_ref::<Literal>() {
+        if spice_sql && let Some(sql) = numeric_literal_to_spice_sql(lit.value()).ok()? {
+            return Some(sql);
+        }
         return scalar_to_sql(lit.value());
     }
     if let Some(bin) = any.downcast_ref::<BinaryExpr>() {
-        let left = physical_expr_to_sql(bin.left(), column_substitutions)?;
-        let right = physical_expr_to_sql(bin.right(), column_substitutions)?;
+        let left = physical_expr_to_sql(bin.left(), column_substitutions, spice_sql)?;
+        let right = physical_expr_to_sql(bin.right(), column_substitutions, spice_sql)?;
         return Some(format!("({left} {op} {right})", op = bin.op()));
     }
     if let Some(cast) = any.downcast_ref::<CastExpr>() {
-        let inner = physical_expr_to_sql(cast.expr(), column_substitutions)?;
+        let inner = physical_expr_to_sql(cast.expr(), column_substitutions, spice_sql)?;
+        if spice_sql && cast.cast_type().is_numeric() {
+            return Some(format!("arrow_cast({inner}, '{}')", cast.cast_type()));
+        }
         let dt = arrow_type_to_sql(cast.cast_type())?;
         return Some(format!("CAST({inner} AS {dt})"));
     }
     if let Some(neg) = any.downcast_ref::<NegativeExpr>() {
-        let inner = physical_expr_to_sql(neg.arg(), column_substitutions)?;
+        let inner = physical_expr_to_sql(neg.arg(), column_substitutions, spice_sql)?;
         return Some(format!("(-{inner})"));
     }
     None

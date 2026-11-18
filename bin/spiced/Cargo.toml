@@ -47,8 +47,7 @@ connector-oracle = { path = "../../crates/data-connectors/connector-oracle", opt
 accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
 accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
 llms-llamacpp = { path = "../../crates/llms-llamacpp", optional = true }
-accelerator-turso = { path = "../../crates/accelerators/accelerator-turso", optional = true }
-accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb", optional = true }
+accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
@@ -63,6 +62,7 @@ podswatcher = { path = "../../crates/podswatcher" }
 repl = { path = "../../crates/repl" }
 runtime-tls = { path = "../../crates/runtime-tls" }
 futures.workspace = true
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 libc = "0.2"
 mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
@@ -107,13 +107,6 @@ tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util"}
-
-# Vortex ships on non-Windows targets only (matching `runtime`'s gate on
-# Cayenne), so the startup parallelism declaration is gated the same way.
-[target.'cfg(not(windows))'.dependencies]
-# The Cayenne engine is not built on Windows, so it is a target dependency rather
-# than an optional one behind a feature.
-accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 vortex-utils.workspace = true
 
 # Raising the soft open file limit at startup (`open_file_limit.rs`).
@@ -147,7 +140,7 @@ tonic.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 
 [features]
-adbc = ["dep:connector-adbc", "runtime/adbc"]
+adbc = ["dep:connector-adbc", "dep:connector-duckdb", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 # Builds jemalloc with `--enable-prof`, without which `_RJEM_MALLOC_CONF=prof:true`
 # is silently ignored. Reports as `jemalloc-profiling`, not `jemalloc`.
@@ -168,7 +161,6 @@ databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
     "adbc",
-    "duckdb",
     "postgres",
     "sqlite",
     "mysql",
@@ -194,7 +186,6 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "turso",
     "smb",
     "models",
     "aws-secrets-manager",
@@ -205,7 +196,6 @@ delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
 elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
-duckdb = ["accelerator-duckdb", "connector-duckdb", "runtime/duckdb"]
 dynamodb = ["connector-dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
@@ -247,7 +237,6 @@ spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 spicebench = ["runtime/spicebench"]
 sqlite = ["accelerator-sqlite", "runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
-turso = ["accelerator-turso", "runtime/turso"]
 vortex = ["runtime/vortex"]
 
 [lints]

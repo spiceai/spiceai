@@ -1,0 +1,63 @@
+---
+source: crates/gemini-chat/src/tests.rs
+expression: "pretty(&Value::Array(items))"
+---
+[
+  {
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "text": "Reading both."
+            }
+          ],
+          "role": "model"
+        },
+        "index": 0
+      }
+    ],
+    "modelVersion": "gpt",
+    "responseId": "<responseId>"
+  },
+  {
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "functionCall": {
+                "args": {
+                  "path": "a.rs"
+                },
+                "id": "call_1",
+                "name": "read_file"
+              }
+            },
+            {
+              "functionCall": {
+                "args": {
+                  "path": "b.rs"
+                },
+                "id": "call_2",
+                "name": "read_file"
+              }
+            }
+          ],
+          "role": "model"
+        },
+        "finishReason": "STOP",
+        "index": 0
+      }
+    ],
+    "modelVersion": "gpt",
+    "responseId": "<responseId>",
+    "usageMetadata": {
+      "cachedContentTokenCount": 100,
+      "candidatesTokenCount": 18,
+      "promptTokenCount": 120,
+      "thoughtsTokenCount": 12,
+      "totalTokenCount": 150
+    }
+  }
+]

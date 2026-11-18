@@ -34,10 +34,10 @@ on:
         type: string
         default: '.'
 
+# Each job that needs more declares it: build-image (packages, id-token, for the
+# spiced_docker_dev call) and dispatch-cluster-bench (actions).
 permissions:
   contents: read
-  packages: write    # workflow_call into spiced_docker_dev needs write
-  actions: write     # workflow_dispatch API needs this
 
 concurrency:
   # One cluster-bench dispatch at a time; the cluster benches themselves are
@@ -51,6 +51,7 @@ jobs:
   #    runs on the same commit reuse the previously-built image.
   # ---------------------------------------------------------------------------
   resolve-image:
+    environment: secret-free
     name: Resolve spiced image tag
     runs-on: ubuntu-24.04
     outputs:
@@ -106,6 +107,10 @@ jobs:
     name: Build spiced image (commit-pinned)
     needs: resolve-image
     if: needs.resolve-image.outputs.need_build == 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     uses: ./.github/workflows/spiced_docker_dev.yml
     with:
       tag: ${{ needs.resolve-image.outputs.image_tag }}
@@ -119,6 +124,10 @@ jobs:
   #    Spice Cloud clustered app.
   # ---------------------------------------------------------------------------
   dispatch-cluster-bench:
+    environment: secret-free
+    permissions:
+      contents: read
+      actions: write  # POST .../actions/workflows/testoperator_run_cluster_bench.yml/dispatches
     name: Dispatch cluster benchmarks
     needs: [resolve-image, build-image]
     if: |

@@ -205,7 +205,6 @@ fn make_dataset(source: &std::path::Path, data_path: &std::path::Path) -> Datase
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result<(), anyhow::Error>
 {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
@@ -278,7 +277,6 @@ async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result
 /// Its file-mode twin above is the control — it must keep passing unchanged, which
 /// is what says the shared durable path was not disturbed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_memory_mode_applies_retention_sql() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -390,7 +388,6 @@ const NULL_ROWS: [(i64, Option<i64>); 6] = [
 /// definitively; it is also the direction that fails silently, since a retention pass
 /// that deleted the NULLs would still leave a table with no row below the floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_memory_mode_retention_sql_keeps_a_null_the_predicate_cannot_evaluate()
 -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
@@ -483,7 +480,6 @@ async fn cayenne_memory_mode_retention_sql_keeps_a_null_the_predicate_cannot_eva
 /// took from. The bypass is only correct if the filtered arm empties the tier on its own,
 /// and that is a claim about `is_delete_all`-shaped input that no other test makes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_memory_mode_retention_sql_matching_every_row_empties_the_tier()
 -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));

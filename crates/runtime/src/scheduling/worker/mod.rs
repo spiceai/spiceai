@@ -53,9 +53,13 @@ impl ScheduledTask for WorkerPromptTask {
             let prompt = Arc::clone(&self.prompt);
             let runtime = Arc::clone(&self.runtime);
 
-            let workers_lock = Arc::clone(&runtime.workers);
-            let workers = workers_lock.read().await;
-            let Some(worker) = workers.get(&worker_name.to_string()) else {
+            let Some(worker) = runtime
+                .workers
+                .read()
+                .await
+                .get(worker_name.as_ref())
+                .cloned()
+            else {
                 tracing::debug!("Worker not found for ScheduledTask: {worker_name}");
                 return Ok(());
             };
@@ -64,7 +68,7 @@ impl ScheduledTask for WorkerPromptTask {
                 "Executing worker prompt task for worker: {worker_name}, prompt: {prompt}",
             );
 
-            let Some(model) = Arc::clone(worker).as_model() else {
+            let Some(model) = worker.as_model() else {
                 tracing::debug!(
                     "Worker is not a model worker, skipping prompt execution: {worker_name}",
                 );
@@ -136,10 +140,7 @@ impl ScheduledTask for WorkerSqlTask {
                 return Ok(());
             }
 
-            let workers_lock = Arc::clone(&runtime.workers);
-            let workers = workers_lock.read().await;
-            // we don't actually need the worker, but validate that it still exists
-            if !workers.contains_key(&worker_name.to_string()) {
+            if !runtime.workers.read().await.contains_key(worker_name.as_ref()) {
                 tracing::debug!("Worker not found for ScheduledTask: {worker_name}");
                 return Ok(());
             }

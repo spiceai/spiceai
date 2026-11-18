@@ -229,7 +229,7 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
 /// - Catalog changes propagate to all cluster nodes
 #[tokio::test]
 async fn test_ballista_cluster_tls_config() -> Result<(), anyhow::Error> {
-    use runtime::config::{ClusterConfig, ClusterRole};
+    use runtime::config::{ClusterConfig, Role};
 
     let _tracing = init_tracing(Some("integration=debug,info"));
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -249,23 +249,23 @@ async fn test_ballista_cluster_tls_config() -> Result<(), anyhow::Error> {
 
             // Build a cluster config with TLS enabled (scheduler role)
             let scheduler_config = ClusterConfig {
-                role: Some(ClusterRole::Scheduler),
+                role: Some(Role::Scheduler),
                 ..Default::default()
             };
 
             // Verify scheduler config is valid
-            assert_eq!(scheduler_config.role, Some(ClusterRole::Scheduler));
+            assert_eq!(scheduler_config.role, Some(Role::Scheduler));
             tracing::info!("✅ Scheduler cluster config validated");
 
             // Build a cluster config for executor role
             let executor_config = ClusterConfig {
-                role: Some(ClusterRole::Executor),
+                role: Some(Role::Executor),
                 scheduler_address: Some("https://localhost:50051".to_string()),
                 ..Default::default()
             };
 
             // Verify executor config is valid
-            assert_eq!(executor_config.role, Some(ClusterRole::Executor));
+            assert_eq!(executor_config.role, Some(Role::Executor));
             assert_eq!(
                 executor_config.scheduler_address,
                 Some("https://localhost:50051".to_string())

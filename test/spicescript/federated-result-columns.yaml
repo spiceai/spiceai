@@ -1,0 +1,50 @@
+name: federated-result-columns
+description: >
+  Federated result columns keep their planned types and nullability by position,
+  including repeated names on the nullable side of an outer join, over
+  PostgreSQL, MySQL, DuckDB and DuckLake. The duckdb connector uses ADBC read-only.
+sources:
+  src: { kind: '${matrix.src}' }
+matrix:
+  src: [postgres, mysql, duckdb, ducklake]
+variants:
+  default: federated
+  # duckdb: now exercises ADBC read-only alongside oracle: src. Direct adbc:
+  # takes the write lock; PostgreSQL-mirror scripts retain that variant.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: federated-result-columns
+  datasets:
+    - { from: '${matrix.src}:t', name: t, params: '${sources.src.params}' }
+    - { from: '${matrix.src}:u', name: u, params: '${sources.src.params}' }
+defaults:
+  expect: { oracle: src }
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id INT NOT NULL PRIMARY KEY, d DECIMAL(8, 2));
+        CREATE TABLE u (id INT NOT NULL PRIMARY KEY, t_id INT, d DECIMAL(18, 6));
+        INSERT INTO t VALUES (1, 12.34), (2, NULL), (3, -56.78);
+        INSERT INTO u VALUES (10, 1, 12345678901.123456), (11, 1, NULL), (12, 99, -98765432109.654321);
+    when: { src: [postgres, mysql, duckdb] }
+  # DuckLake tables have no primary keys.
+  - source-exec:
+      src: |
+        CREATE TABLE t (id INT NOT NULL, d DECIMAL(8, 2));
+        CREATE TABLE u (id INT NOT NULL, t_id INT, d DECIMAL(18, 6));
+        INSERT INTO t VALUES (1, 12.34), (2, NULL), (3, -56.78);
+        INSERT INTO u VALUES (10, 1, 12345678901.123456), (11, 1, NULL), (12, 99, -98765432109.654321);
+    when: { src: ducklake }
+  - start: {}
+  - query: SELECT t.id AS tid, u.id AS uid FROM t LEFT JOIN u ON t.id = u.t_id
+  - query: SELECT t.id, u.id FROM t LEFT JOIN u ON t.id = u.t_id
+  - query: SELECT t.id, u.id FROM t RIGHT JOIN u ON t.id = u.t_id
+  - query: SELECT t.d, u.d FROM t LEFT JOIN u ON t.id = u.t_id
+  - query: SELECT (SELECT max(id) FROM t)
+    oracle-sql: SELECT max(id) AS "max(t.id)" FROM t
+  - query: SELECT q."max(t.id)" AS result FROM (SELECT (SELECT max(id) FROM t)) q
+    oracle-sql: SELECT max(id) AS result FROM t
+  - query: SELECT q."max(t.id)" + 1 AS result FROM (SELECT (SELECT max(id) FROM t)) q
+    oracle-sql: SELECT max(id) + 1 AS result FROM t

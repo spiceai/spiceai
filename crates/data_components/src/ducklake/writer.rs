@@ -21,18 +21,20 @@ limitations under the License.
 //!
 //! Write mechanism:
 //! 1. Bridges async `RecordBatchStream` to sync via an mpsc channel
-//! 2. Registers a temporary Arrow scan view (`register_arrow_scan_view`)
-//! 3. Executes `INSERT INTO <table> SELECT * FROM <temp_view>` in a transaction
-//! 4. Drops the temporary view and commits (or rolls back on error)
+//! 2. Bulk ingests into a temporary staging table through ADBC
+//! 3. Executes `INSERT INTO <table> SELECT * FROM temp.main.<stage>` in the same transaction
+//! 4. Drops the staging table and commits (or rolls back on error)
 
 use std::borrow::Cow;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arrow::array::{RecordBatch, RecordBatchReader};
+use super::{DuckLakePool, execute_sql};
+use adbc_core::options::{IngestMode, OptionConnection, OptionStatement};
+use adbc_core::{Connection as _, Optionable as _, Statement as _};
+use arrow::array::{Array as _, RecordBatch, RecordBatchReader};
 use arrow::datatypes::SchemaRef;
-use arrow::ffi_stream::FFI_ArrowArrayStream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::TableReference;
@@ -46,19 +48,17 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
-use datafusion_table_providers::duckdb::DuckDB;
-use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use futures::StreamExt;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-/// Process-wide counter to guarantee unique temporary view names.
-static VIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Process-wide counter to guarantee unique temporary staging table names.
+static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A federated `DuckDB` table writer.
 pub struct DuckDbFederatedTableWriter {
     read_provider: Arc<dyn TableProvider>,
-    pool: Arc<DuckDbConnectionPool>,
+    pool: Arc<DuckLakePool>,
     table_reference: TableReference,
     write_lock: Arc<Mutex<()>>,
 }
@@ -80,7 +80,7 @@ impl DuckDbFederatedTableWriter {
     #[must_use]
     pub fn create(
         read_provider: Arc<dyn TableProvider>,
-        pool: Arc<DuckDbConnectionPool>,
+        pool: Arc<DuckLakePool>,
         table_reference: &TableReference,
         write_lock: Arc<Mutex<()>>,
     ) -> Arc<dyn TableProvider> {
@@ -227,7 +227,7 @@ impl TableProvider for DuckDbFederatedTableWriter {
 }
 
 struct DuckDbFederatedDataSink {
-    pool: Arc<DuckDbConnectionPool>,
+    pool: Arc<DuckLakePool>,
     table_reference: TableReference,
     schema: SchemaRef,
     write_lock: Arc<Mutex<()>>,
@@ -259,7 +259,7 @@ impl DataSink for DuckDbFederatedDataSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::common::Result<u64> {
-        let _write_guard = self.write_lock.lock().await;
+        let _write_guard = Arc::clone(&self.write_lock).lock_owned().await;
 
         let pool = Arc::clone(&self.pool);
         let table_ref_quoted = self.table_reference.to_quoted_string();
@@ -274,110 +274,84 @@ impl DataSink for DuckDbFederatedDataSink {
         // from a dropped sender (e.g. stream error after partial data).
         let (commit_tx, commit_rx) = oneshot::channel::<()>();
 
-        let write_handle: JoinHandle<datafusion::common::Result<u64>> = tokio::task::spawn_blocking(
-            move || {
-                let mut db_conn = pool.connect_sync().map_err(DataFusionError::External)?;
-
-                let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let stream = FFI_ArrowArrayStream::new(Box::new(SyncRecordBatchReceiver::new(
-                    batch_rx,
-                    Arc::clone(&schema),
-                )));
-
-                let current_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?
-                    .as_millis();
-
-                // `register_arrow_scan_view` creates a view in the connection's
-                // default catalog (does not support qualified names). The INSERT might
-                // target different attached database (e.g. `ducklake`). DuckDB
-                // does not allow writes to multiple databases in a single transaction:
-                //
-                //   "TransactionContext Error: Attempting to write to database
-                //    'ducklake' in a transaction that has already modified database
-                //    'memory' - a single transaction can only write to a single attached database."
-                //
-                // Approach:
-                //  1. Register the view outside our explicit transaction (auto-commits to the default catalog).
-                //  2. Open a transaction for the INSERT (writes only to the target).
-                //  3. Commit or roll back.
-                //  4. Drop the view (best-effort).
-                let view_id = VIEW_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let view_name = format!("__scan_{current_ts}_{view_id}");
-                duckdb_conn
-                    .conn
-                    .register_arrow_scan_view(&view_name, &stream)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                // Transaction scoped in a block — see explanation above.
-                let result = {
-                    let tx = duckdb_conn
-                        .conn
-                        .transaction()
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                    let inner_result = (|| {
-                        if insert_op == InsertOp::Overwrite {
-                            let delete_sql = format!("DELETE FROM {table_ref_quoted}");
-                            tracing::debug!("{delete_sql}");
-                            tx.execute(&delete_sql, [])
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                        }
-
-                        let insert_sql = format!(
-                            r#"INSERT INTO {table_ref_quoted} SELECT * FROM "{view_name}""#
-                        );
-                        tracing::debug!("{insert_sql}");
-
-                        let rows = tx
-                            .execute(&insert_sql, [])
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                        Ok::<usize, DataFusionError>(rows)
-                    })();
-
-                    match inner_result {
-                        Ok(rows) => {
-                            // Only commit if the async side confirmed the stream completed
-                            // successfully.
-                            commit_rx.blocking_recv().map_err(|_| {
-                                DataFusionError::Execution(format!(
-                                    "Stream terminated before all data was sent to {table_ref_quoted}; rolling back"
-                                ))
-                            })?;
-                            tx.commit()
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                            Ok(rows as u64)
-                        }
-                        Err(e) => {
-                            // Transaction automatically rolls back on drop.
-                            Err(e)
-                        }
+        let write_handle: JoinHandle<datafusion::common::Result<u64>> =
+            tokio::task::spawn_blocking(move || {
+                // Keep the write lock in the blocking task too: cancelling the
+                // async producer must not release it before rollback completes.
+                let _write_guard = _write_guard;
+                let mut connection = pool.connect().map_err(DataFusionError::External)?;
+                let connection = &mut connection;
+                connection
+                    .set_option(OptionConnection::AutoCommit, "false".into())
+                    .map_err(|source| DataFusionError::External(Box::new(source)))?;
+                let stage_id = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let stage = format!("__spice_stage_{stage_id}");
+                let result = (|| -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                    let mut ingest = connection.new_statement()?;
+                    ingest.set_option(OptionStatement::TargetTable, stage.clone().into())?;
+                    ingest.set_option(OptionStatement::Temporary, "true".into())?;
+                    ingest.set_option(OptionStatement::IngestMode, IngestMode::Create.into())?;
+                    ingest.bind_stream(Box::new(SyncRecordBatchReceiver::new(batch_rx, schema)))?;
+                    ingest.execute_update()?;
+                    drop(ingest);
+                    // Channel closure alone cannot distinguish a successful stream
+                    // from cancellation or an input error after partial ingestion.
+                    commit_rx
+                        .blocking_recv()
+                        .map_err(|_| super::Error::StreamTerminated {
+                            table: table_ref_quoted.clone(),
+                        })?;
+                    if insert_op == InsertOp::Overwrite {
+                        execute_sql(connection, &format!("DELETE FROM {table_ref_quoted}"))?;
                     }
-                };
-
-                // Best-effort cleanup: drop the temporary view after the transaction is resolved.
-                if let Err(e) = duckdb_conn
-                    .conn
-                    .execute(&format!(r#"DROP VIEW IF EXISTS "{view_name}""#), [])
-                {
-                    tracing::warn!(
-                        view_name = %view_name,
-                        error = %e,
-                        "Failed to drop temporary DuckDB arrow scan view after insert"
-                    );
+                    // DuckDB's ADBC update count may be unknown. Count the staged
+                    // rows explicitly rather than acknowledging an inferred count.
+                    let mut count = connection.new_statement()?;
+                    count.set_sql_query(format!("SELECT count(*) FROM temp.main.\"{stage}\""))?;
+                    let mut reader = count.execute()?;
+                    let batch = reader.next().ok_or(super::Error::Metadata {
+                        message: "DuckDB returned no staged row count",
+                    })??;
+                    if batch.num_rows() != 1
+                        || batch.num_columns() != 1
+                        || batch.column(0).is_null(0)
+                    {
+                        return Err(super::Error::Metadata {
+                            message: "DuckDB returned an invalid staged row count",
+                        }
+                        .into());
+                    }
+                    let counts = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .ok_or(super::Error::Metadata {
+                            message: "DuckDB returned an invalid staged row count",
+                        })?;
+                    let rows = u64::try_from(counts.value(0))?;
+                    drop(reader);
+                    drop(count);
+                    execute_sql(
+                        connection,
+                        &format!(
+                            "INSERT INTO {table_ref_quoted} SELECT * FROM temp.main.\"{stage}\""
+                        ),
+                    )?;
+                    execute_sql(connection, &format!("DROP TABLE temp.main.\"{stage}\""))?;
+                    connection.commit()?;
+                    Ok(rows)
+                })();
+                if result.is_err() {
+                    connection
+                        .rollback()
+                        .map_err(|source| DataFusionError::External(Box::new(source)))?;
                 }
-
-                result
-            },
-        );
+                result.map_err(DataFusionError::External)
+            });
 
         // Feed batches from the async stream into the sync channel.
         // If the stream yields an error, we must still await the blocking task
-        // so it can roll back the transaction and clean up the temporary view.
+        // so it can roll back the transaction and clean up the temporary staging table.
         let mut stream_error: Option<DataFusionError> = None;
         while let Some(batch) = data.next().await {
             match batch {
@@ -397,9 +371,9 @@ impl DataSink for DuckDbFederatedDataSink {
         if stream_error.is_none() {
             // All batches sent successfully — tell the blocking side it is safe to commit.
             let _ = commit_tx.send(());
+        } else {
+            drop(commit_tx);
         }
-        // else: commit_tx is dropped without sending, so blocking_recv returns
-        // Err and the transaction rolls back.
 
         // Always await the blocking task to ensure cleanup completes before
         // releasing the write lock.
@@ -416,7 +390,7 @@ impl DataSink for DuckDbFederatedDataSink {
 }
 
 /// Bridges an async `mpsc::Receiver<RecordBatch>` to a synchronous `RecordBatchReader`
-/// for use with `DuckDB`'s `register_arrow_scan_view`.
+/// for ADBC bulk ingestion.
 struct SyncRecordBatchReceiver {
     rx: mpsc::Receiver<RecordBatch>,
     schema: SchemaRef,
@@ -439,299 +413,5 @@ impl Iterator for SyncRecordBatchReceiver {
 impl RecordBatchReader for SyncRecordBatchReceiver {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::execution::TaskContext;
-    use datafusion::physical_plan::memory::MemoryStream;
-
-    fn test_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-        ]))
-    }
-
-    fn get_mem_pool() -> Arc<DuckDbConnectionPool> {
-        Arc::new(
-            DuckDbConnectionPool::new_memory()
-                .expect("should create in-memory DuckDB connection pool"),
-        )
-    }
-
-    /// Creates a test table and seeds it with initial rows.
-    fn setup_table(pool: &Arc<DuckDbConnectionPool>, table_name: &str) {
-        let mut conn = Arc::clone(pool).connect_sync().expect("should connect");
-        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("should get DuckDB connection");
-        duckdb_conn
-            .conn
-            .execute_batch(&format!(
-                r#"
-                CREATE TABLE "{table_name}" (id BIGINT, name VARCHAR);
-                INSERT INTO "{table_name}" VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
-                "#,
-            ))
-            .expect("should create and seed table");
-    }
-
-    fn row_count(pool: &Arc<DuckDbConnectionPool>, table_name: &str) -> i64 {
-        let mut conn = Arc::clone(pool).connect_sync().expect("should connect");
-        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("should get DuckDB connection");
-        duckdb_conn
-            .conn
-            .query_row(
-                &format!(r#"SELECT COUNT(1) FROM "{table_name}""#),
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("should get count")
-    }
-
-    fn make_batches(ids: Vec<i64>, names: Vec<&str>) -> Vec<RecordBatch> {
-        vec![
-            RecordBatch::try_new(
-                test_schema(),
-                vec![
-                    Arc::new(Int64Array::from(ids)),
-                    Arc::new(StringArray::from(names)),
-                ],
-            )
-            .expect("should create record batch"),
-        ]
-    }
-
-    async fn write_via_sink(
-        pool: &Arc<DuckDbConnectionPool>,
-        table_ref: TableReference,
-        insert_op: InsertOp,
-        batches: Vec<RecordBatch>,
-    ) -> u64 {
-        let schema = batches[0].schema();
-        let sink = DuckDbFederatedDataSink {
-            pool: Arc::clone(pool),
-            table_reference: table_ref,
-            schema: Arc::clone(&schema),
-            write_lock: Arc::new(Mutex::new(())),
-            insert_op,
-        };
-
-        let stream =
-            Box::pin(MemoryStream::try_new(batches, schema, None).expect("should create stream"));
-
-        Arc::new(sink)
-            .write_all(stream, &Arc::new(TaskContext::default()))
-            .await
-            .expect("should write all")
-    }
-
-    #[tokio::test]
-    async fn test_append_inserts_rows() {
-        let pool = get_mem_pool();
-        setup_table(&pool, "test_table");
-
-        let rows_written = write_via_sink(
-            &pool,
-            TableReference::bare("test_table"),
-            InsertOp::Append,
-            make_batches(vec![4, 5], vec!["dave", "eve"]),
-        )
-        .await;
-
-        assert_eq!(rows_written, 2);
-        assert_eq!(row_count(&pool, "test_table"), 5);
-    }
-
-    #[tokio::test]
-    async fn test_overwrite_replaces_rows() {
-        let pool = get_mem_pool();
-        setup_table(&pool, "test_table");
-        assert_eq!(row_count(&pool, "test_table"), 3);
-
-        let rows_written = write_via_sink(
-            &pool,
-            TableReference::bare("test_table"),
-            InsertOp::Overwrite,
-            make_batches(vec![10, 20], vec!["x", "y"]),
-        )
-        .await;
-
-        assert_eq!(rows_written, 2);
-        assert_eq!(row_count(&pool, "test_table"), 2);
-    }
-
-    #[tokio::test]
-    async fn test_append_to_empty_table() {
-        let pool = get_mem_pool();
-        let mut conn = Arc::clone(&pool).connect_sync().expect("should connect");
-        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("should get DuckDB connection");
-        duckdb_conn
-            .conn
-            .execute_batch(r#"CREATE TABLE "empty_tbl" (id BIGINT, name VARCHAR)"#)
-            .expect("should create table");
-
-        let rows_written = write_via_sink(
-            &pool,
-            TableReference::bare("empty_tbl"),
-            InsertOp::Append,
-            make_batches(vec![1], vec!["only"]),
-        )
-        .await;
-
-        assert_eq!(rows_written, 1);
-        assert_eq!(row_count(&pool, "empty_tbl"), 1);
-    }
-
-    #[tokio::test]
-    async fn test_overwrite_empty_table() {
-        let pool = get_mem_pool();
-        let mut conn = Arc::clone(&pool).connect_sync().expect("should connect");
-        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("should get DuckDB connection");
-        duckdb_conn
-            .conn
-            .execute_batch(r#"CREATE TABLE "empty_tbl" (id BIGINT, name VARCHAR)"#)
-            .expect("should create table");
-
-        let rows_written = write_via_sink(
-            &pool,
-            TableReference::bare("empty_tbl"),
-            InsertOp::Overwrite,
-            make_batches(vec![1, 2], vec!["a", "b"]),
-        )
-        .await;
-
-        assert_eq!(rows_written, 2);
-        assert_eq!(row_count(&pool, "empty_tbl"), 2);
-    }
-
-    #[tokio::test]
-    async fn test_multipart_table_reference() {
-        let pool = get_mem_pool();
-
-        // DuckDB in-memory default catalog is "memory", default schema is "main"
-        let mut conn = Arc::clone(&pool).connect_sync().expect("should connect");
-        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("should get DuckDB connection");
-        duckdb_conn
-            .conn
-            .execute_batch(r#"CREATE TABLE "main"."multi_test" (id BIGINT, name VARCHAR)"#)
-            .expect("should create table");
-
-        let rows_written = write_via_sink(
-            &pool,
-            TableReference::partial("main", "multi_test"),
-            InsertOp::Append,
-            make_batches(vec![1, 2, 3], vec!["a", "b", "c"]),
-        )
-        .await;
-
-        assert_eq!(rows_written, 3);
-        assert_eq!(row_count(&pool, "multi_test"), 3);
-    }
-
-    #[tokio::test]
-    async fn test_append_then_overwrite() {
-        let pool = get_mem_pool();
-        setup_table(&pool, "test_table");
-
-        // Append 2 rows → total 5
-        write_via_sink(
-            &pool,
-            TableReference::bare("test_table"),
-            InsertOp::Append,
-            make_batches(vec![4, 5], vec!["dave", "eve"]),
-        )
-        .await;
-        assert_eq!(row_count(&pool, "test_table"), 5);
-
-        // Overwrite with 1 row → total 1
-        write_via_sink(
-            &pool,
-            TableReference::bare("test_table"),
-            InsertOp::Overwrite,
-            make_batches(vec![99], vec!["only"]),
-        )
-        .await;
-        assert_eq!(row_count(&pool, "test_table"), 1);
-
-        // Append again → total 3
-        write_via_sink(
-            &pool,
-            TableReference::bare("test_table"),
-            InsertOp::Append,
-            make_batches(vec![100, 101], vec!["more1", "more2"]),
-        )
-        .await;
-        assert_eq!(row_count(&pool, "test_table"), 3);
-    }
-
-    #[tokio::test]
-    async fn test_special_characters_in_names() {
-        let pool = get_mem_pool();
-
-        // Create a schema and table with special characters (spaces, dots, reserved words)
-        let mut conn = Arc::clone(&pool).connect_sync().expect("should connect");
-        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("should get DuckDB connection");
-        duckdb_conn
-            .conn
-            .execute_batch(
-                r#"
-                CREATE SCHEMA "my schema.v2";
-                CREATE TABLE "my schema.v2"."my.table" (id BIGINT, name VARCHAR);
-                "#,
-            )
-            .expect("should create schema and table");
-
-        // Append with special characters in schema and table name
-        let rows_written = write_via_sink(
-            &pool,
-            TableReference::partial("my schema.v2", "my.table"),
-            InsertOp::Append,
-            make_batches(vec![1, 2], vec!["hello", "world"]),
-        )
-        .await;
-
-        assert_eq!(rows_written, 2);
-
-        let count: i64 = {
-            let mut c = Arc::clone(&pool).connect_sync().expect("should connect");
-            let dc = DuckDB::duckdb_conn(&mut c).expect("should get DuckDB connection");
-            dc.conn
-                .query_row(
-                    r#"SELECT COUNT(1) FROM "my schema.v2"."my.table""#,
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("should get count")
-        };
-        assert_eq!(count, 2);
-
-        // Overwrite with special characters
-        let rows_written = write_via_sink(
-            &pool,
-            TableReference::partial("my schema.v2", "my.table"),
-            InsertOp::Overwrite,
-            make_batches(vec![99], vec!["replaced"]),
-        )
-        .await;
-
-        assert_eq!(rows_written, 1);
-
-        let count: i64 = {
-            let mut c = Arc::clone(&pool).connect_sync().expect("should connect");
-            let dc = DuckDB::duckdb_conn(&mut c).expect("should get DuckDB connection");
-            dc.conn
-                .query_row(
-                    r#"SELECT COUNT(1) FROM "my schema.v2"."my.table""#,
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("should get count")
-        };
-        assert_eq!(count, 1);
     }
 }

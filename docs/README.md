@@ -95,12 +95,10 @@ The project docs for contributors and community. For user documentation of the S
 ## Examples
 
 - [HTTP Refresh SQL Example](examples/http_refresh_sql_example.md)
-- [Turso Acceleration Example](examples/turso_acceleration_example.md)
 
 ## Feature Notes
 
 - [Databricks Resilience](features/databricks-resilience.md)
-- [DuckDB Index Scan Settings](features/duckdb_index_scan_settings.md)
 - [GCS Connector](features/gcs-connector.md)
 - [Git Connector](features/git-connector.md)
 - [MongoDB Change Streams](features/mongodb-change-streams.md)
@@ -116,7 +114,7 @@ The project docs for contributors and community. For user documentation of the S
 
 ## Release Notes
 
-Release notes are stored in [release_notes](release_notes/). Use the series directories for older releases:
+Release notes are stored in [release_notes](release_notes/). Notes for the current release series are at the top level; earlier series each have a directory:
 
 - [Alpha](release_notes/alpha/)
 - [Beta](release_notes/beta/)
@@ -132,5 +130,8 @@ Release notes are stored in [release_notes](release_notes/). Use the series dire
 - [v1.8](release_notes/v1.8/)
 - [v1.9](release_notes/v1.9/)
 - [v1.10](release_notes/v1.10/)
-
-Recent v1.11 and v2.0 release notes are at the top level of [release_notes](release_notes/).
+- [v1.11](release_notes/v1.11/)
+- [v2.0](release_notes/v2.0/)
+- [v2.1](release_notes/v2.1/)
+- [v2.2](release_notes/v2.2/)
+- [v2.3](release_notes/v2.3/)

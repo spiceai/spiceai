@@ -1,0 +1,75 @@
+name: executor-numeric-literals
+description: >
+  Numeric literals sent to Spice executors retain their Arrow types and values,
+  including Float32, infinities, NaNs and wide decimals.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-literals
+  datasets:
+    - from: postgres:public.e
+      name: e
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+
+defaults:
+  cluster: { executors: 2 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE e (
+          id int PRIMARY KEY, f float8, r float4, d numeric(38, 10), n numeric(38, 0),
+          i8 bigint, i4 int, i2 smallint, s text COLLATE "C", bin bytea, tz timestamptz, ts timestamp, dt date);
+        INSERT INTO e VALUES
+          (1, 'NaN', 'NaN', 0, 0, 9223372036854775807, 2147483647, 32767, '', '\x00',
+           '2024-03-10 01:30:00-08', '1970-01-01 00:00:00', '1970-01-01'),
+          (2, 'Infinity', 'Infinity', 9999999999999999999999999999.9999999999,
+           99999999999999999999999999999999999999, 0, 1, 1, ' ', '\x',
+           '2024-03-10 03:30:00-07', '2024-03-10 02:30:00', '2024-03-10'),
+          (3, '-Infinity', '-Infinity', -9999999999999999999999999999.9999999999,
+           -99999999999999999999999999999999999999, -9223372036854775808, -2147483648, -32768,
+           '日本語', '\x00ff00', '1969-12-31 23:59:59.999999+00', '1970-01-01 00:00:00.000001', '1969-12-31'),
+          (4, '-0', '-0', 0.0000000001, 1, -1, -1, -1, '😀 emoji', '\xdeadbeef',
+           '2024-11-03 01:30:00-07', '2024-11-03 01:30:00.5', '2024-11-03'),
+          (5, '0', '0', -0.0000000001, -1, 1, 0, 0, 'naïve', '\x0a0d',
+           '2024-11-03 01:30:00-08', '2000-02-29 12:00:00.000001', '2000-02-29'),
+          (6, 1e308, 3.4e38, 12345678901234567890.1234567890, 12345678901234567890123456789012345678,
+           9223372036854775807, 2147483647, 100, e'tab\there', '\x7f',
+           '1900-01-01 00:00:00+00', '1999-12-31 23:59:59', '1900-01-01'),
+          (7, 5e-324, 1e-45, 0.5, 5, 7, 7, 7, e'line\nbreak', '\x80',
+           '2038-01-19 03:14:08+00', '2038-01-19 03:14:08', '2038-01-19'),
+          (8, 2.2250738585072014e-308, 1.17549435e-38, 1.5, 15, 8, 8, 8, repeat('xyz', 4000), decode(repeat('ab', 5000), 'hex'),
+           '2100-12-31 23:59:59.999999+00', '2100-12-31 23:59:59.999999', '2100-12-31'),
+          (9, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+          (10, 0.30000000000000004, 0.1, 2.5, 25, 10, 10, 10, e'a''b"c\\d_e', '\x5c',
+           '2024-06-30 23:59:59+14', '2024-06-30 23:59:59', '2024-06-30'),
+          (11, 'NaN', 1, 2.5, 18446744073709551615, 11, 11, 11, 'naïve', '\x00',
+           '2024-03-10 10:00:00+00', '2024-03-10 10:00:00', '2024-03-10');
+  - start: { ready: false }
+  - query: SELECT count(*) AS n FROM e
+    eventually: 60s
+  - query: SELECT id FROM e WHERE r = CAST('0.1' AS REAL) ORDER BY id
+  - query: SELECT id FROM e WHERE f = CAST('Infinity' AS DOUBLE PRECISION) ORDER BY id
+  - query: SELECT id FROM e WHERE r <> CAST('0.1' AS REAL) ORDER BY id
+  - query: SELECT id FROM e WHERE d = CAST('9999999999999999999999999999.9999999999' AS DECIMAL(38, 10)) ORDER BY id
+  - query: SELECT id FROM e WHERE n = CAST('25' AS DECIMAL(38, 0)) ORDER BY id
+  - query: SELECT id FROM e WHERE f = CAST('NaN' AS DOUBLE PRECISION) ORDER BY id
+  - query: SELECT id FROM e WHERE f <> CAST('NaN' AS DOUBLE PRECISION) ORDER BY id
+  - query: SELECT sum(CASE WHEN r = CAST('0.1' AS REAL) THEN 1 ELSE 0 END) AS n FROM e
+  - query: SELECT sum(CASE WHEN f = CAST('Infinity' AS DOUBLE PRECISION) THEN 1 ELSE 0 END) AS n FROM e
+  - query: SELECT sum(r + CAST('0.1' AS REAL)) > CAST('0.200000002' AS DOUBLE PRECISION) AS precise FROM e WHERE id = 10
+  - query: SELECT sum(arrow_cast(n, 'UInt64')) AS n FROM e WHERE id = 11
+    expect: { rows: [['18446744073709551615']] }
+  - explain: SELECT sum(r + CAST('0.1' AS REAL)) > CAST('0.200000002' AS DOUBLE PRECISION) AS precise FROM e WHERE id = 10
+    contains: [PartialAggregationFlightSqlExec, "arrow_cast('0.1', 'Float32')"]
+  - query: SELECT id FROM e WHERE arrow_cast(n, 'Decimal128(38, -2)') = arrow_cast(0, 'Decimal128(38, -2)') ORDER BY id
+    expect: { rows: [['1'], ['4'], ['5'], ['7'], ['8'], ['10']] }
+  - explain: SELECT id FROM e WHERE arrow_cast(n, 'Decimal128(38, -2)') = arrow_cast(0, 'Decimal128(38, -2)') ORDER BY id
+    contains: [FilterExec, FlightSqlExec]

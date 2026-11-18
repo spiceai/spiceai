@@ -286,7 +286,8 @@ def score_create(path: str) -> list[dict]:
     checks.append(
         expectation(
             "Opening paragraph says this is a patch release",
-            re.search(r"\bpatch release\b", lead, re.IGNORECASE) is not None,
+            re.search(r"\bpatch (?:and hardening )?release\b", lead, re.IGNORECASE)
+            is not None,
             f"opening: {lead[:160]!r}",
         )
     )

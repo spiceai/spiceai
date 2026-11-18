@@ -243,7 +243,7 @@ mod tests {
             { "name": "b", "acceleration": { "engine": "cayenne" } },
         ]});
         let variant: VariantSpec = serde_json::from_value(json!({ "datasets": {
-            "*": { "acceleration": { "params": { "cayenne_metastore": "turso" } } },
+            "*": { "acceleration": { "params": { "cayenne_deletion_mode": "key" } } },
             "a": { "acceleration": { "params": { "x": null } } },
         }}))
         .expect("variant");
@@ -251,8 +251,8 @@ mod tests {
         assert_eq!(
             pod,
             json!({ "datasets": [
-                { "name": "a", "acceleration": { "engine": "cayenne", "params": { "cayenne_metastore": "turso" } } },
-                { "name": "b", "acceleration": { "engine": "cayenne", "params": { "cayenne_metastore": "turso" } } },
+                { "name": "a", "acceleration": { "engine": "cayenne", "params": { "cayenne_deletion_mode": "key" } } },
+                { "name": "b", "acceleration": { "engine": "cayenne", "params": { "cayenne_deletion_mode": "key" } } },
             ]})
         );
         let bad: VariantSpec =

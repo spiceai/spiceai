@@ -1,5 +1,3 @@
 {
-  "clickhouse-decimals": 63,
-  "clickhouse-federation": 8,
-  "clickhouse-tpch": 47
+  "clickhouse-decimals": 63
 }

@@ -23,12 +23,14 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::datafusion::flight_session_extension::FlightSessionExtension;
 use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     flight_service_server::FlightService,
     sql::{self, ProstMessageExt},
 };
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::from_substrait_plan_with_consumer;
@@ -79,7 +81,7 @@ fn decode_plan_proto(cmd: &sql::CommandStatementSubstraitPlan) -> Result<(Plan, 
 async fn decode_plan(
     cmd: &sql::CommandStatementSubstraitPlan,
     datafusion: &Arc<DataFusion>,
-) -> Result<(LogicalPlan, String), Status> {
+) -> Result<(LogicalPlan, String, SessionState), Status> {
     let (proto, cache_key) = decode_plan_proto(cmd)?;
 
     let session = datafusion.ctx.state();
@@ -95,7 +97,23 @@ async fn decode_plan(
         .await
         .map_err(map_substrait_error)?;
 
-    Ok((plan, cache_key))
+    Ok((plan, cache_key, session))
+}
+
+/// Decodes `cmd` for a request. A sessionless request also returns the session
+/// snapshot the plan was decoded against, for execution to reuse; a stateful
+/// Flight request keeps its own session-specific execution settings.
+async fn decode_request(
+    cmd: &sql::CommandStatementSubstraitPlan,
+    context: &RequestContext,
+    datafusion: &Arc<DataFusion>,
+) -> Result<(LogicalPlan, String, Option<SessionState>), Status> {
+    let (plan, cache_key, session) = decode_plan(cmd, datafusion).await?;
+    let session = context
+        .extension::<FlightSessionExtension>()
+        .is_none()
+        .then_some(session);
+    Ok((plan, cache_key, session))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -134,7 +152,7 @@ pub(crate) async fn get_flight_info(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    let (plan, cache_key) = decode_plan(&cmd, &datafusion).await?;
+    let (plan, cache_key, session) = decode_request(&cmd, &context, &datafusion).await?;
 
     let read_only = is_auth_read_only(&context);
     if read_only {
@@ -142,7 +160,9 @@ pub(crate) async fn get_flight_info(
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 
-    let query = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion)).build();
+    let query =
+        QueryBuilder::from_substrait_plan(plan, cache_key, session, Arc::clone(&datafusion))
+            .build();
     let (dataset_schema, _) = query
         .get_schema()
         .await
@@ -174,18 +194,19 @@ pub(crate) async fn do_get(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    let (plan, cache_key) = decode_plan(&cmd, &datafusion).await?;
+    let (plan, cache_key, session) = decode_request(&cmd, &context, &datafusion).await?;
 
     if is_auth_read_only(&context) {
         validate_sql_query_read_only(&plan)
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 
-    let query_result = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
-        .build()
-        .run()
-        .await
-        .map_err(handle_query_error)?;
+    let query_result =
+        QueryBuilder::from_substrait_plan(plan, cache_key, session, Arc::clone(&datafusion))
+            .build()
+            .run()
+            .await
+            .map_err(handle_query_error)?;
 
     let ipc_write_options = Service::ipc_write_options_for_context(&context)?;
     let (output, from_cache) = Service::query_result_to_flight_stream(
@@ -262,7 +283,7 @@ mod tests {
             value: "EUROPE".to_string(),
             length: 25,
         }));
-        let (decoded, _) = decode_plan(
+        let (decoded, _, _) = decode_plan(
             &cmd(Some(SubstraitPlan {
                 plan: Bytes::from(proto.encode_to_vec()),
                 version: "0.62.0".to_string(),
@@ -394,7 +415,7 @@ mod tests {
             Arc::new(LargeStringArray::from(vec!["EUROPE"])) as ArrayRef,
         )])?;
         for (declared, proto) in [("string", as_string), ("varchar", as_varchar)] {
-            let (decoded, _) = decode_plan(
+            let (decoded, _, _) = decode_plan(
                 &cmd(Some(SubstraitPlan {
                     plan: Bytes::from(proto.encode_to_vec()),
                     version: "0.62.0".to_string(),
@@ -508,7 +529,7 @@ mod tests {
         for (sql, expected, names_escape) in queries {
             let plan = df.ctx.sql(sql).await?.into_unoptimized_plan();
             let proto = to_substrait_plan(&plan, &df.ctx.state())?;
-            let (decoded, _) = decode_plan(
+            let (decoded, _, _) = decode_plan(
                 &cmd(Some(SubstraitPlan {
                     plan: Bytes::from(proto.encode_to_vec()),
                     version: "0.63.0".to_string(),

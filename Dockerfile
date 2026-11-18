@@ -1,12 +1,12 @@
-#syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.98.1
-FROM rust:${RUST_VERSION}-slim-trixie as build
+#syntax=docker/dockerfile:1.2@sha256:e2a8561e419ab1ba6b2fe6cbdf49fd92b95912df1cf7d313c3e2230a333fdbcc
+# Keep the rust tag on the channel in rust-toolchain.toml.
+FROM rust:1.99.1-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7 as build
 
 # cache mounts below may already exist and owned by root
 USER root
 
 RUN apt update \
-    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev clang lld libclang-dev \
+    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev clang lld libclang-dev curl \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 COPY . /build
@@ -41,7 +41,24 @@ RUN \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced && \
     cp "$(find /build/target -name libpdfium.so -print -quit)" /root/libpdfium.so
 
-FROM debian:trixie-slim as sandbox-setup
+# `duckdb:` and `ducklake:` datasets read through the DuckDB library installed
+# on the host, loaded by name at runtime. Keep DUCKDB_VERSION at the newest
+# release test/duckdb_versions.json lists.
+ARG DUCKDB_VERSION=2.0.0
+ARG DUCKDB_SHA256_AMD64=993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1
+ARG DUCKDB_SHA256_ARM64=c60eecf91143ca6bbac55c4f4d40dc22520488b0ac257c86e0fe9a2b451cf2b7
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64|"") duckdb_platform=linux-amd64; duckdb_sha256="${DUCKDB_SHA256_AMD64}" ;; \
+      arm64) duckdb_platform=linux-arm64; duckdb_sha256="${DUCKDB_SHA256_ARM64}" ;; \
+      *) echo "Unsupported TARGETARCH for libduckdb: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fSLo /tmp/libduckdb.tar.gz "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-${duckdb_platform}.tar.gz"; \
+    echo "${duckdb_sha256}  /tmp/libduckdb.tar.gz" | sha256sum -c -; \
+    tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so; \
+    rm -f /tmp/libduckdb.tar.gz
+
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 as sandbox-setup
 
 ARG CARGO_FEATURES
 
@@ -89,6 +106,12 @@ RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' s
 # Copy PDFium's own shared-library dependencies (they are a subset of spiced's,
 # but sweep explicitly since ldd on spiced does not see the dlopen'd PDFium)
 RUN ldd /spice_sandbox/usr/local/bin/libpdfium.so | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
+
+# Copy libduckdb, loaded by name at runtime for `duckdb:` and `ducklake:`, onto
+# the default library path, with its own shared-library dependencies (ldd on
+# spiced does not see it)
+COPY --from=build /root/libduckdb.so /spice_sandbox/usr/lib/libduckdb.so
+RUN ldd /spice_sandbox/usr/lib/libduckdb.so | grep -o '/[^ ]*' | sed 's/[:)]$//' | grep -v '^/spice_sandbox' | sort -u | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
 
 # Copy additional required libraries
 RUN find /lib /usr/lib -name 'libpthread.so.0' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;

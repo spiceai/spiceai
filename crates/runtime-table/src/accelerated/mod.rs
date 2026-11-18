@@ -74,7 +74,10 @@ pub mod caching_eviction;
 mod caching_scan_tests;
 pub mod checkpoint_primary_key;
 pub mod fallback_retention;
-pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
+pub use fallback_retention::{
+    Error as FallbackRetentionKeepError, FallbackRetentionKeep, ensure_no_fallible_implicit_cast,
+};
+pub(crate) mod exact_string_time;
 pub mod federation;
 pub(crate) mod index_rebuild;
 pub mod partition_scope;
@@ -183,6 +186,19 @@ pub enum Error {
         "Manual refresh is not supported for `append` mode. Only `full` refresh mode supports manual refreshes."
     ))]
     ManualRefreshIsNotSupported {},
+
+    #[snafu(display(
+        "Failed to refresh dataset {dataset_name}: a refresh cannot run in refresh_mode '{mode}'. Valid modes are 'full' or 'append'."
+    ))]
+    RefreshModeCannotRun {
+        dataset_name: String,
+        mode: &'static str,
+    },
+
+    #[snafu(display("{source}"))]
+    InvalidRefreshOverrides {
+        source: refresh::InvalidRefreshOverrides,
+    },
 
     #[snafu(display(
         "Failed to reload the partitions this executor serves: the dataset's change stream has stopped."
@@ -564,6 +580,9 @@ pub struct Builder {
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
     node_local: bool,
+    /// Forwards committed append refreshes to the dataset's `DoExchange`
+    /// subscribers.
+    data_update_publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
 }
 
 impl Builder {
@@ -624,6 +643,7 @@ impl Builder {
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
+            data_update_publisher: None,
             fallback_retention_keep: None,
             append_cursor_store: None,
             node_local: false,
@@ -985,6 +1005,17 @@ impl Builder {
         self
     }
 
+    /// Forward each committed append refresh to the dataset's `DoExchange`
+    /// subscribers, so an append stream from this dataset delivers the rows
+    /// its refreshes append.
+    pub fn data_update_publisher(
+        &mut self,
+        publisher: Option<runtime_acceleration::dataupdate::DataUpdatePublisher>,
+    ) -> &mut Self {
+        self.data_update_publisher = publisher;
+        self
+    }
+
     /// Provide per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`. These layer on top of the runtime-global
     /// CDC config only for this dataset's changes stream;
@@ -1262,6 +1293,7 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
+        refresher.with_data_update_publisher(self.data_update_publisher);
 
         // Durable federated write-back (#11838): a WriteBack Cayenne table whose
         // commit path marks dirty keys gets a per-table delivery worker that
@@ -1776,12 +1808,31 @@ impl AcceleratedTable {
         }
     }
 
+    /// Checks one-off refresh overrides against this dataset: the mode must be one an
+    /// on-demand refresh can run, and a `refresh_sql` must parse and select the
+    /// dataset's `time_column`, as the spicepod's `refresh_sql` must at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRefreshOverrides`] describing the first problem found.
+    pub async fn validate_refresh_overrides(&self, overrides: &RefreshOverrides) -> Result<()> {
+        let refresh = self.refresh_params.read().await.clone();
+        overrides
+            .validate_for(&self.dataset_name, &refresh, self.federated.schema())
+            .context(InvalidRefreshOverridesSnafu)
+    }
+
     /// # Errors
     ///
     /// Returns an error if the table has no refresh trigger (it is not configured
     /// for refreshes) or the refresh task has already stopped.
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
         if let Some(refresh_trigger) = self.refresh_trigger() {
+            // Rejected here, before anything is queued, so the caller learns of it: the
+            // worker would otherwise fail the refresh after the request was accepted.
+            if let Some(overrides) = &overrides {
+                self.validate_refresh_overrides(overrides).await?;
+            }
             refresh_trigger
                 .send(overrides)
                 .await
@@ -2287,7 +2338,14 @@ impl AcceleratedTable {
                 let mut batch_write_tx = self.batch_write_tx.clone().ok_or_else(|| {
                     DataFusionError::Internal("batch_write_tx missing in caching mode".to_string())
                 })?;
+                // Neither reads the accelerator before the origin answers, so the
+                // scan is planned only if a failing fetch needs it.
                 let input = if caching::uses_source_first(
+                    filters,
+                    self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
+                ) || caching::passes_through(
                     filters,
                     self.cache_ttl,
                     self.cache_stale_while_revalidate_ttl,
@@ -3267,6 +3325,93 @@ mod tests {
             .refresher()
             .refresh_completion()
             .expect("the table carries a refresh-completion signal")
+    }
+
+    /// The on-demand refresh endpoint, and the CLI's `--refresh-sql` and
+    /// `--refresh-mode`, which post to it, queue a refresh through `trigger_refresh`.
+    /// Overrides it cannot honor are refused there, so the caller gets an error
+    /// instead of a refresh that panics, fails later, or writes rows without a time.
+    #[tokio::test]
+    async fn trigger_refresh_refuses_overrides_it_cannot_honor() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+        ]));
+        let source = Arc::new(
+            data_components::arrow::write::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source table builds"),
+        );
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator table builds"),
+        ) as Arc<dyn TableProvider>;
+        let table = Builder::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("events"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            "mem_table".to_string(),
+            accelerator,
+            refresh::Refresh::new(RefreshMode::Append)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::UnixSeconds),
+            Handle::current(),
+        )
+        .build()
+        .await
+        .expect("accelerated table builds");
+
+        let refused = |overrides: RefreshOverrides| {
+            let table = &table;
+            async move {
+                match table.trigger_refresh(Some(overrides)).await {
+                    Err(Error::InvalidRefreshOverrides { source }) => source.to_string(),
+                    other => panic!("expected the overrides to be refused, got {other:?}"),
+                }
+            }
+        };
+        for mode in [
+            RefreshMode::Changes,
+            RefreshMode::Disabled,
+            RefreshMode::Caching,
+            RefreshMode::Snapshot,
+        ] {
+            let message = refused(RefreshOverrides {
+                sql: None,
+                mode: Some(mode),
+                max_jitter: None,
+            })
+            .await;
+            assert!(
+                message.contains("Valid modes are 'full' or 'append'"),
+                "{message}"
+            );
+        }
+        let message = refused(RefreshOverrides {
+            sql: Some("SELECT id FROM events".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        assert!(
+            message.contains("time_column 'ts' was not found"),
+            "{message}"
+        );
+        let message = refused(RefreshOverrides {
+            sql: Some("SELEC nonsense".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        assert!(message.starts_with("Invalid refresh_sql"), "{message}");
+
+        table
+            .trigger_refresh(Some(RefreshOverrides {
+                sql: Some("SELECT id, ts FROM events".to_string()),
+                mode: Some(RefreshMode::Append),
+                max_jitter: None,
+            }))
+            .await
+            .expect("overrides that select the time column queue a refresh");
     }
 
     /// Regression test for #13086. A cluster scheduler runs no refresh locally,

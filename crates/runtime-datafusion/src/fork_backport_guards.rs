@@ -549,3 +549,662 @@ async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows
         panic!("row {index} is {got}, expected {want}: groups must sort by their sum, descending");
     }
 }
+
+/// An aggregate UDF computing `SUM(v)` over `Int64` that records every `EmitTo`
+/// it is asked for, so a guard can see how an aggregate drains its groups.
+mod emit_probe {
+    use std::sync::{Arc, Mutex};
+
+    use arrow::array::{ArrayRef, BooleanArray, Int64Array};
+    use arrow::datatypes::DataType;
+    use datafusion::common::{Result, not_impl_err};
+    use datafusion::logical_expr::function::AccumulatorArgs;
+    use datafusion::logical_expr::{
+        Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Signature,
+        Volatility,
+    };
+
+    pub(super) type Emits = Arc<Mutex<Vec<EmitTo>>>;
+
+    #[derive(Debug)]
+    struct EmitProbe {
+        signature: Signature,
+        emits: Emits,
+    }
+    impl PartialEq for EmitProbe {
+        fn eq(&self, other: &Self) -> bool {
+            self.signature == other.signature
+        }
+    }
+    impl Eq for EmitProbe {}
+    impl std::hash::Hash for EmitProbe {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.signature.hash(state);
+        }
+    }
+    impl AggregateUDFImpl for EmitProbe {
+        fn name(&self) -> &'static str {
+            "emit_probe"
+        }
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+        fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+            not_impl_err!("emit_probe runs only as a groups accumulator")
+        }
+        fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+            true
+        }
+        fn create_groups_accumulator(
+            &self,
+            _args: AccumulatorArgs,
+        ) -> Result<Box<dyn GroupsAccumulator>> {
+            Ok(Box::new(EmitProbeGroups {
+                sums: Vec::new(),
+                emits: Arc::clone(&self.emits),
+            }))
+        }
+    }
+
+    struct EmitProbeGroups {
+        sums: Vec<i64>,
+        emits: Emits,
+    }
+    impl EmitProbeGroups {
+        fn take(&mut self, emit_to: EmitTo) -> ArrayRef {
+            self.emits
+                .lock()
+                .expect("emit log lock is not poisoned")
+                .push(emit_to);
+            Arc::new(Int64Array::from(emit_to.take_needed(&mut self.sums)))
+        }
+        fn add(&mut self, values: &ArrayRef, group_indices: &[usize], total_num_groups: usize) {
+            self.sums.resize(total_num_groups, 0);
+            let values = values
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("emit_probe takes an Int64 argument");
+            for (&group, value) in group_indices.iter().zip(values.values()) {
+                self.sums[group] += value;
+            }
+        }
+    }
+    impl GroupsAccumulator for EmitProbeGroups {
+        fn update_batch(
+            &mut self,
+            values: &[ArrayRef],
+            group_indices: &[usize],
+            _opt_filter: Option<&BooleanArray>,
+            total_num_groups: usize,
+        ) -> Result<()> {
+            self.add(&values[0], group_indices, total_num_groups);
+            Ok(())
+        }
+        fn merge_batch(
+            &mut self,
+            values: &[ArrayRef],
+            group_indices: &[usize],
+            total_num_groups: usize,
+        ) -> Result<()> {
+            self.add(&values[0], group_indices, total_num_groups);
+            Ok(())
+        }
+        fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+            Ok(self.take(emit_to))
+        }
+        fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+            Ok(vec![self.take(emit_to)])
+        }
+        fn convert_to_state(
+            &self,
+            _values: &[ArrayRef],
+            _opt_filter: Option<&BooleanArray>,
+        ) -> Result<Vec<ArrayRef>> {
+            not_impl_err!("emit_probe does not skip partial aggregation")
+        }
+        fn size(&self) -> usize {
+            self.sums.capacity() * size_of::<i64>()
+        }
+    }
+
+    /// A probe UDF and the log its accumulators append to.
+    pub(super) fn probe() -> (Arc<AggregateUDF>, Emits) {
+        let emits = Emits::default();
+        let udf = Arc::new(AggregateUDF::from(EmitProbe {
+            signature: Signature::exact(vec![DataType::Int64], Volatility::Immutable),
+            emits: Arc::clone(&emits),
+        }));
+        (udf, emits)
+    }
+}
+
+/// `(k, g, probe)` rows of `batches`, sorted.
+fn emitted_groups(batches: &[arrow::array::RecordBatch]) -> Vec<(i32, i32, i64)> {
+    use arrow::array::{Int32Array, Int64Array};
+    let mut got: Vec<(i32, i32, i64)> = batches
+        .iter()
+        .flat_map(|batch| {
+            let column = |index: usize| batch.column(index).as_any();
+            let k = column(0).downcast_ref::<Int32Array>().expect("k is Int32");
+            let g = column(1).downcast_ref::<Int32Array>().expect("g is Int32");
+            let probe = column(2)
+                .downcast_ref::<Int64Array>()
+                .expect("probe is Int64");
+            (0..batch.num_rows())
+                .map(|row| (k.value(row), g.value(row), probe.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    got.sort_unstable();
+    got
+}
+
+const ORDERED_AGGREGATE_BATCH_SIZE: usize = 8;
+const ORDERED_AGGREGATE_GROUPS: usize = 10 * ORDERED_AGGREGATE_BATCH_SIZE;
+
+/// Rows `(k = 2000, g, v = g)` for every group `g`, declared sorted on `k`, and
+/// their schema. The leading group key is a constant, as TPC-DS Q78's `d_year`
+/// is under `d_year = 2000`, so every group is still open at end of input.
+fn ordered_aggregate_input() -> (
+    arrow::datatypes::SchemaRef,
+    std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) {
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("g", DataType::Int32, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let groups = i32::try_from(ORDERED_AGGREGATE_GROUPS).expect("group count fits in i32");
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![2000; ORDERED_AGGREGATE_GROUPS])),
+            Arc::new(Int32Array::from_iter_values(0..groups)),
+            Arc::new(Int64Array::from_iter_values((0..groups).map(i64::from))),
+        ],
+    )
+    .expect("batch matches its schema");
+    let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+        col("k", &schema).expect("k exists"),
+    )])
+    .expect("ordering is not empty");
+    let input = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&schema), None)
+        .expect("memory source builds")
+        .try_with_sort_information(vec![ordering])
+        .expect("input is sorted on k");
+    (schema, DataSourceExec::from_data_source(input))
+}
+
+/// spiceai/datafusion#277, the ordered partial path (upstream from `DataFusion`
+/// 55.3.0 as apache/datafusion#25312). An ordered aggregate must emit the
+/// groups left at end of input with one `EmitTo::All`. Emitting them as
+/// repeated `EmitTo::First(batch_size)` renumbers every group still held, so
+/// the drain costs time quadratic in the group count.
+#[tokio::test]
+async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
+    use std::sync::Arc;
+
+    use arrow::array::RecordBatch;
+    use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::EmitTo;
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::{ExecutionPlan, InputOrderMode, collect};
+
+    let (schema, input) = ordered_aggregate_input();
+    let (probe, emits) = emit_probe::probe();
+    let aggregate = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::new_single(vec![
+            (col("k", &schema).expect("k exists"), "k".to_string()),
+            (col("g", &schema).expect("g exists"), "g".to_string()),
+        ]),
+        vec![Arc::new(
+            AggregateExprBuilder::new(probe, vec![col("v", &schema).expect("v exists")])
+                .schema(Arc::clone(&schema))
+                .alias("probe")
+                .build()
+                .expect("aggregate builds"),
+        )],
+        vec![None],
+        input,
+        Arc::clone(&schema),
+    )
+    .expect("aggregate plans");
+    assert!(
+        matches!(
+            aggregate.input_order_mode(),
+            InputOrderMode::PartiallySorted(_)
+        ),
+        "the guard needs the ordered aggregate path, got {:?}",
+        aggregate.input_order_mode()
+    );
+
+    let config = get_df_default_config().with_batch_size(ORDERED_AGGREGATE_BATCH_SIZE);
+    let task = Arc::new(TaskContext::default().with_session_config(config));
+    let output = collect(Arc::new(aggregate) as Arc<dyn ExecutionPlan>, task)
+        .await
+        .expect("aggregate runs");
+
+    let rows: Vec<usize> = output.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(
+        rows,
+        vec![ORDERED_AGGREGATE_BATCH_SIZE; ORDERED_AGGREGATE_GROUPS / ORDERED_AGGREGATE_BATCH_SIZE]
+    );
+    let groups = i32::try_from(ORDERED_AGGREGATE_GROUPS).expect("group count fits in i32");
+    let expected: Vec<(i32, i32, i64)> = (0..groups).map(|g| (2000, g, i64::from(g))).collect();
+    assert_eq!(
+        emitted_groups(&output),
+        expected,
+        "every group must be emitted once with its sum"
+    );
+    let emits = emits.lock().expect("emit log lock is not poisoned").clone();
+    assert_eq!(
+        emits,
+        vec![EmitTo::All],
+        "the groups left at end of input must be emitted once"
+    );
+}
+
+/// An ordered final aggregate over sorted partial states, holding more groups
+/// than `batch_size` at end of input, returns every group exactly once with its
+/// merged state, in `batch_size` batches. The fork drains this path through
+/// spiceai/datafusion#277's single `EmitTo::All`, so the test checks that the
+/// drain neither drops, repeats nor mis-slices a group.
+#[tokio::test]
+async fn an_ordered_final_aggregate_returns_every_group_once() {
+    use std::sync::Arc;
+
+    use arrow::array::RecordBatch;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::{ExecutionPlan, InputOrderMode, collect};
+
+    let (schema, input) = ordered_aggregate_input();
+    let group_by = PhysicalGroupBy::new_single(vec![
+        (col("k", &schema).expect("k exists"), "k".to_string()),
+        (col("g", &schema).expect("g exists"), "g".to_string()),
+    ]);
+    let aggregate_expr = |probe| {
+        vec![Arc::new(
+            AggregateExprBuilder::new(probe, vec![col("v", &schema).expect("v exists")])
+                .schema(Arc::clone(&schema))
+                .alias("probe")
+                .build()
+                .expect("aggregate builds"),
+        )]
+    };
+    let config = get_df_default_config().with_batch_size(ORDERED_AGGREGATE_BATCH_SIZE);
+    let task = Arc::new(TaskContext::default().with_session_config(config));
+
+    // The partial states, as a sorted input to the final aggregate.
+    let (partial_probe, _) = emit_probe::probe();
+    let partial = AggregateExec::try_new(
+        AggregateMode::Partial,
+        group_by.clone(),
+        aggregate_expr(partial_probe),
+        vec![None],
+        input,
+        Arc::clone(&schema),
+    )
+    .expect("partial aggregate plans");
+    let partial_schema = partial.schema();
+    let states = collect(
+        Arc::new(partial) as Arc<dyn ExecutionPlan>,
+        Arc::clone(&task),
+    )
+    .await
+    .expect("partial aggregate runs");
+    let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+        col("k", &partial_schema).expect("k exists"),
+    )])
+    .expect("ordering is not empty");
+    let states = MemorySourceConfig::try_new(&[states], Arc::clone(&partial_schema), None)
+        .expect("memory source builds")
+        .try_with_sort_information(vec![ordering])
+        .expect("states are sorted on k");
+
+    let (final_probe, _) = emit_probe::probe();
+    let aggregate = AggregateExec::try_new(
+        AggregateMode::Final,
+        group_by.as_final(),
+        aggregate_expr(final_probe),
+        vec![None],
+        DataSourceExec::from_data_source(states),
+        Arc::clone(&schema),
+    )
+    .expect("final aggregate plans");
+    assert!(
+        matches!(
+            aggregate.input_order_mode(),
+            InputOrderMode::PartiallySorted(_)
+        ),
+        "the guard needs the ordered aggregate path, got {:?}",
+        aggregate.input_order_mode()
+    );
+    let output = collect(Arc::new(aggregate) as Arc<dyn ExecutionPlan>, task)
+        .await
+        .expect("final aggregate runs");
+
+    let rows: Vec<usize> = output.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(
+        rows,
+        vec![ORDERED_AGGREGATE_BATCH_SIZE; ORDERED_AGGREGATE_GROUPS / ORDERED_AGGREGATE_BATCH_SIZE]
+    );
+    let groups = i32::try_from(ORDERED_AGGREGATE_GROUPS).expect("group count fits in i32");
+    let expected: Vec<(i32, i32, i64)> = (0..groups).map(|g| (2000, g, i64::from(g))).collect();
+    assert_eq!(
+        emitted_groups(&output),
+        expected,
+        "every group must be emitted once with its sum"
+    );
+}
+
+/// spiceai/datafusion#279 and #280. A join with a high fan-out yields many output
+/// batches per input batch without polling an input, so unless each output batch
+/// spends the cooperative budget, the task running it never yields: a cancelled
+/// or timed-out query cannot stop it, and on a single-threaded runtime nothing
+/// else runs. Each query here runs on a single-threaded runtime and must give its
+/// 100 ms read timeout a chance to fire. A sort-merge join sorts its inputs
+/// first, and that read yields, so its inputs are finite and share one key.
+#[test]
+fn every_join_yields_to_the_scheduler() {
+    let mut never_yielded = Vec::new();
+    for (operator, prefer_hash_join, sql) in [
+        (
+            "HashJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value % 2 = b.value % 2",
+        ),
+        (
+            "SortMergeJoinExec",
+            false,
+            "SELECT max(a.value + b.value) FROM range(1, 20000) b JOIN range(1, 20000) a ON a.value / 1000000 = b.value / 1000000",
+        ),
+        (
+            "NestedLoopJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value + b.value > 1",
+        ),
+        (
+            "CrossJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b CROSS JOIN range(1, 1000000000000) a",
+        ),
+    ] {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime builds");
+            let result = runtime.block_on(async {
+                let ctx = spice_session(|config| {
+                    config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+                    // One partition keeps repartition exchanges, which yield on their own, out
+                    // of the plan. A sort-merge join is planned only over several partitions.
+                    if prefer_hash_join {
+                        config.options_mut().execution.target_partitions = 1;
+                    }
+                });
+                let plan = ctx
+                    .sql(sql)
+                    .await
+                    .expect("query plans")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical plan");
+                let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string();
+                assert!(
+                    shown.contains(operator),
+                    "{sql} is not planned with {operator}:\n{shown}"
+                );
+                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())
+                    .expect("query executes");
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    futures::StreamExt::next(&mut stream),
+                )
+                .await
+                .is_err()
+            });
+            let _ = done.send(result);
+        });
+        if finished.recv_timeout(std::time::Duration::from_secs(30)) != Ok(true) {
+            never_yielded.push(operator);
+        }
+    }
+    assert!(
+        never_yielded.is_empty(),
+        "{never_yielded:?} never yielded, so their queries' read timeouts could not fire"
+    );
+}
+
+/// The SQL planner refuses a data type nested more than 64 array or struct
+/// levels deep, and still plans one at the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_to_a_type_nested_past_the_limit_is_refused() {
+    let ctx = spice_session(|_| {});
+    assert_eq!(
+        answer(
+            &ctx,
+            &format!("SELECT CAST(NULL AS INT{}) IS NULL", "[]".repeat(64))
+        )
+        .await,
+        Ok(owned(&["true"]))
+    );
+    let error = answer(
+        &ctx,
+        &format!("SELECT CAST(NULL AS INT{}) IS NULL", "[]".repeat(65)),
+    )
+    .await
+    .expect_err("65 levels exceed the limit");
+    assert!(
+        error.contains("SQL data type nesting depth exceeds the maximum of 64"),
+        "{error}"
+    );
+}
+
+/// Array and struct levels count toward the same limit: a type alternating
+/// `ARRAY<…>` and `STRUCT<…>` plans at 64 levels and is refused at 65.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_to_a_mixed_array_and_struct_type_past_the_limit_is_refused() {
+    // PostgreSQL, the dialect Spice sessions default to, has no `STRUCT<…>` type syntax.
+    let ctx = spice_session(|config| {
+        config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::Generic;
+    });
+    let nested = |levels: usize| {
+        (0..levels).fold("INT".to_string(), |inner, level| {
+            if level % 2 == 0 {
+                format!("ARRAY<{inner}>")
+            } else {
+                format!("STRUCT<a {inner}>")
+            }
+        })
+    };
+    assert_eq!(
+        answer(
+            &ctx,
+            &format!("SELECT CAST(NULL AS {}) IS NULL", nested(64))
+        )
+        .await,
+        Ok(owned(&["true"]))
+    );
+    let error = answer(
+        &ctx,
+        &format!("SELECT CAST(NULL AS {}) IS NULL", nested(65)),
+    )
+    .await
+    .expect_err("65 levels exceed the limit");
+    assert!(
+        error.contains("SQL data type nesting depth exceeds the maximum of 64"),
+        "{error}"
+    );
+}
+
+/// spiceai/datafusion#287. With more than one `COUNT(DISTINCT …)` the plan keeps
+/// the generic `ScalarValue` set per aggregate instead of rewriting a single
+/// distinct into a `GROUP BY`. A list or struct value read from a batch is a
+/// one-row slice that shares the batch's buffers, so each stored distinct value
+/// must be a compacted copy: kept as a slice, each one is charged the whole
+/// batch, and 50,000 three-element lists asked for tens of GB and failed with
+/// `ResourcesExhausted`.
+///
+/// Spilling is disabled and the pool is 256 MiB, which the real distinct state
+/// (a few MB per aggregate) fits many times over. Four partitions run the
+/// partial and final aggregates, so the merged state's values are checked too.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_count_distinct_over_nested_values_charge_each_value_once() {
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+    const POOL_BYTES: usize = 256 * 1024 * 1024;
+
+    let mut config = get_df_default_config();
+    config.options_mut().execution.target_partitions = 4;
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(POOL_BYTES, 1.0)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build_arc()
+        .expect("runtime builds");
+    let ctx = SessionContext::new_with_config_rt(config, runtime);
+    run_statements(
+        &ctx,
+        &["CREATE TABLE distinct_nested AS SELECT value AS id, \
+           [value, value + 1, value % 7] AS l, \
+           named_struct('a', value, 'b', value % 7) AS s, \
+           CAST(value % 5 AS INT) AS grp \
+           FROM generate_series(0, 49999)"],
+    )
+    .await;
+
+    for (sql, expected) in [
+        (
+            "SELECT count(DISTINCT l), count(DISTINCT grp) FROM distinct_nested",
+            vec!["50000,5".to_string()],
+        ),
+        (
+            "SELECT count(DISTINCT s), count(DISTINCT grp) FROM distinct_nested",
+            vec!["50000,5".to_string()],
+        ),
+        (
+            "SELECT grp, count(DISTINCT l), count(DISTINCT s) FROM distinct_nested \
+             GROUP BY grp ORDER BY grp",
+            (0..5).map(|grp| format!("{grp},10000,10000")).collect(),
+        ),
+    ] {
+        assert_eq!(
+            answer(&ctx, sql).await,
+            Ok(expected),
+            "{sql} must fit in a {POOL_BYTES}-byte pool"
+        );
+    }
+}
+
+/// spiceai/datafusion#283. A grouped `TopK` aggregation sizes its hash table and
+/// heap to the groups it sees, not to its `LIMIT`, so a `LIMIT` far above the
+/// row count still answers. Unpatched, a `LIMIT` this large fails at once on a
+/// capacity overflow, before anything is allocated.
+#[tokio::test(flavor = "multi_thread")]
+async fn topk_aggregation_with_a_limit_far_above_its_groups_answers() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &["CREATE TABLE topk_large_limit(s VARCHAR, y BIGINT) AS VALUES ('a', 1), ('b', 3), ('b', 4), ('c', 2)"],
+    )
+    .await;
+    let limit = i64::MAX;
+    for (sql, expected) in [
+        (
+            format!("SELECT DISTINCT s FROM topk_large_limit ORDER BY s DESC LIMIT {limit}"),
+            owned(&["c", "b", "a"]),
+        ),
+        (
+            format!(
+                "SELECT s, max(y) FROM topk_large_limit GROUP BY s ORDER BY max(y) DESC NULLS LAST LIMIT {limit}"
+            ),
+            owned(&["b,4", "c,2", "a,1"]),
+        ),
+    ] {
+        let plan = answer(&ctx, &format!("EXPLAIN {sql}"))
+            .await
+            .expect("plan")
+            .join("\n");
+        assert!(
+            plan.contains(&format!("lim=[{limit}]")),
+            "the query must plan a TopK aggregation:\n{plan}"
+        );
+        assert_eq!(answer(&ctx, &sql).await, Ok(expected), "{sql}");
+    }
+}
+
+/// spiceai/datafusion#300. `levenshtein` refuses a batch whose rows have more
+/// than 1,000,000,000 character pairs in total (`chars(str1) * chars(str2)`
+/// summed) before it computes any distance, since the distances take that many
+/// steps with no cancellation point, and still answers within the limit. Each
+/// string type is checked with one long row of literal arguments, which the
+/// planner folds, and with many shorter rows of column arguments.
+#[tokio::test(flavor = "multi_thread")]
+async fn levenshtein_refuses_a_batch_past_its_size_limit() {
+    let ctx = spice_session(|_| {});
+    for string_type in ["Utf8", "LargeUtf8", "Utf8View"] {
+        assert_eq!(
+            sorted_answer(
+                &ctx,
+                &format!(
+                    "SELECT levenshtein(arrow_cast(s, '{string_type}'), arrow_cast(t, '{string_type}')) \
+                     FROM (VALUES ('kitten', 'sitting'), ('naïve', 'naive'), ('', 'abc')) v(s, t)"
+                )
+            )
+            .await,
+            Ok(sorted(&["3", "1", "3"])),
+            "{string_type}"
+        );
+        for sql in [
+            // One row of 40,001 x 25,000 characters.
+            format!(
+                "SELECT levenshtein(arrow_cast(repeat('a', 40001), '{string_type}'), \
+                 arrow_cast(repeat('b', 25000), '{string_type}'))"
+            ),
+            // One batch of 1,001 rows of 1,000 x 1,000 characters.
+            format!(
+                "SELECT levenshtein(arrow_cast(repeat('a', 1000 + v - v), '{string_type}'), \
+                 arrow_cast(repeat('b', 1000), '{string_type}')) \
+                 FROM (SELECT value AS v FROM generate_series(1, 1001)) t"
+            ),
+        ] {
+            let error = answer(&ctx, &sql)
+                .await
+                .expect_err("the batch exceeds the limit");
+            assert!(
+                error.contains(
+                    "levenshtein input is too long: the strings in one batch have more than \
+                     1000000000 character pairs"
+                ),
+                "{sql}: {error}"
+            );
+        }
+    }
+}

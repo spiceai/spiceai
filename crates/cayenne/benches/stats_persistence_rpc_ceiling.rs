@@ -64,7 +64,7 @@ use tokio::sync::Mutex;
 /// Per-RPC simulated round trip. Two realistic shapes mirror
 /// `metastore_connection_contention.rs`:
 /// - 1 ms: local SQLite (WAL, NORMAL sync).
-/// - 10 ms: same-zone network metastore (Turso, managed Postgres).
+/// - 10 ms: same-zone network metastore.
 const RTTS: &[(&str, Duration)] = &[
     ("rtt_1ms", Duration::from_millis(1)),
     ("rtt_10ms", Duration::from_millis(10)),

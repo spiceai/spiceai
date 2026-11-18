@@ -25,6 +25,10 @@ variants:
     datasets: { t: { acceleration: { refresh_mode: append } } }
   others:
     when: { src: [mongodb, dynamodb, postgres, mysql] }
+  # Each variant above that keeps an unpartitioned Cayenne file acceleration,
+  # with the prototype object-native Cayenne metastore.
+  kafka-object-native: {when: {src: kafka}, datasets: {t: {acceleration: {refresh_mode: append}}}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
+  others-object-native: {when: {src: [mongodb, dynamodb, postgres, mysql]}, spicepod: {runtime: {params: {cayenne_vnext: enabled}}}}
 defaults:
   expect: { oracle: ref }
 steps:

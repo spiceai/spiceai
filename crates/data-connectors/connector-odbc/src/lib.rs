@@ -115,8 +115,12 @@ fn databricks_dialect() -> CustomDialect {
         .build()
 }
 
+/// Athena (Trino) SQL. Identifiers are double-quoted: the statement names
+/// computed outputs by their logical name (`sum(t.a) * Float64(0.0001)`), which
+/// Athena rejects unquoted.
 fn athena_dialect() -> CustomDialect {
     CustomDialectBuilder::new()
+        .with_identifier_quote_style('"')
         .with_interval_style(IntervalStyle::MySQL)
         .with_date_field_extract_style(DateFieldExtractStyle::Extract)
         .with_large_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::Varchar(None))
@@ -382,12 +386,12 @@ mod test {
         // large_utf8_cast_dtype: VARCHAR instead of TEXT
         let expr = cast(col("a"), DataType::LargeUtf8);
         let actual = format!("{}", unparser.expr_to_sql(&expr)?);
-        assert_eq!(actual, "CAST(a AS VARCHAR)");
+        assert_eq!(actual, r#"CAST("a" AS VARCHAR)"#);
 
         // utf8_cast_dtype: VARCHAR
         let expr = cast(col("a"), DataType::Utf8);
         let actual = format!("{}", unparser.expr_to_sql(&expr)?);
-        assert_eq!(actual, "CAST(a AS VARCHAR)");
+        assert_eq!(actual, r#"CAST("a" AS VARCHAR)"#);
 
         Ok(())
     }
@@ -497,6 +501,192 @@ mod test {
 
         std::fs::remove_file("something.so").expect("file should be deleted");
         std::fs::remove_file("noextfile").expect("file should be deleted");
+    }
+
+    /// Regression test for #16082: TPC-H Q11 and Q17, planned by the runtime's
+    /// own session, push a scalar subquery whose output carries its logical
+    /// name (`Float64(0.2) * avg(lineitem.l_quantity)`). Athena rejected that
+    /// name unquoted with `mismatched input '('`, so every identifier the
+    /// Athena dialect writes is double-quoted.
+    #[test]
+    fn athena_sql_for_a_scalar_subquery_comparison_quotes_its_output_name() {
+        use async_trait::async_trait;
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::common::TableReference;
+        use datafusion_table_providers::sql::db_connection_pool::{
+            DbConnectionPool, JoinPushDown, dbconnection::DbConnection,
+        };
+        use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
+        use std::any::Any;
+
+        struct PlanningOnlyConn;
+        impl DbConnection<(), &'static dyn ToString> for PlanningOnlyConn {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn Any {
+                self
+            }
+        }
+
+        /// One Athena workgroup: every table shares the compute context, so a
+        /// join federates as one statement, as through `ODBCDbConnectionPool`.
+        struct AthenaPool;
+        #[async_trait]
+        impl DbConnectionPool<(), &'static dyn ToString> for AthenaPool {
+            async fn connect(
+                &self,
+            ) -> std::result::Result<
+                Box<dyn DbConnection<(), &'static dyn ToString>>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Ok(Box::new(PlanningOnlyConn))
+            }
+            fn join_push_down(&self) -> JoinPushDown {
+                JoinPushDown::AllowedFor("athena".to_string())
+            }
+        }
+
+        const Q11: &str = "SELECT ps_partkey, sum(ps_supplycost * ps_availqty) AS value \
+            FROM partsupp, supplier, nation \
+            WHERE ps_suppkey = s_suppkey AND s_nationkey = n_nationkey AND n_name = 'GERMANY' \
+            GROUP BY ps_partkey HAVING sum(ps_supplycost * ps_availqty) > ( \
+              SELECT sum(ps_supplycost * ps_availqty) * 0.0001 FROM partsupp, supplier, nation \
+              WHERE ps_suppkey = s_suppkey AND s_nationkey = n_nationkey AND n_name = 'GERMANY') \
+            ORDER BY value DESC";
+        const Q17: &str = "SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM lineitem, part \
+            WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX' \
+            AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)";
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let df = runtime::datafusion::builder::DataFusionBuilder::new(
+            runtime::status::RuntimeStatus::new(),
+            Arc::new(data_accelerator_api::AcceleratorEngineRegistry::default()),
+            rt.handle().clone(),
+        )
+        .build();
+
+        let int = || DataType::Int64;
+        let money = || DataType::Decimal128(15, 2);
+        let pool: Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync> =
+            Arc::new(AthenaPool);
+        for (name, columns) in [
+            (
+                "partsupp",
+                vec![
+                    ("ps_partkey", int()),
+                    ("ps_suppkey", int()),
+                    ("ps_availqty", int()),
+                    ("ps_supplycost", money()),
+                ],
+            ),
+            (
+                "supplier",
+                vec![("s_suppkey", int()), ("s_nationkey", int())],
+            ),
+            (
+                "nation",
+                vec![("n_nationkey", int()), ("n_name", DataType::Utf8)],
+            ),
+            (
+                "lineitem",
+                vec![
+                    ("l_partkey", int()),
+                    ("l_quantity", money()),
+                    ("l_extendedprice", money()),
+                ],
+            ),
+            (
+                "part",
+                vec![
+                    ("p_partkey", int()),
+                    ("p_brand", DataType::Utf8),
+                    ("p_container", DataType::Utf8),
+                ],
+            ),
+        ] {
+            let schema = Arc::new(Schema::new(
+                columns
+                    .into_iter()
+                    .map(|(column, data_type)| Field::new(column, data_type, true))
+                    .collect::<Vec<_>>(),
+            ));
+            let remote = TableReference::partial("tpch", name);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "routed through `create_spice_federated_table_provider` with the Athena policy, as `ODBCTableFactory` does"
+            )]
+            let table = SqlTable::new_with_schema("odbc", &pool, schema, remote.clone(), None)
+                .with_dialect(Arc::new(athena_dialect()));
+            let schema = table.schema();
+            let provider = data_components::federation::create_spice_federated_table_provider(
+                table,
+                schema,
+                remote,
+                Some(function_support_for_engine(ODBCProfile::Athena.engine())),
+            );
+            df.ctx
+                .register_table(name, Arc::new(provider))
+                .expect("register the Athena table");
+        }
+
+        let pushed_sql = |sql: &str| -> Vec<String> {
+            let plan = rt.block_on(async {
+                df.ctx
+                    .sql(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("plan {sql}: {e}"))
+                    .create_physical_plan()
+                    .await
+                    .unwrap_or_else(|e| panic!("physical plan for {sql}: {e}"))
+            });
+            let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string();
+            // `base_sql` is the statement executed unless a later stage
+            // rewrites it, which the plan then shows as a `rewritten_*` field.
+            assert!(
+                !rendered.contains(" rewritten_"),
+                "the statement was rewritten after unparsing:\n{rendered}"
+            );
+            rendered
+                .lines()
+                .filter_map(|line| {
+                    line.split_once(" base_sql=")
+                        .map(|(_, sql)| sql.trim().to_string())
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            pushed_sql(Q11),
+            [concat!(
+                r#"SELECT "partsupp"."ps_partkey", sum(("partsupp"."ps_supplycost" * "partsupp"."ps_availqty")) AS "value" "#,
+                r#"FROM "tpch"."partsupp" INNER JOIN "tpch"."supplier" ON ("partsupp"."ps_suppkey" = "supplier"."s_suppkey") "#,
+                r#"INNER JOIN "tpch"."nation" ON ("supplier"."s_nationkey" = "nation"."n_nationkey") "#,
+                r#"WHERE ("nation"."n_name" = 'GERMANY') GROUP BY "partsupp"."ps_partkey" "#,
+                r#"HAVING (sum(("partsupp"."ps_supplycost" * "partsupp"."ps_availqty")) > "#,
+                r#"(SELECT (sum(("partsupp"."ps_supplycost" * "partsupp"."ps_availqty")) * 0.0001) "#,
+                r#"AS "sum(partsupp.ps_supplycost * partsupp.ps_availqty) * Float64(0.0001)" "#,
+                r#"FROM "tpch"."partsupp" INNER JOIN "tpch"."supplier" ON ("partsupp"."ps_suppkey" = "supplier"."s_suppkey") "#,
+                r#"INNER JOIN "tpch"."nation" ON ("supplier"."s_nationkey" = "nation"."n_nationkey") "#,
+                r#"WHERE ("nation"."n_name" = 'GERMANY'))) ORDER BY "value" DESC NULLS FIRST"#,
+            )]
+        );
+        assert_eq!(
+            pushed_sql(Q17),
+            [concat!(
+                r#"SELECT (sum("lineitem"."l_extendedprice") / 7.0) AS "avg_yearly" "#,
+                r#"FROM "tpch"."lineitem" INNER JOIN "tpch"."part" ON ("part"."p_partkey" = "lineitem"."l_partkey") "#,
+                r#"WHERE ("lineitem"."l_quantity" < (SELECT (0.2 * avg("lineitem"."l_quantity")) "#,
+                r#"AS "Float64(0.2) * avg(lineitem.l_quantity)" "#,
+                r#"FROM "tpch"."lineitem" WHERE ("lineitem"."l_partkey" = "part"."p_partkey"))) "#,
+                r#"AND ("part"."p_brand" = 'Brand#23') AND ("part"."p_container" = 'MED BOX')"#,
+            )]
+        );
     }
 }
 

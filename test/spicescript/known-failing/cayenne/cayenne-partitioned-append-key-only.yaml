@@ -11,6 +11,8 @@ variants:
   plain: {}
   partitioned: { datasets: { e: { acceleration: { partition_by: [region] } } } }
   partitioned-with-time: { datasets: { e: { time_column: ts, acceleration: { partition_by: [region] } } } }
+  # The spicepod as written, with the prototype object-native Cayenne metastore.
+  object-native: object-native
 spicepod:
   version: v1
   kind: Spicepod

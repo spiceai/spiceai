@@ -64,7 +64,8 @@ impl CacheKeyType {
 /// ## HTTP Header Format
 ///
 /// The `Cache-Control` request header can include:
-/// - `no-cache`: Bypass the cache entirely (`CacheControl::NoCache`)
+/// - `no-cache`: Skip the cached lookup, run the query, and store the fresh
+///   result for later requests (`CacheControl::Revalidate`)
 ///
 /// ## Cache Key Types
 ///
@@ -80,7 +81,14 @@ impl CacheKeyType {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CacheControl {
     Cache(CacheKeyType),
+    /// Never serve a cached result. Used by the runtime's own queries (for
+    /// example a background stale-while-revalidate refresh, which stores its
+    /// result under the entry's key itself); a client's `no-cache` is
+    /// [`Self::Revalidate`].
     NoCache,
+    /// The client's `no-cache`: never serve a cached result, run the query, and
+    /// store the fresh result under the request's key so later requests read it.
+    Revalidate(CacheKeyType),
     /// max-stale[=N] - Client accepts stale responses up to N seconds old (None = any age)
     MaxStale(CacheKeyType, Option<std::time::Duration>),
     /// min-fresh=N - Client wants responses fresh for at least N more seconds
@@ -120,7 +128,7 @@ impl CacheControl {
     ) -> Self {
         // Check for no-cache (highest priority per RFC 9111)
         if header.no_cache() {
-            return Self::NoCache;
+            return Self::Revalidate(cache_key_type);
         }
 
         // Check for only-if-cached
@@ -155,7 +163,8 @@ impl CacheControl {
             Self::Cache(key_type)
             | Self::MaxStale(key_type, _)
             | Self::MinFresh(key_type, _)
-            | Self::OnlyIfCached(key_type) => Some(*key_type),
+            | Self::OnlyIfCached(key_type)
+            | Self::Revalidate(key_type) => Some(*key_type),
             Self::NoCache => None,
         }
     }
@@ -237,7 +246,7 @@ mod tests {
         headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
         assert!(matches!(
             CacheControl::from_headers(&headers),
-            CacheControl::NoCache
+            CacheControl::Revalidate(CacheKeyType::Default)
         ));
 
         // Test with different cache-control value
@@ -307,6 +316,10 @@ mod tests {
             CacheControl::OnlyIfCached(CacheKeyType::Default).cache_key_type(),
             Some(CacheKeyType::Default)
         );
+        assert_eq!(
+            CacheControl::Revalidate(CacheKeyType::Raw).cache_key_type(),
+            Some(CacheKeyType::Raw)
+        );
         assert_eq!(CacheControl::NoCache.cache_key_type(), None);
     }
 
@@ -364,6 +377,22 @@ mod tests {
             HeaderValue::from_static("max-stale=3600, min-fresh=600, no-cache"),
         );
         let result = CacheControl::from_headers(&headers);
-        assert!(matches!(result, CacheControl::NoCache));
+        assert!(matches!(
+            result,
+            CacheControl::Revalidate(CacheKeyType::Default)
+        ));
+    }
+
+    #[test]
+    fn no_cache_keeps_the_request_cache_key_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        headers.insert("Spice-Cache-Key", HeaderValue::from_static("my-key"));
+        let result = CacheControl::from_headers(&headers);
+        assert_eq!(
+            result,
+            CacheControl::Revalidate(CacheKeyType::ClientSupplied)
+        );
+        assert_eq!(result.cache_key_type(), Some(CacheKeyType::ClientSupplied));
     }
 }

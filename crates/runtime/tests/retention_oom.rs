@@ -20,16 +20,11 @@ limitations under the License.
 // unreferenced static — and every integration binary links separately, so each one that
 // exercises an engine needs its own reference. `integration.rs`'s
 // `accelerator_crates_register_their_engines` guards the mechanism.
-#[cfg(not(windows))]
 use accelerator_cayenne as _;
-#[cfg(feature = "duckdb")]
-use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
-#[cfg(feature = "turso")]
-use accelerator_turso as _;
 
 use std::{
     collections::HashMap,
@@ -81,7 +76,6 @@ enum ExecutableFormat {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_pk_delete_oom_repro() -> Result<(), anyhow::Error> {
     init_tracing();
 

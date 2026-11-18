@@ -215,6 +215,35 @@ pub fn get_total_memory() -> u64 {
     get_container_memory_limit().unwrap_or_else(|| system.total_memory())
 }
 
+/// The memory this process can still use, in bytes: the system's available memory (free
+/// memory and what the kernel can reclaim), within a cgroup limit less this process's
+/// resident memory. Memory that is measured and used up is `Some(0)`; `None` only when the
+/// system reports no memory figures at all.
+#[must_use]
+pub fn get_available_memory() -> Option<u64> {
+    let mut system = System::new();
+    system.refresh_memory();
+    let limit = get_container_memory_limit();
+    let resident = limit.map_or(0, |_| process_resident_memory_bytes().unwrap_or(0));
+    available_within(
+        system.total_memory(),
+        system.available_memory(),
+        limit,
+        resident,
+    )
+}
+
+/// [`get_available_memory`] from its readings: `available` system memory, within `limit` less
+/// `resident`; `None` when the system reported no memory (`total` is 0).
+fn available_within(total: u64, available: u64, limit: Option<u64>, resident: u64) -> Option<u64> {
+    if total == 0 {
+        return None;
+    }
+    Some(limit.map_or(available, |limit| {
+        limit.saturating_sub(resident).min(available)
+    }))
+}
+
 /// Returns the host's total physical memory in bytes, IGNORING any cgroup/container
 /// limit.
 ///
@@ -329,7 +358,10 @@ impl Default for ResourceMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResidentMemory, parse_proc_status_resident, process_resident_memory};
+    use super::{
+        ResidentMemory, available_within, get_available_memory, get_host_memory,
+        parse_proc_status_resident, process_resident_memory,
+    };
 
     /// A real `/proc/self/status` excerpt, in the order and units the kernel
     /// writes them.
@@ -415,6 +447,39 @@ Threads:\t32
     /// Faulting in a known number of fresh heap bytes pins the units: the reading
     /// has to grow by about that many bytes, so a figure in kB or pages, or one
     /// scaled twice, misses the half-to-double window by a factor of 1024 or more.
+    /// The memory this process can still use is less than the machine has, since the system
+    /// and this process already use some: llama.cpp's CPU device reports the whole of it free.
+    /// Memory that is measured and used up reads as `Some(0)`, so fitting a model into it finds
+    /// that nothing fits; `None` is only for a system that reports no memory figures at all.
+    #[test]
+    fn used_up_memory_is_zero_not_unknown() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(available_within(16 * GIB, 0, None, 0), Some(0));
+        assert_eq!(
+            available_within(16 * GIB, 8 * GIB, Some(4 * GIB), 4 * GIB),
+            Some(0)
+        );
+        assert_eq!(
+            available_within(16 * GIB, 8 * GIB, Some(6 * GIB), 4 * GIB),
+            Some(2 * GIB)
+        );
+        assert_eq!(
+            available_within(16 * GIB, GIB, Some(6 * GIB), 4 * GIB),
+            Some(GIB)
+        );
+        assert_eq!(available_within(0, 0, None, 0), None);
+    }
+
+    #[test]
+    fn the_available_memory_is_less_than_the_total() {
+        let available = get_available_memory().expect("the system reports available memory");
+        assert!(
+            available < get_host_memory(),
+            "{available} available of {} total",
+            get_host_memory()
+        );
+    }
+
     #[test]
     fn the_live_reading_is_plausible() {
         const TOUCHED: u64 = 64 * 1024 * 1024;

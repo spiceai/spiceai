@@ -25,7 +25,9 @@ use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
-use runtime_query_engine::sql_depth_guard::ensure_filter_within_depth_limit;
+use runtime_query_engine::sql_depth_guard::{
+    ensure_data_types_within_depth_limit, ensure_filter_within_depth_limit,
+};
 use schemars::JsonSchema;
 use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
@@ -213,6 +215,8 @@ impl SearchRequest {
     }
 
     pub fn parse_where_cond(where_cond: String) -> Result<Expr> {
+        ensure_data_types_within_depth_limit(&where_cond, &PostgreSqlDialect {})
+            .context(WhereConditionTooDeepSnafu)?;
         let parser = Parser::new(&PostgreSqlDialect {});
         let mut parser =
             parser
@@ -248,6 +252,10 @@ impl SearchRequest {
             .iter()
             .map(|c| {
                 let select_statement = format!("SELECT {c} FROM testing");
+                ensure_data_types_within_depth_limit(&select_statement, &GenericDialect)
+                    .map_err(|_| Error::InvalidAdditionalColumns {
+                        additional_column: c.clone(),
+                    })?;
                 let parser = Parser::new(&GenericDialect);
                 let mut parser = parser.try_with_sql(&select_statement).map_err(|err| {
                     tracing::trace!("parsing 'additional_columns' for search failed. {err}");

@@ -1445,14 +1445,6 @@ macro_rules! test_with_backends {
                 $test_fn(fixture).await.expect("Test failed");
             }
 
-            #[cfg(feature = "turso")]
-            #[tokio::test]
-            async fn [<$test_fn _turso>]() {
-                let fixture = TestFixture::new(common::BackendType::Turso)
-                    .await
-                    .expect("Failed to create test fixture");
-                $test_fn(fixture).await.expect("Test failed");
-            }
         }
     };
 }

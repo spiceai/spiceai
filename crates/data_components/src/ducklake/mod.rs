@@ -20,10 +20,294 @@ limitations under the License.
 //! This module provides a catalog provider that connects to a `DuckLake` catalog using `DuckDB`
 //! with the `ducklake` extension.
 
-use crate::duckdb::install_and_load_extension;
+use crate::adbc_helpers::{
+    AdbcInitError, DUCKDB_DRIVER, ManagedDuckDbError, check_duckdb_version, driver_entrypoint,
+    load_adbc_database, managed_duckdb_options,
+};
+use adbc_core::{Connection as _, Database as _, Statement as _};
+use adbc_driver_manager::{ManagedConnection, ManagedDatabase};
+use connection::MetadataConnection;
+use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
+use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
+    ADBCPool, AdbcConnectionPoolBuilder,
+};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The installed `DuckDB` database shared by a `DuckLake` catalog's connections.
+pub struct DuckLakePool {
+    resources: Option<(Arc<ADBCPool<ManagedDatabase>>, ManagedDatabase)>,
+}
+
+/// Errors accessing a `DuckLake` database or its query results.
+#[derive(Debug, snafu::Snafu)]
+pub enum Error {
+    #[snafu(display("The DuckLake connector has already been closed"))]
+    Closed,
+    #[snafu(display("Failed to use the DuckLake connection: {message}"))]
+    Connection { message: String },
+    #[snafu(display("Failed to read DuckLake metadata: {message}"))]
+    Metadata { message: &'static str },
+    #[snafu(display("Stream terminated before all data was sent to {table}; rolling back"))]
+    StreamTerminated { table: String },
+}
+
+impl DuckLakePool {
+    /// Creates a pool sharing one database. Call on a blocking thread.
+    ///
+    /// # Errors
+    /// Returns a connection pool initialization error.
+    pub fn new(
+        database: ManagedDatabase,
+        joins: JoinPushDown,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::new(
+            AdbcConnectionPoolBuilder::new(database.clone())
+                .with_join_push_down(joins)
+                .build()?,
+        );
+        Ok(Arc::new(Self {
+            resources: Some((pool, database)),
+        }))
+    }
+
+    /// Returns the shared pool for read providers.
+    ///
+    /// # Errors
+    /// Returns an error if the connector is closed.
+    pub fn adbc_pool(&self) -> Result<Arc<ADBCPool<ManagedDatabase>>, Error> {
+        self.resources
+            .as_ref()
+            .map(|(pool, _)| Arc::clone(pool))
+            .ok_or(Error::Closed)
+    }
+
+    /// Opens a dedicated connection for a write transaction. Call on a blocking thread.
+    /// A failed rollback cannot return this connection to the reader pool.
+    ///
+    /// # Errors
+    /// Returns a connection initialization error.
+    pub fn connect(&self) -> Result<ManagedConnection, Box<dyn std::error::Error + Send + Sync>> {
+        let (_, database) = self.resources.as_ref().ok_or(Error::Closed)?;
+        Ok(database.new_connection()?)
+    }
+}
+
+impl Drop for DuckLakePool {
+    fn drop(&mut self) {
+        if let Some(resources) = self.resources.take() {
+            crate::adbc_helpers::offload_adbc_drop(resources);
+        }
+    }
+}
+
+/// Initializes one installed `DuckDB` database and attaches the lake once.
+/// Call on a blocking thread.
+///
+/// # Errors
+/// Returns driver, version, extension, credential, or attachment errors.
+pub fn create_ducklake_pool(
+    path: Option<&str>,
+    read_only: bool,
+    connection_string: &str,
+    catalog_name: &str,
+    automatic_migration: bool,
+    s3: &DuckLakeS3Params,
+) -> Result<Arc<DuckLakePool>, Box<dyn std::error::Error + Send + Sync>> {
+    let path = path.unwrap_or(":memory:");
+    let database = load_adbc_database(
+        DUCKDB_DRIVER,
+        driver_entrypoint(DUCKDB_DRIVER),
+        managed_duckdb_options(path, read_only && path != ":memory:"),
+    )
+    .map_err(|source| match source {
+        source @ AdbcInitError::LoadDriver { .. } => Box::new(ManagedDuckDbError::MissingLibrary {
+            connector: "ducklake",
+            source,
+        })
+            as Box<dyn std::error::Error + Send + Sync>,
+        source => Box::new(source),
+    })?;
+    check_duckdb_version(&database, "ducklake")?;
+    // All connections share attachments and secrets in this database. Pools
+    // that open the same file and attach the same lake under the same name
+    // resolve the same tables, so a join between them runs in either one. The
+    // context appears in query plans, so it is a hash, of a connection string
+    // without its password.
+    let pool = DuckLakePool::new(
+        database,
+        JoinPushDown::AllowedFor(join_context(path, connection_string, catalog_name)),
+    )?;
+    let mut connection = pool.connect()?;
+    install_ducklake_extensions(&mut connection)?;
+    if let Some(sql) = build_ducklake_s3_secret_sql(s3) {
+        execute_sql(&mut connection, &sql)?;
+    }
+    execute_sql(
+        &mut connection,
+        &build_ducklake_attach_sql(connection_string, catalog_name, automatic_migration),
+    )?;
+    Ok(pool)
+}
+
+/// The join context of a pool over `path` with the lake at
+/// `connection_string` attached as `catalog_name`: `ducklake:` and a hash of
+/// its [`join_identity`].
+fn join_context(path: &str, connection_string: &str, catalog_name: &str) -> String {
+    let identity = join_identity(path, connection_string, catalog_name);
+    format!(
+        "ducklake:{:016x}",
+        twox_hash::XxHash64::oneshot(0, &identity)
+    )
+}
+
+/// What identifies a pool's lake: the file the pool opens, the metadata
+/// connection string without its password, and the name the lake is attached
+/// as. A password chooses no lake, and the context appears in query plans, so
+/// the password is left out. A `PostgreSQL` or `MySQL` string whose password
+/// cannot be held apart is replaced by a number no other pool gets, so that
+/// pool pushes joins down only between its own tables.
+fn join_identity(path: &str, connection_string: &str, catalog_name: &str) -> Vec<u8> {
+    static UNREADABLE_POOLS: AtomicU64 = AtomicU64::new(0);
+    let mut identity = Vec::new();
+    identity.extend_from_slice(path.as_bytes());
+    // Separates the parts, so ("ab", "c") and ("a", "bc") differ.
+    identity.push(0);
+    if let Ok(metadata) = MetadataConnection::parse(connection_string) {
+        identity.extend_from_slice(metadata.path.as_bytes());
+    } else {
+        // No UTF-8 string holds the byte 0xff, so this is no connection
+        // string's identity.
+        identity.push(0xff);
+        let pool = UNREADABLE_POOLS.fetch_add(1, Ordering::Relaxed);
+        identity.extend_from_slice(&pool.to_le_bytes());
+    }
+    identity.push(0);
+    identity.extend_from_slice(catalog_name.as_bytes());
+    identity.push(0);
+    identity
+}
+
+/// Executes a statement through an ADBC connection on a blocking thread.
+///
+/// # Errors
+/// Returns the statement or execution error.
+pub fn execute_sql(
+    connection: &mut ManagedConnection,
+    sql: &str,
+) -> adbc_core::error::Result<Option<i64>> {
+    let mut statement = connection.new_statement()?;
+    statement.set_sql_query(sql)?;
+    statement.execute_update()
+}
+
+pub mod connection;
 pub mod provider;
 pub mod writer;
+
+/// Reads a single string column through ADBC. Call on a blocking thread.
+///
+/// # Errors
+/// Returns connection, query, or Arrow conversion errors.
+pub fn query_strings(
+    pool: &Arc<DuckLakePool>,
+    sql: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    query_connection_strings(&mut pool.connect()?, sql)
+}
+
+fn query_connection_strings(
+    connection: &mut ManagedConnection,
+    sql: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    use arrow::array::{Array as _, LargeStringArray, StringArray};
+    let mut statement = connection.new_statement()?;
+    statement.set_sql_query(sql)?;
+    let mut names = Vec::new();
+    for batch in statement.execute()? {
+        let batch = batch?;
+        if batch.num_columns() != 1 {
+            return Err(Error::Metadata {
+                message: "DuckDB returned an invalid metadata result",
+            }
+            .into());
+        }
+        let column = batch.column(0);
+        for row in 0..batch.num_rows() {
+            if column.is_null(row) {
+                return Err(Error::Metadata {
+                    message: "DuckDB returned a NULL metadata name",
+                }
+                .into());
+            }
+            let name = if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+                values.value(row)
+            } else if let Some(values) = column.as_any().downcast_ref::<LargeStringArray>() {
+                values.value(row)
+            } else {
+                return Err(Error::Metadata {
+                    message: "DuckDB returned a non-string metadata name",
+                }
+                .into());
+            };
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// Installs and loads the extensions used by `DuckLake`. Call on a blocking thread.
+/// Shares the on-disk install lock with bundled `DuckDB` installations.
+///
+/// # Errors
+/// Returns extension installation or loading errors.
+pub fn install_ducklake_extensions(
+    connection: &mut ManagedConnection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let setting = |connection: &mut ManagedConnection, name: &str| {
+        query_connection_strings(connection, &format!("SELECT current_setting('{name}')"))
+            .ok()
+            .and_then(|values| values.into_iter().next())
+            .filter(|value| !value.is_empty())
+    };
+    let home = setting(connection, "home_directory")
+        .map(std::path::PathBuf::from)
+        .or_else(util::home_dir::home_dir);
+    let directory = match setting(connection, "extension_directory") {
+        Some(directory) => match directory.strip_prefix('~') {
+            Some(rest) => home.map(|home| {
+                let mut expanded = home.into_os_string();
+                expanded.push(rest);
+                std::path::PathBuf::from(expanded)
+            }),
+            None => Some(std::path::PathBuf::from(directory)),
+        },
+        None => home.map(|home| home.join(".duckdb").join("extensions")),
+    };
+    let _directory_lock = directory.and_then(|directory| {
+        let path = directory.join("spice-install.lock");
+        std::fs::create_dir_all(&directory)
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+            })
+            .or_else(|_| std::fs::File::open(&path))
+            .and_then(|file| file.lock().map(|()| file))
+            .ok()
+    });
+    for extension in ["ducklake", "httpfs"] {
+        execute_sql(connection, &format!("INSTALL {extension}"))?;
+        execute_sql(connection, &format!("LOAD {extension}"))?;
+    }
+    Ok(())
+}
 
 /// S3 credential parameters for `DuckLake` connectors.
 ///
@@ -41,26 +325,6 @@ pub struct DuckLakeS3Params {
     pub session_token: Option<String>,
     pub endpoint: Option<String>,
     pub allow_http: bool,
-}
-
-/// Installs and loads `httpfs` in `DuckDB`, then optionally creates an S3 secret
-/// from explicit parameters. If no explicit credentials are given, `DuckDB` uses
-/// its `credential_chain` provider which reads standard `AWS_*` environment variables.
-///
-/// # Errors
-///
-/// Returns a `duckdb::Error` if extension installation or secret creation fails.
-pub fn configure_duckdb_httpfs(
-    conn: &duckdb::Connection,
-    s3: &DuckLakeS3Params,
-) -> Result<(), duckdb::Error> {
-    install_and_load_extension(conn, "httpfs")?;
-
-    if let Some(secret_sql) = build_ducklake_s3_secret_sql(s3) {
-        conn.execute(&secret_sql, [])?;
-    }
-
-    Ok(())
 }
 
 /// Whether a configured session token will be dropped rather than sent to `DuckDB`.
@@ -316,6 +580,194 @@ mod tests {
         assert_eq!(
             build_ducklake_attach_sql("s3://b/o'brien.ducklake", "my\"lake", true),
             "ATTACH 'ducklake:s3://b/o''brien.ducklake' AS \"my\"\"lake\" (AUTOMATIC_MIGRATION TRUE)"
+        );
+    }
+
+    fn hashed(path: &str, connection_string: &str, catalog_name: &str) -> Vec<u8> {
+        super::join_identity(path, connection_string, catalog_name)
+    }
+
+    fn holds(bytes: &[u8], text: &str) -> bool {
+        bytes
+            .windows(text.len())
+            .any(|window| window == text.as_bytes())
+    }
+
+    /// Pools whose metadata connection strings differ only in the password
+    /// attach the same lake, so they share a join context, and the password
+    /// never reaches the hasher: not as written, and not decoded.
+    #[test]
+    fn the_join_context_leaves_the_password_out() {
+        for (a, b, secrets) in [
+            (
+                "postgres:dbname=lake host=127.0.0.1 port=5432 user=spice password=correct-horse-1",
+                "postgres:dbname=lake host=127.0.0.1 port=5432 user=spice password=battery-staple-2",
+                &["correct-horse-1", "battery-staple-2"][..],
+            ),
+            (
+                r"postgres:password = 'it\'s-secret one' dbname=lake user=spice",
+                r"postgres:password = 'it\'s-secret two' dbname=lake user=spice",
+                &[r"it\'s-secret", "it's-secret"][..],
+            ),
+            (
+                "postgres:postgresql://spice:p%40ss-one@127.0.0.1:5432/lake",
+                "postgres:postgresql://spice:p%40ss-two@127.0.0.1:5432/lake",
+                &["p%40ss-", "p@ss-"][..],
+            ),
+            (
+                "postgresql://spice@127.0.0.1:5432/lake?password=query-one&sslmode=disable",
+                "postgresql://spice@127.0.0.1:5432/lake?password=query-two&sslmode=disable",
+                &["query-one", "query-two"][..],
+            ),
+            (
+                r#"mysql:host=127.0.0.1 user=spice passwd="my secret one" database=lake"#,
+                r#"mysql:host=127.0.0.1 user=spice passwd="my secret two" database=lake"#,
+                &["my secret"][..],
+            ),
+            (
+                "mysql:password=mysql-one host=127.0.0.1 database=lake",
+                "mysql:password=mysql-two host=127.0.0.1 database=lake",
+                &["mysql-one", "mysql-two"][..],
+            ),
+            (
+                r#"mysql:"password"=quoted-one host=127.0.0.1 database=lake"#,
+                r#"mysql:"PASSWD"=quoted-two host=127.0.0.1 database=lake"#,
+                &["quoted-one", "quoted-two"][..],
+            ),
+            (
+                "postgres:postgresql://spice:a?password=uri-one@127.0.0.1:5432/lake",
+                "postgres:postgresql://spice:b?password=uri-two@127.0.0.1:5432/lake",
+                &["uri-one", "uri-two", "a?password", "b?password"][..],
+            ),
+            // A password emptied by a later pair is still a secret.
+            (
+                "postgres:dbname=lake user=spice password=overridden-one password=",
+                "postgres:dbname=lake user=spice",
+                &["overridden-one"][..],
+            ),
+        ] {
+            assert_eq!(
+                super::join_context(":memory:", a, "lake"),
+                super::join_context(":memory:", b, "lake"),
+                "{a}"
+            );
+            for s in [a, b] {
+                let bytes = hashed(":memory:", s, "lake");
+                for secret in secrets {
+                    assert!(!holds(&bytes, secret), "{secret} reached the hasher: {s}");
+                }
+            }
+        }
+    }
+
+    /// A connection string without a password reaches the hasher as written,
+    /// so its join context is the one it always had.
+    #[test]
+    fn a_connection_string_without_a_password_keeps_its_join_context() {
+        for s in [
+            "metadata.ducklake",
+            "s3://bucket/lake/metadata.ducklake",
+            "sqlite:metadata.sqlite",
+            "postgres:dbname=lake host=127.0.0.1 port=5432 user=spice",
+            "postgres:postgresql://spice@127.0.0.1:5432/lake",
+            "mysql:host=127.0.0.1 database=lake",
+        ] {
+            assert_eq!(
+                hashed("lake.db", s, "lake"),
+                format!("lake.db\0{s}\0lake\0").into_bytes(),
+                "{s}"
+            );
+        }
+        // Computed from the same bytes by an XxHash64 written apart from this
+        // crate, which also reproduces the contexts a trunk build printed.
+        assert_eq!(
+            super::join_context(":memory:", "metadata.ducklake", "ducklake"),
+            "ducklake:35e31303b41f39cb"
+        );
+        assert_eq!(
+            super::join_context(
+                "lake.db",
+                "postgres:dbname=lake host=127.0.0.1 port=5432 user=spice",
+                "lake"
+            ),
+            "ducklake:faf513d2ca296302"
+        );
+    }
+
+    /// Everything but the password still tells lakes apart: a join between
+    /// pools over different lakes, or attached under different names, is
+    /// never pushed down to one of them.
+    #[test]
+    fn pools_over_different_lakes_keep_different_join_contexts() {
+        let base = "postgres:dbname=lake host=h1 port=5432 user=spice password=p";
+        let context = super::join_context(":memory:", base, "lake");
+        for (path, connection_string, catalog_name) in [
+            ("lake.db", base, "lake"),
+            (":memory:", base, "other"),
+            (
+                ":memory:",
+                "postgres:dbname=other host=h1 port=5432 user=spice password=p",
+                "lake",
+            ),
+            (
+                ":memory:",
+                "postgres:dbname=lake host=h2 port=5432 user=spice password=p",
+                "lake",
+            ),
+            (
+                ":memory:",
+                "postgres:dbname=lake host=h1 port=5433 user=spice password=p",
+                "lake",
+            ),
+            (
+                ":memory:",
+                "postgres:dbname=lake host=h1 port=5432 user=other password=p",
+                "lake",
+            ),
+            (
+                ":memory:",
+                "mysql:dbname=lake host=h1 port=5432 user=spice password=p",
+                "lake",
+            ),
+        ] {
+            assert_ne!(
+                super::join_context(path, connection_string, catalog_name),
+                context,
+                "{path} {connection_string} {catalog_name}"
+            );
+        }
+        // libpq reads both passwords as `a?password=X` and reaches database
+        // `db1` on one host and `db2` on another.
+        assert_ne!(
+            super::join_context(
+                ":memory:",
+                "postgres:postgresql://u:a?password=X@127.0.0.1:5432/db1",
+                "lake"
+            ),
+            super::join_context(
+                ":memory:",
+                "postgres:postgresql://u:a?password=X@localhost:5432/db2",
+                "lake"
+            ),
+        );
+    }
+
+    /// A string whose password cannot be held apart never reaches the hasher;
+    /// a number of the pool's own does, so each such pool has its own join
+    /// context and pushes joins down only between its own tables.
+    #[test]
+    fn an_unreadable_connection_string_gets_a_join_context_of_its_own() {
+        let s = "postgres:dbname=lake user=spice password='unterminated-secret";
+        let bytes = hashed(":memory:", s, "lake");
+        // The path, the marker, 8 bytes of the pool's number, and the name.
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(
+            [&bytes[..10], &bytes[18..]].concat(),
+            b":memory:\0\xff\0lake\0"
+        );
+        assert_ne!(
+            super::join_context(":memory:", s, "lake"),
+            super::join_context(":memory:", s, "lake")
         );
     }
 }

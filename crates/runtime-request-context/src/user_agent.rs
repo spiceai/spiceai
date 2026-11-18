@@ -230,16 +230,6 @@ fn get_os_version_internal() -> Result<String, GenericError> {
     Ok(version)
 }
 
-#[cfg(target_family = "windows")]
-fn get_os_version_internal() -> Result<String, GenericError> {
-    use winver::WindowsVersion;
-    if let Some(version) = WindowsVersion::detect() {
-        Ok(version.to_string())
-    } else {
-        Ok("unknown".to_string())
-    }
-}
-
 #[must_use]
 fn get_runtime_os_string() -> String {
     let os_type = os_type();
@@ -422,21 +412,21 @@ mod tests {
     #[test]
     fn test_os_type() {
         let result = os_type();
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
         assert_ne!(result, "unknown");
     }
 
     #[test]
     fn test_os_arch() {
         let result = os_arch();
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
         assert_ne!(result, "unknown");
     }
 
     #[test]
     fn test_get_runtime_os_string() {
         let result = get_runtime_os_string();
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
 
         // Should contain OS type
         assert!(result.contains(os_type()));

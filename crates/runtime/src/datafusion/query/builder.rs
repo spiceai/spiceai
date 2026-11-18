@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashSet, sync::Arc};
 
 use datafusion::common::ParamValues;
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use tokio::time::Instant;
@@ -53,6 +54,9 @@ pub struct QueryBuilder {
     results_cache_mode: ResultsCacheMode,
     runtime_binding: QueryRuntimeBinding,
     emit_tracker: bool,
+    serialized_plan_cache_key: Option<Arc<str>>,
+    planning_session: Option<Box<SessionState>>,
+    fetch: Option<usize>,
 }
 
 impl QueryBuilder {
@@ -68,6 +72,9 @@ impl QueryBuilder {
             results_cache_mode: ResultsCacheMode::default(),
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
             emit_tracker: true,
+            serialized_plan_cache_key: None,
+            planning_session: None,
+            fetch: None,
         }
     }
 
@@ -88,6 +95,9 @@ impl QueryBuilder {
             results_cache_mode: ResultsCacheMode::default(),
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
             emit_tracker: true,
+            serialized_plan_cache_key: None,
+            planning_session: None,
+            fetch: None,
         }
     }
 
@@ -111,7 +121,23 @@ impl QueryBuilder {
             results_cache_mode: ResultsCacheMode::default(),
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
             emit_tracker: true,
+            serialized_plan_cache_key: None,
+            planning_session: None,
+            fetch: None,
         }
+    }
+
+    /// A wire plan is keyed by its serialized digest only in plan cache mode.
+    pub(crate) fn from_substrait_plan(
+        plan: LogicalPlan,
+        digest: String,
+        session: Option<SessionState>,
+        df: Arc<DataFusion>,
+    ) -> Self {
+        let mut builder = Self::from_plan(plan, digest.clone(), df);
+        builder.serialized_plan_cache_key = Some(digest.into());
+        builder.planning_session = session.map(Box::new);
+        builder
     }
 
     #[must_use]
@@ -157,6 +183,18 @@ impl QueryBuilder {
     #[must_use]
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Returns at most `rows` rows: the query runs as if it ended in `LIMIT rows`, so sources
+    /// and operators stop early and the query finishes once it has them. A statement that writes
+    /// or describes (DML, DDL, `COPY`, `EXPLAIN`, `SET`) is not limited. The limit is part of the
+    /// planned query, so the results cache keeps a limited answer apart from the full one.
+    ///
+    /// Used by the built-in `sql` tool, which shows a model only the first rows of a result.
+    #[must_use]
+    pub fn fetch(mut self, rows: usize) -> Self {
+        self.fetch = Some(rows);
         self
     }
 
@@ -238,6 +276,9 @@ impl QueryBuilder {
             read_only: self.read_only,
             results_cache_mode: self.results_cache_mode,
             runtime_binding: self.runtime_binding,
+            serialized_plan_cache_key: self.serialized_plan_cache_key,
+            planning_session: self.planning_session,
+            fetch: self.fetch,
         }
     }
 }

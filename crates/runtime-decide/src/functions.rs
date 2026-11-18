@@ -127,7 +127,8 @@ impl DecisionUdf {
     pub(crate) fn new(kind: Kind, decider: Arc<Decider>) -> Self {
         let layout = kind.layout();
         // `Any` takes every argument as it is: the input may be any type, and the
-        // constants are checked while the query is planned, with messages that name them.
+        // constants are checked with messages that name them, while the query is planned
+        // or, for a per-query subquery, when the function runs.
         // Fixed arities let the parameters have names; `AsyncScalarUDF` does not
         // forward `coerce_types`, which a variable-arity signature would need.
         let arities: Vec<TypeSignature> = (layout.required..=layout.params.len())

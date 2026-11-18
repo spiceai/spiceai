@@ -149,7 +149,7 @@ async fn start_runtime_process(
 ///
 /// Resolution comes before the install, so a `SPICED_PATH` that names nothing
 /// is reported rather than answered with a download of the latest release.
-async fn resolve_or_install(ctx: &RuntimeContext) -> Result<ResolvedSpiced> {
+pub(crate) async fn resolve_or_install(ctx: &RuntimeContext) -> Result<ResolvedSpiced> {
     if let Some(resolved) = ctx.resolve_spiced()? {
         return Ok(resolved);
     }
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn a_quiet_run_adds_no_flags_of_its_own() {
-        assert!(spiced_args(&RunConfig::default(), None).is_empty());
+        assert_eq!(spiced_args(&RunConfig::default(), None), [] as [String; 0]);
     }
 
     #[test]

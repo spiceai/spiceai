@@ -233,7 +233,8 @@ github_compare_files HEAD
 
     def test_nextest_filter_cannot_hide_failure(self):
         # Run the repository's actual nextest + verify-cli recipes. Only workspace
-        # selection and lint are adapted to this dependency-free external crate.
+        # selection, lint and the libduckdb install are adapted to this
+        # dependency-free external crate, which loads no DuckDB.
         makefile = re.sub(r"(?m)^NEXTEST_SELECTION :=[^\n]*(?:\n\t[^\n]*)*",
                           "NEXTEST_SELECTION := --workspace", (REPO / "Makefile").read_text())
         makefile = re.sub(r"(?m)^NEXTEST_FILTER :=.*$", "NEXTEST_FILTER := kind(=lib)", makefile)
@@ -257,6 +258,8 @@ inherits = "dev"
         self.write("version.txt", "0.1.0\n")
         self.write("scripts/verify_cli_build.py", (REPO / "scripts/verify_cli_build.py").read_text())
         self.write("scripts/nextest_build_targets.py", (REPO / "scripts/nextest_build_targets.py").read_text())
+        # `nextest` puts the directory this prints on ADBC_DRIVER_PATH.
+        self.write("scripts/libduckdb.py", "import pathlib\nprint(pathlib.Path(__file__).parent)\n")
         self.run_ok("cargo", "generate-lockfile", "--offline")
         self.commit()
         for controls in (
@@ -305,6 +308,53 @@ inherits = "dev"
         self.assertEqual((self.root / "status").read_text().strip(), "success")
         self.assertEqual((self.root / "description").read_text().strip(),
                          "Signed off by audit — verified in batch abc")
+
+    def test_targeted_steps_select_members_that_share_a_name(self):
+        self.write("Cargo.toml", '[workspace]\nresolver = "2"\n'
+                   'members = ["crates/dup-new", "crates/user"]\nexclude = ["crates/dup-old"]\n')
+        for directory, version, features in (("dup-new", "0.2.0", "std = []\n"),
+                                             ("dup-old", "0.1.0", "")):
+            self.write(f"crates/{directory}/Cargo.toml",
+                       f'[package]\nname = "dup"\nversion = "{version}"\nedition = "2021"\n'
+                       f"\n[features]\ndefault = []\n{features}")
+            self.write(f"crates/{directory}/src/lib.rs", "pub fn version() {}\n")
+        self.write("crates/user/Cargo.toml",
+                   '[package]\nname = "user"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                   '[dependencies]\ndup = { path = "../dup-new", features = ["std"] }\n'
+                   'dup-old = { package = "dup", path = "../dup-old" }\n')
+        self.write("crates/user/src/lib.rs", "pub fn call() { dup::version(); dup_old::version() }\n")
+        self.run_ok("cargo", "generate-lockfile", "--offline")
+        self.commit()
+        script = '''source "$1"
+VCS=git
+packages=$(changed_workspace_packages HEAD)
+libs=$(packages_with_lib_targets "$packages")
+features=$(features_for_packages "$(workspace_features_for_packages "$packages")" "$libs")
+printf 'packages=%s\\nlibs=%s\\nfeatures=%s\\n' "$packages" "$libs" "$features"
+flags=()
+for package in $libs; do flags+=(-p "$package"); done
+cargo check --offline --lib "${flags[@]}" ${features:+--features "$features"}
+'''
+        result = self.run_command("bash", "-c", script, "test", str(SUBJECT))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        selected = dict(line.split("=", 1) for line in result.stdout.splitlines()
+                        if line.split("=", 1)[0] in ("packages", "libs", "features"))
+        self.assertEqual(selected["packages"].split(), ["dup@0.2.0", "user"])
+        self.assertEqual(selected["libs"].split(), ["dup@0.2.0", "user"])
+        self.assertEqual(selected["features"], "dup/std")
+
+    def test_scoped_lint_accepts_a_qualified_package(self):
+        result = subprocess.run(
+            ["make", "--no-print-directory", "-n", "lint-rust", "PACKAGES=chrono@0.4.45"],
+            cwd=REPO, env=self.env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        commands = {line.split()[1]: shlex.split(line) for line in result.stdout.splitlines()
+                    if line.startswith(("cargo fmt ", "cargo clippy "))}
+        self.assertIn("-p chrono -- --check", " ".join(commands["fmt"]))
+        self.assertIn("-p chrono@0.4.45", " ".join(commands["clippy"]))
+        self.assertIn("--lib", commands["clippy"])
 
     def test_gate_features_match(self):
         result = subprocess.run(

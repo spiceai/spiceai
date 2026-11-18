@@ -132,12 +132,6 @@ endif
 # built and never run. None needs excluding today; one whose tests could not
 # run in the gate would be excluded by name here, with the reason beside it.
 #
-# Running cayenne's integration tests under the workspace resolve rather than
-# `-p cayenne` enables its `turso` feature, which puts 304 `*_turso` variants in
-# the gate alongside their SQLite siblings. They need more stack than the 2 MiB
-# std gives a thread; `test_with_backends!` reserves it (see
-# `crates/cayenne/tests/common/mod.rs`), so no name needs excluding here.
-#
 # Shared so `nextest` and `verify-cli` cannot drift onto different selections:
 # a different selection resolves different features, which would make verify-cli
 # recompile instead of reading the build nextest just did.
@@ -167,7 +161,7 @@ endif
 # selected for the same reason: each stands a local one-shot HTTP server up on an
 # ephemeral port and drives a provider adapter against it, so they exercise the
 # real client's error mapping with no credentials and no external service, as
-# does `model2vec_hf_cache` against a local Hugging Face cache. They are modules
+# do `model2vec_hf_cache`, `safetensors_hf_cache` and `gguf_hf_cache` against a local Hugging Face cache. They are modules
 # of `llms`'s `integration` binary; its `llms` module calls the live provider
 # APIs and needs a `.env`, so it stays in the nightly gate.
 #
@@ -182,13 +176,13 @@ endif
 # silently never built it — selection looked complete while three lanes never
 # ran. See `crates/cayenne/tests/correctness/README.md`.
 #
-# Scoped to `cayenne` deliberately. `runtime/duckdb,runtime/sqlite` would also
-# unlock runtime's accelerator-parity binary, but the feature flows through the
+# Scoped to `cayenne` deliberately. `runtime/sqlite` would also unlock runtime's
+# accelerator-parity binary, but the feature flows through the
 # whole `--all` build: every runtime test binary the gate builds relinks with
 # them, and those link at hundreds of megabytes each. That is a
 # large, permanent cost on every sign-off and merge-queue run to gain two
 # micro-shape comparisons — the thinnest of the five lanes. It belongs in the
-# integration workflow, which already builds with `duckdb,sqlite`.
+# integration workflow, which already builds with `adbc,sqlite`.
 #
 # The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
 # build script fetches over the network, so folding it into the gate would make
@@ -240,7 +234,17 @@ print-rust-gate-features:
 # large to load (dyld aborts before `main`, failing the whole run).
 # `runtime`'s `chat_tool_use` binary drives `/v1/chat/completions` through the
 # tool-use loop against an in-process mock of the Anthropic Messages API.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use))
+# `duckdb-oracle`'s `integration` binary checks the installed-libduckdb driver
+# every DuckDB result-correctness lane compares against: Arrow types, NULLs and
+# settings round-trip through ADBC, and a database file reopens. It loads the
+# libduckdb `nextest` installs, needing no credentials and no service.
+# `runtime-datafusion`'s `is_distinct_from_precedence` binary is self-contained
+# (in-memory SessionContext, no credentials) and gates the vendored sqlparser
+# fix that binds `IS [NOT] DISTINCT FROM` tighter than `AND` / `OR`.
+# `accelerator-cayenne`'s `integration` binary opens Cayenne accelerations through
+# the accelerator registry on temp dirs: stored data files, partitioning, lookup
+# indexes, snapshot restore and source acknowledgement. It needs no service.
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use)) + (package(=runtime-datafusion) & binary(=is_distinct_from_precedence)) + binary_id(=accelerator-cayenne::integration)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -260,10 +264,22 @@ endif
 # and `verify-cli` so both build the same graph.
 _NEXTEST_TARGETS_CMD = $(PYTHON) scripts/nextest_build_targets.py --filter '$(_NEXTEST_FILTER)' -- $(NEXTEST_SELECTION) $(NEXTEST_FLAG)
 .PHONY: nextest
+# The DuckDB result-correctness lane loads an installed libduckdb through ADBC
+# rather than a DuckDB built into the test binaries. `scripts/libduckdb.py` installs the newest release
+# `test/duckdb_versions.json` lists, checked against its recorded SHA-256 and
+# cached under ~/.cache/spice/libduckdb, so only a machine's first sign-off for a
+# release downloads it. Its manifest goes first on ADBC_DRIVER_PATH, so every
+# sign-off and merge-queue run tests the same release whatever else is installed
+# (LIBDUCKDB_VERSION picks another listed one). A failed install stops the gate:
+# a lane that cannot load its oracle must not pass by not running.
+_WITH_LIBDUCKDB = libduckdb="$$($(PYTHON) scripts/libduckdb.py)" || exit $$?; \
+	export ADBC_DRIVER_PATH="$$libduckdb$${ADBC_DRIVER_PATH:+:$$ADBC_DRIVER_PATH}";
+
 nextest:
 	@echo 'note: the chDB result-correctness lane is not in this run (it needs libchdb; CI runs it in correctness_chdb.yml).' >&2
 	@echo '      to run it here: cargo test -p cayenne --features result-correctness-chdb --test result_correctness_vs_chdb_test' >&2
-	@targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
+	@$(_WITH_LIBDUCKDB) \
+	targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
 	cargo nextest run $(NEXTEST_SELECTION) $$targets $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
@@ -300,26 +316,28 @@ verify-cli:
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
-	@cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@$(_WITH_LIBDUCKDB) \
+	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture
+	# The `adbc::` tests need the SQLite ADBC driver; run them with `dbc install sqlite` and `-E 'test(/^adbc::/)'`, as integration_adbc.yml does.
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(/^adbc::/)'
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture -E 'not test(spiceai_integration_test)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,adbc,sqlite --no-capture -E 'not test(spiceai_integration_test) and not test(/^adbc::/)'
 
 .PHONY: test-integration-models
 test-integration-models:
-	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture
+	@cargo test -p runtime --test integration_models --features models -- --nocapture
 
 .PHONY: test-integration-models-without-openai
 test-integration-models-without-openai:
-	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture --skip openai_test
+	@cargo test -p runtime --test integration_models --features models -- --nocapture --skip openai_test
 
 .PHONY: test-bench
 test-bench:
@@ -331,7 +349,7 @@ test-bench:
 ## workspace-wide linting (unless PACKAGES is set, then uses package defaults —
 ## workspace features like `models` are not valid on every crate).
 ## Example: make lint-rust PACKAGES="runtime data_components"
-## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
+## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="adbc,postgres"
 PACKAGES ?=
 FEATURES ?=
 # Use strip non-empty checks (not bare ifdef): PACKAGES/FEATURES are always
@@ -340,7 +358,9 @@ FEATURES ?=
 ifneq ($(strip $(PACKAGES)),)
 _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
-_FMT_FLAGS := $(_LINT_PKG_FLAGS)
+# `cargo fmt -p` takes a bare member name, not the `name@version` spec that
+# scripts/signoff passes when a dependency shares a member's name.
+_FMT_FLAGS := $(foreach p,$(PACKAGES),-p $(firstword $(subst @, ,$(p))))
 # Scoped runs pass --lib only when a selected package has a library: it is a
 # fatal `no library targets found` when every selected package is bin-only
 # (e.g. testoperator alone), which would break the targeted pre-lint that
@@ -348,7 +368,7 @@ _FMT_FLAGS := $(_LINT_PKG_FLAGS)
 # runs only for the lint recipes, not for every target that reads PACKAGES. If
 # the metadata cannot be read, --lib is left out: --tests still lints each
 # library through its unit-test build, and the full workspace lint follows.
-_LINT_LIB_FLAG = $(shell cargo metadata --no-deps --format-version 1 2>/dev/null | $(PYTHON) -c 'import json, sys; wanted = set(sys.argv[1:]); packages = json.load(sys.stdin)["packages"]; lib_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}; print("--lib" if any(p["name"] in wanted and lib_kinds & set(t["kind"]) for p in packages for t in p["targets"]) else "")' $(PACKAGES) 2>/dev/null)
+_LINT_LIB_FLAG = $(shell cargo metadata --no-deps --format-version 1 2>/dev/null | $(PYTHON) -c 'import json, sys; wanted = {spec.split("@")[0] for spec in sys.argv[1:]}; packages = json.load(sys.stdin)["packages"]; lib_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}; print("--lib" if any(p["name"] in wanted and lib_kinds & set(t["kind"]) for p in packages for t in p["targets"]) else "")' $(PACKAGES) 2>/dev/null)
 _LINT_TARGET_FLAGS = $(_LINT_LIB_FLAG) --bins --tests
 else
 _LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
@@ -422,6 +442,9 @@ lint-rust:
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
 	$(PYTHON) scripts/test_check_module_reachability.py
 	$(PYTHON) scripts/check_module_reachability.py
+	## Cayenne data-path guard (fast, no compile): data files go through each dataset's ObjectStore, so no new std::fs/tokio::fs call may enter crates/cayenne/src/provider
+	$(PYTHON) scripts/test_check_cayenne_data_path_fs.py
+	$(PYTHON) scripts/check_cayenne_data_path_fs.py
 	## Fork-pin guard (fast, no compile): a moved fork pin must come with a re-audit of that fork's patches. See docs/dev/fork_patches.md
 	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
 	$(PYTHON) scripts/test_check_fork_patches.py
@@ -443,7 +466,6 @@ lint-rust-fix:
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
 	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
-	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
 	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
 	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
@@ -512,7 +534,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # and it is not `default` minus `models`: it is an independent list maintained by hand right here,
 # so a feature added to `default` does not reach `make install-data-only` until it is added below
 # too, and no check reports the omission. The two currently differ in both directions, which is why
-# reading this list as "default, less the model bits" is wrong: -data is also an ADBC-less build
+# reading this list as "default, less the model bits" is wrong: -data is also a build
 # without any of the three feature-gated secret stores `default` turns on (aws-secrets-manager,
 # azure-keyvault and keyring-secret-store) — the env and Kubernetes stores are not feature-gated
 # at all, so a -data build still reads secrets from both of those — and it carries the PostgreSQL
@@ -521,7 +543,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # `default = [...]` array in bin/spiced/Cargo.toml.
 #
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb
+SPICED_DATA_FEATURES := adbc,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build

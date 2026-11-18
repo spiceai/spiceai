@@ -50,7 +50,7 @@ struct Cli {
 enum Commands {
     /// Trigger a build for the current (or specified) branch.
     ///
-    /// Triggers the '`build_and_release`' workflow in GitHub Actions.
+    /// Triggers the '`build_release`' workflow in GitHub Actions.
     /// If an active build exists for the latest commit (SHA-based), it will be reused.
     /// If a successful build exists (for this commit), no action is taken.
     Trigger {
@@ -278,7 +278,7 @@ fn trigger_build(
             "run",
             "list",
             "--workflow",
-            "build_and_release.yml",
+            "build_release.yml",
             "--branch",
             &branch,
             "--limit",
@@ -345,12 +345,12 @@ fn trigger_build(
                 ("macos", "aarch64") => "macOS aarch64 (Apple Silicon)".to_string(),
                 ("macos", "x86_64") => {
                     anyhow::bail!(
-                        "Failed to determine build platform for OS macOS and architecture x86_64: Intel macOS is not supported by the build_and_release workflow. Use an Apple Silicon macOS or supported Linux machine to trigger this build."
+                        "Failed to determine build platform for OS macOS and architecture x86_64: Intel macOS is not supported by the build_release workflow. Use an Apple Silicon macOS or supported Linux machine to trigger this build."
                     );
                 }
                 (other_os, other_arch) => {
                     anyhow::bail!(
-                        "Failed to determine build platform for OS {other_os} and architecture {other_arch}: Unsupported combination for build_and_release workflow. Supported combinations are: linux/aarch64, linux/x86_64, macos/aarch64.",
+                        "Failed to determine build platform for OS {other_os} and architecture {other_arch}: Unsupported combination for build_release workflow. Supported combinations are: linux/aarch64, linux/x86_64, macos/aarch64.",
                     );
                 }
             }
@@ -361,7 +361,7 @@ fn trigger_build(
         let mut cmd_args: Vec<String> = vec![
             "workflow".to_string(),
             "run".to_string(),
-            "build_and_release.yml".to_string(),
+            "build_release.yml".to_string(),
             "--ref".to_string(),
             branch.clone(),
             "-f".to_string(),
@@ -397,7 +397,7 @@ fn trigger_build(
 
         if !wait {
             println!("You can check the status with:");
-            println!("  gh run list --workflow build_and_release.yml --branch \"{branch}\"");
+            println!("  gh run list --workflow build_release.yml --branch \"{branch}\"");
             return Ok(());
         }
 
@@ -414,7 +414,7 @@ fn trigger_build(
                     "run",
                     "list",
                     "--workflow",
-                    "build_and_release.yml",
+                    "build_release.yml",
                     "--branch",
                     &branch,
                     "--limit",
@@ -521,7 +521,7 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
             "run",
             "list",
             "--workflow",
-            "build_and_release.yml",
+            "build_release.yml",
             "--branch",
             &branch,
             "--status",

@@ -19,12 +19,8 @@ limitations under the License.
 //! Connects to specific tables in a `DuckLake` catalog using `DuckDB` with the `ducklake` extension.
 
 use async_trait::async_trait;
-use data_components::Read;
-use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
-use data_components::ducklake::{
-    DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
-};
+use data_components::ducklake::{DuckLakePool, DuckLakeS3Params, create_ducklake_pool};
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
@@ -32,11 +28,7 @@ use data_connector_api::{
 };
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion_table_providers::UnsupportedTypeAction;
-use datafusion_table_providers::duckdb::DuckDBTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use duckdb::AccessMode;
+use datafusion_table_providers::adbc::AdbcTableFactory;
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::dialect::new_duckdb_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
@@ -56,7 +48,9 @@ pub enum Error {
     MissingConnectionString,
 
     #[snafu(display("Failed to initialize DuckLake extension: {source}"))]
-    UnableToInitializeDuckLake { source: duckdb::Error },
+    UnableToInitializeDuckLake {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Failed to get underlying DuckDB connection"))]
     FailedToGetDuckDbConnection,
@@ -65,10 +59,18 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckLake {
-    duckdb_factory: DuckDBTableFactory,
-    pool: Arc<DuckDbConnectionPool>,
+    duckdb_factory: Option<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
+    pool: Arc<DuckLakePool>,
     catalog_name: String,
     write_lock: Arc<Mutex<()>>,
+}
+
+impl Drop for DuckLake {
+    fn drop(&mut self) {
+        if let Some(factory) = self.duckdb_factory.take() {
+            data_components::adbc_helpers::offload_adbc_drop(factory);
+        }
+    }
 }
 
 impl std::fmt::Debug for DuckLake {
@@ -132,63 +134,11 @@ fn create_ducklake_factory(
     open_path: Option<&str>,
     automatic_migration: bool,
     params: &ConnectorParams,
-) -> AnyErrorResult<(DuckDBTableFactory, Arc<DuckDbConnectionPool>, String)> {
-    let pool = if let Some(path) = open_path {
-        Arc::new(with_utc_session_timezone(
-            DuckDbConnectionPool::new_file(path, &AccessMode::ReadWrite)
-                .map_err(|source| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "ducklake".to_string(),
-                    connector_component: params.component.clone(),
-                    source,
-                })?
-                .with_unsupported_type_action(
-                    params
-                        .unsupported_type_action
-                        .unwrap_or(UnsupportedTypeAction::Error),
-                ),
-        ))
-    } else {
-        Arc::new(with_utc_session_timezone(
-            DuckDbConnectionPool::new_memory()
-                .map_err(|source| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "ducklake".to_string(),
-                    connector_component: params.component.clone(),
-                    source,
-                })?
-                .with_unsupported_type_action(
-                    params
-                        .unsupported_type_action
-                        .unwrap_or(UnsupportedTypeAction::Error),
-                ),
-        ))
-    };
-
-    let conn = Arc::clone(&pool).connect_sync().map_err(|source| {
-        DataConnectorError::UnableToConnectInternal {
-            dataconnector: "ducklake".to_string(),
-            connector_component: params.component.clone(),
-            source,
-        }
-    })?;
-
-    let duckdb_wrapper = conn
-        .as_any()
-        .downcast_ref::<DuckDbConnection>()
-        .ok_or_else(|| DataConnectorError::InvalidConfiguration {
-            dataconnector: "ducklake".to_string(),
-            connector_component: params.component.clone(),
-            message: "Failed to get underlying DuckDB connection".to_string(),
-            source: Box::new(Error::FailedToGetDuckDbConnection),
-        })?;
-
-    install_and_load_extension(&duckdb_wrapper.conn, "ducklake")
-        .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-            dataconnector: "ducklake".to_string(),
-            connector_component: params.component.clone(),
-            source: Box::new(e),
-        })?;
-
+) -> AnyErrorResult<(
+    AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
+    Arc<DuckLakePool>,
+    String,
+)> {
     let s3_params = DuckLakeS3Params {
         region: params
             .parameters
@@ -228,25 +178,19 @@ fn create_ducklake_factory(
             .is_some_and(|v| v == "true"),
     };
 
-    configure_duckdb_httpfs(&duckdb_wrapper.conn, &s3_params)
-        .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-            dataconnector: "ducklake".to_string(),
-            connector_component: params.component.clone(),
-            source: Box::new(e),
-        })?;
-
-    let attach_sql =
-        build_ducklake_attach_sql(connection_string, catalog_name, automatic_migration);
-    duckdb_wrapper
-        .conn
-        .execute(&attach_sql, [])
-        .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-            dataconnector: "ducklake".to_string(),
-            connector_component: params.component.clone(),
-            source: Box::new(e),
-        })?;
+    let pool = create_ducklake_pool(
+        open_path,
+        false,
+        connection_string,
+        catalog_name,
+        automatic_migration,
+        &s3_params,
+    )
+    .map_err(|source| DataConnectorError::UnableToConnectInternal {
+        dataconnector: "ducklake".into(),
+        connector_component: params.component.clone(),
+        source,
+    })?;
 
     // The dialect was installed without a deny-list, so every Spice-only UDF was
     // unparsed verbatim into the statement sent to DuckDB. See #10703 / #13664.
@@ -262,8 +206,7 @@ fn create_ducklake_factory(
         clippy::disallowed_methods,
         reason = "installs `deny_spice_functions_for_duckdb_table_providers()` below"
     )]
-    let factory = DuckDBTableFactory::new(Arc::clone(&pool))
-        .with_dialect(new_duckdb_dialect())
+    let factory = AdbcTableFactory::new(pool.adbc_pool()?)
         .with_function_support(deny_spice_functions_for_duckdb_table_providers());
     Ok((factory, pool, catalog_name.to_string()))
 }
@@ -313,7 +256,7 @@ impl DataConnectorFactory for DuckLakeFactory {
                 .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
             let params_for_factory = params.clone();
-            let (duckdb_factory, pool, catalog_name) = tokio::task::spawn_blocking(move || {
+            let init = tokio::task::spawn_blocking(move || {
                 create_ducklake_factory(
                     &connection_string,
                     &catalog_name,
@@ -321,16 +264,18 @@ impl DataConnectorFactory for DuckLakeFactory {
                     automatic_migration,
                     &params_for_factory,
                 )
-            })
-            .await
-            .map_err(|source| DataConnectorError::UnableToConnectInternal {
-                dataconnector: "ducklake".to_string(),
-                connector_component: params.component.clone(),
-                source: Box::new(source),
-            })??;
+            });
+            let (duckdb_factory, pool, catalog_name) =
+                data_components::adbc_helpers::await_adbc_initialization(init)
+                    .await
+                    .map_err(|source| DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "ducklake".to_string(),
+                        connector_component: params.component.clone(),
+                        source: Box::new(source),
+                    })?;
 
             Ok(Arc::new(DuckLake {
-                duckdb_factory,
+                duckdb_factory: Some(duckdb_factory),
                 pool,
                 catalog_name,
                 write_lock: Arc::new(Mutex::new(())),
@@ -375,7 +320,15 @@ impl DataConnector for DuckLake {
     ) -> data_connector_api::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_ref = self.resolve_table_reference(dataset);
 
-        Ok(Read::table_provider(&self.duckdb_factory, table_ref)
+        Ok(self
+            .duckdb_factory
+            .as_ref()
+            .ok_or_else(|| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "ducklake".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(data_components::ducklake::Error::Closed),
+            })?
+            .table_provider(table_ref, Some(new_duckdb_dialect()))
             .await
             .context(data_connector_api::UnableToGetReadProviderSnafu {
                 dataconnector: "ducklake",
@@ -390,7 +343,15 @@ impl DataConnector for DuckLake {
     ) -> Option<data_connector_api::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_ref = self.resolve_table_reference(dataset);
 
-        let read_provider = match Read::table_provider(&self.duckdb_factory, table_ref.clone())
+        let Some(factory) = self.duckdb_factory.as_ref() else {
+            return Some(Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "ducklake".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(data_components::ducklake::Error::Closed),
+            }));
+        };
+        let read_provider = match factory
+            .table_provider(table_ref.clone(), Some(new_duckdb_dialect()))
             .await
             .context(data_connector_api::UnableToGetReadProviderSnafu {
                 dataconnector: "ducklake",

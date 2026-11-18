@@ -34,7 +34,7 @@ use runtime_checkpoint_api::{
     BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
     kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
 };
-use runtime_component::dataset::DatasetSpec;
+use runtime_component::{Role, dataset::DatasetSpec};
 use runtime_parameters::Parameters;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -78,6 +78,9 @@ pub trait ConnectorContext: Send + Sync {
     /// The loaded app, for the runtime-level configuration a connector consults
     /// (e.g. `runtime.params`, `runtime.flight`).
     fn app(&self) -> Arc<App>;
+
+    /// The `--role` the runtime started with. A Spicepod reload cannot change it.
+    fn role(&self) -> Role;
 
     /// The process-wide per-origin HTTP rate-control registry, so connectors
     /// sharing an origin share one limiter.
@@ -163,4 +166,21 @@ pub struct ConnectorParams {
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub component: ConnectorComponent,
     pub io_runtime: Handle,
+}
+
+impl ConnectorParams {
+    /// The value of parameter `name` if the component's spicepod sets it, and `None` if it is
+    /// left at its default. [`Parameters`] fills in each spec's default, so whether the
+    /// parameter was set is read from the spicepod's own params.
+    #[must_use]
+    pub fn user_set(&self, name: &str) -> Option<&str> {
+        let spicepod_params = match &self.component {
+            ConnectorComponent::Dataset(dataset) => &dataset.params,
+            ConnectorComponent::Catalog(catalog) => &catalog.params,
+        };
+        spicepod_params
+            .contains_key(&self.parameters.user_param(name).0)
+            .then(|| self.parameters.get(name).expose().ok())
+            .flatten()
+    }
 }

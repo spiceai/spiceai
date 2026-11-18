@@ -54,7 +54,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 #[cfg(test)]
 use futures::StreamExt;
 use futures::stream;
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 use runtime_acceleration::change_sink::provider::partitioned_widening_refusal;
 #[cfg(test)]
 use runtime_acceleration::change_sink::provider::{
@@ -79,7 +79,7 @@ use runtime_datafusion::error::find_datafusion_root;
 use runtime_datafusion::error::format_datafusion_error;
 use runtime_metrics::acceleration as metrics;
 use runtime_status as status;
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
@@ -223,6 +223,27 @@ impl SourceDurabilityObserver {
 
 #[async_trait::async_trait]
 impl DurabilityObserver for SourceDurabilityObserver {
+    async fn record_position(
+        &self,
+        fence: u64,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // The newest committer at or below the fence holds the furthest position
+        // it covers. Only its owned write is taken under the lock.
+        let record = {
+            let queue = self.queue.lock().await;
+            queue
+                .iter()
+                .take_while(|(epoch, _)| *epoch <= fence)
+                .filter_map(|(_, committers)| committers.last())
+                .last()
+                .and_then(|committer| committer.record_position())
+        };
+        match record {
+            Some(record) => record.await.map_err(Into::into),
+            None => Ok(()),
+        }
+    }
+
     async fn on_durable(&self, fence: u64) {
         self.durable_fence.fetch_max(fence, Ordering::AcqRel);
         self.durability_known.store(true, Ordering::Release);
@@ -2535,7 +2556,6 @@ mod tests {
     // arms. Dropping the `file_update` arm was a real defect: `recreates_on_schema_mismatch`
     // makes a restart rebuild the table in that mode, and telling those operators a restart
     // will not help sends them to unnecessary manual recovery.
-    #[cfg(not(windows))]
     #[test]
     fn partitioned_widening_refusal_names_both_recovery_arms() {
         let msg = partitioned_widening_refusal("sales.orders", "column `total` widened i32 -> i64");
@@ -4611,7 +4631,6 @@ mod tests {
     /// The cross-epoch drain collapse: a coalescable dataset's whole
     /// `epoch <= durable` prefix folds to ONE commit carrying the max value —
     /// O(epochs) work becomes a single ack.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn slot_advancer_collapses_coalescable_epochs_to_one_commit() {
         let log = Arc::new(TokioMutex::new(Vec::new()));
@@ -4646,7 +4665,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn test_memory_cdc_durable_path_required_for_delete_truncate_and_unknown() {
         let upsert = create_test_change_batch(
@@ -4672,7 +4690,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn test_memory_cdc_delete_burst_stays_on_mem_path_when_sink_absorbs() {
         // A keyed delete-bearing burst stays on the mem path when the sink
@@ -4717,7 +4734,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn test_memory_cdc_deferral_requires_every_committer_to_support_deferral() {
         let log = CommitLog::new();
@@ -4747,7 +4763,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_slot_advancer_requeues_failed_deferred_committers() {
         let log = CommitLog::new();
@@ -5093,8 +5108,12 @@ mod tests {
 
         // The write must land far inside the 60s linger window. A 5s deadline is
         // generous for the immediate write yet nowhere near the buggy 60s wait.
+        // Wait for the envelope's commit, not the write counter: `CountingExec`
+        // counts when the insert plan starts executing, and the commit follows
+        // only once that write has finished, so asserting the commit log as soon
+        // as the counter moves races the write.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while insert_execution_calls.load(AtomicOrdering::SeqCst) == 0 {
+        while log.ids().await.is_empty() {
             assert!(
                 std::time::Instant::now() <= deadline,
                 "over-budget burst was held by the linger window instead of writing immediately",
@@ -5521,7 +5540,7 @@ mod tests {
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
             if self
                 .failures_remaining
-                .fetch_update(
+                .try_update(
                     AtomicOrdering::SeqCst,
                     AtomicOrdering::SeqCst,
                     |remaining| remaining.checked_sub(1),
@@ -6079,19 +6098,12 @@ mod tests {
 
     // -- Partitioned Cayenne: a widened CDC batch is refused, never acked -----
 
-    #[cfg(not(windows))]
     use data_accelerator_api::upsert_dedup::wrap_with_upsert_dedup_if_needed;
-    #[cfg(not(windows))]
     use data_components::poly::PolyTableProvider;
-    #[cfg(not(windows))]
     use datafusion::common::Constraints;
-    #[cfg(not(windows))]
     use datafusion::logical_expr::TableProviderFilterPushDown;
-    #[cfg(not(windows))]
     use datafusion::scalar::ScalarValue;
-    #[cfg(not(windows))]
     use runtime_table_partition::creator::{Error as PartitionCreatorError, PartitionCreator};
-    #[cfg(not(windows))]
     use runtime_table_partition::{Partition, expression::PartitionedBy};
 
     /// A [`PartitionCreator`] that starts empty and backs each new partition
@@ -6105,13 +6117,11 @@ mod tests {
     ///
     /// `direct_writes` selects the partition write behavior independently of the
     /// sink's schema-evolution capability.
-    #[cfg(not(windows))]
     #[derive(Debug)]
     struct MemPartitionCreator {
         direct_writes: bool,
     }
 
-    #[cfg(not(windows))]
     #[async_trait]
     impl PartitionCreator for MemPartitionCreator {
         fn accepts_direct_partition_writes(&self) -> bool {
@@ -6149,7 +6159,6 @@ mod tests {
     ///
     /// Writes must pass through every layer, including deduplication. Schema
     /// policy comes from the sink bound to this composed target.
-    #[cfg(not(windows))]
     async fn partitioned_accelerator(dedup: bool, direct_writes: bool) -> Arc<dyn TableProvider> {
         let partitioned = Arc::new(
             PartitionTableProvider::new(
@@ -6184,7 +6193,6 @@ mod tests {
     ///
     /// Reads through the whole provider stack the CDC apply writes to, so it sees
     /// what a query against the dataset would see.
-    #[cfg(not(windows))]
     async fn accelerator_row_ids(accelerator: &Arc<dyn TableProvider>) -> Vec<i32> {
         let ctx = SessionContext::new();
         let scan = accelerator
@@ -6216,7 +6224,6 @@ mod tests {
     /// Apply one widened single-upsert CDC envelope under `on_schema_change:
     /// append_new_columns`, and report `(run applied, committed envelope ids,
     /// dataset status is error)`.
-    #[cfg(not(windows))]
     async fn apply_widened_envelope(
         name: &str,
         accelerator: Arc<dyn TableProvider>,
@@ -6239,7 +6246,6 @@ mod tests {
     /// `seed` is applied through the ordinary CDC write path rather than written
     /// behind it, so a test asserting the acceleration is unmutated is asserting
     /// against rows the apply loop itself put there.
-    #[cfg(not(windows))]
     async fn apply_widened_burst(
         name: &str,
         accelerator: Arc<dyn TableProvider>,
@@ -6356,7 +6362,6 @@ mod tests {
     ///
     /// Run for both stack shapes: the upsert-dedup wrapper must not hide the
     /// partition provider from the refusal.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_widened_cdc_batch_on_partitioned_cayenne_is_never_acked() {
         for dedup in [false, true] {
@@ -6404,7 +6409,6 @@ mod tests {
     /// satisfied by the broken behavior, since a burst that refuses mid-way
     /// acknowledges nothing either. The row-level assertion is the one that fails
     /// without the preflight.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_refused_widening_burst_leaves_the_partitioned_acceleration_intact() {
         for (case, ops) in [
@@ -6462,7 +6466,6 @@ mod tests {
     /// This is the boundary of the preflight above rather than incidental: the
     /// preflight is reached by every burst, so without the upsert gate a
     /// delete-only burst would start classifying, which no burst shape did before.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_widened_delete_only_burst_still_applies_to_a_partitioned_cayenne() {
         for (case, ops) in [("delete_only", ["d"]), ("truncate_only", ["t"])] {
@@ -6505,7 +6508,6 @@ mod tests {
     /// partitions from any other engine's. Without these, the test above would
     /// also pass if the refusal fired for every dataset, or for every
     /// partitioned one.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_widened_cdc_batch_outside_a_partitioned_cayenne_still_commits() {
         for (case, accelerator) in [
@@ -6550,7 +6552,7 @@ mod tests {
         .await
         .expect("must not hang on empty stream");
         res.expect("must return Ok on empty stream");
-        assert!(log.ids().await.is_empty());
+        assert_eq!(log.ids().await, [] as [i32; 0]);
     }
 
     #[tokio::test]

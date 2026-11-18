@@ -194,7 +194,6 @@ async fn start_runtime(
 
 /// Cayenne evolves the table live under `sync_all_columns`, so the changes
 /// after the `ALTER` land with their fractional values.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_sync_all_columns_widens_live() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -237,7 +236,6 @@ async fn mysql_cayenne_sync_all_columns_widens_live() -> Result<(), anyhow::Erro
 
 /// Under `block` the registered `Int32` type stays: a value that type holds
 /// exactly is applied as it, and the stream keeps applying later changes.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_block_keeps_the_registered_type() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -273,64 +271,6 @@ async fn mysql_cayenne_block_keeps_the_registered_type() -> Result<(), anyhow::E
                  +----+----+-------+",
             )
             .await
-        })
-        .await
-}
-
-/// `DuckDB` cannot evolve mid-stream, so under `sync_all_columns` a change is
-/// cast to the table's current `Int32` type until a restart applies the
-/// evolution. A value the cast holds exactly is applied; one it would round is
-/// refused, never stored rounded.
-#[cfg(feature = "duckdb")]
-#[tokio::test(flavor = "multi_thread")]
-async fn mysql_duckdb_sync_all_columns_never_stores_a_rounded_value() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-    test_request_context()
-        .scope(async {
-            let container = common::start_mysql_docker_container().await?;
-            let port = container.host_port(3306)?;
-            let dir = tempfile::tempdir()?;
-            let table = "type_change_duckdb_sync";
-            let (pool, rt) = start(
-                port,
-                table,
-                "INT",
-                "duckdb",
-                OnSchemaChange::SyncAllColumns,
-                dir.path(),
-            )
-            .await?;
-            exec(&pool, &format!("ALTER TABLE {table} MODIFY k DOUBLE")).await?;
-            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 2.0)")).await?;
-            wait_for(
-                &rt,
-                &format!("SELECT id, k FROM {table} WHERE id = 4"),
-                "+----+---+\n\
-                 | id | k |\n\
-                 +----+---+\n\
-                 | 4  | 2 |\n\
-                 +----+---+",
-            )
-            .await?;
-
-            exec(&pool, &format!("INSERT INTO {table} VALUES (5, 2.5)")).await?;
-            // The refusal leaves nothing to poll for, so watch for the bound the
-            // other changes in this file arrive within.
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                let rows = run_query(
-                    &rt,
-                    &format!("SELECT count(*) AS c FROM {table} WHERE id = 5"),
-                )
-                .await?;
-                assert_eq!(
-                    rows, "+---+\n| c |\n+---+\n| 0 |\n+---+",
-                    "2.5 must not be stored as an Int32"
-                );
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Ok(())
         })
         .await
 }
@@ -402,7 +342,6 @@ async fn assert_never_applied(rt: &Runtime, table: &str, id: i64) -> Result<(), 
 /// no accelerator widens an integer to a decimal, so even an integer-valued
 /// change after it is not applied. The dataset reports why, and how to
 /// re-bootstrap, before any row change follows the `ALTER`.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_integer_to_decimal_stops_the_stream() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -498,7 +437,6 @@ async fn zero_scale_decimal_keeps_applying_until_it_gains_a_scale(
         .await
 }
 
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_block_zero_scale_decimal_keeps_applying_until_it_gains_a_scale()
 -> Result<(), anyhow::Error> {
@@ -509,7 +447,6 @@ async fn mysql_cayenne_block_zero_scale_decimal_keeps_applying_until_it_gains_a_
     .await
 }
 
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_sync_all_columns_zero_scale_decimal_keeps_applying_until_it_gains_a_scale()
 -> Result<(), anyhow::Error> {
@@ -523,7 +460,6 @@ async fn mysql_cayenne_sync_all_columns_zero_scale_decimal_keeps_applying_until_
 /// Under `block` a `FLOAT` column keeps its registered `Float32` type, so a
 /// `DOUBLE` it becomes stops the stream at the `ALTER` rather than storing
 /// `16777217` rounded to `16777216`.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_block_float_to_double_stops_the_stream() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -601,7 +537,6 @@ async fn zero_scale_decimal_to_bigint_keeps_applying(
         .await
 }
 
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_block_zero_scale_decimal_to_bigint_keeps_applying()
 -> Result<(), anyhow::Error> {
@@ -609,7 +544,6 @@ async fn mysql_cayenne_block_zero_scale_decimal_to_bigint_keeps_applying()
         .await
 }
 
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_sync_all_columns_zero_scale_decimal_to_bigint_keeps_applying()
 -> Result<(), anyhow::Error> {
@@ -624,7 +558,6 @@ async fn mysql_cayenne_sync_all_columns_zero_scale_decimal_to_bigint_keeps_apply
 /// stream at the `ALTER`: `MySQL` rewrote the key `9007199254740993` to
 /// `9007199254740992` in place, so a later change matched by the rewritten key
 /// would miss the row the acceleration holds.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_lossy_key_retype_stops_the_stream() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -763,7 +696,6 @@ async fn lossy_retype_stops_and_the_named_fix_reloads(
         .await
 }
 
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_block_lossy_retype_stops_and_the_named_fix_reloads()
 -> Result<(), anyhow::Error> {
@@ -774,7 +706,6 @@ async fn mysql_cayenne_block_lossy_retype_stops_and_the_named_fix_reloads()
     .await
 }
 
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_sync_all_columns_lossy_retype_stops_and_the_named_fix_reloads()
 -> Result<(), anyhow::Error> {
@@ -789,7 +720,6 @@ async fn mysql_cayenne_sync_all_columns_lossy_retype_stops_and_the_named_fix_rel
 /// `DECIMAL` stops the stream at the `ALTER`. The column keeps its unsigned
 /// type, and the binlog sends a decimal as text, which the unsigned decode
 /// reads as `BIT` bytes: `42` was once stored as `13362`.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_unsigned_integer_to_decimal_stops_the_stream() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

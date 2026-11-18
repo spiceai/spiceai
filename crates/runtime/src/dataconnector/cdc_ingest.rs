@@ -717,4 +717,67 @@ mod tests {
             .expect_err("should fail");
         assert!(matches!(err, Error::NotRegistered { .. }));
     }
+
+    #[tokio::test]
+    async fn recursive_avro_schema_header_returns_bad_request() {
+        use axum::{
+            body::Bytes,
+            extract::Path,
+            http::{HeaderMap, HeaderValue, StatusCode, header},
+        };
+        use http_body_util::BodyExt;
+
+        let dataset = "test_recursive_avro_schema";
+        let (tx, _rx) = mpsc::channel::<IngestWork>(1);
+        register_handle(
+            dataset,
+            CdcIngestHandle {
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+                primary_keys: vec!["id".to_string()],
+                schema_registry_url: None,
+                avro_schema_json: None,
+                tx,
+            },
+        );
+
+        let schema = r#"{"type": "record", "name": "Envelope", "fields": [
+            {"name": "after", "type": ["null", {"type": "record", "name": "Node", "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "next", "type": ["null", "Node"]}
+            ]}]},
+            {"name": "op", "type": "string"}
+        ]}"#
+        .replace('\n', " ");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/avro"),
+        );
+        headers.insert(
+            "x-avro-schema",
+            HeaderValue::from_str(&schema).expect("header value"),
+        );
+
+        // A one-byte body: `after` is the null branch and the datum ends there.
+        let response = crate::http::v1::cdc::post(
+            Path(dataset.to_string()),
+            headers,
+            Bytes::from_static(&[0]),
+        )
+        .await;
+        unregister_handle(dataset);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(
+            body["message"],
+            "Failed to decode CDC body for dataset 'test_recursive_avro_schema': Invalid Avro schema: record 'Node' contains itself, directly or through other types. CDC ingest does not accept recursive Avro schemas; send a schema without self-referencing records"
+        );
+    }
 }

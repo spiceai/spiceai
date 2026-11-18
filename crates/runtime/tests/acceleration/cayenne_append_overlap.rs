@@ -154,7 +154,6 @@ async fn refresh_to(rt: &Arc<Runtime>, round: &str, expected: i64) -> Result<(),
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_append_refresh_honours_refresh_append_overlap() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 

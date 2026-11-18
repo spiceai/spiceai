@@ -43,6 +43,13 @@ pub trait SpiceModelTool: Sync + Send {
         None
     }
     fn parameters(&self) -> Option<Value>;
+
+    /// The JSON Schema of the object [`Self::call`] returns, when it always returns one. MCP
+    /// clients receive it as the tool's `outputSchema` and the result as `structuredContent`.
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
     /// If the tool is a proxy around an MCP tool, this method should return the proxy. Otherwise, it should return None.

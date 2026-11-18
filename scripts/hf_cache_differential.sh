@@ -11,7 +11,8 @@
 #
 # Usage: scripts/hf_cache_differential.sh [work dir]
 # Needs network access to huggingface.co and the `hf` CLI on PATH
-# (`uv tool install huggingface_hub` installs it).
+# (`uv tool install huggingface_hub` installs it). The Hub rate-limits anonymous requests per IP;
+# set HF_TOKEN to send every request with that token instead.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${1:-$ROOT/target/hf_cache_differential}"
@@ -41,7 +42,23 @@ for case in "${CASES[@]}"; do
   kind="$1"; repo="$2"; shift 2; files=("$@")
   slug="${repo//\//__}"
   plural="${kind}s"
-  commit=$(curl -s "https://huggingface.co/api/$plural/$repo/revision/main" | python3 -c "import json,sys; print(json.load(sys.stdin)['sha'])")
+  # HF_TOKEN goes from the environment into a header, never into a process's arguments, and
+  # add_unredirected_header keeps it off a redirect.
+  commit=$(python3 - "$plural" "$repo" <<'PY'
+import json, os, sys, urllib.request
+plural, repo = sys.argv[1:]
+request = urllib.request.Request(f"https://huggingface.co/api/{plural}/{repo}/revision/main")
+if token := os.environ.get("HF_TOKEN", "").strip():
+    request.add_unredirected_header("Authorization", f"Bearer {token}")
+print(json.load(urllib.request.urlopen(request))["sha"])
+PY
+)
+  if [ -z "$commit" ]; then
+    # The traceback above names the Hub's answer, such as `HTTP Error 429: Too Many Requests`.
+    failures=$((failures+1))
+    printf '%-58s the Hub did not name the commit of main\n' "$kind $repo"
+    continue
+  fi
   A="$WORK/$slug/spice"; B="$WORK/$slug/hf"
   hf_type=()
   [ "$kind" != model ] && hf_type=(--repo-type "$kind")
@@ -56,7 +73,10 @@ a, b, folder, commit, repo, plural, *files = sys.argv[1:]
 tree = {}
 url = f"https://huggingface.co/api/{plural}/{repo}/paths-info/{commit}"
 data = "&".join(["expand=false"] + [f"paths={urllib.parse.quote(f)}" for f in files]).encode()
-for entry in json.load(urllib.request.urlopen(urllib.request.Request(url, data=data))):
+request = urllib.request.Request(url, data=data)
+if token := os.environ.get("HF_TOKEN", "").strip():
+    request.add_unredirected_header("Authorization", f"Bearer {token}")
+for entry in json.load(urllib.request.urlopen(request)):
     tree[entry["path"]] = entry
 problems = []
 for f in files:

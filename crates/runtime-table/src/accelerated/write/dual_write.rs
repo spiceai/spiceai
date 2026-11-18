@@ -1066,7 +1066,6 @@ mod tests {
     /// the table's write coordinator with every other writer that stages several
     /// partitions, or a writer holding partition `a` that then needs `b`
     /// deadlocks against a dual write holding `b` that needs `a`.
-    #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn partitioned_dual_write_serializes_with_other_multi_partition_writers() {
         use std::time::Duration;
@@ -1157,7 +1156,6 @@ mod tests {
     /// A dual write that is dropped partway, as when its client disconnects or a `DoPut` times
     /// out, commits neither path: the source's input fails instead of ending, so the source
     /// cannot commit the batches it already received.
-    #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_dual_write_dropped_partway_commits_neither_path() {
         use std::time::Duration;
@@ -1215,7 +1213,6 @@ mod tests {
     /// Once the source has been told the input is complete, the dual write runs to its end even
     /// if its caller stops waiting: the source commits, then the accelerator, and a partitioned
     /// table's write coordinator stays held until then.
-    #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_dual_write_dropped_while_the_source_commits_still_commits_the_accelerator() {
         use std::time::Duration;
@@ -1267,7 +1264,6 @@ mod tests {
 
     /// When the accelerator cannot stage a write, the source commits none of it either, and the
     /// dual write fails with the accelerator's error.
-    #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_accelerator_that_cannot_stage_keeps_the_source_from_committing() {
         use std::time::Duration;
@@ -1305,7 +1301,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     mod fixture {
         use std::sync::Arc;
 

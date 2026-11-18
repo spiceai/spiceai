@@ -26,3 +26,6 @@ pub use file_format::*;
 
 #[cfg(test)]
 mod scan_tests;
+
+#[cfg(test)]
+mod probe_tests;

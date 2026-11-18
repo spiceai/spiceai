@@ -21,7 +21,6 @@ limitations under the License.
 //! The old per-dataset `cayenne_tuning` is no longer read, so a dataset that still sets it
 //! stays `disabled` and is told once, and an invalid `runtime.adaptive_tuning` fails the load.
 
-#![cfg(not(windows))]
 #![recursion_limit = "256"]
 #![expect(clippy::expect_used)]
 

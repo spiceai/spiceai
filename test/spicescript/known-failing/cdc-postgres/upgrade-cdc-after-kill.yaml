@@ -9,10 +9,16 @@ description: >
   rebuilt by re-reading their tables, because each slot was acknowledged
   past the position recorded as applied ("rebuild_cause=acknowledged_past").
 
+matrix:
+  from: [2.3.x, 2.4.x]
+from: '${matrix.from}'
+
 sources:
   src: { kind: postgres }
   my: { kind: mysql }
 
+# No `object-native` variant yet: a release writes the SQLite Cayenne
+# metastore, which the object-native metastore does not import (#16187).
 spicepod:
   version: v1
   kind: Spicepod

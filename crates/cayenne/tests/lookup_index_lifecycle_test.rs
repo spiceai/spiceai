@@ -52,9 +52,9 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use cayenne::CayenneTableProvider;
 use cayenne::lookup_index::{IndexPersistence, LookupIndexCounters};
 use cayenne::metadata::{IndexRunRecord, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -1023,7 +1023,10 @@ async fn failed_unregistration_retains_run_file(corrupt: bool) {
         TableSpec::new(NAME, schema(), &[]).persistence(IndexPersistence::Enabled),
     )
     .await;
-    assert!(registered_runs(&fixture, NAME).await.is_empty());
+    assert_eq!(
+        registered_runs(&fixture, NAME).await,
+        [] as [IndexRunRecord; 0]
+    );
     assert_eq!(run_file_count(&fixture.data_path), 0);
     lookup(&retried, NAME, 7).await;
 }

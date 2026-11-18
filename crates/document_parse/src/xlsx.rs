@@ -266,6 +266,8 @@ mod tests {
 
     const WORKSHEET_PREFIX: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#;
     const WORKSHEET_SUFFIX: &[u8] = b"</sheetData></worksheet>";
+    /// calamine finds the workbook part through the package relationships.
+    const PACKAGE_RELS: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
 
     fn worksheet(rows: &str) -> Vec<u8> {
         [WORKSHEET_PREFIX, rows.as_bytes(), WORKSHEET_SUFFIX].concat()
@@ -308,6 +310,7 @@ mod tests {
         );
 
         let mut parts: Vec<(&str, Part<'_>)> = vec![
+            ("_rels/.rels", Part::Bytes(PACKAGE_RELS)),
             ("xl/workbook.xml", Part::Bytes(workbook_xml.as_bytes())),
             (
                 "xl/_rels/workbook.xml.rels",

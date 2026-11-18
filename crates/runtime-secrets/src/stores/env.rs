@@ -189,9 +189,10 @@ fn load_filename_into_map(filename: &str, values: &mut HashMap<String, String>) 
 
 /// Iterates parsed entries from a [`dotenv`] iterator into `values`.
 /// Keys already present are preserved, so earlier-loaded files win.
-/// Malformed lines are logged with their line number and content so users
-/// can fix them. I/O-level errors (e.g. missing file) are reported at debug
-/// level because the file is optional.
+/// Malformed lines are logged by line number only: any part of the line,
+/// including text that looks like a key, can be secret. I/O-level errors
+/// (e.g. missing file) are reported at debug level because the file is
+/// optional.
 fn collect_iter<I>(iter: I, label: &str, values: &mut HashMap<String, String>)
 where
     I: Iterator<Item = Result<(String, String), dotenv::Error>>,
@@ -201,10 +202,8 @@ where
             Ok((key, val)) => {
                 values.entry(key).or_insert(val);
             }
-            Err(dotenv::Error::LineParse(line_num, content)) => {
-                tracing::warn!(
-                    "{label}: line {line_num} is malformed and was skipped: `{content}`"
-                );
+            Err(dotenv::Error::LineParse(line_num, _)) => {
+                tracing::warn!("{label}: line {line_num} is malformed and was skipped");
             }
             Err(err) => {
                 tracing::debug!("{label}: {err}");
@@ -242,8 +241,8 @@ fn export_without_overwrite(values: &HashMap<String, String>) {
 /// Iterates parsed entries from a [`dotenv`] iterator, setting each valid
 /// key-value pair into the environment. Variables already present in the
 /// environment are preserved, so earlier-loaded files take priority over later
-/// ones. Malformed lines are logged with their line number and content so users
-/// can fix them. I/O-level errors (e.g. missing file) are reported at debug
+/// ones. Malformed lines are logged with their line number so users can fix
+/// them. I/O-level errors (e.g. missing file) are reported at debug
 /// level because the file is optional.
 ///
 /// # Safety
@@ -265,9 +264,13 @@ fn lookup_process_env(variants: &[String]) -> crate::AnyErrorResult<Option<Secre
         .find_map(|variant| match std::env::var(variant) {
             Ok(value) => Some(Ok(SecretString::from(value))),
             Err(std::env::VarError::NotPresent) => None,
-            Err(err) => Some(Err(
-                Box::new(err) as Box<dyn std::error::Error + Send + Sync>
-            )),
+            // `VarError::NotUnicode` displays the raw value, so report the
+            // failure without it: this error is logged and can reach dataset
+            // status and the cluster `ExpandSecret` response.
+            Err(std::env::VarError::NotUnicode(_)) => Some(Err(format!(
+                "environment variable `{variant}` is not valid Unicode (value not shown)"
+            )
+            .into())),
         })
         .transpose()
 }
@@ -303,6 +306,27 @@ pub(crate) static ENV_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_unicode_env_value_is_not_echoed_in_the_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env_guard = ENV_TEST_MUTEX.lock().await;
+        let key = format!("SPICE_NON_UNICODE_{}", rand::random::<u64>());
+        // SAFETY: serialized by ENV_TEST_MUTEX.
+        unsafe {
+            std::env::set_var(
+                &key,
+                std::ffi::OsStr::from_bytes(b"do-not-leak-this-value\xff"),
+            );
+        }
+        let err = lookup_process_env(std::slice::from_ref(&key))
+            .expect_err("a non-Unicode value is an error");
+        let message = err.to_string();
+        unsafe { std::env::remove_var(&key) };
+        assert!(!message.contains("do-not-leak-this-value"), "{message}");
+        assert!(message.contains(&key), "{message}");
+    }
     use std::io::Write;
 
     use secrecy::ExposeSecret;

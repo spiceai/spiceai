@@ -1,0 +1,40 @@
+name: view-over-quoted-name
+description: >
+  A Spicepod view that reads a dataset whose quoted name holds capitals
+  (`name: '"Orders"'`) answers the dataset's rows, and the runtime becomes
+  ready. Known failing: the view is never registered after `Initializing
+  view`, so it is not found, and `/v1/ready` never reports ready. Neither the
+  dataset nor the view is accelerated.
+
+sources:
+  lake: { kind: files }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: view-over-quoted-name
+  datasets:
+    - from: file://${sources.lake.path}/orders/
+      name: '"Orders"'
+      params: { file_format: csv }
+  views:
+    - name: recent
+      sql: SELECT id FROM "Orders"
+
+steps:
+  - generate:
+      lake:
+        table: orders
+        rows: 2
+        seed: 1
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+  - start: { ready: false }
+  - query: SELECT id FROM "Orders" ORDER BY id
+    eventually: 60s
+    expect: { rows: [['1'], ['2']] }
+  - query: SELECT id FROM recent ORDER BY id
+    eventually: 60s
+    expect: { rows: [['1'], ['2']] }
+  - wait-ready: { timeout: 60s }
