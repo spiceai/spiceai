@@ -227,7 +227,6 @@ impl Messages for AnthropicMessages {
 
 /// One server-sent event: its `data`, which for the Messages API is a JSON object whose `type`
 /// is the event's name.
-#[derive(Default)]
 struct SseDecoder {
     /// The stream so far, its line endings written as LF.
     buffer: Vec<u8>,
@@ -235,10 +234,26 @@ struct SseDecoder {
     after_cr: bool,
     /// Where in `buffer` a blank line can start: the bytes before it were searched already.
     searched: usize,
+    /// The most bytes one event may hold, its blank line included and each line ending counted
+    /// once.
+    max_event_bytes: usize,
+    /// Whether an event passed `max_event_bytes`, which ends the stream.
+    refused: bool,
 }
 
 impl SseDecoder {
-    /// Adds `chunk` and returns the data of each event it completes.
+    fn new(max_event_bytes: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            after_cr: false,
+            searched: 0,
+            max_event_bytes,
+            refused: false,
+        }
+    }
+
+    /// Adds `chunk` and returns the data of each event it completes, up to the first that passes
+    /// the cap, which sets `refused`.
     fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         // A line ends with LF, CRLF or CR. Each is written as LF as soon as it arrives, so an
         // event is dispatched at its blank line rather than when the next chunk shows whether a
@@ -261,6 +276,10 @@ impl SseDecoder {
             .position(|pair| pair == b"\n\n")
         {
             let end = self.searched + at;
+            if end + 2 - start > self.max_event_bytes {
+                self.refused = true;
+                break;
+            }
             let block = String::from_utf8_lossy(&self.buffer[start..end]);
             let data: Vec<&str> = block
                 .lines()
@@ -273,6 +292,7 @@ impl SseDecoder {
             start = end + 2;
             self.searched = start;
         }
+        self.refused |= self.buffer.len() - start > self.max_event_bytes;
         self.buffer.drain(..start);
         self.searched = self.buffer.len().saturating_sub(1);
         events
@@ -282,8 +302,6 @@ impl SseDecoder {
 struct StreamState {
     response: reqwest::Response,
     decoder: SseDecoder,
-    /// The most bytes the event being received may hold.
-    max_event_bytes: usize,
     queue: VecDeque<Result<Value, MessagesError>>,
     model: String,
     done: bool,
@@ -318,12 +336,12 @@ impl StreamState {
                 }
             }
         }
-        if !self.done && self.decoder.buffer.len() > self.max_event_bytes {
+        if !self.done && self.decoder.refused {
             self.done = true;
             self.queue.push_back(Err(MessagesError::api(format!(
                 "Anthropic streamed an event for model '{}' of more than {} bytes, so the stream \
                  was ended",
-                self.model, self.max_event_bytes
+                self.model, self.decoder.max_event_bytes
             ))));
         }
     }
@@ -338,8 +356,7 @@ fn event_stream(
 ) -> MessageStream {
     let state = StreamState {
         response,
-        decoder: SseDecoder::default(),
-        max_event_bytes,
+        decoder: SseDecoder::new(max_event_bytes),
         queue: VecDeque::new(),
         model,
         done: false,
@@ -377,6 +394,7 @@ fn event_stream(
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use rstest::rstest;
     use serde_json::json;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -416,28 +434,44 @@ mod tests {
         );
     }
 
+    const SMALL_EVENT: &str = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+
+    /// An event past the cap ends the stream however its bytes are split into chunks: in one
+    /// chunk, in small pieces, or with only the last chunk taking it past the cap.
+    #[rstest]
+    #[case::one_chunk(vec![])]
+    #[case::small_chunks((1..20).map(|i| i * 16).collect())]
+    #[case::the_last_chunk_passes_the_cap(vec![SMALL_EVENT.len(), 2 * SMALL_EVENT.len()])]
     #[tokio::test]
-    async fn a_streamed_event_past_the_cap_ends_the_stream() {
-        let small = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+    async fn a_streamed_event_past_the_cap_ends_the_stream(#[case] cuts: Vec<usize>) {
         let large = format!(
             "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"text\":\"{}\"}}\n\n",
             "b".repeat(100)
         );
-        let chunks: Vec<Result<Bytes, std::io::Error>> = format!("{small}{large}")
-            .as_bytes()
-            .chunks(16)
-            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
-            .collect();
+        let body = format!("{SMALL_EVENT}{large}");
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        for end in cuts
+            .into_iter()
+            .filter(|&end| end < body.len())
+            .chain([body.len()])
+        {
+            chunks.push(Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+                &body.as_bytes()[start..end],
+            )));
+            start = end;
+        }
         let response = reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(
             futures::stream::iter(chunks),
         )));
 
-        let events: Vec<_> = event_stream(response, "model".to_string(), small.len())
+        // The first event is exactly the cap.
+        let events: Vec<_> = event_stream(response, "model".to_string(), SMALL_EVENT.len())
             .collect()
             .await;
         assert_eq!(events.len(), 2);
         assert_eq!(
-            events[0].as_ref().expect("the event under the cap is read"),
+            events[0].as_ref().expect("the event at the cap is read"),
             &json!({"type": "ping"})
         );
         let error = events[1]
@@ -448,14 +482,14 @@ mod tests {
             format!(
                 "Anthropic streamed an event for model 'model' of more than {} bytes, so the \
                  stream was ended",
-                small.len()
+                SMALL_EVENT.len()
             )
         );
     }
 
     #[test]
     fn events_are_decoded_across_chunk_boundaries() {
-        let mut decoder = SseDecoder::default();
+        let mut decoder = SseDecoder::new(usize::MAX);
         let stream = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: ping\r\ndata: {\"type\": \"ping\"}\r\n\r\n: comment\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"h\u{e9}\"}}\n\n";
         let bytes = stream.as_bytes();
         let mut events = Vec::new();
@@ -482,7 +516,7 @@ mod tests {
         for ending in ["\n", "\r\n", "\r"] {
             let stream = event.replace('\n', ending);
             for size in [1, 2, 3, stream.len()] {
-                let mut decoder = SseDecoder::default();
+                let mut decoder = SseDecoder::new(usize::MAX);
                 let mut events = Vec::new();
                 for chunk in stream.as_bytes().chunks(size) {
                     events.extend(decoder.push(chunk));
