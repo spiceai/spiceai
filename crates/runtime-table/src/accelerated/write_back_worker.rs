@@ -415,6 +415,14 @@ impl WriteBackWorker {
         // `Arc<CayenneTableProvider>` coerces to the `Arc<dyn TableProvider>`
         // `read_table` expects at the call argument below.
         let accelerator = Arc::clone(&self.provider);
+        // Taken before the read, so the deliverer knows which source changes the
+        // read observed (#16505): a key that changes through the change stream
+        // after this point may hold, after the delivery commits, a row the
+        // accelerator does not.
+        let mut read_fence = self
+            .deliverer
+            .as_ref()
+            .map(|deliverer| deliverer.begin_read());
         let current = ctx
             .read_table(accelerator)?
             .filter(filter)?
@@ -470,7 +478,7 @@ impl WriteBackWorker {
             // `WriteBackDeliverer::deliver_upserts`), not the worker's.
             if has_present {
                 deliverer
-                    .deliver_upserts(current)
+                    .deliver_upserts(current, read_fence.take().unwrap_or_default())
                     .await
                     .map_err(delivery_to_df_err)?;
             }
@@ -899,7 +907,11 @@ mod deliverer_tests {
             std::slice::from_ref(&self.conflict_key)
         }
 
-        async fn deliver_upserts(&self, rows: Vec<RecordBatch>) -> DeliveryResult {
+        async fn deliver_upserts(
+            &self,
+            rows: Vec<RecordBatch>,
+            _read: data_connector_api::write_back::ReadFence,
+        ) -> DeliveryResult {
             self.maybe_fail()?;
             self.upserts.lock().push(rows);
             Ok(())
