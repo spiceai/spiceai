@@ -56,10 +56,12 @@ jobs:
     # Emit the required context on pull requests without running cargo-deny;
     # the real check runs on the merge-group commit.
     if: ${{ github.event_name != 'pull_request' }}
-    # The pool of the other required macOS checks. The bare `self-hosted` label
-    # matched any self-hosted runner, so this gate landed on a `spiceai-macos`
-    # mini in 115 of 238 merge-queue runs (2026-09-29..10-06).
-    runs-on: spiceai-macos-large
+    # Not a macOS pool: `cargo deny` reads the dependency graph, which does not depend on
+    # the host, and the required compiles in `pr.yml` queue for the `spiceai-macos-large`
+    # runners, where this two-minute job waited 29 min at p90 (merge_group,
+    # 2026-11-11..18). A named pool rather than the bare `self-hosted` label, which
+    # matches any self-hosted runner.
+    runs-on: spiceai-dev-runners
     # Slowest observed success in the 2026-07-25..08-08 window: 8 min.
     timeout-minutes: 60
     steps:

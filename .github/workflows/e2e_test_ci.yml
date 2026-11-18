@@ -70,8 +70,9 @@ permissions:
 
 jobs:
   # Skip the expensive E2E matrix on merge groups that don't touch code (docs,
-  # etc.). `build` — which every test job depends on — is gated on this, so the
-  # whole matrix cascades to "skipped" while the E2E Test CI gate still reports.
+  # etc.). `build_linux` and `build_macos` — one of which every test job depends on —
+  # are gated on this, so the whole matrix cascades to "skipped" while the E2E Test CI
+  # gate still reports.
   check_changes:
     environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
@@ -112,17 +113,11 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                builder: "spiceai-dev-runners",
                 runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                // `spiceai-macos-large` on every event, trunk pushes included. A three-hour
-                // build on a `spiceai-macos` mini runs past its 180-minute step bound where
-                // the host is shared (#14557), and starves the short macOS test jobs below
-                // that sit on that pool to avoid exactly this neighbour (#13761).
-                builder: "spiceai-macos-large",
                 runner: "macos-15",
                 target_os: "darwin",
                 target_arch: "aarch64"
@@ -132,23 +127,25 @@ jobs:
             const isPrEvent = context.eventName === 'pull_request';
             return isPrEvent ? matrix.slice(0, 1) : matrix;
 
-  build:
-    name: Build ${{ matrix.target.name }} binaries
-    runs-on: ${{ matrix.target.builder }}
+  # One build job per platform rather than one matrix job: a job that `needs` a matrix
+  # job waits for every leg of it, so a test that runs on one platform would wait for the
+  # other platform's build as well. Tests that run only on Linux (spicescript among them)
+  # need `build_linux`, tests that run only on macOS need `build_macos`, and tests whose
+  # matrix covers both platforms need both.
+  build_linux:
+    name: Build Linux x64 binaries
+    runs-on: spiceai-dev-runners
     environment: ci
-    needs: [setup-matrix, check_changes]
+    needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
-    # A backstop above the longest step bound below, leaving room for the artifact upload
-    # and the post steps. The compile steps carry their own tighter bounds so that a
-    # wedged one is cut while the `always()` diagnostics after it can still run — a hung
-    # compile is exactly when the sccache stats are worth having.
+    # A backstop above the compile step's own bound below, leaving room for the artifact
+    # upload and the post steps. The compile step carries a tighter bound so that a wedged
+    # one is cut while the `always()` diagnostics after it can still run — a hung compile
+    # is exactly when the sccache stats are worth having.
     timeout-minutes: 200
-    env:
-      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
-
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials for the compiler cache
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -162,51 +159,35 @@ jobs:
       - name: Set up Rust
         uses: $/.github/actions/setup-rust
 
-      # Not on the macOS leg. Its self-hosted runner instances share one user, so one
-      # `~/.cargo`, and rust-cache's save step deletes every file it found in
-      # `~/.cargo/bin` when it restored — the rustup proxies (`cargo`, `rustc`,
-      # `rustup`) included. A trunk push saving the cache therefore pulls `cargo` out
-      # from under whatever job a sibling instance on the same Mac is running, which
-      # then fails `cargo: command not found` (exit 127) mid-build. Nothing is lost by
-      # skipping it there: `~/.cargo` and `target/` persist on those hosts and sccache
-      # serves the compile, while the restore of this multi-GB cache spends up to ten
-      # minutes before it lands or gives up.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        if: matrix.target.target_os != 'darwin'
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Set up make
-        if: matrix.target.target_os == 'linux'
         uses: $/.github/actions/setup-make
 
       - name: Set up cc
-        if: matrix.target.target_os == 'linux'
         uses: $/.github/actions/setup-cc
 
       - name: Install Protoc
         uses: $/.github/actions/install-protoc
 
-      - name: Set up spiceio
-        if: matrix.target.target_os == 'darwin' && env.HAS_SPICEIO_SECRET == 'true'
-        id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+      # The compiler cache is the RustFS-backed sccache bucket that the integration and
+      # chDB builds on this pool already use. A failure here (a RustFS outage) must not
+      # fail the build: without credentials `setup-sccache` disables the cache and the
+      # compile runs uncached. The lifetime covers the job's 200-minute bound, because the
+      # cache server signs its requests with these credentials until the compile ends.
+      - name: Get RustFS credentials
+        id: rustfs
+        continue-on-error: true
+        uses: $/.github/actions/rustfs-credentials
         with:
-          smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.SMB_PASSWORD }}
-          token: ${{ github.token }}
-          bucket: sccache
-          region: us-west-1
-          immutable-objects: "true"
-          otel-endpoint: spicehq/spiceio
-          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
-          otel-region: us-west-2
-          instance-id: ci-${{ github.run_id }}-${{ github.job }}-${{ strategy.job-index }}
-          machine: ${{ runner.name }}
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '12000'
+          export-env: 'false'
 
       - name: Build spiced and spice CLI
-        if: matrix.target.target_os != 'darwin'
-        # 65 minutes was the slowest this leg had taken across ten successful `merge_group`
+        # 65 minutes was the slowest this build had taken across ten successful `merge_group`
         # runs when the bound was set; on 2026-08-28 that worst case moved. Four consecutive
         # `merge_group` runs hit 90 minutes with only the last few crates left, on four
         # different runners, each restoring the same rust-cache entry (full match) with the
@@ -220,25 +201,114 @@ jobs:
         # the queue more than waiting does: it discards a nearly finished compile, dequeues
         # the PR, and makes the queue re-run the whole batch chain, adding load to the pool
         # that caused the slowdown in the first place. 150 keeps roughly the margin over
-        # worst-observed that the macOS leg below uses, and stays clear of the job's 200 so
-        # that a wedge here is cut by *this step* — which attributes the failure to the
+        # worst-observed that the macOS build below uses, and stays clear of the job's 200
+        # so that a wedge here is cut by *this step* — which attributes the failure to the
         # compile — rather than by the job bound, which GitHub renders as the whole job
-        # being cancelled. It buys no diagnostics on this leg: the `always()` steps below
-        # are all gated to macOS, so a Linux build has none to run.
+        # being cancelled, and leaves the `always()` sccache stats below able to run.
         timeout-minutes: 150
         uses: $/.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel'
           build_cli: 'true'
           upload_artifact: 'true'
-          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          artifact_name: build_linux_x86_64
           # The binaries only hand off to this run's test jobs, so they need not
           # outlive it; at the repository's 30-day default each run kept its
           # two builds (~600 MiB) stored for a month.
           artifact_retention_days: '1'
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Show sccache stats
+        if: always() && env.SCCACHE_SETUP == 'true'
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+
+  # Also runs the OpenAI and Hugging Face model tests on the binaries it just built. As
+  # jobs of their own they each waited for another `spiceai-macos-large` runner after this
+  # build finished, 45-51 min at p90 for a 4-minute test (merge_group, 2026-11-11..18),
+  # which made them the last E2E jobs to finish.
+  build_macos:
+    name: Build and model-test macOS aarch64 (Apple Silicon)
+    # `spiceai-macos-large` on every event, trunk pushes included. A three-hour build on a
+    # `spiceai-macos` mini runs past its 180-minute step bound where the host is shared
+    # (#14557), and starves the short macOS test jobs that sit on that pool to avoid
+    # exactly this neighbour (#13761). The model tests need a self-hosted Mac as well:
+    # Metal, and the Hugging Face cache in `$HOME`.
+    runs-on: spiceai-macos-large
+    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
+    environment: ci
+    needs: check_changes
+    if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
+    # A backstop above the compile step's own 180-minute bound below plus the model tests'
+    # step bounds, leaving room for the artifact upload and the post steps.
+    timeout-minutes: 220
+    permissions:
+      contents: read
+      actions: read
+      # The model tests' Spicepods read this repository's issues with `GITHUB_TOKEN`.
+      issues: read
+      pull-requests: read
+      # Exchanged for OpenAI access tokens: workload identity federation.
+      id-token: write
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
+      # Workload identity federation: spiced and the OpenAI model tests exchange this job's
+      # GitHub OIDC token for provider access tokens with these IDs, and exchange again
+      # before each expires. Identifiers, not credentials: the credential is the OIDC
+      # token, which `id-token: write` already makes available to every step.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1 # Shallow clone for faster checkout
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+
+      # No rust-cache here. This pool's self-hosted runner instances share one user, so one
+      # `~/.cargo`, and rust-cache's save step deletes every file it found in
+      # `~/.cargo/bin` when it restored — the rustup proxies (`cargo`, `rustc`,
+      # `rustup`) included. A trunk push saving the cache therefore pulls `cargo` out
+      # from under whatever job a sibling instance on the same Mac is running, which
+      # then fails `cargo: command not found` (exit 127) mid-build. Nothing is lost by
+      # skipping it: `~/.cargo` and `target/` persist on those hosts and sccache serves
+      # the compile, while the restore of this multi-GB cache spends up to ten minutes
+      # before it lands or gives up.
+
+      - name: Install Protoc
+        uses: $/.github/actions/install-protoc
+
+      - name: Set up spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
 
       - name: Build spiced and spice CLI (macOS)
-        if: matrix.target.target_os == 'darwin'
         # This is the step that wedged for over 4.5 hours and held four queue candidates
         # behind it (#12717). 138 minutes is its slowest successful `merge_group` run of
         # the last ten (74-138); the self-hosted macOS pool puts several runner instances
@@ -250,37 +320,245 @@ jobs:
           features: 'tpc-extension,models,postgres-accel,metal'
           build_cli: 'true'
           upload_artifact: 'true'
-          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          artifact_name: build_darwin_aarch64
           artifact_retention_days: '1'
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Show sccache stats
-        if: always() && matrix.target.target_os == 'darwin' && env.SCCACHE_SETUP == 'true'
-        # `always()`: this is the one step that reports cache health, and without it
-        # it is skipped on exactly the failures it would explain (#12420). The `||`
-        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
-        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        if: always() && env.SCCACHE_SETUP == 'true'
+        # See the same step in `build_linux`.
         run: |
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
-        if: always() && matrix.target.target_os == 'darwin' && steps.setup-spiceio.outputs.pid != ''
+        if: always() && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always() && matrix.target.target_os == 'darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spiceio-e2e-build-logs
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
+      # The model tests: `spiced` from this build against one Spicepod each, driven
+      # through the REPL expect scripts. Every wait inside them is bounded (readiness, then
+      # the scripts' idle timeouts), so a host starved by a neighbouring job fails a step
+      # rather than slowing it (#13761). The step bounds stand in for the 10-minute bound
+      # each had as a job of its own (#12644). The Hugging Face steps run whatever the
+      # OpenAI ones did, so one model's failure does not hide the other's result; each
+      # step needs only the previous step of its own model to have passed.
+      - name: Install spice
+        id: install-spice
+        uses: $/.github/actions/install-spice
+        with:
+          build-path: ${{ github.workspace }}
+
+      - name: 'openai model: init spice app'
+        run: |
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      # Several runner instances share one host and therefore one network namespace, so
+      # spiced's default 8090/50051 cannot be assumed free (#12419).
+      - name: 'openai model: allocate Spice runtime ports'
+        uses: $/.github/actions/allocate-spice-ports
+
+      - name: 'openai model: start spice runtime'
+        id: openai-start
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `Set up spiceio` exported the compiler cache's `AWS_ENDPOINT_URL` for the rest of
+        # this job; spiced would send every `s3://` request there (#12624).
+        run: |
+          unset AWS_ENDPOINT_URL
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
+
+      - name: 'openai model: wait for Spice runtime to be ready'
+        uses: $/.github/actions/wait-for-spice-ready
+        with:
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
+          timeout: '60'
+
+      - name: 'openai model: test the expect scripts driving the REPLs'
+        timeout-minutes: 5
+        run: |
+          ./test/models/expect_test.sh
+
+      - name: 'openai model: test vector search'
+        timeout-minutes: 5
+        run: |
+          ./test/models/search_01.exp
+
+      - name: 'openai model: test chat'
+        timeout-minutes: 5
+        run: |
+          ./test/models/chat_01.exp
+
+      - name: 'openai model: stop spice and check logs'
+        if: always() && steps.openai-start.outcome != 'skipped'
+        uses: $/.github/actions/stop-spice
+
+      - name: 'huggingface model: init spice app'
+        id: hf-init
+        if: ${{ !cancelled() && steps.install-spice.outcome == 'success' }}
+        run: |
+          cp ./test/models/spicepod_hf.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: 'huggingface model: authenticate the Hugging Face cache'
+        id: hf-auth
+        if: ${{ !cancelled() && steps.hf-init.outcome == 'success' }}
+        uses: $/.github/actions/hf-cache-auth
+        with:
+          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+
+      # Fail here, in seconds and by name, rather than as an unexplained five-minute
+      # readiness timeout. The retries ride out the transient per-IP 401/429 responses
+      # the pool draws from the Hub; this retries a *download*, never an assertion.
+      - name: 'huggingface model: pre-flight the Hugging Face components'
+        id: hf-preflight
+        if: ${{ !cancelled() && steps.hf-auth.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+
+          repos="$(sed -n 's|^[[:space:]]*-\{0,1\}[[:space:]]*from:[[:space:]]*huggingface:huggingface\.co/\([^[:space:]]*\).*$|\1|p' ./spicepod.yaml)"
+          if [ -z "${repos}" ]; then
+            echo "No Hugging Face components in the spicepod; nothing to pre-flight."
+            exit 0
+          fi
+
+          # The same token spiced will use: `HF_TOKEN`, else the runner's token file.
+          token="${HF_TOKEN:-}"
+          token_file="${HOME}/.cache/huggingface/token"
+          if [ -z "${token}" ] && [ -s "${token_file}" ]; then
+            token="$(cat "${token_file}")"
+          fi
+
+          # The token goes to curl through a config on stdin rather than an -H argument,
+          # so it never appears in this process's argv. `printf` is a shell builtin, so
+          # it spawns nothing that could carry it either. curl drops the header on a
+          # cross-host redirect by default, which is what keeps `-L` safe here.
+          probe() {
+            if [ -n "${token}" ]; then
+              printf 'header = "Authorization: Bearer %s"\n' "${token}" |
+                curl -K - -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            else
+              curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            fi
+          }
+
+          rc=0
+          while IFS= read -r component; do
+            [ -n "${component}" ] || continue
+
+            # A spicepod pins a revision by joining it onto the repo id as
+            # `org/model:revision` — both `models` and `embeddings` do, and
+            # `split_hf_model_id` in crates/spicepod exists to undo that join before a
+            # loader talks to the Hub. The Hub has no repo under the joined name: a
+            # revision is a path segment, `<repo>/resolve/<revision>/…`. So probing the
+            # joined string asks for a repo that does not exist, which the Hub answers
+            # 404 with a token and 401 without — and both land in a branch below that
+            # blames the Hub or a quota rather than this URL. Undo the join here too.
+            repo_id="${component%%:*}"
+            revision="${component#*:}"
+            if [ "${revision}" = "${component}" ] || [ -z "${revision}" ]; then
+              revision=main
+            fi
+            url="https://huggingface.co/${repo_id}/resolve/${revision}/config.json"
+
+            code=""
+            for attempt in 1 2 3 4 5; do
+              code="$(probe "${url}")" || code="000"
+              if [ "${code}" -lt 400 ] 2>/dev/null; then
+                echo "  ok    ${component} @ ${revision} (HTTP ${code}, attempt ${attempt})"
+                break
+              fi
+              echo "  retry ${component} @ ${revision}: HTTP ${code} (attempt ${attempt}/5)"
+              sleep $((attempt * 3))
+            done
+
+            if ! { [ "${code}" -lt 400 ]; } 2>/dev/null; then
+              case "${code}" in
+                401|403)
+                  echo "::error::Hugging Face returned ${code} for ${component} after 5 attempts (${url}). This is a Hub access/quota failure, not a code failure in this branch — anonymous downloads share a per-IP quota across the whole self-hosted pool. Set the SPICE_SECRET_HF_TOKEN secret, or run 'huggingface-cli login' on the runner." ;;
+                429)
+                  echo "::error::Hugging Face rate-limited ${component} (429) after 5 attempts (${url}). Not a code failure in this branch." ;;
+                404)
+                  echo "::error::Hugging Face has no ${repo_id} at revision ${revision} (404, ${url}). Unlike the other codes here this one is about the spicepod: check the repo id and the pinned revision." ;;
+                *)
+                  echo "::error::Could not reach Hugging Face for ${component} (HTTP ${code}) after 5 attempts (${url}). Not a code failure in this branch." ;;
+              esac
+              rc=1
+            fi
+          # A here-string, not a pipe: a pipe would run the loop in a subshell and `rc`
+          # would never make it back out, so every failure would exit 0.
+          done <<< "${repos}"
+
+          exit "${rc}"
+
+      - name: 'huggingface model: allocate Spice runtime ports'
+        id: hf-ports
+        if: ${{ !cancelled() && steps.hf-preflight.outcome == 'success' }}
+        uses: $/.github/actions/allocate-spice-ports
+
+      - name: 'huggingface model: start spice runtime'
+        id: hf-start
+        if: ${{ !cancelled() && steps.hf-ports.outcome == 'success' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `Set up spiceio` exported the compiler cache's `AWS_ENDPOINT_URL` for the rest of
+        # this job; spiced would send every `s3://` request there (#12624).
+        run: |
+          unset AWS_ENDPOINT_URL
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
+
+      - name: 'huggingface model: wait for Spice runtime to be ready'
+        id: hf-ready
+        if: ${{ !cancelled() && steps.hf-start.outcome == 'success' }}
+        uses: $/.github/actions/wait-for-spice-ready
+        with:
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
+          timeout: '300'
+
+      - name: 'huggingface model: test the expect scripts driving the REPLs'
+        id: hf-expect
+        if: ${{ !cancelled() && steps.hf-ready.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          ./test/models/expect_test.sh
+
+      - name: 'huggingface model: test vector search'
+        id: hf-search
+        if: ${{ !cancelled() && steps.hf-expect.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          ./test/models/search_01.exp
+
+      # No step retry: in merge-queue job 103597842965 a fixed 30s budget ran out
+      # while Qwen2.5-3B was still streaming a long answer on Metal, not on a
+      # Hub download (config probe HTTP 200; `search_01.exp` had already
+      # passed). The REPL scripts bound silence rather than total response
+      # time (90s, override with SPICE_REPL_IDLE_TIMEOUT) and spicepod_hf.yml
+      # caps hf_max_completion_tokens at 64. A stall after that is a hang.
+      - name: 'huggingface model: test chat'
+        if: ${{ !cancelled() && steps.hf-search.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          ./test/models/chat_01_simple.exp
+
+      - name: 'huggingface model: stop spice and check logs'
+        if: always() && steps.hf-start.outcome != 'skipped'
+        uses: $/.github/actions/stop-spice
+
   test-bigquery:
     # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
     environment: ci
     name: BigQuery Regression Tests
-    needs: build
+    needs: build_linux
     if: ${{ inputs.run_all_tests }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 90
@@ -395,20 +673,10 @@ jobs:
                 runner: "spiceai-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
-              },
-              {
-                name: "macOS aarch64 (Apple Silicon)",
-                // `spiceai-macos-large`, like `test_hf_model`: both gate the
-                // merge queue through `E2E Test CI`, and on the `spiceai-macos`
-                // minis this 2.4-minute leg queued 83 min at p90 for a runner
-                // (merge_group, 2026-09-29..10-06). Every wait inside it is
-                // bounded (60s readiness, then 30s/30s/60s in the expect
-                // scripts), so a host starved by a neighbouring build fails it
-                // rather than slowing it (#13761).
-                runner: "spiceai-macos-large",
-                target_os: "darwin",
-                target_arch: "aarch64"
               }
+              // No macOS leg: `build_macos` runs the macOS model tests on the binaries
+              // it builds, rather than handing them to a job that waits for another
+              // `spiceai-macos-large` runner.
             ];
 
             const isPrEvent = context.eventName === 'pull_request';
@@ -418,12 +686,12 @@ jobs:
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     # A backstop for the whole job, so it has to clear this job's own setup — artifact
     # download and CLI install on the self-hosted pool — before the steps' bounded waits
-    # (60s readiness, then 30s/30s/60s inside the expect scripts) can report anything.
-    # Matches `test_hf_model`, which has the same setup on the same runners (#12644).
+    # (60s readiness, then 30s/30s/60s inside the expect scripts) can report anything
+    # (#12644).
     timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
       - setup-model-matrix
     if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' }}
     # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
@@ -495,15 +763,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y expect
 
-      - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && !startsWith(matrix.target.runner, 'spiceai-macos')
-        run: |
-          if command -v expect >/dev/null 2>&1; then
-            expect -v
-          else
-            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
-          fi
-
       - name: Test the expect scripts driving the REPLs
         run: |
           ./test/models/expect_test.sh
@@ -520,199 +779,6 @@ jobs:
         if: always()
         uses: $/.github/actions/stop-spice
 
-  test_hf_model:
-    permissions:
-      contents: read
-      # test/models/spicepod_hf.yml: a github: dataset searches this repository's issues with GITHUB_TOKEN.
-      issues: read
-      pull-requests: read
-    environment: ci
-    name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    timeout-minutes: 10
-    runs-on: ${{ matrix.target.runner }}
-    needs:
-      - build
-      - setup-model-matrix
-    if: ${{ github.event_name != 'pull_request' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          # A self-hosted Mac for Metal and for the Hugging Face cache in $HOME
-          # (see below); the large pool because this leg gates the merge queue,
-          # and on the `spiceai-macos` minis it queued 88 min at p90 for a runner
-          # (merge_group, 2026-09-29..10-06).
-          - name: 'macOS aarch64 (Apple Silicon)'
-            runner: 'spiceai-macos-large'
-            target_os: 'darwin'
-            target_arch: 'aarch64'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 1
-
-      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: ./build
-
-      - name: Install spice
-        uses: $/.github/actions/install-spice
-        with:
-          build-path: ./build
-
-      - name: Init spice app
-        run: |
-          cp ./test/models/spicepod_hf.yml ./spicepod.yaml
-          cat ./spicepod.yaml
-
-      - name: Authenticate the Hugging Face cache
-        uses: $/.github/actions/hf-cache-auth
-        with:
-          token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
-
-      # Fail here, in seconds and by name, rather than as an unexplained five-minute
-      # readiness timeout. The retries ride out the transient per-IP 401/429 responses
-      # the pool draws from the Hub; this retries a *download*, never an assertion.
-      - name: Pre-flight the Hugging Face components
-        timeout-minutes: 5
-        run: |
-          set -uo pipefail
-
-          repos="$(sed -n 's|^[[:space:]]*-\{0,1\}[[:space:]]*from:[[:space:]]*huggingface:huggingface\.co/\([^[:space:]]*\).*$|\1|p' ./spicepod.yaml)"
-          if [ -z "${repos}" ]; then
-            echo "No Hugging Face components in the spicepod; nothing to pre-flight."
-            exit 0
-          fi
-
-          # The same token spiced will use: `HF_TOKEN`, else the runner's token file.
-          token="${HF_TOKEN:-}"
-          token_file="${HOME}/.cache/huggingface/token"
-          if [ -z "${token}" ] && [ -s "${token_file}" ]; then
-            token="$(cat "${token_file}")"
-          fi
-
-          # The token goes to curl through a config on stdin rather than an -H argument,
-          # so it never appears in this process's argv. `printf` is a shell builtin, so
-          # it spawns nothing that could carry it either. curl drops the header on a
-          # cross-host redirect by default, which is what keeps `-L` safe here.
-          probe() {
-            if [ -n "${token}" ]; then
-              printf 'header = "Authorization: Bearer %s"\n' "${token}" |
-                curl -K - -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
-            else
-              curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
-            fi
-          }
-
-          rc=0
-          while IFS= read -r component; do
-            [ -n "${component}" ] || continue
-
-            # A spicepod pins a revision by joining it onto the repo id as
-            # `org/model:revision` — both `models` and `embeddings` do, and
-            # `split_hf_model_id` in crates/spicepod exists to undo that join before a
-            # loader talks to the Hub. The Hub has no repo under the joined name: a
-            # revision is a path segment, `<repo>/resolve/<revision>/…`. So probing the
-            # joined string asks for a repo that does not exist, which the Hub answers
-            # 404 with a token and 401 without — and both land in a branch below that
-            # blames the Hub or a quota rather than this URL. Undo the join here too.
-            repo_id="${component%%:*}"
-            revision="${component#*:}"
-            if [ "${revision}" = "${component}" ] || [ -z "${revision}" ]; then
-              revision=main
-            fi
-            url="https://huggingface.co/${repo_id}/resolve/${revision}/config.json"
-
-            code=""
-            for attempt in 1 2 3 4 5; do
-              code="$(probe "${url}")" || code="000"
-              if [ "${code}" -lt 400 ] 2>/dev/null; then
-                echo "  ok    ${component} @ ${revision} (HTTP ${code}, attempt ${attempt})"
-                break
-              fi
-              echo "  retry ${component} @ ${revision}: HTTP ${code} (attempt ${attempt}/5)"
-              sleep $((attempt * 3))
-            done
-
-            if ! { [ "${code}" -lt 400 ]; } 2>/dev/null; then
-              case "${code}" in
-                401|403)
-                  echo "::error::Hugging Face returned ${code} for ${component} after 5 attempts (${url}). This is a Hub access/quota failure, not a code failure in this branch — anonymous downloads share a per-IP quota across the whole self-hosted pool. Set the SPICE_SECRET_HF_TOKEN secret, or run 'huggingface-cli login' on the runner." ;;
-                429)
-                  echo "::error::Hugging Face rate-limited ${component} (429) after 5 attempts (${url}). Not a code failure in this branch." ;;
-                404)
-                  echo "::error::Hugging Face has no ${repo_id} at revision ${revision} (404, ${url}). Unlike the other codes here this one is about the spicepod: check the repo id and the pinned revision." ;;
-                *)
-                  echo "::error::Could not reach Hugging Face for ${component} (HTTP ${code}) after 5 attempts (${url}). Not a code failure in this branch." ;;
-              esac
-              rc=1
-            fi
-          # A here-string, not a pipe: a pipe would run the loop in a subshell and `rc`
-          # would never make it back out, so every failure would exit 0.
-          done <<< "${repos}"
-
-          exit "${rc}"
-
-      # Same shared-host constraint as the OpenAI model job above (#12419).
-      - name: Allocate Spice runtime ports
-        uses: $/.github/actions/allocate-spice-ports
-
-      - name: Start spice runtime
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
-
-      - name: Wait for Spice runtime is ready
-        uses: $/.github/actions/wait-for-spice-ready
-        with:
-          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
-          timeout: '300'
-
-      - name: Configure apt mirrors (Linux)
-        if: matrix.target.target_os == 'linux'
-        uses: $/.github/actions/configure-apt
-
-      - name: Install expect (linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y expect
-
-      - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && !startsWith(matrix.target.runner, 'spiceai-macos')
-        run: |
-          if command -v expect >/dev/null 2>&1; then
-            expect -v
-          else
-            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
-          fi
-
-      - name: Test the expect scripts driving the REPLs
-        run: |
-          ./test/models/expect_test.sh
-
-      - name: Test vector search
-        run: |
-          ./test/models/search_01.exp
-
-      # No step retry: in merge-queue job 103597842965 a fixed 30s budget ran out
-      # while Qwen2.5-3B was still streaming a long answer on Metal, not on a
-      # Hub download (config probe HTTP 200; `search_01.exp` had already
-      # passed). The REPL scripts bound silence rather than total response
-      # time (90s, override with SPICE_REPL_IDLE_TIMEOUT) and spicepod_hf.yml
-      # caps hf_max_completion_tokens at 64. A stall after that is a hang.
-      - name: Test chat
-        run: |
-          ./test/models/chat_01_simple.exp
-
-      - name: Stop spice and check logs
-        if: always()
-        uses: $/.github/actions/stop-spice
-
   test_quickstart_dremio:
     environment: secret-free
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -720,7 +786,8 @@ jobs:
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
 
@@ -797,7 +864,8 @@ jobs:
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
 
@@ -863,7 +931,8 @@ jobs:
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
 
@@ -963,7 +1032,7 @@ jobs:
       contents: read
       id-token: write  # RustFS credentials
     needs:
-      - build
+      - build_linux
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1042,7 +1111,8 @@ jobs:
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
 
@@ -1202,7 +1272,8 @@ jobs:
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
 
@@ -1424,7 +1495,8 @@ jobs:
     name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
 
@@ -1549,7 +1621,8 @@ jobs:
     name: 'Test DuckDB quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
 
@@ -1636,7 +1709,8 @@ jobs:
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
 
@@ -1778,7 +1852,8 @@ jobs:
     name: 'Test results caching on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
 
@@ -1974,7 +2049,7 @@ jobs:
     # source is unreadable, does not depend on the platform.
     runs-on: spiceai-dev-runners
     needs:
-      - build
+      - build_linux
     timeout-minutes: 5
 
     steps:
@@ -2135,7 +2210,7 @@ jobs:
     name: 'Test GitHub connector on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
       - setup-matrix
     timeout-minutes: 15
     permissions:
@@ -2234,7 +2309,7 @@ jobs:
     if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: spiceai-dev-runners
     needs:
-      - build
+      - build_linux
     timeout-minutes: 20
     concurrency:
       group: huggingface-connector-live-hub
@@ -2279,7 +2354,7 @@ jobs:
     # moves on its own, so this Linux-only job stays on ubuntu-24.04.
     runs-on: ubuntu-24.04
     needs:
-      - build
+      - build_linux
       - setup-matrix
     timeout-minutes: 5
 
@@ -2395,7 +2470,8 @@ jobs:
     name: 'Test Databricks catalog connector (mode: delta_lake) on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
+      - build_macos
       - setup-matrix
     timeout-minutes: 5
     environment: ci
@@ -2505,7 +2581,7 @@ jobs:
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
       - setup-matrix
     timeout-minutes: 10
 
@@ -2760,7 +2836,7 @@ jobs:
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - build_linux
       - setup-matrix
     timeout-minutes: 10
 
@@ -2964,7 +3040,7 @@ jobs:
   # Runs the scenario scripts against this run's spiced and spice CLI.
   test_spicescript:
     name: ${{ matrix.name }}
-    needs: [build, build_spicescript]
+    needs: [build_linux, build_spicescript]
     runs-on: spiceai-dev-runners
     environment: ci
     permissions:
@@ -3217,11 +3293,11 @@ jobs:
     needs:
       - check_changes
       - setup-matrix
-      - build
+      - build_linux
+      - build_macos
       - setup-model-matrix
       - test-bigquery
       - test_openai_model
-      - test_hf_model
       - test_quickstart_dremio
       - test_quickstart_spiceai
       - test_quickstart_s3
