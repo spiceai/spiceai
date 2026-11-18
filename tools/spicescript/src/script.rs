@@ -212,9 +212,24 @@ pub struct VariantSpec {
     /// Extra environment for this variant's `spiced`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The address this variant's `spiced` serves HTTP on.
+    #[serde(default)]
+    pub http_bind: HttpBind,
     /// Run this variant only in matrix combinations with these values.
     #[serde(default)]
     pub when: Map<String, Value>,
+}
+
+/// Where a variant's `spiced` serves HTTP. The runner reaches it at
+/// `127.0.0.1` either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HttpBind {
+    /// `127.0.0.1`, the default.
+    #[default]
+    Loopback,
+    /// `0.0.0.0`, as in a container or on a server.
+    EveryInterface,
 }
 
 #[derive(Debug, Clone, Deserialize)]

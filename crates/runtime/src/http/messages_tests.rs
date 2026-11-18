@@ -371,6 +371,12 @@ async fn runtime_with_options(
             .into(),
         crate::search::util::RuntimeTableProviderExplorer,
     ));
+    let request_origin = Arc::new(super::host_policy::RequestOriginPolicy::new(
+        auth.is_some(),
+        None,
+        cors,
+        false,
+    ));
     super::routes::routes(
         &rt,
         Arc::new(Config::new()),
@@ -378,8 +384,7 @@ async fn runtime_with_options(
         auth,
         cors,
         false,
-        #[cfg(feature = "mcp")]
-        None,
+        request_origin,
     )
 }
 

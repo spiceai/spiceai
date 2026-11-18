@@ -63,6 +63,7 @@ fn start_time_only_changes(
         task_history,
         auth,
         cors,
+        allowed_hosts,
         flight,
         mcp,
         // Applied on reload: `shutdown_timeout` is read from the current app
@@ -124,6 +125,12 @@ fn start_time_only_changes(
             start_time_auth(auth.as_ref()) != start_time_auth(current.auth.as_ref()),
         ),
         ("runtime.cors", Process, *cors != current.cors),
+        // Read once when the HTTP listener starts.
+        (
+            "runtime.allowed_hosts",
+            Process,
+            *allowed_hosts != current.allowed_hosts,
+        ),
         (
             "runtime.flight",
             ProcessAndRecreatedComponents,
@@ -569,6 +576,12 @@ mod tests {
             (
                 "runtime.cors",
                 Box::new(|rt: &mut SpicepodRuntime| rt.cors.enabled = true),
+            ),
+            (
+                "runtime.allowed_hosts",
+                Box::new(|rt: &mut SpicepodRuntime| {
+                    rt.allowed_hosts = Some(vec!["spice.internal".to_string()]);
+                }),
             ),
             (
                 "runtime.flight",

@@ -230,6 +230,11 @@ pub enum Error {
     #[snafu(display("{source}"))]
     UnableToConfigureAuth { source: runtime::auth::Error },
 
+    #[snafu(display(
+        "Both `runtime.allowed_hosts` and the deprecated `runtime.mcp.allowed_hosts` are set. Remove `runtime.mcp.allowed_hosts`; `runtime.allowed_hosts` applies to `/v1/mcp` as well. See https://spiceai.org/docs/reference/spicepod/runtime#allowed_hosts"
+    ))]
+    BothAllowedHostsSet,
+
     #[snafu(display("Unable to initialize tracing: {source}"))]
     UnableToInitializeTracing {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -1267,6 +1272,36 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         tracing::warn!("{warning}");
     }
     let endpoint_auth = endpoint_auth.with_identity_source(identity_source);
+
+    // `runtime.allowed_hosts`, and the MCP-only list it replaces.
+    if let Some(app) = app.as_ref() {
+        let mcp_allowed_hosts = app
+            .runtime
+            .mcp
+            .as_ref()
+            .and_then(|mcp| mcp.allowed_hosts.as_ref());
+        match (app.runtime.allowed_hosts.as_ref(), mcp_allowed_hosts) {
+            (Some(_), Some(_)) => return BothAllowedHostsSetSnafu.fail(),
+            (None, Some(_)) => tracing::warn!(
+                "`runtime.mcp.allowed_hosts` is deprecated and now applies to the whole HTTP API. Move its entries to `runtime.allowed_hosts`; `runtime.mcp.allowed_hosts` is removed in v2.6. See https://spiceai.org/docs/reference/spicepod/runtime#allowed_hosts"
+            ),
+            _ => {}
+        }
+    }
+    let answers_any_host = app
+        .as_ref()
+        .and_then(|app| app.runtime.effective_allowed_hosts())
+        .is_some_and(|hosts| hosts.iter().any(|host| host.trim() == "*"));
+    if !is_executor
+        && !runtime_auth_configured
+        && !matches!(client_auth_mode, ClientAuthMode::Required)
+        && !answers_any_host
+    {
+        tracing::info!(
+            "{}",
+            runtime::http_no_authentication_message(&args.runtime.http_bind_address.to_string())
+        );
+    }
 
     // Captured before `args` is moved into the server task below.
     let runtime_overrides = args.set_runtime.clone();

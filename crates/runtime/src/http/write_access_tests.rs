@@ -95,6 +95,12 @@ async fn routes(auth: bool) -> Router {
             ApiKey::parse_str(&format!("{READ_WRITE_KEY}:rw")),
         ])) as Arc<dyn HttpAuth + Send + Sync>)
     });
+    let request_origin = Arc::new(super::host_policy::RequestOriginPolicy::new(
+        auth_layer.is_some(),
+        None,
+        &CorsConfig::default(),
+        false,
+    ));
     super::routes::routes(
         &rt,
         Arc::new(Config::new()),
@@ -102,8 +108,7 @@ async fn routes(auth: bool) -> Router {
         auth_layer,
         &CorsConfig::default(),
         false,
-        #[cfg(feature = "mcp")]
-        None,
+        request_origin,
     )
 }
 

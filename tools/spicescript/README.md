@@ -228,7 +228,9 @@ with each other, and each ran the writes separately.
 **Variants** are [JSON merge patches](https://www.rfc-editor.org/rfc/rfc7386).
 `spicepod:` patches the whole spicepod, and `datasets:` patches datasets by name
 (`*` for all), since a merge patch replaces a list wholesale. A variant may also
-set `env:` for `spiced`, whose values take the same placeholders, and `when: { <matrix key>: <value> }` to exist only in some
+set `env:` for `spiced`, whose values take the same placeholders,
+`http-bind: every-interface` to serve HTTP on `0.0.0.0` rather than
+`127.0.0.1` (the runner still reaches it at `127.0.0.1`), and `when: { <matrix key>: <value> }` to exist only in some
 combinations. Variants run in alphabetical order, and the first is the one the
 others are compared with.
 

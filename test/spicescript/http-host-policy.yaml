@@ -1,0 +1,116 @@
+name: http-host-policy
+description: >
+  A runtime without authentication, bound to loopback or to every interface,
+  answers only requests whose Host is an IP address, localhost, a name under
+  .localhost or a name in runtime.allowed_hosts, and only browser requests from
+  a local Origin; any other request, to a probe, a read route or a write route,
+  gets a JSON 403 naming the setting to change. runtime.allowed_hosts and the
+  deprecated runtime.mcp.allowed_hosts (with a warning) add names; setting both
+  stops spiced from starting. A runtime with an API key lets a foreign Host
+  reach authentication (401 without the key).
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  loopback: {}
+  every-interface: { http-bind: every-interface }
+  api-key:
+    spicepod: { runtime: { auth: { api-key: { enabled: true, keys: ['host-key:rw'] } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-host-policy
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true }
+
+defaults:
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t SELECT i FROM generate_series(1, 3) i;
+  - start: {}
+  - assert-log: { contains: 'HTTP on \S+ requires no authentication, so it answers only to IP addresses and localhost names\. Add host names with `runtime\.allowed_hosts`, or configure `runtime\.auth`\.' }
+    except: api-key
+  - assert-log: { lacks: 'requires no authentication, so it answers only' }
+    only: api-key
+
+  # Local names and IP addresses: answered.
+  - http: { path: /health, api-key: none, headers: { host: localhost } }
+    expect: { status: 200 }
+  - http: { path: /health, api-key: none, headers: { host: 'app.localhost:8090' } }
+    expect: { status: 200 }
+  - http: { path: /health, api-key: none, headers: { host: '[::1]:8090' } }
+    expect: { status: 200 }
+  - http: { path: /health, api-key: none, headers: { host: '192.0.2.10:8090' } }
+    expect: { status: 200 }
+  - http: { method: POST, path: /v1/sql, api-key: none, headers: { host: '127.0.0.1:8090', content-type: text/plain }, body: SELECT count(*) AS n FROM t }
+    expect: { status: 200, body-contains: '3' }
+    except: api-key
+
+  # Any other name: refused before authentication, a probe and a write route included.
+  - http: { method: POST, path: /v1/sql, api-key: none, headers: { host: 'app.example.com:8090', content-type: text/plain }, body: SELECT count(*) AS n FROM t }
+    expect:
+      status: 403
+      json:
+        - { pointer: /error, equals: "Host 'app.example.com' is not allowed: this runtime requires no authentication, so it answers only to IP addresses, localhost and the names in `runtime.allowed_hosts`. Add 'app.example.com' to `runtime.allowed_hosts`, or configure `runtime.auth`. See https://spiceai.org/docs/reference/spicepod/runtime#allowed_hosts" }
+    except: api-key
+  - http: { path: /health, api-key: none, headers: { host: app.example.com } }
+    expect: { status: 403 }
+    except: api-key
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, api-key: none, headers: { host: app.example.com } }
+    expect: { status: 403, body-contains: "Host 'app.example.com' is not allowed" }
+    except: api-key
+
+  # A foreign Origin: refused; no Origin or a local one: answered.
+  - http: { method: POST, path: /v1/sql, api-key: none, headers: { origin: 'https://app.example.com', content-type: text/plain }, body: SELECT count(*) AS n FROM t }
+    expect:
+      status: 403
+      json:
+        - { pointer: /error, equals: "Origin 'https://app.example.com' is not allowed: this runtime requires no authentication, so it accepts browser requests only from local origins, or from `runtime.cors.allowed_origins` when `runtime.cors.enabled` is true. Add the origin there, or configure `runtime.auth`. See https://spiceai.org/docs/reference/spicepod/runtime#cors" }
+    except: api-key
+  - http: { method: POST, path: /v1/sql, api-key: none, headers: { origin: 'http://localhost:3000', content-type: text/plain }, body: SELECT count(*) AS n FROM t }
+    expect: { status: 200, body-contains: '3' }
+    except: api-key
+
+  # With an API key, Host and Origin are left to authentication.
+  - http: { path: /v1/status, api-key: none, headers: { host: app.example.com, origin: 'https://app.example.com' } }
+    expect: { status: 401 }
+    only: api-key
+  - http: { method: POST, path: /v1/sql, api-key: host-key, headers: { host: app.example.com, content-type: text/plain }, body: SELECT count(*) AS n FROM t }
+    expect: { status: 200, body-contains: '3' }
+    only: api-key
+
+  # runtime.allowed_hosts adds names, a leading dot with its subdomains.
+  - restart:
+      patch: { spicepod: { runtime: { allowed_hosts: [app.example.com, .corp.example] } } }
+  - http: { method: POST, path: /v1/sql, api-key: none, headers: { host: 'app.example.com:8090', content-type: text/plain }, body: SELECT count(*) AS n FROM t }
+    expect: { status: 200, body-contains: '3' }
+    except: api-key
+  - http: { path: /health, api-key: none, headers: { host: 'db.corp.example' } }
+    expect: { status: 200 }
+  - http: { path: /health, api-key: none, headers: { host: 'other.example.com' } }
+    expect:
+      status: 403
+      json:
+        - { pointer: /error, matches: "^Host 'other.example.com' is not allowed: " }
+
+  # The deprecated runtime.mcp.allowed_hosts still adds names, with a warning.
+  - restart:
+      patch: { spicepod: { runtime: { allowed_hosts: null, mcp: { allowed_hosts: [legacy.example] } } } }
+  - assert-log: { contains: 'WARN .*`runtime\.mcp\.allowed_hosts` is deprecated and now applies to the whole HTTP API\. Move its entries to `runtime\.allowed_hosts`; `runtime\.mcp\.allowed_hosts` is removed in v2\.6\.' }
+  - http: { path: /health, api-key: none, headers: { host: legacy.example } }
+    expect: { status: 200 }
+  - http: { path: /health, api-key: none, headers: { host: app.example.com } }
+    expect: { status: 403 }
+
+  # Both set: spiced does not start.
+  - stop: {}
+  - start:
+      patch: { spicepod: { runtime: { allowed_hosts: [app.example.com] } } }
+      exits: 'ERROR .*Both `runtime\.allowed_hosts` and the deprecated `runtime\.mcp\.allowed_hosts` are set\. Remove `runtime\.mcp\.allowed_hosts`; `runtime\.allowed_hosts` applies to `/v1/mcp` as well\.'
