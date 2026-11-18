@@ -75,10 +75,14 @@ impl Drop for Download {
 }
 
 /// An in-memory store whose `get` copies each object, as a download from a remote store does.
+/// It counts the objects downloaded, and can list every object with a size of 0, as a store whose
+/// listing does not know the sizes does.
 #[derive(Debug)]
 struct DownloadingStore {
     inner: InMemory,
     held: Arc<Held>,
+    gets: AtomicUsize,
+    list_sizes: bool,
 }
 
 impl fmt::Display for DownloadingStore {
@@ -111,6 +115,7 @@ impl ObjectStore for DownloadingStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         let result = self.inner.get_opts(location, options).await?;
         let meta = result.meta.clone();
         let range = result.range.clone();
@@ -132,7 +137,18 @@ impl ObjectStore for DownloadingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
+        let list_sizes = self.list_sizes;
+        self.inner
+            .list(prefix)
+            .map(move |meta| {
+                meta.map(|mut meta| {
+                    if !list_sizes {
+                        meta.size = 0;
+                    }
+                    meta
+                })
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
@@ -169,6 +185,8 @@ async fn store_with(spicepod: &str, files: &[(&str, Vec<u8>)]) -> DownloadingSto
     let store = DownloadingStore {
         inner: InMemory::new(),
         held: Arc::new(Held::default()),
+        gets: AtomicUsize::new(0),
+        list_sizes: true,
     };
     store
         .put(
@@ -259,4 +277,102 @@ async fn a_file_referenced_more_than_once_is_packaged_once() {
             ("spicepod.yaml".to_string(), spicepod.as_bytes().to_vec()),
         ]
     );
+}
+
+fn parts(count: u64) -> Vec<(String, Vec<u8>)> {
+    (0..count)
+        .map(|i| (format!("data/part-{i}.bin"), incompressible(i, FILE_BYTES)))
+        .collect()
+}
+
+const PARTS_SPICEPOD: &str =
+    "version: v1\nkind: Spicepod\nname: pkg\ndatasets:\n  - from: file:data\n    name: parts\n";
+
+async fn parts_store(files: &[(String, Vec<u8>)], list_sizes: bool) -> DownloadingStore {
+    let file_refs: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|(path, data)| (path.as_str(), data.clone()))
+        .collect();
+    let mut store = store_with(PARTS_SPICEPOD, &file_refs).await;
+    store.list_sizes = list_sizes;
+    store.gets.store(0, Ordering::SeqCst);
+    store
+}
+
+/// A folder with more files than the package may hold is refused before any of its files is
+/// downloaded, naming the dataset and how many files it lists.
+#[tokio::test]
+async fn a_folder_over_the_file_limit_is_refused_before_its_files_are_fetched() {
+    let store = parts_store(&parts(FILES as u64), true).await;
+    let error = package::make_zip_within(
+        &store,
+        &Path::from("spicepod.yaml"),
+        package::PackageBudget::new(5, 1 << 30),
+    )
+    .await
+    .expect_err("eight files are over a five-file budget");
+    assert!(error.is_over_budget());
+    assert_eq!(
+        error.to_string(),
+        "it references more than 5 files, the most a package may hold, and dataset 'parts' ('file:data') alone lists 8. Reference fewer files in that dataset. See https://spiceai.org/docs/api/http/packages"
+    );
+    assert_eq!(
+        store.gets.load(Ordering::SeqCst),
+        1,
+        "only spicepod.yaml may be downloaded"
+    );
+}
+
+/// A folder whose listed sizes are over the byte limit is refused before any of its files is
+/// downloaded.
+#[tokio::test]
+async fn listed_sizes_over_the_byte_limit_are_refused_before_any_download() {
+    let store = parts_store(&parts(FILES as u64), true).await;
+    let error = package::make_zip_within(
+        &store,
+        &Path::from("spicepod.yaml"),
+        package::PackageBudget::new(10_000, 1 << 20),
+    )
+    .await
+    .expect_err("2 MiB of files are over a 1 MiB budget");
+    assert_eq!(
+        error.to_string(),
+        "its files total more than 1 MiB, the most a package may hold, and dataset 'parts' ('file:data') alone adds 2 MiB. Reference fewer or smaller files in that dataset. See https://spiceai.org/docs/api/http/packages"
+    );
+    assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+}
+
+/// When the listing does not give sizes, the bytes are counted as they arrive: the download that
+/// passes the limit stops, and no later file is fetched.
+#[tokio::test]
+async fn bytes_over_the_limit_stop_the_download_when_sizes_are_not_listed() {
+    let store = parts_store(&parts(FILES as u64), false).await;
+    let error = package::make_zip_within(
+        &store,
+        &Path::from("spicepod.yaml"),
+        package::PackageBudget::new(10_000, 1 << 20),
+    )
+    .await
+    .expect_err("2 MiB of files are over a 1 MiB budget");
+    // spicepod.yaml and three 256 KiB files fit; the fourth passes 1 MiB as it arrives.
+    assert_eq!(
+        error.to_string(),
+        "its files total more than 1 MiB, the most a package may hold, and dataset 'parts' ('file:data') alone adds 1 MiB. Reference fewer or smaller files in that dataset. See https://spiceai.org/docs/api/http/packages"
+    );
+    assert_eq!(store.gets.load(Ordering::SeqCst), 1 + 4);
+}
+
+/// A package within its budget is unchanged by it.
+#[tokio::test]
+async fn a_package_within_its_budget_is_built() {
+    let files = parts(FILES as u64);
+    let store = parts_store(&files, false).await;
+    let zip = package::make_zip_within(
+        &store,
+        &Path::from("spicepod.yaml"),
+        package::PackageBudget::new(9, 3 << 20),
+    )
+    .await
+    .expect("nine files and 2 MiB fit");
+    assert_eq!(archive_entries(&zip).len(), FILES + 1);
 }
