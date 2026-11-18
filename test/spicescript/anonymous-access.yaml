@@ -105,7 +105,7 @@ steps:
     count: 1
     only: loopback
   - flight-exec: UPDATE items SET qty = qty + 1 WHERE id = 2
-    expect-error: Permission denied
+    expect-error: "This route changes data, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured."
     only: every-interface
   - flight-put: { dataset: items, rows: [[5, five, 50]] }
     only: loopback
