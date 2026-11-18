@@ -382,14 +382,14 @@ impl WriteBackDeliverer for PostgresWriteBackDeliverer {
                 .register_delivery(xid8, read.downcast_ref::<EchoReadGuard>())
                 .await
                 .map_err(|e| {
-                delivery_error(
-                    format!(
-                        "Failed to register the delivery transaction for durable write-back to table '{}', so its change echo could not be suppressed; the delivery was aborted rather than risk re-applying it. See: https://spiceai.org/docs/components/data-connectors/postgres",
-                        self.table
-                    ),
-                    e,
-                )
-            })?;
+                    delivery_error(
+                        format!(
+                            "Failed to register the delivery transaction for durable write-back to table '{}', so its change echo could not be suppressed; the delivery was aborted rather than risk re-applying it. See: https://spiceai.org/docs/components/data-connectors/postgres",
+                            self.table
+                        ),
+                        e,
+                    )
+                })?;
 
             let commit_result = tx.commit().await;
             (xid8, commit_result)
