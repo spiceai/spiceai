@@ -1005,18 +1005,15 @@ async fn call_tool_round(
     let in_flight = InFlightCall::new(peer.clone(), handle.id.clone());
     // Spice applies the timeout here, not through `PeerRequestOptions`: rmcp's own timeout
     // awaits the cancel notification, which a stalled server can hold forever.
-    let response = match tokio::time::timeout(timeout.duration(), handle.await_response()).await {
-        Ok(response) => {
-            in_flight.finished();
-            response?
-        }
-        Err(_) => {
-            in_flight.cancel(CALL_TIMEOUT_REASON);
-            return Err(ServiceError::Timeout {
-                timeout: timeout.duration(),
-            });
-        }
+    let Ok(response) = tokio::time::timeout(timeout.duration(), handle.await_response()).await
+    else {
+        in_flight.cancel(CALL_TIMEOUT_REASON);
+        return Err(ServiceError::Timeout {
+            timeout: timeout.duration(),
+        });
     };
+    in_flight.finished();
+    let response = response?;
     match response {
         ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
         ServerResult::InputRequiredResult(result) => Ok(CallToolResponse::InputRequired(result)),
@@ -1449,7 +1446,7 @@ mod tests {
     use super::*;
     use rmcp::{
         RoleServer, ServerHandler, ServiceExt,
-        model::{ContentBlock, InputRequiredResult, ServerCapabilities, ServerInfo, Tool},
+        model::{ContentBlock, InputRequiredResult, ServerCapabilities, ServerConfig, Tool},
         service::NotificationContext,
     };
     use serde_json::{Value, json};
@@ -1507,8 +1504,8 @@ mod tests {
     }
 
     impl ServerHandler for CancelRecordingServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
         }
 
         fn list_tools(
@@ -1527,33 +1524,30 @@ mod tests {
             }))
         }
 
-        fn call_tool(
+        async fn call_tool(
             &self,
             request: CallToolRequestParams,
             context: RequestContext<RoleServer>,
-        ) -> impl Future<Output = std::result::Result<CallToolResponse, ErrorData>> + Send + '_
-        {
-            async move {
-                let hangs = request.name == "hang"
-                    || (request.name == "two_rounds"
-                        && request.request_state.as_deref() == Some("round-2"));
-                if request.name == "two_rounds" && !hangs {
-                    return Ok(CallToolResponse::InputRequired(
-                        InputRequiredResult::from_request_state("round-2"),
-                    ));
-                }
-                if !hangs {
-                    return Ok(CallToolResult::success(vec![ContentBlock::text("ok")]).into());
-                }
-                self.hang_ids
-                    .lock()
-                    .expect("hang ids lock")
-                    .push(context.id.clone());
-                self.hang_started.notify_one();
-                // rmcp cancels `ct` when `notifications/cancelled` for this request arrives.
-                context.ct.cancelled().await;
-                Err(ErrorData::internal_error("cancelled", None))
+        ) -> std::result::Result<CallToolResponse, ErrorData> {
+            let hangs = request.name == "hang"
+                || (request.name == "two_rounds"
+                    && request.request_state.as_deref() == Some("round-2"));
+            if request.name == "two_rounds" && !hangs {
+                return Ok(CallToolResponse::InputRequired(
+                    InputRequiredResult::from_request_state("round-2"),
+                ));
             }
+            if !hangs {
+                return Ok(CallToolResult::success(vec![ContentBlock::text("ok")]).into());
+            }
+            self.hang_ids
+                .lock()
+                .expect("hang ids lock")
+                .push(context.id.clone());
+            self.hang_started.notify_one();
+            // rmcp cancels `ct` when `notifications/cancelled` for this request arrives.
+            context.ct.cancelled().await;
+            Err(ErrorData::internal_error("cancelled", None))
         }
 
         fn on_cancelled(
