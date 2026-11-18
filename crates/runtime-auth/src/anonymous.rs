@@ -145,7 +145,7 @@ impl AnonymousAccess {
                     IpAddr::V4(_) | IpAddr::V6(_) => "",
                 };
                 format!(
-                    "Spice Runtime {listener} on {bind_address} serves requests without credentials read-only, because it listens beyond loopback{unspecified} and `runtime.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data, call read-write tools, or read other callers' task history. To allow writes, configure `runtime.auth` with an API key ending in `:rw`. See https://spiceai.org/docs/api/auth"
+                    "Spice Runtime {listener} on {bind_address} serves requests without credentials read-only, because it listens beyond loopback{unspecified} and `runtime.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data or call read-write tools. To allow writes, configure `runtime.auth` with an API key ending in `:rw`. See https://spiceai.org/docs/api/auth"
                 )
             }
         }
@@ -305,15 +305,15 @@ mod tests {
         );
         assert_eq!(
             AnonymousAccess::ReadOnly.startup_line("HTTP", &addr("0.0.0.0:8090")),
-            "Spice Runtime HTTP on 0.0.0.0:8090 serves requests without credentials read-only, because it listens beyond loopback (0.0.0.0 is not a loopback address) and `runtime.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data, call read-write tools, or read other callers' task history. To allow writes, configure `runtime.auth` with an API key ending in `:rw`. See https://spiceai.org/docs/api/auth"
+            "Spice Runtime HTTP on 0.0.0.0:8090 serves requests without credentials read-only, because it listens beyond loopback (0.0.0.0 is not a loopback address) and `runtime.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data or call read-write tools. To allow writes, configure `runtime.auth` with an API key ending in `:rw`. See https://spiceai.org/docs/api/auth"
         );
         assert_eq!(
             AnonymousAccess::ReadOnly.startup_line("Flight", &addr("[::]:50051")),
-            "Spice Runtime Flight on [::]:50051 serves requests without credentials read-only, because it listens beyond loopback (:: is not a loopback address) and `runtime.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data, call read-write tools, or read other callers' task history. To allow writes, configure `runtime.auth` with an API key ending in `:rw`. See https://spiceai.org/docs/api/auth"
+            "Spice Runtime Flight on [::]:50051 serves requests without credentials read-only, because it listens beyond loopback (:: is not a loopback address) and `runtime.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data or call read-write tools. To allow writes, configure `runtime.auth` with an API key ending in `:rw`. See https://spiceai.org/docs/api/auth"
         );
         assert_eq!(
             AnonymousAccess::ReadOnly.startup_line("HTTP", &addr("10.0.0.5:8090")),
-            "Spice Runtime HTTP on 10.0.0.5:8090 serves requests without credentials read-only, because it listens beyond loopback and `runtime.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data, call read-write tools, or read other callers' task history. To allow writes, configure `runtime.auth` with an API key ending in `:rw`. See https://spiceai.org/docs/api/auth"
+            "Spice Runtime HTTP on 10.0.0.5:8090 serves requests without credentials read-only, because it listens beyond loopback and `runtime.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data or call read-write tools. To allow writes, configure `runtime.auth` with an API key ending in `:rw`. See https://spiceai.org/docs/api/auth"
         );
     }
 

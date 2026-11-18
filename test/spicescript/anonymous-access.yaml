@@ -54,7 +54,7 @@ steps:
     only: loopback
   - assert-log:
       count:
-        "WARN .*Spice Runtime HTTP on 0\\.0\\.0\\.0:\\d+ serves requests without credentials read-only, because it listens beyond loopback \\(0\\.0\\.0\\.0 is not a loopback address\\) and `runtime\\.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data, call read-write tools, or read other callers' task history\\. To allow writes, configure `runtime\\.auth` with an API key ending in `:rw`\\. See https://spiceai\\.org/docs/api/auth": 1
+        "WARN .*Spice Runtime HTTP on 0\\.0\\.0\\.0:\\d+ serves requests without credentials read-only, because it listens beyond loopback \\(0\\.0\\.0\\.0 is not a loopback address\\) and `runtime\\.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data or call read-write tools\\. To allow writes, configure `runtime\\.auth` with an API key ending in `:rw`\\. See https://spiceai\\.org/docs/api/auth": 1
         "WARN .*Spice Runtime Flight on 0\\.0\\.0\\.0:\\d+ serves requests without credentials read-only, because it listens beyond loopback \\(0\\.0\\.0\\.0 is not a loopback address\\)": 1
       lacks: ["as the local operator", "any process on this machine can modify"]
     only: every-interface
