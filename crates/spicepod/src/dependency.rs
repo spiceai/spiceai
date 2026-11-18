@@ -186,8 +186,8 @@ mod tests {
 
     #[test]
     fn an_invalid_trust_value_names_the_accepted_ones() {
-        let error = parse("- from: acme/support\n  trust: yes\n")
-            .expect_err("`yes` is not a trust level");
+        let error =
+            parse("- from: acme/support\n  trust: yes\n").expect_err("`yes` is not a trust level");
         assert!(
             error.contains("unknown variant `yes`, expected `restricted` or `full`"),
             "{error}"
@@ -203,8 +203,8 @@ mod tests {
 
     #[test]
     fn the_short_form_round_trips_unchanged() {
-        let dependencies = parse("- spiceai/quickstart\n- from: acme/tools\n  trust: full\n")
-            .expect("parses");
+        let dependencies =
+            parse("- spiceai/quickstart\n- from: acme/tools\n  trust: full\n").expect("parses");
         let written = yaml::to_string(&dependencies).expect("serializes");
         assert_eq!(
             parse(&written).expect("re-parses"),

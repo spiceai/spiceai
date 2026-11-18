@@ -240,7 +240,11 @@ fn connection_string_attributes(connection_string: &str) -> Vec<(String, String)
         let Some((key, after_key)) = rest.split_once('=') else {
             break;
         };
-        let key = key.trim().trim_start_matches(';').trim().to_ascii_lowercase();
+        let key = key
+            .trim()
+            .trim_start_matches(';')
+            .trim()
+            .to_ascii_lowercase();
         let after_key = after_key.trim_start();
         let (value, after_value) = if let Some(braced) = after_key.strip_prefix('{') {
             let mut value = String::new();
@@ -258,9 +262,7 @@ fn connection_string_attributes(connection_string: &str) -> Vec<(String, String)
                 }
                 value.push(c);
             }
-            let after = braced[end..]
-                .split_once(';')
-                .map_or("", |(_, after)| after);
+            let after = braced[end..].split_once(';').map_or("", |(_, after)| after);
             (value, after)
         } else {
             match after_key.split_once(';') {
@@ -349,7 +351,8 @@ impl DataConnectorFactory for ODBCFactory {
             // Explicitly check if the user has tried to specify a file path,
             // whatever else is configured: a driver given as a path, or a DSN
             // file, makes the driver manager load native code from it.
-            if let Some(connection_string) = params.parameters.get("connection_string").expose().ok()
+            if let Some(connection_string) =
+                params.parameters.get("connection_string").expose().ok()
                 && names_a_file(connection_string)
             {
                 return Err(Error::DirectDriverNotPermitted {}.into());

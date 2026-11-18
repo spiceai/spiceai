@@ -107,11 +107,15 @@ pub async fn build_before_run(app_dir: &Path) -> Result<()> {
 /// Every function with a `build:` block in the root Spicepod and its
 /// dependencies, in declaration order.
 async fn build_targets(app_dir: &Path) -> Result<Vec<BuildTarget>> {
-    let root = spicepod::Spicepod::load(app_dir)
-        .await
-        .map_err(|source| Error::InvalidArgument {
-            message: format!("Failed to read the Spicepod in '{}': {source}", app_dir.display()),
-        })?;
+    let root =
+        spicepod::Spicepod::load(app_dir)
+            .await
+            .map_err(|source| Error::InvalidArgument {
+                message: format!(
+                    "Failed to read the Spicepod in '{}': {source}",
+                    app_dir.display()
+                ),
+            })?;
     let mut targets = targets_of(&root.functions, None);
     for dependency in &root.dependencies {
         let path = app_dir.join("spicepods").join(dependency.from());

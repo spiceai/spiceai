@@ -164,7 +164,9 @@ fn adbc_driver_library(
     from: &str,
     params: Option<&std::collections::HashMap<String, crate::param::ParamValue>>,
 ) -> Option<String> {
-    let connector = from.split_once(':').map_or(from, |(connector, _)| connector);
+    let connector = from
+        .split_once(':')
+        .map_or(from, |(connector, _)| connector);
     if !connector.eq_ignore_ascii_case("adbc") {
         return None;
     }

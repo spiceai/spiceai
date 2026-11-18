@@ -768,7 +768,8 @@ impl WasmConfig {
                 });
             }
         }
-        let module = param_path(&decl.params, MODULE_PARAM)?.ok_or(WasmBuildError::MissingModule)?;
+        let module =
+            param_path(&decl.params, MODULE_PARAM)?.ok_or(WasmBuildError::MissingModule)?;
 
         Ok(Self {
             module,
@@ -1396,9 +1397,10 @@ mod tests {
         let actual = sha256_hex(&std::fs::read(&module).expect("read the module"));
 
         let mut pinned = wasm_identity_decl(&module);
-        pinned
-            .params
-            .insert(SHA256_PARAM.to_string(), Value::String(actual.to_uppercase()));
+        pinned.params.insert(
+            SHA256_PARAM.to_string(),
+            Value::String(actual.to_uppercase()),
+        );
         build_table_udtf(&pinned, None)
             .await
             .expect("a matching pin loads");

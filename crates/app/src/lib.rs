@@ -138,7 +138,10 @@ impl RefusedComponent {
             return None;
         }
         let program = spicepod::host_program::host_program(component)?;
-        if matches!(program, spicepod::host_program::HostProgram::BuildCommand(_)) {
+        if matches!(
+            program,
+            spicepod::host_program::HostProgram::BuildCommand(_)
+        ) {
             return None;
         }
         Some(Self {
@@ -874,15 +877,17 @@ impl AppBuilder {
             let dependency_path = path.join("spicepods").join(dependency);
             // A component that runs a program on the host is loaded from a
             // dependency only when `spicepod.yaml` trusts it.
-            let mut admitted = |component: spicepod::host_program::ComponentRef<'_>| {
-                match RefusedComponent::of(dependency_entry, component) {
+            let mut admitted =
+                |component: spicepod::host_program::ComponentRef<'_>| match RefusedComponent::of(
+                    dependency_entry,
+                    component,
+                ) {
                     Some(refused) => {
                         refused_components.push(refused);
                         false
                     }
                     None => true,
-                }
-            };
+                };
             let dependent_spicepod =
                 Spicepod::load(&dependency_path)
                     .await

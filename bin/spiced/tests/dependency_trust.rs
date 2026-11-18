@@ -175,7 +175,9 @@ fn a_trusted_dependency_starts_its_stdio_tool() {
 
     spiced.wait_for("the program to start", || marker.exists());
     assert!(
-        !spiced.printed().contains("from Spicepod dependency 'thirdparty'"),
+        !spiced
+            .printed()
+            .contains("from Spicepod dependency 'thirdparty'"),
         "a trusted dependency is not refused: {}",
         spiced.printed()
     );

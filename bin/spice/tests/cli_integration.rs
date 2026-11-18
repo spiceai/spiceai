@@ -1050,7 +1050,10 @@ mod add {
             .expect("run spice add again");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{stdout}");
-        assert!(!stdout.contains("Note:"), "a trusted dependency gets no note: {stdout}");
+        assert!(
+            !stdout.contains("Note:"),
+            "a trusted dependency gets no note: {stdout}"
+        );
         assert_eq!(
             fs::read_to_string(temp_dir.path().join("spicepod.yaml")).expect("read spicepod.yaml"),
             trusted,
@@ -1489,7 +1492,12 @@ mod build {
                 ".",
                 "./broken.wasm",
                 "\"sh -c 'echo the compiler says no >&2; exit 3'\"",
-            ) + &function_yaml("never", ".", "./never.wasm", "\"sh -c 'printf x > never.wasm'\"")),
+            ) + &function_yaml(
+                "never",
+                ".",
+                "./never.wasm",
+                "\"sh -c 'printf x > never.wasm'\"",
+            )),
             "",
         );
 
@@ -1523,11 +1531,21 @@ mod build {
             dependency.join("spicepod.yaml"),
             format!(
                 "version: v2\nkind: Spicepod\nname: scoring\nfunctions:\n{}",
-                function_yaml("score", ".", "./score.wasm", "\"sh -c 'printf dep > score.wasm'\"")
+                function_yaml(
+                    "score",
+                    ".",
+                    "./score.wasm",
+                    "\"sh -c 'printf dep > score.wasm'\""
+                )
             ),
         )
         .expect("write the dependency");
-        let own = function_yaml("own", ".", "./own.wasm", "\"sh -c 'printf own > own.wasm'\"");
+        let own = function_yaml(
+            "own",
+            ".",
+            "./own.wasm",
+            "\"sh -c 'printf own > own.wasm'\"",
+        );
 
         write_project(project.path(), &own, "dependencies:\n  - acme/scoring\n");
         let output = spice_cmd()
@@ -1541,7 +1559,10 @@ mod build {
             refused.contains("Failed to build function 'score' from Spicepod dependency 'acme/scoring': its `build:` command runs a program on this host, and a dependency may do that only when spicepod.yaml trusts it. To trust it, replace `- acme/scoring` under `dependencies:` with `- { from: acme/scoring, trust: full }`. See: https://spiceai.org/docs/reference/spicepod#dependencies"),
             "{refused}"
         );
-        assert!(project.path().join("own.wasm").exists(), "the root's own function still builds");
+        assert!(
+            project.path().join("own.wasm").exists(),
+            "the root's own function still builds"
+        );
         assert!(!project.path().join("score.wasm").exists(), "{refused}");
 
         write_project(
@@ -1570,7 +1591,12 @@ mod build {
         let project = TempDir::new().expect("create the project");
         write_project(
             project.path(),
-            &function_yaml("score", ".", "./score.wasm", "\"sh -c 'printf built > score.wasm'\""),
+            &function_yaml(
+                "score",
+                ".",
+                "./score.wasm",
+                "\"sh -c 'printf built > score.wasm'\"",
+            ),
             "",
         );
         let bin = TempDir::new().expect("create the runtime directory");
@@ -1602,7 +1628,9 @@ mod build {
             "{printed}"
         );
         assert_eq!(
-            fs::read_to_string(&seen).expect("the stub runtime ran").trim(),
+            fs::read_to_string(&seen)
+                .expect("the stub runtime ran")
+                .trim(),
             "built",
             "the module must exist before the runtime starts: {printed}"
         );
