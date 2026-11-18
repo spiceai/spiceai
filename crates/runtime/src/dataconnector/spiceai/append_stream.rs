@@ -406,7 +406,8 @@ where
         // Reloads refused in a row for lack of memory.
         let mut refusals = 0_u32;
         let mut last_epoch: Option<String> = None;
-        // Whether the producer has marked any subscription of this stream. A
+        // Whether the producer marks its stream: set once a subscription
+        // carries an epoch, and cleared when one applies data without it. A
         // reconnect can end before its `begin` marker, so it carries no epoch
         // of its own; it is still resubscribed rather than treated as the end
         // of an unmarked producer's stream.
@@ -552,15 +553,21 @@ where
                     Step::Resnapshot(reason) => break Ended::Resubscribe(reason),
                     Step::Skip | Step::Ignore | Step::SnapshotComplete => continue,
                 };
-                if let Some(epoch) = subscription.epoch()
-                    && last_epoch.as_deref() != Some(epoch)
-                {
-                    if last_epoch.is_some() {
-                        tracing::info!(
-                            "The source of dataset '{table_reference}' restarted, so the dataset is reloading from the source's new snapshot."
-                        );
+                match subscription.epoch() {
+                    Some(epoch) if last_epoch.as_deref() != Some(epoch) => {
+                        if last_epoch.is_some() {
+                            tracing::info!(
+                                "The source of dataset '{table_reference}' restarted, so the dataset is reloading from the source's new snapshot."
+                            );
+                        }
+                        last_epoch = Some(epoch.to_string());
                     }
-                    last_epoch = Some(epoch.to_string());
+                    Some(_) => {}
+                    // A producer that sends data without a `begin` does not
+                    // mark its stream, such as one rolled back to a release
+                    // without markers, so it is followed as an unmarked
+                    // producer again.
+                    None => marked_producer = false,
                 }
                 let batch = match normalizer.normalize(batch) {
                     Ok(batch) => batch,
@@ -1378,6 +1385,98 @@ mod tests {
             replacement(&mut stream).await,
             2,
             "the stream recovers from the snapshot after the reconnects"
+        );
+    }
+
+    /// `messages`, then the connection resets.
+    fn reset_after(messages: Vec<FlightData>) -> Messages {
+        futures::stream::iter(messages.into_iter().map(Ok))
+            .chain(futures::stream::once(async {
+                Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                    "connection reset",
+                ))))
+            }))
+            .boxed()
+    }
+
+    /// A marked producer whose reconnects stay up past a healthy minute but
+    /// never begin a snapshot still exhausts the retry budget: only a completed
+    /// snapshot makes such a subscription healthy.
+    #[tokio::test]
+    async fn reconnects_that_never_begin_a_snapshot_exhaust_the_retry_budget() {
+        let runtime = crate::Runtime::builder().build().await;
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (first, _) =
+            through_end(producer(&runtime.datafusion(), &broadcaster, table(vec![1])).await).await;
+        let schema_message = first[0].clone();
+        let mut subscriptions = vec![reset_after(first)];
+        for _ in 0..MAX_APPEND_STREAM_RESUBSCRIBES {
+            let schema_message = schema_message.clone();
+            subscriptions.push(
+                futures::stream::once(async move { Ok(schema_message) })
+                    .chain(futures::stream::once(async {
+                        tokio::time::sleep(APPEND_STREAM_HEALTHY_SUBSCRIPTION * 2).await;
+                        Err(FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                            "connection reset",
+                        ))))
+                    }))
+                    .boxed(),
+            );
+        }
+
+        tokio::time::pause();
+        let mut stream = consumer(subscriptions);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        let error = tokio::time::timeout(APPEND_STREAM_HEALTHY_SUBSCRIPTION * 100, stream.next())
+            .await
+            .expect("the stream gives up")
+            .expect("an envelope")
+            .err()
+            .expect("an error");
+        let reset = FlightError::Tonic(Box::new(tonic::Status::unavailable("connection reset")));
+        match error {
+            cdc::StreamError::Flight(message) => assert_eq!(
+                message,
+                format!(
+                    "The append stream for dataset '{DATASET}' gave up after {MAX_APPEND_STREAM_RESUBSCRIBES} resubscribes: the stream from its source failed ({reset})"
+                )
+            ),
+            other => panic!("expected the retry budget to run out, got {other:?}"),
+        }
+    }
+
+    /// A producer that stops marking its stream, such as one rolled back to a
+    /// release without markers, is followed as an unmarked producer again: its
+    /// stream ending ends the append stream, as it always has.
+    #[tokio::test]
+    async fn a_producer_that_stops_marking_its_stream_is_followed_unmarked() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let (mut unmarked, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+        for message in &mut unmarked {
+            message.app_metadata = bytes::Bytes::new();
+        }
+        let ended = futures::stream::iter(unmarked.into_iter().map(Ok)).boxed();
+
+        tokio::time::pause();
+        let mut stream = consumer(vec![reset_after(first), ended]);
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(
+            next_rows(&mut stream).await,
+            Some((1, true)),
+            "the truncate"
+        );
+        assert_eq!(next_rows(&mut stream).await, Some((2, true)), "the rows");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("the append stream ends without retrying")
+                .is_none(),
+            "an unmarked stream that ends is not resubscribed"
         );
     }
 
