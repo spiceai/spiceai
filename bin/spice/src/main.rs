@@ -958,7 +958,9 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::ResponseIncomplete { .. } => "response_incomplete",
         spice::error::Error::Registry { .. } => "registry",
         spice::error::Error::ConfigIo { .. } => "config_io",
-        spice::error::Error::BuildFailed { .. } => "build_failed",
+        spice::error::Error::BuildFailed { .. } | spice::error::Error::BuildRefused { .. } => {
+            "build_failed"
+        }
         spice::error::Error::ConfigParse { .. } => "config_parse",
         spice::error::Error::CreateDirectory { .. } => "create_directory",
         spice::error::Error::RuntimeExecution { .. } => "runtime_execution",

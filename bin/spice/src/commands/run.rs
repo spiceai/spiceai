@@ -68,10 +68,16 @@ pub struct RunArgs {
 
 /// Execute the run command.
 pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Result<()> {
+    // The runtime runs in the app directory and resolves the Spicepod's
+    // relative paths against it, a function's `params.module` among them,
+    // wherever the Spicepod itself is. The modules are built and hashed
+    // against the same directory, so the runtime loads what was just built.
+    let runtime_dir = ctx.app_dir();
+
     // Build the function modules the runtime is about to load. The runtime
     // itself never builds anything.
-    if let Some(app_dir) = local_spicepod_dir(ctx.app_dir(), &args.args) {
-        crate::commands::build::build_before_run(&app_dir).await?;
+    if let Some(spicepod) = local_spicepod(runtime_dir, &args.args) {
+        crate::commands::build::build_before_run(&spicepod, runtime_dir).await?;
     }
 
     run_runtime(
@@ -83,7 +89,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
             metrics_endpoint: args.metrics_endpoint.clone(),
             verbosity,
             args: args.args.clone(),
-            working_dir: None,
+            working_dir: Some(runtime_dir.clone()),
             // Nothing precedes this command, so the runtime it starts is the
             // only process that can report the Cloud connection.
             connection_report: ConnectionReport::Runtime,
@@ -92,21 +98,17 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
     .await
 }
 
-/// The local directory holding the Spicepod `spiced` will run: the leading
-/// positional argument passed through to it (`spice run ./app/spicepod.yaml`),
-/// or the app directory. A remote Spicepod (`s3://`, `https://`) has nothing
-/// local to build.
-fn local_spicepod_dir(app_dir: &std::path::Path, args: &[String]) -> Option<std::path::PathBuf> {
+/// The local Spicepod `spiced` will load, exactly as it is named: the leading
+/// positional argument passed through to it (`spice run ./app/production.yaml`,
+/// a manifest file or a directory holding `spicepod.yaml`), or the runtime
+/// directory. A remote Spicepod (`s3://`, `https://`) has nothing local to
+/// build.
+fn local_spicepod(runtime_dir: &std::path::Path, args: &[String]) -> Option<std::path::PathBuf> {
     let Some(spicepod) = args.first().filter(|arg| !arg.starts_with('-')) else {
-        return Some(app_dir.to_path_buf());
+        return Some(runtime_dir.to_path_buf());
     };
     if spicepod.contains("://") {
         return None;
     }
-    let path = app_dir.join(spicepod);
-    if path.is_dir() {
-        Some(path)
-    } else {
-        path.parent().map(std::path::Path::to_path_buf)
-    }
+    Some(runtime_dir.join(spicepod))
 }

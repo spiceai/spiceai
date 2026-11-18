@@ -1635,6 +1635,167 @@ mod build {
             "the module must exist before the runtime starts: {printed}"
         );
     }
+
+    /// What a stub runtime saw when `spice run` started it.
+    struct RuntimeSaw {
+        /// Its working directory.
+        cwd: std::path::PathBuf,
+        /// The bytes of `./score.wasm`, read relative to its working
+        /// directory the way the runtime reads a relative `params.module`.
+        module: String,
+        /// Its arguments, among them the Spicepod it was told to load.
+        args: Vec<String>,
+    }
+
+    /// A stub runtime that records [`RuntimeSaw`] in `record`.
+    fn stub_runtime(bin: &TempDir, record: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let spiced = bin.path().join("spiced");
+        fs::write(
+            &spiced,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'v2.5.0'; exit 0; fi\n{{ pwd -P; if [ -f ./score.wasm ]; then cat ./score.wasm; else printf missing; fi; echo; printf '%s\\n' \"$@\"; }} > '{record}'\nexit 0\n",
+                record = record.display()
+            ),
+        )
+        .expect("write the stub runtime");
+        fs::set_permissions(&spiced, fs::Permissions::from_mode(0o755))
+            .expect("make the stub runtime executable");
+        spiced
+    }
+
+    fn runtime_saw(record: &std::path::Path, printed: &str) -> RuntimeSaw {
+        let record = fs::read_to_string(record)
+            .unwrap_or_else(|err| panic!("the stub runtime never ran ({err}): {printed}"));
+        let mut lines = record.lines();
+        RuntimeSaw {
+            cwd: lines.next().unwrap_or_default().into(),
+            module: lines.next().unwrap_or_default().to_string(),
+            args: lines.map(str::to_string).collect(),
+        }
+    }
+
+    /// `spice run production.yaml` builds the functions of `production.yaml`,
+    /// the manifest the runtime is given, not of the `spicepod.yaml` beside it.
+    #[test]
+    fn test_run_builds_the_manifest_it_names() {
+        let project = TempDir::new().expect("create the project");
+        write_project(
+            project.path(),
+            &function_yaml(
+                "decoy",
+                ".",
+                "./decoy.wasm",
+                "\"sh -c 'printf decoy > decoy.wasm'\"",
+            ),
+            "",
+        );
+        fs::write(
+            project.path().join("production.yaml"),
+            format!(
+                "version: v2\nkind: Spicepod\nname: production\nfunctions:\n{}",
+                function_yaml(
+                    "score",
+                    ".",
+                    "./score.wasm",
+                    "\"sh -c 'printf production > score.wasm'\""
+                )
+            ),
+        )
+        .expect("write production.yaml");
+        let bin = TempDir::new().expect("create the runtime directory");
+        let record = bin.path().join("runtime-saw");
+        let spiced = stub_runtime(&bin, &record);
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .env("SPICED_PATH", &spiced)
+            .args(["run", "production.yaml"])
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        assert!(
+            printed.contains(&format!(
+                "Built 'score' -> ./score.wasm (sha256 {})",
+                sha256_hex(b"production")
+            )),
+            "{printed}"
+        );
+        assert!(!printed.contains("decoy"), "{printed}");
+        assert!(
+            !project.path().join("decoy.wasm").exists(),
+            "the other manifest's build must not run: {printed}"
+        );
+        let saw = runtime_saw(&record, &printed);
+        assert!(
+            saw.args.iter().any(|arg| arg == "production.yaml"),
+            "the runtime loads the same manifest: {:?} {printed}",
+            saw.args
+        );
+        assert_eq!(saw.module, "production", "{printed}");
+    }
+
+    /// From the app's parent directory, `spice run ./app/spicepod.yaml` builds
+    /// a relative `params.module` where the runtime then loads it: in the
+    /// directory the runtime runs in, which is where `spice run` was invoked.
+    /// The runtime never starts on a stale module there while the new one sits
+    /// beside the Spicepod.
+    #[test]
+    fn test_run_from_a_parent_directory_builds_the_module_the_runtime_loads() {
+        let parent = TempDir::new().expect("create the parent directory");
+        let app = parent.path().join("app");
+        fs::create_dir_all(&app).expect("create the app directory");
+        write_project(
+            &app,
+            &function_yaml(
+                "score",
+                ".",
+                "./score.wasm",
+                "\"sh -c 'printf fresh > score.wasm'\"",
+            ),
+            "",
+        );
+        fs::write(parent.path().join("score.wasm"), "stale").expect("write a stale module");
+        let bin = TempDir::new().expect("create the runtime directory");
+        let record = bin.path().join("runtime-saw");
+        let spiced = stub_runtime(&bin, &record);
+
+        let output = spice_cmd()
+            .current_dir(parent.path())
+            .env("SPICED_PATH", &spiced)
+            .args(["run", "./app/spicepod.yaml"])
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        let saw = runtime_saw(&record, &printed);
+        assert_eq!(
+            saw.cwd,
+            parent.path().canonicalize().expect("canonical parent"),
+            "{printed}"
+        );
+        assert!(
+            saw.args.iter().any(|arg| arg == "./app/spicepod.yaml"),
+            "{:?} {printed}",
+            saw.args
+        );
+        assert_eq!(
+            saw.module, "fresh",
+            "the runtime must load the module that was just built: {printed}"
+        );
+        assert!(
+            printed.contains(&format!(
+                "Built 'score' -> ./score.wasm (sha256 {})",
+                sha256_hex(b"fresh")
+            )),
+            "the printed digest must be the module the runtime loads: {printed}"
+        );
+        assert!(!app.join("score.wasm").exists(), "{printed}");
+    }
 }
 
 // ============================================================================
