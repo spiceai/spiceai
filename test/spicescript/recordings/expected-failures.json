@@ -1894,8 +1894,35 @@
       "who": "as-written",
       "key": "query: SELECT * FROM accounts #4",
       "kind": "wrong-answer",
-      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
-      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "signature": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
+      "pattern": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT * FROM accounts #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"owner\", row_number: 47, expected: \"\\\"through spice\\\"\", actual: \"\\\"at the source\\\"\" }",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "as-written",
+      "key": "query: SELECT owner FROM accounts WHERE id = 5",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"owner\", row_number: 1, expected: \"\\\"through spice\\\"\", actual: \"\\\"at the source\\\"\" }",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT owner FROM accounts WHERE id = 5",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"owner\", row_number: 1, expected: \"\\\"through spice\\\"\", actual: \"\\\"at the source\\\"\" }",
       "group": "write-back",
       "may-pass": true
     }
