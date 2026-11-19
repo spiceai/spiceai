@@ -1038,6 +1038,14 @@ pub(crate) fn handle_datafusion_error(e: &DataFusionError) -> Status {
         DataFusionError::SchemaError(schema_err, _) => {
             Status::invalid_argument(format!("{schema_err}"))
         }
+        // Data a connector refused as a compression bomb: the query is the client's to
+        // change, so a client error, as `/v1/sql` answers it.
+        DataFusionError::External(e)
+            if data_components::refusal::is_compression_refusal(e.as_ref())
+                || data_components::refusal::is_request_bound_refusal(e.as_ref()) =>
+        {
+            Status::invalid_argument(e.to_string())
+        }
         DataFusionError::External(e) => {
             if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
                 match e {
@@ -1427,6 +1435,62 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::FutureExt;
     use runtime_request_context::Protocol;
+
+    /// Data refused as a compression bomb is a client error with the refusal's own
+    /// message, however it was wrapped; text alone does not make an error one.
+    #[test]
+    fn a_compression_refusal_is_a_client_error_by_its_type() {
+        let refusal = http_body_limit::Error::CompressionRatio {
+            codec: http_body_limit::Codec::Gzip,
+            input: http_body_limit::Input::File,
+            decoded: 67_200_000,
+            received: 33_600,
+        };
+        let typed =
+            http_body_limit::CompressionRefusal::new("a reworded refusal".to_string(), &refusal)
+                .expect("a compression refusal");
+        let error = DataFusionError::Context(
+            "scan".to_string(),
+            Box::new(DataFusionError::External(Box::new(typed))),
+        );
+        let status = handle_datafusion_error(&error);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "a reworded refusal");
+
+        let text_only = DataFusionError::External(Box::new(std::io::Error::other(
+            "the response was refused as a compression bomb",
+        )));
+        assert_eq!(
+            handle_datafusion_error(&text_only).code(),
+            tonic::Code::Internal
+        );
+    }
+
+    /// A query over an HTTP dataset's request bound is a client error with the
+    /// refusal's own message, however it was wrapped; text alone does not make an
+    /// error one.
+    #[test]
+    fn a_request_bound_refusal_is_a_client_error_by_its_type() {
+        let error = DataFusionError::Context(
+            "scan".to_string(),
+            Box::new(DataFusionError::External(Box::new(
+                data_components::http::provider::Error::TooManyRequests {
+                    message: "a reworded request-bound refusal".to_string(),
+                },
+            ))),
+        );
+        let status = handle_datafusion_error(&error);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "a reworded request-bound refusal");
+
+        let text_only = DataFusionError::External(Box::new(std::io::Error::other(
+            "set `max_request_partitions` on the dataset",
+        )));
+        assert_eq!(
+            handle_datafusion_error(&text_only).code(),
+            tonic::Code::Internal
+        );
+    }
 
     /// The messages a Flight response sent, and the failure that ended it, if any.
     type Sent = (Vec<FlightData>, Option<(tonic::Code, String)>);

@@ -18637,6 +18637,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "futures",
+ "http-body-limit",
  "humantime",
  "insta",
  "object_store 0.13.2",
@@ -20706,6 +20707,7 @@ dependencies = [
  "tokio",
  "tonic",
  "yaml",
+ "zstd 0.13.5",
 ]
 
 [[package]]

@@ -100,6 +100,12 @@ pub enum Error {
     #[snafu(display("Filter rejected: {message}"))]
     FilterRejected { message: String },
 
+    /// A query whose request filters, or a subquery's values, combine into more
+    /// requests than `max_request_partitions` allows. Typed, so callers classify it
+    /// as a refused request by type (see `crate::refusal`), not by its message.
+    #[snafu(display("{message}"))]
+    TooManyRequests { message: String },
+
     #[snafu(display("HTTP provider configuration error: {message}"))]
     Configuration { message: String },
 
@@ -122,9 +128,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to read the response from {endpoint} for {dataset}: {source}. Ask the \
-        endpoint for an uncompressed response by adding `Accept-Encoding: identity` to \
-        `http_headers`, or request less data per call. \
+        "Failed to read the response from {endpoint} for {dataset}: {source} \
         See: https://spiceai.org/docs/components/data-connectors/https"
     ))]
     CompressionRatio {
@@ -153,6 +157,19 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// `n` with a comma between each group of three digits, as error messages print counts.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
 
 /// How a message refers to the dataset: by name when there is one, and by a phrase that
 /// still reads as a sentence when there is not.
@@ -368,14 +385,17 @@ impl From<Error> for DataFusionError {
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
-            err @ (Error::HttpRequest { .. } | Error::JsonNesting { .. }) => {
-                DataFusionError::External(Box::new(err))
-            }
+            // Kept typed. `TooManyRequests` and `CompressionRatio` are refusals callers
+            // classify by type (see `crate::refusal`): `/v1/sql` answers them as JSON, and a
+            // refresh does not ask again for a query or a response that would be refused
+            // again.
+            err @ (Error::HttpRequest { .. }
+            | Error::JsonNesting { .. }
+            | Error::TooManyRequests { .. }
+            | Error::CompressionRatio { .. }) => DataFusionError::External(Box::new(err)),
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
-            // `Plan`, so a refresh does not re-ask: the response will expand as far again.
-            err @ Error::CompressionRatio { .. } => DataFusionError::Plan(err.to_string()),
             // The pool's own error kind, so the query fails as any other that ran out of
             // query memory does.
             err @ Error::ResponseMemory { .. } => {
@@ -395,6 +415,9 @@ pub const DEFAULT_MAX_QUERY_LENGTH: usize = 1024;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
+/// The most distinct requests one scan of an HTTP dataset may send by default, one for
+/// each combination of its request filter values (`max_request_partitions`).
+pub const DEFAULT_MAX_REQUEST_PARTITIONS: usize = 1000;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
 const PAGINATION_REPEAT_DETECTION_WINDOW: usize = 1024;
 pub type PartitionSpec = (
@@ -912,7 +935,7 @@ pub struct HttpTableProvider {
     custom_headers: HeaderMap,
     allowed_paths: Option<(GlobSet, Vec<String>)>,
     request_filter_options: RequestFilterOptions,
-    max_request_partitions: Option<usize>,
+    max_request_partitions: usize,
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
     auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
@@ -974,7 +997,7 @@ impl HttpTableProvider {
             custom_headers: HeaderMap::new(),
             allowed_paths: None,
             request_filter_options: RequestFilterOptions::default(),
-            max_request_partitions: None,
+            max_request_partitions: DEFAULT_MAX_REQUEST_PARTITIONS,
             health_probe: None,
             pagination: None,
             auth: None,
@@ -1245,12 +1268,12 @@ impl HttpTableProvider {
     }
 
     #[must_use]
-    pub fn max_request_partitions(&self) -> Option<usize> {
+    pub fn max_request_partitions(&self) -> usize {
         self.max_request_partitions
     }
 
     #[must_use]
-    pub fn with_max_request_partitions(mut self, max_request_partitions: Option<usize>) -> Self {
+    pub fn with_max_request_partitions(mut self, max_request_partitions: usize) -> Self {
         self.max_request_partitions = max_request_partitions;
         self
     }
@@ -2592,7 +2615,7 @@ impl HttpExec {
 
     /// Returns the maximum number of request partitions allowed, if configured.
     #[must_use]
-    pub fn max_request_partitions(&self) -> Option<usize> {
+    pub fn max_request_partitions(&self) -> usize {
         self.provider.max_request_partitions()
     }
 
@@ -2660,23 +2683,26 @@ impl HttpExec {
         values: &[String],
     ) -> DataFusionResult<Self> {
         let existing = &self.partitions;
-        let new_count = existing.len().checked_mul(values.len()).ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "HttpExec: expanding params would create more partitions than can be counted ({} existing x {} values). Reduce the number of dynamic values.",
-                existing.len(),
-                values.len(),
-            ))
-        })?;
-
-        if let Some(max) = self.max_request_partitions()
-            && new_count > max
-        {
-            return Err(DataFusionError::Plan(format!(
-                "HttpExec: expanding params would create {new_count} partitions (existing {} x {} values), which exceeds max_request_partitions={max}. Reduce the number of dynamic values or increase max_request_partitions.",
-                existing.len(),
-                values.len(),
-            )));
-        }
+        let max = self.max_request_partitions();
+        let new_count = existing.len().checked_mul(values.len());
+        let new_count = match new_count {
+            Some(count) if count <= max => count,
+            _ => {
+                let needed = new_count.map_or_else(
+                    || "more requests than can be counted".to_string(),
+                    |count| format!("{} requests", thousands(count)),
+                );
+                return Err(DataFusionError::External(Box::new(
+                    Error::TooManyRequests {
+                        message: format!(
+                            "Failed to run the query on {} (https): the values a subquery supplied for {col_name} combine into {needed}, more than the {} allowed. Filter the subquery, or set `max_request_partitions` on the dataset. See: https://spiceai.org/docs/components/data-connectors/https",
+                            self.provider.dataset_subject(),
+                            thousands(max),
+                        ),
+                    },
+                )));
+            }
+        };
 
         let mut new_partitions = Vec::with_capacity(new_count);
 
@@ -4706,26 +4732,30 @@ impl HttpTableProvider {
         body_count: usize,
         header_count: usize,
     ) -> Result<()> {
+        let max = self.max_request_partitions;
         let partition_count = path_count
             .checked_mul(query_count)
             .and_then(|count| count.checked_mul(body_count))
-            .and_then(|count| count.checked_mul(header_count))
-            .ok_or_else(|| Error::FilterRejected {
-                message: "The HTTP request partition count overflowed while combining request_path, request_query, request_body, and request_headers filters. Reduce the number of filter values.".to_string(),
-            })?;
-
-        if let Some(max_request_partitions) = self.max_request_partitions {
-            ensure!(
-                partition_count <= max_request_partitions,
-                FilterRejectedSnafu {
-                    message: format!(
-                        "The HTTP connector would create {partition_count} request partitions, which exceeds max_request_partitions={max_request_partitions}. Reduce the number of request_path, request_query, request_body, or request_headers filter values, or increase max_request_partitions."
-                    )
-                }
-            );
+            .and_then(|count| count.checked_mul(header_count));
+        let (needed, fix) = match partition_count {
+            Some(count) if count <= max => return Ok(()),
+            Some(count) => (
+                format!("{} requests", thousands(count)),
+                format!("set `max_request_partitions: {count}` on the dataset"),
+            ),
+            None => (
+                "more requests than can be counted".to_string(),
+                "set `max_request_partitions` on the dataset".to_string(),
+            ),
+        };
+        TooManyRequestsSnafu {
+            message: format!(
+                "Failed to plan the query on {} (https): its request filters combine into {needed}, more than the {} allowed. Use fewer request_path, request_query, request_body or request_headers values, or {fix}. See: https://spiceai.org/docs/components/data-connectors/https",
+                self.dataset_subject(),
+                thousands(max),
+            ),
         }
-
-        Ok(())
+        .fail()
     }
 }
 
@@ -7459,7 +7489,7 @@ mod tests {
             .with_allowed_paths(vec!["/api/users".to_string(), "/api/posts".to_string()])
             .expect("allowed paths")
             .enable_query_filters(64)
-            .with_max_request_partitions(Some(3));
+            .with_max_request_partitions(3);
         let filters = vec![
             Expr::InList(InList::new(
                 Box::new(Expr::Column(Column::from_name("request_path"))),
@@ -7482,13 +7512,17 @@ mod tests {
         let err = provider
             .extract_partitions(&filters)
             .expect_err("expected partition cap rejection");
-        match err {
-            DataFusionError::Plan(message) => {
-                assert!(message.contains("4 request partitions"));
-                assert!(message.contains("max_request_partitions=3"));
-            }
-            other => panic!("Unexpected error: {other:?}"),
-        }
+        assert!(
+            crate::refusal::is_request_bound_refusal(&err),
+            "the refusal keeps its type: {err:?}"
+        );
+        let DataFusionError::External(refused) = err else {
+            panic!("Unexpected error: {err:?}");
+        };
+        assert_eq!(
+            refused.to_string(),
+            "Failed to plan the query on this dataset (https): its request filters combine into 4 requests, more than the 3 allowed. Use fewer request_path, request_query, request_body or request_headers values, or set `max_request_partitions: 4` on the dataset. See: https://spiceai.org/docs/components/data-connectors/https"
+        );
     }
 
     #[test]
@@ -11726,10 +11760,7 @@ mod tests {
     ///
     /// Enables all filter types (path, query, body, headers) so that
     /// `with_expanded_params` validation passes for any column.
-    fn make_exec(
-        partitions: Vec<PartitionSpec>,
-        max_request_partitions: Option<usize>,
-    ) -> HttpExec {
+    fn make_exec(partitions: Vec<PartitionSpec>, max_request_partitions: usize) -> HttpExec {
         let provider = base_provider()
             .with_allowed_paths(["/*"])
             .expect("valid path glob")
@@ -11748,7 +11779,10 @@ mod tests {
 
     #[test]
     fn content_builder_preserves_utf8_empty_nul_and_duplicate_values() {
-        let plain = make_exec(vec![(None, None, None, None)], None);
+        let plain = make_exec(
+            vec![(None, None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let (cached, _) = plain.for_cache_fetch();
         let rows: Vec<String> = ["", "雪🌶", "before\0after", "same", "same"]
             .into_iter()
@@ -11797,7 +11831,10 @@ mod tests {
 
     #[test]
     fn cache_fetch_metadata_matches_plain_http() {
-        let plain = make_exec(vec![(None, None, None, None)], None);
+        let plain = make_exec(
+            vec![(None, None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let (cached, completion) = plain.for_cache_fetch();
         let rows = vec!["same".to_string(), "same".to_string()];
         for query in [None, Some("")] {
@@ -11915,7 +11952,10 @@ mod tests {
 
     #[test]
     fn test_with_expanded_params_request_path() {
-        let exec = make_exec(vec![(None, None, None, None)], None);
+        let exec = make_exec(
+            vec![(None, None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let result = exec
             .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
             .expect("expand should succeed");
@@ -11936,7 +11976,7 @@ mod tests {
                 (Some("/a".to_string()), None, None, None),
                 (Some("/b".to_string()), None, None, None),
             ],
-            None,
+            DEFAULT_MAX_REQUEST_PARTITIONS,
         );
         let result = exec
             .with_expanded_params(
@@ -11973,7 +12013,10 @@ mod tests {
     /// counter as its template, not a fresh one, for that fallback to see it.
     #[test]
     fn test_with_expanded_params_shares_metrics_with_template() {
-        let exec = make_exec(vec![(None, None, None, None)], None);
+        let exec = make_exec(
+            vec![(None, None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let expanded = exec
             .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
             .expect("expand should succeed");
@@ -12003,12 +12046,25 @@ mod tests {
                 (Some("/a".to_string()), None, None, None),
                 (Some("/b".to_string()), None, None, None),
             ],
-            Some(3),
+            3,
         );
 
-        _ = exec
+        let error = exec
             .with_expanded_params("request_query", &["q=1".to_string(), "q=2".to_string()])
             .expect_err("should exceed max_request_partitions");
+        assert!(
+            crate::refusal::is_request_bound_refusal(&error),
+            "the refusal keeps its type: {error:?}"
+        );
+        let DataFusionError::External(refused) = error else {
+            panic!("expected a typed refusal, got {error:?}");
+        };
+        assert_eq!(
+            refused.to_string(),
+            "Failed to run the query on this dataset (https): the values a subquery supplied for request_query combine into 4 requests, more than the 3 allowed. Filter the subquery, or set `max_request_partitions` on the dataset. See: https://spiceai.org/docs/components/data-connectors/https"
+        );
+        assert_eq!(thousands(90_000), "90,000");
+        assert_eq!(thousands(1_000), "1,000");
     }
 
     type PartitionAccessor = Box<dyn Fn(&PartitionSpec) -> &Option<String>>;
@@ -12032,7 +12088,10 @@ mod tests {
         ];
 
         for (test_value, col_name, accessor) in &cases {
-            let exec = make_exec(vec![(None, None, None, None)], None);
+            let exec = make_exec(
+                vec![(None, None, None, None)],
+                DEFAULT_MAX_REQUEST_PARTITIONS,
+            );
             let result = exec
                 .with_expanded_params(col_name, &[test_value.to_string()])
                 .unwrap_or_else(|e| panic!("expand for {col_name} should succeed: {e}"));
@@ -12075,7 +12134,10 @@ mod tests {
 
     #[test]
     fn test_with_expanded_params_unknown_column_errors() {
-        let exec = make_exec(vec![(Some("/orig".to_string()), None, None, None)], None);
+        let exec = make_exec(
+            vec![(Some("/orig".to_string()), None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let _ = exec
             .with_expanded_params("nonexistent_column", &["x".to_string()])
             .expect_err("unknown column should error");

@@ -582,7 +582,7 @@ mod tests {
         )
         .with_schema(Some(schema))
         .build(
-            reqwest::Client::new(),
+            reqwest::Client::builder(),
             std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
         )
         .expect("client to build");
@@ -619,7 +619,7 @@ mod tests {
         .with_json_pointer(Some("/data/view/nodes"))
         .with_schema(Some(Arc::clone(&schema)))
         .build(
-            reqwest::Client::new(),
+            reqwest::Client::builder(),
             std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
         )
         .expect("client to build");
@@ -677,7 +677,7 @@ mod tests {
         )
         .with_schema(Some(Arc::clone(&schema)))
         .build(
-            reqwest::Client::new(),
+            reqwest::Client::builder(),
             std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
         )
         .expect("configured client");
@@ -704,7 +704,7 @@ mod tests {
             UnnestBehavior::Depth(0),
         )
         .build(
-            reqwest::Client::new(),
+            reqwest::Client::builder(),
             std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
         )
         .expect("inferred client");
@@ -745,7 +745,7 @@ mod tests {
         .with_json_pointer(Some("/data/view/nodes"))
         .with_schema(Some(schema))
         .build(
-            reqwest::Client::new(),
+            reqwest::Client::builder(),
             std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
         )
         .expect("client to build");
@@ -786,7 +786,7 @@ mod tests {
             .with_json_pointer(Some("/data/view/nodes"))
             .with_schema(Some(Arc::clone(&schema)))
             .build(
-                reqwest::Client::new(),
+                reqwest::Client::builder(),
                 std::sync::Arc::new(
                     datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
                 ),
@@ -830,7 +830,7 @@ mod tests {
         )
         .with_json_pointer(Some("/data/view"))
         .build(
-            reqwest::Client::new(),
+            reqwest::Client::builder(),
             std::sync::Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
         )
         .expect("client to build");

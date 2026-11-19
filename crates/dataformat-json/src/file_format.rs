@@ -63,6 +63,7 @@ use datafusion_datasource::decoder::Decoder;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::source::DataSource;
 use futures::TryStreamExt;
+use http_body_limit::Expansion;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore, ObjectStoreExt};
 use snafu::prelude::*;
 use tokio_util::io::{StreamReader, SyncIoBridge};
@@ -82,6 +83,8 @@ pub struct SpiceJsonOptions {
     /// When `true`, include Socrata `meta_data` columns (sid, id, position, etc.)
     /// in the schema for SODA format responses. Disabled by default.
     pub soda_metadata: bool,
+    /// The dataset and connector a refused file names and links, when known.
+    pub source: Option<crate::limits::SourceLabel>,
 }
 
 #[derive(Debug, Snafu)]
@@ -144,6 +147,7 @@ impl Default for SpiceJsonOptions {
             flatten_json: None,
             json_pointer: None,
             soda_metadata: false,
+            source: None,
         }
     }
 }
@@ -216,6 +220,17 @@ impl SpiceJsonFormat {
     #[must_use]
     pub fn with_soda_metadata(mut self, enabled: bool) -> Self {
         self.options.soda_metadata = enabled;
+        self
+    }
+
+    /// Name the dataset these files belong to and the connector that reads them, which a
+    /// refused file names and links.
+    #[must_use]
+    pub fn with_source(mut self, dataset: impl Into<String>, connector: impl Into<String>) -> Self {
+        self.options.source = Some(crate::limits::SourceLabel {
+            dataset: dataset.into(),
+            connector: connector.into(),
+        });
         self
     }
 
@@ -357,15 +372,28 @@ impl SpiceJsonFormat {
         let reservation = MemoryConsumer::new(format!("JSON schema probe of '{location}'"))
             .register(&state.runtime_env().memory_pool);
         tokio::task::spawn_blocking(move || {
-            let decoded =
-                FileCompressionType::from(format.options.compression).convert_read(reader)?;
-            let body = format.open_body(decoded, &reservation)?;
+            let (decoded, expansion) = crate::limits::checked_decoder(
+                FileCompressionType::from(format.options.compression),
+                reader,
+            )?;
             // `reservation` outlives the probe, so a document stays charged while it is read.
-            probe(&format, body)
+            format
+                .open_body(decoded, &reservation)
+                .and_then(|body| probe(&format, body))
+                .map_err(|error| {
+                    // The record parsers report a failed read as text; the check still knows
+                    // whether the file was refused.
+                    match expansion.as_ref().and_then(Expansion::refused) {
+                        Some(refusal) => DataFusionError::External(Box::new(refusal)),
+                        None => error,
+                    }
+                })
         })
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?
-        .map_err(|e| crate::limits::locate_refusal(location, e))
+        .map_err(|e| {
+            crate::limits::locate_refusal("JSON", location, self.options.source.as_ref(), e)
+        })
     }
 
     /// Classifies a decompressed body as streamable records or a whole
@@ -700,6 +728,7 @@ impl FileFormat for SpiceJsonFormat {
                 .with_json_pointer(self.options.json_pointer.clone())
                 .with_unnest_struct(self.options.flatten_json.clone())
                 .with_soda_metadata(self.options.soda_metadata)
+                .with_source(self.options.source.clone())
                 .with_table_schema(table_schema),
         )
     }

@@ -1556,7 +1556,11 @@ pub trait ListingTableConnector: DataConnector {
     {
         let mut format = SpiceJsonFormat::default()
             .with_format(default_format)
-            .with_file_compression_type(file_compression_type);
+            .with_file_compression_type(file_compression_type)
+            .with_source(
+                dataset.name.to_string(),
+                connector_docs_page(&format!("{self}")),
+            );
 
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
@@ -3301,6 +3305,16 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
             );
             ParquetPageIndexOptions::default()
         }
+    }
+}
+
+/// The connector's documentation page under `components/data-connectors/`, which an
+/// error about one of its files links: the connector's name, except where its page is
+/// named for the scheme users write.
+fn connector_docs_page(connector: &str) -> String {
+    match connector {
+        "http_listing" => "https".to_string(),
+        other => other.to_string(),
     }
 }
 
