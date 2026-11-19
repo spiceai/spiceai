@@ -2820,6 +2820,17 @@
               }
             }
           },
+          "403": {
+            "description": "The tool can change data or act outside Spice, and the credentials on the request do not allow write access",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Failed to call tool 'store_memory': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Tool not found",
             "content": {
