@@ -139,13 +139,8 @@ jobs:
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     # A backstop above the compile step's own bound below, leaving room for the artifact
-    # upload and the post steps. The compile step carries a tighter bound so that a wedged
-    # one is cut while the `always()` diagnostics after it can still run — a hung compile
-    # is exactly when the sccache stats are worth having.
+    # upload and the post steps.
     timeout-minutes: 200
-    permissions:
-      contents: read
-      id-token: write  # RustFS credentials for the compiler cache
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,8 +154,14 @@ jobs:
       - name: Set up Rust
         uses: $/.github/actions/setup-rust
 
+      # rust-cache names its entry after the job id unless `shared-key` is set. Trunk pushes
+      # save this entry and merge groups restore it, so a new job id would leave every
+      # merge group with no entry to restore until a trunk push saved one under the new
+      # name. `build` is the id this job had while it was one leg of a matrix, so the key
+      # stays `v0-rust-build-Linux-x64-…`, the entry trunk already saves.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          shared-key: build
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Set up make
@@ -172,25 +173,12 @@ jobs:
       - name: Install Protoc
         uses: $/.github/actions/install-protoc
 
-      # The compiler cache is the RustFS-backed sccache bucket that the integration and
-      # chDB builds on this pool already use. A failure here (a RustFS outage) must not
-      # fail the build: without credentials `setup-sccache` disables the cache and the
-      # compile runs uncached. A stalled RustFS must not hold the build either: the
-      # action's `curl` calls carry no overall timeout, so a server that accepts the
-      # connection and never answers would otherwise keep this step running until the
-      # job's 200-minute bound cancels the build. The token exchange takes seconds, so
-      # two minutes is a stall. The lifetime covers the job's bound, because the cache
-      # server signs its requests with these credentials until the compile ends.
-      - name: Get RustFS credentials
-        id: rustfs
-        continue-on-error: true
-        timeout-minutes: 2
-        uses: $/.github/actions/rustfs-credentials
-        with:
-          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          duration-seconds: '12000'
-          export-env: 'false'
-
+      # No compiler cache. rust-cache above restores the dependencies, and the time goes to
+      # the workspace crates a commit changes and everything built on them, which no cache
+      # can serve: in a `merge_group` run with sccache, 98.6% of cacheable compiles hit and
+      # `spiced` still took 57 min, against 54 min the same day with rust-cache alone. The
+      # cache needs RustFS credentials, so an OIDC token (`id-token: write`) in the job
+      # that runs every dependency's build script, and it bought no time for that.
       - name: Build spiced and spice CLI
         # 65 minutes was the slowest this build had taken across ten successful `merge_group`
         # runs when the bound was set; on 2026-08-28 that worst case moved. Four consecutive
@@ -209,7 +197,7 @@ jobs:
         # worst-observed that the macOS build below uses, and stays clear of the job's 200
         # so that a wedge here is cut by *this step* — which attributes the failure to the
         # compile — rather than by the job bound, which GitHub renders as the whole job
-        # being cancelled, and leaves the `always()` sccache stats below able to run.
+        # being cancelled.
         timeout-minutes: 150
         uses: $/.github/actions/build-spiced
         with:
@@ -221,19 +209,6 @@ jobs:
           # outlive it; at the repository's 30-day default each run kept its
           # two builds (~600 MiB) stored for a month.
           artifact_retention_days: '1'
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
-          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
-          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
-
-      - name: Show sccache stats
-        if: always() && env.SCCACHE_SETUP == 'true'
-        # `always()`: this is the one step that reports cache health, and without it
-        # it is skipped on exactly the failures it would explain (#12420). The `||`
-        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
-        # gone `--show-stats` cannot answer either, and that is itself the finding.
-        run: |
-          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
   # Also runs the OpenAI and Hugging Face model tests on the binaries it just built. As
   # jobs of their own they each waited for another `spiceai-macos-large` runner after this
@@ -252,8 +227,10 @@ jobs:
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     # A backstop above the compile step's own 180-minute bound below plus the model tests'
-    # step bounds, leaving room for the artifact upload and the post steps.
-    timeout-minutes: 220
+    # bounds (36 minutes: six 5-minute step bounds and the two readiness timeouts), leaving
+    # room for setup, the artifact upload and the post steps, so that a wedged step is cut
+    # by its own bound and named, not by this one.
+    timeout-minutes: 230
     permissions:
       contents: read
       actions: read
@@ -331,7 +308,10 @@ jobs:
 
       - name: Show sccache stats
         if: always() && env.SCCACHE_SETUP == 'true'
-        # See the same step in `build_linux`.
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
         run: |
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
@@ -352,16 +332,26 @@ jobs:
       # through the REPL expect scripts. Every wait inside them is bounded (readiness, then
       # the scripts' idle timeouts), so a host starved by a neighbouring job fails a step
       # rather than slowing it (#13761). The step bounds stand in for the 10-minute bound
-      # each had as a job of its own (#12644). The Hugging Face steps run whatever the
-      # OpenAI ones did, so one model's failure does not hide the other's result; each
-      # step needs only the previous step of its own model to have passed.
+      # each had as a job of its own (#12644). Each model runs whatever the other model and
+      # the expect scripts' own tests did, so one failure does not hide another's result;
+      # each step needs only the previous step of its own model to have passed.
       - name: Install spice
         id: install-spice
         uses: $/.github/actions/install-spice
         with:
           build-path: ${{ github.workspace }}
 
+      # Once for both models: it drives stand-in processes rather than `spiced`, so it needs
+      # no runtime and its result is the same whichever model is configured. Run once per
+      # model it added 2m41s to this job, and every macOS test waits for this job to end.
+      - name: 'model tests: test the expect scripts driving the REPLs'
+        timeout-minutes: 5
+        run: |
+          ./test/models/expect_test.sh
+
       - name: 'openai model: init spice app'
+        id: openai-init
+        if: ${{ !cancelled() && steps.install-spice.outcome == 'success' }}
         run: |
           cp ./test/models/spicepod_openai.yml ./spicepod.yaml
           cat ./spicepod.yaml
@@ -369,10 +359,13 @@ jobs:
       # Several runner instances share one host and therefore one network namespace, so
       # spiced's default 8090/50051 cannot be assumed free (#12419).
       - name: 'openai model: allocate Spice runtime ports'
+        id: openai-ports
+        if: ${{ !cancelled() && steps.openai-init.outcome == 'success' }}
         uses: $/.github/actions/allocate-spice-ports
 
       - name: 'openai model: start spice runtime'
         id: openai-start
+        if: ${{ !cancelled() && steps.openai-ports.outcome == 'success' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # `Set up spiceio` exported the compiler cache's `AWS_ENDPOINT_URL` for the rest of
@@ -382,22 +375,22 @@ jobs:
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: 'openai model: wait for Spice runtime to be ready'
+        id: openai-ready
+        if: ${{ !cancelled() && steps.openai-start.outcome == 'success' }}
         uses: $/.github/actions/wait-for-spice-ready
         with:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '60'
 
-      - name: 'openai model: test the expect scripts driving the REPLs'
-        timeout-minutes: 5
-        run: |
-          ./test/models/expect_test.sh
-
       - name: 'openai model: test vector search'
+        id: openai-search
+        if: ${{ !cancelled() && steps.openai-ready.outcome == 'success' }}
         timeout-minutes: 5
         run: |
           ./test/models/search_01.exp
 
       - name: 'openai model: test chat'
+        if: ${{ !cancelled() && steps.openai-search.outcome == 'success' }}
         timeout-minutes: 5
         run: |
           ./test/models/chat_01.exp
@@ -529,16 +522,9 @@ jobs:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '300'
 
-      - name: 'huggingface model: test the expect scripts driving the REPLs'
-        id: hf-expect
-        if: ${{ !cancelled() && steps.hf-ready.outcome == 'success' }}
-        timeout-minutes: 5
-        run: |
-          ./test/models/expect_test.sh
-
       - name: 'huggingface model: test vector search'
         id: hf-search
-        if: ${{ !cancelled() && steps.hf-expect.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.hf-ready.outcome == 'success' }}
         timeout-minutes: 5
         run: |
           ./test/models/search_01.exp
