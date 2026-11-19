@@ -587,9 +587,401 @@ impl ObjectStore for SFTPObjectStore {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use futures::StreamExt;
+    use object_store::ObjectStore;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread;
+
+    /// RFC 4253 `SSH_MSG_DISCONNECT`.
+    const SSH_MSG_DISCONNECT: u8 = 1;
+    /// RFC 8308 `SSH_MSG_EXT_INFO`.
+    const SSH_MSG_EXT_INFO: u8 = 7;
+    /// RFC 4253 `SSH_DISCONNECT_BY_APPLICATION`.
+    const SSH_DISCONNECT_BY_APPLICATION: u32 = 11;
+
+    /// One cleartext SSH binary packet, the form read before `NEWKEYS`.
+    ///
+    /// `packet_length` covers the padding-length byte, the payload, and the
+    /// padding, and the bytes on the wire (including the 4-byte length) are a
+    /// multiple of 8. That is the packet `libssh2` accepts while encryption is
+    /// still `none`.
+    fn cleartext_ssh_packet(payload: &[u8]) -> Vec<u8> {
+        // At least four padding bytes, then enough more that the on-wire
+        // packet (4-byte length included) is a multiple of the pre-encryption
+        // block size of 8.
+        let mut padding = 4usize;
+        while (4 + 1 + payload.len() + padding) % 8 != 0 {
+            padding += 1;
+        }
+        let packet_length = u32::try_from(1 + payload.len() + padding)
+            .expect("an SSH test packet fits in the 32-bit length field");
+        let padding_length =
+            u8::try_from(padding).expect("SSH padding for these payloads fits in one byte");
+        let mut packet = Vec::with_capacity(4 + 1 + payload.len() + padding);
+        packet.extend_from_slice(&packet_length.to_be_bytes());
+        packet.push(padding_length);
+        packet.extend_from_slice(payload);
+        packet.extend(std::iter::repeat_n(0u8, padding));
+        packet
+    }
+
+    fn disconnect_packet() -> Vec<u8> {
+        let mut payload = vec![SSH_MSG_DISCONNECT];
+        payload.extend_from_slice(&SSH_DISCONNECT_BY_APPLICATION.to_be_bytes());
+        payload.extend_from_slice(&3u32.to_be_bytes());
+        payload.extend_from_slice(b"bye");
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        cleartext_ssh_packet(&payload)
+    }
+
+    fn extension_count_packet() -> Vec<u8> {
+        let mut payload = vec![SSH_MSG_EXT_INFO];
+        payload.extend_from_slice(&u32::MAX.to_be_bytes());
+        cleartext_ssh_packet(&payload)
+    }
+
+    /// Accept one client, then send an SSH banner and one binary packet.
+    ///
+    /// The read of the client's banner happens first, matching the order the
+    /// handshake uses: it writes its banner before it reads ours. The socket
+    /// stays open afterwards so a client blocked in a read is not woken by a
+    /// close.
+    fn accept_and_send(listener: TcpListener, packet: Vec<u8>) {
+        listener
+            .set_nonblocking(true)
+            .expect("the listener should allow a bounded accept");
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(30) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accepting the SFTP client failed: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("the accepted socket should be blocking again");
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        stream
+            .write_all(b"SSH-2.0-sftp-probe\r\n")
+            .expect("the SSH banner should be written");
+        stream
+            .write_all(&packet)
+            .expect("the SSH packet should be written");
+        let _ = stream.flush();
+        let _ = stream.read(&mut buf);
+    }
+
+    fn spawn_peer(packet: Vec<u8>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("a loopback listener should bind for the SSH peer");
+        let port = listener
+            .local_addr()
+            .expect("the listener should report its address")
+            .port();
+        thread::spawn(move || accept_and_send(listener, packet));
+        port
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the test runtime should start")
+    }
+
+    fn error_text(error: &object_store::Error) -> String {
+        match error {
+            object_store::Error::Generic { source, .. } => source.to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    async fn read_one(store: &SFTPObjectStore, operation: &str) -> object_store::Result<()> {
+        let location = Path::from("object");
+        match operation {
+            "get" => store
+                .get_opts(&location, GetOptions::default())
+                .await
+                .map(|_| ()),
+            "list" => {
+                let mut listed = store.list(Some(&location));
+                match listed.next().await {
+                    Some(item) => item.map(|_| ()),
+                    None => Ok(()),
+                }
+            }
+            "list_with_delimiter" => store
+                .list_with_delimiter(Some(&location))
+                .await
+                .map(|_| ()),
+            other => panic!("unknown SFTP read operation {other}"),
+        }
+    }
+
+    fn store_for(port: u16, timeout: Duration) -> SFTPObjectStore {
+        SFTPObjectStore::new(
+            "user".to_string(),
+            "placeholder".to_string(),
+            "127.0.0.1".to_string(),
+            port.to_string(),
+            Some(timeout),
+        )
+    }
+
+    /// A well-formed disconnect during key exchange must fail the read in the
+    /// handshake, not by sitting out `client_timeout`.
+    fn assert_disconnect_packet_is_handled() {
+        let port = spawn_peer(disconnect_packet());
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = runtime().block_on(async {
+                let started = Instant::now();
+                let result = read_one(&store_for(port, Duration::from_secs(5)), "get").await;
+                (started.elapsed(), result)
+            });
+            let _ = tx.send(outcome);
+        });
+
+        let (elapsed, result) = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| {
+            panic!(
+                "a pre-auth SSH_MSG_DISCONNECT was not handled within 2s; the packet the \
+                 extension-count test sends is framed the same way, so this peer never reached \
+                 the handshake's packet handler"
+            )
+        });
+        let error = result.expect_err("a disconnect during key exchange must not return an object");
+        let message = error_text(&error);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "handling a pre-auth disconnect took {elapsed:?}, message: {message}"
+        );
+        assert!(
+            message.contains("Unable to exchange encryption keys"),
+            "the handshake should fail while exchanging keys after the disconnect packet, got \
+             {message}"
+        );
+    }
+
+    fn user_cpu_millis(pid: u32) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let Some((_, after_comm)) = stat.rsplit_once(')') else {
+            return 0;
+        };
+        // `utime` is field 14. Fields after the comm start at field 3.
+        let ticks: u64 = after_comm
+            .split_whitespace()
+            .nth(11)
+            .and_then(|field| field.parse().ok())
+            .unwrap_or(0);
+        ticks.saturating_mul(1_000) / 100
+    }
+
+    fn extension_count_outcome(operation: &str) -> Result<String, String> {
+        let port = spawn_peer(extension_count_packet());
+        let marker = std::env::temp_dir().join(format!(
+            "sftp-ext-info-{}-{}-{operation}",
+            std::process::id(),
+            port
+        ));
+        let _ = std::fs::remove_file(&marker);
+        // `module_path!` starts with the crate name, and libtest's filter does not.
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, rest)| rest);
+        let mut child = Command::new(
+            std::env::current_exe().expect("the test binary should have a path"),
+        )
+        .arg("--exact")
+        .arg("--nocapture")
+        .arg(format!(
+            "{module}::pre_auth_extension_count_returns_before_the_session_timeout"
+        ))
+        .env("SFTP_EXT_INFO_MARKER", marker.to_string_lossy().as_ref())
+        .env("SFTP_EXT_INFO_PORT", port.to_string())
+        .env("SFTP_EXT_INFO_OP", operation)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the extension-count probe process should start");
+
+        let started = Instant::now();
+        let mut saw_start = false;
+        while started.elapsed() < Duration::from_secs(60) {
+            if std::fs::read_to_string(&marker)
+                .ok()
+                .is_some_and(|text| text.starts_with("started"))
+            {
+                saw_start = true;
+                break;
+            }
+            if child
+                .try_wait()
+                .expect("the probe process should be waitable")
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !saw_start {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut stderr = String::new();
+            if let Some(mut err) = child.stderr.take() {
+                let _ = Read::read_to_string(&mut err, &mut stderr);
+            }
+            let _ = std::fs::remove_file(&marker);
+            return Err(format!(
+                "{operation}: the probe never reached the SFTP read. stderr={stderr}"
+            ));
+        }
+
+        let cpu_at_start = user_cpu_millis(child.id());
+        let bound = Duration::from_secs(3);
+        let wait_started = Instant::now();
+        let finished = loop {
+            if let Some(status) = child
+                .try_wait()
+                .expect("the probe process should be waitable")
+            {
+                break Some(status);
+            }
+            if wait_started.elapsed() >= bound {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        let cpu_burned = user_cpu_millis(child.id()).saturating_sub(cpu_at_start);
+        let status = match finished {
+            Some(status) => status,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&marker);
+                return Err(format!(
+                    "{operation}: still inside the SSH handshake 3s after the server sent \
+                     SSH_MSG_EXT_INFO with nr_extensions=0xFFFFFFFF, having used {cpu_burned}ms \
+                     of user CPU. The session timeout is 8s and does not stop this loop. \
+                     put_opts, put_multipart_opts, delete_stream, list_with_offset, and \
+                     copy_opts are not part of this check: they return NotSupported before \
+                     opening a session"
+                ));
+            }
+        };
+
+        let marker_text = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_file(&marker);
+        let mut stderr = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = Read::read_to_string(&mut err, &mut stderr);
+        }
+        if !status.success() || !marker_text.starts_with("done\n") {
+            return Err(format!(
+                "{operation}: probe exited {status} without a bounded failure. \
+                 marker={marker_text:?} stderr={stderr}"
+            ));
+        }
+        let mut lines = marker_text.lines();
+        let _ = lines.next();
+        let elapsed_ms: u128 = lines
+            .next()
+            .and_then(|line| line.parse().ok())
+            .unwrap_or(u128::MAX);
+        let message = lines.next().unwrap_or("");
+        if elapsed_ms >= 2_000 || message == "read succeeded" {
+            return Err(format!(
+                "{operation}: nr_extensions=0xFFFFFFFF returned after {elapsed_ms}ms: {message}"
+            ));
+        }
+        Ok(format!(
+            "{operation}: failed in {elapsed_ms}ms: {message}"
+        ))
+    }
+
+    #[test]
+    fn cleartext_extension_packet_matches_the_bytes_the_handler_reads() {
+        // Length 12, padding 6, message 7, count 0xFFFFFFFF. The transport
+        // parser strips the length and the padding and hands the five payload
+        // bytes to the extension handler.
+        assert_eq!(
+            extension_count_packet(),
+            [
+                0x00, 0x00, 0x00, 0x0c, 0x06, 0x07, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pre_auth_disconnect_is_handled_without_waiting_out_the_timeout() {
+        assert_disconnect_packet_is_handled();
+    }
+
+    #[test]
+    fn pre_auth_extension_count_returns_before_the_session_timeout() {
+        if let (Ok(marker), Ok(port), Ok(operation)) = (
+            std::env::var("SFTP_EXT_INFO_MARKER"),
+            std::env::var("SFTP_EXT_INFO_PORT"),
+            std::env::var("SFTP_EXT_INFO_OP"),
+        ) {
+            let port: u16 = port
+                .parse()
+                .expect("SFTP_EXT_INFO_PORT should be a port number");
+            std::fs::write(&marker, b"started\n").expect("the probe marker should be writable");
+            let started = Instant::now();
+            let result = runtime().block_on(async {
+                read_one(&store_for(port, Duration::from_secs(8)), &operation).await
+            });
+            let elapsed = started.elapsed();
+            let message = match &result {
+                Ok(()) => "read succeeded".to_string(),
+                Err(error) => error_text(error),
+            };
+            std::fs::write(
+                &marker,
+                format!("done\n{}\n{message}\n", elapsed.as_millis()),
+            )
+            .expect("the probe marker should record the outcome");
+            assert!(
+                result.is_err(),
+                "{operation} succeeded after SSH_MSG_EXT_INFO nr_extensions=0xFFFFFFFF: {message}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "{operation} was still running after {elapsed:?} (session timeout 8s) once the \
+                 server sent nr_extensions=0xFFFFFFFF: {message}"
+            );
+            return;
+        }
+
+        assert_disconnect_packet_is_handled();
+        let mut failures = Vec::new();
+        for operation in ["get", "list", "list_with_delimiter"] {
+            if let Err(failure) = extension_count_outcome(operation) {
+                failures.push(failure);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "a pre-authentication extension count must fail the SFTP read without outrunning the \
+             session timeout:\n{}",
+            failures.join("\n")
+        );
+    }
 
     #[test]
     fn resolve_addrs_accepts_a_named_host() {
