@@ -69,7 +69,7 @@ use crate::store::ftp::FTPObjectStore;
 #[cfg(feature = "nfs")]
 use crate::store::nfs::NFSObjectStore;
 #[cfg(feature = "sftp")]
-use crate::store::sftp::{HostKeyFingerprint, SFTPObjectStore};
+use crate::store::sftp::SFTPObjectStore;
 #[cfg(feature = "smb")]
 use crate::store::smb::SMBObjectStore;
 
@@ -664,9 +664,6 @@ impl SpiceObjectStoreRegistry {
         let password = params.get("pass").map(ToOwned::to_owned).ok_or_else(|| {
             DataFusionError::Configuration("No password provided for SFTP".to_string())
         })?;
-        let host_key_fingerprint =
-            HostKeyFingerprint::parse(params.get("host_key_fingerprint").map(String::as_str))
-                .map_err(DataFusionError::Configuration)?;
         let client_timeout = params
             .get("client_timeout")
             .map(|timeout| fundu::parse_duration(timeout))
@@ -683,7 +680,6 @@ impl SpiceObjectStoreRegistry {
             password,
             host.to_string(),
             port,
-            host_key_fingerprint,
             client_timeout,
         )) as Arc<dyn ObjectStore>)
     }

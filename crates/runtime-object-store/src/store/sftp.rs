@@ -18,12 +18,16 @@ use std::{
     future::Future,
     io::{Read, Seek, SeekFrom},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+};
 use bytes::Bytes;
 use chrono::DateTime;
 use futures::StreamExt;
@@ -32,7 +36,9 @@ use object_store::{
     Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
-use ssh2::{HashType, HostKeyType, Session};
+use ssh2::{
+    CheckResult, HashType, HostKeyType, KnownHostFileKind, KnownHosts, MethodType, Session,
+};
 
 use super::common::{
     DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
@@ -41,8 +47,20 @@ use super::common::{
 
 const STORE_NAME: &str = "SFTP";
 
-const HOST_KEY_FINGERPRINT_PARAM: &str = "sftp_host_key_fingerprint";
-const SFTP_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/sftp";
+const SFTP_DOCS: &str =
+    "https://spiceai.org/docs/components/data-connectors/ftp#sftp-host-key-verification";
+
+/// Host key algorithms libssh2 can verify, in its order of preference, each beside the key type
+/// a `known_hosts` entry records for it.
+const HOST_KEY_ALGORITHMS: [(&str, &str); 7] = [
+    ("ecdsa-sha2-nistp256", "ecdsa-sha2-nistp256"),
+    ("ecdsa-sha2-nistp384", "ecdsa-sha2-nistp384"),
+    ("ecdsa-sha2-nistp521", "ecdsa-sha2-nistp521"),
+    ("ssh-ed25519", "ssh-ed25519"),
+    ("ssh-rsa", "rsa-sha2-512"),
+    ("ssh-rsa", "rsa-sha2-256"),
+    ("ssh-rsa", "ssh-rsa"),
+];
 
 /// Wall-clock bound for one connection attempt — name resolution, TCP connect, SSH handshake
 /// and password authentication together — when `client_timeout` is not configured.
@@ -53,87 +71,87 @@ const SFTP_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/sft
 /// in the same window.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The SHA-256 digest of the host key an SFTP server must present before any credentials
-/// are sent to it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct HostKeyFingerprint([u8; 32]);
+/// The OpenSSH `known_hosts` file that SFTP servers are verified against.
+struct KnownHostsFile {
+    path: PathBuf,
+    contents: String,
+}
 
-impl HostKeyFingerprint {
-    /// Parse the `SHA256:<base64>` form that `ssh-keygen -lf` prints.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message naming `sftp_host_key_fingerprint` when `value` is absent, empty or
-    /// not a SHA-256 fingerprint in that form.
-    pub fn parse(value: Option<&str>) -> Result<Self, String> {
-        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-            return Err(format!(
-                "Missing required parameter `{HOST_KEY_FINGERPRINT_PARAM}`. Set it to the SHA256 fingerprint of the SFTP server's host key, for example the output of `ssh-keyscan <host> | ssh-keygen -lf -`. See: {SFTP_DOCS}"
-            ));
-        };
+/// One server's entries in a [`KnownHostsFile`], loaded into the session that connects to it.
+struct ServerHostKeys {
+    known_hosts: KnownHosts,
+    /// The name `known_hosts` records the server under.
+    name: String,
+    /// The host key algorithms for the key types of the server's entries.
+    algorithms: Vec<&'static str>,
+    addr: String,
+    path: PathBuf,
+}
 
-        // The value is not echoed back: a malformed value may be a full public key.
-        value
-            .strip_prefix("SHA256:")
-            .and_then(|encoded| STANDARD_NO_PAD.decode(encoded.trim_end_matches('=')).ok())
-            .and_then(|digest| <[u8; 32]>::try_from(digest).ok())
-            .map(Self)
-            .ok_or_else(|| {
-                format!(
-                    "Invalid `{HOST_KEY_FINGERPRINT_PARAM}`. Expected a SHA256 fingerprint in the form `SHA256:<base64>`, as printed by `ssh-keygen -lf`. See: {SFTP_DOCS}"
-                )
-            })
-    }
-
-    /// Accept the host key the server presented during the handshake only if its SHA-256
-    /// digest is this fingerprint.
-    fn verify(&self, session: &Session, addr: &str) -> object_store::Result<()> {
-        let Some(presented) = session.host_key_hash(HashType::Sha256) else {
+impl ServerHostKeys {
+    /// Accept the host key the server presented during the handshake only if one of its
+    /// entries holds that key.
+    fn verify(&self, session: &Session) -> object_store::Result<()> {
+        let (Some((key, kind)), Some(digest)) =
+            (session.host_key(), session.host_key_hash(HashType::Sha256))
+        else {
             return Err(handle_error(format!(
-                "The SFTP server at {addr} presented no host key, so the connection was refused before authentication."
+                "The SFTP server {} presented no host key, so the connection was refused before authentication.",
+                self.addr
             )));
         };
-        self.check(presented, session.host_key().map(|(_, kind)| kind), addr)
+        self.check(key, kind, digest)
     }
 
-    fn check(
-        &self,
-        presented: &[u8],
-        kind: Option<HostKeyType>,
-        addr: &str,
-    ) -> object_store::Result<()> {
-        if presented == self.0 {
+    /// `digest` is the SHA-256 digest of `key`, which a refusal reports as its fingerprint.
+    fn check(&self, key: &[u8], kind: HostKeyType, digest: &[u8]) -> object_store::Result<()> {
+        if matches!(self.known_hosts.check(&self.name, key), CheckResult::Match) {
             return Ok(());
         }
 
         Err(handle_error(format!(
-            "The SFTP server at {addr} presented the {} host key SHA256:{}, which does not match `{HOST_KEY_FINGERPRINT_PARAM}` ({self}), so the connection was refused before authentication. Verify the server's host key and update `{HOST_KEY_FINGERPRINT_PARAM}`. See: {SFTP_DOCS}",
-            host_key_type_name(kind),
-            STANDARD_NO_PAD.encode(presented),
+            "The SFTP server {addr} presented the {kind} host key SHA256:{fingerprint}, which does not match its entry in {path}, so the connection was refused before authentication. Verify the server's host key with its operator, then update its entry in {path}. See: {SFTP_DOCS}",
+            addr = self.addr,
+            kind = host_key_type_name(kind),
+            fingerprint = STANDARD_NO_PAD.encode(digest),
+            path = self.path.display(),
         )))
     }
 }
 
-impl std::fmt::Display for HostKeyFingerprint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SHA256:{}", STANDARD_NO_PAD.encode(self.0))
-    }
-}
-
-impl std::fmt::Debug for HostKeyFingerprint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
-    }
-}
-
 /// The key type label `ssh-keygen -lf` prints beside each fingerprint.
-fn host_key_type_name(kind: Option<HostKeyType>) -> &'static str {
+fn host_key_type_name(kind: HostKeyType) -> &'static str {
     match kind {
-        Some(HostKeyType::Rsa) => "RSA",
-        Some(HostKeyType::Dss) => "DSA",
-        Some(HostKeyType::Ecdsa256 | HostKeyType::Ecdsa384 | HostKeyType::Ecdsa521) => "ECDSA",
-        Some(HostKeyType::Ed25519) => "ED25519",
-        Some(HostKeyType::Unknown) | None => "unknown",
+        HostKeyType::Rsa => "RSA",
+        HostKeyType::Dss => "DSA",
+        HostKeyType::Ecdsa256 | HostKeyType::Ecdsa384 | HostKeyType::Ecdsa521 => "ECDSA",
+        HostKeyType::Ed25519 => "ED25519",
+        HostKeyType::Unknown => "unknown",
+    }
+}
+
+/// The key type an SSH public key blob names in its first field, such as `ssh-ed25519`.
+fn key_type(key: &[u8]) -> Option<&str> {
+    let (length, rest) = key.split_first_chunk::<4>()?;
+    let length = usize::try_from(u32::from_be_bytes(*length)).ok()?;
+    std::str::from_utf8(rest.get(..length)?).ok()
+}
+
+/// `host` without the brackets a URL puts around an IPv6 address.
+fn unbracketed(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// The name OpenSSH records a server under in `known_hosts`: the host alone on port 22,
+/// `[host]:port` on any other port.
+fn known_hosts_name(host: &str, port: &str) -> String {
+    let host = unbracketed(host);
+    if port.parse::<u16>() == Ok(22) {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
     }
 }
 
@@ -143,7 +161,6 @@ struct SFTPClientConfig {
     password: String,
     host: String,
     port: String,
-    host_key_fingerprint: HostKeyFingerprint,
     timeout: Option<Duration>,
 }
 
@@ -154,7 +171,6 @@ impl std::fmt::Debug for SFTPClientConfig {
             .field("password", &"[REDACTED]")
             .field("host", &self.host)
             .field("port", &self.port)
-            .field("host_key_fingerprint", &self.host_key_fingerprint)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -166,7 +182,6 @@ impl SFTPClientConfig {
         password: String,
         host: String,
         port: String,
-        host_key_fingerprint: HostKeyFingerprint,
         timeout: Option<Duration>,
     ) -> Self {
         Self {
@@ -174,9 +189,97 @@ impl SFTPClientConfig {
             password,
             host,
             port,
-            host_key_fingerprint,
             timeout,
         }
+    }
+
+    fn addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Read `~/.ssh/known_hosts` of the user that runs the process, as `ssh` does.
+    fn read_known_hosts(&self) -> object_store::Result<KnownHostsFile> {
+        let Some(home) = util::home_dir::home_dir().filter(|home| !home.as_os_str().is_empty())
+        else {
+            return Err(self.known_hosts_unreadable(
+                "~/.ssh/known_hosts",
+                "the home directory of the user that runs spiced is not set",
+            ));
+        };
+        self.read_known_hosts_from(home.join(".ssh").join("known_hosts"))
+    }
+
+    fn read_known_hosts_from(&self, path: PathBuf) -> object_store::Result<KnownHostsFile> {
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => Ok(KnownHostsFile { path, contents }),
+            Err(error) => {
+                Err(self.known_hosts_unreadable(&path.display().to_string(), &error.to_string()))
+            }
+        }
+    }
+
+    fn known_hosts_unreadable(&self, path: &str, reason: &str) -> object_store::Error {
+        handle_error(format!(
+            "Cannot verify the SFTP server {addr} because {path} cannot be read ({reason}), so the connection was refused. {add} In a container, {path} must exist in the home directory of the user that runs spiced. See: {SFTP_DOCS}",
+            addr = self.addr(),
+            add = self.add_server_hint(path),
+        ))
+    }
+
+    fn add_server_hint(&self, path: &str) -> String {
+        format!(
+            "To add the server, run `ssh-keyscan -p {port} {host} >> {path}`, then check the fingerprints that `ssh-keygen -lf {path}` prints with the server's operator.",
+            port = self.port,
+            host = unbracketed(&self.host),
+        )
+    }
+
+    /// Load `file` into `session` and find this server's entries in it.
+    fn host_keys(
+        &self,
+        session: &Session,
+        file: &KnownHostsFile,
+    ) -> object_store::Result<ServerHostKeys> {
+        let mut known_hosts = session.known_hosts().map_err(handle_error)?;
+        for line in file.contents.lines() {
+            // A line libssh2 cannot parse vouches for no server, so it is skipped rather than
+            // failing the whole file.
+            let _ = known_hosts.read_str(line, KnownHostFileKind::OpenSSH);
+        }
+
+        // An entry is this server's when libssh2's lookup, which also matches hashed names,
+        // finds the entry's own key under the server's name.
+        let name = known_hosts_name(&self.host, &self.port);
+        let key_types: Vec<String> = known_hosts
+            .hosts()
+            .map_err(handle_error)?
+            .iter()
+            .filter_map(|entry| STANDARD.decode(entry.key()).ok())
+            .filter(|key| matches!(known_hosts.check(&name, key), CheckResult::Match))
+            .filter_map(|key| key_type(&key).map(ToOwned::to_owned))
+            .collect();
+        let algorithms: Vec<&'static str> = HOST_KEY_ALGORITHMS
+            .iter()
+            .filter(|(entry_type, _)| key_types.iter().any(|listed| listed == entry_type))
+            .map(|(_, algorithm)| *algorithm)
+            .collect();
+
+        if algorithms.is_empty() {
+            let path = file.path.display().to_string();
+            return Err(handle_error(format!(
+                "{path} has no Ed25519, ECDSA or RSA host key for the SFTP server {addr}, so the connection was refused. {add} See: {SFTP_DOCS}",
+                addr = self.addr(),
+                add = self.add_server_hint(&path),
+            )));
+        }
+
+        Ok(ServerHostKeys {
+            known_hosts,
+            name,
+            algorithms,
+            addr: self.addr(),
+            path: file.path.clone(),
+        })
     }
 
     /// Resolve this endpoint's name, charging the lookup against the connection bound.
@@ -193,7 +296,11 @@ impl SFTPClientConfig {
         .await
     }
 
-    fn connect(&self, endpoint: &ResolvedEndpoint) -> object_store::Result<Session> {
+    fn connect(
+        &self,
+        endpoint: &ResolvedEndpoint,
+        known_hosts: &KnownHostsFile,
+    ) -> object_store::Result<Session> {
         let started = Instant::now();
         // Whatever `resolve` spent, plus however long this attempt waited for a thread of the
         // shared blocking pool, has already come off the bound the caller asked for.
@@ -203,9 +310,16 @@ impl SFTPClientConfig {
                 endpoint.addr
             )));
         };
-        let stream = connect_within(&endpoint.addrs, &endpoint.addr, bound)?;
 
         let mut session = Session::new().map_err(handle_error)?;
+        let host_keys = self.host_keys(&session, known_hosts)?;
+        // libssh2 compares the presented key with every entry for the server, whatever its
+        // type, so the server is asked only for the key types its entries hold.
+        session
+            .method_pref(MethodType::HostKey, &host_keys.algorithms.join(","))
+            .map_err(handle_error)?;
+
+        let stream = connect_within(&endpoint.addrs, &endpoint.addr, bound)?;
         session.set_tcp_stream(stream);
         // `handshake` and `userauth_password` are blocking reads on the session, and a
         // session inherits no deadline from the stream it was given. Without this, a peer
@@ -218,8 +332,15 @@ impl SFTPClientConfig {
         // of it. That is what keeps the attempt inside the single wall-clock bound
         // `DEFAULT_CONNECT_TIMEOUT` and `client_timeout` describe.
         session.set_timeout(remaining_session_timeout_ms(bound, started.elapsed())?);
-        session.handshake().map_err(handle_error)?;
-        self.host_key_fingerprint.verify(&session, &endpoint.addr)?;
+        session.handshake().map_err(|error| {
+            handle_error(format!(
+                "The SSH handshake with the SFTP server {} failed: {error}. Only host keys of the types {} lists for the server are accepted: {}.",
+                endpoint.addr,
+                known_hosts.path.display(),
+                host_keys.algorithms.join(", "),
+            ))
+        })?;
+        host_keys.verify(&session)?;
         session.set_timeout(remaining_session_timeout_ms(bound, started.elapsed())?);
         session
             .userauth_password(&self.user, &self.password)
@@ -247,18 +368,10 @@ impl SFTPObjectStore {
         password: String,
         host: String,
         port: String,
-        host_key_fingerprint: HostKeyFingerprint,
         timeout: Option<Duration>,
     ) -> Self {
         Self {
-            config: Arc::new(SFTPClientConfig::new(
-                user,
-                password,
-                host,
-                port,
-                host_key_fingerprint,
-                timeout,
-            )),
+            config: Arc::new(SFTPClientConfig::new(user, password, host, port, timeout)),
         }
     }
 
@@ -298,12 +411,13 @@ impl SFTPObjectStore {
         &self,
         prefix: Option<String>,
     ) -> object_store::Result<Vec<ObjectMeta>> {
+        let known_hosts = self.config.read_known_hosts()?;
         let endpoint = self.config.resolve().await?;
         let config = Arc::clone(&self.config);
         let prefix = prefix.unwrap_or_else(|| "/".to_string());
 
         tokio::task::spawn_blocking(move || {
-            let session = config.connect(&endpoint)?;
+            let session = config.connect(&endpoint, &known_hosts)?;
             let mut results = Vec::new();
             let mut queue = vec![prefix];
 
@@ -325,6 +439,7 @@ impl SFTPObjectStore {
         &self,
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
+        let known_hosts = self.config.read_known_hosts()?;
         let endpoint = self.config.resolve().await?;
         let config = Arc::clone(&self.config);
         let prefix_str = prefix.map_or("/".to_string(), |p| {
@@ -337,7 +452,7 @@ impl SFTPObjectStore {
         });
 
         tokio::task::spawn_blocking(move || {
-            let session = config.connect(&endpoint)?;
+            let session = config.connect(&endpoint, &known_hosts)?;
             let entries = Self::list_directory_blocking(&session, &prefix_str)?;
             Ok(process_directory_entries_shallow(&prefix_str, entries))
         })
@@ -548,13 +663,14 @@ impl ObjectStore for SFTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        let known_hosts = self.config.read_known_hosts()?;
         let endpoint = self.config.resolve().await?;
         let config = Arc::clone(&self.config);
         let location = location.clone();
 
         // Perform all blocking operations in spawn_blocking, including reading the data
         let (object_meta, start, end, data) = tokio::task::spawn_blocking(move || {
-            let session = config.connect(&endpoint)?;
+            let session = config.connect(&endpoint, &known_hosts)?;
             let location_string = format!("/{location}");
             let mut file = session
                 .sftp()
@@ -692,105 +808,224 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    /// `ssh-keygen -lf` output for a throwaway Ed25519 key.
-    const OPENSSH_FINGERPRINT: &str = "SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ4";
-    /// `shasum -a 256` of the same key's public blob.
-    const OPENSSH_DIGEST: [u8; 32] = [
-        0x1c, 0x06, 0x0a, 0x46, 0x50, 0x31, 0x20, 0xd7, 0x47, 0x3c, 0xe4, 0x19, 0xe5, 0x7e, 0x74,
-        0xb6, 0x9b, 0x18, 0xc6, 0x10, 0xc6, 0xab, 0x11, 0xb6, 0x07, 0x22, 0x8b, 0xd2, 0x2c, 0x43,
-        0x75, 0x0e,
-    ];
+    /// Throwaway public keys, as `ssh-keyscan` prints them after the host name.
+    const ED25519_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPBQ8kppWL6HG608gJ99zCsN/L0BJTe/2EGD13PETtC3";
+    const ECDSA_KEY: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEuiLrygIV6zpNdnf7Fmg4QZ4M1nko+B7+hI2B7lVQEsJ0+HBWe/Aup2hF6ySzBRbhJvi8yHLSaahRYu9oVOlWI=";
+    const RSA_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQC38Rn0hlY11yJ04YQJ3CyiMGa84zjGhxGduTSzVeETF6ObL9uUjZ059FkmgLoRlPV1fRmNqSeZ2uwDN7/4vxbIP2H2sWxrLPDZkpVZDJVnhZdudbj1I7/K9LqE/vu0pNy4J1VQTLM+Dq+qp9ftiLAzAlgZjZ0lYVpSHFu7r+AD5w==";
+    /// Another Ed25519 key, whose fingerprint `ssh-keygen -lf` prints as
+    /// `SHA256:vWeZav04Dvb8VcdGh5fOw/bdSDbR4FQU8GARvuEqqpQ`.
+    const OTHER_ED25519_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJZqXRVHcyVuKLqRNX7yDum727H6YbbpSPlIR10jUpkf";
+    /// `ssh-keygen -H` output for `ED25519_KEY` under `sftp.example.com` and
+    /// `[sftp.example.com]:2222`, and for `ECDSA_KEY` under `other.example.com`.
+    const HASHED_ENTRIES: &str = "\
+|1|H4OjDaPxxpQUmoUPmcYJOynN3L4=|JTCZ9IsDs00qKvnY2Z69qYj3cVY= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPBQ8kppWL6HG608gJ99zCsN/L0BJTe/2EGD13PETtC3
+|1|u1iwbHWE2iujHo/7SR7jt6II/JE=|Xvm3JAROreppnqX3gFrucvba2fY= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPBQ8kppWL6HG608gJ99zCsN/L0BJTe/2EGD13PETtC3
+|1|qWo+7H+0nOaq/DShJkzv6afagEo=|MRjYdeiR1H1hZ2qvCkZAbo9h1J0= ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEuiLrygIV6zpNdnf7Fmg4QZ4M1nko+B7+hI2B7lVQEsJ0+HBWe/Aup2hF6ySzBRbhJvi8yHLSaahRYu9oVOlWI=
+";
+    const KNOWN_HOSTS_PATH: &str = "/home/spice/.ssh/known_hosts";
 
-    fn test_fingerprint() -> HostKeyFingerprint {
-        HostKeyFingerprint(OPENSSH_DIGEST)
+    fn config(host: &str, port: &str) -> SFTPClientConfig {
+        SFTPClientConfig::new(
+            "user".to_string(),
+            "password".to_string(),
+            host.to_string(),
+            port.to_string(),
+            None,
+        )
+    }
+
+    fn known_hosts(contents: &str) -> KnownHostsFile {
+        KnownHostsFile {
+            path: PathBuf::from(KNOWN_HOSTS_PATH),
+            contents: contents.to_string(),
+        }
+    }
+
+    fn host_keys(host: &str, port: &str, contents: &str) -> object_store::Result<ServerHostKeys> {
+        let session = Session::new().expect("a session should be created");
+        config(host, port).host_keys(&session, &known_hosts(contents))
+    }
+
+    fn refusal(result: object_store::Result<ServerHostKeys>) -> String {
+        result
+            .err()
+            .map(|error| error.to_string())
+            .expect("the server must be refused")
+    }
+
+    /// The raw blob of a `<type> <base64>` public key, as the server presents it.
+    fn key_blob(public_key: &str) -> Vec<u8> {
+        let (_, encoded) = public_key
+            .split_once(' ')
+            .expect("a public key has a type and a key");
+        STANDARD.decode(encoded).expect("the key is base64")
+    }
+
+    fn assert_accepts(keys: &ServerHostKeys, public_key: &str, kind: HostKeyType) {
+        keys.check(&key_blob(public_key), kind, &[0; 32])
+            .expect("the key in the server's entry should be accepted");
     }
 
     #[test]
-    fn host_key_fingerprint_reads_the_form_ssh_keygen_prints() {
-        for value in [
-            OPENSSH_FINGERPRINT.to_string(),
-            format!("  {OPENSSH_FINGERPRINT}\n"),
-            format!("{OPENSSH_FINGERPRINT}="),
-        ] {
-            let fingerprint = HostKeyFingerprint::parse(Some(&value))
-                .expect("an OpenSSH SHA256 fingerprint should parse");
-            assert_eq!(fingerprint, test_fingerprint(), "parsing {value:?}");
-            assert_eq!(fingerprint.to_string(), OPENSSH_FINGERPRINT);
+    fn a_missing_or_unreadable_known_hosts_file_is_refused() {
+        let missing = std::env::temp_dir()
+            .join(format!("spice-sftp-test-{}", std::process::id()))
+            .join("known_hosts");
+        // A directory exists but cannot be read as a file.
+        let unreadable = std::env::temp_dir();
+
+        for path in [missing, unreadable] {
+            let error = config("sftp.example.com", "2222")
+                .read_known_hosts_from(path.clone())
+                .err()
+                .map(|error| error.to_string())
+                .expect("a known_hosts file that cannot be read must refuse the connection");
+
+            let path = path.display();
+            for expected in [
+                format!(
+                    "Cannot verify the SFTP server sftp.example.com:2222 because {path} cannot be read ("
+                ),
+                format!(
+                    "run `ssh-keyscan -p 2222 sftp.example.com >> {path}`, then check the fingerprints that `ssh-keygen -lf {path}` prints with the server's operator."
+                ),
+                format!(
+                    "In a container, {path} must exist in the home directory of the user that runs spiced."
+                ),
+            ] {
+                assert!(
+                    error.contains(&expected),
+                    "expected {expected:?} in {error:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn a_missing_host_key_fingerprint_is_refused() {
-        for value in [None, Some(""), Some("   ")] {
-            let error = HostKeyFingerprint::parse(value)
-                .expect_err("a missing fingerprint must not allow a connection");
+    fn a_server_without_an_entry_is_refused() {
+        for (host, port, contents) in [
+            ("sftp.example.com", "22", ""),
+            (
+                "sftp.example.com",
+                "22",
+                &format!("other.example.com {ED25519_KEY}\n") as &str,
+            ),
+            // An entry for port 22 does not vouch for another port, as in `ssh`.
+            (
+                "sftp.example.com",
+                "2222",
+                &format!("sftp.example.com {ED25519_KEY}\n"),
+            ),
+        ] {
             assert_eq!(
-                error,
-                "Missing required parameter `sftp_host_key_fingerprint`. Set it to the SHA256 fingerprint of the SFTP server's host key, for example the output of `ssh-keyscan <host> | ssh-keygen -lf -`. See: https://spiceai.org/docs/components/data-connectors/sftp",
-                "parsing {value:?}"
+                refusal(host_keys(host, port, contents)),
+                format!(
+                    "Generic SFTP error: /home/spice/.ssh/known_hosts has no Ed25519, ECDSA or RSA host key for the SFTP server {host}:{port}, so the connection was refused. To add the server, run `ssh-keyscan -p {port} {host} >> /home/spice/.ssh/known_hosts`, then check the fingerprints that `ssh-keygen -lf /home/spice/.ssh/known_hosts` prints with the server's operator. See: https://spiceai.org/docs/components/data-connectors/ftp#sftp-host-key-verification"
+                ),
+                "known_hosts {contents:?}"
             );
         }
     }
 
     #[test]
-    fn a_malformed_host_key_fingerprint_is_refused() {
-        // The public key the fingerprint above was taken from.
-        let public_key =
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAD/ravtbyepCYQJSRjWRj2AIrVVfEUlYlTW/ovYGPEU";
-        for value in [
-            // No algorithm prefix.
-            "HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ4",
-            // Lowercase prefix.
-            "sha256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ4",
-            // The legacy MD5 form.
-            "MD5:1c:06:0a:46:50:31:20:d7:47:3c:e4:19:e5:7e:74:b6",
-            // Not base64.
-            "SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDd!!",
-            // A SHA-1 length digest.
-            "SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhA",
-            // One byte short of a SHA-256 digest.
-            "SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ",
-            "SHA256:",
-            public_key,
-        ] {
-            let error = HostKeyFingerprint::parse(Some(value))
-                .expect_err("a malformed fingerprint must not allow a connection");
-            assert_eq!(
-                error,
-                "Invalid `sftp_host_key_fingerprint`. Expected a SHA256 fingerprint in the form `SHA256:<base64>`, as printed by `ssh-keygen -lf`. See: https://spiceai.org/docs/components/data-connectors/sftp",
-                "parsing {value:?}"
-            );
-        }
-    }
+    fn a_presented_key_that_differs_from_the_entry_is_refused() {
+        let keys = host_keys(
+            "sftp.example.com",
+            "22",
+            &format!("sftp.example.com {ED25519_KEY}\n"),
+        )
+        .expect("the server has an entry");
+        let digest = STANDARD_NO_PAD
+            .decode("vWeZav04Dvb8VcdGh5fOw/bdSDbR4FQU8GARvuEqqpQ")
+            .expect("the fingerprint is base64");
 
-    #[test]
-    fn a_presented_host_key_matching_the_fingerprint_is_accepted() {
-        test_fingerprint()
-            .check(
-                &OPENSSH_DIGEST,
-                Some(HostKeyType::Ed25519),
-                "sftp.example.com:22",
-            )
-            .expect("the configured host key should be accepted");
-    }
-
-    #[test]
-    fn a_presented_host_key_that_differs_is_refused() {
-        let mut presented = OPENSSH_DIGEST;
-        presented[31] ^= 1;
-
-        let error = test_fingerprint()
-            .check(
-                &presented,
-                Some(HostKeyType::Ecdsa256),
-                "sftp.example.com:22",
-            )
-            .expect_err("a different host key must not be accepted");
+        let error = keys
+            .check(&key_blob(OTHER_ED25519_KEY), HostKeyType::Ed25519, &digest)
+            .expect_err("a key that is not in the server's entry must be refused");
 
         assert_eq!(
             error.to_string(),
-            "Generic SFTP error: The SFTP server at sftp.example.com:22 presented the ECDSA host key SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ8, which does not match `sftp_host_key_fingerprint` (SHA256:HAYKRlAxINdHPOQZ5X50tpsYxhDGqxG2ByKL0ixDdQ4), so the connection was refused before authentication. Verify the server's host key and update `sftp_host_key_fingerprint`. See: https://spiceai.org/docs/components/data-connectors/sftp"
+            "Generic SFTP error: The SFTP server sftp.example.com:22 presented the ED25519 host key SHA256:vWeZav04Dvb8VcdGh5fOw/bdSDbR4FQU8GARvuEqqpQ, which does not match its entry in /home/spice/.ssh/known_hosts, so the connection was refused before authentication. Verify the server's host key with its operator, then update its entry in /home/spice/.ssh/known_hosts. See: https://spiceai.org/docs/components/data-connectors/ftp#sftp-host-key-verification"
         );
+    }
+
+    #[test]
+    fn a_presented_key_in_a_plain_entry_is_accepted() {
+        let keys = host_keys(
+            "sftp.example.com",
+            "22",
+            &format!("other.example.com {OTHER_ED25519_KEY}\nsftp.example.com {ED25519_KEY}\n"),
+        )
+        .expect("the server has an entry");
+
+        assert_accepts(&keys, ED25519_KEY, HostKeyType::Ed25519);
+    }
+
+    #[test]
+    fn a_presented_key_in_a_hashed_entry_is_accepted() {
+        for port in ["22", "2222"] {
+            let keys = host_keys("sftp.example.com", port, HASHED_ENTRIES)
+                .expect("the hashed entries name the server");
+
+            assert_eq!(keys.algorithms, ["ssh-ed25519"]);
+            assert_accepts(&keys, ED25519_KEY, HostKeyType::Ed25519);
+        }
+
+        let other = host_keys("other.example.com", "22", HASHED_ENTRIES)
+            .expect("the hashed entries name the other server");
+        assert_eq!(other.algorithms, ["ecdsa-sha2-nistp256"]);
+
+        refusal(host_keys("unknown.example.com", "22", HASHED_ENTRIES));
+    }
+
+    #[test]
+    fn a_presented_key_in_a_host_port_entry_is_accepted() {
+        let contents = format!("[sftp.example.com]:2222 {ED25519_KEY}\n");
+
+        let keys = host_keys("sftp.example.com", "2222", &contents)
+            .expect("the entry names the server and its port");
+        assert_accepts(&keys, ED25519_KEY, HostKeyType::Ed25519);
+
+        refusal(host_keys("sftp.example.com", "22", &contents));
+        assert_eq!(
+            known_hosts_name("[2001:db8::1]", "2222"),
+            "[2001:db8::1]:2222"
+        );
+        assert_eq!(known_hosts_name("[2001:db8::1]", "22"), "2001:db8::1");
+    }
+
+    #[test]
+    fn only_the_key_types_of_the_servers_entries_are_negotiated() {
+        let ed25519_only = format!(
+            "sftp.example.com {ED25519_KEY}\nother.example.com {ECDSA_KEY}\nother.example.com {RSA_KEY}\n"
+        );
+        assert_eq!(
+            host_keys("sftp.example.com", "22", &ed25519_only)
+                .expect("the server has an entry")
+                .algorithms,
+            ["ssh-ed25519"]
+        );
+
+        // `ssh-keyscan` output, with a comment and a line libssh2 cannot parse.
+        let keyscan = format!(
+            "# sftp.example.com:22 SSH-2.0-OpenSSH_9.2\nsftp.example.com {RSA_KEY}\nsftp.example.com\nsftp.example.com {ECDSA_KEY}\nsftp.example.com {ED25519_KEY}\n"
+        );
+        let keys = host_keys("sftp.example.com", "22", &keyscan).expect("the server has entries");
+        assert_eq!(
+            keys.algorithms,
+            [
+                "ecdsa-sha2-nistp256",
+                "ssh-ed25519",
+                "rsa-sha2-512",
+                "rsa-sha2-256",
+                "ssh-rsa"
+            ]
+        );
+        assert_accepts(&keys, RSA_KEY, HostKeyType::Rsa);
+        assert_accepts(&keys, ECDSA_KEY, HostKeyType::Ecdsa256);
+        assert_accepts(&keys, ED25519_KEY, HostKeyType::Ed25519);
     }
 
     #[test]
@@ -969,7 +1204,6 @@ mod tests {
             "password".to_string(),
             "127.0.0.1".to_string(),
             "22".to_string(),
-            test_fingerprint(),
             None,
         );
         let endpoint = ResolvedEndpoint {
@@ -983,7 +1217,7 @@ mod tests {
         // `ssh2::Session` is not `Debug`, so the success arm cannot be unwrapped into a panic
         // message; naming it here keeps the failure legible.
         let error = config
-            .connect(&endpoint)
+            .connect(&endpoint, &known_hosts(""))
             .err()
             .map(|error| error.to_string())
             .expect("an expired deadline must not start a connection");
@@ -1009,9 +1243,10 @@ mod tests {
             "password".to_string(),
             addr.ip().to_string(),
             addr.port().to_string(),
-            test_fingerprint(),
             Some(Duration::from_millis(500)),
         );
+        // An entry for the listener, so the attempt gets as far as the handshake.
+        let known_hosts = known_hosts(&format!("[{}]:{} {ED25519_KEY}", addr.ip(), addr.port()));
         let endpoint = config
             .resolve()
             .await
@@ -1023,7 +1258,7 @@ mod tests {
         thread::spawn(move || {
             let _ = tx.send(
                 config
-                    .connect(&endpoint)
+                    .connect(&endpoint, &known_hosts)
                     .err()
                     .map(|error| error.to_string()),
             );
@@ -1033,9 +1268,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("the handshake must observe a deadline rather than wait on a silent peer");
 
+        let error = outcome.expect("a peer that sends no SSH banner must not yield a session");
         assert!(
-            outcome.is_some(),
-            "a peer that sends no SSH banner must not yield a session"
+            error.contains("SSH handshake"),
+            "the attempt should fail in the handshake, got {error}"
         );
 
         drop(listener);
@@ -1048,7 +1284,6 @@ mod tests {
             "password".to_string(),
             "sftp.example.com".to_string(),
             "22".to_string(),
-            test_fingerprint(),
             None,
         );
         assert_eq!(format!("{store}"), "SFTP");
@@ -1061,7 +1296,6 @@ mod tests {
             "pass".to_string(),
             "localhost".to_string(),
             "22".to_string(),
-            test_fingerprint(),
             Some(Duration::from_mins(1)),
         );
         assert_eq!(config.host, "localhost");
