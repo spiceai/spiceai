@@ -3345,8 +3345,8 @@ mod tests {
             otlp_metric("gc_pause_seconds", Some(summary(3))),
         ]);
 
-        let response = service
-            .export(Request::new(request))
+        let response = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("an export with accepted data points must not fail")
             .into_inner();
@@ -3383,8 +3383,8 @@ mod tests {
             otlp_metric("http.server.request.duration", Some(gauge(1.0))),
             otlp_metric("gc_pause_seconds", Some(summary(3))),
         ]);
-        let response = service
-            .export(Request::new(request))
+        let response = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("the store accepts every metric")
             .into_inner();
@@ -3410,8 +3410,8 @@ mod tests {
             otlp_metric("svc_requests", Some(gauge(1.0))),
             otlp_metric("other", Some(gauge(2.0))),
         ]);
-        service
-            .export(Request::new(request))
+        local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("export succeeds");
 
@@ -3436,8 +3436,8 @@ mod tests {
             otlp_metric("svc_requests", Some(gauge(1.0))),
             otlp_metric("other", Some(gauge(2.0))),
         ]);
-        let response = service
-            .export(Request::new(request))
+        let response = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("the store took every point")
             .into_inner();
@@ -3462,8 +3462,8 @@ mod tests {
             otlp_metric("svc_requests", Some(gauge(1.0))),
             otlp_metric("gc_pause_seconds", Some(summary(2))),
         ]);
-        let response = service
-            .export(Request::new(request))
+        let response = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("export succeeds")
             .into_inner();
@@ -3489,8 +3489,8 @@ mod tests {
         let service = store_service(&engine, &["otel_metrics"]);
 
         let request = otlp_request(vec![otlp_metric("gc_pause_seconds", Some(summary(2)))]);
-        let status = service
-            .export(Request::new(request))
+        let status = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect_err("nothing was stored anywhere");
         assert_eq!(
@@ -3509,8 +3509,8 @@ mod tests {
 
         let request = otlp_request(vec![otlp_metric("gc_pause_seconds", Some(summary(3)))]);
 
-        let status = service
-            .export(Request::new(request))
+        let status = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect_err("an export that lost every data point must fail");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
@@ -3534,8 +3534,8 @@ mod tests {
             ),
         ]);
 
-        let response = service
-            .export(Request::new(request))
+        let response = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("an export that rejected nothing must succeed")
             .into_inner();
@@ -3544,6 +3544,19 @@ mod tests {
             "nothing was rejected, so no partial success is reported"
         );
         assert_eq!(engine.rows_written(), 0);
+    }
+
+    /// The context of an export from a collector on this machine to a runtime without
+    /// `runtime.auth`: the local operator, which may write. The export tests run in it, as a
+    /// local collector's export does.
+    fn local_operator() -> Arc<RequestContext> {
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Flight).build());
+        context
+            .set_auth_principal(
+                Arc::new(runtime_auth::anonymous::LocalPrincipal) as AuthPrincipalRef
+            )
+            .expect("auth principal should be set");
+        context
     }
 
     fn context_with_api_key(key: ApiKey) -> Arc<RequestContext> {
@@ -3818,8 +3831,8 @@ mod tests {
             vec![string_attribute("service.instance.id", "instance-a")],
         );
 
-        service
-            .export(Request::new(request))
+        local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("the export must succeed");
 
@@ -3855,8 +3868,8 @@ mod tests {
         });
         let request = otlp_request(vec![otlp_metric("svc_requests", Some(data))]);
 
-        let response = service
-            .export(Request::new(request))
+        let response = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("an export with an accepted data point must not fail")
             .into_inner();
@@ -3915,8 +3928,8 @@ mod tests {
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
         let request = otlp_request(vec![otlp_metric("svc_requests", Some(gauge(1.0)))]);
-        let response = service
-            .export(Request::new(request))
+        let response = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("the retried export must succeed")
             .into_inner();
@@ -3955,8 +3968,8 @@ mod tests {
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
         let request = otlp_request(vec![otlp_metric("svc_requests", Some(gauge(1.0)))]);
-        let response = service
-            .export(Request::new(request))
+        let response = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("the export must land once the schema settles")
             .into_inner();
@@ -3994,8 +4007,8 @@ mod tests {
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
         let request = otlp_request(vec![otlp_metric("svc_requests", Some(gauge(1.0)))]);
-        let status = service
-            .export(Request::new(request))
+        let status = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect_err("an export that lost every data point must fail");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
@@ -4024,8 +4037,8 @@ mod tests {
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
         let request = otlp_request(vec![otlp_metric("svc_requests", Some(gauge(1.0)))]);
-        let status = service
-            .export(Request::new(request))
+        let status = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect_err("an export that lost every data point must fail");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
@@ -4048,8 +4061,8 @@ mod tests {
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
         let request = otlp_request(vec![otlp_metric("svc_requests", Some(gauge(1.0)))]);
-        let status = service
-            .export(Request::new(request))
+        let status = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect_err("an export that lost every data point must fail");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
@@ -4058,5 +4071,27 @@ mod tests {
             1,
             "a non-schema write failure must not be retried"
         );
+    }
+
+    /// An export without credentials, from a caller the runtime serves read-only (it reached a
+    /// runtime without `runtime.auth` over the network), is refused before anything is stored.
+    #[tokio::test]
+    async fn otlp_grpc_export_without_credentials_is_denied_and_writes_nothing() {
+        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["otel_metrics"]));
+        let service = store_service(&engine, &["otel_metrics"]);
+        let request = otlp_request(vec![otlp_metric("checkout_requests", Some(gauge(1.0)))]);
+
+        let status = Arc::new(RequestContextBuilder::new(Protocol::Flight).build())
+            .scope(service.export(Request::new(request)))
+            .await
+            .expect_err("an export without credentials must not be stored");
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            status.message(),
+            runtime_auth::anonymous::write_route_refusal()
+        );
+        assert_eq!(engine.rows_written(), 0);
+        assert_eq!(engine.tables_written(), [] as [String; 0]);
     }
 }
