@@ -20,7 +20,10 @@ limitations under the License.
 //! connector does; `inferred` and `declared_ns` start from parsed events. Run with:
 //! `cargo bench -p data_components --features debezium --bench debezium_decode`
 
-#![allow(clippy::expect_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "bench setup fails loudly on bad fixtures"
+)]
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use criterion::{

@@ -96,7 +96,7 @@ pub enum Error {
 
     #[snafu(display(
         "Failed to ingest a change event: the value {value} of column '{column}' is outside the range of its type Timestamp({unit:?}). \
-        Declare the column with a coarser unit, such as `Timestamp(Microsecond, UTC)`. \
+        Declare the column with a coarser time unit, such as `Microsecond`. \
         See: https://spiceai.org/docs/components/data-connectors/debezium"
     ))]
     TimestampOutOfRange {
@@ -111,6 +111,26 @@ pub enum Error {
         See: https://spiceai.org/docs/components/data-connectors/debezium"
     ))]
     InvalidTimestampValue {
+        column: String,
+        value: serde_json::Value,
+    },
+
+    #[snafu(display(
+        "Failed to ingest a change event: column '{column}' has the Debezium type {semantic_type}, which is not a timestamp. \
+        Declare the column with a type that matches its source column. \
+        See: https://spiceai.org/docs/components/data-connectors/debezium"
+    ))]
+    NotATimestamp {
+        column: String,
+        semantic_type: String,
+    },
+
+    #[snafu(display(
+        "Failed to ingest a change event: the integer value {value} of column '{column}' has no Debezium timestamp type, so its unit is unknown. \
+        Send change events with their schema, or declare the column in the unit of its values, `Microsecond` or `Millisecond`. \
+        See: https://spiceai.org/docs/components/data-connectors/debezium"
+    ))]
+    UnknownTimestampUnit {
         column: String,
         value: serde_json::Value,
     },
@@ -274,33 +294,33 @@ fn append_field_value_to_builder(
             }
         }
         DataType::Timestamp(unit, _) => {
-            let (column, source_unit) = (
+            let (column, semantic_type) = (
                 field.name().as_str(),
-                source_field.and_then(|f| debezium_timestamp_unit(f.name.as_deref()?)),
+                source_field.and_then(|f| f.name.as_deref()),
             );
             match unit {
                 TimeUnit::Second => append_timestamp::<TimestampSecondType>(
                     field_value,
                     column,
-                    source_unit,
+                    semantic_type,
                     builder,
                 )?,
                 TimeUnit::Millisecond => append_timestamp::<TimestampMillisecondType>(
                     field_value,
                     column,
-                    source_unit,
+                    semantic_type,
                     builder,
                 )?,
                 TimeUnit::Microsecond => append_timestamp::<TimestampMicrosecondType>(
                     field_value,
                     column,
-                    source_unit,
+                    semantic_type,
                     builder,
                 )?,
                 TimeUnit::Nanosecond => append_timestamp::<TimestampNanosecondType>(
                     field_value,
                     column,
-                    source_unit,
+                    semantic_type,
                     builder,
                 )?,
             }
@@ -447,12 +467,14 @@ fn append_array_value_to_list_builder<T: ArrayBuilder>(
 /// Appends a Debezium timestamp value to a `T` builder.
 ///
 /// A string is an ISO 8601 instant (`io.debezium.time.ZonedTimestamp`, always
-/// in UTC). An integer counts from the Unix epoch in `source_unit`, the unit of
-/// its Debezium semantic type; without one it is taken to be in `T::UNIT`.
+/// in UTC). An integer counts from the Unix epoch in the unit its Debezium
+/// semantic type (`semantic_type`) names. An integer without a semantic type is
+/// taken to be in the column's unit only for millisecond and microsecond
+/// columns, the units those values have always been read in.
 fn append_timestamp<T: ArrowTimestampType>(
     value: &Json,
     column: &str,
-    source_unit: Option<TimeUnit>,
+    semantic_type: Option<&str>,
     builder: &mut dyn ArrayBuilder,
 ) -> Result<()> {
     let invalid = || InvalidTimestampValueSnafu {
@@ -472,16 +494,33 @@ fn append_timestamp<T: ArrowTimestampType>(
             )
         }
         Json::Number(n) => {
-            let n = n.as_i64().with_context(invalid)?;
-            Some(
-                convert_time_unit(n, source_unit.unwrap_or(T::UNIT), T::UNIT).with_context(
-                    || TimestampOutOfRangeSnafu {
+            let out_of_range = || TimestampOutOfRangeSnafu {
+                column,
+                value: value.clone(),
+                unit: T::UNIT,
+            };
+            let n = match n.as_i64() {
+                Some(n) => n,
+                None if n.is_u64() => return out_of_range().fail(),
+                None => return invalid().fail(),
+            };
+            let source_unit = match semantic_type {
+                Some(name) => {
+                    debezium_timestamp_unit(name).with_context(|| NotATimestampSnafu {
+                        column,
+                        semantic_type: name,
+                    })?
+                }
+                None if matches!(T::UNIT, TimeUnit::Millisecond | TimeUnit::Microsecond) => T::UNIT,
+                None => {
+                    return UnknownTimestampUnitSnafu {
                         column,
                         value: value.clone(),
-                        unit: T::UNIT,
-                    },
-                )?,
-            )
+                    }
+                    .fail();
+                }
+            };
+            Some(convert_time_unit(n, source_unit, T::UNIT).with_context(out_of_range)?)
         }
         _ => return invalid().fail(),
     };
@@ -989,7 +1028,8 @@ mod tests {
                 NANOS,
                 1_795_035_600_123_456,
             ),
-            // Without a known semantic type, an integer is in the column's own unit.
+            // Without a semantic type, an integer is in the unit of a millisecond
+            // or microsecond column.
             (
                 &micros,
                 TimeUnit::Microsecond,
@@ -1000,8 +1040,8 @@ mod tests {
             (
                 &json!(1_795_035_600_123_i64),
                 TimeUnit::Millisecond,
+                Some("UTC"),
                 None,
-                Some("io.debezium.time.Date"),
                 1_795_035_600_123,
             ),
         ];
@@ -1025,14 +1065,15 @@ mod tests {
     #[test]
     fn timestamps_outside_the_declared_type_fail() {
         const MICROS: Option<&str> = Some("io.debezium.time.MicroTimestamp");
+        const DOCS: &str = "See: https://spiceai.org/docs/components/data-connectors/debezium";
         let out_of_range = |value: &str| {
             format!(
-                "Failed to ingest a change event: the value {value} of column 'at' is outside the range of its type Timestamp(Nanosecond). Declare the column with a coarser unit, such as `Timestamp(Microsecond, UTC)`. See: https://spiceai.org/docs/components/data-connectors/debezium"
+                "Failed to ingest a change event: the value {value} of column 'at' is outside the range of its type Timestamp(Nanosecond). Declare the column with a coarser time unit, such as `Microsecond`. {DOCS}"
             )
         };
         let not_a_timestamp = |value: &str| {
             format!(
-                "Failed to ingest a change event: the value {value} of column 'at' is not a timestamp. Expected an ISO 8601 string or an integer. See: https://spiceai.org/docs/components/data-connectors/debezium"
+                "Failed to ingest a change event: the value {value} of column 'at' is not a timestamp. Expected an ISO 8601 string or an integer. {DOCS}"
             )
         };
         let cases = [
@@ -1046,9 +1087,31 @@ mod tests {
                 MICROS,
                 out_of_range("9300000000000000"),
             ),
+            (
+                json!(u64::MAX),
+                MICROS,
+                out_of_range("18446744073709551615"),
+            ),
             (json!("infinity"), None, not_a_timestamp("\"infinity\"")),
             (json!(1.5), MICROS, not_a_timestamp("1.5")),
             (json!(true), None, not_a_timestamp("true")),
+            // A day count is not an epoch offset in any timestamp unit.
+            (
+                json!(20_775),
+                Some("io.debezium.time.Date"),
+                format!(
+                    "Failed to ingest a change event: column 'at' has the Debezium type io.debezium.time.Date, which is not a timestamp. Declare the column with a type that matches its source column. {DOCS}"
+                ),
+            ),
+            // Without a semantic type the unit of an integer is unknown, and a
+            // nanosecond column has never read integers in its own unit.
+            (
+                json!(1_795_035_600_123_456_i64),
+                None,
+                format!(
+                    "Failed to ingest a change event: the integer value 1795035600123456 of column 'at' has no Debezium timestamp type, so its unit is unknown. Send change events with their schema, or declare the column in the unit of its values, `Microsecond` or `Millisecond`. {DOCS}"
+                ),
+            ),
         ];
 
         for (value, semantic_type, expected) in cases {
