@@ -72,13 +72,22 @@ impl ClusterSchedulerGrpc {
         action: &str,
     ) -> Result<(), Status> {
         let certificate = PeerCertificate::from_request(request);
+        // The `host:port` other nodes fetch this executor's shuffle and result
+        // data at; an IPv6 literal is bracketed so the port stays separable.
+        let advertised = metadata.and_then(|metadata| {
+            metadata.host.as_deref().map(|host| {
+                if host.contains(':') && !host.starts_with('[') {
+                    format!("[{host}]:{}", metadata.port)
+                } else {
+                    format!("{host}:{}", metadata.port)
+                }
+            })
+        });
         authorize_executor_claim(
             &self.executor_registry,
             certificate.as_ref(),
             executor_id,
-            metadata
-                .and_then(|metadata| metadata.host.as_deref())
-                .map(Advertised::Host),
+            advertised.as_deref().map(Advertised::Address),
             action,
         )
     }

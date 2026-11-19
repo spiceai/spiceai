@@ -329,7 +329,8 @@ impl ClusterHarness {
     /// This is used to test late-join scenarios (e.g. DDL replay on join).
     /// The executor is added to `self.executors` and its server handle to `self.handles`.
     pub async fn add_executor(&mut self, app: Option<App>) -> Result<(), anyhow::Error> {
-        self.add_executor_on(app, None).await
+        self.add_executor_on(app, None, NODE_ADVERTISE_ADDRESS)
+            .await
     }
 
     /// Start and register a new executor configured with `cluster_port` as its
@@ -338,13 +339,24 @@ impl ClusterHarness {
         &mut self,
         cluster_port: u16,
     ) -> Result<(), anyhow::Error> {
-        self.add_executor_on(None, Some(cluster_port)).await
+        self.add_executor_on(None, Some(cluster_port), NODE_ADVERTISE_ADDRESS)
+            .await
+    }
+
+    /// Start a new executor that advertises `advertise_address` as its
+    /// `--node-advertise-address`, which its certificate may not name.
+    pub async fn add_executor_advertising(
+        &mut self,
+        advertise_address: &str,
+    ) -> Result<(), anyhow::Error> {
+        self.add_executor_on(None, None, advertise_address).await
     }
 
     async fn add_executor_on(
         &mut self,
         app: Option<App>,
         cluster_port: Option<u16>,
+        advertise_address: &str,
     ) -> Result<(), anyhow::Error> {
         let i = self.next_executor_index;
         self.next_executor_index += 1;
@@ -358,6 +370,7 @@ impl ClusterHarness {
             self.pki.as_ref(),
             &self.scheduler_cluster_addr,
             cluster_port,
+            advertise_address,
         )
         .await?;
 
@@ -388,6 +401,7 @@ pub struct ClusterHarnessBuilder {
     scheduler_app: Option<App>,
     executor_apps: Vec<Option<App>>,
     allow_insecure_connections: bool,
+    scheduler_advertise_address: String,
 }
 
 impl ClusterHarnessBuilder {
@@ -396,7 +410,15 @@ impl ClusterHarnessBuilder {
             scheduler_app: None,
             executor_apps: Vec::new(),
             allow_insecure_connections: false,
+            scheduler_advertise_address: NODE_ADVERTISE_ADDRESS.to_string(),
         }
+    }
+
+    /// Have the scheduler advertise `address` as its `--node-advertise-address`,
+    /// which its certificate may not name.
+    pub fn scheduler_advertise_address(mut self, address: &str) -> Self {
+        self.scheduler_advertise_address = address.to_string();
+        self
     }
 
     /// Set the scheduler's `App` (datasets, runtime config, etc.).
@@ -462,7 +484,7 @@ impl ClusterHarnessBuilder {
             cluster: ClusterConfig {
                 role: Some(Role::Scheduler),
                 node_bind_address: scheduler_ports.cluster_addr(),
-                node_advertise_address: Some("127.0.0.1".to_string()),
+                node_advertise_address: Some(self.scheduler_advertise_address.clone()),
                 ..node_tls_config(pki.as_ref(), "scheduler")?
             },
             ..Default::default()
@@ -484,14 +506,16 @@ impl ClusterHarnessBuilder {
         let mut handles: Vec<JoinHandle<RuntimeResult<()>>> = Vec::new();
 
         let cloned = Arc::clone(&scheduler_rt);
-        handles.push(tokio::spawn(async move {
+        let mut scheduler_handle = tokio::spawn(async move {
             Box::pin(cloned.start_servers(scheduler_config, None, EndpointAuth::no_auth())).await
-        }));
+        });
 
         tokio::select! {
             () = tokio::time::sleep(Duration::from_mins(1)) => {
+                scheduler_handle.abort();
                 return Err(anyhow::Error::msg("Timed out waiting for scheduler to start"));
             }
+            result = &mut scheduler_handle => return Err(scheduler_stopped(result)),
             () = Arc::clone(&scheduler_rt).load_components() => {}
         }
 
@@ -504,12 +528,14 @@ impl ClusterHarnessBuilder {
         // `wait_for_row_count` (or `is_ready` after the executor harness
         // has loaded its data).
 
-        // Wait for the scheduler's cluster port to be reachable.
-        wait_for_tcp(
-            &format!("127.0.0.1:{}", scheduler_ports.cluster),
-            Duration::from_secs(30),
-        )
-        .await;
+        // Wait for the scheduler's cluster port to be reachable, unless the
+        // scheduler stops first (it refuses to start on a misconfiguration).
+        let scheduler_cluster_port = format!("127.0.0.1:{}", scheduler_ports.cluster);
+        tokio::select! {
+            result = &mut scheduler_handle => return Err(scheduler_stopped(result)),
+            () = wait_for_tcp(&scheduler_cluster_port, Duration::from_secs(30)) => {}
+        }
+        handles.push(scheduler_handle);
 
         let scheduler_cluster_addr = scheduler_ports.cluster_advertise();
 
@@ -528,6 +554,7 @@ impl ClusterHarnessBuilder {
                 pki.as_ref(),
                 &scheduler_cluster_addr,
                 None,
+                NODE_ADVERTISE_ADDRESS,
             )
             .await?;
 
@@ -567,6 +594,19 @@ impl ClusterHarnessBuilder {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Why the scheduler's server task ended while the harness was starting it.
+fn scheduler_stopped(result: Result<RuntimeResult<()>, tokio::task::JoinError>) -> anyhow::Error {
+    anyhow::Error::msg(match result {
+        Ok(Ok(())) => "scheduler server thread finished unexpectedly".to_string(),
+        Ok(Err(e)) => format!("scheduler server failed to start: {e}"),
+        Err(e) => format!("scheduler server thread panicked: {e}"),
+    })
+}
+
+/// The address nodes advertise unless a test chooses another; every
+/// harness-issued certificate names it.
+const NODE_ADVERTISE_ADDRESS: &str = "127.0.0.1";
+
 fn node_tls_config(
     pki: Option<&test_framework::pki::PkiConfig>,
     label: &str,
@@ -596,6 +636,7 @@ async fn start_executor(
     pki: Option<&test_framework::pki::PkiConfig>,
     scheduler_cluster_addr: &str,
     cluster_port: Option<u16>,
+    advertise_address: &str,
 ) -> Result<(Arc<Runtime>, JoinHandle<RuntimeResult<()>>), anyhow::Error> {
     let mut executor_ports = NodePorts::allocate();
     if let Some(cluster_port) = cluster_port {
@@ -610,7 +651,7 @@ async fn start_executor(
             role: Some(Role::Executor),
             node_bind_address: executor_ports.cluster_addr(),
             scheduler_address: Some(scheduler_cluster_addr.to_string()),
-            node_advertise_address: Some("127.0.0.1".to_string()),
+            node_advertise_address: Some(advertise_address.to_string()),
             ..node_tls_config(pki, label)?
         },
         ..Default::default()

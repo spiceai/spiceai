@@ -802,6 +802,29 @@ impl ClusterTlsConfig {
         &self.inner.schedulers
     }
 
+    /// Whether this node's own certificate is valid for `host` — the host it
+    /// advertises to its peers. A node advertises only an address its
+    /// certificate names.
+    #[must_use]
+    pub fn self_certificate_names_host(&self, host: &str) -> bool {
+        self.inner.bundle.self_certificate_names_host(host)
+    }
+
+    /// The subject of this node's own certificate, for messages.
+    #[must_use]
+    pub fn self_subject(&self) -> String {
+        self.inner.bundle.self_subject()
+    }
+
+    /// Records how this node is reached by its peers, so a later certificate
+    /// reload that drops the advertise host is rejected (see
+    /// [`pki::ClusterPkiBundle::set_advertise_identity`]).
+    pub fn set_advertise_identity(&self, node_kind: &str, node_id: &str, host: &str) {
+        self.inner
+            .bundle
+            .set_advertise_identity(node_kind, node_id, host);
+    }
+
     /// Connects to each of the scheduler addresses `addresses` (URLs or
     /// `host:port`) and records the identity the scheduler presents at each, so
     /// requests this executor serves can be told to come from the scheduler.
@@ -1201,7 +1224,50 @@ impl ResolvedClusterConfig {
 }
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
+/// Checks that this node's own cluster certificate names `advertise_host`, the
+/// address other cluster nodes connect to it at, and arms the same check for
+/// later certificate reloads, which keep the current certificate on a mismatch
+/// (spiceai/spiceai#16481). On a mismatch, logs and returns the startup message.
+fn ensure_certificate_names_advertise_address(
+    tls: &ClusterTlsConfig,
+    node_kind: &str,
+    node_id: &str,
+    advertise_host: &str,
+) -> Result<(), String> {
+    tls.set_advertise_identity(node_kind, node_id, advertise_host);
+    if tls.self_certificate_names_host(advertise_host) {
+        return Ok(());
+    }
+    let message = runtime_cluster::peer::advertise_address_mismatch_message(
+        runtime_cluster::peer::MismatchSite::Startup,
+        node_kind,
+        node_id,
+        &tls.self_subject(),
+        advertise_host,
+    );
+    tracing::error!("{message}");
+    Err(message)
+}
+
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
+    // Executors connect to a scheduler at the address it advertises, so a
+    // scheduler whose certificate does not name that address is unreachable:
+    // refuse to start rather than serve a cluster no executor can join.
+    if let (Some(tls), Some(advertise_host)) = (
+        rt.df.cluster_config.tls_config(),
+        rt.df.cluster_config.node_advertise_address(),
+    ) {
+        ensure_certificate_names_advertise_address(
+            tls,
+            "scheduler",
+            rt.df.cluster_config.instance_id(),
+            advertise_host,
+        )
+        .map_err(|message| crate::Error::FailedToStartClusterScheduler {
+            source: message.into(),
+        })?;
+    }
+
     let (scheduler, executor_stream_registry) = create_scheduler_server(rt).await?;
 
     rt.df
@@ -1449,6 +1515,17 @@ pub async fn initialize_cluster_executor(
     // Tells the scheduler this process apart from an earlier run under the same
     // id. A UUIDv7 sorts by creation time, so a later run's id compares greater.
     let process_id = uuid::Uuid::now_v7().to_string();
+
+    // Before this executor registers, check its own certificate names the
+    // address it advertises. The scheduler would otherwise refuse the
+    // registration; failing here puts the error in this executor's own log, where
+    // the operator who just deployed it is looking.
+    if let Some(tls) = rt.df.cluster_config.tls_config() {
+        ensure_certificate_names_advertise_address(tls, "executor", &executor_id, &advertise_host)
+            .map_err(|message| FailedToStartClusterExecutor {
+                source: message.into(),
+            })?;
+    }
 
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.

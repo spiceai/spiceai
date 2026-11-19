@@ -297,7 +297,15 @@ pub async fn start_executor_flight_server(
         rt.datafusion().data_update_broadcaster(),
     );
     let session_store = spice_service.session_store();
-    let composite_service = CompositeFlightService::new(spice_service);
+    // The executor's shuffle work directory, so the composite service can confine
+    // peer shuffle fetches to it (a peer fetches output by file path).
+    let shuffle_work_dir = rt
+        .df
+        .executor
+        .read()
+        .ok()
+        .and_then(|executor| executor.as_ref().map(|e| e.work_dir().to_string()));
+    let composite_service = CompositeFlightService::new(spice_service, shuffle_work_dir);
 
     // Wrap the auth in session-awareness to accept session IDs as bearer tokens
     let session_aware_auth = session_auth::with_session_awareness(

@@ -1,0 +1,5 @@
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: app
+  datasets: []

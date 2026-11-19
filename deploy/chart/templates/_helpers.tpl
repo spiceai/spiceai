@@ -99,6 +99,37 @@ Whether the role joins a cluster: a scheduler or an executor.
 {{- end -}}
 
 {{/*
+Cluster nodes (schedulers and executors) run as a StatefulSet behind a headless
+Service, so each pod has a stable DNS name its certificate can cover with one
+wildcard SAN (see https://spiceai.org/docs/features/distributed-query). A
+StatefulSet is also used when `stateful.enabled` requests one for any role.
+*/}}
+{{- define "spiceai.useStatefulSet" -}}
+{{- if or .Values.stateful.enabled (include "spiceai.clusterNode" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The headless Service that gives cluster node pods their stable per-pod DNS names.
+*/}}
+{{- define "spiceai.headlessServiceName" -}}
+{{- printf "%s-headless" (include "spiceai.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+The address a cluster node advertises to its peers: its stable per-pod DNS name,
+`$(POD_NAME).<headless-service>.<namespace>.svc.cluster.local`, which a wildcard
+certificate `*.<headless-service>.<namespace>.svc.cluster.local` covers.
+`cluster.advertiseAddress` overrides it.
+*/}}
+{{- define "spiceai.advertiseAddress" -}}
+{{- if .Values.cluster.advertiseAddress -}}
+{{- .Values.cluster.advertiseAddress -}}
+{{- else -}}
+{{- printf "$(POD_NAME).%s.%s.svc.cluster.local" (include "spiceai.headlessServiceName" .) (include "spiceai.namespace" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 The `spiced` arguments that select the role, after the command. A server takes
 none, so its pods start exactly as before the chart had a role.
 */}}
@@ -119,7 +150,7 @@ none, so its pods start exactly as before the chart had a role.
 - --node-bind-address
 - {{ printf "0.0.0.0:%v" $cluster.port | quote }}
 - --node-advertise-address
-- {{ $cluster.advertiseAddress | default "$(SPICE_POD_IP)" | quote }}
+- {{ include "spiceai.advertiseAddress" . | quote }}
 {{- if eq $role "executor" }}
 - --scheduler-address
 - {{ required "role: executor requires `cluster.schedulerAddress`, the scheduler's cluster address, e.g. https://spice-scheduler-spiceai:50052" $cluster.schedulerAddress | quote }}

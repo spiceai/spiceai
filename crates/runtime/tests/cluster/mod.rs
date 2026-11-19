@@ -29,5 +29,6 @@ mod io_wait_lending;
 mod job_store;
 mod peer_identity;
 mod scheduler_failover;
+mod shuffle_fetch;
 mod simple;
 mod write_through_idle_timeout;
