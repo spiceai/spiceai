@@ -223,7 +223,7 @@ impl reqwest::dns::Resolve for RedirectHostResolver {
 const OFF_HOST_REDIRECT_REFUSED: &str = "a redirect off the request's host to a private, loopback, or link-local address is not followed";
 
 /// Why [`guard_redirects`] refuses a redirect under [`RedirectScope::RequestOrigin`].
-const OFF_ORIGIN_REDIRECT_REFUSED: &str = "a request that carries a custom credential header follows a redirect only to its own scheme, host, and port. Configure the endpoint URL as the redirect target directly";
+const OFF_ORIGIN_REDIRECT_REFUSED: &str = "a request that carries a custom credential header follows a redirect only to its own scheme, host, and port. Configure the endpoint URL as the redirect target directly.";
 
 /// Which redirects [`guard_redirects`] follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

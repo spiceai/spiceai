@@ -656,34 +656,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bearer_token_follows_a_redirect_to_another_port_on_the_endpoint_host() {
-        let target = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::any())
-            .respond_with(users_response())
-            .mount(&target)
-            .await;
-        let endpoint = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::any())
-            .respond_with(redirect_response(&format!("{}/graphql", target.uri())))
-            .mount(&endpoint)
-            .await;
-
-        let result = query_users(
+    async fn a_dataset_without_a_custom_header_token_follows_a_redirect_to_another_port() {
+        for params in [
             &[
                 ("graphql_auth_token", "test-token"),
                 ("json_pointer", "/data/users"),
-            ],
-            &format!("{}/graphql", endpoint.uri()),
-        )
-        .await
-        .expect("the redirect is followed");
+            ][..],
+            &[
+                ("graphql_auth_header", "x-api-key"),
+                ("graphql_auth_user", "user"),
+                ("json_pointer", "/data/users"),
+            ][..],
+        ] {
+            let target = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(users_response())
+                .mount(&target)
+                .await;
+            let endpoint = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(redirect_response(&format!("{}/graphql", target.uri())))
+                .mount(&endpoint)
+                .await;
 
-        let rows: usize = result
-            .records
-            .iter()
-            .map(arrow::array::RecordBatch::num_rows)
-            .sum();
-        assert_eq!(rows, 1);
+            let result = query_users(params, &format!("{}/graphql", endpoint.uri()))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("the redirect is followed with {params:?}: {error}")
+                });
+
+            let rows: usize = result
+                .records
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
+            assert_eq!(rows, 1);
+        }
     }
 }
 
