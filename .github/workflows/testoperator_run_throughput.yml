@@ -332,7 +332,7 @@ jobs:
         id: aws-s3-athena
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_S3_ATHENA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_S3_ATHENA_ROLE_ARN }}
           role-session-name: gha-s3-athena-${{ github.run_id }}
           role-duration-seconds: 21600
           aws-region: us-east-1
@@ -343,7 +343,7 @@ jobs:
         id: aws-dynamodb
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
           role-session-name: gha-dynamodb-${{ github.run_id }}
           role-duration-seconds: 21600
           aws-region: us-east-1
