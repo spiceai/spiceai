@@ -44,6 +44,8 @@ inputs:
         - 'install/**'
         - 'Cargo.toml'
         - 'Cargo.lock'
+        # The spice CLI embeds the Spicepod schema (`include_str!`) to type `--set` values.
+        - '.schema/spicepod.schema.json'
         - 'version.txt'
         - '**/*.snap'
         - '**/*.proto'
