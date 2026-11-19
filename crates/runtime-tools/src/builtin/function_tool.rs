@@ -44,9 +44,9 @@ use datafusion::common::utils::quote_identifier;
 use futures::TryStreamExt;
 use serde_json::{Map, Value};
 use spicepod::component::function::{Function, FunctionArg, FunctionKind};
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 
-use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+use runtime_auth::{AuthRequestContext, principal_has_write_access};
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -154,7 +154,13 @@ impl SpiceModelTool for FunctionAsTool {
         Some(build_parameters_schema(&self.args))
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Runs the function in a `SELECT`, read-only for a principal without write access, so a
+    /// read-only key is refused the functions that run code or call out, as in its own SQL.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let req: Value = serde_json::from_str(arg)?;
         let obj = req.as_object().ok_or_else(|| {
             Box::<dyn std::error::Error + Send + Sync>::from("expected a JSON object of arguments")
@@ -194,24 +200,12 @@ impl SpiceModelTool for FunctionAsTool {
     }
 }
 
-pub(crate) async fn current_principal_requires_read_only() -> bool {
+/// Whether the request is made by a principal without write access. A request with no principal
+/// is not.
+async fn current_principal_requires_read_only() -> bool {
     let context = RequestContext::current(AsyncMarker::new().await);
     AuthRequestContext::auth_principal(context.as_ref())
         .is_some_and(|principal| !principal_has_write_access(principal))
-}
-
-/// Whether the request is authenticated as a principal with write access. A request with no
-/// principal does not have it.
-pub(crate) async fn current_principal_allows_write() -> bool {
-    let context = RequestContext::current(AsyncMarker::new().await);
-    AuthRequestContext::auth_principal(context.as_ref()).is_some_and(principal_has_write_access)
-}
-
-fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
-    principal
-        .groups()
-        .iter()
-        .any(|group| *group == "write" || *group == "read_write")
 }
 
 fn function_call_sql(function_name: &str, literals: &[String]) -> String {

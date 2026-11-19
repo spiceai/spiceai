@@ -1455,10 +1455,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(json!([{ "rows": 3 }]))
         }
@@ -1940,10 +1941,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!([{ "answer": 42 }]))
         }
     }
@@ -1965,10 +1967,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(
                 json!({"datasets": [{"table": format!("dataset_{call}")}], "total": 1, "has_more": false}),
