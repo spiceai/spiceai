@@ -119,6 +119,29 @@ pub struct Function {
     /// Set to `false` to keep the function SQL-only.
     #[serde(default = "crate::component::default_true")]
     pub as_tool: bool,
+
+    /// How `spice build` builds this function's module (`params.module`).
+    ///
+    /// CLI-only: `spice build` and `spice run` read it; the runtime ignores it
+    /// and never builds anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<FunctionBuild>,
+}
+
+/// The command `spice build` runs to build a function's module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct FunctionBuild {
+    /// The command `spice build` runs, as the developer and with the
+    /// developer's environment, for example
+    /// `cargo build --target wasm32-unknown-unknown --release`.
+    pub command: String,
+
+    /// The directory the command runs in, relative to the Spicepod. Defaults
+    /// to the Spicepod's directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
 }
 
 /// Function kind.
@@ -287,6 +310,7 @@ impl WithDependsOn<Function> for Function {
             depends_on: depends_on.to_vec(),
             metrics: self.metrics.clone(),
             as_tool: self.as_tool,
+            build: self.build.clone(),
         }
     }
 }
@@ -412,6 +436,7 @@ body: SELECT doc AS line, 1 AS line_no FROM args
             depends_on: vec!["a".into()],
             metrics: None,
             as_tool: true,
+            build: None,
         };
         let g = f.depends_on(&["b".into(), "c".into()]);
         assert_eq!(g.depends_on, vec!["b".to_string(), "c".to_string()]);

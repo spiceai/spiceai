@@ -148,7 +148,8 @@ const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is ano
 
 mod cloud_connect;
 pub use cloud_connect::{
-    BootstrapEnrollmentError, bootstrap_enrollment as cloud_connect_bootstrap,
+    BootstrapEnrollmentError, StateDirectoryError, bootstrap_enrollment as cloud_connect_bootstrap,
+    prepare_state_directory as cloud_connect_prepare_state,
 };
 mod connection_report;
 pub mod crash_handler;

@@ -20,7 +20,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArgs};
 use spice::commands::component::{ComponentSection, SingletonSection};
 use spice::commands::{
-    acceleration, add, catalogs, chat, cloud, cluster, coding_agent, completions, component,
+    acceleration, add, build, catalogs, chat, cloud, cluster, coding_agent, completions, component,
     connect, dataset, datasets, feedback, init, install, login, models, nsql, pods, query, refresh,
     run, search, sql, status, trace, upgrade, validate, version, workers,
 };
@@ -166,6 +166,8 @@ enum Commands {
     Upgrade(upgrade::UpgradeArgs),
 
     Run(run::RunArgs),
+
+    Build(build::BuildArgs),
 
     Status(status::StatusArgs),
 
@@ -814,6 +816,7 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Install(_)
         | Commands::Upgrade(_)
         | Commands::Run(_)
+        | Commands::Build(_)
         | Commands::Add(_)
         | Commands::Connect(_)
         | Commands::Validate(_)
@@ -955,6 +958,9 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::ResponseIncomplete { .. } => "response_incomplete",
         spice::error::Error::Registry { .. } => "registry",
         spice::error::Error::ConfigIo { .. } => "config_io",
+        spice::error::Error::BuildFailed { .. } | spice::error::Error::BuildRefused { .. } => {
+            "build_failed"
+        }
         spice::error::Error::ConfigParse { .. } => "config_parse",
         spice::error::Error::CreateDirectory { .. } => "create_directory",
         spice::error::Error::RuntimeExecution { .. } => "runtime_execution",
@@ -1040,6 +1046,7 @@ fn is_json_output(cmd: &mut Commands) -> bool {
         | Commands::Install(_)
         | Commands::Upgrade(_)
         | Commands::Run(_)
+        | Commands::Build(_)
         | Commands::Add(_)
         | Commands::Connect(_)
         | Commands::Validate(_)
@@ -1105,6 +1112,11 @@ fn run_cli(cli: Cli) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(run::execute(&ctx, &args, cli.verbose))?;
+        }
+        Commands::Build(args) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
+            rt.block_on(build::execute(&ctx, &args))?;
         }
         Commands::Sql(args) => {
             let rt = tokio::runtime::Runtime::new()

@@ -17,12 +17,14 @@ limitations under the License.
 //! The mutation lock that serializes changes to one instance directory's Cloud
 //! Connect state.
 //!
-//! `<config-dir>/connect.lock` is the common primitive later lifecycle layers
-//! use to cover a complete state-changing operation, such as the interactive
-//! enrollment/project transaction or a release. It is coarser and outer to
-//! [`crate::EnrollmentTransactionLock`], which already serializes one enrollment
-//! operation in this foundation layer: once a caller needs both, it takes this
-//! lock first and the enrollment lock second, never the reverse.
+//! `<config-dir>/cloud-connect/connect.lock` is the common primitive later
+//! lifecycle layers use to cover a complete state-changing operation, such as
+//! the interactive enrollment/project transaction or a release. It is coarser
+//! and outer to [`crate::EnrollmentTransactionLock`], which already serializes
+//! one enrollment operation in this foundation layer: once a caller needs both,
+//! it takes this lock first and the enrollment lock second, never the reverse.
+//! Taking it applies the state-directory rule ([`crate::state_dir::check`]) to
+//! the directory it lives in, creating that directory owner-only.
 //!
 //! It lives here, below the CLI, so that the runtime can take the same lock:
 //! it reaches the same state through the control stream, and two exclusion
@@ -61,6 +63,9 @@ pub enum Error {
         "Cloud Connect state for this directory is already being changed{owner}. Wait for that command to finish, then retry."
     ))]
     LockTimeout { owner: String },
+
+    #[snafu(display("{source}"))]
+    StateDirectory { source: crate::state_dir::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -103,16 +108,47 @@ impl MutationLock {
         action: &'static str,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::acquire_in(config_dir, action, timeout, StateRule::Apply).await
+    }
+
+    /// Take the mutation lock at the config directory itself, where a CLI
+    /// that predates the state directory takes it, without applying the
+    /// state-directory rule. Held while state written there moves into the
+    /// state directory, so such a CLI cannot change it mid-move.
+    ///
+    /// # Errors
+    ///
+    /// As [`MutationLock::acquire`].
+    pub async fn acquire_legacy(config_dir: &Path, action: &'static str) -> Result<Self> {
+        Self::acquire_in(config_dir, action, MUTATION_LOCK_TIMEOUT, StateRule::Skip).await
+    }
+
+    async fn acquire_in(
+        config_dir: &Path,
+        action: &'static str,
+        timeout: Duration,
+        rule: StateRule,
+    ) -> Result<Self> {
         let config_dir = config_dir.to_path_buf();
         let lock_path = config_dir.join(MUTATION_LOCK_FILE);
         // Blocking file I/O, and a wait that can last the whole timeout, so it
-        // never occupies an async worker thread.
-        tokio::task::spawn_blocking(move || acquire_lock(&config_dir, action, timeout))
-            .await
-            .map_err(|source| Error::Io {
-                path: lock_path,
-                source: std::io::Error::other(format!("lock task panicked: {source}")),
-            })?
+        // never occupies an async worker thread. The caller's subscriber goes
+        // with it: before `spiced` installs its global one, a thread-local one
+        // is all there is, and the state directory's repair line must reach it.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                if rule == StateRule::Apply {
+                    prepare_state_directory(&config_dir)?;
+                }
+                acquire_lock(&config_dir, action, timeout)
+            })
+        })
+        .await
+        .map_err(|source| Error::Io {
+            path: lock_path,
+            source: std::io::Error::other(format!("lock task panicked: {source}")),
+        })?
     }
 
     /// Return the canonical config directory protected by this lock after
@@ -232,6 +268,34 @@ impl MutationLock {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateRule {
+    Apply,
+    Skip,
+}
+
+/// Apply the state-directory rule to the directory the lock lives in,
+/// creating it owner-only. A privileged caller still may not create the
+/// config directory above it: enrollment as the intended account does that.
+fn prepare_state_directory(state_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0
+        && let Some(parent) = state_dir.parent()
+        && std::fs::symlink_metadata(parent)
+            .is_err_and(|source| source.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(Error::Io {
+            path: parent.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "a privileged Cloud Connect mutation cannot create the config directory; enroll as the intended service account first",
+            ),
+        });
+    }
+    crate::state_dir::check(state_dir, true).context(StateDirectorySnafu)?;
+    Ok(())
 }
 
 fn acquire_lock(config_dir: &Path, action: &str, timeout: Duration) -> Result<MutationLock> {

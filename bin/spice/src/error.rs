@@ -187,6 +187,24 @@ pub enum Error {
     #[snafu(display("{message}"))]
     Registry { message: String },
 
+    /// `spice build` could not build a function's module.
+    #[snafu(display(
+        "Failed to build function '{function}': {source}. See: {}",
+        crate::commands::build::FUNCTIONS_DOCS
+    ))]
+    BuildFailed {
+        function: String,
+        source: crate::commands::build::BuildError,
+    },
+
+    /// A function from a Spicepod dependency declares a build, and
+    /// `spicepod.yaml` does not trust that dependency to run programs.
+    #[snafu(display(
+        "Failed to build function '{function}' from Spicepod dependency '{from}': its `build:` command runs a program on this host, and a dependency may do that only when spicepod.yaml trusts it. To trust it, replace `- {from}` under `dependencies:` with `- {{ from: {from}, trust: full }}`. See: {}",
+        crate::commands::build::DEPENDENCIES_DOCS
+    ))]
+    BuildRefused { function: String, from: String },
+
     /// Failed to read/write configuration
     #[snafu(display("Failed to {operation} configuration at '{}': {source}", path.display()))]
     ConfigIo {

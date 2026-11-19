@@ -29,7 +29,7 @@ limitations under the License.
 //!    then enrolls this instance *before the runtime is built or any
 //!    listener binds*, so the durable identity exists by the time anything
 //!    else here runs.
-//! 2. `$SPICE_CONFIG_DIR/identity.json` contains a usable previously-enrolled
+//! 2. `$SPICE_CONFIG_DIR/cloud-connect/identity.json` contains a usable previously-enrolled
 //!    identity — reconnection is automatic, with no flag.
 //!
 //! If neither is true, this module never opens a connection. An existing
@@ -82,6 +82,7 @@ use runtime::datafusion::query::Error as QueryError;
 use runtime::status::ComponentStatus;
 #[cfg(test)]
 use runtime_cloud_connect::config::IDENTITY_FILE;
+use runtime_cloud_connect::config::INCOMING_CLOUD_MANAGED_SPICEPOD_FILE;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, DEPLOYMENT_TRANSACTION_FILE,
     DEPLOYMENT_TRANSACTION_INCOMING_FILE, INCOMING_SECRET_CACHE_FILE,
@@ -333,6 +334,53 @@ fn reconcile_requested_endpoint(
             Err("the control-plane binding on disk could not be read, so the requested endpoint cannot be checked against it.".to_string())
         }
     }
+}
+
+/// Why this instance's Cloud Connect state directory cannot be used, so the
+/// runtime does not start.
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("Failed to start: {source}"))]
+pub struct StateDirectoryError {
+    source: runtime_cloud_connect::state_dir::Error,
+}
+
+/// Move Cloud Connect state an earlier version kept in the config directory
+/// into the state directory, then apply the state-directory rule to it.
+///
+/// Called from `main` with the instance directory claimed and before the
+/// `--token` bootstrap, so that nothing is read from or written to a state
+/// directory another account could have changed. An instance that has never
+/// enrolled and starts without `--token` has no state directory; nothing is
+/// created and nothing is logged for it.
+///
+/// # Errors
+///
+/// Returns [`StateDirectoryError`] when the state directory, or a config
+/// directory that still holds state to move, cannot be trusted or used.
+pub async fn prepare_state_directory(args: &crate::Args) -> Result<(), StateDirectoryError> {
+    let config_dir = CloudConnectConfig::default_config_dir();
+    runtime_cloud_connect::state_dir::migrate_legacy_state(&config_dir)
+        .await
+        .map_err(|source| StateDirectoryError { source })?;
+    let state_dir = runtime_cloud_connect::state_dir::state_dir(&config_dir);
+    let create = args.token.is_some();
+    // `main`'s subscriber is thread-local until the runtime installs the
+    // global one, so it goes with the check to the blocking thread.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            runtime_cloud_connect::state_dir::check(&state_dir, create)
+        })
+    })
+    .await
+    .map_err(|source| StateDirectoryError {
+        source: runtime_cloud_connect::state_dir::Error::Io {
+            path: CloudConnectConfig::default_state_dir(),
+            source: std::io::Error::other(format!("state directory task panicked: {source}")),
+        },
+    })?
+    .map_err(|source| StateDirectoryError { source })?;
+    Ok(())
 }
 
 /// Why a `--token` bootstrap could not produce a durable identity. Every
@@ -766,6 +814,7 @@ fn reconcile(active: &App, deployed: App) -> Reconciled {
         runtime,
         management,
         snapshots,
+        refused_components,
     } = deployed;
 
     let mut restart_required = Vec::new();
@@ -792,6 +841,10 @@ fn reconcile(active: &App, deployed: App) -> Reconciled {
         views,
         models,
         functions,
+        // What the deployment's dependencies may not load. It describes the
+        // deployed components, which are reconciled, and a reload logs any it
+        // newly refuses.
+        refused_components,
         // Read at start only to label anonymous telemetry, which is already
         // running: the label keeps the name the instance started under, and
         // nothing else in a running process is built from the app's name. Take
@@ -2626,9 +2679,6 @@ async fn stage_cloud_managed_spicepod(
         }
     }
 }
-
-/// The name a deployment is staged under before it is promoted.
-const INCOMING_CLOUD_MANAGED_SPICEPOD_FILE: &str = "spicepod-cloud-managed.incoming.yml";
 
 /// Create `incoming` afresh and write `spicepod_yaml` to it durably.
 ///

@@ -35,6 +35,10 @@ mod cloud_managed_spicepod;
 mod cpu_budget;
 mod dependency_logging;
 #[cfg(unix)]
+mod dependency_trust;
+#[cfg(feature = "odbc")]
+mod odbc_driver_path;
+#[cfg(unix)]
 mod open_file_limit;
 mod otel_logs;
 
