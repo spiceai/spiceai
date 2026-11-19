@@ -566,7 +566,10 @@ impl MistralLlama {
     /// Rejects a request whose prompt does not fit the model's context, before it reaches
     /// the engine. An over-context prompt otherwise keeps the host's CPU and memory busy
     /// for minutes, even after the client has gone.
-    async fn check_prompt_fits(&self, req: &CreateChatCompletionRequest) -> Result<(), OpenAIError> {
+    async fn check_prompt_fits(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> Result<(), OpenAIError> {
         let messages = req
             .messages
             .iter()
