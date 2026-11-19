@@ -22678,8 +22678,12 @@ version = "2.5.0-unstable"
 dependencies = [
  "async-trait",
  "rmcp",
+ "runtime-auth",
+ "runtime-request-context",
  "serde_json",
+ "snafu",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

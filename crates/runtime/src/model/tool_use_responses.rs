@@ -1247,7 +1247,11 @@ mod tests {
             None
         }
 
-        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             // Spice's own lookup of the datasets for the system prompt (it asks for a `limit`) is
             // not a call the model made, and its answer here is no page, so no list is added.
             if !arg.contains("\"limit\"") {
@@ -1274,10 +1278,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(
                 json!({"datasets": [{"table": "spice.public.taxi_trips"}], "total": 1, "has_more": false}),
             )
@@ -1434,10 +1439,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Err("no such table".into())
         }
     }
