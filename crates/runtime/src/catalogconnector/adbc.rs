@@ -32,9 +32,9 @@ use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::adbc_helpers::{
-    BIGQUERY_SKIP_ANONYMOUS_TABLES, DUCKDB_DRIVER, build_db_options, connection_secrets,
+    BIGQUERY_SKIP_QUERY_RESULT_TABLES, DUCKDB_DRIVER, build_db_options, connection_secrets,
     dialect_for_driver, driver_entrypoint, enrich_with_bigquery_metadata, is_bigquery_driver,
-    scrub_connection_secrets, skip_bigquery_anonymous_tables,
+    scrub_connection_secrets, skip_bigquery_query_result_tables,
 };
 use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -116,7 +116,7 @@ pub enum Error {
     /// `message` is the driver's error with the connection's credentials
     /// scrubbed.
     #[snafu(display(
-        "Failed to create ADBC database (driver='{driver_location}'): the BigQuery driver does not support the `{BIGQUERY_SKIP_ANONYMOUS_TABLES}` option, which the catalog needs to list hidden datasets without fetching the metadata of every cached query result. Use the BigQuery ADBC driver built from https://github.com/spiceai/bigquery. Cause: {message}"
+        "Failed to create ADBC database (driver='{driver_location}'): the BigQuery driver does not support the `{BIGQUERY_SKIP_QUERY_RESULT_TABLES}` option, which the catalog needs to list hidden datasets without fetching the metadata of every cached query result. Use the BigQuery ADBC driver built from https://github.com/spiceai/bigquery. Cause: {message}"
     ))]
     UnsupportedBigQueryDriver {
         driver_location: String,
@@ -381,7 +381,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
         // Without the option, listing a `BigQuery` hidden dataset fetches the
         // metadata of every cached query result in it, one call per table.
         if is_bigquery_driver(&driver_name) {
-            skip_bigquery_anonymous_tables(&mut db).map_err(|e| {
+            skip_bigquery_query_result_tables(&mut db).map_err(|e| {
                 UnsupportedBigQueryDriverSnafu {
                     driver_location: driver_location.clone(),
                     message: scrub_connection_secrets(&e.to_string(), &secrets),
@@ -415,7 +415,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
 /// A catalog provider for ADBC that discovers schemas and tables using the ADBC
 /// metadata API (`get_objects`). It lists tables only in schemas the catalog's
 /// `include` can reach. A `BigQuery` driver must leave out the tables of cached
-/// query results; see [`skip_bigquery_anonymous_tables`].
+/// query results; see [`skip_bigquery_query_result_tables`].
 struct AdbcCatalogProvider {
     pool: Arc<ADBCPool<ManagedDatabase>>,
     table_factory: AdbcTableFactory<ManagedDatabase>,

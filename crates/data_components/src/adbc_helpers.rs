@@ -549,18 +549,18 @@ pub fn is_bigquery_hidden_dataset(dataset: &str) -> bool {
 /// results out of `get_objects`, before the driver fetches any table's metadata.
 /// Tables in a user's own hidden datasets are still listed. Only the
 /// `spiceai/bigquery` build of the driver has it.
-pub const BIGQUERY_SKIP_ANONYMOUS_TABLES: &str = "bigquery.skip_anonymous_tables";
+pub const BIGQUERY_SKIP_QUERY_RESULT_TABLES: &str = "bigquery.skip_query_result_tables";
 
-/// Turns on [`BIGQUERY_SKIP_ANONYMOUS_TABLES`] for a `BigQuery` database.
+/// Turns on [`BIGQUERY_SKIP_QUERY_RESULT_TABLES`] for a `BigQuery` database.
 ///
 /// # Errors
 ///
 /// When the driver rejects the option, as a driver build without it does.
-pub fn skip_bigquery_anonymous_tables(
+pub fn skip_bigquery_query_result_tables(
     database: &mut impl adbc_core::Optionable<Option = OptionDatabase>,
 ) -> adbc_core::error::Result<()> {
     database.set_option(
-        OptionDatabase::Other(BIGQUERY_SKIP_ANONYMOUS_TABLES.to_string()),
+        OptionDatabase::Other(BIGQUERY_SKIP_QUERY_RESULT_TABLES.to_string()),
         "true".into(),
     )
 }
@@ -1136,7 +1136,7 @@ mod scrub_tests {
 }
 
 #[cfg(test)]
-mod bigquery_anonymous_table_skip_tests {
+mod bigquery_query_result_table_skip_tests {
     use super::*;
     use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status};
     use adbc_core::options::OptionValue;
@@ -1180,16 +1180,16 @@ mod bigquery_anonymous_table_skip_tests {
     }
 
     #[test]
-    fn a_driver_with_the_option_skips_anonymous_tables() {
+    fn a_driver_with_the_option_skips_query_result_tables() {
         let mut database = Database {
             known: true,
             set: Vec::new(),
         };
-        skip_bigquery_anonymous_tables(&mut database).expect("the option is applied");
+        skip_bigquery_query_result_tables(&mut database).expect("the option is applied");
         assert_eq!(
             database.set,
             vec![(
-                "bigquery.skip_anonymous_tables".to_string(),
+                "bigquery.skip_query_result_tables".to_string(),
                 "true".to_string()
             )]
         );
@@ -1201,7 +1201,7 @@ mod bigquery_anonymous_table_skip_tests {
             known: false,
             set: Vec::new(),
         };
-        let error = skip_bigquery_anonymous_tables(&mut database)
+        let error = skip_bigquery_query_result_tables(&mut database)
             .expect_err("a driver without the option rejects it");
         assert_eq!(error.status, Status::NotImplemented);
         assert!(database.set.is_empty());

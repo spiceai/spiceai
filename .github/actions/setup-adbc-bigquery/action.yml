@@ -7,7 +7,7 @@ inputs:
       Commit of spiceai/bigquery to build the driver from: upstream go/v1.15.0
       plus the Spice patches docs/dev/fork_patches.md lists.
     required: false
-    default: '1fb52b8c743badcd98a3331233d9dd32262d59c1'
+    default: '5bf335f677816f0f39d1a2557fc402ba93895764'
   go_version:
     description: >-
       Go version to build the driver with. Must satisfy the `go` directive in the
@@ -54,7 +54,7 @@ runs:
         # A driver without these patches still builds and loads, so check for
         # each one: see the ADBC BigQuery driver section of docs/dev/fork_patches.md.
         missing=""
-        grep -q '"bigquery.skip_anonymous_tables"' driver.go || missing="$missing bigquery.skip_anonymous_tables"
+        grep -q '"bigquery.skip_query_result_tables"' driver.go || missing="$missing bigquery.skip_query_result_tables"
         grep -q '^func getTableInfos(' connection.go || missing="$missing getTableInfos"
         grep -q '^func isInaccessibleTable(' connection.go || missing="$missing isInaccessibleTable"
         if [ -n "$missing" ]; then
