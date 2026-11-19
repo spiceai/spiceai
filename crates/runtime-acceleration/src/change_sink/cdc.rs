@@ -260,14 +260,18 @@ pub fn group_into_sub_batches(
             .collect();
     }
 
-    // Extract data batch and PK column indices once, instead of per-row.
-    let data_batch = change_batch.data_batch();
+    // Find the PK columns once, instead of per-row, from the data schema. The
+    // data is read as a batch only when there are keys to encode: a row
+    // without data, such as the truncate that opens a `DoExchange` snapshot,
+    // carries a null data struct, which cannot be read as a batch when a
+    // column is non-nullable, and a keyless batch never needs one.
     let pk_column_names = change_batch.primary_keys(0);
+    let data_schema = change_batch.data_schema();
     let pk_col_indices: Vec<usize> = pk_column_names
         .iter()
-        .filter_map(|name| data_batch.schema().index_of(name).ok())
+        .filter_map(|name| data_schema.index_of(name).ok())
         .collect();
-    let has_pks = !pk_col_indices.is_empty();
+    let data_batch = (!pk_col_indices.is_empty()).then(|| change_batch.data_batch());
 
     let mut upserts = OpBatchAccumulator::new();
     let mut deletes = OpBatchAccumulator::new();
@@ -290,8 +294,8 @@ pub fn group_into_sub_batches(
         // bucket (CDC rows are full-state snapshots so only the latest
         // row per PK matters) and flush only on *cross-bucket* conflicts
         // to preserve inter-operation ordering.
-        if has_pks {
-            let primary_key = encode_primary_key(&data_batch, &pk_col_indices, row_id);
+        if let Some(data_batch) = &data_batch {
+            let primary_key = encode_primary_key(data_batch, &pk_col_indices, row_id);
 
             // Cross-bucket conflict: the *other* bucket already has this
             // PK, so flush it to preserve operation ordering.

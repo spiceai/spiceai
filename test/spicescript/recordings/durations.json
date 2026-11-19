@@ -158,6 +158,7 @@
   "search-hybrid": 6,
   "served-while-source-down": 48,
   "settings-evolution": 73,
+  "sidecar-append-stream-keyed": 4,
   "sidecar-cluster": 129,
   "sidecar-substrait-field-metadata": 3,
   "slow-refresh-warning": 52,
