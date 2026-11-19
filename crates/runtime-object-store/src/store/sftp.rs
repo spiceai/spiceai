@@ -375,6 +375,15 @@ impl SFTPObjectStore {
         }
     }
 
+    /// Read the `known_hosts` file on the blocking pool, so a stalled home directory cannot
+    /// hold a runtime worker.
+    async fn read_known_hosts(&self) -> object_store::Result<KnownHostsFile> {
+        let config = Arc::clone(&self.config);
+        tokio::task::spawn_blocking(move || config.read_known_hosts())
+            .await
+            .map_err(|e| generic_error(STORE_NAME, e))?
+    }
+
     /// List a single directory and return its entries (blocking).
     fn list_directory_blocking(
         session: &Session,
@@ -411,7 +420,7 @@ impl SFTPObjectStore {
         &self,
         prefix: Option<String>,
     ) -> object_store::Result<Vec<ObjectMeta>> {
-        let known_hosts = self.config.read_known_hosts()?;
+        let known_hosts = self.read_known_hosts().await?;
         let endpoint = self.config.resolve().await?;
         let config = Arc::clone(&self.config);
         let prefix = prefix.unwrap_or_else(|| "/".to_string());
@@ -439,7 +448,7 @@ impl SFTPObjectStore {
         &self,
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
-        let known_hosts = self.config.read_known_hosts()?;
+        let known_hosts = self.read_known_hosts().await?;
         let endpoint = self.config.resolve().await?;
         let config = Arc::clone(&self.config);
         let prefix_str = prefix.map_or("/".to_string(), |p| {
@@ -663,7 +672,7 @@ impl ObjectStore for SFTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let known_hosts = self.config.read_known_hosts()?;
+        let known_hosts = self.read_known_hosts().await?;
         let endpoint = self.config.resolve().await?;
         let config = Arc::clone(&self.config);
         let location = location.clone();
