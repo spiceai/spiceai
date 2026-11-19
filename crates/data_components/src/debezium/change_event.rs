@@ -105,18 +105,20 @@ impl ChangeEvent {
 
     #[must_use]
     pub fn get_schema_fields(&self) -> Option<Vec<&Field>> {
-        self.schema.as_ref().and_then(|schema| {
-            schema
-                .fields
-                .iter()
-                .find(|field| field.field.as_ref().is_some_and(|field| field == "after"))
-                .and_then(|field| {
-                    field
-                        .fields
-                        .as_ref()
-                        .map(|fields| fields.as_slice().iter().collect())
-                })
-        })
+        self.row_fields().map(|fields| fields.iter().collect())
+    }
+
+    /// The fields of the row (`after`) struct in the embedded schema, or `None`
+    /// for a schemaless event.
+    #[must_use]
+    pub fn row_fields(&self) -> Option<&[Field]> {
+        self.schema
+            .as_ref()?
+            .fields
+            .iter()
+            .find(|field| field.field.as_deref() == Some("after"))?
+            .fields
+            .as_deref()
     }
 }
 

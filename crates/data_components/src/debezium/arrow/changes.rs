@@ -19,7 +19,7 @@ use crate::{
     cdc::{ChangeBatch, changes_schema},
     debezium::{
         arrow::downcast_builder,
-        change_event::{ChangeEvent, Op},
+        change_event::{ChangeEvent, Field as ChangeEventField, Op},
     },
     schema_projection::SchemaProjection,
 };
@@ -99,19 +99,29 @@ fn append_change_event(
     change: &ChangeEvent,
     projection: Option<&SchemaProjection>,
 ) -> super::Result<()> {
+    let source_fields = change.row_fields();
     if primary_key.is_empty() && matches!(change.payload.op, Op::Update) {
         let before = change
             .payload
             .before
             .clone()
             .context(super::UpdateOpWithoutBeforeFieldSnafu)?;
-        append_change_row(struct_builder, schema, primary_key, "d", before, projection)?;
+        append_change_row(
+            struct_builder,
+            schema,
+            primary_key,
+            "d",
+            before,
+            source_fields,
+            projection,
+        )?;
         append_change_row(
             struct_builder,
             schema,
             primary_key,
             "c",
             change.payload.after.clone(),
+            source_fields,
             projection,
         )?;
         return Ok(());
@@ -133,6 +143,7 @@ fn append_change_event(
         primary_key,
         op,
         change_data,
+        source_fields,
         projection,
     )
 }
@@ -143,6 +154,7 @@ fn append_change_row(
     primary_key: &[String],
     op: &str,
     change_data: serde_json::Value,
+    source_fields: Option<&[ChangeEventField]>,
     projection: Option<&SchemaProjection>,
 ) -> super::Result<()> {
     struct_builder.append(true);
@@ -183,7 +195,11 @@ fn append_change_row(
                         .context(super::InvalidChangeEventSchemaSnafu {
                             reason: "data field appears more than once",
                         })?;
-                super::append_value_to_struct_builder(change_data, data_struct_builder)?;
+                super::append_value_to_struct_builder(
+                    change_data,
+                    data_struct_builder,
+                    source_fields,
+                )?;
             }
             _ => unreachable!("Unexpected field in changes schema {}", field.name()),
         }

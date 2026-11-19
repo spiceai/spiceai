@@ -21,11 +21,11 @@ use arrow::{
         ArrayBuilder, BinaryBuilder, BooleanBuilder, Decimal128Builder, Float32Builder,
         Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder, PrimitiveBuilder,
         RecordBatch, StringBuilder, StructArray, Time64MicrosecondBuilder,
-        TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
     },
     datatypes::{
-        ArrowPrimitiveType, DataType, Date32Type, Field, Int16Type, Int32Type, Int64Type, Schema,
-        Time64MicrosecondType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+        ArrowPrimitiveType, ArrowTimestampType, DataType, Date32Type, Field, Int16Type, Int32Type,
+        Int64Type, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType,
+        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
     },
 };
 use arrow_tools::decimal;
@@ -94,10 +94,25 @@ pub enum Error {
     #[snafu(display("Failed to convert Debezium value to f64 floating point"))]
     UnableToConvertToF64,
 
-    #[snafu(display("Timestamp type ({unit:?},{time_zone:?}) not supported yet",))]
-    TimestampNotSupported {
+    #[snafu(display(
+        "Failed to ingest a change event: the value {value} of column '{column}' is outside the range of its type Timestamp({unit:?}). \
+        Declare the column with a coarser unit, such as `Timestamp(Microsecond, UTC)`. \
+        See: https://spiceai.org/docs/components/data-connectors/debezium"
+    ))]
+    TimestampOutOfRange {
+        column: String,
+        value: serde_json::Value,
         unit: TimeUnit,
-        time_zone: Option<String>,
+    },
+
+    #[snafu(display(
+        "Failed to ingest a change event: the value {value} of column '{column}' is not a timestamp. \
+        Expected an ISO 8601 string or an integer. \
+        See: https://spiceai.org/docs/components/data-connectors/debezium"
+    ))]
+    InvalidTimestampValue {
+        column: String,
+        value: serde_json::Value,
     },
 
     #[snafu(display("Data type {data_type} not supported yet"))]
@@ -165,15 +180,18 @@ pub fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Resul
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), values.len());
 
     for value in values {
-        append_value_to_struct_builder(value, &mut struct_builder)?;
+        append_value_to_struct_builder(value, &mut struct_builder, None)?;
     }
 
     Ok(struct_builder.finish())
 }
 
+/// Appends one row to `builder`. `source_fields` is the row schema embedded in
+/// the change event, if any; it gives the unit of integer-encoded timestamps.
 pub fn append_value_to_struct_builder(
     value: serde_json::Value,
     builder: &mut StructBuilder,
+    source_fields: Option<&[ChangeEventField]>,
 ) -> Result<()> {
     builder.append(true);
     let null_value = serde_json::Value::Null;
@@ -193,9 +211,23 @@ pub fn append_value_to_struct_builder(
             }
         };
 
+        // Only integer timestamps need their Debezium semantic type. Debezium
+        // lists the row's fields in table order, so try the same position first.
+        let source_field = match (field.data_type(), field_value, source_fields) {
+            (DataType::Timestamp(..), Json::Number(_), Some(fields)) => fields
+                .get(idx)
+                .filter(|f| f.field.as_deref() == Some(field.name().as_str()))
+                .or_else(|| {
+                    fields
+                        .iter()
+                        .find(|f| f.field.as_deref() == Some(field.name().as_str()))
+                }),
+            _ => None,
+        };
+
         let field_builder = builder.field_builder_array(idx);
 
-        append_field_value_to_builder(field_value, field, field_builder)?;
+        append_field_value_to_builder(field_value, field, field_builder, source_field)?;
     }
 
     Ok(())
@@ -206,6 +238,7 @@ fn append_field_value_to_builder(
     field_value: &serde_json::Value,
     field: &Arc<Field>,
     builder: &mut dyn ArrayBuilder,
+    source_field: Option<&ChangeEventField>,
 ) -> Result<()> {
     match field.data_type() {
         DataType::Utf8 => {
@@ -240,45 +273,38 @@ fn append_field_value_to_builder(
                 None => decimal_builder.append_null(),
             }
         }
-        DataType::Timestamp(unit, time_zone) => match (unit, time_zone) {
-            (TimeUnit::Microsecond, None) => {
-                append_i64_to_builder::<i64, TimestampMicrosecondType>(field_value, builder)?;
+        DataType::Timestamp(unit, _) => {
+            let (column, source_unit) = (
+                field.name().as_str(),
+                source_field.and_then(|f| debezium_timestamp_unit(f.name.as_deref()?)),
+            );
+            match unit {
+                TimeUnit::Second => append_timestamp::<TimestampSecondType>(
+                    field_value,
+                    column,
+                    source_unit,
+                    builder,
+                )?,
+                TimeUnit::Millisecond => append_timestamp::<TimestampMillisecondType>(
+                    field_value,
+                    column,
+                    source_unit,
+                    builder,
+                )?,
+                TimeUnit::Microsecond => append_timestamp::<TimestampMicrosecondType>(
+                    field_value,
+                    column,
+                    source_unit,
+                    builder,
+                )?,
+                TimeUnit::Nanosecond => append_timestamp::<TimestampNanosecondType>(
+                    field_value,
+                    column,
+                    source_unit,
+                    builder,
+                )?,
             }
-            (TimeUnit::Millisecond, None) => {
-                append_i64_to_builder::<i64, TimestampMillisecondType>(field_value, builder)?;
-            }
-            (TimeUnit::Microsecond, Some(_)) => {
-                let tz_builder = downcast_builder::<TimestampMicrosecondBuilder>(builder)?;
-                let time_micros = field_value
-                    .as_str()
-                    .map(|ts| {
-                        // ts is in the format "2024-06-26T02:12:51.219026Z"
-                        let parsed_timestamp: DateTime<Utc> =
-                            ts.parse().context(UnableToParseTimestampSnafu)?;
-                        Ok(parsed_timestamp.timestamp_micros())
-                    })
-                    .transpose()?;
-                tz_builder.append_option(time_micros);
-            }
-            (TimeUnit::Millisecond, Some(_)) => {
-                let tz_builder = downcast_builder::<TimestampMillisecondBuilder>(builder)?;
-                let time_millis = field_value
-                    .as_str()
-                    .map(|ts| {
-                        // ts is in the format "2024-06-26T02:12:51.219026Z"
-                        let parsed_timestamp: DateTime<Utc> =
-                            ts.parse().context(UnableToParseTimestampSnafu)?;
-                        Ok(parsed_timestamp.timestamp_millis())
-                    })
-                    .transpose()?;
-                tz_builder.append_option(time_millis);
-            }
-            _ => TimestampNotSupportedSnafu {
-                unit: *unit,
-                time_zone: time_zone.as_ref().map(|tz| tz.as_ref().to_string()),
-            }
-            .fail()?,
-        },
+        }
         DataType::Time64(TimeUnit::Microsecond) => {
             if field_value.is_string() {
                 let time_builder = downcast_builder::<Time64MicrosecondBuilder>(builder)?;
@@ -416,6 +442,82 @@ fn append_array_value_to_list_builder<T: ArrayBuilder>(
     list_builder.append(true);
 
     Ok(())
+}
+
+/// Appends a Debezium timestamp value to a `T` builder.
+///
+/// A string is an ISO 8601 instant (`io.debezium.time.ZonedTimestamp`, always
+/// in UTC). An integer counts from the Unix epoch in `source_unit`, the unit of
+/// its Debezium semantic type; without one it is taken to be in `T::UNIT`.
+fn append_timestamp<T: ArrowTimestampType>(
+    value: &Json,
+    column: &str,
+    source_unit: Option<TimeUnit>,
+    builder: &mut dyn ArrayBuilder,
+) -> Result<()> {
+    let invalid = || InvalidTimestampValueSnafu {
+        column,
+        value: value.clone(),
+    };
+    let converted = match value {
+        Json::Null => None,
+        Json::String(ts) => {
+            let ts: DateTime<Utc> = ts.parse().ok().with_context(invalid)?;
+            Some(
+                T::from_datetime(ts).with_context(|| TimestampOutOfRangeSnafu {
+                    column,
+                    value: value.clone(),
+                    unit: T::UNIT,
+                })?,
+            )
+        }
+        Json::Number(n) => {
+            let n = n.as_i64().with_context(invalid)?;
+            Some(
+                convert_time_unit(n, source_unit.unwrap_or(T::UNIT), T::UNIT).with_context(
+                    || TimestampOutOfRangeSnafu {
+                        column,
+                        value: value.clone(),
+                        unit: T::UNIT,
+                    },
+                )?,
+            )
+        }
+        _ => return invalid().fail(),
+    };
+    downcast_builder::<PrimitiveBuilder<T>>(builder)?.append_option(converted);
+    Ok(())
+}
+
+/// The unit of an integer-encoded Debezium timestamp semantic type.
+fn debezium_timestamp_unit(semantic_type: &str) -> Option<TimeUnit> {
+    match semantic_type {
+        "io.debezium.time.Timestamp" | "org.apache.kafka.connect.data.Timestamp" => {
+            Some(TimeUnit::Millisecond)
+        }
+        "io.debezium.time.MicroTimestamp" => Some(TimeUnit::Microsecond),
+        "io.debezium.time.NanoTimestamp" => Some(TimeUnit::Nanosecond),
+        _ => None,
+    }
+}
+
+/// Converts an epoch offset between units, rounding toward negative infinity
+/// like `chrono` does, and returning `None` on overflow.
+fn convert_time_unit(value: i64, from: TimeUnit, to: TimeUnit) -> Option<i64> {
+    const fn exponent(unit: TimeUnit) -> u32 {
+        match unit {
+            TimeUnit::Second => 0,
+            TimeUnit::Millisecond => 3,
+            TimeUnit::Microsecond => 6,
+            TimeUnit::Nanosecond => 9,
+        }
+    }
+    let (from, to) = (exponent(from), exponent(to));
+    if to >= from {
+        value.checked_mul(10_i64.pow(to - from))
+    } else {
+        Some(value.div_euclid(10_i64.pow(from - to)))
+    }
 }
 
 fn append_i64_to_builder<CastTo, T: ArrowPrimitiveType<Native = CastTo>>(
@@ -744,6 +846,218 @@ mod tests {
         assert_eq!(result.expect("number should be valid"), Some(1_234_500));
     }
 
+    /// Decodes `value` into a single `Timestamp(unit, time_zone)` column named
+    /// `at`, whose Debezium semantic type is `semantic_type` (`None` for a
+    /// schemaless event), and returns the column's raw epoch value.
+    fn decode_timestamp(
+        value: &Json,
+        unit: TimeUnit,
+        time_zone: Option<&str>,
+        semantic_type: Option<&str>,
+    ) -> Result<Option<i64>> {
+        use crate::arrow::struct_builder::StructBuilder;
+        use arrow::array::{Array, AsArray};
+
+        let data_type = DataType::Timestamp(unit, time_zone.map(Into::into));
+        let schema = Schema::new(vec![Field::new("at", data_type.clone(), true)]);
+        let source_fields = semantic_type.map(|name| {
+            vec![
+                serde_json::from_value::<ChangeEventField>(
+                    json!({"type": "int64", "optional": true, "name": name, "field": "at"}),
+                )
+                .expect("valid Debezium field"),
+            ]
+        });
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+        append_value_to_struct_builder(
+            json!({ "at": value }),
+            &mut builder,
+            source_fields.as_deref(),
+        )?;
+        let batch: RecordBatch = builder.finish().into();
+        assert_eq!(batch.column(0).data_type(), &data_type);
+        let raw = arrow::compute::cast(batch.column(0), &DataType::Int64).expect("cast to Int64");
+        let raw = raw.as_primitive::<Int64Type>();
+        Ok(raw.is_valid(0).then(|| raw.value(0)))
+    }
+
+    /// Every Debezium timestamp encoding decodes into every declared timestamp
+    /// unit, with or without a time zone. 2026-11-18T21:00:00.123456Z is
+    /// `1_795_035_600_123_456` microseconds after the Unix epoch.
+    #[test]
+    fn timestamps_decode_into_every_declared_unit() {
+        const ZONED: Option<&str> = Some("io.debezium.time.ZonedTimestamp");
+        const MILLIS: Option<&str> = Some("io.debezium.time.Timestamp");
+        const CONNECT_MILLIS: Option<&str> = Some("org.apache.kafka.connect.data.Timestamp");
+        const MICROS: Option<&str> = Some("io.debezium.time.MicroTimestamp");
+        const NANOS: Option<&str> = Some("io.debezium.time.NanoTimestamp");
+        let iso = json!("2026-11-18T21:00:00.123456Z");
+        let before_epoch = json!("1969-12-31T23:59:59.999999Z");
+        let micros = json!(1_795_035_600_123_456_i64);
+
+        let cases = [
+            (
+                &iso,
+                TimeUnit::Nanosecond,
+                Some("UTC"),
+                ZONED,
+                1_795_035_600_123_456_000,
+            ),
+            (
+                &iso,
+                TimeUnit::Nanosecond,
+                None,
+                ZONED,
+                1_795_035_600_123_456_000,
+            ),
+            (
+                &iso,
+                TimeUnit::Microsecond,
+                Some("UTC"),
+                ZONED,
+                1_795_035_600_123_456,
+            ),
+            (
+                &iso,
+                TimeUnit::Millisecond,
+                Some("UTC"),
+                ZONED,
+                1_795_035_600_123,
+            ),
+            (&iso, TimeUnit::Second, Some("UTC"), ZONED, 1_795_035_600),
+            (&iso, TimeUnit::Second, None, None, 1_795_035_600),
+            (
+                &json!("2026-11-18T23:00:00+02:00"),
+                TimeUnit::Second,
+                Some("UTC"),
+                ZONED,
+                1_795_035_600,
+            ),
+            // Sub-unit precision rounds toward negative infinity, before the epoch too.
+            (
+                &before_epoch,
+                TimeUnit::Nanosecond,
+                Some("UTC"),
+                ZONED,
+                -1_000,
+            ),
+            (&before_epoch, TimeUnit::Millisecond, Some("UTC"), ZONED, -1),
+            (&before_epoch, TimeUnit::Second, None, ZONED, -1),
+            (
+                &micros,
+                TimeUnit::Nanosecond,
+                None,
+                MICROS,
+                1_795_035_600_123_456_000,
+            ),
+            (
+                &micros,
+                TimeUnit::Microsecond,
+                None,
+                MICROS,
+                1_795_035_600_123_456,
+            ),
+            (
+                &micros,
+                TimeUnit::Millisecond,
+                Some("UTC"),
+                MICROS,
+                1_795_035_600_123,
+            ),
+            (&micros, TimeUnit::Second, None, MICROS, 1_795_035_600),
+            (&json!(-1), TimeUnit::Millisecond, None, MICROS, -1),
+            (&json!(-1), TimeUnit::Nanosecond, None, MICROS, -1_000),
+            (
+                &json!(1_795_035_600_123_i64),
+                TimeUnit::Nanosecond,
+                None,
+                MILLIS,
+                1_795_035_600_123_000_000,
+            ),
+            (
+                &json!(1_795_035_600_123_i64),
+                TimeUnit::Microsecond,
+                None,
+                CONNECT_MILLIS,
+                1_795_035_600_123_000,
+            ),
+            (
+                &json!(1_795_035_600_123_456_789_i64),
+                TimeUnit::Microsecond,
+                None,
+                NANOS,
+                1_795_035_600_123_456,
+            ),
+            // Without a known semantic type, an integer is in the column's own unit.
+            (
+                &micros,
+                TimeUnit::Microsecond,
+                None,
+                None,
+                1_795_035_600_123_456,
+            ),
+            (
+                &json!(1_795_035_600_123_i64),
+                TimeUnit::Millisecond,
+                None,
+                Some("io.debezium.time.Date"),
+                1_795_035_600_123,
+            ),
+        ];
+
+        for (value, unit, time_zone, semantic_type, expected) in cases {
+            let case = format!("{value} {semantic_type:?} into Timestamp({unit:?}, {time_zone:?})");
+            let decoded = decode_timestamp(value, unit, time_zone, semantic_type)
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert_eq!(decoded, Some(expected), "{case}");
+        }
+
+        assert_eq!(
+            decode_timestamp(&Json::Null, TimeUnit::Nanosecond, Some("UTC"), ZONED)
+                .expect("NULL decodes"),
+            None
+        );
+    }
+
+    /// A value the column cannot hold fails the change event and names the
+    /// column, instead of loading a NULL or a wrapped value.
+    #[test]
+    fn timestamps_outside_the_declared_type_fail() {
+        const MICROS: Option<&str> = Some("io.debezium.time.MicroTimestamp");
+        let out_of_range = |value: &str| {
+            format!(
+                "Failed to ingest a change event: the value {value} of column 'at' is outside the range of its type Timestamp(Nanosecond). Declare the column with a coarser unit, such as `Timestamp(Microsecond, UTC)`. See: https://spiceai.org/docs/components/data-connectors/debezium"
+            )
+        };
+        let not_a_timestamp = |value: &str| {
+            format!(
+                "Failed to ingest a change event: the value {value} of column 'at' is not a timestamp. Expected an ISO 8601 string or an integer. See: https://spiceai.org/docs/components/data-connectors/debezium"
+            )
+        };
+        let cases = [
+            (
+                json!("2262-04-12T00:00:00Z"),
+                None,
+                out_of_range("\"2262-04-12T00:00:00Z\""),
+            ),
+            (
+                json!(9_300_000_000_000_000_i64),
+                MICROS,
+                out_of_range("9300000000000000"),
+            ),
+            (json!("infinity"), None, not_a_timestamp("\"infinity\"")),
+            (json!(1.5), MICROS, not_a_timestamp("1.5")),
+            (json!(true), None, not_a_timestamp("true")),
+        ];
+
+        for (value, semantic_type, expected) in cases {
+            let err = decode_timestamp(&value, TimeUnit::Nanosecond, Some("UTC"), semantic_type)
+                .expect_err(&format!("{value} must not decode"));
+            assert_eq!(err.to_string(), expected, "{value}");
+        }
+    }
+
     #[test]
     fn test_append_value_missing_nullable_field_fills_null() {
         use crate::arrow::struct_builder::StructBuilder;
@@ -759,7 +1073,7 @@ mod tests {
 
         // Message is missing the nullable "name" field
         let value = json!({"id": 42});
-        let result = append_value_to_struct_builder(value, &mut builder);
+        let result = append_value_to_struct_builder(value, &mut builder, None);
         assert!(
             result.is_ok(),
             "Should succeed when nullable field is missing"
@@ -799,7 +1113,7 @@ mod tests {
 
         // Message is missing the required "status" field
         let value = json!({"id": 42});
-        let err = append_value_to_struct_builder(value, &mut builder)
+        let err = append_value_to_struct_builder(value, &mut builder, None)
             .expect_err("Should fail when required field is missing");
         assert!(
             matches!(
@@ -822,7 +1136,7 @@ mod tests {
 
         // Message has extra field "removed_column" not in schema
         let value = json!({"id": 42, "removed_column": "old_value"});
-        let result = append_value_to_struct_builder(value, &mut builder);
+        let result = append_value_to_struct_builder(value, &mut builder, None);
         assert!(result.is_ok(), "Extra fields in message should be ignored");
 
         let struct_array = builder.finish();
@@ -848,12 +1162,12 @@ mod tests {
 
         // Old message with only "id" (before schema evolution)
         let old_value = json!({"id": 1});
-        append_value_to_struct_builder(old_value, &mut builder)
+        append_value_to_struct_builder(old_value, &mut builder, None)
             .expect("old message should process successfully");
 
         // New message with all fields
         let new_value = json!({"id": 2, "name": "Alice", "age": 30, "active": true});
-        append_value_to_struct_builder(new_value, &mut builder)
+        append_value_to_struct_builder(new_value, &mut builder, None)
             .expect("new message should process successfully");
 
         let struct_array = builder.finish();
