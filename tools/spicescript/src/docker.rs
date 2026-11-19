@@ -141,22 +141,6 @@ impl Container {
             .await
             .context("Docker did not answer; start Docker (or OrbStack) and retry")?;
         pull_if_missing(&docker, &spec.image).await?;
-        if let Some(network) = spec.network.as_ref().filter(|n| !is_shared_network(n))
-            && docker
-                .inspect_network::<String>(network, None)
-                .await
-                .is_err()
-        {
-            let pid = std::process::id().to_string();
-            docker
-                .create_network(bollard::network::CreateNetworkOptions {
-                    name: network.as_str(),
-                    labels: HashMap::from([(RUNNER_LABEL, pid.as_str())]),
-                    ..Default::default()
-                })
-                .await
-                .with_context(|| format!("Failed to create network {network}"))?;
-        }
 
         let also = also_publish_on();
         let mut ports = HashMap::new();
@@ -214,70 +198,108 @@ impl Container {
             }),
             ..Default::default()
         };
-        // A container left behind by an interrupted run would hold the name.
-        let _ = docker
-            .remove_container(
-                &spec.name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        let (created_id, name) = create_or_adopt(
-            CREATE_ATTEMPTS,
-            CREATE_RETRY_PAUSE,
-            &spec.name,
-            |name| {
-                let docker = &docker;
-                let mut config = config.clone();
-                // Under another name, keep the original as an alias on the
-                // container's network, so its peers still find it by it.
-                let aliases: Vec<String> = (name != spec.name)
-                    .then(|| spec.name.clone())
-                    .into_iter()
-                    .chain(spec.alias.clone())
-                    .collect();
-                if !aliases.is_empty()
-                    && let Some(network) = spec.network.as_deref().filter(|n| !is_shared_network(n))
+        // Creating the network and the container runs to its end in a task of
+        // its own, so that a caller that stops waiting (a combination whose
+        // other source failed to start drops this future) cannot leave a
+        // container the daemon created but nothing tracks. If the caller is
+        // gone by the time it is created, the task removes it.
+        let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+        let task_docker = docker.clone();
+        let task_spec = spec.clone();
+        tokio::spawn(async move {
+            let (docker, spec) = (&task_docker, &task_spec);
+            let created = async {
+                if let Some(network) = spec.network.as_ref().filter(|n| !is_shared_network(n))
+                    && docker
+                        .inspect_network::<String>(network, None)
+                        .await
+                        .is_err()
                 {
-                    config.networking_config = Some(NetworkingConfig {
-                        endpoints_config: HashMap::from([(
-                            network.to_string(),
-                            EndpointSettings {
-                                aliases: Some(aliases),
-                                ..Default::default()
-                            },
-                        )]),
-                    });
-                }
-                async move {
+                    let pid = std::process::id().to_string();
                     docker
-                        .create_container(
-                            Some(CreateContainerOptions {
-                                name: name.as_str(),
-                                platform: None,
-                            }),
-                            config,
-                        )
+                        .create_network(bollard::network::CreateNetworkOptions {
+                            name: network.as_str(),
+                            labels: HashMap::from([(RUNNER_LABEL, pid.as_str())]),
+                            ..Default::default()
+                        })
                         .await
-                        .map(|created| created.id)
+                        .with_context(|| format!("Failed to create network {network}"))?;
                 }
-            },
-            |holder| {
-                let docker = &docker;
-                async move {
-                    docker
-                        .inspect_container(&holder, None)
-                        .await
-                        .map(|found| found.id.unwrap_or(holder))
-                }
-            },
-        )
-        .await
-        .with_context(|| format!("Failed to create container {}", spec.name))?;
-        crate::cleanup::track_container(&created_id, &name, spec.network.as_deref());
+                // A container left behind by an interrupted run would hold the name.
+                let _ = docker
+                    .remove_container(
+                        &spec.name,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            v: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                let (created_id, name) = create_or_adopt(
+                    CREATE_ATTEMPTS,
+                    CREATE_RETRY_PAUSE,
+                    &spec.name,
+                    |name| {
+                        let mut config = config.clone();
+                        // Under another name, keep the original as an alias on the
+                        // container's network, so its peers still find it by it.
+                        let aliases: Vec<String> = (name != spec.name)
+                            .then(|| spec.name.clone())
+                            .into_iter()
+                            .chain(spec.alias.clone())
+                            .collect();
+                        if !aliases.is_empty()
+                            && let Some(network) =
+                                spec.network.as_deref().filter(|n| !is_shared_network(n))
+                        {
+                            config.networking_config = Some(NetworkingConfig {
+                                endpoints_config: HashMap::from([(
+                                    network.to_string(),
+                                    EndpointSettings {
+                                        aliases: Some(aliases),
+                                        ..Default::default()
+                                    },
+                                )]),
+                            });
+                        }
+                        async move {
+                            docker
+                                .create_container(
+                                    Some(CreateContainerOptions {
+                                        name: name.as_str(),
+                                        platform: None,
+                                    }),
+                                    config,
+                                )
+                                .await
+                                .map(|created| created.id)
+                        }
+                    },
+                    |holder| async move {
+                        docker
+                            .inspect_container(&holder, None)
+                            .await
+                            .map(|found| found.id.unwrap_or(holder))
+                    },
+                )
+                .await
+                .with_context(|| format!("Failed to create container {}", spec.name))?;
+                crate::cleanup::track_container(&created_id, &name, spec.network.as_deref());
+                Ok::<_, anyhow::Error>((created_id, name))
+            }
+            .await;
+            if let Err(Ok((created_id, _))) = created_tx.send(created) {
+                // Synchronous `docker rm`, as in `Drop`.
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::cleanup::remove_if_tracked(&created_id);
+                })
+                .await;
+            }
+        });
+        let (created_id, name) = created_rx
+            .await
+            .context("the task creating the container ended without an answer")??;
         let container = Self {
             docker,
             id: created_id,
