@@ -2008,6 +2008,8 @@ impl DataFusion {
         catalog: Arc<dyn CatalogProvider>,
     ) -> Result<()> {
         if let Some(deferred_catalog) = catalog.downcast_ref::<DeferredCatalogProvider>() {
+            // A deferred catalog gets its access when it loads.
+            self.restrict_catalog_access(name, &AccessMode::Read)?;
             self.deferred_catalogs
                 .write()
                 .await
@@ -2021,12 +2023,7 @@ impl DataFusion {
             };
 
             self.ctx.register_catalog(name, catalog_to_register);
-
-            if access.allows_ddl() {
-                self.mark_catalog_ddl_enabled(name)?;
-            } else if access.allows_write() {
-                self.mark_catalog_writable(name)?;
-            }
+            self.set_catalog_access(name, access)?;
         }
 
         Ok(())
@@ -2257,6 +2254,36 @@ impl DataFusion {
             .write()
             .map_err(|_| Error::UnableToLockWritableCatalogs {})?
             .insert(catalog_name.to_string());
+        Ok(())
+    }
+
+    /// Makes a registered catalog writable, DDL-enabled or neither, as `access` allows,
+    /// replacing the access an earlier registration under the same name allowed.
+    pub fn set_catalog_access(&self, catalog_name: &str, access: &AccessMode) -> Result<()> {
+        self.restrict_catalog_access(catalog_name, access)?;
+        if access.allows_ddl() {
+            self.mark_catalog_ddl_enabled(catalog_name)
+        } else if access.allows_write() {
+            self.mark_catalog_writable(catalog_name)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Withdraws the write and DDL access that `access` does not allow from a catalog.
+    pub fn restrict_catalog_access(&self, catalog_name: &str, access: &AccessMode) -> Result<()> {
+        if !access.allows_ddl() {
+            self.ddl_enabled_catalogs
+                .write()
+                .map_err(|_| Error::UnableToLockDdlEnabledCatalogs {})?
+                .remove(catalog_name);
+        }
+        if !access.allows_write() {
+            self.writable_catalogs
+                .write()
+                .map_err(|_| Error::UnableToLockWritableCatalogs {})?
+                .remove(catalog_name);
+        }
         Ok(())
     }
 
@@ -3139,11 +3166,7 @@ impl DataFusion {
         if let Some(catalog) = deferred_catalogs.get(name) {
             if let Ok(provider) = catalog.get_catalog_provider().await {
                 self.ctx.register_catalog(name, Arc::clone(&provider));
-                if access.allows_ddl() {
-                    self.mark_catalog_ddl_enabled(name)?;
-                } else if access.allows_write() {
-                    self.mark_catalog_writable(name)?;
-                }
+                self.set_catalog_access(name, access)?;
             }
 
             drop(deferred_catalogs);

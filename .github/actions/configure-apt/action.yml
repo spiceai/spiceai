@@ -28,13 +28,20 @@ runs:
         Acquire::ForceIPv4 "true";
         EOF
 
-        # GitHub-hosted Ubuntu runner images can include the git-core PPA.
-        # It is not needed for CI and can make apt update fail when Launchpad
-        # times out.
+        # Runner images can include third-party apt sources that CI never
+        # installs from: the git-core PPA and the GitHub CLI repository
+        # (gh is already on the image). apt-get update fetches every source's
+        # index, so one of them timing out or caught mid-sync ("File has
+        # unexpected size ... Mirror sync in progress?") fails the whole
+        # update with exit 100. A step that does need gh from apt adds the
+        # GitHub CLI source itself right before it installs, after this runs.
         if [ -d /etc/apt/sources.list.d ]; then
           while IFS= read -r -d '' SOURCE_FILE; do
             if sudo grep -Eq 'ppa\.launchpadcontent\.net/git-core/ppa|git-core/ppa' "${SOURCE_FILE}"; then
               echo "Removing git-core PPA apt source: ${SOURCE_FILE}"
+              sudo rm -f "${SOURCE_FILE}"
+            elif sudo grep -Eq '^[^#]*cli\.github\.com/packages' "${SOURCE_FILE}"; then
+              echo "Removing GitHub CLI apt source: ${SOURCE_FILE}"
               sudo rm -f "${SOURCE_FILE}"
             fi
           done < <(
