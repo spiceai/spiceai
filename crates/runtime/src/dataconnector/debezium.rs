@@ -682,7 +682,7 @@ async fn get_metadata_from_kafka(
         })?;
 
     // Sample the schema with a temporary consumer. The real consumer is not polled
-    // here: it starts every partition at the beginning on its first assignment.
+    // here: it starts each partition at the beginning when it is assigned.
     let (key, value) = if schema_evolution {
         fetch_latest_change_event(dataset, topic, kafka_config).await?
     } else {
