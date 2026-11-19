@@ -22,7 +22,9 @@ spicepod:
     auth:
       api-key:
         enabled: true
-        keys: [tool-key]
+        # An MCP tool is read-write unless declared read-only, so calling `big__numbers` needs a
+        # read-write key.
+        keys: ['tool-key:rw']
     caching:
       sql_results:
         item_ttl: 10m

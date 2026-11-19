@@ -290,3 +290,69 @@ mod sigv4_signing {
         );
     }
 }
+
+/// Guards the `spiceai/iceberg-rust` fork patch that leaves a successful response's
+/// body out of the error raised when it cannot be parsed. A `loadTable` answer vends
+/// storage credentials in its `config`, and this error becomes the dataset status
+/// and the log line. `docs/dev/fork_patches.md` is the ledger this guard is named in.
+#[cfg(test)]
+mod response_errors {
+    use std::collections::HashMap;
+
+    use iceberg::{Catalog as _, CatalogBuilder, TableIdent};
+    use iceberg_catalog_rest::RestCatalogBuilder;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::RestCatalog;
+
+    const VENDED: &str = "vended-credential-marker";
+
+    #[tokio::test]
+    async fn a_load_table_answer_that_fails_to_parse_leaves_its_credentials_out_of_the_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {},
+                "overrides": {},
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables/t"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata-location": "s3://bucket/t/metadata/00000.metadata.json",
+                "metadata": { "format-version": 9 },
+                "config": {
+                    "s3.access-key-id": VENDED,
+                    "s3.secret-access-key": VENDED,
+                    "s3.session-token": VENDED,
+                },
+            })))
+            .mount(&server)
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogBuilder::default()
+                .load("rest", HashMap::from([("uri".to_string(), server.uri())]))
+                .await
+                .expect("the REST catalog is configured"),
+        );
+
+        let err = catalog
+            .load_table(&TableIdent::from_strs(["ns", "t"]).expect("a valid table identifier"))
+            .await
+            .expect_err("metadata with an unknown format version does not parse");
+
+        for shown in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !shown.contains(VENDED),
+                "the error repeats the vended credentials: {shown}"
+            );
+            assert!(
+                shown.contains("Failed to parse response from rest catalog server"),
+                "the error no longer says what failed: {shown}"
+            );
+        }
+    }
+}

@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 use snafu::ResultExt;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 
 pub struct GetCurrentDateTimeTool {
     name: String,
@@ -52,7 +52,12 @@ impl SpiceModelTool for GetCurrentDateTimeTool {
         None
     }
 
-    async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Reads the clock.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::get_current_datetime", tool = self.name().to_string());
         let datetime = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let value = Value::String(datetime);
