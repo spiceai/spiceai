@@ -27,7 +27,7 @@ use bytes::Bytes;
 use h2::server::SendResponse;
 use rstest::rstest;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
@@ -48,6 +48,12 @@ enum Connection {
     RefuseFirstStream,
     /// Completes TLS and HTTP/2, reads a request whole, and closes without answering.
     CloseAfterRequest,
+    /// Completes TLS and, when the first request's `HEADERS` arrive, sends a graceful `GOAWAY`
+    /// (`NO_ERROR`) whose last stream ID is 0: the server processed no stream.
+    GoAwayBeforeStream,
+    /// Completes TLS and HTTP/2, reads a request whole, then sends a graceful `GOAWAY`
+    /// (`NO_ERROR`) whose last stream ID covers that request, and closes without answering.
+    GoAwayAfterRequest,
 }
 
 /// What reached the server.
@@ -167,13 +173,61 @@ async fn handle(
             read_client_hello(&mut stream).await;
             stream.set_zero_linger().expect("a zero linger");
         }
-        Connection::Serve | Connection::RefuseFirstStream | Connection::CloseAfterRequest => {
+        Connection::GoAwayBeforeStream => {
+            if let Ok(tls) = acceptor.accept(stream).await {
+                go_away_before_any_stream(tls).await;
+            }
+        }
+        Connection::Serve
+        | Connection::RefuseFirstStream
+        | Connection::CloseAfterRequest
+        | Connection::GoAwayAfterRequest => {
             // A client that does not trust the certificate ends the handshake here.
             if let Ok(tls) = acceptor.accept(stream).await {
                 serve(tls, behavior, &counts).await;
             }
         }
     }
+}
+
+/// Speaks HTTP/2 frames directly, because `h2`'s server cannot send a `GOAWAY` whose last
+/// stream ID is below a stream it has already read: it sends its own `SETTINGS`, reads the
+/// client's frames up to the first `HEADERS`, answers with `GOAWAY` (last stream ID 0,
+/// `NO_ERROR`), and reads until the client closes, so the connection ends with a FIN.
+async fn go_away_before_any_stream(mut tls: TlsStream<TcpStream>) {
+    const SETTINGS: [u8; 9] = [0, 0, 0, 0x4, 0, 0, 0, 0, 0];
+    const HEADERS: u8 = 0x1;
+    #[rustfmt::skip]
+    const GOAWAY_NO_STREAM: [u8; 17] = [
+        0, 0, 8, 0x7, 0, 0, 0, 0, 0, // an 8-byte GOAWAY frame on stream 0
+        0, 0, 0, 0, // last stream ID: 0
+        0, 0, 0, 0, // error code: NO_ERROR
+    ];
+
+    let mut preface = [0_u8; 24];
+    if tls.read_exact(&mut preface).await.is_err() || tls.write_all(&SETTINGS).await.is_err() {
+        return;
+    }
+    loop {
+        let mut header = [0_u8; 9];
+        if tls.read_exact(&mut header).await.is_err() {
+            return;
+        }
+        let length =
+            usize::from(header[0]) << 16 | usize::from(header[1]) << 8 | usize::from(header[2]);
+        let mut payload = vec![0_u8; length];
+        if tls.read_exact(&mut payload).await.is_err() {
+            return;
+        }
+        if header[3] == HEADERS {
+            break;
+        }
+    }
+    if tls.write_all(&GOAWAY_NO_STREAM).await.is_err() || tls.flush().await.is_err() {
+        return;
+    }
+    let mut rest = Vec::new();
+    let _ = tls.read_to_end(&mut rest).await;
 }
 
 /// Reads the first TLS record whole, so the connection closes with nothing left unread: a
@@ -216,7 +270,10 @@ async fn serve(tls: TlsStream<TcpStream>, behavior: Connection, counts: &Counts)
                     while let Some(Ok(chunk)) = body.data().await {
                         let _ = body.flow_control().release_capacity(chunk.len());
                     }
-                    if behavior == Connection::CloseAfterRequest {
+                    if matches!(
+                        behavior,
+                        Connection::CloseAfterRequest | Connection::GoAwayAfterRequest
+                    ) {
                         let _ = unanswered_tx.send(respond);
                         return;
                     }
@@ -229,7 +286,17 @@ async fn serve(tls: TlsStream<TcpStream>, behavior: Connection, counts: &Counts)
                     }
                 });
             }
-            Some(_unanswered) = unanswered_rx.recv() => return,
+            Some(unanswered) = unanswered_rx.recv() => {
+                if behavior == Connection::GoAwayAfterRequest {
+                    // The `GOAWAY` names the last stream the server read, this one. Polling
+                    // the connection sends it and then closes the connection. The stream is
+                    // held open meanwhile, so it ends with the connection, not with a reset.
+                    connection.abrupt_shutdown(h2::Reason::NO_ERROR);
+                    while connection.accept().await.is_some() {}
+                    drop(unanswered);
+                }
+                return;
+            }
         }
     }
 }
@@ -327,5 +394,42 @@ async fn a_stream_the_server_refused_is_sent_again() {
         server.counts(),
         [1, 2],
         "one connection carried the refused stream and the answered one"
+    );
+}
+
+/// A graceful `GOAWAY` whose last stream ID is below the request's stream says the server did
+/// not process that stream (RFC 9113, section 6.8), so the request is sent again on a new
+/// connection. `reqwest` retries this by default; this checks the policy keeps that retry.
+#[tokio::test]
+async fn a_stream_after_a_graceful_goaway_is_sent_again() {
+    let server = Server::start(Some(Connection::GoAwayBeforeStream), Connection::Serve).await;
+
+    let answer = server.send(&server.client()).await;
+
+    assert_eq!(answer.as_deref().ok(), Some(ANSWER), "{answer:?}");
+    assert_eq!(
+        server.counts(),
+        [2, 1],
+        "the first connection processed no stream and the second answered the request"
+    );
+}
+
+/// A graceful `GOAWAY` whose last stream ID covers the request says the server may have
+/// processed it, so when the connection then closes without an answer, the request is not sent
+/// again.
+#[tokio::test]
+async fn a_stream_a_graceful_goaway_covers_is_not_sent_again() {
+    let server = Server::start(Some(Connection::GoAwayAfterRequest), Connection::Serve).await;
+
+    let error = server
+        .send(&server.client())
+        .await
+        .expect_err("the server closed the connection without answering");
+
+    assert!(!error.is_connect(), "{error:?}");
+    assert_eq!(
+        server.counts(),
+        [1, 1],
+        "the request was sent once: {error:?}"
     );
 }
