@@ -520,7 +520,9 @@ impl JobExecutor {
         Ok(state)
     }
 
-    /// The queries among `job_ids` whose job records are final, with the results they keep.
+    /// The queries among `job_ids` whose job records, read from the job store, are final, with
+    /// the results they keep. A record that is missing, cannot be read, or is not final keeps its
+    /// slot.
     async fn finished_among(&self, job_ids: &[String]) -> Vec<(String, Option<StoredEntry>)> {
         let states = futures::future::join_all(
             job_ids
@@ -528,14 +530,18 @@ impl JobExecutor {
                 .map(|job_id| self.job_store.get_job_ignoring_expiry(job_id)),
         )
         .await;
-        states
-            .into_iter()
-            .filter_map(|state| match state {
-                Ok(state) if state.is_terminal() => {
-                    let stored = stored_entry(&state);
-                    Some((state.job_id, stored))
+        job_ids
+            .iter()
+            .zip(states)
+            .filter_map(|(job_id, state)| match state {
+                Ok(state) if state.is_terminal() && state.job_id == *job_id => {
+                    Some((job_id.clone(), stored_entry(&state)))
                 }
-                _ => None,
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::debug!(job_id, "Failed to read a running async query's state: {e}");
+                    None
+                }
             })
             .collect()
     }
@@ -2224,5 +2230,322 @@ mod tests {
             ledger.running
         );
         assert_eq!(ledger.pending.len(), 0);
+    }
+
+    /// An in-memory object store that counts attempted writes of caller ledgers and refuses
+    /// every read of objects whose path contains `unreadable`.
+    #[derive(Debug, Default)]
+    struct ObservedStore {
+        inner: InMemory,
+        ledger_writes: std::sync::atomic::AtomicUsize,
+        unreadable: Option<String>,
+    }
+
+    impl std::fmt::Display for ObservedStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ObservedStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for ObservedStore {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if let Some(unreadable) = &self.unreadable
+                && location.as_ref().contains(unreadable.as_str())
+            {
+                return Err(object_store::Error::Generic {
+                    store: "ObservedStore",
+                    source: "injected read failure".into(),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().contains("/owners/") {
+                self.ledger_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    const TWO_SLOTS: JobLimits = JobLimits {
+        running: 2,
+        pending: 0,
+        stored_bytes: u64::MAX,
+    };
+
+    /// A job that ran under `job_store` and succeeded with a result of `bytes`.
+    async fn succeeded_job(job_store: &JobStore, bytes: usize) -> (String, StoredEntry) {
+        let job_id = seed_job(job_store, OWNER).await;
+        let driver = job_store
+            .set_job_running(&job_id)
+            .await
+            .expect("started")
+            .driver()
+            .expect("a running job has a driver");
+        let done = job_store
+            .complete_job(
+                &job_id,
+                &driver,
+                JobResult {
+                    manifest: super::super::state::JobResultManifest {
+                        format: "ARROW_IPC".to_string(),
+                        schema: super::super::state::JobSchema {
+                            column_count: 0,
+                            columns: vec![],
+                        },
+                        total_row_count: 0,
+                        total_chunk_count: 0,
+                        total_byte_count: bytes,
+                    },
+                    chunk_indices: vec![],
+                    chunk_row_offsets: vec![],
+                },
+            )
+            .await
+            .expect("completed");
+        let stored = stored_entry(&done).expect("a succeeded job keeps its result");
+        (job_id, stored)
+    }
+
+    /// A job that `job_store` started and that is still running.
+    async fn running_job(job_store: &JobStore) -> String {
+        let job_id = seed_job(job_store, OWNER).await;
+        job_store.set_job_running(&job_id).await.expect("started");
+        job_id
+    }
+
+    /// Admits `job_ids` to `OWNER`'s two running slots, on scheduler `node-a`.
+    async fn admit_on_a(job_store: &JobStore, job_ids: &[&str]) {
+        job_store
+            .modify_ledger(OWNER, |ledger| {
+                let mut changed = false;
+                for job_id in job_ids {
+                    changed |= ledger.admit(job_id, "node-a", TWO_SLOTS, 0) == Ok(Admission::Run);
+                }
+                ((), changed)
+            })
+            .await
+            .expect("admitted");
+    }
+
+    fn running_of(ledger: &super::super::ledger::Ledger) -> Vec<&str> {
+        ledger.running.keys().map(String::as_str).collect()
+    }
+
+    /// The recheck releases a finished query's slot, and the finishing scheduler's own
+    /// release, landing later, changes nothing: the slot is freed once, the other running
+    /// query keeps its slot, and the result's bytes are counted once.
+    #[tokio::test]
+    async fn recheck_then_release_frees_a_finished_slot_once() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
+        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
+        let (finished, stored) = succeeded_job(&store_a, 10).await;
+        let running = running_job(&store_a).await;
+        admit_on_a(&store_a, &[&finished, &running]).await;
+        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
+
+        let next = scheduler_b
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("admitted after the recheck");
+        let mut expected = vec![running.as_str(), next.job_id.as_str()];
+        expected.sort_unstable();
+        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
+        assert_eq!(running_of(&ledger), expected);
+        assert_eq!(ledger.stored_bytes(), 10);
+
+        // The finishing scheduler's own release, folded into its next write, lands late.
+        store_a.queue_release(OWNER, &finished, Some(stored));
+        store_a
+            .modify_ledger(OWNER, |_| ((), false))
+            .await
+            .expect("written");
+        let ledger = store_a.read_ledger(OWNER).await.expect("ledger");
+        assert_eq!(running_of(&ledger), expected);
+        assert_eq!(ledger.stored_bytes(), 10);
+        assert!(!store_a.has_queued_releases(OWNER));
+    }
+
+    /// The finishing scheduler's release lands first; a recheck that saw the slot taken
+    /// before then changes nothing more for it.
+    #[tokio::test]
+    async fn release_then_recheck_frees_a_finished_slot_once() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
+        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
+        let (finished, stored) = succeeded_job(&store_a, 10).await;
+        let running = running_job(&store_a).await;
+        admit_on_a(&store_a, &[&finished, &running]).await;
+        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
+
+        store_a
+            .modify_ledger(OWNER, |ledger| ((), ledger.finish(&finished, Some(stored))))
+            .await
+            .expect("released");
+        let taken = vec![finished.clone(), running.clone()];
+        let admission = scheduler_b
+            .readmit_after_finished(OWNER, "late", &taken, now_ms_or_zero())
+            .await;
+
+        assert_eq!(admission, Some(Ok(Admission::Run)));
+        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
+        let mut expected = vec![running.as_str(), "late"];
+        expected.sort_unstable();
+        assert_eq!(running_of(&ledger), expected);
+        assert_eq!(ledger.stored_bytes(), 10);
+    }
+
+    /// The recheck's write is refused once, because the finishing scheduler's release landed
+    /// after the recheck's scheduler last wrote the ledger; the retry, on a fresh read, frees
+    /// nothing more.
+    #[tokio::test]
+    async fn a_recheck_retried_after_a_conflict_frees_a_finished_slot_once() {
+        let observed = Arc::new(ObservedStore::default());
+        let store: Arc<dyn object_store::ObjectStore> = Arc::clone(&observed) as _;
+        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
+        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
+        let (finished, stored) = succeeded_job(&store_a, 10).await;
+        let running = running_job(&store_a).await;
+        // Scheduler B writes the ledger last, so it holds that version.
+        admit_on_a(&store_b, &[&finished, &running]).await;
+        store_a
+            .modify_ledger(OWNER, |ledger| ((), ledger.finish(&finished, Some(stored))))
+            .await
+            .expect("released");
+        let writes_before = observed
+            .ledger_writes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
+
+        let taken = vec![finished.clone(), running.clone()];
+        let admission = scheduler_b
+            .readmit_after_finished(OWNER, "late", &taken, now_ms_or_zero())
+            .await;
+
+        assert_eq!(admission, Some(Ok(Admission::Run)));
+        // One write refused at the stale version, one landed after the fresh read.
+        assert_eq!(
+            observed
+                .ledger_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+                - writes_before,
+            2
+        );
+        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
+        let mut expected = vec![running.as_str(), "late"];
+        expected.sort_unstable();
+        assert_eq!(running_of(&ledger), expected);
+        assert_eq!(ledger.stored_bytes(), 10);
+    }
+
+    /// The recheck frees only slots whose job records are final: a missing record or one that
+    /// is not final keeps its slot, and the submission is refused as usual.
+    #[tokio::test]
+    async fn the_recheck_keeps_slots_whose_records_are_missing_or_not_final() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
+        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
+        let running = running_job(&store_a).await;
+        admit_on_a(&store_a, &["no-record", &running]).await;
+        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
+
+        let error = scheduler_b
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect_err("both slots stay taken");
+
+        assert!(
+            matches!(error, Error::QueueFull { pending: 0 }),
+            "{error:?}"
+        );
+        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
+        let mut expected = vec!["no-record", running.as_str()];
+        expected.sort_unstable();
+        assert_eq!(running_of(&ledger), expected);
+    }
+
+    /// A job record that cannot be read, or does not parse, keeps its slot: the read error
+    /// leads to the usual refusal, never to an admission.
+    #[tokio::test]
+    async fn the_recheck_keeps_slots_whose_records_cannot_be_read() {
+        use object_store::ObjectStoreExt;
+        let unreadable = "unreadable-job";
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(ObservedStore {
+            unreadable: Some(unreadable.to_string()),
+            ..ObservedStore::default()
+        });
+        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
+        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
+        store
+            .put(
+                &object_store::path::Path::from("test/jobs/corrupt-job.json"),
+                object_store::PutPayload::from_static(b"{\"status\": "),
+            )
+            .await
+            .expect("written");
+        admit_on_a(&store_a, &[unreadable, "corrupt-job"]).await;
+        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
+
+        let error = scheduler_b
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect_err("both slots stay taken");
+
+        assert!(
+            matches!(error, Error::QueueFull { pending: 0 }),
+            "{error:?}"
+        );
+        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
+        assert_eq!(running_of(&ledger), vec!["corrupt-job", unreadable]);
     }
 }
