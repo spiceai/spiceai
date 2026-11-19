@@ -40,7 +40,7 @@ steps:
     expect: { rows: [['1', 'a'], ['2', 'b'], ['3', null]] }
   - assert-files: { contains: ['cayenne\.db$'] }
     only: sqlite
-  - assert-files: { contains: ['object_native/catalog/head$'], lacks: ['cayenne\.db$'] }
+  - assert-files: { contains: ['cayenne/v1/catalog/head$'], lacks: ['cayenne\.db$'] }
     only: object-native
 
   # The source changes while spiced is stopped. A start that finds the
