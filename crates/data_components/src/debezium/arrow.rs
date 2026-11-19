@@ -206,6 +206,18 @@ pub fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Resul
     Ok(struct_builder.finish())
 }
 
+/// Whether decoding into `schema` needs the Debezium semantic types of the
+/// event's fields: only integer timestamps in second or nanosecond columns do.
+#[must_use]
+pub(crate) fn reads_source_timestamp_units(schema: &Schema) -> bool {
+    schema.fields().iter().any(|f| {
+        matches!(
+            f.data_type(),
+            DataType::Timestamp(TimeUnit::Second | TimeUnit::Nanosecond, _)
+        )
+    })
+}
+
 /// Appends one row to `builder`. `source_fields` is the row schema embedded in
 /// the change event, if any; it gives the unit of integer-encoded timestamps.
 pub fn append_value_to_struct_builder(
@@ -231,10 +243,16 @@ pub fn append_value_to_struct_builder(
             }
         };
 
-        // Only integer timestamps need their Debezium semantic type. Debezium
-        // lists the row's fields in table order, so try the same position first.
+        // Only integer timestamps in second or nanosecond columns need their
+        // Debezium semantic type (see `append_timestamp`). Reading it touches the
+        // event's schema, so other columns skip it. Debezium lists the row's
+        // fields in table order, so the same position is tried first.
         let source_field = match (field.data_type(), field_value, source_fields) {
-            (DataType::Timestamp(..), Json::Number(_), Some(fields)) => fields
+            (
+                DataType::Timestamp(TimeUnit::Second | TimeUnit::Nanosecond, _),
+                Json::Number(_),
+                Some(fields),
+            ) => fields
                 .get(idx)
                 .filter(|f| f.field.as_deref() == Some(field.name().as_str()))
                 .or_else(|| {
@@ -467,11 +485,11 @@ fn append_array_value_to_list_builder<T: ArrayBuilder>(
 /// Appends a Debezium timestamp value to a `T` builder.
 ///
 /// A string is an ISO 8601 instant (`io.debezium.time.ZonedTimestamp`, always
-/// in UTC). An integer counts from the Unix epoch in the unit its Debezium
-/// semantic type (`semantic_type`) names. An integer without a semantic type is
-/// read in the column's unit for millisecond and microsecond columns, which
-/// keeps schemaless events loading into those columns, and is rejected for
-/// second and nanosecond columns.
+/// in UTC). An integer counts from the Unix epoch: in a millisecond or
+/// microsecond column it is read in the column's unit, the units Debezium
+/// timestamp schemas are inferred as; in a second or nanosecond column it is
+/// converted from the unit its Debezium semantic type (`semantic_type`) names,
+/// and rejected when that type is missing or not a timestamp.
 fn append_timestamp<T: ArrowTimestampType>(
     value: &Json,
     column: &str,
@@ -501,13 +519,13 @@ fn append_timestamp<T: ArrowTimestampType>(
                 unit: T::UNIT,
             };
             let source_unit = match semantic_type {
+                _ if matches!(T::UNIT, TimeUnit::Millisecond | TimeUnit::Microsecond) => T::UNIT,
                 Some(name) => {
                     debezium_timestamp_unit(name).with_context(|| NotATimestampSnafu {
                         column,
                         semantic_type: name,
                     })?
                 }
-                None if matches!(T::UNIT, TimeUnit::Millisecond | TimeUnit::Microsecond) => T::UNIT,
                 None => {
                     return UnknownTimestampUnitSnafu {
                         column,
@@ -998,15 +1016,8 @@ mod tests {
                 MICROS,
                 1_795_035_600_123_456,
             ),
-            (
-                &micros,
-                TimeUnit::Millisecond,
-                Some("UTC"),
-                MICROS,
-                1_795_035_600_123,
-            ),
             (&micros, TimeUnit::Second, None, MICROS, 1_795_035_600),
-            (&json!(-1), TimeUnit::Millisecond, None, MICROS, -1),
+            (&json!(-1), TimeUnit::Second, None, MICROS, -1),
             (&json!(-1), TimeUnit::Nanosecond, None, MICROS, -1_000),
             (
                 &json!(1_795_035_600_123_i64),
@@ -1017,17 +1028,17 @@ mod tests {
             ),
             (
                 &json!(1_795_035_600_123_i64),
-                TimeUnit::Microsecond,
+                TimeUnit::Second,
                 None,
                 CONNECT_MILLIS,
-                1_795_035_600_123_000,
+                1_795_035_600,
             ),
             (
                 &json!(1_795_035_600_123_456_789_i64),
-                TimeUnit::Microsecond,
+                TimeUnit::Nanosecond,
                 None,
                 NANOS,
-                1_795_035_600_123_456,
+                1_795_035_600_123_456_789,
             ),
             // Without a semantic type, an integer is in the unit of a millisecond
             // or microsecond column.
@@ -1120,21 +1131,6 @@ mod tests {
                 .expect_err(&format!("{value} must not decode"));
             assert_eq!(err.to_string(), expected, "{value}");
         }
-
-        // A millisecond column reads integers without a semantic type in its own
-        // unit, but still rejects a known non-timestamp type.
-        let err = decode_timestamp(
-            &json!(20_775),
-            TimeUnit::Millisecond,
-            None,
-            Some("io.debezium.time.Date"),
-        )
-        .expect_err("a day count must not decode into a millisecond column");
-        assert!(
-            matches!(&err, Error::NotATimestamp { column, semantic_type }
-                if column == "at" && semantic_type == "io.debezium.time.Date"),
-            "got: {err:?}"
-        );
     }
 
     #[test]

@@ -46,6 +46,7 @@ pub fn to_change_batch(
         primary_key,
         change,
         projection,
+        super::reads_source_timestamp_units(table_schema),
     )?;
 
     let struct_array = struct_builder.finish();
@@ -69,6 +70,7 @@ pub fn vector_to_change_batch(
     let schema = changes_schema(table_schema);
 
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), changes.len());
+    let read_source_fields = super::reads_source_timestamp_units(table_schema);
 
     for change in changes {
         append_change_event(
@@ -77,6 +79,7 @@ pub fn vector_to_change_batch(
             primary_key,
             change,
             projection,
+            read_source_fields,
         )?;
     }
 
@@ -98,8 +101,15 @@ fn append_change_event(
     primary_key: &[String],
     change: &ChangeEvent,
     projection: Option<&SchemaProjection>,
+    read_source_fields: bool,
 ) -> super::Result<()> {
-    let source_fields = change.row_fields();
+    // Each event carries its own copy of the schema, so it is read only when a
+    // column needs it.
+    let source_fields = if read_source_fields {
+        change.row_fields()
+    } else {
+        None
+    };
     if primary_key.is_empty() && matches!(change.payload.op, Op::Update) {
         let before = change
             .payload
