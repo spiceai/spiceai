@@ -208,6 +208,25 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 filter = 'test(=models::hf::nsql::huggingface_test_nsql) | test(=models::hf::huggingface_test_chat_completion) | test(=models::hf::huggingface_test_gemma_chat_completion) | test(=models::hf::huggingface_test_gemma4_chat_completion)'
 test-group = 'local-llm-tests'
 
+# `huggingface_test_nsql` asks a local Llama-3.2-3B for SQL through `/v1/nsql`,
+# which generates again after every query that fails to run, up to 11 times. The
+# recorded task history shows 9 `sql_query` runs for its first case. Its real
+# work sits inside the global 360s ceiling's noise band. In the nightly
+# `integration tests (models)` runs from 2026-11-05 to 2026-11-19, every pass
+# took 254s to 327s, and 13 of the 17 runs that reached the test had at least
+# one try killed at the ceiling. The kills came on all five `mbp-runner` hosts,
+# and the passes on four of them, so no single host is the cause.
+#
+# Sized like the Cayenne blocks above: the slowest pass, 326.8s (run
+# 42539095133), x 4.6 x 1.25 (5.75x) = 1879s, rounded up to whole 120s periods:
+# 1920s (16). Retries stay at the default. An assertion failure is still
+# retried and reported as before, and a real hang is still killed, after 32
+# minutes instead of 6. `.github/scripts/check_nextest_config.py` holds this to
+# the baseline.
+[[profile.default.overrides]]
+filter = '(binary_id(=runtime::integration_models) & test(=models::hf::nsql::huggingface_test_nsql))'
+slow-timeout = { period = "120s", terminate-after = 16 }
+
 [[profile.default.overrides]]
 filter = 'test(/^github::/)'
 test-group = 'github-api-tests'
