@@ -72,9 +72,9 @@ impl Xai {
             .with_api_base(endpoint)
             .with_api_key(api_key);
 
-        // No retries, as `crate::provider::client_without_retry`. The service also reads xAI's
+        // Retries as `crate::provider::client_without_retry` does. The service also reads xAI's
         // error bodies, which `async-openai` cannot.
-        let http_client = reqwest::Client::new();
+        let http_client = crate::provider::http_client();
         let client = Client::build(http_client.clone(), cfg)
             .with_http_service(error::XaiErrorService::new(http_client));
 
