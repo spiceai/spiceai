@@ -37,7 +37,7 @@
   "csv-header-binding": 32,
   "databricks-credentials": 1,
   "debezium-direct": 10,
-  "debezium-kafka": 118,
+  "debezium-kafka": 210,
   "debezium-offset-recovery": 89,
   "derived-table-scopes": 14,
   "distinct-on-scopes": 5,

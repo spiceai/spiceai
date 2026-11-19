@@ -4,7 +4,9 @@ description: >
   (Redpanda), and Spice follows the topic (`from: debezium:`): the initial
   snapshot, inserts, updates and deletes are applied once each, and the
   Cayenne acceleration answers as PostgreSQL does, before and after spiced
-  restarts. (An Arrow acceleration of the topic fails to start:
+  restarts. A dataset with declared `columns` on a topic with no messages yet
+  is ready with no rows, then follows the topic once changes arrive. (An
+  Arrow acceleration of the topic fails to start:
   known-failing/debezium/debezium-kafka-arrow.yaml.)
 
 sources:
@@ -46,6 +48,15 @@ spicepod:
         kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
         kafka_security_protocol: plaintext
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    - from: debezium:${sources.src.namespace}.public.e
+      name: e
+      params:
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
+        kafka_security_protocol: plaintext
+      columns:
+        - { name: id, type: bigint }
+        - { name: v, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
 
 defaults:
   expect: { oracle: src }
@@ -56,6 +67,8 @@ steps:
         CREATE TABLE t (id bigint PRIMARY KEY, v text, n bigint);
         ALTER TABLE t REPLICA IDENTITY FULL;
         INSERT INTO t SELECT g, 'v' || g, g * 10 FROM generate_series(1, 500) g;
+        CREATE TABLE e (id bigint PRIMARY KEY, v text);
+        ALTER TABLE e REPLICA IDENTITY FULL;
   # Debezium first, so the topic and its schema exist when spiced starts.
   - source-exec:
       dbz: >-
@@ -74,7 +87,7 @@ steps:
         DEBEZIUM_SOURCE_DATABASE_PASSWORD=${sources.src.params.pg_pass}
         DEBEZIUM_SOURCE_DATABASE_DBNAME=${sources.src.params.pg_db}
         DEBEZIUM_SOURCE_TOPIC_PREFIX=${sources.src.namespace}
-        DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST=public.t
+        DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST=public.t,public.e
         DEBEZIUM_SOURCE_PLUGIN_NAME=pgoutput
         DEBEZIUM_SOURCE_SLOT_NAME=dbz_${sources.src.namespace}
         DEBEZIUM_SOURCE_PUBLICATION_NAME=dbz_${sources.src.namespace}
@@ -85,9 +98,15 @@ steps:
         nohup /debezium/run.sh > /proc/1/fd/1 2>&1 < /dev/null &
   - source-query: { kafka: "for i in $(seq 1 60); do rpk topic list | grep -q '${sources.src.namespace}.public.t' && break; sleep 1; done; rpk topic list | grep -c '${sources.src.namespace}.public.t'" }
     expect: { rows: [['1']] }
+  # The snapshot of the empty table `e` publishes nothing, so its topic exists
+  # with no messages.
+  - source-query: { kafka: "rpk topic create ${sources.src.namespace}.public.e >/dev/null && rpk topic describe ${sources.src.namespace}.public.e -p | awk 'NR > 1 { print $NF }'" }
+    expect: { rows: [['0']] }
   - start: {}
   - query: SELECT * FROM t
     eventually: 120s
+  - query: SELECT * FROM e
+    expect-empty: true
 
   - source-exec:
       src: |
@@ -99,7 +118,12 @@ steps:
         DELETE FROM t WHERE id BETWEEN 200 AND 205;
         INSERT INTO t VALUES (1000, 'in a transaction', 1);
         COMMIT;
+        INSERT INTO e SELECT g, 'e' || g FROM generate_series(1, 50) g;
+        UPDATE e SET v = 'updated' WHERE id % 5 = 0;
+        DELETE FROM e WHERE id % 7 = 0;
   - query: SELECT * FROM t
+    eventually: 60s
+  - query: SELECT * FROM e
     eventually: 60s
   - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM t
     expect: { rows: [['0']] }
@@ -110,7 +134,10 @@ steps:
       src: |
         UPDATE t SET v = 'after restart' WHERE id <= 20;
         DELETE FROM t WHERE id > 590;
+        UPDATE e SET v = 'after restart' WHERE id <= 10;
   - query: SELECT * FROM t
+    eventually: 60s
+  - query: SELECT * FROM e
     eventually: 60s
 
   # One row is updated many times while spiced is down. Restarted with small
