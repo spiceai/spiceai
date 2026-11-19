@@ -23,7 +23,6 @@ limitations under the License.
 use async_openai::Client;
 use async_openai::config::Config;
 use async_openai::error::{ApiError, OpenAIError};
-use async_openai::middleware::ReqwestService;
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use secrecy::SecretString;
@@ -150,27 +149,22 @@ pub fn guarded_client_builder() -> reqwest::ClientBuilder {
     )
 }
 
-/// Builds an `async-openai` client that sends each request once, under the egress policy of
-/// [`guarded_client_builder`]. `async-openai` retries `429` and `5xx` responses by default;
-/// Spice retries and rate-controls requests itself, so a second layer would multiply attempts
-/// and hide the provider's first answer.
+/// Builds an `async-openai` client that sends each request once. `async-openai` retries `429` and
+/// `5xx` responses by default; Spice retries and rate-controls requests itself, so a second layer
+/// would multiply attempts and hide the provider's first answer.
+///
+/// The endpoint is held to the egress policy of [`guarded_client_builder`], a connect timeout, a
+/// read timeout and a bound on what one response may hold in memory ([`crate::model_http`]).
 ///
 /// # Errors
 ///
-/// Returns an error when the HTTP client cannot be built, which happens only when its TLS
-/// backend cannot be initialized.
+/// None at present: [`crate::model_http`] builds the HTTP client, and that build fails only
+/// where `reqwest::Client::new()` panics.
 pub fn client_without_retry<C: Config>(config: C) -> Result<Client<C>, OpenAIError> {
-    Ok(client_without_retry_on(
-        guarded_client_builder().build()?,
+    Ok(crate::model_http::client(
         config,
+        crate::model_http::Limits::default(),
     ))
-}
-
-/// [`client_without_retry`] over `http_client`, for a provider that sends other requests with
-/// the same HTTP client. `http_client` must come from [`guarded_client_builder`].
-#[must_use]
-pub fn client_without_retry_on<C: Config>(http_client: reqwest::Client, config: C) -> Client<C> {
-    Client::build(http_client.clone(), config).with_http_service(ReqwestService::new(http_client))
 }
 
 /// [`client_without_retry`] for a model lister, whose errors name `provider`.

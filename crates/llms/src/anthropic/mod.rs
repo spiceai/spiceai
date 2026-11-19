@@ -32,8 +32,6 @@ use crate::config::{GenericAuthMechanism, HostedModelConfig};
 
 pub struct Anthropic {
     client: Client<HostedModelConfig>,
-    /// The HTTP client under `client`, which the Messages API sends its requests with too.
-    http: reqwest::Client,
     model: AnthropicModelVariant,
     /// Whether [`Anthropic::model`] came from [`DEFAULT_ANTHROPIC_MODEL`] because the
     /// configuration named no model. Anthropic answers a request for a model it no longer serves
@@ -85,10 +83,8 @@ impl Anthropic {
                 HeaderValue::from_static("structured-outputs-2025-11-13"),
             );
 
-        let http = crate::provider::guarded_client_builder().build()?;
         Ok(Self {
-            client: crate::provider::client_without_retry_on(http.clone(), cfg),
-            http,
+            client: crate::provider::client_without_retry(cfg)?,
             model: variant,
             model_from_default,
             endpoint_from_default,
@@ -110,7 +106,7 @@ impl Anthropic {
             .config()
             .clone()
             .with_header_value("anthropic-workspace-id", value);
-        self.client = crate::provider::client_without_retry_on(self.http.clone(), cfg);
+        self.client = crate::provider::client_without_retry(cfg)?;
         Ok(self)
     }
 }
