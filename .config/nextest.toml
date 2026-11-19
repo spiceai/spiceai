@@ -211,11 +211,12 @@ test-group = 'local-llm-tests'
 # `huggingface_test_nsql` asks a local Llama-3.2-3B for SQL through `/v1/nsql`,
 # which generates again after every query that fails to run, up to 11 times. The
 # recorded task history shows 9 `sql_query` runs for its first case. Its real
-# work sits inside the global 360s ceiling's noise band. In the nightly
-# `integration tests (models)` runs from 2026-11-05 to 2026-11-19, every pass
-# took 254s to 327s, and 13 of the 17 runs that reached the test had at least
-# one try killed at the ceiling. The kills came on all five `mbp-runner` hosts,
-# and the passes on four of them, so no single host is the cause.
+# work sits inside the global 360s ceiling's noise band. In the
+# `integration tests (models)` runs from 2026-11-05 to 2026-11-19 that reached
+# the test (nightly on trunk and dispatched on branches), every pass took 254s
+# to 327s, and 14 of 19 runs had at least one try killed at the ceiling; on
+# trunk's nightly, 6 of 9. The kills came on all five `mbp-runner` hosts, and
+# the passes on four of them, so no single host is the cause.
 #
 # Sized like the Cayenne blocks above: the slowest pass, 326.8s (run
 # 42539095133), x 4.6 x 1.25 (5.75x) = 1879s, rounded up to whole 120s periods:
