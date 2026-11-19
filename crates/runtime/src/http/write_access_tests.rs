@@ -208,11 +208,20 @@ async fn read_write_caller_gets_the_unauthenticated_answer() {
         }
     }
 
-    for (path, field) in [
-        ("/v1/packages/generate", "from"),
+    let missing = |field: &str| {
+        format!(
+            "Failed to deserialize the JSON body into the target type: missing field `{field}` at line 1 column 2"
+        )
+    };
+    for (path, expected_body) in [
+        // `/v1/packages/generate` answers every error with a JSON `{"error": …}` body.
+        (
+            "/v1/packages/generate",
+            serde_json::json!({ "error": missing("from") }).to_string(),
+        ),
         (
             "/v1/datasets/missing/acceleration/snapshots/current",
-            "snapshot_id",
+            missing("snapshot_id"),
         ),
     ] {
         let answer = send(
@@ -225,12 +234,7 @@ async fn read_write_caller_gets_the_unauthenticated_answer() {
         .await;
         assert_eq!(
             answer,
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "Failed to deserialize the JSON body into the target type: missing field `{field}` at line 1 column 2"
-                )
-            ),
+            (StatusCode::UNPROCESSABLE_ENTITY, expected_body),
             "POST {path} with a read-write key and `{{}}`"
         );
     }
