@@ -49,20 +49,23 @@ impl XaiModelLister {
             .with_api_base(&api_base);
 
         Ok(Self {
-            client: crate::provider::client_without_retry(config),
+            client: crate::provider::lister_client(config, PROVIDER_NAME)?,
         })
     }
 
     /// Creates a new model lister with explicit credentials.
-    #[must_use]
-    pub fn new(api_key: &SecretString, api_base: Option<&str>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the HTTP client cannot be built.
+    pub fn new(api_key: &SecretString, api_base: Option<&str>) -> ListModelsResult<Self> {
         let config = OpenAIConfig::default()
             .with_api_key(api_key.expose_secret())
             .with_api_base(api_base.unwrap_or(API_BASE));
 
-        Self {
-            client: crate::provider::client_without_retry(config),
-        }
+        Ok(Self {
+            client: crate::provider::lister_client(config, PROVIDER_NAME)?,
+        })
     }
 }
 

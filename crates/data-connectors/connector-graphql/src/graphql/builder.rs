@@ -38,6 +38,7 @@ pub struct GraphQLClientBuilder {
     semaphore: Option<Arc<Semaphore>>,
     auth_header: Option<reqwest::header::HeaderName>,
     nested_pager: Option<super::client::NestedConnectionPager>,
+    egress: Option<http_egress::Egress>,
 }
 
 impl GraphQLClientBuilder {
@@ -56,6 +57,7 @@ impl GraphQLClientBuilder {
             semaphore: None,
             auth_header: None,
             nested_pager: None,
+            egress: None,
         }
     }
 
@@ -113,6 +115,14 @@ impl GraphQLClientBuilder {
         self
     }
 
+    /// Follow redirects under `egress`; the client passed to [`Self::build`] must be built
+    /// with [`http_egress::configure`] and the same `egress`.
+    #[must_use]
+    pub fn with_egress(mut self, egress: http_egress::Egress) -> Self {
+        self.egress = Some(egress);
+        self
+    }
+
     #[must_use]
     pub fn with_nested_pager(
         mut self,
@@ -137,6 +147,10 @@ impl GraphQLClientBuilder {
             self.semaphore,
             self.auth_header,
         )?;
-        Ok(graphql_client.with_nested_pager(self.nested_pager))
+        let graphql_client = graphql_client.with_nested_pager(self.nested_pager);
+        Ok(match self.egress {
+            Some(egress) => graphql_client.with_egress(egress),
+            None => graphql_client,
+        })
     }
 }

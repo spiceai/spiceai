@@ -33,9 +33,12 @@ use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, http::HttpBuilder};
 use object_store_spawn::{DestinationGuard, SpawnedReqwestConnector};
 use tokio::runtime::Handle;
-use url::{Url, form_urlencoded::parse};
+use url::{
+    Url,
+    form_urlencoded::{self, parse},
+};
 
-use crate::{http_auth, ssrf};
+use crate::{http_auth, ssrf, url_table};
 
 /// Records how a cached object store entry was built so fragment-aware lookups
 /// can repair a poisoned (env-default) entry without clobbering deliberate
@@ -826,8 +829,50 @@ impl SpiceObjectStoreRegistry {
         crate::builder::build_gcs_object_store(bucket_name, &params, self.io_runtime.clone())
     }
 
+    /// Builds the store for `url` without registering it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no store serves `url`'s scheme, or the store's settings in the URL
+    /// fragment are invalid.
+    pub fn build_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        self.get_feature_store(url)
+    }
+
+    /// Builds the store a URL table reads an object-store location through when no dataset
+    /// covers it: the location's store with no credentials at all, so it reads only what is
+    /// public. Of the URL's settings, only those a query may choose are kept.
+    fn prepare_url_table_anonymous_object_store(
+        &self,
+        target: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let mut unsigned = target.clone();
+        let mut fragment = form_urlencoded::Serializer::new(String::new());
+        for (key, value) in parse(target.fragment().unwrap_or_default().as_bytes()) {
+            if url_table::ANONYMOUS_FRAGMENT_KEYS.contains(&key.as_ref()) {
+                fragment.append_pair(&key, &value);
+            }
+        }
+        match url_table::StoreFamily::of_scheme(target.scheme()) {
+            Some(url_table::StoreFamily::S3) => fragment.append_pair("auth", "public"),
+            Some(url_table::StoreFamily::Azure | url_table::StoreFamily::Gcs) => {
+                fragment.append_pair("skip_signature", "true")
+            }
+            None => {
+                return Err(DataFusionError::Execution(format!(
+                    "No object store available for: {target:?}"
+                )));
+            }
+        };
+        unsigned.set_fragment(Some(&fragment.finish()));
+        self.get_feature_store(&unsigned)
+    }
+
     fn get_feature_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         if url.as_str().starts_with(ssrf::URL_TABLE_SCHEME_PREFIX) {
+            if let Some(target) = url_table::anonymous_target(url) {
+                return self.prepare_url_table_anonymous_object_store(&target);
+            }
             let target = ssrf::url_table_target(url).ok_or_else(|| {
                 DataFusionError::Execution(format!("No object store available for: {url:?}"))
             })?;

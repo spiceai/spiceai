@@ -28,7 +28,6 @@ use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DEFAULT_SPICE_CLIENT_TIMEOUT, DataConnector,
     DataConnectorError, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
-    default_spice_client,
 };
 use data_http_rate_control as http_rate_control;
 use data_http_rate_control::{
@@ -164,6 +163,31 @@ impl DataConnectorFactory for GraphQLFactory {
     }
 }
 
+/// Redirects a GraphQL request follows before it fails.
+const MAX_REDIRECTS: usize = 10;
+
+/// The HTTP client GraphQL requests are sent with: `default_spice_client`'s settings, with the
+/// egress policy's resolver and no redirect followed by `reqwest` itself.
+fn graphql_http_client(
+    egress: &http_egress::Egress,
+    https_only: bool,
+) -> reqwest::Result<reqwest::Client> {
+    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    http_egress::configure(
+        reqwest::Client::builder()
+            .user_agent(util::spiceai_user_agent())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(DEFAULT_SPICE_CLIENT_TIMEOUT)
+            .default_headers(headers)
+            .https_only(https_only),
+        egress,
+    )
+    .build()
+}
+
 impl GraphQL {
     async fn get_client(
         &self,
@@ -241,7 +265,15 @@ impl GraphQL {
             });
         }
 
-        let client = default_spice_client("application/json")
+        // The endpoint's host is trusted as its first DNS answer leaves it, every host a
+        // redirect introduces is checked, and `reqwest` follows no redirect itself: the client
+        // follows them through `http_egress::send`, which keeps the configured credentials on
+        // the endpoint's origin. An `https` endpoint never makes a plaintext request.
+        let egress = http_egress::Egress::new(
+            Some(runtime_object_store::ssrf::connector_redirect_guard("GraphQL").redirects_only()),
+            MAX_REDIRECTS,
+        );
+        let client = graphql_http_client(&egress, endpoint.scheme() == "https")
             .boxed()
             .map_err(|source| DataConnectorError::InternalWithSource {
                 dataconnector: "graphql".to_string(),
@@ -255,8 +287,8 @@ impl GraphQL {
             &ConnectorComponent::from(dataset),
             "graphql",
         )?;
-        // The GraphQL client is `default_spice_client`, so its request timeout
-        // is the `client_timeout` equivalent the acquire bound defaults to.
+        // The GraphQL client times out after `DEFAULT_SPICE_CLIENT_TIMEOUT`, so its request
+        // timeout is the `client_timeout` equivalent the acquire bound defaults to.
         rate_control.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
         let rate_limiter = self
             .rate_control_registry
@@ -288,6 +320,7 @@ impl GraphQL {
         .with_rate_limiter(Some(rate_limiter))
         .with_rate_controller(rate_controller.shared().controller.clone())
         .with_auth_header(auth_header)
+        .with_egress(egress)
         .build(client)
         .boxed();
 

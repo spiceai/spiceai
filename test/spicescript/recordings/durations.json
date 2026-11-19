@@ -92,6 +92,7 @@
   "layout-equivalence": 62,
   "localpod": 8,
   "maintained-aggregates": 6,
+  "mcp-transport-security": 1,
   "memory-limit": 33,
   "metrics-agreement": 13,
   "metrics-agreement-cdc": 58,
@@ -186,5 +187,6 @@
   "unparse-set-operations": 5,
   "unparse-sort-keys": 14,
   "unsigned-negation": 5,
+  "url-table-credentials": 13,
   "views": 11
 }

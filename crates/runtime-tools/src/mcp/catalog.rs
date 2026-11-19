@@ -101,14 +101,6 @@ fn forward_stderr(tool_name: String, stderr: ChildStderr) {
     });
 }
 
-/// Check if a hostname is localhost
-fn is_localhost(host: &str) -> bool {
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-    )
-}
-
 pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<McpClient>>,
 
@@ -629,7 +621,8 @@ impl McpToolCatalog {
                 auth_token,
                 headers,
             } => {
-                // Security: Validate URL scheme (only https allowed, http for localhost testing)
+                // `MCPConfig::from_type` has already refused plaintext to a host that is not
+                // loopback unless the tool allows it; only the scheme is left to check.
                 if url.scheme() != "https" && url.scheme() != "http" {
                     return Err(Error::CouldNotConstructTool {
                         name: "mcp_streamable_http".to_string(),
@@ -638,16 +631,6 @@ impl McpToolCatalog {
                             url.scheme()
                         ),
                     });
-                }
-
-                // Security: Warn if using http (unencrypted) for non-localhost
-                let host = url.host_str().unwrap_or("<unknown>");
-                if url.scheme() == "http" && !is_localhost(host) {
-                    tracing::warn!(
-                        "MCP HTTPS client using unencrypted HTTP connection to non-localhost host '{}': {}. This is insecure.",
-                        host,
-                        url
-                    );
                 }
 
                 let http_client =
@@ -1364,23 +1347,6 @@ mod tests {
             !DANGEROUS_PATH_GLOB_SET.is_match("./script.sh"),
             "./script.sh should be allowed"
         );
-    }
-
-    #[test]
-    fn test_is_localhost_ipv4() {
-        assert!(is_localhost("127.0.0.1"));
-        assert!(is_localhost("localhost"));
-        assert!(is_localhost("0.0.0.0"));
-        assert!(!is_localhost("192.168.1.1"));
-        assert!(!is_localhost("example.com"));
-    }
-
-    #[test]
-    fn test_is_localhost_ipv6() {
-        assert!(is_localhost("::1"));
-        assert!(is_localhost("[::1]"));
-        assert!(!is_localhost("::2"));
-        assert!(!is_localhost("2001:db8::1"));
     }
 
     fn sample_listed_tool(name: &'static str) -> rmcp::model::Tool {

@@ -230,6 +230,19 @@ pub trait DataConnectorFactory: Send + Sync {
     }
 }
 
+/// The objects a dataset reads from an object store, as its connector resolves them from the
+/// dataset's configuration.
+#[derive(Clone, Debug)]
+pub struct ObjectStoreScope {
+    /// The dataset's object-store URL, with the store settings and credentials in its fragment,
+    /// as the object-store registry builds a store from it.
+    pub store_url: url::Url,
+    /// The suffix the dataset lists objects by (for example `.parquet`, `.csv.gz`), or a
+    /// `*`-prefixed suffix (`*`, `*.parquet`) for a dataset that lists every object and selects
+    /// by content.
+    pub listing_suffix: String,
+}
+
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
 #[async_trait]
 pub trait DataConnector: Debug + Send + Sync + 'static {
@@ -398,6 +411,20 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         Ok(())
+    }
+
+    /// The objects this connector reads for `dataset` from an object store: the store URL with
+    /// its credentials, and the suffix it lists objects by. `None` for a connector that does not
+    /// read files from an object store.
+    ///
+    /// URL tables lend a dataset's credentials only for the objects this scope admits, so a
+    /// wrapper must forward it: the default `None` would make a wrapped dataset lend nothing,
+    /// and the URL table fall back to an unsigned read.
+    async fn object_store_scope(
+        &self,
+        _dataset: &DatasetSpec,
+    ) -> DataConnectorResult<Option<ObjectStoreScope>> {
+        Ok(None)
     }
 
     /// A hook called **before** the accelerated table is built, giving the

@@ -322,6 +322,16 @@ impl DataConnector for ReconnectingConnector {
         }
     }
 
+    async fn object_store_scope(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> super::DataConnectorResult<Option<data_connector_api::ObjectStoreScope>> {
+        self.connector(dataset)
+            .await?
+            .object_store_scope(dataset)
+            .await
+    }
+
     async fn register_object_stores(
         &self,
         dataset: &DatasetSpec,

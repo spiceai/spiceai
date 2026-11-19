@@ -133,19 +133,59 @@ pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
     hint
 }
 
-/// Builds an `async-openai` client that sends each request once. `async-openai` retries `429` and
-/// `5xx` responses by default; Spice retries and rate-controls requests itself, so a second layer
-/// would multiply attempts and hide the provider's first answer.
+/// A `reqwest` client builder under the egress policy every hosted model's HTTP client applies.
+///
+/// A model request carries its credential in a header and the prompt in its body, and a model
+/// endpoint has no reason to send either to another origin, so the client is
+/// [`http_egress::origin_bound`]: it follows a redirect only within the endpoint's origin, and
+/// the endpoint's host is pinned to the class of its first DNS answer, so an endpoint the
+/// operator put on a loopback or private address (a local Ollama, an in-cluster vLLM) stays
+/// reachable and a public endpoint cannot later resolve to an internal address.
+///
+/// Each call starts a new egress state, so each client pins the hosts it reaches on its own.
+pub fn guarded_client_builder() -> reqwest::ClientBuilder {
+    http_egress::origin_bound(
+        reqwest::Client::builder(),
+        "a model's client follows a redirect only within its endpoint's origin",
+    )
+}
+
+/// Builds an `async-openai` client that sends each request once, under the egress policy of
+/// [`guarded_client_builder`]. `async-openai` retries `429` and `5xx` responses by default;
+/// Spice retries and rate-controls requests itself, so a second layer would multiply attempts
+/// and hide the provider's first answer.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built, which happens only when its TLS
+/// backend cannot be initialized.
+pub fn client_without_retry<C: Config>(config: C) -> Result<Client<C>, OpenAIError> {
+    Ok(client_without_retry_on(
+        guarded_client_builder().build()?,
+        config,
+    ))
+}
+
+/// [`client_without_retry`] over `http_client`, for a provider that sends other requests with
+/// the same HTTP client. `http_client` must come from [`guarded_client_builder`].
 #[must_use]
-pub fn client_without_retry<C: Config>(config: C) -> Client<C> {
-    let http_client = reqwest::Client::new();
+pub fn client_without_retry_on<C: Config>(http_client: reqwest::Client, config: C) -> Client<C> {
     Client::build(http_client.clone(), config).with_http_service(ReqwestService::new(http_client))
 }
 
-/// Creates an HTTP client with standard timeout and TLS settings.
+/// [`client_without_retry`] for a model lister, whose errors name `provider`.
+pub(crate) fn lister_client<C: Config>(config: C, provider: &str) -> ListModelsResult<Client<C>> {
+    client_without_retry(config).map_err(|error| ListModelsError::NetworkError {
+        provider: provider.to_string(),
+        message: error.to_string(),
+    })
+}
+
+/// Creates an HTTP client with standard timeout and TLS settings, under the egress policy of
+/// [`guarded_client_builder`].
 #[must_use]
 pub fn create_http_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
+    guarded_client_builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(API_TIMEOUT)

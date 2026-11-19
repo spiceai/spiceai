@@ -53,6 +53,55 @@ pub enum Error {
         "Model {name} includes a non-existent path: {path}. Verify the model configuration and ensure all paths are correct. For details, visit https://spiceai.org/docs/components/models",
     ))]
     ReferencedPathDoesNotExist { name: String, path: String },
+
+    #[snafu(display("{}", endpoint_redirect_message("model", name, param, source)))]
+    EndpointRedirectRefused {
+        name: String,
+        param: &'static str,
+        source: http_egress::RedirectRefused,
+    },
+}
+
+/// The message for a model or embedding model named `name` that failed to load because its
+/// endpoint redirected where a model's client does not go: to another origin, or from HTTPS to
+/// HTTP. `setting` names what sets the endpoint, such as `` `endpoint` ``.
+pub(crate) fn endpoint_redirect_message(
+    kind: &str,
+    name: &str,
+    setting: &str,
+    refused: &http_egress::RedirectRefused,
+) -> String {
+    format!(
+        "Failed to load {kind} '{name}': {refused}. Set {setting} to the URL the endpoint redirects to. See: https://spiceai.org/docs/components/models"
+    )
+}
+
+/// What sets the endpoint of a model served from `source`: the parameter, or for a Google
+/// model, whose own endpoint is fixed, the token endpoint its service account key names.
+pub(crate) fn endpoint_param(source: Option<&ModelSource>) -> &'static str {
+    match source {
+        Some(ModelSource::SpiceAI) => "`spiceai_endpoint`",
+        Some(ModelSource::Databricks) => "`databricks_endpoint`",
+        Some(ModelSource::TypeSafe) => "`typesafe_endpoint`",
+        Some(ModelSource::Google) => "the service account key's `token_uri`",
+        _ => "`endpoint`",
+    }
+}
+
+/// `err`, or, when the model failed to load because its client refused a redirect from its
+/// endpoint, [`Error::EndpointRedirectRefused`], which names the model and the fix.
+fn with_redirect_cause(name: &str, source: Option<&ModelSource>, err: Error) -> Error {
+    let Error::FailedToLoadLLM { source: cause, .. } = &err else {
+        return err;
+    };
+    match http_egress::refused_redirect(cause.as_ref()) {
+        Some(refused) => Error::EndpointRedirectRefused {
+            name: name.to_string(),
+            param: endpoint_param(source),
+            source: refused.clone(),
+        },
+        None => err,
+    }
 }
 
 impl Runtime {
@@ -191,6 +240,7 @@ impl Runtime {
                 Ok(())
             }
             Err(e) => {
+                let e = with_redirect_cause(&m.name, source.as_ref(), e);
                 metrics::models::LOAD_ERROR.add(1, &[]);
                 self.status.update_model(
                     &model.name,
@@ -564,7 +614,9 @@ fn needs_retry(attempt: &Result<(), Error>) -> bool {
 /// can clear. A Spicepod change loads the model again.
 fn is_permanent_model_failure(err: &Error) -> bool {
     match err {
-        Error::ReferencedPathDoesNotExist { .. } => true,
+        // Only a new endpoint clears a refused redirect, and a Spicepod change loads the model
+        // again.
+        Error::ReferencedPathDoesNotExist { .. } | Error::EndpointRedirectRefused { .. } => true,
         Error::FailedToLoadLLM { source, .. } => {
             model_error(source.as_ref()).is_some_and(llms::chat::Error::is_configuration_error)
         }
@@ -613,6 +665,43 @@ fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod redirect_message_tests {
+    use spicepod::component::model::ModelSource;
+
+    use super::{endpoint_param, endpoint_redirect_message};
+
+    #[test]
+    fn a_refused_endpoint_redirect_names_the_model_and_the_param_to_change() {
+        let refused = http_egress::RedirectRefused::CrossOrigin {
+            origin: "https://api.example.com".to_string(),
+            target: "https://gateway.example.com".to_string(),
+        };
+        assert_eq!(
+            endpoint_redirect_message(
+                "model",
+                "claude",
+                endpoint_param(Some(&ModelSource::Anthropic)),
+                &refused
+            ),
+            "Failed to load model 'claude': the server redirected to another origin, https://gateway.example.com, and this request carries a credential that is sent only to https://api.example.com. Set `endpoint` to the URL the endpoint redirects to. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            endpoint_param(Some(&ModelSource::SpiceAI)),
+            "`spiceai_endpoint`"
+        );
+        assert_eq!(
+            endpoint_param(Some(&ModelSource::Databricks)),
+            "`databricks_endpoint`"
+        );
+        assert_eq!(
+            endpoint_param(Some(&ModelSource::Google)),
+            "the service account key's `token_uri`"
+        );
+        assert_eq!(endpoint_param(Some(&ModelSource::OpenAi)), "`endpoint`");
+    }
 }
 
 #[cfg(test)]
