@@ -47,7 +47,7 @@ pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as Replication
 pub use pgwire_replication::{CaCertificate, PgOutputFormat};
 pub use retention::{SlotRemoval, SlotRetentionPosture};
 pub use slot::{SlotInfo, SlotSetupOutcome};
-pub use xid_registry::{XactStatus, XidEntry, XidRegistry};
+pub use xid_registry::{EchoKeys, EchoReadGuard, XactStatus, XidEntry, XidRegistry};
 
 /// Extracts a human-readable message from a `tokio_postgres::Error`.
 ///
