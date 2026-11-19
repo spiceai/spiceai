@@ -1974,7 +1974,7 @@
           "Ready"
         ],
         "summary": "Check Readiness",
-        "description": "Check the runtime status of all the components of the runtime. If the service is ready, it returns an HTTP 200 status with the message \"ready\". If not, it returns a 503 status with the message \"not ready\".\n\nThe behavior for when an accelerated dataset is considered ready is configurable via the `ready_state` parameter. See [Data refresh](https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state) for more details.\n\nIn distributed (scheduler) mode the readiness response can additionally be gated on executor\navailability via the `min_ready_executors` and `min_ready_executors_percent` query parameters\n(both optional). Both must pass when supplied. Pass `verbose=true` to get a multi-line\ndiagnostic body explaining each gate.\n\n### Readiness Probe\nIn production deployments, the /v1/ready endpoint can be used as a readiness probe for a Spice deployment to ensure traffic is routed to the Spice runtime only after all datasets have finished loading.\n\nExample Kubernetes readiness probe:\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready\n   port: 8090\n```\n\nExample with executor gating (scheduler role):\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready?min_ready_executors=3&min_ready_executors_percent=80\n   port: 8090\n```",
+        "description": "Check the runtime status of all the components of the runtime. If the service is ready, it returns an HTTP 200 status with the message \"ready\". If not, it returns a 503 status with the message \"not ready\".\n\nThe behavior for when an accelerated dataset is considered ready is configurable via the `ready_state` parameter. See [Data refresh](https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state) for more details.\n\nIn distributed (scheduler) mode the readiness response can additionally be gated on executor\navailability via the `min_ready_executors` and `min_ready_executors_percent` query parameters\n(both optional). Both must pass when supplied. Pass `verbose=true` to get a multi-line\ndiagnostic body explaining each gate.\n\n### Readiness Probe\nIn production deployments, the /v1/ready endpoint can be used as a readiness probe for a Spice deployment to ensure traffic is routed to the Spice runtime only after all datasets have finished loading.\n\nExample Kubernetes readiness probe:\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready\n   port: 8090\n```\n\nTo route traffic to the healthy datasets of a runtime where one dataset failed to load, while\nstill waiting for every dataset to finish its first load:\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready?allow_unhealthy=true\n   port: 8090\n```\n\nExample with executor gating (scheduler role):\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready?min_ready_executors=3&min_ready_executors_percent=80\n   port: 8090\n```",
         "operationId": "ready",
         "parameters": [
           {
@@ -2003,6 +2003,15 @@
               ],
               "format": "int32",
               "minimum": 0
+            }
+          },
+          {
+            "name": "allow_unhealthy",
+            "in": "query",
+            "description": "When `true`, a component that failed to load (status `Error`) does not hold readiness back:\nthe runtime reports ready once every other component has loaded, so the healthy datasets\ncan be served while the failed one reports its error. A component still on its first load\nstill blocks, and a runtime whose datasets have all failed stays not ready. Defaults to\n`false`, where every component must have loaded.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           },
           {
