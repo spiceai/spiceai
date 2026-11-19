@@ -59,6 +59,11 @@ pub fn keep_containers() {
     KEEP_CONTAINERS.store(true, Ordering::Relaxed);
 }
 
+/// Whether `--keep` asked for containers to be left running.
+pub fn keeping_containers() -> bool {
+    KEEP_CONTAINERS.load(Ordering::Relaxed)
+}
+
 pub fn track_container(id: &str, name: &str, network: Option<&str>) {
     CONTAINERS.lock().insert(
         id.to_string(),
