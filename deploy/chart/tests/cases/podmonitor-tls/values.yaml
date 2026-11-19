@@ -1,0 +1,10 @@
+monitoring:
+  podMonitor:
+    enabled: true
+    tlsConfig:
+      ca: {secret: {name: spice-scrape-tls, key: ca.crt}}
+      cert: {secret: {name: spice-scrape-tls, key: tls.crt}}
+      keySecret: {name: spice-scrape-tls, key: tls.key}
+auth:
+  apiKey:
+    existingSecret: spice-key

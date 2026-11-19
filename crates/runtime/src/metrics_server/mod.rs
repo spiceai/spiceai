@@ -38,7 +38,7 @@ use prometheus::{
     Encoder, TextEncoder,
     proto::{Bucket, Histogram, LabelPair, Metric, MetricFamily, MetricType},
 };
-use runtime_tls::TlsConfig;
+use runtime_tls::{ClientAuthEnforcement, TlsConfig};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
@@ -133,6 +133,7 @@ where
                 process_tls_tcp_stream(
                     stream,
                     acceptor.clone(),
+                    config.client_auth,
                     prometheus_registry.clone(),
                     cluster_collector.clone(),
                     rate_limiter.clone(),
@@ -154,6 +155,7 @@ where
 fn process_tls_tcp_stream(
     stream: TcpStream,
     acceptor: TlsAcceptor,
+    client_auth: ClientAuthEnforcement,
     prometheus_registry: prometheus::Registry,
     cluster_collector: Option<Arc<ClusterMetricsCollector>>,
     rate_limiter: Option<Arc<DirectRateLimiter>>,
@@ -163,8 +165,28 @@ fn process_tls_tcp_stream(
         let stream = runtime_tls::accept_within(&acceptor, stream, handshake_timeout).await;
         match stream {
             Ok(stream) => {
-                serve_connection(stream, prometheus_registry, cluster_collector, rate_limiter)
-                    .await;
+                // The listener admits handshakes without a client certificate so
+                // probes reach `/health`; a certificate that was presented has
+                // already been verified against the client CA.
+                let client = if client_auth == ClientAuthEnforcement::Required
+                    && stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .is_none_or(<[_]>::is_empty)
+                {
+                    Client::MissingRequiredCertificate
+                } else {
+                    Client::Admitted
+                };
+                serve_connection(
+                    stream,
+                    client,
+                    prometheus_registry,
+                    cluster_collector,
+                    rate_limiter,
+                )
+                .await;
             }
             Err(e) => {
                 tracing::debug!("Error accepting TLS connection: {e}");
@@ -181,14 +203,25 @@ fn process_tcp_stream(
 ) {
     tokio::spawn(serve_connection(
         stream,
+        Client::Admitted,
         prometheus_registry,
         cluster_collector,
         rate_limiter,
     ));
 }
 
+/// Whether a connection's client may read more than `/health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Client {
+    Admitted,
+    /// `client_auth_mode: required`, and the connection presented no client
+    /// certificate: only `/health` answers, as on the HTTP listener.
+    MissingRequiredCertificate,
+}
+
 async fn serve_connection<S>(
     stream: S,
+    client: Client,
     prometheus_registry: prometheus::Registry,
     cluster_collector: Option<Arc<ClusterMetricsCollector>>,
     rate_limiter: Option<Arc<DirectRateLimiter>>,
@@ -205,6 +238,7 @@ async fn serve_connection<S>(
                     &prometheus_registry,
                     cluster_collector.as_deref(),
                     rate_limiter.as_deref(),
+                    client,
                     &req,
                 )
                 .await,
@@ -240,6 +274,7 @@ async fn handle_http_request<B>(
     prometheus_registry: &prometheus::Registry,
     cluster_collector: Option<&ClusterMetricsCollector>,
     rate_limiter: Option<&DirectRateLimiter>,
+    client: Client,
     req: &Request<B>,
 ) -> Response<Full<Bytes>> {
     let path = req.uri().path();
@@ -249,6 +284,18 @@ async fn handle_http_request<B>(
             .headers_mut()
             .append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
         return response;
+    }
+
+    // Before the rate limit, so a client without a certificate cannot use up
+    // the scrape budget.
+    if client == Client::MissingRequiredCertificate {
+        let body =
+            serde_json::json!({ "error": runtime_tls::CLIENT_CERTIFICATE_REQUIRED }).to_string();
+        let mut resp = Response::new(Full::from(body));
+        *resp.status_mut() = StatusCode::UNAUTHORIZED;
+        resp.headers_mut()
+            .append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        return resp;
     }
 
     if path != "/metrics" {
@@ -1676,7 +1723,7 @@ mod tests {
             .uri("/metrics")
             .body(())
             .expect("test request should build");
-        let response = handle_http_request(&registry, None, None, &request).await;
+        let response = handle_http_request(&registry, None, None, Client::Admitted, &request).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response
             .into_body()
@@ -1786,6 +1833,7 @@ mod tests {
             process_tls_tcp_stream(
                 stream,
                 crate::http::test_tls_acceptor(),
+                ClientAuthEnforcement::Disabled,
                 prometheus::Registry::new(),
                 None,
                 None,
@@ -1816,10 +1864,24 @@ mod tests {
             .body(())
             .expect("test request should build");
 
-        let first = handle_http_request(&registry, None, Some(&rate_limiter), &request).await;
+        let first = handle_http_request(
+            &registry,
+            None,
+            Some(&rate_limiter),
+            Client::Admitted,
+            &request,
+        )
+        .await;
         assert_eq!(first.status(), StatusCode::OK);
 
-        let second = handle_http_request(&registry, None, Some(&rate_limiter), &request).await;
+        let second = handle_http_request(
+            &registry,
+            None,
+            Some(&rate_limiter),
+            Client::Admitted,
+            &request,
+        )
+        .await;
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
 
         let retry_after = second
@@ -1851,17 +1913,35 @@ mod tests {
             .expect("test request should build");
 
         // Burn the only token in the bucket.
-        let first =
-            handle_http_request(&registry, None, Some(&rate_limiter), &metrics_request).await;
+        let first = handle_http_request(
+            &registry,
+            None,
+            Some(&rate_limiter),
+            Client::Admitted,
+            &metrics_request,
+        )
+        .await;
         assert_eq!(first.status(), StatusCode::OK);
-        let second =
-            handle_http_request(&registry, None, Some(&rate_limiter), &metrics_request).await;
+        let second = handle_http_request(
+            &registry,
+            None,
+            Some(&rate_limiter),
+            Client::Admitted,
+            &metrics_request,
+        )
+        .await;
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
 
         // /health should still succeed repeatedly even with the bucket empty.
         for _ in 0..3 {
-            let resp =
-                handle_http_request(&registry, None, Some(&rate_limiter), &health_request).await;
+            let resp = handle_http_request(
+                &registry,
+                None,
+                Some(&rate_limiter),
+                Client::Admitted,
+                &health_request,
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
     }
@@ -1881,8 +1961,14 @@ mod tests {
                 .uri(bypass_path)
                 .body(())
                 .expect("test request should build");
-            let response =
-                handle_http_request(&registry, None, Some(&rate_limiter), &request).await;
+            let response = handle_http_request(
+                &registry,
+                None,
+                Some(&rate_limiter),
+                Client::Admitted,
+                &request,
+            )
+            .await;
             assert_eq!(
                 response.status(),
                 StatusCode::NOT_FOUND,
@@ -1895,12 +1981,24 @@ mod tests {
             .body(())
             .expect("test request should build");
 
-        let first_metrics =
-            handle_http_request(&registry, None, Some(&rate_limiter), &metrics_request).await;
+        let first_metrics = handle_http_request(
+            &registry,
+            None,
+            Some(&rate_limiter),
+            Client::Admitted,
+            &metrics_request,
+        )
+        .await;
         assert_eq!(first_metrics.status(), StatusCode::OK);
 
-        let second_metrics =
-            handle_http_request(&registry, None, Some(&rate_limiter), &metrics_request).await;
+        let second_metrics = handle_http_request(
+            &registry,
+            None,
+            Some(&rate_limiter),
+            Client::Admitted,
+            &metrics_request,
+        )
+        .await;
         assert_eq!(second_metrics.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 

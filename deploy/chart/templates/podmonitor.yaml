@@ -12,7 +12,13 @@ spec:
   podMetricsEndpoints:
   - interval: 10s
     path: /metrics
+    {{- with .Values.monitoring.podMonitor.tlsConfig }}
+    scheme: https
+    tlsConfig:
+      {{- toYaml . | nindent 6 }}
+    {{- else }}
     scheme: http
+    {{- end }}
     targetPort: 9090
   selector:
     matchLabels:

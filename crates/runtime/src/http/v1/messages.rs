@@ -136,7 +136,7 @@ pub(crate) async fn encode_layer_errors(req: Request<Body>, next: Next) -> Respo
     let (parts, body) = response.into_parts();
     let text = axum::body::to_bytes(body, MAX_LAYER_ERROR_BODY_BYTES)
         .await
-        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .map(|bytes| super::layer_error_text(&bytes))
         .unwrap_or_default();
     let message = if text.is_empty() {
         status

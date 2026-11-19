@@ -35,6 +35,23 @@ use deferred::DeferredCatalogProvider;
 use snafu::prelude::*;
 use tokio::sync::Mutex;
 
+/// Discards cached plans and results when a catalog refresh replaces or removes a table,
+/// so a repeated query plans against the table the catalog lists now.
+#[cfg(any(feature = "databricks", feature = "delta_lake"))]
+pub(crate) fn clear_caches_on_catalog_change(
+    runtime: &Runtime,
+) -> data_components::unity_catalog::provider::CatalogChangeListener {
+    let df = Arc::downgrade(&runtime.df);
+    Arc::new(move || {
+        let df = std::sync::Weak::clone(&df);
+        Box::pin(async move {
+            if let Some(df) = df.upgrade() {
+                df.clear_cached_plans_and_results().await;
+            }
+        })
+    })
+}
+
 /// Render `err` together with every error in its `source()` chain, on one line.
 ///
 /// Database clients routinely keep the useful part of a failure off the outermost

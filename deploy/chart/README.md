@@ -9,6 +9,24 @@ helm install spiceai deploy/chart \
   --set spicepod.name=my-app
 ```
 
+## Authentication
+
+The runtime requires an API key on HTTP (8090) and Flight (50051). On first install the chart generates a read-write key into the Secret `<release>-spiceai-api-key`, keeps it across upgrades and uninstalls, and the runtime reads it through `runtime.auth`. Read it with:
+
+```bash
+kubectl get secret spiceai-spiceai-api-key -o jsonpath='{.data.api-key}' | base64 -d
+```
+
+Send it as `X-API-Key: <key>` over HTTP, or as the password of a Flight handshake. The `/health` and `/v1/ready` probes need no key.
+
+- **Your own key**: create a Secret with an `api-key` entry and set `auth.apiKey.existingSecret` to its name.
+- **Your own `runtime.auth`**: when `spicepod.runtime.auth` is set, the chart adds no key and uses yours as written.
+- **No API key**: `auth.mode: none`, on a `ClusterIP` Service only; the chart refuses it with a `NodePort` or `LoadBalancer` Service. Anonymous callers then get the runtime's rules for unauthenticated callers on a non-loopback listener, and the chart adds the Service's names to `runtime.allowed_hosts` so in-cluster clients can address it by name.
+
+### GitOps (Argo CD, `helm template`)
+
+A render that cannot read the cluster, such as `helm template`, `helm install --dry-run` without `=server`, or Argo CD, cannot reuse a generated key, so it fails unless `auth.apiKey.existingSecret` is set. Create the Secret (for example with External Secrets or Sealed Secrets) and set `auth.apiKey.existingSecret`.
+
 ## Configuration
 
 ### Values
@@ -29,6 +47,9 @@ helm install spiceai deploy/chart \
 | `serviceAccount.annotations`       | Annotations for the ServiceAccount                                           | `{}`                              |
 | `service.type`                     | Kubernetes Service type (`ClusterIP`, `NodePort`, `LoadBalancer`, or `null`) | `null`                            |
 | `service.additionalAnnotations`    | Additional annotations on the Service                                        | `{}`                              |
+| `service.ports`                    | The Service's ports                                                          | `http` and `flight`               |
+| `auth.mode`                        | `api_key`: require an API key; `none`: no API key (ClusterIP only)           | `api_key`                         |
+| `auth.apiKey.existingSecret`       | Secret with the API key under `api-key`; empty: the chart generates one      | `''`                              |
 | `livenessProbe`                    | Kubernetes liveness probe configuration                                      | see `values.yaml`                 |
 | `readinessProbe`                   | Kubernetes readiness probe configuration                                     | see `values.yaml`                 |
 | `startupProbe`                     | Kubernetes startup probe configuration                                       | see `values.yaml`                 |
@@ -37,6 +58,7 @@ helm install spiceai deploy/chart \
 | `stateful.size`                    | PVC size                                                                     | `1Gi`                             |
 | `stateful.mountPath`               | Mount path in container                                                      | `/data`                           |
 | `monitoring.podMonitor.enabled`    | Create a PodMonitor for Prometheus                                           | `false`                           |
+| `monitoring.podMonitor.tlsConfig`  | Prometheus Operator `SafeTLSConfig` for the scrape; set: scrape over HTTPS   | `{}`                              |
 | `additionalLabels`                 | Labels added to all resources                                                | `{}`                              |
 | `additionalEnv`                    | Extra environment variables                                                  | `[]`                              |
 | `resources`                        | CPU/memory requests and limits                                               | `{}`                              |
@@ -53,17 +75,23 @@ helm install spiceai deploy/chart \
 A distributed cluster is two releases: one with `role: scheduler` and one with `role: executor` whose `cluster.schedulerAddress` points at the scheduler's Service. Both expose the cluster port, `50052` by default, and advertise their pod IP unless `cluster.advertiseAddress` is set. The scheduler's `spicepod` needs `runtime.state.location`:
 
 ```bash
+kubectl create secret generic spice-api-key --from-literal=api-key="$(openssl rand -hex 16)"
+
 helm install spice-scheduler deploy/chart \
   --set role=scheduler \
   --set cluster.tls.secretName=spice-cluster-tls \
+  --set auth.apiKey.existingSecret=spice-api-key \
   --set spicepod.runtime.state.location=s3://my-bucket/spice-state
 
 helm install spice-executor deploy/chart \
   --set role=executor \
   --set replicaCount=3 \
   --set cluster.schedulerAddress=https://spice-scheduler-spiceai:50052 \
-  --set cluster.tls.secretName=spice-cluster-tls
+  --set cluster.tls.secretName=spice-cluster-tls \
+  --set auth.apiKey.existingSecret=spice-api-key
 ```
+
+Both releases name the same `auth.apiKey.existingSecret`, so every node accepts the key that clients send to the scheduler.
 
 Cluster nodes authenticate each other with mTLS. The Secret holds `ca.crt`, `tls.crt`, and `tls.key`, the layout cert-manager writes, and each certificate must name the address its node is reached at: the scheduler Service host for the scheduler, and each node's advertise address. For development and testing on a trusted network, `cluster.allowInsecureConnections: true` runs the cluster without mTLS. The chart refuses to render a scheduler or executor with neither. An executor serves only `/health`, so its readiness probe checks `/health` in place of the default `/v1/ready`.
 

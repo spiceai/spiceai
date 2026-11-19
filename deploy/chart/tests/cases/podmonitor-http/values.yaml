@@ -1,0 +1,6 @@
+monitoring:
+  podMonitor:
+    enabled: true
+auth:
+  apiKey:
+    existingSecret: spice-key

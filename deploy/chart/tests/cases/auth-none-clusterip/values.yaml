@@ -1,0 +1,11 @@
+auth:
+  mode: none
+service:
+  type: ClusterIP
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  runtime:
+    allowed_hosts: [spice.corp.example]
+  datasets: []

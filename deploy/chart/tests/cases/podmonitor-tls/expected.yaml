@@ -1,0 +1,37 @@
+---
+# Source: spiceai/templates/podmonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: spiceai-podmonitor
+  labels:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+spec:
+  podMetricsEndpoints:
+  - interval: 10s
+    path: /metrics
+    scheme: https
+    tlsConfig:
+      ca:
+        secret:
+          key: ca.crt
+          name: spice-scrape-tls
+      cert:
+        secret:
+          key: tls.crt
+          name: spice-scrape-tls
+      keySecret:
+        key: tls.key
+        name: spice-scrape-tls
+    targetPort: 9090
+  selector:
+    matchLabels:      
+      app.kubernetes.io/name: spiceai
+      app.kubernetes.io/instance: spiceai
+      app: spiceai
