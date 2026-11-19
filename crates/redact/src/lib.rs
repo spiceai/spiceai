@@ -263,6 +263,7 @@ pub fn redact_message_credentials(message: &str) -> String {
         if prev.is_none_or(|p| !is_scheme_char(p))
             && let Some((redacted, len)) = redact_url_at(rest, true)
         {
+            let (redacted, len) = without_closing_parentheses(rest, redacted, len);
             out.push_str(&redacted);
             prev = redacted.chars().last();
             rest = &rest[len..];
@@ -273,6 +274,24 @@ pub fn redact_message_credentials(message: &str) -> String {
         rest = &rest[c.len_utf8()..];
     }
     out
+}
+
+/// The URL [`redact_url_at`] found at the start of `rest`, `len` bytes long, without the
+/// `)`s at its end that close a parenthesis opened before it: `for url (https://h/x)`, as
+/// errors from HTTP clients put it. A `)` is the URL's own while the URL opens as many as
+/// it closes (`https://h/wiki/Foo_(bar)`), the rule autolinkers use. Without this, a
+/// secret query value at the end of the URL would take the `)` with it when it is replaced.
+fn without_closing_parentheses(rest: &str, redacted: String, len: usize) -> (String, usize) {
+    let mut end = len;
+    while rest[..end].ends_with(')')
+        && rest[..end].matches(')').count() > rest[..end].matches('(').count()
+    {
+        end -= 1;
+    }
+    if end == len {
+        return (redacted, len);
+    }
+    redact_url_at(&rest[..end], true).unwrap_or((redacted, len))
 }
 
 #[cfg(test)]
@@ -361,5 +380,31 @@ mod tests {
             redact_message_credentials("GET https://h:8443?email=a@b.example failed"),
             "GET https://h:8443?email=a@b.example failed"
         );
+    }
+
+    /// The `)` that closes a parenthesis around a URL stays in the message, and one the URL
+    /// opened itself stays in the URL.
+    #[test]
+    fn redact_message_credentials_keeps_closing_parentheses() {
+        for (message, expected) in [
+            (
+                "error sending request for url (http://h:1/v1?api_key=K/chat/completions) Verify",
+                "error sending request for url (http://h:1/v1?api_key=***) Verify",
+            ),
+            (
+                "Error performing GET http://alice:pw@h:1/c?comp=list (after 3 retries)",
+                "Error performing GET http://h:1/c?comp=list (after 3 retries)",
+            ),
+            (
+                "(see https://u:p@h/x?token=abc)",
+                "(see https://h/x?token=***)",
+            ),
+            (
+                "docs at https://en.example.org/wiki/Foo_(bar) and (https://h/wiki/Foo_(bar))",
+                "docs at https://en.example.org/wiki/Foo_(bar) and (https://h/wiki/Foo_(bar))",
+            ),
+        ] {
+            assert_eq!(redact_message_credentials(message), expected, "{message}");
+        }
     }
 }

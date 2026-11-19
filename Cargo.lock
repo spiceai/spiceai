@@ -6290,6 +6290,7 @@ dependencies = [
  "object_store 0.13.2",
  "orc-rust",
  "paste",
+ "redact",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",
  "runtime-component",
@@ -6314,6 +6315,7 @@ name = "data-connector-types"
 version = "2.5.0-unstable"
 dependencies = [
  "globset",
+ "redact",
  "runtime-component",
  "snafu",
 ]
@@ -11890,6 +11892,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "rand 0.10.1",
+ "redact",
  "regex",
  "reqwest 0.13.4",
  "reqwest-eventsource",
@@ -18344,6 +18347,7 @@ dependencies = [
  "opentelemetry-proto 0.32.0",
  "opentelemetry_sdk 0.32.1",
  "parking_lot",
+ "redact",
  "reqwest 0.13.4",
  "snafu",
  "spicepod",
@@ -20542,6 +20546,7 @@ dependencies = [
  "prometheus",
  "prost 0.14.3",
  "rcgen",
+ "redact",
  "repl",
  "reqwest 0.13.4",
  "runtime",
