@@ -31,6 +31,18 @@ limitations under the License.
 //! reads both. Unlike llama-server, which probes a user message alone, each role is probed in
 //! a conversation of its own, so a template that reads a system message's first part gets the
 //! system message's parts joined instead of losing all but the first.
+//!
+//! A request may also send a system or developer message after the conversation has started,
+//! as Claude Code sends its environment after the first user message. Templates differ here
+//! too: Qwen3's renders such a message in place, Qwen3.5's renders only the system and
+//! developer messages the conversation starts with and leaves later ones out, and others raise
+//! `System message must be at the beginning`. The probe renders one after a user message, and
+//! for a template that does not render it there with its text, the message reaches the
+//! template as a user's: its text joined to the user message before it, after a blank line, or
+//! as a user message of its own when the message before it is not a user's. Its text keeps its
+//! place in the conversation, so the prompt before it is the one the same conversation renders
+//! without it. llama-server probes only a system message that starts the conversation, and
+//! sends a later one to the template as it came.
 
 use either::Either;
 use indexmap::IndexMap;
@@ -50,13 +62,27 @@ const PROBE_KEY: &str = "spice_content_probe";
 const ROLES: [&str; 5] = ["system", "developer", "user", "assistant", "tool"];
 const USER: usize = 2;
 
-/// What a model's chat templates read as a message's `content`: the template a request without
+/// The roles of [`ROLES`] that instruct the model, which a chat template may render only at the
+/// start of a conversation: `ROLES[0]` and `ROLES[1]`.
+const INSTRUCTIONS: usize = 2;
+
+/// What a model's chat templates read of a request's messages: the template a request without
 /// tools renders with, and the one a request with tools renders with. The two differ only for
 /// a model with named `default` and `tool_use` templates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContentSupport {
-    without_tools: RoleShapes,
-    with_tools: RoleShapes,
+    without_tools: TemplateReads,
+    with_tools: TemplateReads,
+}
+
+/// What one chat template reads of a request's messages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TemplateReads {
+    shapes: RoleShapes,
+    /// For each of the [`INSTRUCTIONS`] roles, whether a message of that role after the
+    /// conversation has started reaches the template as a user's, because the template does
+    /// not render it there. A template that was not probed gets it as it came.
+    later_as_user: [bool; INSTRUCTIONS],
 }
 
 /// What one chat template reads as the content of a message of each of [`ROLES`].
@@ -91,35 +117,102 @@ impl ContentSupport {
         render: impl Fn(Vec<IndexMap<String, MessageContent>>, bool) -> Option<String>,
     ) -> Self {
         Self {
-            without_tools: RoleShapes::probe(|messages| render(messages, false)),
-            with_tools: RoleShapes::probe(|messages| render(messages, true)),
+            without_tools: TemplateReads::probe(&|messages| render(messages, false)),
+            with_tools: TemplateReads::probe(&|messages| render(messages, true)),
         }
     }
 
-    /// Rewrites each message's `content` to a shape the template a request renders with reads
-    /// in full for the message's role; `with_tools` is whether the request offers tools.
-    pub fn rewrite(self, messages: &mut [IndexMap<String, MessageContent>], with_tools: bool) {
-        let shapes = if with_tools {
+    /// Rewrites a request's messages to ones the template it renders with reads in full: each
+    /// message's `content` in a shape the template reads for the message's role, and a system
+    /// or developer message after the conversation has started as a user's when the template
+    /// does not render it there. `with_tools` is whether the request offers tools.
+    pub fn rewrite(self, messages: &mut Vec<IndexMap<String, MessageContent>>, with_tools: bool) {
+        let reads = if with_tools {
             self.with_tools
         } else {
             self.without_tools
         };
-        for message in messages {
-            let role = match message.get("role") {
-                Some(Either::Left(role)) => ROLES.iter().position(|r| r == role),
-                _ => None,
-            };
-            let Shapes { strings, parts } = shapes.0[role.unwrap_or(USER)];
-            let Some(content) = message.get_mut("content") else {
+        for message in messages.iter_mut() {
+            let shapes = reads.shapes.0[role_of(message).unwrap_or(USER)];
+            if let Some(content) = message.get_mut("content") {
+                shapes.fit(content);
+            }
+        }
+        reads.place_later_instructions(messages);
+    }
+}
+
+impl TemplateReads {
+    /// Probes one chat template through `render`: the shapes of content it reads for each role,
+    /// and whether it renders a system or developer message after a user message.
+    fn probe(render: &impl Fn(Vec<IndexMap<String, MessageContent>>) -> Option<String>) -> Self {
+        let shapes = RoleShapes::probe(render);
+        let later_as_user = std::array::from_fn(|role| !shapes.renders_later(render, role));
+        Self {
+            shapes,
+            later_as_user,
+        }
+    }
+
+    /// Each system or developer message after the first message of any other role that this
+    /// template gets as a user's ([`Self::later_as_user`]): its text joined to the user message
+    /// before it, after a blank line, or the message itself as a user's when the message before
+    /// it is not a user's.
+    fn place_later_instructions(self, messages: &mut Vec<IndexMap<String, MessageContent>>) {
+        let is_instruction = |message: &IndexMap<String, MessageContent>| {
+            role_of(message).is_some_and(|role| role < INSTRUCTIONS)
+        };
+        let Some(start) = messages.iter().position(|m| !is_instruction(m)) else {
+            return;
+        };
+        let as_user = |message: &IndexMap<String, MessageContent>| {
+            role_of(message)
+                .and_then(|role| self.later_as_user.get(role))
+                .is_some_and(|as_user| *as_user)
+        };
+        if !messages.iter().skip(start).any(as_user) {
+            return;
+        }
+        let mut placed: Vec<IndexMap<String, MessageContent>> = Vec::with_capacity(messages.len());
+        for (index, mut message) in std::mem::take(messages).into_iter().enumerate() {
+            if index < start || !as_user(&message) {
+                placed.push(message);
                 continue;
-            };
-            *content = match (strings, parts, &*content) {
-                (true, false, Either::Right(sent)) => Either::Left(joined_text(sent)),
-                (false, true, Either::Left(text)) => text_parts([text.as_str()]),
-                // A template that reads both takes each message as it came, and one that reads
-                // neither fails on it either way.
-                _ => continue,
-            };
+            }
+            let text = message.get("content").map(content_text).unwrap_or_default();
+            match placed.last_mut() {
+                Some(before) if role_of(before) == Some(USER) => join_text(before, &text),
+                _ => {
+                    message.insert("role".to_string(), Either::Left(ROLES[USER].to_string()));
+                    if let Some(content) = message.get_mut("content") {
+                        self.shapes.0[USER].fit(content);
+                    }
+                    placed.push(message);
+                }
+            }
+        }
+        *messages = placed;
+    }
+}
+
+impl Shapes {
+    /// Rewrites `content` to a shape a template that reads `self` reads in full.
+    fn fit(self, content: &mut MessageContent) {
+        *content = match (self.strings, self.parts, &*content) {
+            (true, false, Either::Right(sent)) => Either::Left(joined_text(sent)),
+            (false, true, Either::Left(text)) => text_parts([text.as_str()]),
+            // A template that reads both takes each message as it came, and one that reads
+            // neither fails on it either way.
+            _ => return,
+        };
+    }
+
+    /// `text` in a shape a template that reads `self` reads: a string, unless it reads only parts.
+    fn content(self, text: &str) -> MessageContent {
+        if !self.strings && self.parts {
+            text_parts([text])
+        } else {
+            Either::Left(text.to_string())
         }
     }
 }
@@ -129,7 +222,7 @@ impl RoleShapes {
     /// as a string and as two parts in that role's message. A role whose conversation the
     /// template renders in neither shape, as Gemma 3's refuses a `tool` message, is taken to
     /// read what a user message reads.
-    fn probe(render: impl Fn(Vec<IndexMap<String, MessageContent>>) -> Option<String>) -> Self {
+    fn probe(render: &impl Fn(Vec<IndexMap<String, MessageContent>>) -> Option<String>) -> Self {
         let mut probed = ROLES.map(|role| {
             let strings = render(conversation(role, Either::Left(MARKERS[0].to_string())))
                 .is_some_and(|prompt| prompt.contains(MARKERS[0]));
@@ -146,18 +239,69 @@ impl RoleShapes {
         }
         Self(probed)
     }
+
+    /// Whether the template renders, with its text, a message of `ROLES[role]` that follows a
+    /// user message, in a conversation that starts with a system message as Claude Code's does.
+    /// Each message is in a shape the template reads for its role.
+    fn renders_later(
+        self,
+        render: &impl Fn(Vec<IndexMap<String, MessageContent>>) -> Option<String>,
+        role: usize,
+    ) -> bool {
+        let hi = || message(ROLES[USER], self.0[USER].content("Hi"));
+        let conversation = vec![
+            message(ROLES[0], self.0[0].content("Be brief.")),
+            hi(),
+            message(ROLES[role], self.0[role].content(MARKERS[0])),
+            hi(),
+        ];
+        render(conversation).is_some_and(|prompt| prompt.contains(MARKERS[0]))
+    }
+}
+
+/// The index in [`ROLES`] of `message`'s role, `None` for any other role.
+fn role_of(message: &IndexMap<String, MessageContent>) -> Option<usize> {
+    match message.get("role") {
+        Some(Either::Left(role)) => ROLES.iter().position(|r| r == role),
+        _ => None,
+    }
+}
+
+/// A message of `role` with `content`.
+fn message(role: &str, content: MessageContent) -> IndexMap<String, MessageContent> {
+    IndexMap::from([
+        ("role".to_string(), Either::Left(role.to_string())),
+        ("content".to_string(), content),
+    ])
+}
+
+/// The text of a message's content: a string as it is, and text parts joined with newlines.
+fn content_text(content: &MessageContent) -> String {
+    match content {
+        Either::Left(text) => text.clone(),
+        Either::Right(parts) => joined_text(parts),
+    }
+}
+
+/// Joins `text` to `message`'s content after a blank line: to its string, or as a text part
+/// after its parts, which a template renders one after another.
+fn join_text(message: &mut IndexMap<String, MessageContent>, text: &str) {
+    match message.get_mut("content") {
+        Some(Either::Left(content)) => {
+            content.push_str("\n\n");
+            content.push_str(text);
+        }
+        Some(Either::Right(parts)) => parts.push(text_part(format!("\n\n{text}"))),
+        None => {
+            message.insert("content".to_string(), Either::Left(text.to_string()));
+        }
+    }
 }
 
 /// A conversation in which the message of `role` has `content`, and which a chat template
 /// renders as it renders a request's: a system or developer message before a user message,
 /// an assistant message between user messages, and a tool message after an assistant's call.
 fn conversation(role: &str, content: MessageContent) -> Vec<IndexMap<String, MessageContent>> {
-    let message = |role: &str, content: MessageContent| {
-        IndexMap::from([
-            ("role".to_string(), Either::Left(role.to_string())),
-            ("content".to_string(), content),
-        ])
-    };
     let hi = || message("user", Either::Left("Hi".to_string()));
     match role {
         "system" | "developer" => vec![message(role, content), hi()],
@@ -202,14 +346,17 @@ pub(crate) fn text_parts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Messag
     Either::Right(
         texts
             .into_iter()
-            .map(|text| {
-                IndexMap::from([
-                    ("type".to_string(), Value::String("text".to_string())),
-                    ("text".to_string(), Value::String(text.to_string())),
-                ])
-            })
+            .map(|text| text_part(text.to_string()))
             .collect(),
     )
+}
+
+/// `text` as a text part.
+fn text_part(text: String) -> IndexMap<String, Value> {
+    IndexMap::from([
+        ("type".to_string(), Value::String("text".to_string())),
+        ("text".to_string(), Value::String(text)),
+    ])
 }
 
 /// The text of a message's text parts, joined with newlines, as llama-server joins them for a

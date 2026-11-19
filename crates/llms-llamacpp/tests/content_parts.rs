@@ -33,7 +33,7 @@ use crate::{fixture, harmony, mtp::qwen35_gguf, prefix_reuse::gemma_gguf, qwen3_
 const A: &str = "The secret word is PLUM.";
 const B: &str = "Be brief.";
 
-async fn load(gguf: &Path, name: &'static str) -> LlamaCpp {
+pub(crate) async fn load(gguf: &Path, name: &'static str) -> LlamaCpp {
     LlamaCpp::from(
         &[gguf.to_path_buf()],
         LocalModelOptions {
@@ -203,7 +203,7 @@ async fn gemma_3_gets_a_system_message_s_parts_joined() {
 
 /// Qwen3-0.6B with the chat template in `file` (a `.jinja` file or a `tokenizer_config.json`),
 /// written in `scratch` with `contents`.
-async fn with_template(scratch: &Path, file: &str, contents: &str) -> LlamaCpp {
+pub(crate) async fn with_template(scratch: &Path, file: &str, contents: &str) -> LlamaCpp {
     let file = scratch.join(file);
     std::fs::write(&file, contents).expect("the template writes");
     LlamaCpp::from(
