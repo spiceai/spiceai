@@ -34,10 +34,12 @@ use std::{
 
 use async_openai::{
     error::{ApiError, OpenAIError},
-    middleware::{HttpRequestFactory, ReqwestService},
+    middleware::HttpRequestFactory,
 };
 use reqwest::{Response, StatusCode};
 use serde::Deserialize;
+
+use crate::model_http::BoundedService;
 
 /// The error body that xAI returns for a refused request.
 #[derive(Debug, Deserialize)]
@@ -73,20 +75,18 @@ fn error_type(status: StatusCode) -> &'static str {
     }
 }
 
-/// Wraps [`ReqwestService`] and turns an xAI error response into [`OpenAIError::ApiError`].
+/// Wraps [`BoundedService`] and turns an xAI error response into [`OpenAIError::ApiError`].
 ///
 /// A failed response with a body in another shape is given back unchanged, for `async-openai`
 /// to read as usual.
 #[derive(Clone, Debug)]
 pub(super) struct XaiErrorService {
-    inner: ReqwestService,
+    inner: BoundedService,
 }
 
 impl XaiErrorService {
-    pub(super) fn new(http_client: reqwest::Client) -> Self {
-        Self {
-            inner: ReqwestService::new(http_client),
-        }
+    pub(super) fn new(inner: BoundedService) -> Self {
+        Self { inner }
     }
 }
 
