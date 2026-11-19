@@ -4,8 +4,7 @@ description: >
   (Redpanda), and Spice follows the topic (`from: debezium:`): the initial
   snapshot, inserts, updates and deletes are applied once each, and the
   Cayenne acceleration answers as PostgreSQL does, before and after spiced
-  restarts. (An Arrow acceleration of the topic fails to start:
-  known-failing/debezium/debezium-kafka-arrow.yaml.)
+  restarts.
 
 sources:
   src: { kind: postgres }

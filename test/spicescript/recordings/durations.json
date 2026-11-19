@@ -38,6 +38,7 @@
   "databricks-credentials": 1,
   "debezium-direct": 10,
   "debezium-kafka": 118,
+  "debezium-kafka-arrow": 59,
   "debezium-offset-recovery": 89,
   "derived-table-scopes": 14,
   "distinct-on-scopes": 5,

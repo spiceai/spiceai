@@ -1,11 +1,11 @@
-# Known failing (#15495).
 name: debezium-kafka-arrow
 description: >
-  An Arrow acceleration of a Debezium topic in Kafka (`from: debezium:`)
-  starts and answers as PostgreSQL does after the snapshot and later changes.
-  (It fails to start: "Unable to restart Kafka offsets Failed to set partition
-  in list: Set partition offset error: UnknownPartition", on every run; the
-  same topic accelerated into Cayenne starts.)
+  An Arrow acceleration in memory of a Debezium topic in Kafka (`from:
+  debezium:`) starts and answers as PostgreSQL does after the snapshot and
+  later changes. Its consumer group is named, so after spiced restarts the
+  group has committed offsets while the acceleration is empty: the dataset
+  reads the topic from the beginning again and still answers as PostgreSQL
+  does.
 
 sources:
   src: { kind: postgres }
@@ -38,6 +38,7 @@ spicepod:
       params:
         kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
         kafka_security_protocol: plaintext
+        kafka_consumer_group_id: spice-${sources.src.namespace}
       acceleration: { enabled: true, engine: arrow, mode: memory, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
 
 defaults:
@@ -96,3 +97,9 @@ steps:
     eventually: 60s
   - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM t
     expect: { rows: [['0']] }
+
+  # The acceleration is in memory, so spiced restarts with it empty while the
+  # consumer group holds committed offsets.
+  - restart: {}
+  - query: SELECT * FROM t
+    eventually: 60s
