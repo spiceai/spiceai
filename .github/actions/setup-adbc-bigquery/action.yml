@@ -7,7 +7,7 @@ inputs:
       Commit of spiceai/bigquery to build the driver from: upstream go/v1.15.0
       plus the Spice patches docs/dev/fork_patches.md lists.
     required: false
-    default: 'cde50558ad9b77d7d29ff7cce163c4d87ce4c054'
+    default: '1fb52b8c743badcd98a3331233d9dd32262d59c1'
   go_version:
     description: >-
       Go version to build the driver with. Must satisfy the `go` directive in the
