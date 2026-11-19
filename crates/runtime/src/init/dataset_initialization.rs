@@ -247,7 +247,16 @@ impl DatasetInitialization {
                     match builder().await {
                         Ok(connector) => connector,
                         Err(source) => {
-                            let err = RuntimeError::UnableToInitializeDataConnector { source };
+                            // The production builder already returns a boxed `RuntimeError`
+                            // (`UnableToInitializeDataConnector` for a factory failure); keep
+                            // it as is, so the classifier sees the factory's own error and a
+                            // configuration failure stays permanent.
+                            let err = match source.downcast::<RuntimeError>() {
+                                Ok(err) => *err,
+                                Err(source) => {
+                                    RuntimeError::UnableToInitializeDataConnector { source }
+                                }
+                            };
                             if !is_permanent_dataset_failure(&err) {
                                 *retry = Some(Self {
                                     dataset: Arc::clone(&dataset),
@@ -704,6 +713,29 @@ mod tests {
                 dataconnector: "test".to_string(),
                 connector_component: component.clone(),
                 message: "endpoint is required".to_string(),
+            })
+        });
+
+        let failure = match plan(&runtime, &dataset, builder).initialize_retriable().await {
+            Ok(_) => panic!("the attempt must fail"),
+            Err(failure) => failure,
+        };
+        assert!(failure.retry.is_none(), "a configuration error has no retry");
+    }
+
+    /// The production builder boxes a `RuntimeError`; a configuration error inside it stays
+    /// permanent rather than being wrapped and read as an unavailable source.
+    #[tokio::test]
+    async fn a_boxed_runtime_error_from_the_builder_keeps_its_classification() {
+        let (runtime, dataset) = ready_deferred_dataset().await;
+        let component = ConnectorComponent::from(dataset.as_ref());
+        let (builder, _) = failing_then_serving(usize::MAX, move || {
+            Box::new(crate::Error::UnableToInitializeDataConnector {
+                source: Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "test".to_string(),
+                    connector_component: component.clone(),
+                    message: "endpoint is required".to_string(),
+                }),
             })
         });
 
