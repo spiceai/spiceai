@@ -1320,7 +1320,7 @@ mod tests {
             "an install with nowhere to go must fail the dataset rather than let it \
              report Ready while its table is unqueryable"
         );
-        assert!(schema.table_names().is_empty());
+        assert_eq!(schema.table_names(), [] as [String; 0]);
         assert!(schema.providers.read().is_empty());
     }
 
@@ -1351,7 +1351,7 @@ mod tests {
             "removed table must not resolve"
         );
         assert!(schema.table("orders").await.expect("lookup").is_none());
-        assert!(schema.table_names().is_empty());
+        assert_eq!(schema.table_names(), [] as [String; 0]);
     }
 
     #[test]

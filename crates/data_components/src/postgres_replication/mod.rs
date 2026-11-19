@@ -47,7 +47,7 @@ pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as Replication
 pub use pgwire_replication::{CaCertificate, PgOutputFormat};
 pub use retention::{SlotRemoval, SlotRetentionPosture};
 pub use slot::{SlotInfo, SlotSetupOutcome};
-pub use xid_registry::{XactStatus, XidEntry, XidRegistry};
+pub use xid_registry::{EchoKeys, EchoReadGuard, XactStatus, XidEntry, XidRegistry};
 
 /// Extracts a human-readable message from a `tokio_postgres::Error`.
 ///
@@ -921,7 +921,6 @@ pub struct ReplicationStreamInput {
 /// Back-pressure: the returned stream waits for each envelope's `commit()` to
 /// complete before emitting the next one, so the accelerator's write throughput
 /// naturally paces the replication stream.
-#[must_use]
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
     // Uses the policy already set on `input` (the connector maps the dataset's
     // `on_schema_change`); construct with `policy: SchemaEvolutionPolicy::Block`
@@ -945,7 +944,6 @@ pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream 
 /// per-member [`schema_evolution::RelationSchemaTracker`] for all datasets,
 /// slot-sharing or not. `input.params.shared` governs only slot/publication
 /// naming, not which pump runs.
-#[must_use]
 pub fn start_replication_stream_with_policy(
     mut input: ReplicationStreamInput,
     policy: SchemaEvolutionPolicy,

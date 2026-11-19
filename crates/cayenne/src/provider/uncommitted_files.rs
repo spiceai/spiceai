@@ -328,7 +328,7 @@ mod tests {
                 .contains(&("s2".to_string(), "c.vortex".to_string()))
         );
         files.forget("s1");
-        assert!(files.files("s1").is_empty());
+        assert_eq!(files.files("s1"), [] as [(String, u64); 0]);
         assert!(!files.holds_snapshot("s1"));
         assert_eq!(files.snapshots(), HashSet::from(["s2".to_string()]));
     }

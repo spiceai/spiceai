@@ -613,9 +613,34 @@ impl MetadataCatalog for ObjectNativeCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         cold_files: &[ColdTierFile],
+        retain_tombstones_above: Option<i64>,
     ) -> CatalogResult<()> {
         self.for_table(table_id)
-            .commit_overwrite_to_cold(table_id, new_snapshot_id, cold_files)
+            .commit_overwrite_to_cold(
+                table_id,
+                new_snapshot_id,
+                cold_files,
+                retain_tombstones_above,
+            )
+            .await
+    }
+    async fn swap_cold_tier_files(
+        &self,
+        table_id: &str,
+        removed_file_urls: &[String],
+        added: &[ColdTierFile],
+    ) -> CatalogResult<bool> {
+        self.for_table(table_id)
+            .swap_cold_tier_files(table_id, removed_file_urls, added)
+            .await
+    }
+    async fn clear_key_tombstones_at_or_below(
+        &self,
+        table_id: &str,
+        cutoff: i64,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .clear_key_tombstones_at_or_below(table_id, cutoff)
             .await
     }
     async fn upsert_pk_index(

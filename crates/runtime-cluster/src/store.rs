@@ -1142,7 +1142,7 @@ mod tests {
             .await
             .expect("get")
             .expect("exists");
-        assert!(metadata.partitions.is_empty());
+        assert_eq!(metadata.partitions, [] as [PartitionMetadata; 0]);
     }
 
     #[tokio::test]

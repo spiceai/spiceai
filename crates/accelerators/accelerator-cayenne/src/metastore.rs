@@ -283,9 +283,9 @@ impl CayenneAccelerator {
     /// object-native metastore is left as it is. With the flag on, a new dataset goes
     /// to the object-native metastore and one already on SQLite is an error naming
     /// the dataset and the fix, except under `mode: file_create`, which recreates it
-    /// from its source in the object-native metastore. A partitioned dataset, and
-    /// every dataset of a cluster scheduler or executor, stays on SQLite under the
-    /// flag.
+    /// from its source in the object-native metastore. Every dataset of a cluster
+    /// scheduler or executor stays on SQLite under the flag; outside a cluster a
+    /// partitioned dataset is refused under it.
     pub(super) async fn metastore_type_for(
         &self,
         source: &dyn AccelerationSource,
@@ -296,6 +296,7 @@ impl CayenneAccelerator {
             return Ok(Metastore::Sqlite);
         }
         let requested = Self::vnext_enabled(source)?;
+        self.ensure_partition_by_supported(source)?;
         // A cluster scheduler or executor keeps SQLite under the flag. The
         // executors of a cluster share `runtime.state.location`, while the
         // object-native metastore allows one writer per dataset log, so each
@@ -309,7 +310,7 @@ impl CayenneAccelerator {
         let partitioned = source
             .acceleration()
             .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
-        if vnext && !partitioned {
+        if vnext {
             let location_supported = url::Url::parse(
                 &effective_state_location(&source.app())?.location,
             )
@@ -345,13 +346,8 @@ impl CayenneAccelerator {
                 .catalog_holds(metadata_dir, Metastore::Sqlite, source, &table_name)
                 .await?;
         if in_sqlite {
-            // A partitioned dataset stays on SQLite under the flag (below), so
-            // finding it there is where it belongs, not an acceleration to move.
-            if partitioned && vnext {
-                self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support `partition_by` yet.");
-            }
             ensure!(
-                !vnext || recreated || partitioned,
+                !vnext || recreated,
                 InvalidConfigurationSnafu {
                     detail: Arc::from(format!(
                         "Dataset '{table_name}' is accelerated in the SQLite Cayenne metastore, but `runtime.params.{CAYENNE_VNEXT_PARAM}` is enabled, and an existing acceleration is not moved to the object-native metastore. Set `runtime.params.{CAYENNE_VNEXT_PARAM}: disabled` to keep serving it, or start it once with `acceleration.mode: file_create` to reload it from its source into the object-native metastore."
@@ -380,21 +376,18 @@ impl CayenneAccelerator {
                 }
             );
         }
-        if partitioned {
-            // The object-native metastore does not hold partitioned tables yet.
-            // One already in it is refused rather than moved to a new, empty
-            // SQLite table that would strand its rows.
-            ensure!(
-                !in_native,
-                InvalidConfigurationSnafu {
-                    detail: Arc::from(format!(
-                        "Dataset '{table_name}' is in the object-native Cayenne metastore, which does not support `partition_by` yet. Remove `partition_by` to keep serving it, or delete its acceleration so it rebuilds on SQLite."
-                    )),
-                }
-            );
-            self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support `partition_by` yet.");
-            return Ok(Metastore::Sqlite);
-        }
+        // The object-native metastore does not hold partitioned tables yet. One that
+        // gained `partition_by` while in it (outside a cluster it is refused above
+        // with the flag on) is refused rather than moved to a new, empty SQLite table
+        // that would strand its rows.
+        ensure!(
+            !partitioned,
+            InvalidConfigurationSnafu {
+                detail: Arc::from(format!(
+                    "Dataset '{table_name}' is in the object-native Cayenne metastore, which does not support `partition_by` yet. Remove `partition_by` to keep serving it, or delete its acceleration so it rebuilds on SQLite."
+                )),
+            }
+        );
         // `mode: file_create` with the flag disabled drops the object-native copy
         // and recreates the table, which then lands in SQLite.
         Ok(Metastore::ObjectNative)

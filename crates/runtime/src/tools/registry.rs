@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use snafu::{ResultExt, Snafu};
 use tokio::sync::OnceCell;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 use tracing_futures::Instrument;
 
 use crate::{
@@ -57,6 +57,8 @@ static TOOL_REGISTRY_SEARCH_TOOL_CACHE: LazyLock<
 struct ToolRegistrySearchCacheKey {
     runtime_id: usize,
     embedding_model_name: String,
+    /// The loaded model instance, which a Spicepod change to the model replaces.
+    embedding_model_id: usize,
     tools_hash: u64,
 }
 
@@ -322,6 +324,7 @@ async fn cached_tool_registry_search_tool(
     let key = ToolRegistrySearchCacheKey {
         runtime_id: Arc::as_ptr(rt).addr(),
         embedding_model_name: embedding_model_name.to_string(),
+        embedding_model_id: Arc::as_ptr(&embedding_model).cast::<()>().addr(),
         tools_hash: tool_registry_tools_hash(&tools),
     };
 
@@ -435,7 +438,12 @@ impl SpiceModelTool for ToolRegistrySearchTool {
         parameters::<ToolSearchParams>()
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Searches the registry's tool descriptions.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::tool_search", tool = self.name().to_string(), input = arg);
 
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
@@ -528,7 +536,13 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
         parameters::<ToolInvokeParams>()
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Calls the tool it resolves through that tool's own `call`, which authorizes the caller for
+    /// that tool, so the meta-tool needs no access of its own.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::tool_invoke", tool = self.name().to_string(), input = arg);
 
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
@@ -1250,11 +1264,44 @@ mod tests {
             Some(self.parameters.clone())
         }
 
-        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             if let Ok(mut received_args) = self.received_args.lock() {
                 received_args.push(arg.to_string());
             }
             Ok(self.response.clone())
+        }
+    }
+
+    /// A read-write tool, as an MCP server's tools are, counting the calls that reach it.
+    struct WriteTool {
+        runs: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SpiceModelTool for WriteTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("probe__send_alert")
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("Send an alert"))
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({"type": "object"}))
+        }
+
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadWrite
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!("sent"))
         }
     }
 
@@ -1276,10 +1323,11 @@ mod tests {
             Some(json!({"type": "object"}))
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Err("tool failed".into())
         }
     }
@@ -1709,6 +1757,64 @@ mod tests {
                 .to_string()
                 .contains("Failed to invoke tool 'failing' from searchable registry")
         );
+    }
+
+    /// `tool_invoke` only reads, so any caller may call it, but the tool it resolves is held to
+    /// its own access: a read-write tool is refused to a caller without write access — the
+    /// refusal reaches the caller as the cause of the failed invocation — and runs for one with
+    /// write access.
+    #[tokio::test]
+    async fn invoke_holds_the_selected_tool_to_its_access() {
+        use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+        use runtime_request_context::{Protocol, RequestContext};
+        use spicepod::component::runtime::ApiKey;
+
+        let write_tool = Arc::new(WriteTool {
+            runs: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let advertised_tools = tool_registry_tools(
+            vec![Arc::clone(&write_tool) as Arc<dyn SpiceModelTool>],
+            mock_embed(),
+        );
+        let invoke_tool = advertised_tools
+            .iter()
+            .find(|tool| tool.name() == TOOL_INVOKE_NAME)
+            .expect("tool_invoke should be advertised");
+        let invocation = r#"{"tool_id":"probe__send_alert","arguments":{}}"#;
+        let as_key = |key: &str| {
+            let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+            let principal: AuthPrincipalRef = Arc::new(ApiKey::parse_str(key));
+            context
+                .set_auth_principal(principal)
+                .expect("a new request has no principal yet");
+            context
+        };
+
+        let error = as_key("reader")
+            .scope(invoke_tool.call(invocation))
+            .await
+            .expect_err("a read-only key is refused the read-write tool");
+        assert_eq!(
+            ::tools::ToolCallDenied::find(error.as_ref()).map(ToString::to_string),
+            Some("Failed to call tool 'probe__send_alert': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth".to_string()),
+            "unexpected error: {error}"
+        );
+        invoke_tool
+            .call(invocation)
+            .await
+            .expect_err("a request with no principal is refused the read-write tool");
+        assert_eq!(
+            write_tool.runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused call must not reach the tool"
+        );
+
+        let result = as_key("writer:rw")
+            .scope(invoke_tool.call(invocation))
+            .await
+            .expect("a read-write key may call it");
+        assert_eq!(result.get("result"), Some(&json!("sent")));
+        assert_eq!(write_tool.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

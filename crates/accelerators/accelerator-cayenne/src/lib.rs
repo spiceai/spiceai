@@ -300,6 +300,11 @@ pub enum Error {
         path: Option<String>,
     },
 
+    /// `acceleration.partition_by` on a file-mode dataset with
+    /// `runtime.params.cayenne_vnext` enabled.
+    #[snafu(display("{}", partition_by_under_vnext_refusal(dataset)))]
+    PartitionByUnderVnextRefused { dataset: Arc<str> },
+
     #[snafu(display(
         "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
     ))]
@@ -3913,6 +3918,7 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         Self::ensure_data_path_supported(source)?;
+        self.ensure_partition_by_supported(source)?;
         if let Some(acceleration) = source.acceleration() {
             // Validate S3 Express One Zone configuration - only one method allowed
             let has_s3_zone_ids = acceleration.params.contains_key("cayenne_s3_zone_ids");
@@ -5234,6 +5240,16 @@ fn object_store_data_path_refusal(dataset: &str, path: Option<&str>) -> String {
     )
 }
 
+/// The text of [`Error::PartitionByUnderVnextRefused`]: with `runtime.params.cayenne_vnext`
+/// enabled, a file-mode dataset cannot set `partition_by` yet.
+fn partition_by_under_vnext_refusal(dataset: &str) -> String {
+    format!(
+        "Failed to load dataset '{dataset}' (cayenne): `acceleration.partition_by` is not supported yet with `runtime.params.cayenne_vnext` enabled. \
+        Remove `partition_by` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 impl CayenneAccelerator {
     /// Refuses a file-mode dataset whose own data would be in an object store (an
     /// `s3://` `cayenne_file_path`, S3 Express included, or `cayenne_s3_zone_ids`)
@@ -5259,6 +5275,28 @@ impl CayenneAccelerator {
             .fail(),
             None => Ok(()),
         }
+    }
+
+    /// Refuses a file-mode dataset that sets `partition_by` while
+    /// `runtime.params.cayenne_vnext` is enabled outside a cluster. The object-native
+    /// metastore does not hold partitioned tables, and such a table, kept on SQLite
+    /// with its data files read and written through the local object store, misses
+    /// rows its change stream applied (#16308). A cluster scheduler or executor keeps
+    /// every dataset on SQLite under the flag and is not refused.
+    fn ensure_partition_by_supported(&self, source: &dyn AccelerationSource) -> Result<()> {
+        let partitioned = source
+            .acceleration()
+            .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
+        if !partitioned || !source.is_file_accelerated() || self.cluster_role.is_some() {
+            return Ok(());
+        }
+        ensure!(
+            !Self::vnext_enabled(source)?,
+            PartitionByUnderVnextRefusedSnafu {
+                dataset: Arc::from(source.name().to_string()),
+            }
+        );
+        Ok(())
     }
     /// Deletes every object under the object-store data path `data_dir` through
     /// the dataset's store, for `mode: file_create`, and returns how many it deleted.
@@ -5877,7 +5915,10 @@ mod tests {
         )
         .expect("disabled maintained aggregate config should parse");
 
-        assert!(specs.is_empty());
+        assert_eq!(
+            specs,
+            [] as [cayenne::maintained_aggregate::MaintainedAggregateSpec; 0]
+        );
     }
 
     #[test]
@@ -6749,6 +6790,77 @@ mod tests {
                 .expect("a local data path loads with the flag off"),
             "/var/spice/data/orders/"
         );
+    }
+
+    /// With `runtime.params.cayenne_vnext` enabled outside a cluster, a file-mode
+    /// dataset that sets `partition_by` fails to load before anything is opened, with
+    /// a message naming the dataset and the fix. A cluster executor keeps it on
+    /// SQLite, and with the flag off, in memory mode, or without `partition_by` the
+    /// check lets it through.
+    #[tokio::test]
+    async fn partition_by_is_refused_under_the_flag() {
+        let partitioned = |flag: &str, mode: Mode| {
+            let mut source = data_path_source(flag, &[]);
+            source.set_acceleration(Acceleration {
+                engine: Engine::Cayenne,
+                mode,
+                partition_by: vec![spicepod::partitioning::PartitionedBy {
+                    name: "bucket".to_string(),
+                    expression: "bucket(4, id)".to_string(),
+                }],
+                ..Default::default()
+            });
+            source
+        };
+        let expected = "Failed to load dataset 'orders' (cayenne): `acceleration.partition_by` is not supported yet with `runtime.params.cayenne_vnext` enabled. Remove `partition_by` from the dataset, or set `runtime.params.cayenne_vnext: disabled`. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
+
+        let source = partitioned("enabled", Mode::File);
+        let accelerator = CayenneAccelerator::new();
+        let error = accelerator
+            .validate_init(&source)
+            .await
+            .expect_err("partition_by is refused under the flag");
+        assert_eq!(error.to_string(), expected);
+        let error = accelerator
+            .metastore_type_for(&source, "/nonexistent/metadata")
+            .await
+            .expect_err("the metastore choice refuses it too");
+        assert_eq!(error.to_string(), expected);
+
+        let executor =
+            CayenneAccelerator::from_runtime_config(&data_accelerator_api::CayenneRuntimeConfig {
+                footer_cache_mb: None,
+                cluster_role: Some(runtime_component::ClusterRole::Executor),
+            });
+        executor
+            .ensure_partition_by_supported(&source)
+            .expect("a cluster executor is not refused");
+        assert_eq!(
+            executor
+                .metastore_type_for(&source, "/nonexistent/metadata")
+                .await
+                .expect("a cluster executor keeps a partitioned dataset"),
+            crate::metastore::Metastore::Sqlite
+        );
+
+        for (source, why) in [
+            (
+                partitioned("disabled", Mode::File),
+                "a partitioned dataset loads with the flag off",
+            ),
+            (
+                partitioned("enabled", Mode::Memory),
+                "memory mode keeps no data files, so the flag does not apply",
+            ),
+            (
+                data_path_source("enabled", &[]),
+                "an unpartitioned dataset loads under the flag",
+            ),
+        ] {
+            accelerator
+                .ensure_partition_by_supported(&source)
+                .expect(why);
+        }
     }
 
     /// Under `runtime.params.cayenne_vnext`, a standard S3 data path is accepted so
@@ -9326,7 +9438,10 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(first[0].contains("sets `cayenne_tuning`"), "{first:?}");
         // A repeat (an init retry, or a reload that changed nothing) does not.
-        assert!(unreported_retired_param_warnings(TABLE, &params(&["cayenne_tuning"])).is_empty());
+        assert_eq!(
+            unreported_retired_param_warnings(TABLE, &params(&["cayenne_tuning"])),
+            [] as [String; 0]
+        );
         // A retired key newly added to the existing table warns; the old one stays quiet.
         let added =
             unreported_retired_param_warnings(TABLE, &params(&["cayenne_tuning", "goal_qph"]));
@@ -9339,8 +9454,9 @@ mod tests {
             1
         );
         // No retired key, nothing to report.
-        assert!(
-            unreported_retired_param_warnings(TABLE, &params(&["cayenne_file_path"])).is_empty()
+        assert_eq!(
+            unreported_retired_param_warnings(TABLE, &params(&["cayenne_file_path"])),
+            [] as [String; 0]
         );
     }
 
@@ -10489,7 +10605,7 @@ mod tests {
         let options = datalake_test_options(vec!["id".to_string()], config);
         let warnings = validate_datalake_table_options("dl_t", &options)
             .expect("inferred sort columns must not conflict with explicit clustering");
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [String; 0]);
     }
 
     #[test]

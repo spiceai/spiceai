@@ -888,6 +888,7 @@ impl MetadataCatalog for Domain {
         table_id: &str,
         new_snapshot_id: &str,
         cold_files: &[ColdTierFile],
+        retain_tombstones_above: Option<i64>,
     ) -> CatalogResult<()> {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
@@ -898,9 +899,92 @@ impl MetadataCatalog for Domain {
                 inner.blob(bloom).await?;
             }
         }
-        let mut batch = actions::overwrite_clear(table_id, new_snapshot_id);
+        let mut batch = match retain_tombstones_above {
+            None => actions::overwrite_clear(table_id, new_snapshot_id),
+            // Keep the key-based deletion vectors above the cutoff, which may still
+            // hide superseded rows of the carried-forward datalake files; every
+            // position-based one names a warm file this clear retires. The vectors
+            // are listed from the state this writer holds, which the commit is
+            // conditioned on, so none committed since can be missed.
+            Some(cutoff) => {
+                let removed: Vec<String> = inner
+                    .table(table_id)?
+                    .delete_files
+                    .values()
+                    .filter(|dv| dv.source.is_some() || dv.seq <= cutoff)
+                    .map(|dv| dv.id.clone())
+                    .collect();
+                actions::overwrite_clear_retaining(table_id, new_snapshot_id, &removed, cutoff)
+            }
+        };
         batch.push(actions::add_cold(ObjRef::of, table_id, cold_files));
         inner.commit(batch).await
+    }
+    async fn swap_cold_tier_files(
+        &self,
+        table_id: &str,
+        removed_file_urls: &[String],
+        added: &[ColdTierFile],
+    ) -> CatalogResult<bool> {
+        validate_uuid("table_id", table_id)?;
+        let mut inner = self.inner.take().await;
+        let table = inner.table(table_id)?;
+        if removed_file_urls.is_empty()
+            || removed_file_urls
+                .iter()
+                .any(|url| !table.cold.contains_key(url))
+        {
+            return Ok(false);
+        }
+        // The manifest is rewritten whole, from the state this writer holds,
+        // which the commit is conditioned on: the files the swap keeps, then the
+        // files it adds.
+        let kept: Vec<proto::ColdEntry> = table
+            .cold
+            .values()
+            .filter(|entry| !removed_file_urls.contains(&entry.url))
+            .cloned()
+            .collect();
+        for file in added {
+            inner.blob(&file.statistics_blob).await?;
+            if let Some(bloom) = &file.pk_bloom {
+                inner.blob(bloom).await?;
+            }
+        }
+        inner
+            .commit(vec![
+                Action::new(Kind::ClearColdFiles(actions::table(table_id))),
+                Action::new(Kind::AddColdFiles(proto::AddColdFiles {
+                    table_id: table_id.to_string(),
+                    files: kept,
+                })),
+                actions::add_cold(ObjRef::of, table_id, added),
+            ])
+            .await?;
+        Ok(true)
+    }
+    async fn clear_key_tombstones_at_or_below(
+        &self,
+        table_id: &str,
+        cutoff: i64,
+    ) -> CatalogResult<()> {
+        validate_uuid("table_id", table_id)?;
+        let mut inner = self.inner.take().await;
+        // Listed from the state this writer holds, which the commit is
+        // conditioned on; position-based vectors are kept.
+        let removed: Vec<String> = inner
+            .table(table_id)?
+            .delete_files
+            .values()
+            .filter(|dv| dv.source.is_none() && dv.seq <= cutoff)
+            .map(|dv| dv.id.clone())
+            .collect();
+        inner
+            .commit(vec![
+                actions::remove_delete_files(table_id, proto::Select::Listed, &removed, None),
+                actions::clear_insert_records(table_id, Some(cutoff)),
+            ])
+            .await
     }
     async fn upsert_pk_index(
         &self,

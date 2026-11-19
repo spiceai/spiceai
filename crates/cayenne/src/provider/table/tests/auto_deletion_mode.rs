@@ -392,10 +392,9 @@ async fn an_empty_reclaim_preserves_a_concurrent_upsert() {
             .await
             .expect("plan all-row delete");
         collect(delete, ctx.task_ctx()).await.expect("delete rows");
-        assert!(
-            collect_id_value_pairs(&ctx, &provider, &name)
-                .await
-                .is_empty()
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, &name).await,
+            [] as [(i64, i64); 0]
         );
         assert_eq!(provider.deletion_index_len(), 4);
 

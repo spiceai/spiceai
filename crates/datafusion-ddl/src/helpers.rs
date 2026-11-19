@@ -184,7 +184,10 @@ mod tests {
     fn extract_primary_key_empty_when_no_constraints() {
         let schema = test_schema();
         let constraints = Constraints::new_unverified(vec![]);
-        assert!(extract_primary_key_columns(&constraints, &schema).is_empty());
+        assert_eq!(
+            extract_primary_key_columns(&constraints, &schema),
+            [] as [String; 0]
+        );
     }
 
     #[test]

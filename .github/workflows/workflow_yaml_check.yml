@@ -20,8 +20,12 @@ on:
       - '.github/scripts/test_codeql_workflow.py'
       - '.github/scripts/docker_pull.sh'
       - '.github/scripts/test_docker_pull.py'
+      - '.github/scripts/mc_cp.sh'
+      - '.github/scripts/test_mc_cp.py'
       - '.github/scripts/mssql_tpch_restore.sh'
       - '.github/scripts/test_mssql_tpch_restore.py'
+      - '.github/scripts/extract_snapshot_archives.py'
+      - '.github/scripts/test_extract_snapshot_archives.py'
   push:
     branches:
       - trunk
@@ -34,13 +38,20 @@ on:
       - '.github/scripts/test_codeql_workflow.py'
       - '.github/scripts/docker_pull.sh'
       - '.github/scripts/test_docker_pull.py'
+      - '.github/scripts/mc_cp.sh'
+      - '.github/scripts/test_mc_cp.py'
       - '.github/scripts/mssql_tpch_restore.sh'
       - '.github/scripts/test_mssql_tpch_restore.py'
+      - '.github/scripts/extract_snapshot_archives.py'
+      - '.github/scripts/test_extract_snapshot_archives.py'
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
+
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
 
 jobs:
   check-workflow-yaml:
@@ -75,7 +86,9 @@ jobs:
           python .github/scripts/test_check_workflow_yaml.py -v
           python .github/scripts/test_codeql_workflow.py -v
           python .github/scripts/test_docker_pull.py -v
+          python .github/scripts/test_mc_cp.py -v
           python .github/scripts/test_mssql_tpch_restore.py -v
+          python .github/scripts/test_extract_snapshot_archives.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py
@@ -124,4 +137,28 @@ jobs:
           # linters, which grade the contents of `run:` blocks. That is a separate
           # backlog with its own findings here; this gate is about whether GitHub
           # can schedule the definition at all. Enabling them is tracked in #14222.
+          actionlint -color -shellcheck= -pyflakes=
+
+      - name: Lint same-repository action calls (actionlint, `$/` read as `./`)
+        run: |
+          set -euo pipefail
+          # actionlint does not parse `uses: $/…` and skips those steps (see
+          # `.github/actionlint.yaml`). `$/` and `./` name the same action file, so
+          # linting a copy with `./` keeps the check of each call's `with:`
+          # against that action's inputs. actionlint finds the project by its Git
+          # root, so the copy is a repository of its own. Every `$/.github/` is
+          # rewritten, not only one right after `uses: `, so a quoted value, a
+          # quoted key, a flow-style step or a folded value can't keep its `$/`
+          # and skip the check. The copy is only linted, so rewriting the same
+          # text in a comment or a script changes nothing.
+          copy="$(mktemp -d)"
+          cp -R .github "$copy/"
+          git -C "$copy" init --quiet
+          find "$copy/.github" -type f \( -name '*.yml' -o -name '*.yaml' \) \
+            -exec sed -i -E 's#\$/\.github/#./.github/#g' {} +
+          if grep -rqF '$/.github/' "$copy/.github"; then
+            echo "::error::A \`uses: \$/\` call was left in the copy, so its inputs would go unchecked."
+            exit 1
+          fi
+          cd "$copy"
           actionlint -color -shellcheck= -pyflakes=

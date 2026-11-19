@@ -143,7 +143,7 @@ mod tests {
         let push_down = JoinPushDown::AllowedFor(String::new());
         match push_down {
             JoinPushDown::AllowedFor(ctx) => {
-                assert!(ctx.is_empty());
+                assert_eq!(ctx, "");
             }
             JoinPushDown::Disallow => panic!("Expected AllowedFor variant"),
         }

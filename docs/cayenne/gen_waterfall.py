@@ -2,8 +2,8 @@
 import html
 import os
 
-# Run from this script's directory so waterfall.svg / waterfall_ls.pdf are always
-# written next to it, regardless of the caller's working directory.
+# Run from this script's directory so waterfall.svg is always written next to it,
+# regardless of the caller's working directory.
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 DARK="#1e293b"; BORDER="#312e81"; ACCENT="#6366f1"; SUB="#475569"; SEQ="#6366f1"; FAINT="#94a3b8"
 def esc(s): return html.escape(s, quote=True)
@@ -111,12 +111,3 @@ SVG = "\n".join(svg)
 with open("waterfall.svg", "w", encoding="utf-8") as f:
     f.write(SVG)
 print(f"wrote waterfall.svg ({len(SVG)} bytes)")
-# Optional landscape preview PDF — only if WeasyPrint's native deps are present.
-# waterfall.svg is the committed artifact referenced by cayenne.md; the preview
-# is a convenience and its absence never blocks regenerating the figure.
-try:
-    from weasyprint import HTML
-    HTML(string=f"<html><head><style>@page{{size:A4 landscape; margin:8mm}}</style></head><body style='margin:0'>{SVG}</body></html>").write_pdf("waterfall_ls.pdf")
-    print("wrote waterfall_ls.pdf preview")
-except Exception as e:  # noqa: BLE001 — preview is best-effort
-    print(f"skipped waterfall_ls.pdf preview ({e})")
