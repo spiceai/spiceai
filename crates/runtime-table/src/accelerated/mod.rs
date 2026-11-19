@@ -1818,8 +1818,7 @@ impl AcceleratedTable {
     pub async fn validate_refresh_overrides(&self, overrides: &RefreshOverrides) -> Result<()> {
         let refresh = self.refresh_params.read().await.clone();
         let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
-            !get_primary_keys_from_constraints(constraints, &self.accelerator.schema())
-                .is_empty()
+            !get_primary_keys_from_constraints(constraints, &self.accelerator.schema()).is_empty()
         });
         overrides
             .validate_append_keys(&refresh, has_primary_key)

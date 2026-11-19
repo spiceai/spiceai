@@ -2169,10 +2169,12 @@ mod tests {
             .validate_append_keys(&full, false)
             .expect_err("an append with no watermark and no key is rejected");
         assert!(
-            matches!(err, InvalidRefreshOverrides::AppendRequiresTimeColumnOrPrimaryKey)
-                && err
-                    .to_string()
-                    .contains("Append mode requires either `time_column` or `primary_key`"),
+            matches!(
+                err,
+                InvalidRefreshOverrides::AppendRequiresTimeColumnOrPrimaryKey
+            ) && err
+                .to_string()
+                .contains("Append mode requires either `time_column` or `primary_key`"),
             "{err}"
         );
         append
@@ -2187,9 +2189,12 @@ mod tests {
             .validate_append_keys(&Refresh::new(RefreshMode::Append), false)
             .expect("checked at startup");
         for mode in [None, Some(RefreshMode::Full)] {
-            RefreshOverrides { mode, ..append.clone() }
-                .validate_append_keys(&full, false)
-                .expect("only an append override is checked");
+            RefreshOverrides {
+                mode,
+                ..append.clone()
+            }
+            .validate_append_keys(&full, false)
+            .expect("only an append override is checked");
         }
     }
 
