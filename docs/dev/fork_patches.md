@@ -616,8 +616,9 @@ Upstream [adbc-drivers/bigquery](https://github.com/adbc-drivers/bigquery), fork
 BigQuery. It is not a cargo dependency, so the pin table
 above does not list it: `.github/actions/setup-adbc-bigquery` builds
 `libadbc_driver_bigquery.so` from the commit in its `adbc_bigquery_commit` input, and
-checks that each patch below is present before it builds. Both patches are proposed
-upstream.
+checks that each patch below is present before it builds. Both patches are merged
+upstream (adbc-drivers/bigquery#381) but are in no release yet; the fork carries them
+until the pin moves to a release that has them.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
