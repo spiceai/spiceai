@@ -996,47 +996,49 @@ impl JobStore {
         );
         let mut slot = caller.write.lock().await;
         slot.used_at = Some(std::time::Instant::now());
-        let releases = std::mem::take(&mut *caller.releases.lock());
-        let cached = Mutex::new(slot.cached.take());
-        let change = Mutex::new(|ledger: &mut Ledger| {
-            let mut released = false;
-            for release in &releases {
-                released |= ledger.finish(&release.job_id, release.stored);
-            }
-            let (out, changed) = change(ledger);
-            (out, changed || released)
-        });
+        let carried = std::mem::take(&mut *caller.releases.lock());
         let path = self.ledger_path(owner);
-        let result = retry_on_conflict(&ConflictRetry::default(), || async {
-            let last_written = cached.lock().take();
-            if let Some(mut ledger) = last_written {
+        let (result, last_written) = {
+            let cached = Mutex::new(slot.cached.take());
+            let change = Mutex::new(|ledger: &mut Ledger| {
+                let mut released = false;
+                for release in &carried {
+                    released |= ledger.finish(&release.job_id, release.stored);
+                }
+                let (out, changed) = change(ledger);
+                (out, changed || released)
+            });
+            let result = retry_on_conflict(&ConflictRetry::default(), || async {
+                let last_written = cached.lock().take();
+                if let Some(mut ledger) = last_written {
+                    let (out, changed) = (*change.lock())(&mut ledger);
+                    if changed && self.write_ledger(&path, &mut ledger).await? {
+                        *cached.lock() = Some(ledger).filter(has_version);
+                        return Ok(Attempt::Done(out));
+                    }
+                }
+                let mut ledger = self.read_ledger(owner).await?;
                 let (out, changed) = (*change.lock())(&mut ledger);
-                if changed && self.write_ledger(&path, &mut ledger).await? {
+                if !changed {
                     *cached.lock() = Some(ledger).filter(has_version);
                     return Ok(Attempt::Done(out));
                 }
-            }
-            let mut ledger = self.read_ledger(owner).await?;
-            let (out, changed) = (*change.lock())(&mut ledger);
-            if !changed {
-                *cached.lock() = Some(ledger).filter(has_version);
-                return Ok(Attempt::Done(out));
-            }
-            if self.write_ledger(&path, &mut ledger).await? {
-                *cached.lock() = Some(ledger).filter(has_version);
-                Ok(Attempt::Done(out))
-            } else {
-                Ok(Attempt::Conflict)
-            }
-        })
-        .await;
-        slot.cached = cached.into_inner();
-        drop(change);
-        if result.is_err() && !releases.is_empty() {
+                if self.write_ledger(&path, &mut ledger).await? {
+                    *cached.lock() = Some(ledger).filter(has_version);
+                    Ok(Attempt::Done(out))
+                } else {
+                    Ok(Attempt::Conflict)
+                }
+            })
+            .await;
+            (result, cached.into_inner())
+        };
+        slot.cached = last_written;
+        if result.is_err() && !carried.is_empty() {
             // Not written: the releases this write carried wait for the next one.
             let mut queued = caller.releases.lock();
             let later = std::mem::take(&mut *queued);
-            queued.extend(releases);
+            queued.extend(carried);
             queued.extend(later);
         }
         result.map_err(|err| match err {
