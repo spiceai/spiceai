@@ -96,7 +96,7 @@ pub enum Error {
 
     #[snafu(display(
         "Failed to ingest a change event: the value {value} of column '{column}' is outside the range of its type Timestamp({unit:?}). \
-        Declare the column with a coarser time unit, such as `Microsecond`. \
+        Declare the column with a coarser time unit, such as `Timestamp(Microsecond, UTC)` for `timestamptz` or `Timestamp(Microsecond)` for `timestamp`. \
         See: https://spiceai.org/docs/components/data-connectors/debezium"
     ))]
     TimestampOutOfRange {
@@ -116,7 +116,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to ingest a change event: column '{column}' has the Debezium type {semantic_type}, which is not a timestamp. \
+        "Failed to ingest a change event: column '{column}' has the Debezium type {semantic_type}, which is not an integer timestamp type. \
         Declare the column with a type that matches its source column. \
         See: https://spiceai.org/docs/components/data-connectors/debezium"
     ))]
@@ -127,7 +127,7 @@ pub enum Error {
 
     #[snafu(display(
         "Failed to ingest a change event: the integer value {value} of column '{column}' has no Debezium timestamp type, so its unit is unknown. \
-        Send change events with their schema, or declare the column in the unit of its values, `Microsecond` or `Millisecond`. \
+        Send change events with their schema, or declare the column with the unit of its values, such as `Timestamp(Microsecond)` or `Timestamp(Microsecond, UTC)`. \
         See: https://spiceai.org/docs/components/data-connectors/debezium"
     ))]
     UnknownTimestampUnit {
@@ -469,8 +469,9 @@ fn append_array_value_to_list_builder<T: ArrayBuilder>(
 /// A string is an ISO 8601 instant (`io.debezium.time.ZonedTimestamp`, always
 /// in UTC). An integer counts from the Unix epoch in the unit its Debezium
 /// semantic type (`semantic_type`) names. An integer without a semantic type is
-/// taken to be in the column's unit only for millisecond and microsecond
-/// columns, the units those values have always been read in.
+/// read in the column's unit for millisecond and microsecond columns, which
+/// keeps schemaless events loading into those columns, and is rejected for
+/// second and nanosecond columns.
 fn append_timestamp<T: ArrowTimestampType>(
     value: &Json,
     column: &str,
@@ -499,11 +500,6 @@ fn append_timestamp<T: ArrowTimestampType>(
                 value: value.clone(),
                 unit: T::UNIT,
             };
-            let n = match n.as_i64() {
-                Some(n) => n,
-                None if n.is_u64() => return out_of_range().fail(),
-                None => return invalid().fail(),
-            };
             let source_unit = match semantic_type {
                 Some(name) => {
                     debezium_timestamp_unit(name).with_context(|| NotATimestampSnafu {
@@ -519,6 +515,11 @@ fn append_timestamp<T: ArrowTimestampType>(
                     }
                     .fail();
                 }
+            };
+            let n = match n.as_i64() {
+                Some(n) => n,
+                None if n.is_u64() => return out_of_range().fail(),
+                None => return invalid().fail(),
             };
             Some(convert_time_unit(n, source_unit, T::UNIT).with_context(out_of_range)?)
         }
@@ -1068,7 +1069,7 @@ mod tests {
         const DOCS: &str = "See: https://spiceai.org/docs/components/data-connectors/debezium";
         let out_of_range = |value: &str| {
             format!(
-                "Failed to ingest a change event: the value {value} of column 'at' is outside the range of its type Timestamp(Nanosecond). Declare the column with a coarser time unit, such as `Microsecond`. {DOCS}"
+                "Failed to ingest a change event: the value {value} of column 'at' is outside the range of its type Timestamp(Nanosecond). Declare the column with a coarser time unit, such as `Timestamp(Microsecond, UTC)` for `timestamptz` or `Timestamp(Microsecond)` for `timestamp`. {DOCS}"
             )
         };
         let not_a_timestamp = |value: &str| {
@@ -1100,16 +1101,16 @@ mod tests {
                 json!(20_775),
                 Some("io.debezium.time.Date"),
                 format!(
-                    "Failed to ingest a change event: column 'at' has the Debezium type io.debezium.time.Date, which is not a timestamp. Declare the column with a type that matches its source column. {DOCS}"
+                    "Failed to ingest a change event: column 'at' has the Debezium type io.debezium.time.Date, which is not an integer timestamp type. Declare the column with a type that matches its source column. {DOCS}"
                 ),
             ),
             // Without a semantic type the unit of an integer is unknown, and a
-            // nanosecond column has never read integers in its own unit.
+            // nanosecond column rejects it.
             (
                 json!(1_795_035_600_123_456_i64),
                 None,
                 format!(
-                    "Failed to ingest a change event: the integer value 1795035600123456 of column 'at' has no Debezium timestamp type, so its unit is unknown. Send change events with their schema, or declare the column in the unit of its values, `Microsecond` or `Millisecond`. {DOCS}"
+                    "Failed to ingest a change event: the integer value 1795035600123456 of column 'at' has no Debezium timestamp type, so its unit is unknown. Send change events with their schema, or declare the column with the unit of its values, such as `Timestamp(Microsecond)` or `Timestamp(Microsecond, UTC)`. {DOCS}"
                 ),
             ),
         ];
@@ -1119,6 +1120,21 @@ mod tests {
                 .expect_err(&format!("{value} must not decode"));
             assert_eq!(err.to_string(), expected, "{value}");
         }
+
+        // A millisecond column reads integers without a semantic type in its own
+        // unit, but still rejects a known non-timestamp type.
+        let err = decode_timestamp(
+            &json!(20_775),
+            TimeUnit::Millisecond,
+            None,
+            Some("io.debezium.time.Date"),
+        )
+        .expect_err("a day count must not decode into a millisecond column");
+        assert!(
+            matches!(&err, Error::NotATimestamp { column, semantic_type }
+                if column == "at" && semantic_type == "io.debezium.time.Date"),
+            "got: {err:?}"
+        );
     }
 
     #[test]
