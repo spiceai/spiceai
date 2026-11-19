@@ -9,9 +9,10 @@ use crate::name::{LocalName, Namespace, NamespaceResolver, QName};
 use crate::utils::{is_whitespace, Bytes};
 use crate::XmlVersion;
 
-use std::collections::HashSet;
+use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
-use std::hash::{BuildHasherDefault, DefaultHasher, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::iter::FusedIterator;
 use std::{borrow::Cow, ops::Range};
 
@@ -980,7 +981,7 @@ enum State {
 /// [#969]: https://github.com/tafia/quick-xml/issues/969
 const SMALL_ATTRIBUTE_COUNT: usize = 32;
 
-/// A no-op [`Hasher`] for the `key_hashes` set, whose values are already 64-bit
+/// A no-op [`Hasher`] for the [`KeyIndex`] set and map, whose keys are already 64-bit
 /// hashes of attribute names; re-hashing them with the default SipHash would be
 /// wasted work. Only `write_u64` is ever exercised (via `u64`'s `Hash` impl).
 #[derive(Default)]
@@ -1004,11 +1005,59 @@ impl Hasher for IdentityHasher {
     }
 }
 
-/// Hashes a single attribute name. A fresh [`DefaultHasher`] per name keeps each
-/// hash independent (so it is also DoS-resistant on untrusted input).
+/// Index of the attribute names of one start tag, built once the tag declares
+/// more than `SMALL_ATTRIBUTE_COUNT` attributes.
+///
+/// Names are hashed with a randomly keyed SipHash ([`RandomState`]), so a
+/// document author cannot precompute names that collide. `hashes` settles a new
+/// name with one lookup. `first` maps each hash to the position in
+/// [`IterState::keys`] of the first name with that hash, so a repeated name is
+/// settled with one lookup and one name comparison. Only a 64-bit collision
+/// between two different names falls back to the linear scan.
+#[derive(Clone, Debug)]
+struct KeyIndex {
+    hasher: RandomState,
+    /// Hashes of every name in `keys`.
+    hashes: HashSet<u64, BuildHasherDefault<IdentityHasher>>,
+    /// Built on the first repeated hash, so a tag of distinct names never pays
+    /// for it, and kept in step with `keys` from then on.
+    first: Option<HashMap<u64, usize, BuildHasherDefault<IdentityHasher>>>,
+}
+
+impl KeyIndex {
+    fn new(slice: &[u8], keys: &[Range<usize>]) -> Self {
+        let hasher = RandomState::new();
+        let mut hashes = HashSet::with_capacity_and_hasher(keys.len() * 2, Default::default());
+        for r in keys {
+            hashes.insert(hash_name(&hasher, &slice[r.clone()]));
+        }
+        Self {
+            hasher,
+            hashes,
+            first: None,
+        }
+    }
+
+    /// Position in `keys` of the first name whose hash is `hash`.
+    fn first_position(&mut self, slice: &[u8], keys: &[Range<usize>], hash: u64) -> Option<usize> {
+        let hasher = &self.hasher;
+        self.first
+            .get_or_insert_with(|| {
+                let mut first =
+                    HashMap::with_capacity_and_hasher(keys.len() * 2, Default::default());
+                for (i, r) in keys.iter().enumerate() {
+                    first.entry(hash_name(hasher, &slice[r.clone()])).or_insert(i);
+                }
+                first
+            })
+            .get(&hash)
+            .copied()
+    }
+}
+
 #[inline]
-fn hash_name(name: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
+fn hash_name(hasher: &RandomState, name: &[u8]) -> u64 {
+    let mut hasher = hasher.build_hasher();
     hasher.write(name);
     hasher.finish()
 }
@@ -1028,13 +1077,13 @@ pub(crate) struct IterState {
     /// names. We store a ranges instead of slices to able to report a previous
     /// attribute position
     keys: Vec<Range<usize>>,
-    /// 64-bit hashes of the byte content of `keys`, used as an O(1) pre-filter
-    /// once a start tag declares more than `SMALL_ATTRIBUTE_COUNT` attributes, so
-    /// the duplicate check stays O(N) over the whole tag instead of O(N²). The
-    /// values are already hashes, so the set stores them with `IdentityHasher`
-    /// instead of re-hashing. Allocated only when the threshold is crossed, so
-    /// small tags (and [`IterState::new`]) stay allocation-free and `const`.
-    key_hashes: Option<HashSet<u64, BuildHasherDefault<IdentityHasher>>>,
+    /// Hash index of `keys`, used once a start tag declares more than
+    /// `SMALL_ATTRIBUTE_COUNT` attributes, so the duplicate check stays O(N) over
+    /// the whole tag instead of O(N²), for distinct and repeated names alike.
+    /// Allocated only when the threshold is crossed, so small tags (and
+    /// [`IterState::new`]) stay allocation-free and `const`. Boxed so that every
+    /// [`Attributes`] pays only a pointer for it.
+    key_index: Option<Box<KeyIndex>>,
 }
 
 impl IterState {
@@ -1044,7 +1093,7 @@ impl IterState {
             html,
             check_duplicates: true,
             keys: Vec::new(),
-            key_hashes: None,
+            key_index: None,
         }
     }
 
@@ -1127,7 +1176,7 @@ impl IterState {
     /// attributes that beats hashing and needs no allocation, which is the
     /// overwhelmingly common case. Once a tag declares more than
     /// `SMALL_ATTRIBUTE_COUNT` attributes -- where the scan would become the
-    /// O(N²) CPU-DoS of [#969] -- it switches to a hash pre-filter that keeps the
+    /// O(N²) CPU-DoS of [#969] -- it switches to a [`KeyIndex`] that keeps the
     /// whole tag O(N).
     ///
     /// [#969]: https://github.com/tafia/quick-xml/issues/969
@@ -1154,8 +1203,11 @@ impl IterState {
     }
 
     /// Cold path of [`Self::check_for_duplicates`] for start tags with many
-    /// attributes: a [`HashSet`] of 64-bit name hashes acts as an O(1) pre-filter
-    /// so iterating N attributes is O(N) rather than O(N²).
+    /// attributes. `keys` never holds the same name twice, so the one earlier
+    /// name with the same hash and bytes is the position the linear scan would
+    /// report, and a repeated name costs O(1) like a new one. Callers such as
+    /// [`Attributes::has_nil`] keep iterating after [`AttrError::Duplicated`], so
+    /// a tag full of repeats must not rescan `keys` for each of them.
     #[cold]
     fn check_for_duplicates_hashed(
         &mut self,
@@ -1163,27 +1215,25 @@ impl IterState {
         key: Range<usize>,
     ) -> Result<Range<usize>, AttrError> {
         let keys = &self.keys;
-        let key_hashes = self.key_hashes.get_or_insert_with(|| {
-            // First time over the threshold: seed the set with the names already
-            // collected during the linear phase so the pre-filter knows them.
-            let mut set = HashSet::with_capacity_and_hasher(
-                keys.len() * 2,
-                BuildHasherDefault::<IdentityHasher>::default(),
-            );
-            for r in keys {
-                set.insert(hash_name(&slice[r.clone()]));
+        let index = self
+            .key_index
+            .get_or_insert_with(|| Box::new(KeyIndex::new(slice, keys)));
+        let name = &slice[key.clone()];
+        let hash = hash_name(&index.hasher, name);
+        if index.hashes.insert(hash) {
+            if let Some(first) = &mut index.first {
+                first.insert(hash, self.keys.len());
             }
-            set
-        });
-        // A fresh hash proves the name is new. On a hit (a real duplicate, or the
-        // astronomically rare 64-bit collision) fall back to the linear scan to
-        // recover the exact previous position for `AttrError::Duplicated`.
-        if !key_hashes.insert(hash_name(&slice[key.clone()])) {
-            if let Some(prev) = self
-                .keys
-                .iter()
-                .find(|r| slice[(*r).clone()] == slice[key.clone()])
-            {
+        } else {
+            if let Some(i) = index.first_position(slice, &self.keys, hash) {
+                let prev = &self.keys[i];
+                if slice[prev.clone()] == *name {
+                    return Err(AttrError::Duplicated(key.start, prev.start));
+                }
+            }
+            // Two different names share a 64-bit hash under a random key:
+            // only then is the exact earlier position found by scanning.
+            if let Some(prev) = self.keys.iter().find(|r| slice[(*r).clone()] == *name) {
                 return Err(AttrError::Duplicated(key.start, prev.start));
             }
         }
@@ -2130,6 +2180,50 @@ mod xml {
                     iter.next(),
                     Some(Err(AttrError::Duplicated(dup_pos, positions[dup])))
                 );
+            }
+
+            /// Past the hash threshold, every repeat of a name -- first seen in
+            /// the linear phase or in the hashed phase -- reports the position of
+            /// its first occurrence, iteration continues after each error, and
+            /// the names that follow the repeats are still yielded.
+            #[test]
+            fn repeats_past_hash_threshold() {
+                let n = SMALL_ATTRIBUTE_COUNT * 4;
+                let repeated = [0, SMALL_ATTRIBUTE_COUNT - 1, n - 1];
+
+                let mut source = String::from("tag");
+                let mut positions = Vec::with_capacity(n);
+                for i in 0..n {
+                    source.push(' ');
+                    positions.push(source.len());
+                    source.push_str(&format!("k{:04}=''", i));
+                }
+                let mut expected = Vec::new();
+                for round in 0..3 {
+                    for &i in &repeated {
+                        source.push(' ');
+                        expected.push(Err(AttrError::Duplicated(source.len(), positions[i])));
+                        source.push_str(&format!("k{:04}=''", i));
+                    }
+                    source.push_str(&format!(" tail{}=''", round));
+                    expected.push(Ok(format!("tail{}", round)));
+                }
+
+                let mut iter = Attributes::new(&source, 3);
+                for i in 0..n {
+                    assert_eq!(
+                        iter.next().map(|a| a.map(|a| a.key)),
+                        Some(Ok(QName(format!("k{:04}", i).as_bytes())))
+                    );
+                }
+                for want in expected {
+                    let got = iter.next().map(|a| a.map(|a| a.key));
+                    match want {
+                        Ok(name) => assert_eq!(got, Some(Ok(QName(name.as_bytes())))),
+                        Err(e) => assert_eq!(got, Some(Err(e))),
+                    }
+                }
+                assert_eq!(iter.next(), None);
             }
         }
 

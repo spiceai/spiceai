@@ -653,6 +653,18 @@ tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 # See vendor/sqlparser/README.md.
 sqlparser = { path = "vendor/sqlparser" }
 
+# Local vendored forks of `quick-xml` 0.39.4, 0.40.1, 0.41.0 and 0.42.0 (path: vendor/quick-xml/<version>).
+# Checking a start tag for duplicate attribute names took time quadratic in its attribute count
+# (RUSTSEC-2026-0194), so one crafted tag in an XML response from an object store, STS, or another
+# XML endpoint could hold a CPU core for minutes. 0.41.0 hashes the names but still rescans for
+# every repeated name, which `has_nil` (any `Option` field read through serde) walks past. Each
+# fork keeps one O(1) hash lookup per name. Drop a fork once every crate on that line moves to a
+# quick-xml release with an O(N) check. See vendor/quick-xml/README.md.
+quick-xml = { path = "vendor/quick-xml/0.39.4" }
+quick-xml-0-40 = { package = "quick-xml", path = "vendor/quick-xml/0.40.1" }
+quick-xml-0-41 = { package = "quick-xml", path = "vendor/quick-xml/0.41.0" }
+quick-xml-0-42 = { package = "quick-xml", path = "vendor/quick-xml/0.42.0" }
+
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.
 backoff = { path = "crates/backoff" }
 

@@ -26,13 +26,12 @@ ignore = [
   # (uses `rustls::pki_types::pem` instead), but the spice-rs SDK (`spiceai`
   # crate) still pulls v1.x transitively. Owner: spice-rs / runtime.
   "RUSTSEC-2025-0134",
-  # `quick-xml` quadratic duplicate-attribute check on start tags (DoS). Pulled
-  # transitively in several versions (via vortex, AWS-XML, and serialization
-  # dependencies); no single safe upgrade across all pins yet. Owner: data components/runtime.
-  "RUSTSEC-2026-0194",
   # `quick-xml` unbounded namespace-declaration allocation in `NsReader`
-  # (memory-exhaustion DoS), same transitive chain as RUSTSEC-2026-0194; no safe
-  # upgrade yet. Owner: data components/runtime.
+  # (memory-exhaustion DoS). Fixed upstream in 0.41.0, but the vendored 0.39.4
+  # and 0.40.1 forks (vendor/quick-xml, required by `object_store` 0.13 and 0.14)
+  # do not carry the fix. cargo-deny does not scan path dependencies, so this
+  # entry no longer matches; it records that the advisory is still open on those
+  # lines. Owner: data components/runtime.
   "RUSTSEC-2026-0195",
   # `h2` unbounded empty DATA frames. The shipped `h2` 0.4 is on a fixed release;
   # only `h2` 0.3 remains, reached solely through `chdb-rust` 1.x, whose build
