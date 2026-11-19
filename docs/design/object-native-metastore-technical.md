@@ -1230,9 +1230,10 @@ removal list:
   object gone while the floor has moved starts over from the newer head; it
   returns that head's state, never a mix. The catalog runs one collection per
   log at a time beside its commits, after each checkpoint.
-- Model: `window-storage` (deletion, a reader of an older head, a collector
-  restart) and the `window-storage-gc-early` control, which deletes without
-  waiting and fails I7. Its traces replay against the collector.
+- Model: `window-storage-7-exhaust` (deletion, a reader of an older head, a
+  collector restart) and the `window-storage-gc-early-5-exhaust` control, which
+  deletes without waiting and fails I7. Their traces replay against the
+  collector.
 
 Objects a record's actions reference (data files, `objects/blobs/…`) are not
 log objects: they follow the rules above and [#15818](https://github.com/spiceai/spiceai/issues/15818).
