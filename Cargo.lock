@@ -2377,6 +2377,7 @@ dependencies = [
  "azure_core 1.1.0",
  "base64 0.22.1",
  "http-body-limit",
+ "http-retry",
  "reqwest 0.13.4",
  "serde",
  "serde_json",

@@ -21,9 +21,9 @@ limitations under the License.
 //! connection while TLS is still being negotiated, and the client then reads an early end of
 //! stream (`tls handshake eof`) or a reset. A request is written only after the handshake
 //! completes, so the server never saw it, and sending it again on a new connection is safe
-//! whatever its method. [`policy`] sends such a request again.
+//! whatever its method. A client from [`client_builder`] sends such a request again.
 //!
-//! Setting a policy replaces the one `reqwest` uses by default, so [`policy`] also keeps the
+//! Setting a policy replaces the one `reqwest` uses by default, so this policy also keeps the
 //! retries `reqwest` makes by default. Those are for an HTTP/2 stream the server refused
 //! without processing it: a `REFUSED_STREAM` reset, or a graceful `GOAWAY` that came before
 //! the stream.
@@ -44,31 +44,27 @@ use std::io;
 /// The most times a request is sent again after its first attempt.
 pub const MAX_RETRIES_PER_REQUEST: u32 = 2;
 
-/// A [`reqwest::ClientBuilder`] whose client retries with [`policy`].
+/// A [`reqwest::ClientBuilder`] whose client retries as the [crate documentation](crate)
+/// describes.
 pub fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().retry(policy())
-}
-
-/// The retry policy described in the [crate documentation](crate).
-#[must_use]
-pub fn policy() -> reqwest::retry::Builder {
-    reqwest::retry::for_host(EveryHost)
+    let policy = reqwest::retry::for_host(EveryHost)
         .max_retries_per_request(MAX_RETRIES_PER_REQUEST)
         .classify_fn(|attempt| {
             let Some(reason) = attempt.error().and_then(retry_reason) else {
                 return attempt.success();
             };
             tracing::debug!(
-                "Sending a request to '{}' again: {}",
-                attempt.uri().host().unwrap_or_default(),
-                reason.describe()
+                "Sending a request to '{}' again: {reason}",
+                attempt.uri().host().unwrap_or_default()
             );
             attempt.retryable()
-        })
+        });
+    reqwest::Client::builder().retry(policy)
 }
 
-/// A request scope that holds every host. `reqwest` budgets retries per client, and each
-/// client here serves one provider or service.
+/// A request scope that holds every host: whether a failed request can be sent again depends on
+/// how it failed, not on where it was going. `reqwest` keeps one retry budget per client,
+/// whatever the scope.
 struct EveryHost;
 
 impl PartialEq<&str> for EveryHost {
@@ -77,62 +73,35 @@ impl PartialEq<&str> for EveryHost {
     }
 }
 
-/// Why a failed attempt can be sent again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RetryReason {
-    /// The connection closed before the request was written to it.
-    ConnectionClosedBeforeRequest,
-    /// The server refused the HTTP/2 stream without processing it.
-    StreamRefused,
-}
-
-impl RetryReason {
-    fn describe(self) -> &'static str {
-        match self {
-            Self::ConnectionClosedBeforeRequest => {
-                "the connection closed before the request was sent"
-            }
-            Self::StreamRefused => "the server refused the request without processing it",
-        }
-    }
-}
-
-fn retry_reason(error: &(dyn StdError + 'static)) -> Option<RetryReason> {
+/// Why a failed attempt can be sent again, or `None` when it cannot.
+fn retry_reason(error: &(dyn StdError + 'static)) -> Option<&'static str> {
     // A connect error is one hyper reports while it establishes the connection, before it
     // writes any part of the request. A closed or reset connection at any later point may
     // come after the server has read the request.
     let connecting = error
         .downcast_ref::<reqwest::Error>()
         .is_some_and(reqwest::Error::is_connect);
-    if connecting && any_cause(error, &is_closed_connection) {
-        return Some(RetryReason::ConnectionClosedBeforeRequest);
+    if connecting && causes(error).any(is_closed_connection) {
+        return Some("the connection closed before the request was sent");
     }
-    if any_cause(error, &is_refused_stream) {
-        return Some(RetryReason::StreamRefused);
-    }
-    None
+    causes(error)
+        .any(is_refused_stream)
+        .then_some("the server refused the request without processing it")
 }
 
-/// Whether `found` holds for `error` or any error that caused it.
-fn any_cause(
-    error: &(dyn StdError + 'static),
-    found: &impl Fn(&(dyn StdError + 'static)) -> bool,
-) -> bool {
-    if found(error) {
-        return true;
-    }
-    // `io::Error::source` returns the source of the error an `io::Error` wraps, and skips that
-    // error itself. A TLS handshake that reads end of stream is wrapped that way.
-    if let Some(wrapped) = error
-        .downcast_ref::<io::Error>()
-        .and_then(io::Error::get_ref)
-        && any_cause(wrapped, found)
-    {
-        return true;
-    }
-    error
-        .source()
-        .is_some_and(|source| any_cause(source, found))
+/// `error` and each error that caused it.
+fn causes<'a>(
+    error: &'a (dyn StdError + 'static),
+) -> impl Iterator<Item = &'a (dyn StdError + 'static)> {
+    std::iter::successors(Some(error), |&error| {
+        // `io::Error::source` returns the source of the error an `io::Error` wraps, and skips
+        // that error itself. A TLS handshake that reads end of stream is wrapped that way.
+        error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+            .map(|wrapped| wrapped as &(dyn StdError + 'static))
+            .or_else(|| error.source())
+    })
 }
 
 /// The peer closed or reset the connection. This is not a refused connection, a timeout, or an

@@ -55,19 +55,6 @@ enum Connection {
 struct Counts {
     connections: AtomicUsize,
     streams: AtomicUsize,
-    requests: AtomicUsize,
-    answered: AtomicUsize,
-}
-
-impl Counts {
-    fn read(&self) -> [usize; 4] {
-        [
-            self.connections.load(Ordering::SeqCst),
-            self.streams.load(Ordering::SeqCst),
-            self.requests.load(Ordering::SeqCst),
-            self.answered.load(Ordering::SeqCst),
-        ]
-    }
 }
 
 struct Server {
@@ -77,9 +64,9 @@ struct Server {
 }
 
 impl Server {
-    /// A server that treats its first connections as `first` says, and every later one as
-    /// `then`.
-    async fn start(first: &[Connection], then: Connection) -> Self {
+    /// A server that treats its first connection as `first` says, when given, and every other
+    /// one as `then`.
+    async fn start(first: Option<Connection>, then: Connection) -> Self {
         let (certificate, key) = self_signed();
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
@@ -97,13 +84,12 @@ impl Server {
             .expect("a local port");
         let port = listener.local_addr().expect("the local address").port();
         let counts = Arc::new(Counts::default());
-        let first = first.to_vec();
         tokio::spawn({
             let counts = Arc::clone(&counts);
             async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     let index = counts.connections.fetch_add(1, Ordering::SeqCst);
-                    let behavior = first.get(index).copied().unwrap_or(then);
+                    let behavior = first.filter(|_| index == 0).unwrap_or(then);
                     tokio::spawn(handle(
                         stream,
                         behavior,
@@ -149,9 +135,12 @@ impl Server {
             .await
     }
 
-    /// `[connections, streams, requests, answered]`.
-    fn counts(&self) -> [usize; 4] {
-        self.counts.read()
+    /// `[connections, streams]`.
+    fn counts(&self) -> [usize; 2] {
+        [
+            self.counts.connections.load(Ordering::SeqCst),
+            self.counts.streams.load(Ordering::SeqCst),
+        ]
     }
 }
 
@@ -202,7 +191,7 @@ async fn read_client_hello(stream: &mut TcpStream) {
         .expect("the ClientHello");
 }
 
-async fn serve(tls: TlsStream<TcpStream>, behavior: Connection, counts: &Arc<Counts>) {
+async fn serve(tls: TlsStream<TcpStream>, behavior: Connection, counts: &Counts) {
     let Ok(mut connection) = h2::server::handshake(tls).await else {
         return;
     };
@@ -221,14 +210,12 @@ async fn serve(tls: TlsStream<TcpStream>, behavior: Connection, counts: &Arc<Cou
                     respond.send_reset(h2::Reason::REFUSED_STREAM);
                     continue;
                 }
-                let counts = Arc::clone(counts);
                 let unanswered_tx = unanswered_tx.clone();
                 tokio::spawn(async move {
                     let mut body = request.into_body();
                     while let Some(Ok(chunk)) = body.data().await {
                         let _ = body.flow_control().release_capacity(chunk.len());
                     }
-                    counts.requests.fetch_add(1, Ordering::SeqCst);
                     if behavior == Connection::CloseAfterRequest {
                         let _ = unanswered_tx.send(respond);
                         return;
@@ -237,10 +224,8 @@ async fn serve(tls: TlsStream<TcpStream>, behavior: Connection, counts: &Arc<Cou
                         .status(200)
                         .body(())
                         .expect("a response");
-                    if let Ok(mut send) = respond.send_response(response, false)
-                        && send.send_data(Bytes::from_static(ANSWER), true).is_ok()
-                    {
-                        counts.answered.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut send) = respond.send_response(response, false) {
+                        let _ = send.send_data(Bytes::from_static(ANSWER), true);
                     }
                 });
             }
@@ -258,7 +243,7 @@ async fn a_connection_closed_during_the_tls_handshake_is_sent_again(
     #[values(Connection::CloseDuringHandshake, Connection::ResetDuringHandshake)]
     failure: Connection,
 ) {
-    let server = Server::start(&[failure], Connection::Serve).await;
+    let server = Server::start(Some(failure), Connection::Serve).await;
 
     let answer = server.send(&server.client()).await;
 
@@ -269,7 +254,7 @@ async fn a_connection_closed_during_the_tls_handshake_is_sent_again(
     );
     assert_eq!(
         server.counts(),
-        [2, 1, 1, 1],
+        [2, 1],
         "the first connection failed and the second carried the only request"
     );
 }
@@ -278,7 +263,7 @@ async fn a_connection_closed_during_the_tls_handshake_is_sent_again(
 /// and the caller gets the connection error.
 #[tokio::test]
 async fn a_connection_that_closes_every_time_fails_after_the_last_retry() {
-    let server = Server::start(&[], Connection::CloseDuringHandshake).await;
+    let server = Server::start(None, Connection::CloseDuringHandshake).await;
 
     let error = server
         .send(&server.client())
@@ -291,14 +276,14 @@ async fn a_connection_that_closes_every_time_fails_after_the_last_retry() {
         "{error:?}"
     );
     let attempts = usize::try_from(1 + http_retry::MAX_RETRIES_PER_REQUEST).expect("a count");
-    assert_eq!(server.counts(), [attempts, 0, 0, 0]);
+    assert_eq!(server.counts(), [attempts, 0]);
 }
 
 /// The server read the request, so it may have acted on it: the request is not sent again,
 /// even though the next connection would answer it.
 #[tokio::test]
 async fn a_request_the_server_received_is_not_sent_again() {
-    let server = Server::start(&[Connection::CloseAfterRequest], Connection::Serve).await;
+    let server = Server::start(Some(Connection::CloseAfterRequest), Connection::Serve).await;
 
     let error = server
         .send(&server.client())
@@ -308,7 +293,7 @@ async fn a_request_the_server_received_is_not_sent_again() {
     assert!(!error.is_connect(), "{error:?}");
     assert_eq!(
         server.counts(),
-        [1, 1, 1, 0],
+        [1, 1],
         "the request was sent once: {error:?}"
     );
 }
@@ -317,7 +302,7 @@ async fn a_request_the_server_received_is_not_sent_again() {
 /// handshake is not tried again.
 #[tokio::test]
 async fn an_untrusted_certificate_is_not_tried_again() {
-    let server = Server::start(&[], Connection::Serve).await;
+    let server = Server::start(None, Connection::Serve).await;
     let (other_certificate, _) = self_signed();
 
     let error = server
@@ -326,21 +311,21 @@ async fn an_untrusted_certificate_is_not_tried_again() {
         .expect_err("the server's certificate is not trusted");
 
     assert!(error.is_connect(), "{error:?}");
-    assert_eq!(server.counts(), [1, 0, 0, 0], "{error:?}");
+    assert_eq!(server.counts(), [1, 0], "{error:?}");
 }
 
 /// `reqwest` retries a stream the server refused without processing it. Setting a retry policy
 /// replaces `reqwest`'s default one, so this checks the policy keeps that retry.
 #[tokio::test]
 async fn a_stream_the_server_refused_is_sent_again() {
-    let server = Server::start(&[], Connection::RefuseFirstStream).await;
+    let server = Server::start(None, Connection::RefuseFirstStream).await;
 
     let answer = server.send(&server.client()).await;
 
     assert_eq!(answer.as_deref().ok(), Some(ANSWER), "{answer:?}");
     assert_eq!(
         server.counts(),
-        [1, 2, 1, 1],
+        [1, 2],
         "one connection carried the refused stream and the answered one"
     );
 }
