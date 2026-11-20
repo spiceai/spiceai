@@ -2377,6 +2377,7 @@ dependencies = [
  "azure_core 1.1.0",
  "base64 0.22.1",
  "http-body-limit",
+ "http-retry",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -9437,6 +9438,7 @@ version = "2.5.0-unstable"
 dependencies = [
  "bytes",
  "futures",
+ "http-retry",
  "reqwest 0.13.4",
  "secrecy",
  "serde",
@@ -10162,6 +10164,22 @@ dependencies = [
  "http 1.4.1",
  "http-body 1.0.1",
  "pin-project-lite",
+]
+
+[[package]]
+name = "http-retry"
+version = "2.5.0-unstable"
+dependencies = [
+ "bytes",
+ "h2 0.4.20",
+ "http 1.4.1",
+ "rcgen",
+ "reqwest 0.13.4",
+ "rstest 0.26.1",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]
@@ -11862,6 +11880,7 @@ dependencies = [
  "governor",
  "http 1.4.1",
  "http-body-limit",
+ "http-retry",
  "huggingface-hub",
  "indexmap 2.14.0",
  "insta",
@@ -22239,6 +22258,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "http-body-limit",
+ "http-retry",
  "jsonwebtoken",
  "reqwest 0.13.4",
  "secrecy",
