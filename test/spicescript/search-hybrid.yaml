@@ -97,6 +97,10 @@ steps:
       json:
         - { pointer: /error, equals: '`limit` must be between 1 and 10000, but was 0. Request fewer results, or use /v1/sql to read every row. See https://spiceai.org/docs/api/http/search' }
   # The `search` tool, through the MCP gateway (POST /v1/tools/search is the tool-catalog search).
+  # A failed tool call is also answered 200, so the call must return a result with
+  # `isError: false` and the documents found: the vector matches show all 76 documents with a
+  # body and the keyword matches the 60 whose body holds 'fox', 136 with their text, and none of
+  # the 4 whose body is NULL.
   - http:
       method: POST
       path: /v1/mcp
@@ -109,7 +113,19 @@ steps:
       body: '{"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {"name": "search", "arguments": {"datasets": ["docs"], "text": "fox", "limit": 10000}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": {"name": "spicescript", "version": "1"}, "io.modelcontextprotocol/clientCapabilities": {}}}}'
     expect:
       status: 200
-      body-lacks: 'must be between 1 and 10000'
+      body-matches:
+        - '"id":11,"result":\{'
+        - '"isError":false'
+        # A match reads `id: <n>\ncolumn: body\n---\n<body>`, each newline escaped twice in the
+        # response.
+        - '(?s)\A(?:.*?\\\\nid: \d+\\\\ncolumn: body\\\\n---\\\\n\w){136}'
+        - '\\\\nid: 4\\\\ncolumn: body\\\\n---\\\\nfox fox fox fox stone stone stone stone stone stone stone stone\\\\n'
+        - '\\\\nid: 80\\\\ncolumn: body\\\\n---\\\\nstone stone stone stone stone stone stone stone stone stone stone stone\\\\n'
+      body-lacks:
+        - '"error":'
+        - '"isError":true'
+        - '(?s)(?:\\\\nid: \d+\\\\ncolumn: body\\\\n---\\\\n\w.*?){137}'
+        - '\\\\nid: (17|34|51|68)\\\\n'
   - http:
       method: POST
       path: /v1/mcp
