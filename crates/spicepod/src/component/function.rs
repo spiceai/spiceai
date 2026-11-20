@@ -138,8 +138,11 @@ pub struct FunctionBuild {
     /// `cargo build --target wasm32-unknown-unknown --release`.
     pub command: String,
 
-    /// The directory the command runs in, relative to the Spicepod. Defaults
-    /// to the Spicepod's directory.
+    /// The directory the command runs in, relative to the app directory: the
+    /// directory `spice run` starts the runtime in, and the one the runtime
+    /// loads a relative `params.module` from. That holds for a function from a
+    /// Spicepod dependency too, which names its own directory as
+    /// `spicepods/<dependency>/`. Defaults to the app directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
 }

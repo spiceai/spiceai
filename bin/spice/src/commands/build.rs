@@ -83,9 +83,11 @@ pub enum BuildError {
     about = "Build the modules of functions that declare a `build:` block",
     long_about = r#"Build the modules of functions that declare a `build:` block.
 
-Runs each function's `build.command` in `build.workdir` (relative to the
-Spicepod), in declaration order, as you and with your environment, then prints
-the SHA-256 of the module at `params.module`. Stops at the first failed build.
+Runs each function's `build.command` in `build.workdir`, in declaration order,
+as you and with your environment, then prints the SHA-256 of the module at
+`params.module`. Stops at the first failed build. Both paths are relative to
+the app directory, where `spice run` starts the runtime, also for a function
+from a dependency.
 
 Functions from a Spicepod dependency are built only when `spicepod.yaml` trusts
 that dependency (`- { from: <name>, trust: full }` under `dependencies:`).
