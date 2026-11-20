@@ -1,0 +1,68 @@
+name: refresh-api-overrides
+description: >
+  One-off refresh overrides the refresh can't honor are refused with 400
+  before anything is queued, on Cayenne, full and append. A `refresh_sql`
+  that leaves out the time column would load its rows with a NULL time, which
+  the next append reads again; a `refresh_mode` of `changes` or `disabled`
+  panicked the refresh worker, and `caching` or `snapshot` failed after a
+  201. The acceleration is unchanged afterwards and plain refreshes still
+  work.
+sources:
+  src: { kind: postgres }
+variants:
+  full: {}
+  append: { datasets: { t: { acceleration: { refresh_mode: append } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: refresh-api-overrides
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, payload text, ts timestamptz NOT NULL);
+        INSERT INTO t SELECT i, 'p' || i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 minute' FROM generate_series(1, 50) i;
+  - start: {}
+  - query: SELECT id, ts FROM t
+  - source-exec:
+      src: INSERT INTO t SELECT i, 'p' || i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 minute' FROM generate_series(51, 60) i;
+  # A refresh_sql without the time column is refused, as it is in a spicepod.
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_sql": "SELECT id, payload FROM t"}' }
+    expect: { status: 400, body-matches: ["time_column 'ts' was not found"] }
+  # Modes an on-demand refresh can't run are refused, naming the ones it can.
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_mode": "changes"}' }
+    expect: { status: 400, body-matches: ["'changes'", "'full' or 'append'"] }
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_mode": "disabled"}' }
+    expect: { status: 400, body-matches: ["'disabled'", "'full' or 'append'"] }
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_mode": "caching"}' }
+    expect: { status: 400, body-matches: ["'caching'", "'full' or 'append'"] }
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_mode": "snapshot"}' }
+    expect: { status: 400, body-matches: ["'snapshot'", "'full' or 'append'"] }
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_mode": "bogus"}' }
+    expect: { status: 422, body-matches: ["'full' or 'append'"], body-lacks: ['changes'] }
+  # Nothing was refreshed: the acceleration still holds the first 50 rows.
+  - query: SELECT id, ts FROM t
+    oracle-sql: SELECT id, ts FROM t WHERE id <= 50
+  # A refresh_sql that selects the time column, then a plain refresh, load the rest once.
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_sql": "SELECT id, payload, ts FROM t"}' }
+    expect: { status: 201 }
+  - query: SELECT id, payload, ts FROM t
+    eventually: 30s
+  # The next plain refresh loads only the new rows, once.
+  - source-exec:
+      src: INSERT INTO t SELECT i, 'p' || i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 minute' FROM generate_series(61, 70) i;
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh }
+    expect: { status: 201 }
+  - query: SELECT id, payload, ts FROM t
+    eventually: 30s
+  - query: SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS ids FROM t
