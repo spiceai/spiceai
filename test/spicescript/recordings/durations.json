@@ -16,6 +16,7 @@
   "cayenne-upgrade": 8,
   "cayenne-vnext": 8,
   "cayenne-vnext-recreate": 4,
+  "cayenne-vnext-restart": 4,
   "cayenne-vnext-state-down": 7,
   "cayenne-writes": 28,
   "cdc-chaos": 177,
