@@ -10,9 +10,7 @@ all: tpch-gen pg-load
 TPCH_DATA_DIR ?= tpch-kit/dbgen
 
 # Directory the *-tpcds-load targets read TPC-DS .dat files from. dsdgen writes to
-# tpcds-kit/tools/tmp/data (see tpcds-gen), so that is the default; tpcds-fleet-gen
-# writes to $(TPCDS_FLEET_DIR) instead, so a caller using it must pass
-# TPCDS_DATA_DIR to match.
+# tpcds-kit/tools/tmp/data (see tpcds-gen).
 TPCDS_DATA_DIR ?= tpcds-kit/tools/tmp/data
 
 tpch-clone:
@@ -43,21 +41,16 @@ tpcds-clone:
 		cd tpcds-kit && git checkout dd01f906992e1e39837526bffb3f5b759e83b3a8; \
 	fi
 
+# Builds dsdgen with the system C compiler. -fcommon lets the kit's tentative
+# definitions of the same globals in several files link under GCC 10 and later,
+# which default to -fno-common.
 tpcds-init: tpcds-clone
-	@OS=`uname`; \
-	if [ -z "$(OS)" ]; then \
-		if [ "$$OS" = "Linux" ]; then \
-			OS=LINUX; \
-			$(MAKE) -C tpcds-kit/tools CC=gcc-9 OS=$$OS; \
-		elif [ "$$OS" = "Darwin" ]; then \
-			OS=MACOS; \
-			$(MAKE) -C tpcds-kit/tools OS=$$OS; \
-		else \
-			echo "Unsupported operating system: $$OS."; \
-			exit 1; \
-		fi; \
-	fi; \
-	$(MAKE) -C tpcds-kit/tools OS=$$OS
+	@case "`uname`" in \
+		Linux) KIT_OS=LINUX ;; \
+		Darwin) KIT_OS=MACOS ;; \
+		*) echo "Unsupported operating system: `uname`."; exit 1 ;; \
+	esac; \
+	$(MAKE) -C tpcds-kit/tools OS=$$KIT_OS $${KIT_OS}_CFLAGS="-g -Wall -fcommon"
 
 	@echo "Initialized successfully."
 
@@ -124,27 +117,6 @@ $(TPCH_DUCKDB):
 	@chmod +x "$(TPCH_DUCKDB)"
 	@"$(TPCH_DUCKDB)" --version
 
-# Pinned so tpcds-fleet-gen's dataset cannot drift with whatever duckdb happens to
-# be on PATH. Override DUCKDB to use an already-installed CLI.
-DUCKDB_VERSION ?= v1.5.4
-DUCKDB ?= ./tmp/bin/duckdb
-
-$(DUCKDB):
-	@mkdir -p ./tmp/bin
-	@OS=`uname`; ARCH=`uname -m`; \
-	case "$$OS/$$ARCH" in \
-		Linux/x86_64) ASSET=duckdb_cli-linux-amd64.zip ;; \
-		Linux/aarch64 | Linux/arm64) ASSET=duckdb_cli-linux-arm64.zip ;; \
-		Darwin/*) ASSET=duckdb_cli-osx-universal.zip ;; \
-		*) echo "No DuckDB CLI release asset for $$OS/$$ARCH - install duckdb and re-run with DUCKDB=\`command -v duckdb\`"; exit 1 ;; \
-	esac; \
-	echo "Downloading DuckDB CLI $(DUCKDB_VERSION) ($$ASSET)..."; \
-	curl -fsSL --retry 3 -o ./tmp/bin/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/$(DUCKDB_VERSION)/$$ASSET"
-	@unzip -oq ./tmp/bin/duckdb.zip -d ./tmp/bin
-	@rm -f ./tmp/bin/duckdb.zip
-	@chmod +x "$(DUCKDB)"
-	@"$(DUCKDB)" --version
-
 tpch-fleet-gen: $(TPCH_DUCKDB)
 	@# Check if DBGEN_SCALE is set, else default to 1
 	$(eval DBGEN_SCALE ?= 1)
@@ -165,52 +137,6 @@ tpch-fleet-gen: $(TPCH_DUCKDB)
 	done
 	@rm -f "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
 	@echo "Test data generated successfully in $(TPCH_FLEET_DIR) - pass TPCH_DATA_DIR=$(TPCH_FLEET_DIR) to the load targets."
-
-# tpcds-fleet-gen is the TPC-DS analog of tpch-fleet-gen above: it generates the
-# same TPC-DS dataset the rest of the benchmark fleet runs on - the s3/file
-# parquet copies and the hosted MySQL and Spice Cloud databases - which is what
-# crates/test-framework/src/queries/validation/tpcds/*.csv holds the expected
-# answers for. That dataset comes from DuckDB's tpcds extension, a
-# reimplementation whose RNG diverges from tpcds-kit's C dsdgen: schemas and row
-# counts are identical, but which customer bought which item on which ticket
-# differs, so cross-fact-table join incidence differs. Queries whose canonical
-# SF1 answers hold only 1-2 rows (q17, q25, q85 - store/catalog/web sales
-# joined to their returns) come back genuinely empty from a tpcds-kit-seeded
-# database no matter how correct the engine under test is, and value-level
-# result snapshots differ broadly. Seeding from the same generator the expected
-# answers were produced with is what makes a result mismatch mean a real bug.
-#
-# Data only - the DDL (tpcds.sql) and foreign keys (tpcds_ri.sql) still come
-# from tpcds-kit, which tpcds-clone fetches without compiling the C tools.
-# Example: DBGEN_SCALE=1 make tpcds-fleet-gen
-TPCDS_FLEET_DIR ?= ./tmp/tpcds-fleet
-
-TPCDS_TABLES = call_center catalog_page catalog_returns catalog_sales customer \
-	customer_address customer_demographics date_dim household_demographics \
-	income_band inventory item promotion reason ship_mode store store_returns \
-	store_sales time_dim warehouse web_page web_returns web_sales web_site
-
-tpcds-fleet-gen: $(DUCKDB)
-	@# Check if DBGEN_SCALE is set, else default to 1
-	$(eval DBGEN_SCALE ?= 1)
-	@mkdir -p "$(TPCDS_FLEET_DIR)"
-	@rm -f "$(TPCDS_FLEET_DIR)"/*.dat "$(TPCDS_FLEET_DIR)/gen.duckdb" "$(TPCDS_FLEET_DIR)/gen.duckdb.wal"
-	@echo "Generating TPC-DS scale factor $(DBGEN_SCALE)..."
-	@"$(DUCKDB)" "$(TPCDS_FLEET_DIR)/gen.duckdb" -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=$(DBGEN_SCALE));" > /dev/null
-	@# QUOTE '' disables CSV quoting so no field is ever wrapped, and the trailing
-	@# empty column reproduces dsdgen's trailing '|'; NULLs export as empty fields,
-	@# exactly as dsdgen writes them. The result is byte-compatible with dsdgen's
-	@# .dat format, so every *-tpcds-load target reads it unchanged. Tables are
-	@# dropped as they are written to bound peak disk at the larger scales.
-	@for table in $(TPCDS_TABLES); do \
-		echo "Writing $$table.dat..."; \
-		"$(DUCKDB)" "$(TPCDS_FLEET_DIR)/gen.duckdb" -c "\
-			COPY (SELECT *, '' FROM $$table) TO '$(TPCDS_FLEET_DIR)/$$table.dat' (FORMAT CSV, DELIMITER '|', HEADER false, QUOTE ''); \
-			DROP TABLE $$table; \
-			CHECKPOINT;" > /dev/null || exit 1; \
-	done
-	@rm -f "$(TPCDS_FLEET_DIR)/gen.duckdb" "$(TPCDS_FLEET_DIR)/gen.duckdb.wal"
-	@echo "Test data generated successfully in $(TPCDS_FLEET_DIR) - pass TPCDS_DATA_DIR=$(TPCDS_FLEET_DIR) to the load targets."
 
 # Default value for DB_NAME
 DB_NAME ?= tpch

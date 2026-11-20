@@ -23,6 +23,8 @@ runs:
 
     - name: Verify table ${{ inputs.name }} exists
       shell: bash
+      env:
+        INPUT_NAME: ${{ inputs.name }}
       run: |
         response=$(curl -X POST \
           -H "Content-Type: text/plain" \
@@ -31,7 +33,7 @@ runs:
         )
         echo $response | jq
 
-        full_name="${{ inputs.name }}"
+        full_name="${INPUT_NAME}"
 
         # Split the full_name into schema and table_name if it contains a dot
         if [[ $full_name == *"."* ]]; then
@@ -58,8 +60,11 @@ runs:
 
     - name: Verify SQL REPL result count for table ${{ inputs.name }}
       shell: bash
+      env:
+        INPUT_NAME: ${{ inputs.name }}
+        INPUT_EXPECTED_ROWS_COUNT: ${{ inputs.expected-rows-count }}
       run: |
-        query="select * from ${{ inputs.name }} limit 10;"
+        query="select * from ${INPUT_NAME} limit 10;"
         echo "Executing query: $query"
         sql_output=$(spice sql <<EOF
         $query
@@ -74,11 +79,11 @@ runs:
           exit 1
         fi
 
-        if [[ -n "${{ inputs.expected-rows-count }}" ]]; then
-          expected_rows="${{ inputs.expected-rows-count }} rows"
-          expected_rows_displayed="${{ inputs.expected-rows-count }}/${{ inputs.expected-rows-count }} rows displayed"
+        if [[ -n "${INPUT_EXPECTED_ROWS_COUNT}" ]]; then
+          expected_rows="${INPUT_EXPECTED_ROWS_COUNT} rows"
+          expected_rows_displayed="${INPUT_EXPECTED_ROWS_COUNT}/${INPUT_EXPECTED_ROWS_COUNT} rows displayed"
           if [[ $sql_output != *"$expected_rows"* ]] && [[ $sql_output != *"$expected_rows_displayed"* ]]; then
-            echo "Unexpected row count: ${{ inputs.expected-rows-count }}"
+            echo "Unexpected row count: ${INPUT_EXPECTED_ROWS_COUNT}"
             exit 1
           fi
         fi

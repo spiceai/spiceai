@@ -95,8 +95,9 @@ where
                 // Deserialize the map into a serde_value::Value
                 let content = Value::deserialize(de::value::MapAccessDeserializer::new(map))?;
 
-                // Try to deserialize content into T (Component)
-                let component_result = T::deserialize(content.clone());
+                // Try to deserialize content into T (Component), tracking the
+                // field path so a type error can name the field that failed.
+                let component_result = serde_path_to_error::deserialize::<_, T>(content.clone());
                 match component_result {
                     Ok(c) => Ok(ComponentOrReference::Component(c)),
                     Err(component_err) => {
@@ -104,7 +105,10 @@ where
                         let reference_result = ComponentReference::deserialize(content);
                         match reference_result {
                             Ok(r) => Ok(ComponentOrReference::Reference(r)),
-                            Err(_) => Err(de::Error::custom(component_err.to_string())),
+                            Err(_) => Err(de::Error::custom(crate::field_path::prefix_path(
+                                &component_err.path().to_string(),
+                                &component_err.into_inner().to_string(),
+                            ))),
                         }
                     }
                 }
@@ -166,10 +170,12 @@ where
                                 path: component_base_path.clone(),
                             })?;
 
-                        let component_definition: ComponentType = yaml::from_reader(component_rdr)
-                            .context(UnableToParseSpicepodComponentSnafu {
-                                path: component_base_path,
-                            })?;
+                        let component_definition: ComponentType =
+                            yaml::from_reader::<_, yaml::Value>(component_rdr)
+                                .and_then(crate::field_path::from_value)
+                                .context(UnableToParseSpicepodComponentSnafu {
+                                    path: component_base_path,
+                                })?;
 
                         let component = component_definition.depends_on(&reference.depends_on);
 

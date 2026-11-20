@@ -86,12 +86,16 @@ runs:
       if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
       id: minio-download
       shell: bash
+      env:
+        DETECT_OS_OS: ${{ steps.detect-os.outputs.os }}
+        COMMIT_SHA_SHA: ${{ steps.commit-sha.outputs.sha }}
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
       run: |
-        if mc stat spice-minio/artifacts/testoperator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/testoperator${{ steps.detect-os.outputs.ext }}; then
+        if mc stat "spice-minio/artifacts/testoperator/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/testoperator${DETECT_OS_EXT}"; then
           echo "Found testoperator in MinIO"
           mkdir -p target/release
-          mc cp spice-minio/artifacts/testoperator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/testoperator${{ steps.detect-os.outputs.ext }} target/release/testoperator${{ steps.detect-os.outputs.ext }}
-          chmod +x target/release/testoperator${{ steps.detect-os.outputs.ext }}
+          mc cp "spice-minio/artifacts/testoperator/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/testoperator${DETECT_OS_EXT}" "target/release/testoperator${DETECT_OS_EXT}"
+          chmod +x "target/release/testoperator${DETECT_OS_EXT}"
           echo "found=true" >> $GITHUB_OUTPUT
         else
           echo "Testoperator not found in MinIO"
@@ -128,8 +132,10 @@ runs:
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-testoperator.outputs.cache-hit != 'true')
       id: check-sccache
       shell: bash
+      env:
+        INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
       run: |
-        if [ -z "${{ inputs.minio_endpoint }}" ]; then
+        if [ -z "${INPUT_MINIO_ENDPOINT}" ]; then
           echo "SCCACHE_SETUP=false" >> $GITHUB_OUTPUT
         else
           echo "SCCACHE_SETUP=true" >> $GITHUB_OUTPUT
@@ -167,15 +173,21 @@ runs:
     - name: Upload testoperator to MinIO
       if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-testoperator.outputs.cache-hit != 'true')
       shell: bash
+      env:
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
+        DETECT_OS_OS: ${{ steps.detect-os.outputs.os }}
+        COMMIT_SHA_SHA: ${{ steps.commit-sha.outputs.sha }}
       run: |
-        mc cp target/release/testoperator${{ steps.detect-os.outputs.ext }} spice-minio/artifacts/testoperator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/testoperator${{ steps.detect-os.outputs.ext }}
+        mc cp "target/release/testoperator${DETECT_OS_EXT}" "spice-minio/artifacts/testoperator/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/testoperator${DETECT_OS_EXT}"
 
     - name: Install testoperator to system path (Linux/macOS)
       if: inputs.install_to_system_path == 'true' && steps.detect-os.outputs.os != 'windows'
       shell: bash
+      env:
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
       run: |
         sudo mkdir -p /usr/local/bin
-        sudo cp target/release/testoperator${{ steps.detect-os.outputs.ext }} /usr/local/bin/testoperator
+        sudo cp "target/release/testoperator${DETECT_OS_EXT}" /usr/local/bin/testoperator
         sudo chmod +x /usr/local/bin/testoperator
 
     - name: Install testoperator to system path (Windows)
@@ -189,15 +201,19 @@ runs:
     - name: Set output path
       id: set-path
       shell: bash
+      env:
+        INPUT_INSTALL_TO_SYSTEM_PATH: ${{ inputs.install_to_system_path }}
+        DETECT_OS_OS: ${{ steps.detect-os.outputs.os }}
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
       run: |
-        if [ "${{ inputs.install_to_system_path }}" = "true" ]; then
-          if [ "${{ steps.detect-os.outputs.os }}" = "windows" ]; then
+        if [ "${INPUT_INSTALL_TO_SYSTEM_PATH}" = "true" ]; then
+          if [ "${DETECT_OS_OS}" = "windows" ]; then
             echo "path=/c/usr/local/bin/testoperator.exe" >> $GITHUB_OUTPUT
           else
             echo "path=/usr/local/bin/testoperator" >> $GITHUB_OUTPUT
           fi
         else
-          echo "path=${{ github.workspace }}/target/release/testoperator${{ steps.detect-os.outputs.ext }}" >> $GITHUB_OUTPUT
+          echo "path=${{ github.workspace }}/target/release/testoperator${DETECT_OS_EXT}" >> $GITHUB_OUTPUT
         fi
 
     - name: Upload testoperator artifact
