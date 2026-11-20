@@ -32,8 +32,10 @@ use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::state::JobErrorCode;
 
 use super::Result;
+use super::admission::{
+    Admission, Budgets, Limits as JobLimits, MAX_JOB_RESULT_BYTES, Refusal, StoredEntry,
+};
 use super::error::Error;
-use super::ledger::{Admission, Limits as JobLimits, MAX_JOB_RESULT_BYTES, Refusal, StoredEntry};
 use super::state::{JobResult, JobState, JobStatus, now_ms_or_zero};
 use super::store::JobStore;
 use runtime_metrics::async_queries::{self as async_query_metrics, ActiveStatus, RejectionReason};
@@ -119,18 +121,27 @@ fn refusal_error(refusal: Refusal) -> Error {
     }
 }
 
-/// Logs how a job's background task ended. A driver that another scheduler
-/// took the job from stops at its next write; that is not a failure.
-fn report_job_end(job_id: &str, result: Result<()>, what: &str) {
+/// Logs how a job's background task ended, and returns the result it keeps when it succeeded
+/// here. A driver that another scheduler took the job from stops at its next write; that is not
+/// a failure, and the job's result then counts where it finished.
+fn report_job_end(
+    job_id: &str,
+    result: Result<Option<StoredEntry>>,
+    what: &str,
+) -> Option<StoredEntry> {
     match result {
-        Ok(()) => {}
+        Ok(stored) => stored,
         Err(Error::JobTakenOver { .. }) => {
             tracing::debug!(
                 job_id,
                 "Stopped driving the job: another scheduler took it over"
             );
+            None
         }
-        Err(e) => tracing::error!(job_id = %job_id, error = %e, "{what}"),
+        Err(e) => {
+            tracing::error!(job_id = %job_id, error = %e, "{what}");
+            None
+        }
     }
 }
 
@@ -153,7 +164,7 @@ pub struct JobExecutor {
     df: Arc<DataFusion>,
     /// Tracks active jobs by Spice `job_id`
     active_jobs: Arc<RwLock<std::collections::HashMap<String, ActiveJobInfo>>>,
-    /// Starts jobs and keeps each caller's ledger as they start and finish.
+    /// Starts jobs and keeps each caller's budget on this scheduler as they start and finish.
     runner: Runner,
 }
 
@@ -163,9 +174,24 @@ struct PendingJob {
     /// The submitting request's context, which the job runs under. `None` for a public job
     /// taken over from a scheduler that stopped.
     context: Option<Arc<RequestContext>>,
+    /// Where the job's record is: a job admitted to wait is held here before its record is
+    /// written, so a slot freed meanwhile goes to it in submission order.
+    record: PendingRecord,
 }
 
-/// What starting a job and keeping its caller's ledger needs, shared with the jobs' tasks.
+/// Whether a queued job's record is written yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingRecord {
+    /// Its submission is still writing it.
+    Writing,
+    /// A running slot was freed for it while its record was being written: its submission
+    /// starts it once the record is written.
+    PromotedWhileWriting,
+    /// It is written: the job starts when it gets a slot.
+    Written,
+}
+
+/// What starting a job and keeping its caller's budget needs, shared with the jobs' tasks.
 #[derive(Clone)]
 struct Runner {
     job_store: Arc<JobStore>,
@@ -174,25 +200,21 @@ struct Runner {
     /// Jobs this scheduler accepted that wait for a running slot, by job id. A pending job holds
     /// no task and no query resources.
     pending: Arc<parking_lot::Mutex<std::collections::HashMap<String, PendingJob>>>,
-    limits: JobLimits,
+    /// Each caller's running, queued and stored results on this scheduler.
+    budgets: Arc<Budgets>,
 }
 
 /// The message a job gets when the scheduler that held it stopped and it cannot be run under
 /// the identity that submitted it.
 const RESUBMIT_MESSAGE: &str = "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.";
 
-/// How long a job may go without a ledger entry, or a ledger entry without its job, before the
-/// recovery sweep treats it as left by a scheduler that stopped between the two writes. It also
-/// covers a submission that lands after the sweep listed the jobs.
-const UNADMITTED_GRACE_MS: u64 = 60_000;
+/// The message a queued job gets when its submission failed after its record was written, so
+/// no scheduler holds it.
+const ABANDONED_MESSAGE: &str = "The submission of this query failed after the query was recorded, so it never ran. Resubmit the query.";
 
-/// How long a finished query's release waits for another write of its caller's ledger to carry
-/// it before it is written on its own. A submission arriving meanwhile writes the ledger anyway,
-/// and takes the release along.
-const RELEASE_WINDOW: Duration = Duration::from_millis(10);
-
-/// How long this scheduler keeps a caller's ledger in memory after it last changed it.
-const LEDGER_IDLE: Duration = Duration::from_mins(10);
+/// How long a queued job that names this scheduler, but that this scheduler does not hold, is
+/// left alone before the recovery sweep fails it: its submission may still be writing it.
+const UNHELD_GRACE_MS: u64 = 60_000;
 
 impl Runner {
     /// Starts `job_id` in a task of its own, under `context` when it has one, and releases its
@@ -210,6 +232,8 @@ impl Runner {
                 },
             );
             async_query_metrics::add_active(ActiveStatus::Running, 1);
+            let budgets = Arc::clone(&runner.budgets);
+            let on_written = |written: u64| budgets.record_written(&owner, &job_id, written);
             let result = JobExecutor::execute_job(
                 &runner.job_store,
                 Arc::clone(&runner.df),
@@ -217,12 +241,13 @@ impl Runner {
                 &runner.active_jobs,
                 cancel_token,
                 Start::Submitted,
+                &on_written,
             )
             .await;
             runner.active_jobs.write().await.remove(&job_id);
             async_query_metrics::add_active(ActiveStatus::Running, -1);
-            report_job_end(&job_id, result, "Job execution failed");
-            runner.finished(&owner, &job_id).await;
+            let stored = report_job_end(&job_id, result, "Job execution failed");
+            runner.finished(&owner, &job_id, stored);
         }
         .instrument(span);
         match context {
@@ -233,147 +258,79 @@ impl Runner {
         };
     }
 
-    /// Releases `job_id`'s running slot once its state is final, keeps its result in the
-    /// caller's stored-results budget until it expires, and starts the caller's next queued jobs
-    /// this scheduler accepted. A job another scheduler took over keeps its slot.
-    ///
-    /// The release is queued for the caller's next ledger write, such as its next submission,
-    /// so a submission does not wait behind a write of its own. When no write carries it within
-    /// `RELEASE_WINDOW`, it is written here; at once when a queued job of the caller waits here
-    /// for the slot.
-    async fn finished(&self, owner: &str, job_id: &str) {
-        let stored = match self.job_store.get_job_ignoring_expiry(job_id).await {
-            Ok(state) if state.is_terminal() => stored_entry(&state),
-            Ok(_) => return,
-            Err(e) => {
-                tracing::debug!(job_id, "Failed to read the finished async query: {e}");
-                None
-            }
-        };
-        self.job_store.queue_release(owner, job_id, stored);
-        if !self.has_pending(owner) {
-            tokio::time::sleep(RELEASE_WINDOW).await;
-            if !self.has_pending(owner) && !self.job_store.has_queued_releases(owner) {
-                return;
-            }
-        }
-        let node = self.job_store.node_id().to_string();
-        let limits = self.limits;
-        match self
-            .job_store
-            .modify_ledger(owner, |ledger| {
-                let promoted = ledger.promote(&node, limits);
-                let changed = !promoted.is_empty();
-                (promoted, changed)
-            })
-            .await
-        {
-            Ok(promoted) => self.start_promoted(owner, promoted).await,
-            Err(e) => tracing::warn!(
-                job_id,
-                "Failed to release the running slot of async query '{job_id}': {e}. The recovery sweep releases it."
-            ),
-        }
+    /// Releases `job_id`'s running slot or queue place on this scheduler, keeps its result in
+    /// the caller's stored-results budget until it expires, and starts the caller's next queued
+    /// jobs.
+    fn finished(&self, owner: &str, job_id: &str, stored: Option<StoredEntry>) {
+        let promoted = self.budgets.finish(owner, job_id, stored);
+        self.start_promoted(owner, promoted);
     }
 
-    /// Whether a queued job of `owner` waits here for a running slot.
-    fn has_pending(&self, owner: &str) -> bool {
-        self.pending.lock().values().any(|job| job.owner == owner)
-    }
-
-    /// Releases the running slot or queue place of `job_id`, admitted while its job record
-    /// failed to be written, and starts the caller's next queued jobs here. A release that does
-    /// not land is left to the recovery sweep, which drops an entry without a job once
-    /// `UNADMITTED_GRACE_MS` has passed.
-    async fn release_unwritten(&self, owner: &str, job_id: &str) {
-        let node = self.job_store.node_id().to_string();
-        let limits = self.limits;
-        match self
-            .job_store
-            .modify_ledger(owner, |ledger| {
-                let (changed, promoted) = ledger.finish_and_promote(job_id, None, &node, limits);
-                (promoted, changed)
-            })
-            .await
-        {
-            Ok(promoted) => self.start_promoted(owner, promoted).await,
-            Err(e) => tracing::warn!(
-                job_id,
-                "Failed to release the place of async query '{job_id}', whose submission failed: {e}. The recovery sweep releases it."
-            ),
-        }
-    }
-
-    /// Starts the queued jobs of `owner` that this scheduler accepted, while the caller has
-    /// running slots free, in submission order.
-    async fn promote(&self, owner: &str) {
-        let node = self.job_store.node_id().to_string();
-        let limits = self.limits;
-        let promoted = match self
-            .job_store
-            .modify_ledger(owner, |ledger| {
-                let promoted = ledger.promote(&node, limits);
-                let changed = !promoted.is_empty();
-                (promoted, changed)
-            })
-            .await
-        {
-            Ok(promoted) => promoted,
-            Err(e) => {
-                tracing::debug!("Failed to start queued async queries: {e}");
-                return;
-            }
-        };
-        self.start_promoted(owner, promoted).await;
-    }
-
-    /// Starts the queued jobs of `owner` that just got a running slot here.
-    async fn start_promoted(&self, owner: &str, promoted: Vec<String>) {
-        for job_id in promoted {
-            let pending = self.pending.lock().remove(&job_id);
-            async_query_metrics::add_active(ActiveStatus::Pending, -i64::from(pending.is_some()));
-            match pending {
+    /// Starts the queued jobs of `owner` that just got a running slot here, in submission order.
+    /// A job whose record is still being written is started by its submission once written; a
+    /// job that cannot run is failed and the slot goes to the next.
+    fn start_promoted(&self, owner: &str, promoted: Vec<String>) {
+        let mut queue: std::collections::VecDeque<String> = promoted.into();
+        while let Some(job_id) = queue.pop_front() {
+            let job = {
+                let mut pending = self.pending.lock();
+                match pending.get_mut(&job_id) {
+                    Some(job) if job.record == PendingRecord::Writing => {
+                        job.record = PendingRecord::PromotedWhileWriting;
+                        continue;
+                    }
+                    _ => pending.remove(&job_id),
+                }
+            };
+            async_query_metrics::add_active(ActiveStatus::Pending, -i64::from(job.is_some()));
+            match job {
                 Some(job) => self.start(job_id, job.owner, job.context),
-                // Accepted here but no longer known to this process: only a public job can run
+                // Held here but no longer known to this process: only a public job can run
                 // without its submitting request.
                 None if owner == super::PUBLIC_JOB_OWNER => {
                     self.start(job_id, owner.to_string(), None);
                 }
-                None => self.fail_unrunnable(owner, &job_id).await,
+                None => {
+                    self.fail_unrunnable(&job_id);
+                    queue.extend(self.budgets.finish(owner, &job_id, None));
+                }
             }
         }
     }
 
-    /// Fails a queued job of an authenticated caller that cannot be started under its caller,
-    /// and releases its place.
-    async fn fail_unrunnable(&self, owner: &str, job_id: &str) {
+    /// Fails, in the background, a queued job of an authenticated caller that cannot be started
+    /// under its caller.
+    fn fail_unrunnable(&self, job_id: &str) {
         tracing::warn!(
             job_id,
             "Async query job '{job_id}' was waiting on a scheduler that stopped, and it cannot be run under the identity that submitted it, so it is marked failed; resubmit the query."
         );
-        if let Err(e) = self
-            .job_store
-            .fail_pending_job(job_id, JobErrorCode::SchedulerUnavailable, RESUBMIT_MESSAGE)
-            .await
-        {
-            tracing::warn!(
-                job_id,
-                "Failed to mark async query job '{job_id}' failed: {e}"
-            );
-        }
-        if let Err(e) = self
-            .job_store
-            .modify_ledger(owner, |ledger| ((), ledger.finish(job_id, None)))
-            .await
-        {
-            tracing::debug!(job_id, "Failed to release the async query's place: {e}");
-        }
+        let job_store = Arc::clone(&self.job_store);
+        let job_id = job_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = job_store
+                .fail_pending_job(
+                    &job_id,
+                    JobErrorCode::SchedulerUnavailable,
+                    RESUBMIT_MESSAGE,
+                )
+                .await
+            {
+                tracing::warn!(
+                    job_id,
+                    "Failed to mark async query job '{job_id}' failed: {e}"
+                );
+            }
+        });
     }
 }
 
 /// The stored-results entry of a finished job: its result bytes until they expire, if it
 /// succeeded.
 fn stored_entry(state: &JobState) -> Option<StoredEntry> {
+    if state.status != JobStatus::Succeeded {
+        return None;
+    }
     let result = state.result.as_ref()?;
     Some(StoredEntry {
         bytes: u64::try_from(result.manifest.total_byte_count).unwrap_or(u64::MAX),
@@ -418,7 +375,7 @@ impl JobExecutor {
             df: Arc::clone(&df),
             active_jobs: Arc::clone(&active_jobs),
             pending: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
-            limits,
+            budgets: Arc::new(Budgets::new(limits)),
         };
         Self {
             job_store,
@@ -445,322 +402,190 @@ impl JobExecutor {
             job_timeout_seconds(request.timeout_seconds, context.query_timeout())?;
         request.maximum_size = Some(job_maximum_size(request.maximum_size)?);
 
-        // The job is written and admitted to its caller's ledger at the same time, so a
-        // submission waits for one write rather than two. Each side is undone when the other
-        // fails: a job whose admission did not land is deleted, and an admission whose job was
-        // not written is released. A scheduler that stops between the two leaves a job the
-        // recovery sweep fails, or a ledger entry it releases once `UNADMITTED_GRACE_MS` has
-        // passed.
+        // The caller's budget on this scheduler decides first, in memory, so a refused
+        // submission writes nothing and an admitted one writes only its job.
         let job_id = JobStore::generate_job_id();
-        let node = self.job_store.node_id().to_string();
-        let limits = self.runner.limits;
-        let admitted_at_ms = now_ms_or_zero();
-        // The running slots a refused submission found taken.
-        let mut taken = Vec::new();
-        let (created, admission) = tokio::join!(
-            self.job_store
-                .create_job_with_id(job_id.clone(), request, read_only, owner.clone()),
-            self.job_store.modify_ledger(&owner, |ledger| {
-                taken.clear();
-                let admission = ledger.admit(&job_id, &node, limits, admitted_at_ms);
-                if admission.is_err() {
-                    taken.extend(ledger.running.keys().cloned());
+        let admission = self
+            .runner
+            .budgets
+            .admit(&owner, &job_id, now_ms_or_zero())
+            .map_err(refusal_error)?;
+        if admission == Admission::Pending {
+            self.runner.pending.lock().insert(
+                job_id.clone(),
+                PendingJob {
+                    owner: owner.clone(),
+                    context: Some(Arc::clone(&context)),
+                    record: PendingRecord::Writing,
+                },
+            );
+            async_query_metrics::add_active(ActiveStatus::Pending, 1);
+        }
+
+        let state = match self
+            .job_store
+            .create_job_with_id(job_id.clone(), request, read_only, owner.clone())
+            .await
+        {
+            Ok(state) => state,
+            Err(e) => {
+                // The job was not written: its slot or place goes back to the caller.
+                if self.runner.pending.lock().remove(&job_id).is_some() {
+                    async_query_metrics::add_active(ActiveStatus::Pending, -1);
                 }
-                let changed = admission.is_ok();
-                (admission, changed)
-            }),
-        );
-        let (state, admission) = match (created, admission) {
-            (Ok(state), Ok(Ok(admission))) => (state, admission),
-            (Ok(state), Ok(Err(refusal))) => {
-                // A query that finished may still hold its slot until its release lands, here
-                // or on another scheduler. The caller has seen it finish, so its slot is free:
-                // release it and decide again before refusing.
-                match self
-                    .readmit_after_finished(&owner, &job_id, &taken, admitted_at_ms)
-                    .await
-                {
-                    Some(Ok(admission)) => (state, admission),
-                    again => {
-                        self.discard(&job_id).await;
-                        let refusal = match again {
-                            Some(Err(again)) => again,
-                            _ => refusal,
-                        };
-                        return Err(refusal_error(refusal));
-                    }
-                }
-            }
-            (Ok(_), Err(e)) => {
-                self.discard(&job_id).await;
+                self.runner.finished(&owner, &job_id, None);
                 return Err(e);
             }
-            (Err(e), Ok(Ok(_))) => {
-                self.runner.release_unwritten(&owner, &job_id).await;
-                return Err(e);
-            }
-            (Err(_), Ok(Err(refusal))) => return Err(refusal_error(refusal)),
-            (Err(e), Err(_)) => return Err(e),
         };
 
         match admission {
-            Admission::Run => self.runner.start(job_id, owner, Some(Arc::clone(&context))),
+            Admission::Run => self.runner.start(job_id, owner, Some(context)),
             Admission::Pending => {
-                self.runner.pending.lock().insert(
-                    job_id,
-                    PendingJob {
-                        owner,
-                        context: Some(context),
-                    },
-                );
-                async_query_metrics::add_active(ActiveStatus::Pending, 1);
+                let promoted = {
+                    let mut pending = self.runner.pending.lock();
+                    match pending.get_mut(&job_id) {
+                        Some(job) if job.record == PendingRecord::PromotedWhileWriting => {
+                            pending.remove(&job_id).is_some()
+                        }
+                        Some(job) => {
+                            job.record = PendingRecord::Written;
+                            false
+                        }
+                        None => false,
+                    }
+                };
+                if promoted {
+                    async_query_metrics::add_active(ActiveStatus::Pending, -1);
+                    self.runner.start(job_id, owner, Some(context));
+                }
             }
         }
 
         Ok(state)
     }
 
-    /// The queries among `job_ids` whose job records, read from the job store, are final, with
-    /// the results they keep. A record that is missing, cannot be read, or is not final keeps its
-    /// slot.
-    async fn finished_among(&self, job_ids: &[String]) -> Vec<(String, Option<StoredEntry>)> {
-        let states = futures::future::join_all(
-            job_ids
-                .iter()
-                .map(|job_id| self.job_store.get_job_ignoring_expiry(job_id)),
-        )
-        .await;
-        job_ids
-            .iter()
-            .zip(states)
-            .filter_map(|(job_id, state)| match state {
-                Ok(state) if state.is_terminal() && state.job_id == *job_id => {
-                    Some((job_id.clone(), stored_entry(&state)))
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::debug!(job_id, "Failed to read a running async query's state: {e}");
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Admits `job_id` again after releasing the slots among `taken` whose queries finished, and
-    /// starting the queued queries this scheduler holds that then get a slot. `None` when none
-    /// of them finished, so the refusal stands.
-    async fn readmit_after_finished(
-        &self,
-        owner: &str,
-        job_id: &str,
-        taken: &[String],
-        admitted_at_ms: u64,
-    ) -> Option<std::result::Result<Admission, Refusal>> {
-        let finished = self.finished_among(taken).await;
-        if finished.is_empty() {
-            return None;
-        }
-        let node = self.job_store.node_id().to_string();
-        let limits = self.runner.limits;
-        let outcome = self
-            .job_store
-            .modify_ledger(owner, |ledger| {
-                let mut changed = false;
-                for (finished_id, stored) in &finished {
-                    changed |= ledger.finish(finished_id, *stored);
-                }
-                let promoted = ledger.promote(&node, limits);
-                changed |= !promoted.is_empty();
-                let admission = ledger.admit(job_id, &node, limits, admitted_at_ms);
-                changed |= admission.is_ok();
-                ((promoted, admission), changed)
-            })
-            .await;
-        match outcome {
-            Ok((promoted, admission)) => {
-                self.runner.start_promoted(owner, promoted).await;
-                Some(admission)
-            }
-            Err(e) => {
-                tracing::debug!(job_id, "Failed to release finished async queries: {e}");
-                None
-            }
-        }
-    }
-
-    /// Deletes a job that was refused before it could run, best effort.
-    async fn discard(&self, job_id: &str) {
-        if let Err(e) = self.job_store.delete_job(job_id).await {
-            tracing::debug!(job_id, "Failed to delete the refused async query: {e}");
-        }
-    }
-
-    /// Starts the queued jobs this scheduler accepted whose callers have running slots free.
-    /// A slot another scheduler frees is taken here, by the scheduler holding the caller's
-    /// request, so each caller's queued jobs start in submission order across the cluster.
-    pub async fn promote_pending(&self) {
-        let owners: std::collections::BTreeSet<String> = self
-            .runner
-            .pending
-            .lock()
-            .values()
-            .map(|job| job.owner.clone())
-            .collect();
-        for owner in owners {
-            self.runner.promote(&owner).await;
-        }
-    }
-
-    /// Reconciles every caller's ledger with `jobs`, every job's state as the recovery sweep
-    /// listed it, so a scheduler that stopped between writing a job and its ledger leaves
-    /// nothing behind for long:
-    /// - a slot or place whose job finished is released, and a succeeded job's result is kept in
-    ///   the budget until it expires; one whose job is missing is released once
-    ///   `UNADMITTED_GRACE_MS` has passed since it was admitted, since its job may still be
-    ///   being written, or have been written after `jobs` was listed;
-    /// - a ledger that was lost is rebuilt with the results of the caller's succeeded jobs;
-    /// - a queued job accepted by a scheduler that is not live is taken over here when its
-    ///   caller is public, and otherwise failed with a request to resubmit, as a running job
-    ///   is; the rest keep their order;
-    /// - a job that never entered its caller's ledger is failed after the same grace period.
-    pub async fn reconcile_ledgers(
+    /// Recovers queued jobs for the recovery sweep, from `jobs`, every job's state as the sweep
+    /// listed it, and `live_nodes`, the schedulers alive now:
+    /// - a queued job this scheduler holds whose record is no longer queued (cancelled or failed
+    ///   elsewhere) gives back its place;
+    /// - a queued job accepted by a scheduler that is not live is taken over here, oldest first,
+    ///   when its caller is public and has room in its queue here, and otherwise failed with a
+    ///   request to resubmit, as a running job is; one that finds no room waits for a later
+    ///   sweep;
+    /// - a queued job that names this scheduler but that this scheduler does not hold, whose
+    ///   submission failed after writing it, is failed once `UNHELD_GRACE_MS` has passed.
+    pub async fn recover_queued(
         &self,
         jobs: &[JobState],
         live_nodes: &std::collections::HashSet<String>,
     ) {
-        let mut owners: std::collections::BTreeSet<String> = jobs
-            .iter()
-            .map(|job| job.owner_scope().to_string())
-            .collect();
-        match self.job_store.ledger_owners().await {
-            Ok(ledger_owners) => owners.extend(ledger_owners),
-            Err(e) => tracing::debug!("Failed to list caller budgets: {e}"),
-        }
-        let by_id: std::collections::HashMap<&str, &JobState> =
-            jobs.iter().map(|job| (job.job_id.as_str(), job)).collect();
         let node = self.job_store.node_id().to_string();
         let now_ms = now_ms_or_zero();
+        let by_id: std::collections::HashMap<&str, &JobState> =
+            jobs.iter().map(|job| (job.job_id.as_str(), job)).collect();
 
-        for owner in owners {
-            let mut orphaned = Vec::new();
-            let mut tracked = std::collections::HashSet::new();
-            let result = self
-                .job_store
-                .modify_ledger(&owner, |ledger| {
-                    orphaned.clear();
-                    tracked.clear();
-                    let mut changed = ledger.prune_expired(now_ms);
-                    let entries: Vec<String> = ledger
-                        .running
-                        .keys()
-                        .cloned()
-                        .chain(ledger.pending.iter().map(|entry| entry.job_id.clone()))
-                        .collect();
-                    for job_id in entries {
-                        match by_id.get(job_id.as_str()) {
-                            Some(job) if !job.is_terminal() => {
-                                tracked.insert(job_id);
-                            }
-                            Some(job) => changed |= ledger.finish(&job_id, stored_entry(job)),
-                            None if ledger.admitted_at_ms(&job_id).is_some_and(|at| {
-                                now_ms.saturating_sub(at) <= UNADMITTED_GRACE_MS
-                            }) => {}
-                            None => changed |= ledger.finish(&job_id, None),
-                        }
-                    }
-                    if ledger.version.is_none() {
-                        for job in jobs.iter().filter(|job| job.owner_scope() == owner) {
-                            if let Some(stored) = stored_entry(job)
-                                && stored.expires_at_ms > now_ms
-                            {
-                                ledger.keep_stored(stored);
-                                changed = true;
-                            }
-                        }
-                    }
-                    for entry in &ledger.pending {
-                        if !live_nodes.contains(&entry.node) && entry.node != node {
-                            orphaned.push(entry.job_id.clone());
-                        }
-                    }
-                    if owner == super::PUBLIC_JOB_OWNER {
-                        for job_id in &orphaned {
-                            changed |= ledger.take_over(job_id, &node);
-                        }
-                    }
-                    ((), changed)
-                })
-                .await;
-            if let Err(e) = result {
-                tracing::debug!("Failed to reconcile a caller's async query budget: {e}");
-                continue;
-            }
-
-            for job_id in orphaned {
-                if owner == super::PUBLIC_JOB_OWNER {
-                    tracing::info!(
-                        job_id = %job_id,
-                        "Taking over a queued async query from a scheduler that stopped"
-                    );
-                    if self
-                        .runner
-                        .pending
-                        .lock()
-                        .insert(
-                            job_id,
-                            PendingJob {
-                                owner: owner.clone(),
-                                context: None,
-                            },
-                        )
-                        .is_none()
-                    {
-                        async_query_metrics::add_active(ActiveStatus::Pending, 1);
-                    }
-                } else {
-                    self.runner.fail_unrunnable(&owner, &job_id).await;
-                }
-            }
-
-            // A job that was created but never entered its caller's ledger: its scheduler
-            // stopped in between.
-            for job in jobs.iter().filter(|job| {
-                job.owner_scope() == owner
-                    && job.status == JobStatus::Pending
-                    && !tracked.contains(&job.job_id)
-                    && now_ms.saturating_sub(job.created_at_ms) > UNADMITTED_GRACE_MS
-            }) {
-                if let Err(e) = self
-                    .job_store
-                    .fail_pending_job(
-                        &job.job_id,
-                        JobErrorCode::SchedulerUnavailable,
-                        RESUBMIT_MESSAGE,
-                    )
-                    .await
-                {
-                    tracing::debug!(job_id = %job.job_id, "Failed to fail an abandoned async query: {e}");
-                }
-            }
-            self.runner.promote(&owner).await;
-        }
-
-        // Drop queued jobs this scheduler holds that are no longer in their caller's queue
-        // (cancelled, or failed by another scheduler).
         let held: Vec<(String, String)> = self
             .runner
             .pending
             .lock()
             .iter()
+            .filter(|(_, job)| job.record == PendingRecord::Written)
             .map(|(job_id, job)| (job_id.clone(), job.owner.clone()))
             .collect();
         for (job_id, owner) in held {
-            let queued = by_id
+            // A record listed as no longer queued; one written after the listing is not listed.
+            let ended = by_id
                 .get(job_id.as_str())
-                .is_some_and(|job| job.status == JobStatus::Pending);
-            if !queued && self.runner.pending.lock().remove(&job_id).is_some() {
+                .is_some_and(|job| job.status != JobStatus::Pending);
+            if ended && self.runner.pending.lock().remove(&job_id).is_some() {
                 async_query_metrics::add_active(ActiveStatus::Pending, -1);
-                tracing::debug!(job_id = %job_id, owner = %owner, "Dropped a queued async query that is no longer waiting");
+                tracing::debug!(job_id = %job_id, "Dropped a queued async query that is no longer waiting");
+                self.runner.finished(&owner, &job_id, None);
+            }
+        }
+
+        let mut orphaned: Vec<&JobState> =
+            jobs.iter()
+                .filter(|job| {
+                    job.status == JobStatus::Pending
+                        && job.scheduler_node.as_ref().is_some_and(|accepted| {
+                            *accepted != node && !live_nodes.contains(accepted)
+                        })
+                })
+                .collect();
+        orphaned.sort_by_key(|job| job.created_at_ms);
+        for job in orphaned {
+            let job_id = job.job_id.as_str();
+            let owner = job.owner_scope().to_string();
+            if owner != super::PUBLIC_JOB_OWNER {
+                tracing::warn!(
+                    job_id,
+                    "Async query job '{job_id}' was waiting on a scheduler that stopped, and it cannot be run under the identity that submitted it, so it is marked failed; resubmit the query."
+                );
+                if let Err(e) = self
+                    .job_store
+                    .fail_pending_job(job_id, JobErrorCode::SchedulerUnavailable, RESUBMIT_MESSAGE)
+                    .await
+                {
+                    tracing::warn!(
+                        job_id,
+                        "Failed to mark async query job '{job_id}' failed: {e}"
+                    );
+                }
+                continue;
+            }
+            let Some(admission) = self.runner.budgets.take_over_pending(&owner, job_id) else {
+                tracing::debug!(
+                    job_id,
+                    "Not taking over the queued async query yet: its caller's queue here is full"
+                );
+                continue;
+            };
+            match self.job_store.take_over_pending_job(job).await {
+                Ok(Some(_)) => {
+                    tracing::info!(
+                        job_id,
+                        "Taking over a queued async query from a scheduler that stopped"
+                    );
+                    match admission {
+                        Admission::Run => self.runner.start(job_id.to_string(), owner, None),
+                        Admission::Pending => {
+                            self.runner.pending.lock().insert(
+                                job_id.to_string(),
+                                PendingJob {
+                                    owner,
+                                    context: None,
+                                    record: PendingRecord::Written,
+                                },
+                            );
+                            async_query_metrics::add_active(ActiveStatus::Pending, 1);
+                        }
+                    }
+                }
+                Ok(None) => self.runner.finished(&owner, job_id, None),
+                Err(e) => {
+                    tracing::debug!(job_id, "Failed to take over the queued async query: {e}");
+                    self.runner.finished(&owner, job_id, None);
+                }
+            }
+        }
+
+        for job in jobs.iter().filter(|job| {
+            job.status == JobStatus::Pending
+                && job.scheduler_node.as_deref() == Some(node.as_str())
+                && now_ms.saturating_sub(job.created_at_ms) > UNHELD_GRACE_MS
+                && !self.runner.budgets.holds(job.owner_scope(), &job.job_id)
+        }) {
+            if let Err(e) = self
+                .job_store
+                .fail_pending_job(
+                    &job.job_id,
+                    JobErrorCode::SubmissionFailed,
+                    ABANDONED_MESSAGE,
+                )
+                .await
+            {
+                tracing::debug!(job_id = %job.job_id, "Failed to fail an abandoned async query: {e}");
             }
         }
     }
@@ -792,17 +617,7 @@ impl JobExecutor {
                 .fail_orphaned_job(job, JobErrorCode::SchedulerUnavailable, RESUBMIT_MESSAGE)
                 .await
             {
-                Ok(Some(_)) => {
-                    let owner = job.owner_scope().to_string();
-                    if let Err(e) = self
-                        .job_store
-                        .modify_ledger(&owner, |ledger| ((), ledger.finish(job_id, None)))
-                        .await
-                    {
-                        tracing::debug!(job_id, "Failed to release the async query's slot: {e}");
-                    }
-                    self.runner.promote(&owner).await;
-                }
+                Ok(Some(_)) => {}
                 Ok(None) => tracing::debug!(
                     job_id,
                     "Not recovering the job: another scheduler took it over first, or it finished"
@@ -815,10 +630,21 @@ impl JobExecutor {
             return;
         }
 
+        // The job counts against this scheduler once taken over, so it is taken over only when
+        // its caller has a running slot free here; otherwise a later sweep, here or on another
+        // scheduler, takes it.
+        let owner = job.owner_scope().to_string();
         let cancel_token = CancellationToken::new();
         {
             let mut active = self.active_jobs.write().await;
             if active.contains_key(job_id) {
+                return;
+            }
+            if !self.runner.budgets.take_over_running(&owner, job_id) {
+                tracing::debug!(
+                    job_id,
+                    "Not recovering the job yet: its caller has no running slot free here"
+                );
                 return;
             }
             active.insert(
@@ -846,19 +672,9 @@ impl JobExecutor {
         };
         let Some(taken) = taken else {
             self.active_jobs.write().await.remove(job_id);
+            self.runner.finished(&owner, job_id, None);
             return;
         };
-
-        // The job keeps its caller's running slot, now held by this scheduler.
-        let owner = taken.owner_scope().to_string();
-        let node = self.job_store.node_id().to_string();
-        if let Err(e) = self
-            .job_store
-            .modify_ledger(&owner, |ledger| ((), ledger.take_over(job_id, &node)))
-            .await
-        {
-            tracing::debug!(job_id, "Failed to move the async query's slot here: {e}");
-        }
 
         let job_store = Arc::clone(&self.job_store);
         let df = Arc::clone(&self.df);
@@ -868,6 +684,9 @@ impl JobExecutor {
 
         tokio::spawn(
             async move {
+                let budgets = Arc::clone(&runner.budgets);
+                let on_written =
+                    |written: u64| budgets.record_written(&owner, &job_id_owned, written);
                 let result = Self::execute_job(
                     &job_store,
                     df,
@@ -875,6 +694,7 @@ impl JobExecutor {
                     &active_jobs,
                     cancel_token,
                     Start::TakenOver(Box::new(taken)),
+                    &on_written,
                 )
                 .await;
 
@@ -883,8 +703,8 @@ impl JobExecutor {
                     active.remove(&job_id_owned);
                 }
 
-                report_job_end(&job_id_owned, result, "Job recovery failed");
-                runner.finished(&owner, &job_id_owned).await;
+                let stored = report_job_end(&job_id_owned, result, "Job recovery failed");
+                runner.finished(&owner, &job_id_owned, stored);
             }
             .instrument(tracing::info_span!("job_recovery", job_id = %job_id)),
         );
@@ -907,27 +727,13 @@ impl JobExecutor {
         // Update job state
         let state = self.job_store.cancel_job(job_id).await?;
 
-        // A queued job holds no task to release its place, so it is released here. A running
-        // job releases its slot when its task ends.
-        if self.runner.pending.lock().remove(job_id).is_some() {
+        // A queued job held here holds no task to release its place, so it is released here. A
+        // running job releases its slot when its task ends; a job queued on another scheduler is
+        // released there by its next recovery sweep.
+        let held = self.runner.pending.lock().remove(job_id);
+        if let Some(job) = held {
             async_query_metrics::add_active(ActiveStatus::Pending, -1);
-        }
-        let owner = state.owner_scope().to_string();
-        let queued = self
-            .job_store
-            .read_ledger(&owner)
-            .await
-            .is_ok_and(|ledger| ledger.pending.iter().any(|entry| entry.job_id == job_id));
-        if queued
-            && let Err(e) = self
-                .job_store
-                .modify_ledger(&owner, |ledger| ((), ledger.finish(job_id, None)))
-                .await
-        {
-            tracing::debug!(
-                job_id,
-                "Failed to release the cancelled async query's place: {e}"
-            );
+            self.runner.finished(&job.owner, job_id, None);
         }
         Ok(state)
     }
@@ -1019,37 +825,30 @@ impl JobExecutor {
         Ok(jobs)
     }
 
+    /// Counts `bytes` of results expiring at `expires_at_ms` against `owner`'s budget here, as a
+    /// finished query's result.
+    #[cfg(test)]
+    pub(crate) fn keep_stored_for_test(&self, owner: &str, bytes: u64, expires_at_ms: u64) {
+        self.runner.budgets.keep_stored(
+            owner,
+            StoredEntry {
+                bytes,
+                expires_at_ms,
+            },
+        );
+    }
+
     /// The query engine jobs run on.
     pub(crate) fn datafusion(&self) -> &Arc<DataFusion> {
         &self.df
     }
 
     /// Deletes, with their result chunks, the jobs whose results expired and the
-    /// jobs that failed or were cancelled at least the result TTL ago, and drops the expired
-    /// results from each caller's stored-results budget.
+    /// jobs that failed or were cancelled at least the result TTL ago.
     ///
     /// Returns how many jobs were deleted.
     pub async fn cleanup_expired_jobs(&self) -> Result<usize> {
-        self.job_store.forget_idle_ledgers(LEDGER_IDLE);
-        let deleted = self.job_store.cleanup_expired_jobs().await?;
-        let now_ms = now_ms_or_zero();
-        match self.job_store.ledger_owners().await {
-            Ok(owners) => {
-                for owner in owners {
-                    if let Err(e) = self
-                        .job_store
-                        .modify_ledger(&owner, |ledger| ((), ledger.prune_expired(now_ms)))
-                        .await
-                    {
-                        tracing::debug!(
-                            "Failed to drop expired results from a caller's budget: {e}"
-                        );
-                    }
-                }
-            }
-            Err(e) => tracing::debug!("Failed to list caller budgets during cleanup: {e}"),
-        }
-        Ok(deleted)
+        self.job_store.cleanup_expired_jobs().await
     }
 
     /// Lists every job regardless of who submitted it.
@@ -1070,13 +869,14 @@ impl JobExecutor {
         active_jobs: &RwLock<std::collections::HashMap<String, ActiveJobInfo>>,
         cancel: CancellationToken,
         start: Start,
-    ) -> Result<()> {
+        on_written: &(dyn Fn(u64) + Send + Sync),
+    ) -> Result<Option<StoredEntry>> {
         let resume = matches!(start, Start::TakenOver(_));
         let state = match start {
             Start::Submitted => match job_store.set_job_running(job_id).await {
                 Ok(state) => state,
                 // Cancelled (or otherwise finished) before this task started it.
-                Err(Error::JobAlreadyFinished { .. }) => return Ok(()),
+                Err(Error::JobAlreadyFinished { .. }) => return Ok(None),
                 Err(e) => return Err(e),
             },
             Start::TakenOver(state) => *state,
@@ -1091,7 +891,7 @@ impl JobExecutor {
         if cancel.is_cancelled() {
             // Don't call cancel_job here - executor.cancel() already updates the
             // job state via its own cancel_job call.
-            return Ok(());
+            return Ok(None);
         }
 
         // The job stops at its deadline, `timeout_seconds` after it was submitted, wherever it is:
@@ -1149,7 +949,7 @@ impl JobExecutor {
                 }
             };
             match job_store
-                .write_result_chunks_from_stream(job_id, &driver, result_stream)
+                .write_result_chunks_from_stream(job_id, &driver, result_stream, on_written)
                 .await
             {
                 Ok(result) => JobRun::Finished(result),
@@ -1168,7 +968,7 @@ impl JobExecutor {
                 // Don't call cancel_job here - executor.cancel() already updates the
                 // job state. Doing it here would race with the OCC write and cause
                 // ConcurrentModification errors.
-                Ok(())
+                Ok(None)
             },
             () = timeout_fut => {
                 tracing::debug!(job_id = %job_id, "Job timed out");
@@ -1178,16 +978,16 @@ impl JobExecutor {
                     tracing::error!("Failed to cancel the timed-out query '{job_id}': {e}");
                 }
                 job_store.fail_job(job_id, &driver, JobErrorCode::Timeout, "Job execution timed out".to_string()).await?;
-                Ok(())
+                Ok(None)
             }
             outcome = run => match outcome {
                 JobRun::Finished(job_result) => {
-                    job_store.complete_job(job_id, &driver, job_result).await?;
-                    Ok(())
+                    let state = job_store.complete_job(job_id, &driver, job_result).await?;
+                    Ok(stored_entry(&state))
                 }
                 JobRun::Failed(error_code, error_msg) => {
                     job_store.fail_job(job_id, &driver, error_code, error_msg).await?;
-                    Ok(())
+                    Ok(None)
                 }
                 JobRun::WriteFailed(e @ Error::JobTakenOver { .. }) => Err(e),
                 JobRun::WriteFailed(e @ Error::MaximumJobSizeExceeded { .. }) => {
@@ -1196,13 +996,13 @@ impl JobExecutor {
                         .fail_job(job_id, &driver, JobErrorCode::FetchingResultsFailed, e.to_string())
                         .await?;
                     job_store.delete_job_chunks(job_id).await;
-                    Ok(())
+                    Ok(None)
                 }
                 JobRun::WriteFailed(e) => {
                     job_store
                         .fail_job(job_id, &driver, JobErrorCode::FetchingResultsFailed, e.to_string())
                         .await?;
-                    Ok(())
+                    Ok(None)
                 }
             }
         }
@@ -1463,6 +1263,7 @@ mod tests {
                 &job_id,
                 &started.driver().expect("a driver"),
                 int_batches(vec![vec![9, 9], vec![9, 9]]),
+                &|_| {},
             )
             .await
             .expect("the former driver writes while it drives");
@@ -1475,7 +1276,12 @@ mod tests {
             .expect("the job is still driven as observed");
         let driver = taken.driver().expect("a driver");
         let result = successor
-            .write_result_chunks_from_stream(&job_id, &driver, int_batches(vec![vec![1, 2, 3, 4]]))
+            .write_result_chunks_from_stream(
+                &job_id,
+                &driver,
+                int_batches(vec![vec![1, 2, 3, 4]]),
+                &|_| {},
+            )
             .await
             .expect("the driver writes results");
         assert_eq!(result.chunk_indices, vec![0]);
@@ -1885,7 +1691,7 @@ mod tests {
     }
 
     /// An object store that refuses every write of a job record, and serves everything else
-    /// from memory: a job write that fails while its ledger admission lands.
+    /// from memory: a submission whose job write fails after its admission.
     #[derive(Debug)]
     struct FailingJobWrites {
         inner: InMemory,
@@ -1981,10 +1787,10 @@ mod tests {
         }
     }
 
-    /// A submission whose job record fails to be written while its admission lands releases
-    /// the slot or place it was admitted to, so the failed submission holds nothing.
+    /// A submission whose job record fails to be written gives back the slot it was admitted
+    /// to, so the failed submission holds nothing.
     #[tokio::test]
-    async fn a_job_write_that_fails_releases_its_admission() {
+    async fn a_job_write_that_fails_gives_back_its_slot() {
         let job_store = Arc::new(JobStore::new(
             Arc::new(FailingJobWrites {
                 inner: InMemory::new(),
@@ -1992,560 +1798,485 @@ mod tests {
             "test",
             "node-1",
         ));
+        let executor = limited_executor(Arc::clone(&job_store), ONE_EACH);
+        for _ in 0..2 {
+            let error = executor
+                .submit(select_one(), true, OWNER.to_string())
+                .await
+                .expect_err("the job write fails");
+            assert!(matches!(error, Error::ObjectStoreWrite { .. }), "{error:?}");
+            assert_eq!(
+                executor.runner.budgets.counts(OWNER),
+                (0, 0),
+                "the failed submission holds no slot or place"
+            );
+        }
+    }
+
+    /// The budget decides before the job is written, so a refused submission writes no job.
+    #[tokio::test]
+    async fn a_refused_submission_writes_no_job() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = limited_executor(Arc::clone(&job_store), QUEUE_ONLY);
+        let queued = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("the first query waits");
+        assert_eq!(queued.status, JobStatus::Pending);
+        let error = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect_err("the queue is full");
+        assert!(
+            matches!(error, Error::QueueFull { pending: 1 }),
+            "{error:?}"
+        );
+        let jobs = job_store.list_jobs(None).await.expect("jobs listed");
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![queued.job_id.as_str()],
+            "only the admitted query has a job"
+        );
+    }
+
+    /// Each scheduler keeps its own budget: one scheduler's full queue for a caller does not
+    /// refuse that caller on another scheduler over the same job store.
+    #[tokio::test]
+    async fn each_scheduler_admits_up_to_its_own_limits() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
+        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
+        let a = limited_executor(store_a, QUEUE_ONLY);
+        let b = limited_executor(store_b, QUEUE_ONLY);
+
+        a.submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("a admits one");
+        let refused = a
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect_err("a's queue for the caller is full");
+        assert!(
+            matches!(refused, Error::QueueFull { pending: 1 }),
+            "{refused:?}"
+        );
+        let on_b = b
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("b admits the caller up to b's own limit");
+        assert_eq!(on_b.status, JobStatus::Pending);
+        assert_eq!(a.runner.budgets.counts(OWNER), (0, 1));
+        assert_eq!(b.runner.budgets.counts(OWNER), (0, 1));
+    }
+
+    /// Queued queries start in submission order as running ones finish. A placeholder holds the
+    /// one running slot while two queries queue; when it finishes, the older queued query
+    /// starts first. Every query fails at once here, since there is no distributed scheduler,
+    /// and frees the slot for the next.
+    #[tokio::test]
+    async fn queued_queries_start_in_submission_order() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = limited_executor(Arc::clone(&job_store), ONE_EACH_TWO_QUEUED);
+        assert_eq!(
+            executor
+                .runner
+                .budgets
+                .admit(PUBLIC_JOB_OWNER, "placeholder", 0),
+            Ok(Admission::Run)
+        );
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let queued = executor
+                .submit(select_one(), true, PUBLIC_JOB_OWNER.to_string())
+                .await
+                .expect("admitted");
+            assert_eq!(queued.status, JobStatus::Pending);
+            ids.push(queued.job_id);
+        }
+        executor
+            .runner
+            .finished(PUBLIC_JOB_OWNER, "placeholder", None);
+        let older = wait_until_finished(&job_store, &ids[0]).await;
+        let newer = wait_until_finished(&job_store, &ids[1]).await;
+        let older_done = older.completed_at_ms.expect("finished");
+        let newer_started = newer.started_at_ms.expect("started");
+        assert!(
+            newer_started >= older_done,
+            "the newer query started at {newer_started}, before the older finished at {older_done}"
+        );
+        assert_eq!(executor.runner.budgets.counts(PUBLIC_JOB_OWNER), (0, 0));
+    }
+
+    /// An object store whose writes of job records wait until the test opens the gate, and
+    /// that serves everything else from memory.
+    #[derive(Debug)]
+    struct GatedJobWrites {
+        inner: InMemory,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl std::fmt::Display for GatedJobWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GatedJobWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for GatedJobWrites {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().contains("/jobs/") {
+                drop(self.gate.acquire().await);
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A queued query whose slot frees while its record is still being written starts once the
+    /// record is written, so the freed slot is not lost.
+    #[tokio::test]
+    async fn a_query_promoted_while_its_record_is_written_starts_once_written() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let job_store = Arc::new(JobStore::new(
+            Arc::new(GatedJobWrites {
+                inner: InMemory::new(),
+                gate: Arc::clone(&gate),
+            }),
+            "test",
+            "node-1",
+        ));
+        let executor = Arc::new(limited_executor(Arc::clone(&job_store), ONE_EACH));
+        assert_eq!(
+            executor
+                .runner
+                .budgets
+                .admit(PUBLIC_JOB_OWNER, "placeholder", 0),
+            Ok(Admission::Run)
+        );
+        let submitting = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move {
+                executor
+                    .submit(select_one(), true, PUBLIC_JOB_OWNER.to_string())
+                    .await
+            }
+        });
+        // The submission waits in the queue while its record write is held.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while executor.runner.budgets.counts(PUBLIC_JOB_OWNER) != (1, 1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the submission never queued"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Its slot frees now, before its record exists.
+        executor
+            .runner
+            .finished(PUBLIC_JOB_OWNER, "placeholder", None);
+        assert_eq!(executor.runner.budgets.counts(PUBLIC_JOB_OWNER), (1, 0));
+        gate.add_permits(1_000);
+        let queued = submitting
+            .await
+            .expect("the submission task")
+            .expect("admitted");
+        let finished = wait_until_finished(&job_store, &queued.job_id).await;
+        assert!(finished.started_at_ms.is_some(), "the query was started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while executor.runner.budgets.counts(PUBLIC_JOB_OWNER) != (0, 0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slot was not released"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Cancelling a queued query held here frees its place at once.
+    #[tokio::test]
+    async fn cancelling_a_queued_query_frees_its_place() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = limited_executor(Arc::clone(&job_store), QUEUE_ONLY);
+        let queued = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("waits");
+        executor
+            .cancel(&queued.job_id, OWNER)
+            .await
+            .expect("cancelled");
+        assert_eq!(executor.runner.budgets.counts(OWNER), (0, 0));
+        let next = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("the freed place admits the next query");
+        assert_eq!(next.status, JobStatus::Pending);
+    }
+
+    /// A queued query held here whose record was cancelled through another scheduler gives back
+    /// its place at the next recovery sweep.
+    #[tokio::test]
+    async fn a_held_query_cancelled_elsewhere_gives_back_its_place() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = limited_executor(Arc::clone(&job_store), QUEUE_ONLY);
+        let queued = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("waits");
+        job_store
+            .cancel_job(&queued.job_id)
+            .await
+            .expect("cancelled elsewhere");
+        let jobs = job_store.list_jobs(None).await.expect("jobs listed");
+        executor
+            .recover_queued(&jobs, &std::collections::HashSet::new())
+            .await;
+        assert_eq!(executor.runner.budgets.counts(OWNER), (0, 0));
+    }
+
+    /// The scheduler that holds or drives `job_id`, as its record names it.
+    async fn driver_of(job_store: &JobStore, job_id: &str) -> Option<String> {
+        job_store
+            .get_job(job_id)
+            .await
+            .expect("job exists")
+            .scheduler_node
+    }
+
+    /// A job record written by `node`, as that scheduler's submission writes it.
+    async fn job_written_by(
+        store: &Arc<dyn object_store::ObjectStore>,
+        node: &str,
+        owner: &str,
+    ) -> JobState {
+        JobStore::new(Arc::clone(store), "test", node)
+            .create_job(select_one(), true, owner.to_string())
+            .await
+            .expect("job written")
+    }
+
+    /// A running query taken over from a scheduler that stopped counts against the scheduler
+    /// that takes it over, so it is taken over only while its caller has a running slot free
+    /// there; otherwise it waits for a later sweep.
+    #[tokio::test]
+    async fn running_queries_are_taken_over_only_within_the_limit() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let gone = JobStore::new(Arc::clone(&store), "test", "node-gone");
+        let job = job_written_by(&store, "node-gone", PUBLIC_JOB_OWNER).await;
+        let orphan = gone.set_job_running(&job.job_id).await.expect("ran there");
+        let job_store = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-1"));
+        let executor = limited_executor(Arc::clone(&job_store), ONE_EACH);
+
+        // The caller's one running slot here is taken: the orphan is left where it is.
+        assert_eq!(
+            executor.runner.budgets.admit(PUBLIC_JOB_OWNER, "local", 0),
+            Ok(Admission::Run)
+        );
+        executor.resume(&orphan).await;
+        assert_eq!(
+            driver_of(&job_store, &orphan.job_id).await.as_deref(),
+            Some("node-gone")
+        );
+        assert_eq!(executor.runner.budgets.counts(PUBLIC_JOB_OWNER), (1, 0));
+
+        // Once the slot is free, the next sweep takes it over.
+        executor.runner.finished(PUBLIC_JOB_OWNER, "local", None);
+        executor.resume(&orphan).await;
+        assert_eq!(
+            driver_of(&job_store, &orphan.job_id).await.as_deref(),
+            Some("node-1")
+        );
+    }
+
+    /// Queued queries of a scheduler that stopped: a public caller's are taken over oldest first
+    /// while its queue here has room, and an authenticated caller's are failed with a request to
+    /// resubmit.
+    #[tokio::test]
+    async fn queued_queries_of_a_stopped_scheduler_are_taken_over_or_failed() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let first = job_written_by(&store, "node-gone", PUBLIC_JOB_OWNER).await;
+        let second = job_written_by(&store, "node-gone", PUBLIC_JOB_OWNER).await;
+        let theirs = job_written_by(&store, "node-gone", OWNER).await;
+        let job_store = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-1"));
+        let executor = limited_executor(Arc::clone(&job_store), QUEUE_ONLY);
+        // Listed newest first, as the job listing returns them, with `second` written later.
+        let mut later = second.clone();
+        later.created_at_ms = first.created_at_ms + 1;
+        executor
+            .recover_queued(
+                &[later, theirs.clone(), first.clone()],
+                &std::collections::HashSet::new(),
+            )
+            .await;
+
+        let first = job_store.get_job(&first.job_id).await.expect("exists");
+        let second = job_store.get_job(&second.job_id).await.expect("exists");
+        let theirs = job_store.get_job(&theirs.job_id).await.expect("exists");
+        assert_eq!(
+            (first.status, first.scheduler_node.as_deref()),
+            (JobStatus::Pending, Some("node-1")),
+            "the oldest is taken over"
+        );
+        assert_eq!(
+            (second.status, second.scheduler_node.as_deref()),
+            (JobStatus::Pending, Some("node-gone")),
+            "no room for the second: it waits for a later sweep"
+        );
+        assert_eq!(theirs.status, JobStatus::Failed);
+        assert!(
+            matches!(
+                theirs.error.map(|e| e.error_code),
+                Some(JobErrorCode::SchedulerUnavailable)
+            ),
+            "an authenticated caller's queued query is failed"
+        );
+        assert_eq!(executor.runner.budgets.counts(PUBLIC_JOB_OWNER), (0, 1));
+    }
+
+    /// A queued job that names this scheduler but that it does not hold (its submission failed
+    /// after the record was written) is failed once the grace period has passed, and left alone
+    /// before then.
+    #[tokio::test]
+    async fn an_unheld_queued_job_is_failed_after_the_grace_period() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let recent = job_written_by(&store, "node-1", OWNER).await;
+        let mut stale = job_written_by(&store, "node-1", OWNER).await;
+        stale.created_at_ms = stale.created_at_ms.saturating_sub(UNHELD_GRACE_MS + 1_000);
+        let job_store = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-1"));
+        let executor = limited_executor(Arc::clone(&job_store), QUEUE_ONLY);
+        executor
+            .recover_queued(
+                &[recent.clone(), stale.clone()],
+                &std::collections::HashSet::new(),
+            )
+            .await;
+        assert_eq!(
+            job_store
+                .get_job(&recent.job_id)
+                .await
+                .expect("exists")
+                .status,
+            JobStatus::Pending
+        );
+        assert_eq!(
+            job_store
+                .get_job(&stale.job_id)
+                .await
+                .expect("exists")
+                .status,
+            JobStatus::Failed
+        );
+    }
+
+    /// A result budget full on this scheduler refuses the caller here, naming when the oldest
+    /// result expires.
+    #[tokio::test]
+    async fn a_full_result_budget_refuses_with_the_oldest_expiry() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
         let executor = limited_executor(
             Arc::clone(&job_store),
             JobLimits {
                 running: 1,
                 pending: 1,
-                stored_bytes: u64::MAX,
+                stored_bytes: 1 << 30,
             },
         );
-        // One query of another scheduler holds the only running slot, so the next admission is
-        // a queue place; the one after it would be refused.
-        job_store
-            .modify_ledger(OWNER, |ledger| {
-                let admission = ledger.admit("elsewhere", "node-2", executor.runner.limits, 0);
-                ((), admission.is_ok())
-            })
-            .await
-            .expect("ledger written");
-
-        let error = executor
-            .submit(select_one(), true, OWNER.to_string())
-            .await
-            .expect_err("the job write fails");
-        assert!(matches!(error, Error::ObjectStoreWrite { .. }), "{error:?}");
-        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
-        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["elsewhere"]);
-        assert_eq!(ledger.pending.len(), 0);
-        assert!(executor.runner.pending.lock().is_empty());
-
-        // The released place is free again: a second failing submission is admitted to it, not
-        // refused for a full queue, and releases it too.
-        let error = executor
-            .submit(select_one(), true, OWNER.to_string())
-            .await
-            .expect_err("the job write fails again");
-        assert!(matches!(error, Error::ObjectStoreWrite { .. }), "{error:?}");
-        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
-        assert_eq!(ledger.running.len(), 1);
-        assert_eq!(ledger.pending.len(), 0);
-    }
-
-    /// A submission refused by its caller's ledger after its job record was written deletes
-    /// the job, so the refusal leaves no job and no ledger entry behind.
-    #[tokio::test]
-    async fn a_refused_admission_deletes_its_written_job() {
-        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
-        let executor = limited_executor(
-            Arc::clone(&job_store),
-            JobLimits {
-                running: 0,
-                pending: 0,
-                stored_bytes: u64::MAX,
+        let expires_at_ms = now_ms_or_zero() + 3_600_000;
+        executor.runner.budgets.keep_stored(
+            OWNER,
+            StoredEntry {
+                bytes: 1 << 30,
+                expires_at_ms,
             },
         );
         let error = executor
             .submit(select_one(), true, OWNER.to_string())
             .await
-            .expect_err("no place is free");
-        assert!(
-            matches!(error, Error::QueueFull { pending: 0 }),
-            "{error:?}"
-        );
-        assert_eq!(
-            job_store.list_jobs(None).await.expect("jobs listed").len(),
-            0
-        );
-        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
-        assert_eq!((ledger.running.len(), ledger.pending.len()), (0, 0));
-    }
-
-    /// A scheduler that stopped after admitting a query but before writing its job leaves a
-    /// ledger entry with no job. The sweep keeps it while its job may still be being written,
-    /// and releases it once the grace period has passed.
-    #[tokio::test]
-    async fn the_sweep_releases_an_entry_without_a_job_only_after_the_grace_period() {
-        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
-        let executor = limited_executor(Arc::clone(&job_store), JobLimits::default());
-        let now_ms = now_ms_or_zero();
-        let limits = executor.runner.limits;
-        job_store
-            .modify_ledger(OWNER, |ledger| {
-                let recent = ledger.admit("recent", "node-gone", limits, now_ms - 50_000);
-                let stale = ledger.admit(
-                    "stale",
-                    "node-gone",
-                    limits,
-                    now_ms - UNADMITTED_GRACE_MS - 1_000,
-                );
-                ((), recent.is_ok() && stale.is_ok())
-            })
-            .await
-            .expect("ledger written");
-        let live = std::collections::HashSet::from(["node-1".to_string()]);
-
-        executor.reconcile_ledgers(&[], &live).await;
-
-        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
-        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["recent"]);
-        assert_eq!(ledger.pending.len(), 0);
-    }
-
-    /// A finished query whose release no other ledger write carries within the window writes
-    /// it itself, so its slot is freed either way.
-    #[tokio::test]
-    async fn a_finished_query_releases_its_slot_when_no_other_write_carries_it() {
-        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
-        let executor = limited_executor(Arc::clone(&job_store), JobLimits::default());
-        let job_id = seed_job(&job_store, OWNER).await;
-        let limits = executor.runner.limits;
-        let admitted_at_ms = now_ms_or_zero();
-        job_store
-            .modify_ledger(OWNER, |ledger| {
-                let admission = ledger.admit(&job_id, "node-1", limits, admitted_at_ms);
-                ((), admission.is_ok())
-            })
-            .await
-            .expect("admitted");
-        job_store.cancel_job(&job_id).await.expect("cancelled");
-
-        executor.runner.finished(OWNER, &job_id).await;
-
-        assert!(!job_store.has_queued_releases(OWNER));
-        let ledger = job_store.read_ledger(OWNER).await.expect("ledger");
-        assert_eq!((ledger.running.len(), ledger.pending.len()), (0, 0));
-    }
-
-    /// An object store whose writes of caller ledgers land `delay` late, as a slow object store's
-    /// would, and serves everything else from memory.
-    #[derive(Debug)]
-    struct SlowLedgerWrites {
-        inner: InMemory,
-        delay: Duration,
-    }
-
-    impl std::fmt::Display for SlowLedgerWrites {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "SlowLedgerWrites")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl object_store::ObjectStore for SlowLedgerWrites {
-        async fn get_opts(
-            &self,
-            location: &object_store::path::Path,
-            options: object_store::GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-        async fn put_opts(
-            &self,
-            location: &object_store::path::Path,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            if location.as_ref().contains("/owners/") {
-                tokio::time::sleep(self.delay).await;
-            }
-            self.inner.put_opts(location, payload, opts).await
-        }
-        async fn put_multipart_opts(
-            &self,
-            location: &object_store::path::Path,
-            opts: object_store::PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-        fn list(
-            &self,
-            prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
-        {
-            self.inner.list(prefix)
-        }
-        fn delete_stream(
-            &self,
-            locations: futures::stream::BoxStream<
-                'static,
-                object_store::Result<object_store::path::Path>,
-            >,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
-        {
-            self.inner.delete_stream(locations)
-        }
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&object_store::path::Path>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-        async fn copy_opts(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-            options: object_store::CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
-
-    /// A caller limited to one running query sees its query finish on one scheduler and at once
-    /// submits on another, while the first scheduler's release of the slot has not landed. The
-    /// second scheduler admits it: a query whose job record is final no longer holds a slot.
-    #[tokio::test]
-    async fn a_query_seen_finished_frees_its_slot_on_every_scheduler() {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(SlowLedgerWrites {
-            inner: InMemory::new(),
-            delay: Duration::from_millis(300),
-        });
-        let limits = JobLimits {
-            running: 1,
-            pending: 0,
-            stored_bytes: u64::MAX,
+            .expect_err("the result budget is full");
+        let Error::ResultBudgetFull {
+            stored_bytes,
+            oldest_expiry_ms,
+        } = error
+        else {
+            panic!("{error:?}");
         };
-        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
-        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
-        let scheduler_a = limited_executor(Arc::clone(&store_a), limits);
-        let scheduler_b = limited_executor(Arc::clone(&store_b), limits);
-
-        let first = scheduler_a
-            .submit(select_one(), true, OWNER.to_string())
-            .await
-            .expect("the first query is admitted on A");
-        // The caller polls until it sees the query end, as a client does.
-        let ended = wait_until_finished(&store_a, &first.job_id).await;
-        assert!(ended.is_terminal());
-
-        let next = scheduler_b
-            .submit(select_one(), true, OWNER.to_string())
-            .await
-            .expect("the next query is admitted on B at once");
-        assert_ne!(next.job_id, first.job_id);
-        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
-        assert!(
-            !ledger.running.contains_key(&first.job_id),
-            "{:?}",
-            ledger.running
+        assert_eq!(stored_bytes, 1 << 30);
+        assert_eq!(
+            oldest_expiry_ms,
+            Some(expires_at_ms.div_ceil(60_000) * 60_000)
         );
-        assert_eq!(ledger.pending.len(), 0);
+        assert!(job_store.list_jobs(None).await.expect("listed").is_empty());
     }
 
-    /// An in-memory object store that counts attempted writes of caller ledgers and refuses
-    /// every read of objects whose path contains `unreadable`.
-    #[derive(Debug, Default)]
-    struct ObservedStore {
-        inner: InMemory,
-        ledger_writes: std::sync::atomic::AtomicUsize,
-        unreadable: Option<String>,
-    }
-
-    impl std::fmt::Display for ObservedStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "ObservedStore")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl object_store::ObjectStore for ObservedStore {
-        async fn get_opts(
-            &self,
-            location: &object_store::path::Path,
-            options: object_store::GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            if let Some(unreadable) = &self.unreadable
-                && location.as_ref().contains(unreadable.as_str())
-            {
-                return Err(object_store::Error::Generic {
-                    store: "ObservedStore",
-                    source: "injected read failure".into(),
-                });
-            }
-            self.inner.get_opts(location, options).await
-        }
-        async fn put_opts(
-            &self,
-            location: &object_store::path::Path,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            if location.as_ref().contains("/owners/") {
-                self.ledger_writes
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            self.inner.put_opts(location, payload, opts).await
-        }
-        async fn put_multipart_opts(
-            &self,
-            location: &object_store::path::Path,
-            opts: object_store::PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-        fn list(
-            &self,
-            prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
-        {
-            self.inner.list(prefix)
-        }
-        fn delete_stream(
-            &self,
-            locations: futures::stream::BoxStream<
-                'static,
-                object_store::Result<object_store::path::Path>,
-            >,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
-        {
-            self.inner.delete_stream(locations)
-        }
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&object_store::path::Path>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-        async fn copy_opts(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-            options: object_store::CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
-
-    const TWO_SLOTS: JobLimits = JobLimits {
-        running: 2,
-        pending: 0,
+    /// Limits that admit one running and one queued query per caller.
+    const ONE_EACH: JobLimits = JobLimits {
+        running: 1,
+        pending: 1,
         stored_bytes: u64::MAX,
     };
 
-    /// A job that ran under `job_store` and succeeded with a result of `bytes`.
-    async fn succeeded_job(job_store: &JobStore, bytes: usize) -> (String, StoredEntry) {
-        let job_id = seed_job(job_store, OWNER).await;
-        let driver = job_store
-            .set_job_running(&job_id)
-            .await
-            .expect("started")
-            .driver()
-            .expect("a running job has a driver");
-        let done = job_store
-            .complete_job(
-                &job_id,
-                &driver,
-                JobResult {
-                    manifest: super::super::state::JobResultManifest {
-                        format: "ARROW_IPC".to_string(),
-                        schema: super::super::state::JobSchema {
-                            column_count: 0,
-                            columns: vec![],
-                        },
-                        total_row_count: 0,
-                        total_chunk_count: 0,
-                        total_byte_count: bytes,
-                    },
-                    chunk_indices: vec![],
-                    chunk_row_offsets: vec![],
-                },
-            )
-            .await
-            .expect("completed");
-        let stored = stored_entry(&done).expect("a succeeded job keeps its result");
-        (job_id, stored)
-    }
+    /// Limits that admit one running and two queued queries per caller.
+    const ONE_EACH_TWO_QUEUED: JobLimits = JobLimits {
+        running: 1,
+        pending: 2,
+        stored_bytes: u64::MAX,
+    };
 
-    /// A job that `job_store` started and that is still running.
-    async fn running_job(job_store: &JobStore) -> String {
-        let job_id = seed_job(job_store, OWNER).await;
-        job_store.set_job_running(&job_id).await.expect("started");
-        job_id
-    }
-
-    /// Admits `job_ids` to `OWNER`'s two running slots, on scheduler `node-a`.
-    async fn admit_on_a(job_store: &JobStore, job_ids: &[&str]) {
-        job_store
-            .modify_ledger(OWNER, |ledger| {
-                let mut changed = false;
-                for job_id in job_ids {
-                    changed |= ledger.admit(job_id, "node-a", TWO_SLOTS, 0) == Ok(Admission::Run);
-                }
-                ((), changed)
-            })
-            .await
-            .expect("admitted");
-    }
-
-    fn running_of(ledger: &super::super::ledger::Ledger) -> Vec<&str> {
-        ledger.running.keys().map(String::as_str).collect()
-    }
-
-    /// The recheck releases a finished query's slot, and the finishing scheduler's own
-    /// release, landing later, changes nothing: the slot is freed once, the other running
-    /// query keeps its slot, and the result's bytes are counted once.
-    #[tokio::test]
-    async fn recheck_then_release_frees_a_finished_slot_once() {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
-        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
-        let (finished, stored) = succeeded_job(&store_a, 10).await;
-        let running = running_job(&store_a).await;
-        admit_on_a(&store_a, &[&finished, &running]).await;
-        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
-
-        let next = scheduler_b
-            .submit(select_one(), true, OWNER.to_string())
-            .await
-            .expect("admitted after the recheck");
-        let mut expected = vec![running.as_str(), next.job_id.as_str()];
-        expected.sort_unstable();
-        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
-        assert_eq!(running_of(&ledger), expected);
-        assert_eq!(ledger.stored_bytes(), 10);
-
-        // The finishing scheduler's own release, folded into its next write, lands late.
-        store_a.queue_release(OWNER, &finished, Some(stored));
-        store_a
-            .modify_ledger(OWNER, |_| ((), false))
-            .await
-            .expect("written");
-        let ledger = store_a.read_ledger(OWNER).await.expect("ledger");
-        assert_eq!(running_of(&ledger), expected);
-        assert_eq!(ledger.stored_bytes(), 10);
-        assert!(!store_a.has_queued_releases(OWNER));
-    }
-
-    /// The finishing scheduler's release lands first; a recheck that saw the slot taken
-    /// before then changes nothing more for it.
-    #[tokio::test]
-    async fn release_then_recheck_frees_a_finished_slot_once() {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
-        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
-        let (finished, stored) = succeeded_job(&store_a, 10).await;
-        let running = running_job(&store_a).await;
-        admit_on_a(&store_a, &[&finished, &running]).await;
-        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
-
-        store_a
-            .modify_ledger(OWNER, |ledger| ((), ledger.finish(&finished, Some(stored))))
-            .await
-            .expect("released");
-        let taken = vec![finished.clone(), running.clone()];
-        let admission = scheduler_b
-            .readmit_after_finished(OWNER, "late", &taken, now_ms_or_zero())
-            .await;
-
-        assert_eq!(admission, Some(Ok(Admission::Run)));
-        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
-        let mut expected = vec![running.as_str(), "late"];
-        expected.sort_unstable();
-        assert_eq!(running_of(&ledger), expected);
-        assert_eq!(ledger.stored_bytes(), 10);
-    }
-
-    /// The recheck's write is refused once, because the finishing scheduler's release landed
-    /// after the recheck's scheduler last wrote the ledger; the retry, on a fresh read, frees
-    /// nothing more.
-    #[tokio::test]
-    async fn a_recheck_retried_after_a_conflict_frees_a_finished_slot_once() {
-        let observed = Arc::new(ObservedStore::default());
-        let store: Arc<dyn object_store::ObjectStore> = Arc::clone(&observed) as _;
-        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
-        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
-        let (finished, stored) = succeeded_job(&store_a, 10).await;
-        let running = running_job(&store_a).await;
-        // Scheduler B writes the ledger last, so it holds that version.
-        admit_on_a(&store_b, &[&finished, &running]).await;
-        store_a
-            .modify_ledger(OWNER, |ledger| ((), ledger.finish(&finished, Some(stored))))
-            .await
-            .expect("released");
-        let writes_before = observed
-            .ledger_writes
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
-
-        let taken = vec![finished.clone(), running.clone()];
-        let admission = scheduler_b
-            .readmit_after_finished(OWNER, "late", &taken, now_ms_or_zero())
-            .await;
-
-        assert_eq!(admission, Some(Ok(Admission::Run)));
-        // One write refused at the stale version, one landed after the fresh read.
-        assert_eq!(
-            observed
-                .ledger_writes
-                .load(std::sync::atomic::Ordering::SeqCst)
-                - writes_before,
-            2
-        );
-        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
-        let mut expected = vec![running.as_str(), "late"];
-        expected.sort_unstable();
-        assert_eq!(running_of(&ledger), expected);
-        assert_eq!(ledger.stored_bytes(), 10);
-    }
-
-    /// The recheck frees only slots whose job records are final: a missing record or one that
-    /// is not final keeps its slot, and the submission is refused as usual.
-    #[tokio::test]
-    async fn the_recheck_keeps_slots_whose_records_are_missing_or_not_final() {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
-        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
-        let running = running_job(&store_a).await;
-        admit_on_a(&store_a, &["no-record", &running]).await;
-        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
-
-        let error = scheduler_b
-            .submit(select_one(), true, OWNER.to_string())
-            .await
-            .expect_err("both slots stay taken");
-
-        assert!(
-            matches!(error, Error::QueueFull { pending: 0 }),
-            "{error:?}"
-        );
-        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
-        let mut expected = vec!["no-record", running.as_str()];
-        expected.sort_unstable();
-        assert_eq!(running_of(&ledger), expected);
-    }
-
-    /// A job record that cannot be read, or does not parse, keeps its slot: the read error
-    /// leads to the usual refusal, never to an admission.
-    #[tokio::test]
-    async fn the_recheck_keeps_slots_whose_records_cannot_be_read() {
-        use object_store::ObjectStoreExt;
-        let unreadable = "unreadable-job";
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(ObservedStore {
-            unreadable: Some(unreadable.to_string()),
-            ..ObservedStore::default()
-        });
-        let store_a = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-a"));
-        let store_b = Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b"));
-        store
-            .put(
-                &object_store::path::Path::from("test/jobs/corrupt-job.json"),
-                object_store::PutPayload::from_static(b"{\"status\": "),
-            )
-            .await
-            .expect("written");
-        admit_on_a(&store_a, &[unreadable, "corrupt-job"]).await;
-        let scheduler_b = limited_executor(Arc::clone(&store_b), TWO_SLOTS);
-
-        let error = scheduler_b
-            .submit(select_one(), true, OWNER.to_string())
-            .await
-            .expect_err("both slots stay taken");
-
-        assert!(
-            matches!(error, Error::QueueFull { pending: 0 }),
-            "{error:?}"
-        );
-        let ledger = store_b.read_ledger(OWNER).await.expect("ledger");
-        assert_eq!(running_of(&ledger), vec!["corrupt-job", unreadable]);
-    }
+    /// Limits under which every query waits, one per caller, so nothing starts.
+    const QUEUE_ONLY: JobLimits = JobLimits {
+        running: 0,
+        pending: 1,
+        stored_bytes: u64::MAX,
+    };
 }

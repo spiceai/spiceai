@@ -39,19 +39,13 @@ use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::state::JobErrorCode;
 
 use super::error::{
-    DeserializeChunkSnafu, DeserializeLedgerSnafu, DeserializeStateSnafu, JobAlreadyFinishedSnafu,
-    ObjectStoreDeleteSnafu, ObjectStoreListSnafu, ObjectStoreReadSnafu, Result,
-    SerializeChunkSnafu, SerializeStateSnafu,
+    DeserializeChunkSnafu, DeserializeStateSnafu, JobAlreadyFinishedSnafu, ObjectStoreDeleteSnafu,
+    ObjectStoreListSnafu, ObjectStoreReadSnafu, Result, SerializeChunkSnafu, SerializeStateSnafu,
 };
-use super::ledger::{Ledger, StoredEntry, WRITTEN_BYTES_BATCH};
 use super::state::{
     ColumnSchema, DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobDriver, JobResult, JobResultManifest,
     JobSchema, JobState, JobStatus, now_ms_or_zero,
 };
-
-/// [`WRITTEN_BYTES_BATCH`] as the `usize` the chunk writer counts in.
-const BATCH_BYTES: usize = 1 << 30;
-const _: () = assert!(BATCH_BYTES as u64 == WRITTEN_BYTES_BATCH);
 
 /// The result bytes a job may still store: `maximum_size` less the bytes of the chunks it
 /// already `written`.
@@ -79,42 +73,6 @@ pub struct JobStore {
     node_id: String,
     result_ttl: Duration,
     chunk_size: usize,
-    /// One entry per caller this scheduler wrote the ledger of recently.
-    ledger_slots: dashmap::DashMap<String, Arc<CallerLedger>>,
-}
-
-/// This scheduler's state for one caller's ledger.
-#[derive(Default)]
-struct CallerLedger {
-    /// Held across a read-modify-write of the ledger, so this scheduler's own writes take turns
-    /// instead of conflicting and backing off; conditional writes still settle races with other
-    /// schedulers.
-    write: tokio::sync::Mutex<LedgerSlot>,
-    /// Releases of finished queries not yet written. The next write of the ledger carries them,
-    /// so a release does not take a write of its own when another write comes soon.
-    releases: Mutex<Vec<QueuedRelease>>,
-}
-
-/// A caller's ledger as this scheduler last wrote or read it, at the version it was written at,
-/// so the next change is written without reading it first.
-#[derive(Default)]
-struct LedgerSlot {
-    cached: Option<Ledger>,
-    used_at: Option<std::time::Instant>,
-}
-
-/// A finished query whose running slot is released by the next write of its caller's ledger.
-struct QueuedRelease {
-    job_id: String,
-    stored: Option<StoredEntry>,
-}
-
-/// Whether a later conditional write can name the version `ledger` was read or written at.
-fn has_version(ledger: &Ledger) -> bool {
-    ledger
-        .version
-        .as_ref()
-        .is_some_and(|version| version.e_tag.is_some() || version.version.is_some())
 }
 
 impl std::fmt::Debug for JobStore {
@@ -140,7 +98,6 @@ impl JobStore {
             store,
             base_prefix: base_prefix.into(),
             node_id: node_id.into(),
-            ledger_slots: dashmap::DashMap::new(),
             result_ttl: object_store_occ::cleanup::age(DEFAULT_RESULT_TTL),
             chunk_size: DEFAULT_CHUNK_SIZE,
         }
@@ -164,6 +121,25 @@ impl JobStore {
     #[must_use]
     pub(crate) fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// Takes over a queued job whose scheduler stopped: this store's node holds it from now on.
+    /// The takeover lands only while the job is still queued and held as in `observed`, so of
+    /// the schedulers that recover the same job one takes it over and the others get `None`.
+    pub async fn take_over_pending_job(&self, observed: &JobState) -> Result<Option<JobState>> {
+        let node = self.node_id.clone();
+        let (state, taken) = self
+            .modify_job(&observed.job_id, |state| {
+                if state.status != JobStatus::Pending
+                    || state.scheduler_node != observed.scheduler_node
+                {
+                    return Ok(false);
+                }
+                state.scheduler_node = Some(node.clone());
+                Ok(true)
+            })
+            .await?;
+        Ok(taken.then_some(state))
     }
 
     /// Marks a job that is still waiting to run as failed, without running it: one whose
@@ -242,6 +218,9 @@ impl JobStore {
             .with_timeout_seconds(request.timeout_seconds)
             .with_maximum_size(request.maximum_size);
         state.read_only = read_only;
+        // The scheduler that accepted the job holds it until it starts, so the recovery sweep
+        // can tell a queued job whose scheduler stopped.
+        state.scheduler_node = Some(self.node_id.clone());
         self.write_job_state(&mut state).await?;
         Ok(state)
     }
@@ -399,12 +378,9 @@ impl JobStore {
         job_id: &str,
         driver: &JobDriver,
         mut stream: SendableRecordBatchStream,
+        on_written: &(dyn Fn(u64) + Send + Sync),
     ) -> Result<JobResult> {
         let state = self.get_job(job_id).await?;
-        let owner = state.owner_scope().to_string();
-        // Bytes last recorded in the caller's ledger: updated every `WRITTEN_BYTES_BATCH`, not
-        // on every chunk, and exactly when the job finishes.
-        let mut recorded_bytes = 0usize;
 
         let schema: SchemaRef = stream.schema();
 
@@ -466,10 +442,7 @@ impl JobStore {
                     }
                 })?;
 
-                if total_bytes / BATCH_BYTES > recorded_bytes / BATCH_BYTES {
-                    self.record_written(&owner, job_id, total_bytes).await;
-                    recorded_bytes = total_bytes;
-                }
+                on_written(u64::try_from(total_bytes).unwrap_or(u64::MAX));
 
                 chunk_indices.push(chunk_index);
                 chunk_row_offsets.push(committed_rows);
@@ -928,221 +901,6 @@ impl JobStore {
         Ok(deleted_count)
     }
 
-    fn owners_prefix(&self) -> Path {
-        join_path(&self.base_prefix, "owners")
-    }
-
-    /// The ledger of `owner`: a path-safe encoding of the caller's opaque scope.
-    fn ledger_path(&self, owner: &str) -> Path {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut encoded = String::with_capacity(owner.len() * 2);
-        for byte in owner.bytes() {
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-        join_path(&self.base_prefix, &format!("owners/{encoded}.json"))
-    }
-
-    /// The owner a ledger path names, or `None` for a path that is not a ledger.
-    fn ledger_owner(path: &Path) -> Option<String> {
-        let name = path.filename()?.strip_suffix(".json")?;
-        let bytes = (0..name.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(name.get(i..i + 2)?, 16).ok())
-            .collect::<Option<Vec<u8>>>()?;
-        String::from_utf8(bytes).ok()
-    }
-
-    /// Reads `owner`'s ledger; a caller with none has an empty one.
-    pub(crate) async fn read_ledger(&self, owner: &str) -> Result<Ledger> {
-        let path = self.ledger_path(owner);
-        let result = match self.store.get(&path).await {
-            Ok(result) => result,
-            Err(ObjectStoreError::NotFound { .. }) => return Ok(Ledger::default()),
-            Err(source) => return Err(super::error::Error::ObjectStoreRead { source }),
-        };
-        let version = UpdateVersion {
-            e_tag: result.meta.e_tag.clone(),
-            version: result.meta.version.clone(),
-        };
-        let bytes = result.bytes().await.context(ObjectStoreReadSnafu)?;
-        let mut ledger: Ledger = serde_json::from_slice(&bytes).context(DeserializeLedgerSnafu)?;
-        ledger.version = Some(version);
-        Ok(ledger)
-    }
-
-    /// Applies `change` to `owner`'s ledger and writes it back if `change` says it changed,
-    /// starting again from a fresh read when another scheduler wrote it first.
-    ///
-    /// The change is first applied to the ledger as this scheduler last wrote it, which is
-    /// usually still current: the common write is then one conditional write with no read, and
-    /// the write landing proves the ledger was current. When another scheduler wrote the ledger
-    /// since, that write is refused and the ledger is read and changed again at once; only a
-    /// conflict after a fresh read backs off. A change that writes nothing proves nothing about
-    /// the copy it saw, such as a refused admission, so it is decided again on a fresh read.
-    ///
-    /// Releases queued with [`JobStore::queue_release`] are applied first and written with the
-    /// change; when the write fails they stay queued.
-    pub(crate) async fn modify_ledger<T: Send>(
-        &self,
-        owner: &str,
-        mut change: impl FnMut(&mut Ledger) -> (T, bool) + Send,
-    ) -> Result<T> {
-        let caller = Arc::clone(
-            self.ledger_slots
-                .entry(owner.to_string())
-                .or_default()
-                .value(),
-        );
-        let mut slot = caller.write.lock().await;
-        slot.used_at = Some(std::time::Instant::now());
-        let carried = std::mem::take(&mut *caller.releases.lock());
-        let path = self.ledger_path(owner);
-        let (result, last_written) = {
-            let cached = Mutex::new(slot.cached.take());
-            let change = Mutex::new(|ledger: &mut Ledger| {
-                let mut released = false;
-                for release in &carried {
-                    released |= ledger.finish(&release.job_id, release.stored);
-                }
-                let (out, changed) = change(ledger);
-                (out, changed || released)
-            });
-            let result = retry_on_conflict(&ConflictRetry::default(), || async {
-                let last_written = cached.lock().take();
-                if let Some(mut ledger) = last_written {
-                    let (out, changed) = (*change.lock())(&mut ledger);
-                    if changed && self.write_ledger(&path, &mut ledger).await? {
-                        *cached.lock() = Some(ledger).filter(has_version);
-                        return Ok(Attempt::Done(out));
-                    }
-                }
-                let mut ledger = self.read_ledger(owner).await?;
-                let (out, changed) = (*change.lock())(&mut ledger);
-                if !changed {
-                    *cached.lock() = Some(ledger).filter(has_version);
-                    return Ok(Attempt::Done(out));
-                }
-                if self.write_ledger(&path, &mut ledger).await? {
-                    *cached.lock() = Some(ledger).filter(has_version);
-                    Ok(Attempt::Done(out))
-                } else {
-                    Ok(Attempt::Conflict)
-                }
-            })
-            .await;
-            (result, cached.into_inner())
-        };
-        slot.cached = last_written;
-        if result.is_err() && !carried.is_empty() {
-            // Not written: the releases this write carried wait for the next one.
-            let mut queued = caller.releases.lock();
-            let later = std::mem::take(&mut *queued);
-            queued.extend(carried);
-            queued.extend(later);
-        }
-        result.map_err(|err| match err {
-            RetryOnConflictError::ConflictsExhausted { .. } => {
-                super::error::Error::ConcurrentModification {
-                    job_id: format!("owners/{owner}"),
-                }
-            }
-            RetryOnConflictError::Failed(err) => err,
-        })
-    }
-
-    /// Writes `ledger` over the version it was read or last written at, and records the version
-    /// written. Returns `false` when another writer changed it first. On an error the outcome is
-    /// unknown, so the caller drops the ledger it holds.
-    async fn write_ledger(&self, path: &Path, ledger: &mut Ledger) -> Result<bool> {
-        let payload = serde_json::to_vec(&ledger).context(SerializeStateSnafu)?;
-        let expected = match ledger.version.clone() {
-            Some(version) => Expected::at_version(version).ok_or_else(|| {
-                super::error::Error::ObjectStoreWrite {
-                    source: ConditionalWriteError::Unsupported {
-                        path: path.to_string(),
-                        source: ObjectStoreError::NotSupported {
-                            source: "the store reported neither an ETag nor a version".into(),
-                        },
-                    },
-                }
-            })?,
-            None => Expected::Absent,
-        };
-        match conditional_put(self.store.as_ref(), path, payload.into(), &expected).await {
-            Ok(written) => {
-                ledger.version = Some(UpdateVersion {
-                    e_tag: written.e_tag,
-                    version: written.version,
-                });
-                Ok(true)
-            }
-            Err(ConditionalWriteError::Conflict { .. }) => Ok(false),
-            Err(source) => Err(super::error::Error::ObjectStoreWrite { source }),
-        }
-    }
-
-    /// Queues the release of `job_id`'s running slot, with its result kept until it expires, for
-    /// the next write of `owner`'s ledger.
-    pub(crate) fn queue_release(&self, owner: &str, job_id: &str, stored: Option<StoredEntry>) {
-        let caller = Arc::clone(
-            self.ledger_slots
-                .entry(owner.to_string())
-                .or_default()
-                .value(),
-        );
-        caller.releases.lock().push(QueuedRelease {
-            job_id: job_id.to_string(),
-            stored,
-        });
-    }
-
-    /// Whether `owner` has releases no write of its ledger has carried yet.
-    pub(crate) fn has_queued_releases(&self, owner: &str) -> bool {
-        self.ledger_slots
-            .get(owner)
-            .is_some_and(|caller| !caller.releases.lock().is_empty())
-    }
-
-    /// Forgets the ledgers of callers this scheduler has not written for `idle`.
-    pub(crate) fn forget_idle_ledgers(&self, idle: Duration) {
-        self.ledger_slots.retain(|_, caller| {
-            Arc::strong_count(caller) > 1
-                || !caller.releases.lock().is_empty()
-                || caller.write.try_lock().map_or(true, |slot| {
-                    slot.used_at.is_some_and(|at| at.elapsed() < idle)
-                })
-        });
-    }
-
-    /// The owners that have a ledger.
-    pub(crate) async fn ledger_owners(&self) -> Result<Vec<String>> {
-        let mut stream = self.store.list(Some(&self.owners_prefix()));
-        let mut owners = Vec::new();
-        while let Some(entry) = stream.next().await {
-            let meta = entry.context(ObjectStoreListSnafu)?;
-            if let Some(owner) = Self::ledger_owner(&meta.location) {
-                owners.push(owner);
-            }
-        }
-        Ok(owners)
-    }
-
-    /// Records, best effort, that running `job_id` has written `written` result bytes. A write
-    /// that fails is logged: the bytes are recorded exactly when the job finishes.
-    async fn record_written(&self, owner: &str, job_id: &str, written: usize) {
-        let written = u64::try_from(written).unwrap_or(u64::MAX);
-        if let Err(e) = self
-            .modify_ledger(owner, |ledger| ((), ledger.record_written(job_id, written)))
-            .await
-        {
-            tracing::debug!(
-                job_id,
-                "Failed to record the bytes the async query wrote: {e}"
-            );
-        }
-    }
-
     /// Deletes, best effort, the result chunks of `job_id`, as for a job whose results are
     /// discarded. Returns how many it deleted.
     pub(crate) async fn delete_job_chunks(&self, job_id: &str) -> usize {
@@ -1302,313 +1060,6 @@ mod tests {
             timeout_seconds: None,
             maximum_size: None,
         }
-    }
-
-    /// An object store whose first `readers` reads of a caller's ledger are all answered
-    /// before any of them returns, so every scheduler starts from the same version: the race
-    /// the conditional write has to settle.
-    #[derive(Debug)]
-    struct LedgerReadsMeet {
-        inner: Arc<dyn ObjectStore>,
-        readers: usize,
-        reads: std::sync::atomic::AtomicUsize,
-        barrier: tokio::sync::Barrier,
-    }
-
-    impl LedgerReadsMeet {
-        fn new(readers: usize) -> Self {
-            Self {
-                inner: Arc::new(InMemory::new()),
-                readers,
-                reads: std::sync::atomic::AtomicUsize::new(0),
-                barrier: tokio::sync::Barrier::new(readers),
-            }
-        }
-    }
-
-    impl std::fmt::Display for LedgerReadsMeet {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "LedgerReadsMeet")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for LedgerReadsMeet {
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: object_store::GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            let result = self.inner.get_opts(location, options).await;
-            if location.as_ref().contains("/owners/")
-                && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < self.readers
-            {
-                self.barrier.wait().await;
-            }
-            result
-        }
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            self.inner.put_opts(location, payload, opts).await
-        }
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: object_store::PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
-        {
-            self.inner.list(prefix)
-        }
-        fn delete_stream(
-            &self,
-            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
-            self.inner.delete_stream(locations)
-        }
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: object_store::CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
-
-    /// An object store that counts writes of caller ledgers, and refuses the next one when
-    /// asked to.
-    #[derive(Debug, Default)]
-    struct LedgerWrites {
-        inner: InMemory,
-        writes: std::sync::atomic::AtomicUsize,
-        fail_next: std::sync::atomic::AtomicBool,
-    }
-
-    impl std::fmt::Display for LedgerWrites {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "LedgerWrites")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for LedgerWrites {
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: object_store::GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            if location.as_ref().contains("/owners/") {
-                if self
-                    .fail_next
-                    .swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
-                    return Err(ObjectStoreError::Generic {
-                        store: "LedgerWrites",
-                        source: "injected ledger write failure".into(),
-                    });
-                }
-                self.writes
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            self.inner.put_opts(location, payload, opts).await
-        }
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: object_store::PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
-        {
-            self.inner.list(prefix)
-        }
-        fn delete_stream(
-            &self,
-            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
-            self.inner.delete_stream(locations)
-        }
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: object_store::CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
-
-    fn admit(job_id: &'static str) -> impl FnMut(&mut Ledger) -> (bool, bool) + Send {
-        move |ledger| {
-            let admitted = ledger
-                .admit(job_id, "node-1", crate::jobs::JobLimits::default(), 0)
-                .is_ok();
-            (admitted, admitted)
-        }
-    }
-
-    /// A finished query's queued release is written by the caller's next ledger write, with
-    /// no write of its own, and keeps the query's result in the budget.
-    #[tokio::test]
-    async fn a_queued_release_rides_on_the_next_ledger_write() {
-        let store = Arc::new(LedgerWrites::default());
-        let job_store = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-1");
-        let owner = "apikey:0123456789abcdef";
-        assert!(
-            job_store
-                .modify_ledger(owner, admit("a"))
-                .await
-                .expect("written")
-        );
-        job_store.queue_release(
-            owner,
-            "a",
-            Some(StoredEntry {
-                bytes: 10,
-                expires_at_ms: 120_000,
-            }),
-        );
-        assert!(job_store.has_queued_releases(owner));
-
-        assert!(
-            job_store
-                .modify_ledger(owner, admit("b"))
-                .await
-                .expect("written")
-        );
-
-        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(!job_store.has_queued_releases(owner));
-        let ledger = job_store.read_ledger(owner).await.expect("ledger");
-        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["b"]);
-        assert_eq!(
-            ledger.stored,
-            std::collections::BTreeMap::from([(120_000, 10)])
-        );
-    }
-
-    /// A queued release carried by a write that fails stays queued, and the next write
-    /// carries it.
-    #[tokio::test]
-    async fn a_queued_release_outlives_a_failed_write() {
-        let store = Arc::new(LedgerWrites::default());
-        let job_store = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-1");
-        let owner = "apikey:0123456789abcdef";
-        assert!(
-            job_store
-                .modify_ledger(owner, admit("a"))
-                .await
-                .expect("written")
-        );
-        job_store.queue_release(owner, "a", None);
-        store
-            .fail_next
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        job_store
-            .modify_ledger(owner, admit("b"))
-            .await
-            .expect_err("the write fails");
-        assert!(job_store.has_queued_releases(owner));
-        let ledger = job_store.read_ledger(owner).await.expect("ledger");
-        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["a"]);
-
-        assert!(
-            job_store
-                .modify_ledger(owner, admit("c"))
-                .await
-                .expect("written")
-        );
-        assert!(!job_store.has_queued_releases(owner));
-        let ledger = job_store.read_ledger(owner).await.expect("ledger");
-        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), vec!["c"]);
-    }
-
-    /// Four schedulers read a caller's empty ledger at once and each would start its query;
-    /// the conditional write lets only the first take the one running slot, and the others
-    /// read again and queue.
-    #[tokio::test]
-    async fn schedulers_admitting_at_once_share_one_running_limit() {
-        use crate::jobs::ledger::{Admission, Limits};
-        let store: Arc<dyn ObjectStore> = Arc::new(LedgerReadsMeet::new(4));
-        let limits = Limits {
-            running: 1,
-            pending: 8,
-            stored_bytes: u64::MAX,
-        };
-        let admit = |node: &'static str, job_id: &'static str| {
-            let store = JobStore::new(Arc::clone(&store), "test", node);
-            async move {
-                store
-                    .modify_ledger("apikey:0123456789abcdef", |ledger| {
-                        let admission = ledger.admit(job_id, node, limits, 0);
-                        let changed = admission.is_ok();
-                        (admission, changed)
-                    })
-                    .await
-                    .expect("ledger write")
-                    .expect("admitted")
-            }
-        };
-        let admissions = futures::future::join_all([
-            admit("node-a", "a"),
-            admit("node-b", "b"),
-            admit("node-c", "c"),
-            admit("node-d", "d"),
-        ])
-        .await;
-        assert_eq!(
-            admissions.iter().filter(|a| **a == Admission::Run).count(),
-            1,
-            "one running slot across every scheduler: {admissions:?}"
-        );
-        let ledger = JobStore::new(Arc::clone(&store), "test", "node-a")
-            .read_ledger("apikey:0123456789abcdef")
-            .await
-            .expect("ledger");
-        assert_eq!(ledger.running.len(), 1);
-        assert_eq!(ledger.pending.len(), 3);
-        assert_eq!(
-            JobStore::new(Arc::clone(&store), "test", "node-a")
-                .ledger_owners()
-                .await
-                .expect("owners"),
-            vec!["apikey:0123456789abcdef".to_string()]
-        );
     }
 
     #[tokio::test]
@@ -2103,6 +1554,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write empty stream");
@@ -2143,6 +1595,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write single batch stream");
@@ -2192,6 +1645,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -2241,6 +1695,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -2301,6 +1756,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -2337,6 +1793,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -2373,6 +1830,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -2427,6 +1885,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream within maximum size limit");
@@ -2475,6 +1934,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await;
 
@@ -2522,6 +1982,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await;
 
@@ -2563,6 +2024,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream without maximum size limit");
@@ -2789,7 +2251,12 @@ mod tests {
             let successor_driver = taken.driver().expect("a driver");
 
             let err = former
-                .write_result_chunks_from_stream(&job_id, &former_driver, int_stream(vec![7, 7]))
+                .write_result_chunks_from_stream(
+                    &job_id,
+                    &former_driver,
+                    int_stream(vec![7, 7]),
+                    &|_| {},
+                )
                 .await
                 .expect_err("the former driver must not write results");
             assert!(matches!(err, Error::JobTakenOver { .. }), "{err:?}");
@@ -2815,7 +2282,12 @@ mod tests {
             );
 
             let result = successor
-                .write_result_chunks_from_stream(&job_id, &successor_driver, int_stream(vec![1, 2]))
+                .write_result_chunks_from_stream(
+                    &job_id,
+                    &successor_driver,
+                    int_stream(vec![1, 2]),
+                    &|_| {},
+                )
                 .await
                 .expect("the driver writes results");
             let done = successor
@@ -2844,6 +2316,7 @@ mod tests {
                     &job_id,
                     &started.driver().expect("a driver"),
                     int_stream(vec![9, 9, 9]),
+                    &|_| {},
                 )
                 .await
                 .expect("the driver writes while it drives");
@@ -2858,6 +2331,7 @@ mod tests {
                     &job_id,
                     &taken.driver().expect("a driver"),
                     int_stream(vec![1, 2]),
+                    &|_| {},
                 )
                 .await
                 .expect("the new driver writes over the former driver's chunk");

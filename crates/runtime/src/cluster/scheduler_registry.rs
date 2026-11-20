@@ -97,10 +97,6 @@ fn worst_case_tick(ttl_ms: u64) -> Duration {
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
-
-/// How often this scheduler checks whether its queued async queries can start because another
-/// scheduler freed their caller's running slot.
-const PENDING_PROMOTION_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_DIVISOR: u64 = 3;
 
 /// Compare-and-set attempts for one heartbeat before skipping this beat.
@@ -365,7 +361,7 @@ async fn recover_orphaned_jobs(
         live
     };
 
-    // One listing serves both the takeover below and the ledger reconciliation after it.
+    // One listing serves both the takeover of running jobs below and of queued ones after it.
     let jobs = match job_executor.list_all_jobs(None).await {
         Ok(jobs) => jobs,
         Err(err) => {
@@ -392,7 +388,7 @@ async fn recover_orphaned_jobs(
         }
     }
 
-    job_executor.reconcile_ledgers(&jobs, &live).await;
+    job_executor.recover_queued(&jobs, &live).await;
 }
 
 impl SchedulerRegistryRunner {
@@ -420,10 +416,6 @@ impl SchedulerRegistryRunner {
         // not hold up the heartbeat that tells peers this scheduler is alive.
         let mut recovery = std::pin::pin!(Fuse::terminated());
         let mut cleanup = std::pin::pin!(Fuse::terminated());
-        // Queued async queries this scheduler holds start as soon as another scheduler frees
-        // their caller's running slot.
-        let mut promotion_tick = tokio::time::interval(PENDING_PROMOTION_INTERVAL);
-        let mut promotion = std::pin::pin!(Fuse::terminated());
 
         // Run an initial discovery so peers are populated promptly.
         if let Err(err) = self.refresh_peers().await {
@@ -466,10 +458,6 @@ impl SchedulerRegistryRunner {
                     );
                 }
                 () = &mut recovery => {}
-                _ = promotion_tick.tick(), if promotion.is_terminated() => {
-                    promotion.set(self.job_executor.promote_pending().fuse());
-                }
-                () = &mut promotion => {}
                 () = &mut next_cleanup, if cleanup.is_terminated() => {
                     cleanup.set(self.cleanup_pass().fuse());
                 }

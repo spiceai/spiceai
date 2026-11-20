@@ -102,7 +102,7 @@ pub enum Error {
 
     #[snafu(display(
         "`maximum_size` is {requested} bytes, above {} (100 GiB), the most an async query can store. Omit it to use 100 GiB, or set a smaller value. See https://spiceai.org/docs/api/http/queries",
-        super::ledger::MAX_JOB_RESULT_BYTES
+        super::admission::MAX_JOB_RESULT_BYTES
     ))]
     MaximumSizeAboveLimit { requested: u64 },
 
@@ -120,9 +120,6 @@ pub enum Error {
         stored_bytes: u64,
         oldest_expiry_ms: Option<u64>,
     },
-
-    #[snafu(display("Failed to read the async query budget of a caller: {source}"))]
-    DeserializeLedger { source: serde_json::Error },
 
     #[snafu(display(
         "Concurrent modification detected for job {job_id}. Another scheduler modified the job state."
@@ -148,7 +145,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// The size limit a job failed on, for its error: the product limit, or the `maximum_size` the
 /// query set.
 fn size_limit_text(maximum_size: u64) -> String {
-    if maximum_size == super::ledger::MAX_JOB_RESULT_BYTES {
+    if maximum_size == super::admission::MAX_JOB_RESULT_BYTES {
         "100 GiB, the most an async query can store".to_string()
     } else {
         format!(
@@ -222,7 +219,7 @@ mod tests {
         assert_eq!(
             Error::MaximumJobSizeExceeded {
                 job_id: "01ABC-DEF-456-7890AB".to_string(),
-                maximum_size: super::super::ledger::MAX_JOB_RESULT_BYTES,
+                maximum_size: super::super::admission::MAX_JOB_RESULT_BYTES,
             }
             .to_string(),
             "The results of query '01ABC-DEF-456-7890AB' are larger than 100 GiB, the most an async query can store, so the query failed and its results were discarded. Select fewer rows or columns, or aggregate in SQL. See https://spiceai.org/docs/api/http/queries"

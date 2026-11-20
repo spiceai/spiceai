@@ -1,12 +1,15 @@
 name: async-query-budgets
 description: >
-  On a cluster, each caller runs up to 64 async queries at once. Further
+  On a scheduler, each caller runs up to 64 async queries at once. Further
   queries wait as PENDING and start in submission order as running ones
   finish or are cancelled; another caller is unaffected; a `maximum_size`
   above 100 GiB is refused with 400; the scheduler publishes how many it
-  holds. When the scheduler holding the queries is killed, a public
-  caller's waiting queries keep their order and count, and an authenticated
-  caller's fail with a request to resubmit, as its running ones do.
+  holds. When the scheduler holding the queries is killed and started
+  again, it starts with an empty budget and the queries it takes over count
+  against it: a public caller's waiting queries keep their order and count,
+  and an authenticated caller's fail with a request to resubmit, as its
+  running ones do. (Two schedulers each admitting up to 64:
+  async-query-budgets-schedulers.yaml.)
 
 sources:
   lake: { kind: files }
@@ -270,9 +273,11 @@ steps:
     expect: { status: 200, json: [ { pointer: /total_count, equals: 64 } ] }
     eventually: 30s
 
-  # The scheduler holding the queries is killed and started again. A public caller's queries
-  # are taken over: they keep their order and count. An authenticated caller's queries cannot
-  # be run without the request that submitted them, so they fail with a request to resubmit.
+  # The scheduler holding the queries is killed and started again, with an empty budget. A
+  # public caller's queries are taken over and count against it: the 64 running take its 64
+  # slots and the 4 waiting keep their order and count. An authenticated caller's queries
+  # cannot be run without the request that submitted them, so they fail with a request to
+  # resubmit.
   - kill-spiced: {}
   - start: {}
   - http: { method: GET, path: /v1/queries, query: { status: pending } }

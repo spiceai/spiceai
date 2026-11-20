@@ -317,7 +317,7 @@ pub struct CancelActiveQueryResponse {
     responses(
         (status = 202, description = "Query accepted for async execution: `RUNNING`, or `PENDING` while the caller already runs 64 async queries", body = SubmitQueryResponse),
         (status = 400, description = "Invalid request, such as a `timeout_seconds` above `runtime.query.timeout` or a `maximum_size` above 100 GiB"),
-        (status = 429, description = "The caller's queue of waiting queries (1,000) or its stored results (6.25 TiB) is full; retry after `Retry-After` seconds"),
+        (status = 429, description = "The caller's queue of waiting queries (1,000) or its stored results (6.25 TiB) on this scheduler is full; retry after `Retry-After` seconds"),
         (status = 503, description = "Queries API requires cluster mode")
     )
 ))]
@@ -1333,11 +1333,8 @@ mod budget_response_tests {
     use crate::datafusion::builder::DataFusionBuilder;
     use crate::jobs::{JobLimits, JobStore};
     use http_body_util::BodyExt;
-    use object_store::{
-        ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory, path::Path as ObjectPath,
-    };
+    use object_store::{ObjectStore, memory::InMemory};
     use runtime_status::RuntimeStatus;
-    use std::fmt::Write as _;
 
     const OWNER: &str = "apikey:0123456789abcdef";
     const OTHER: &str = "apikey:fedcba9876543210";
@@ -1454,24 +1451,6 @@ mod budget_response_tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         // The end of a minute about an hour from now.
         let expires_at_ms = (crate::jobs::now_ms() / 60_000 + 61) * 60_000;
-        // The caller's ledger as a scheduler stores it, holding 1 GiB of results that expire in
-        // that minute.
-        let owner_hex = OWNER.bytes().fold(String::new(), |mut hex, byte| {
-            write!(hex, "{byte:02x}").expect("writing to a String");
-            hex
-        });
-        let ledger = serde_json::json!({
-            "running": {},
-            "pending": [],
-            "stored": {expires_at_ms.to_string(): 1_u64 << 30},
-        });
-        store
-            .put(
-                &ObjectPath::from(format!("jobs/owners/{owner_hex}.json")),
-                PutPayload::from(serde_json::to_vec(&ledger).expect("ledger JSON")),
-            )
-            .await
-            .expect("ledger written");
         let executor = executor(
             store,
             JobLimits {
@@ -1480,6 +1459,8 @@ mod budget_response_tests {
                 stored_bytes: 1 << 30,
             },
         );
+        // 1 GiB of results this scheduler's queries kept, expiring in that minute.
+        executor.keep_stored_for_test(OWNER, 1 << 30, expires_at_ms);
 
         let refused = executor
             .submit(select_one(), true, OWNER.to_string())

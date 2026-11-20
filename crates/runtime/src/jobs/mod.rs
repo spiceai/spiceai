@@ -22,17 +22,17 @@ limitations under the License.
 //! - Results are chunked and stored in the shared object store
 //! - Only works in cluster mode (requires scheduler state location)
 
+mod admission;
 mod error;
 mod executor;
-mod ledger;
 mod state;
 mod store;
 
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+pub use admission::{Limits as JobLimits, MAX_JOB_RESULT_BYTES};
 pub use error::{Error, Result};
 pub use executor::JobExecutor;
-pub use ledger::{Limits as JobLimits, MAX_JOB_RESULT_BYTES};
 pub use state::JobErrorCode;
 pub use state::{
     DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobDriver, JobResult, JobResultManifest, JobSchema,
