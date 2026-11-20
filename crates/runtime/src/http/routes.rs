@@ -451,8 +451,7 @@ pub(crate) fn routes(
         )
         .route("/v1/packages/generate", generate_package)
         .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel))
-        .route_layer(middleware::from_fn(v1::require_write_access))
-        .layer(middleware::from_fn(package_generate_deprecation));
+        .route_layer(middleware::from_fn(v1::require_write_access));
 
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
@@ -715,6 +714,10 @@ pub(crate) fn routes(
         .merge(authenticated_router)
         .route_layer(middleware::from_fn(super::mtls::mtls_request_layer))
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
+        // Every `POST /v1/packages/generate` response carries its deprecation headers, including
+        // the shutdown, mTLS, auth, write-access, and body-limit rejections above, so this wraps
+        // them.
+        .route_layer(middleware::from_fn(package_generate_deprecation))
         // The Messages API needs every `/v1/messages` error in its error envelope, including the
         // shutdown, mTLS, auth, and body-limit rejections above, so this wraps them.
         .route_layer(middleware::from_fn(v1::messages::encode_layer_errors))
@@ -745,8 +748,8 @@ pub(crate) fn routes(
     router.layer(middleware::from_fn(allow_mcp_param_cors_headers))
 }
 
-/// Every response to the deprecated `POST /v1/packages/generate`, the write-access refusal
-/// included, carries its `Deprecation` and `Link` headers.
+/// Every response to the deprecated `POST /v1/packages/generate`, the refusals of the layers in
+/// front of its handler included, carries its `Deprecation` and `Link` headers.
 async fn package_generate_deprecation(req: Request<Body>, next: Next) -> axum::response::Response {
     let deprecated = req.uri().path() == "/v1/packages/generate";
     let mut response = next.run(req).await;
