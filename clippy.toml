@@ -17,6 +17,10 @@ too-many-lines-threshold = 200
 # without one (#13664). A legitimate call site installs the backend's deny-list
 # — `.with_function_support(..)`, or `create_spice_federated_table_provider` for
 # a `SqlTable` — and says where in its `#[expect(clippy::disallowed_methods)]`.
+# A tool runs through `SpiceModelTool::call` (or `authorized_mcp_proxy`), which
+# decides whether the caller may call it, so a new way to run a tool cannot skip
+# that check; a wrapper forwarding a call already authorized says so in its
+# `#[expect]`.
 disallowed-methods = [
     { path = "std::thread::available_parallelism", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
     { path = "num_cpus::get", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
@@ -31,4 +35,6 @@ disallowed-methods = [
     { path = "data_components::flight::FlightFactory::new", reason = "install the deny-list with .with_function_support(..), or say why the remote can run every pushed function — this factory federates every Spice-only UDF by default (#13664)" },
     { path = "datafusion_table_providers::util::supported_functions::FunctionSupport::with_expression_support", reason = "add the gate with runtime_udfs_api::FunctionSupportBuilder::expression or runtime_udfs_api::and_expression_support — this setter replaces the expression check, dropping the every-backend refusal of SIMILAR TO, which the unparser renders as LIKE" },
     { path = "data_components::flightsql::FlightSQLFactory::new", reason = "install the deny-list with .with_function_support(..) — this factory federates every Spice-only UDF into the remote SQL by default (#13664)" },
+    { path = "tools::SpiceModelTool::run", reason = "call SpiceModelTool::call — `run` skips the check that the caller may call the tool (a read-write tool needs a principal with write access)" },
+    { path = "tools::SpiceModelTool::as_mcp_proxy", reason = "use SpiceModelTool::authorized_mcp_proxy — `as_mcp_proxy` hands out the MCP proxy without checking that the caller may call the tool" },
 ]

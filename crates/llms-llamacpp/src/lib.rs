@@ -2648,19 +2648,25 @@ impl<'v> Picker<'v> {
         self.free.is_greedy() && self.constrained.is_none()
     }
 
-    fn sample(&mut self, context: &Context<'_>, index: i32, in_content: bool) -> Token {
+    /// Fails when a backend failed computing the decode, which leaves nothing to pick from.
+    fn sample(
+        &mut self,
+        context: &Context<'_>,
+        index: i32,
+        in_content: bool,
+    ) -> std::result::Result<Token, String> {
         let (used, other) = match &mut self.constrained {
             Some(constrained) if in_content => (constrained, Some(&mut self.free)),
             constrained => (&mut self.free, constrained.as_mut()),
         };
-        let token = used.sample(context, index);
+        let token = used.sample(context, index).map_err(|e| e.to_string())?;
         // The penalties lead each chain; the chain that did not pick still counts the token.
         if self.penalized
             && let Some(other) = other
         {
             other.accept_at(0, token);
         }
-        token
+        Ok(token)
     }
 }
 
