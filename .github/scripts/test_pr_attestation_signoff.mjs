@@ -5,9 +5,11 @@
 //
 // Attestation is the required check that lets a PR into the merge queue, and its
 // logic lives in `actions/github-script` blocks inside the workflow rather than
-// in a checked-in module: the job deliberately does not check the repository out
-// before running them, because a `pull_request` checkout would put fork-authored
-// code in the job that decides whether that fork's PR is signed off.
+// in a checked-in module: the job deliberately does not check out the PR before
+// running them, because a `pull_request` checkout would put fork-authored code in
+// the job that decides whether that fork's PR is signed off. The one module it
+// uses, the pure-revert rule, comes from a checkout of the base commit and is
+// tested in test_pure_revert.mjs.
 //
 // So these tests read the workflow, lift each step's `script:` block out of it,
 // and run the real text against a stub `github`/`core`/`context`. Nothing is

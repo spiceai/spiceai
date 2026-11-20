@@ -757,6 +757,62 @@ reviews the change and signs off on your behalf (or pushes a small follow-up and
 signs off). This mirrors the trusted-committer model — the full suite in the
 merge queue is still the real gate.
 
+## Trunk Health
+
+Some tests run after merge rather than in the merge queue: `nightly_tests.yml`
+runs the comprehensive set on `trunk` every 12 hours. A failure it finds is
+tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
+`fixes-trunk` that fixes or reverts it. The required **Trunk Health** check
+(`trunk_health.yml`) keeps those from being ignored.
+
+**It blocks merging when either holds:**
+
+- **Overdue:** an open `trunk-broken` issue or `fixes-trunk` PR has carried its
+  label for more than 24 hours. The age counts from the most recent time the
+  label was added. The 24 hours are for triage: a flake or an infrastructure
+  fault should not stop all merging before anyone has looked at it.
+- **Untriaged:** the last two completed `nightly_tests.yml` runs on `trunk`
+  failed (cancelled runs are skipped), and nothing is labeled. Filing the
+  failure as a `trunk-broken` issue clears this and starts that issue's
+  24 hours.
+
+**A PR may merge anyway when any holds:**
+
+- it is labeled `fixes-trunk`;
+- it closes, by a closing keyword such as `Fixes #N`, an issue labeled
+  `trunk-broken` (a plain mention does not count, nor does closing an
+  unlabeled issue);
+- it is a pure revert, by the same rule as [Reverts are
+  fast-tracked](#reverts-are-fast-tracked)
+  (`.github/scripts/pure_revert.mjs`), except that a fork's revert also counts.
+
+**Removing the label is the only override.** If an item should not block
+merging (a flake, an infrastructure fault, a failure in a test that is being
+retired), a maintainer removes its label. That is visible in the issue's
+history and needs no admin bypass.
+
+**Where it runs.** The merge-queue run is the one that blocks. The run on a
+pull request is advisory: it always passes, and when merging is blocked it
+posts one comment listing the blocking items and how to unblock, which it
+updates as things change and edits to say so once the block clears. A fork's
+token cannot comment, so on a fork PR the report is in the job summary. The
+gate reads labels, label events, workflow runs and the PR's closing issues
+with the job's token, and runs `.github/scripts/trunk_health.mjs` from the
+base commit, never the PR's, so a PR cannot change the rule that judges it.
+When it cannot read that state in the merge queue, it fails closed; re-run the
+check.
+
+Anyone with triage permission can add or remove the labels, so they can block
+or unblock merging: the same trust level as approving or enqueueing a PR.
+
+**Rollout.** Once `trunk_health.yml` is on `trunk`, a maintainer creates the
+two labels (`gh label create trunk-broken`, `gh label create fixes-trunk`) and
+runs `scripts/signoff install --yes`, which adds `Trunk Health` to the required
+checks (see [Configure the ruleset](#configure-the-ruleset)). Until then the
+check runs but does not block. It is safe to require before
+`nightly_tests.yml` exists: with no such workflow, the untriaged condition
+stays off.
+
 ## For maintainers
 
 ### What runs where

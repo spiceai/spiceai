@@ -1,0 +1,74 @@
+---
+name: Trunk Health
+
+# Blocks merging into trunk while a post-merge failure goes unaddressed.
+#
+# The comprehensive tests run after merge (nightly_tests.yml). A failure they
+# find is tracked as an open issue labeled `trunk-broken` or an open PR labeled
+# `fixes-trunk`. Once one has carried its label for more than 24 hours, this
+# check fails for every PR that is not labeled `fixes-trunk`, does not close a
+# `trunk-broken` issue, and is not a pure revert. When the last two post-merge
+# runs failed and nothing is labeled, it fails too, until someone files the
+# failure. Removing the label is the only override. The rules are in
+# .github/scripts/trunk_health.mjs; docs/dev/ci_signoff.md explains them.
+#
+# The merge-queue run enforces. The pull_request run is advisory: it always
+# passes, and keeps one PR comment up to date, so a PR is not left with a stale
+# red check after trunk recovers.
+
+on:
+  pull_request:
+    branches:
+      - trunk
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited, ready_for_review]
+  merge_group:
+    branches:
+      - trunk
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref }}
+  cancel-in-progress: true
+
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
+jobs:
+  trunk-health:
+    environment: secret-free
+    name: Trunk Health
+    # GitHub-hosted: the self-hosted runners don't run for fork PRs, which would
+    # leave this required check unreported on them (the same reason as
+    # Attestation). It is a few API calls, so it must not queue behind the pool.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # The base commit's .github/scripts.
+      contents: read
+      # Labels and label events of the blocking issues.
+      issues: read
+      # The post-merge workflow's runs, for the backstop.
+      actions: read
+      # The PR's labels, commits and closing issues, and the advisory comment.
+      # A fork PR's token stays read-only; the job then reports in its summary.
+      pull-requests: write
+    steps:
+      # The gate's code comes from the BASE commit, never the PR's, so a PR
+      # cannot edit the gate to pass itself. On the PR that adds this workflow
+      # the base has no script yet and the check fails; it is not required
+      # until it is on trunk.
+      - name: Check out the base commit's scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          path: trusted
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Check trunk health
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { run } = await import(
+              `${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts/trunk_health.mjs`
+            );
+            await run({ github, context, core });
