@@ -2686,17 +2686,19 @@ fn remove_env_file_keys(keys: &[String]) -> Result<bool> {
 /// a logout or a keychain login report success while the old credential stays
 /// readable, so that is an error naming the keys and the fix.
 fn linked_env_file_keys(path: &std::path::Path, what: &str, keys: &[String]) -> Result<bool> {
-    // A dangling link, or a target that is not a regular file, sets nothing,
-    // and only a regular file is read so a FIFO cannot block. Any other failure
-    // to inspect or read the target is an error: taking it as empty would let
-    // the command report success while the credential stays in the file.
+    // A dangling link, or a target that is not a regular file, sets nothing.
+    // Any other failure to inspect or read the target is an error: taking it
+    // as empty would let the command report success while the credential stays
+    // in the file.
     let read_failed = |source: std::io::Error| Error::ConfigIo {
         operation: "read",
         path: path.to_path_buf(),
         source,
     };
     let linked = match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => std::fs::read_to_string(path).map_err(read_failed)?,
+        Ok(metadata) if metadata.is_file() => {
+            read_linked_regular_file(path).map_err(read_failed)?
+        }
         Ok(_) => String::new(),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(source) => return Err(read_failed(source)),
@@ -2730,6 +2732,36 @@ fn linked_env_file_keys(path: &std::path::Path, what: &str, keys: &[String]) -> 
             ),
         ),
     })
+}
+
+/// The contents of the regular file a linked env file points to, or nothing
+/// when the target is gone or is no longer a regular file.
+///
+/// The link is followed on purpose. The target was a regular file when it was
+/// checked by name, but the link or the target can be replaced since. So the
+/// target is opened without waiting for a writer, its type is checked on the
+/// opened descriptor, and that same descriptor is read: a FIFO swapped in after
+/// the check cannot block the read.
+fn read_linked_regular_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(source) => return Err(source),
+    };
+    let mut contents = String::new();
+    if file.metadata()?.is_file() {
+        file.read_to_string(&mut contents)?;
+    }
+    Ok(contents)
 }
 
 fn ensure_keychain_credentials_removed(failures: &[String]) -> Result<()> {
@@ -6836,6 +6868,106 @@ mod tests {
             std::fs::read(&target).expect("read the link target"),
             NOT_UTF8,
             "the linked file must not be rewritten"
+        );
+    }
+
+    /// A linked `.env` retargeted from a regular file to a FIFO between the
+    /// type check and the read never blocks logout: the target is opened
+    /// without waiting for a writer, and only a regular file is read, through
+    /// that same descriptor.
+    #[cfg(unix)]
+    #[test]
+    fn logout_never_blocks_on_a_linked_env_file_retargeted_to_a_fifo() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        const READS: usize = 5_000;
+        let keys = ["SPICE_SPICEAI_TOKEN".to_string()];
+        let dir = tempfile::tempdir().expect("create the directory");
+        let regular = dir.path().join("shared.env");
+        std::fs::write(&regular, "SPICE_SPICEAI_TOKEN=live\n").expect("write the regular target");
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo exited {made}");
+        let link = dir.path().join(".env");
+        std::os::unix::fs::symlink(&regular, &link).expect("link the env file");
+
+        // Retarget the link back and forth, each time by renaming a new link
+        // over it, so the name always resolves to one of the two targets.
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let stop = Arc::clone(&stop);
+            let (link, regular, fifo) = (link.clone(), regular.clone(), fifo.clone());
+            let staged = dir.path().join(".env.next");
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for target in [&fifo, &regular] {
+                        let _ = std::fs::remove_file(&staged);
+                        std::os::unix::fs::symlink(target, &staged).expect("stage a link");
+                        std::fs::rename(&staged, &link).expect("retarget the link");
+                    }
+                }
+            })
+        };
+
+        let (done, finished) = mpsc::channel();
+        {
+            let link = link.clone();
+            std::thread::spawn(move || {
+                let outcomes: Vec<Result<bool>> = (0..READS)
+                    .map(|_| linked_env_file_keys(&link, "a symbolic link", &keys))
+                    .collect();
+                let _ = done.send(outcomes);
+            });
+        }
+        let outcome = finished.recv_timeout(std::time::Duration::from_secs(60));
+        stop.store(true, Ordering::Relaxed);
+        if outcome.is_err() {
+            // Release a read stuck opening the FIFO, so the thread can exit.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        swapper.join().expect("the swapper thread panicked");
+        let outcomes = outcome.expect("a linked env file retargeted to a FIFO blocked logout");
+
+        let still_sets = |target: &std::path::Path| {
+            format!(
+                "Failed to update configuration at '{path}': it is a symbolic link, and the file it points to ('{target}') still sets SPICE_SPICEAI_TOKEN. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{path}' with a regular file and run this command again. See: https://spiceai.org/docs/cli/reference/login",
+                path = link.display(),
+                target = std::fs::canonicalize(target)
+                    .expect("resolve the link target")
+                    .display()
+            )
+        };
+        let expected_errors = [still_sets(&regular), still_sets(&fifo)];
+        let (mut from_fifo, mut from_file) = (0_usize, 0_usize);
+        for outcome in outcomes {
+            match outcome {
+                // A FIFO sets nothing, so there is nothing to remove from it.
+                Ok(removed) => {
+                    assert!(!removed, "nothing is ever removed through a link");
+                    from_fifo += 1;
+                }
+                // The regular file still sets the key; the error names the
+                // file the link resolved to when the error was built.
+                Err(err) => {
+                    assert!(
+                        expected_errors.contains(&err.to_string()),
+                        "unexpected error: {err}"
+                    );
+                    from_file += 1;
+                }
+            }
+        }
+        assert!(
+            from_fifo > 0 && from_file > 0,
+            "the reads must see both targets ({from_fifo} FIFO, {from_file} regular file)"
         );
     }
 
