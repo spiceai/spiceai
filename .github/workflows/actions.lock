@@ -157,6 +157,13 @@ workflows:
     '.github/workflows/nextest_config_check.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0'
+    '.github/workflows/nightly_tests.yml':
+        - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
+        - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
+        - 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3'
+        - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
+        - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
+        - 'docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550'
     '.github/workflows/object_store_wal.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3'
@@ -244,10 +251,6 @@ workflows:
     '.github/workflows/spicescript_dispatch.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
-        - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
-        - 'docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550'
-    '.github/workflows/spicescript_nightly.yml':
-        - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         - 'docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550'
     '.github/workflows/spidapter_build_and_release.yml':
