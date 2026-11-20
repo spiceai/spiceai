@@ -12,7 +12,7 @@ metadata:
     app.kubernetes.io/instance: spiceai
     app.kubernetes.io/version: VERSION
     app: spiceai
-  name: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  name: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-d8c215
   namespace: spice
 spec:
   replicas: 1

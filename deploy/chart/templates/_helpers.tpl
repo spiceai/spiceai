@@ -110,18 +110,23 @@ StatefulSet is also used when `stateful.enabled` requests one for any role.
 {{- end -}}
 
 {{/*
-The name of the Deployment or StatefulSet. A Deployment takes `<fullname>`. A StatefulSet takes
-`<fullname>` cut to 52 characters, because Kubernetes builds two values from it that must stay
-within 63 characters: each pod's name, `<name>-<ordinal>`, which is also the first DNS label of
-the address a cluster node advertises; and each pod's `controller-revision-hash` label value,
-`<name>-<hash>`, whose hash is up to 10 characters. A name must end in a letter or digit, so
-every trailing `-` the cut leaves is removed.
+The name of the Deployment or StatefulSet. A Deployment takes `<fullname>`. A StatefulSet name
+is at most 52 characters, because Kubernetes builds two values from it that must stay within 63
+characters: each pod's name, `<name>-<ordinal>`, which is also the first DNS label of the
+address a cluster node advertises; and each pod's `controller-revision-hash` label value,
+`<name>-<hash>`, whose hash is up to 10 characters.
+
+A StatefulSet takes `<fullname>` when it fits. A longer fullname is cut to 45 characters, with
+every trailing `-` the cut leaves removed, and followed by `-` and the first 6 hex characters of
+the SHA-256 of the whole fullname. Two releases whose fullnames differ only after the cut
+therefore get different names, and a release keeps its name across upgrades.
 */}}
 {{- define "spiceai.workloadName" -}}
-{{- if include "spiceai.useStatefulSet" . -}}
-{{- regexReplaceAll "-+$" (include "spiceai.fullname" . | trunc 52) "" -}}
+{{- $fullname := include "spiceai.fullname" . -}}
+{{- if and (include "spiceai.useStatefulSet" .) (gt (len $fullname) 52) -}}
+{{- printf "%s-%s" (regexReplaceAll "-+$" ($fullname | trunc 45) "") (sha256sum $fullname | trunc 6) -}}
 {{- else -}}
-{{- include "spiceai.fullname" . -}}
+{{- $fullname -}}
 {{- end -}}
 {{- end -}}
 
