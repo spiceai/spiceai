@@ -275,7 +275,7 @@ async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
         .scope(async {
             let path = setup_test_data(
                 "https://public-data.spiceai.org/delta_table_partition.zip",
-                "delta_table_partition",
+                "delta_table_partition_pruning",
             )
             .await?;
             let _hook = FileCleanup { path: path.clone() };
@@ -759,6 +759,22 @@ async fn query_delta_lake_column_mapping_with_partitions() -> Result<(), String>
                         "+------+------+",
                         "| part | col1 |",
                         "+------+------+",
+                        "| 3    | 3    |",
+                        "| 3    | 13   |",
+                        "| 3    | 23   |",
+                        "| 3    | 33   |",
+                        "| 3    | 43   |",
+                        "+------+------+",
+                    ],
+                ),
+                // A filter that mixes the partition column and a data column
+                (
+                    "SELECT part, col1 FROM cm_partitioned WHERE part = 3 OR col1 = 42 ORDER BY part, col1",
+                    vec![
+                        "+------+------+",
+                        "| part | col1 |",
+                        "+------+------+",
+                        "| 2    | 42   |",
                         "| 3    | 3    |",
                         "| 3    | 13   |",
                         "| 3    | 23   |",
