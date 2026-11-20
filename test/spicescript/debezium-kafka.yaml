@@ -4,8 +4,9 @@ description: >
   (Redpanda), and Spice follows the topic (`from: debezium:`): the initial
   snapshot, inserts, updates and deletes are applied once each, and the
   Cayenne acceleration answers as PostgreSQL does, before and after spiced
-  restarts. A dataset that declares its columns `timestamptz` and `timestamp`
-  loads Debezium's string and integer timestamps into those types. (An Arrow
+  restarts. A dataset that declares its columns `timestamptz`, `timestamp` and
+  `Timestamp(Microsecond)` loads Debezium's string and integer timestamps into
+  those types, converting each integer from the unit of its Debezium type. (An Arrow
   acceleration of the topic fails to start:
   known-failing/debezium/debezium-kafka-arrow.yaml.)
 
@@ -49,8 +50,9 @@ spicepod:
         kafka_security_protocol: plaintext
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
     # Debezium sends `timestamptz` as an ISO 8601 string, `timestamp` as
-    # microseconds and `timestamp(3)` as milliseconds; the declared types hold
-    # nanoseconds.
+    # microseconds and `timestamp(3)` as milliseconds; `timestamptz` and
+    # `timestamp` hold nanoseconds, and `at_ms_us` converts milliseconds to
+    # microseconds.
     - from: debezium:${sources.src.namespace}.public.tz
       name: tz
       params:
@@ -61,6 +63,7 @@ spicepod:
         - { name: at_tz, type: timestamptz }
         - { name: at_us, type: timestamp }
         - { name: at_ms, type: timestamp }
+        - { name: at_ms_us, type: "Timestamp(Microsecond)" }
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
 
 defaults:
@@ -72,14 +75,14 @@ steps:
         CREATE TABLE t (id bigint PRIMARY KEY, v text, n bigint);
         ALTER TABLE t REPLICA IDENTITY FULL;
         INSERT INTO t SELECT g, 'v' || g, g * 10 FROM generate_series(1, 500) g;
-        CREATE TABLE tz (id bigint PRIMARY KEY, at_tz timestamptz, at_us timestamp, at_ms timestamp(3));
+        CREATE TABLE tz (id bigint PRIMARY KEY, at_tz timestamptz, at_us timestamp, at_ms timestamp(3), at_ms_us timestamp(3));
         ALTER TABLE tz REPLICA IDENTITY FULL;
         INSERT INTO tz VALUES
-          (1, '2026-11-18 21:00:00.123456+00', '2026-11-18 21:00:00.123456', '2026-11-18 21:00:00.123'),
-          (2, '1970-01-01 00:00:00+00', '1970-01-01 00:00:00', '1970-01-01 00:00:00'),
-          (3, '1969-12-31 23:59:59.999999+00', '1969-12-31 23:59:59.999999', '1969-12-31 23:59:59.999'),
-          (4, '2026-06-01 12:00:00+05:30', '1900-01-01 00:00:00.5', '2200-01-01 00:00:00'),
-          (5, NULL, NULL, NULL);
+          (1, '2026-11-18 21:00:00.123456+00', '2026-11-18 21:00:00.123456', '2026-11-18 21:00:00.123', '2026-11-18 21:00:00.123'),
+          (2, '1970-01-01 00:00:00+00', '1970-01-01 00:00:00', '1970-01-01 00:00:00', '1970-01-01 00:00:00'),
+          (3, '1969-12-31 23:59:59.999999+00', '1969-12-31 23:59:59.999999', '1969-12-31 23:59:59.999', '1969-12-31 23:59:59.999'),
+          (4, '2026-06-01 12:00:00+05:30', '1900-01-01 00:00:00.5', '2200-01-01 00:00:00', '2200-01-01 00:00:00'),
+          (5, NULL, NULL, NULL, NULL);
   # Debezium first, so the topic and its schema exist when spiced starts.
   - source-exec:
       dbz: >-
@@ -126,7 +129,7 @@ steps:
         DELETE FROM t WHERE id BETWEEN 200 AND 205;
         INSERT INTO t VALUES (1000, 'in a transaction', 1);
         COMMIT;
-        INSERT INTO tz VALUES (6, '2262-04-11 23:47:16.854775+00', '2000-02-29 12:34:56.789012', '2000-02-29 12:34:56.789');
+        INSERT INTO tz VALUES (6, '2262-04-11 23:47:16.854775+00', '2000-02-29 12:34:56.789012', '2000-02-29 12:34:56.789', '9999-12-31 23:59:59.999');
         UPDATE tz SET at_tz = at_tz + interval '1 microsecond', at_us = at_us - interval '1 day' WHERE id = 1;
         DELETE FROM tz WHERE id = 2;
   - query: SELECT * FROM t
@@ -142,7 +145,7 @@ steps:
       src: |
         UPDATE t SET v = 'after restart' WHERE id <= 20;
         DELETE FROM t WHERE id > 590;
-        UPDATE tz SET at_ms = '2026-11-18 21:00:00.999' WHERE id = 3;
+        UPDATE tz SET at_ms = '2026-11-18 21:00:00.999', at_ms_us = '2026-11-18 21:00:00.999' WHERE id = 3;
   - query: SELECT * FROM t
     eventually: 60s
   - query: SELECT * FROM tz

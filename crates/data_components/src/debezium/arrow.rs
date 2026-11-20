@@ -23,8 +23,8 @@ use arrow::{
         RecordBatch, StringBuilder, StructArray, Time64MicrosecondBuilder,
     },
     datatypes::{
-        ArrowPrimitiveType, ArrowTimestampType, DataType, Date32Type, Field, Int16Type, Int32Type,
-        Int64Type, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType,
+        ArrowPrimitiveType, ArrowTimestampType, DataType, Date32Type, Field, Fields, Int16Type,
+        Int32Type, Int64Type, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType,
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
     },
 };
@@ -200,30 +200,47 @@ pub fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Resul
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), values.len());
 
     for value in values {
-        append_value_to_struct_builder(value, &mut struct_builder, None)?;
+        append_value_to_struct_builder(value, &mut struct_builder, &[])?;
     }
 
     Ok(struct_builder.finish())
 }
 
-/// Whether decoding into `schema` needs the Debezium semantic types of the
-/// event's fields: only integer timestamps in second or nanosecond columns do.
-#[must_use]
-pub(crate) fn reads_source_timestamp_units(schema: &Schema) -> bool {
-    schema.fields().iter().any(|f| {
-        matches!(
-            f.data_type(),
-            DataType::Timestamp(TimeUnit::Second | TimeUnit::Nanosecond, _)
-        )
-    })
+/// The Debezium semantic type of each timestamp column in `fields`, looked up by
+/// name in an event's row schema; `None` for other columns. Debezium lists the
+/// row's fields in table order, so the same position is tried first.
+pub(crate) fn timestamp_semantic_types<'a>(
+    fields: &Fields,
+    row_fields: Option<&'a [ChangeEventField]>,
+) -> Vec<Option<&'a str>> {
+    let Some(row_fields) = row_fields else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            if !matches!(field.data_type(), DataType::Timestamp(..)) {
+                return None;
+            }
+            let name = Some(field.name().as_str());
+            row_fields
+                .get(idx)
+                .filter(|f| f.field.as_deref() == name)
+                .or_else(|| row_fields.iter().find(|f| f.field.as_deref() == name))?
+                .name
+                .as_deref()
+        })
+        .collect()
 }
 
-/// Appends one row to `builder`. `source_fields` is the row schema embedded in
-/// the change event, if any; it gives the unit of integer-encoded timestamps.
+/// Appends one row to `builder`. `semantic_types` holds the Debezium semantic
+/// type of each builder field (see [`timestamp_semantic_types`]); it is empty
+/// for an event without a schema.
 pub fn append_value_to_struct_builder(
     value: serde_json::Value,
     builder: &mut StructBuilder,
-    source_fields: Option<&[ChangeEventField]>,
+    semantic_types: &[Option<&str>],
 ) -> Result<()> {
     builder.append(true);
     let null_value = serde_json::Value::Null;
@@ -243,29 +260,10 @@ pub fn append_value_to_struct_builder(
             }
         };
 
-        // Only integer timestamps in second or nanosecond columns need their
-        // Debezium semantic type (see `append_timestamp`). Reading it touches the
-        // event's schema, so other columns skip it. Debezium lists the row's
-        // fields in table order, so the same position is tried first.
-        let source_field = match (field.data_type(), field_value, source_fields) {
-            (
-                DataType::Timestamp(TimeUnit::Second | TimeUnit::Nanosecond, _),
-                Json::Number(_),
-                Some(fields),
-            ) => fields
-                .get(idx)
-                .filter(|f| f.field.as_deref() == Some(field.name().as_str()))
-                .or_else(|| {
-                    fields
-                        .iter()
-                        .find(|f| f.field.as_deref() == Some(field.name().as_str()))
-                }),
-            _ => None,
-        };
-
+        let semantic_type = semantic_types.get(idx).copied().flatten();
         let field_builder = builder.field_builder_array(idx);
 
-        append_field_value_to_builder(field_value, field, field_builder, source_field)?;
+        append_field_value_to_builder(field_value, field, field_builder, semantic_type)?;
     }
 
     Ok(())
@@ -276,7 +274,7 @@ fn append_field_value_to_builder(
     field_value: &serde_json::Value,
     field: &Arc<Field>,
     builder: &mut dyn ArrayBuilder,
-    source_field: Option<&ChangeEventField>,
+    semantic_type: Option<&str>,
 ) -> Result<()> {
     match field.data_type() {
         DataType::Utf8 => {
@@ -312,10 +310,7 @@ fn append_field_value_to_builder(
             }
         }
         DataType::Timestamp(unit, _) => {
-            let (column, semantic_type) = (
-                field.name().as_str(),
-                source_field.and_then(|f| f.name.as_deref()),
-            );
+            let column = field.name().as_str();
             match unit {
                 TimeUnit::Second => append_timestamp::<TimestampSecondType>(
                     field_value,
@@ -485,11 +480,12 @@ fn append_array_value_to_list_builder<T: ArrayBuilder>(
 /// Appends a Debezium timestamp value to a `T` builder.
 ///
 /// A string is an ISO 8601 instant (`io.debezium.time.ZonedTimestamp`, always
-/// in UTC). An integer counts from the Unix epoch: in a millisecond or
-/// microsecond column it is read in the column's unit, the units Debezium
-/// timestamp schemas are inferred as; in a second or nanosecond column it is
-/// converted from the unit its Debezium semantic type (`semantic_type`) names,
-/// and rejected when that type is missing or not a timestamp.
+/// in UTC). An integer counts from the Unix epoch in the unit its Debezium
+/// semantic type (`semantic_type`) names, and is rejected when that type is not
+/// a timestamp. An integer without a semantic type is read in the column's unit
+/// for millisecond and microsecond columns, which keeps schemaless events
+/// loading into those columns, and is rejected for second and nanosecond
+/// columns.
 fn append_timestamp<T: ArrowTimestampType>(
     value: &Json,
     column: &str,
@@ -519,13 +515,13 @@ fn append_timestamp<T: ArrowTimestampType>(
                 unit: T::UNIT,
             };
             let source_unit = match semantic_type {
-                _ if matches!(T::UNIT, TimeUnit::Millisecond | TimeUnit::Microsecond) => T::UNIT,
                 Some(name) => {
                     debezium_timestamp_unit(name).with_context(|| NotATimestampSnafu {
                         column,
                         semantic_type: name,
                     })?
                 }
+                None if matches!(T::UNIT, TimeUnit::Millisecond | TimeUnit::Microsecond) => T::UNIT,
                 None => {
                     return UnknownTimestampUnitSnafu {
                         column,
@@ -918,21 +914,10 @@ mod tests {
 
         let data_type = DataType::Timestamp(unit, time_zone.map(Into::into));
         let schema = Schema::new(vec![Field::new("at", data_type.clone(), true)]);
-        let source_fields = semantic_type.map(|name| {
-            vec![
-                serde_json::from_value::<ChangeEventField>(
-                    json!({"type": "int64", "optional": true, "name": name, "field": "at"}),
-                )
-                .expect("valid Debezium field"),
-            ]
-        });
+        let semantic_types = [semantic_type];
 
         let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
-        append_value_to_struct_builder(
-            json!({ "at": value }),
-            &mut builder,
-            source_fields.as_deref(),
-        )?;
+        append_value_to_struct_builder(json!({ "at": value }), &mut builder, &semantic_types)?;
         let batch: RecordBatch = builder.finish().into();
         assert_eq!(batch.column(0).data_type(), &data_type);
         let raw = arrow::compute::cast(batch.column(0), &DataType::Int64).expect("cast to Int64");
@@ -1016,8 +1001,15 @@ mod tests {
                 MICROS,
                 1_795_035_600_123_456,
             ),
+            (
+                &micros,
+                TimeUnit::Millisecond,
+                Some("UTC"),
+                MICROS,
+                1_795_035_600_123,
+            ),
             (&micros, TimeUnit::Second, None, MICROS, 1_795_035_600),
-            (&json!(-1), TimeUnit::Second, None, MICROS, -1),
+            (&json!(-1), TimeUnit::Millisecond, None, MICROS, -1),
             (&json!(-1), TimeUnit::Nanosecond, None, MICROS, -1_000),
             (
                 &json!(1_795_035_600_123_i64),
@@ -1028,17 +1020,17 @@ mod tests {
             ),
             (
                 &json!(1_795_035_600_123_i64),
-                TimeUnit::Second,
+                TimeUnit::Microsecond,
                 None,
                 CONNECT_MILLIS,
-                1_795_035_600,
+                1_795_035_600_123_000,
             ),
             (
                 &json!(1_795_035_600_123_456_789_i64),
-                TimeUnit::Nanosecond,
+                TimeUnit::Microsecond,
                 None,
                 NANOS,
-                1_795_035_600_123_456_789,
+                1_795_035_600_123_456,
             ),
             // Without a semantic type, an integer is in the unit of a millisecond
             // or microsecond column.
@@ -1131,6 +1123,21 @@ mod tests {
                 .expect_err(&format!("{value} must not decode"));
             assert_eq!(err.to_string(), expected, "{value}");
         }
+
+        // A millisecond column reads integers without a semantic type in its own
+        // unit, but still rejects a known non-timestamp type.
+        let err = decode_timestamp(
+            &json!(20_775),
+            TimeUnit::Millisecond,
+            None,
+            Some("io.debezium.time.Date"),
+        )
+        .expect_err("a day count must not decode into a millisecond column");
+        assert!(
+            matches!(&err, Error::NotATimestamp { column, semantic_type }
+                if column == "at" && semantic_type == "io.debezium.time.Date"),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -1148,7 +1155,7 @@ mod tests {
 
         // Message is missing the nullable "name" field
         let value = json!({"id": 42});
-        let result = append_value_to_struct_builder(value, &mut builder, None);
+        let result = append_value_to_struct_builder(value, &mut builder, &[]);
         assert!(
             result.is_ok(),
             "Should succeed when nullable field is missing"
@@ -1188,7 +1195,7 @@ mod tests {
 
         // Message is missing the required "status" field
         let value = json!({"id": 42});
-        let err = append_value_to_struct_builder(value, &mut builder, None)
+        let err = append_value_to_struct_builder(value, &mut builder, &[])
             .expect_err("Should fail when required field is missing");
         assert!(
             matches!(
@@ -1211,7 +1218,7 @@ mod tests {
 
         // Message has extra field "removed_column" not in schema
         let value = json!({"id": 42, "removed_column": "old_value"});
-        let result = append_value_to_struct_builder(value, &mut builder, None);
+        let result = append_value_to_struct_builder(value, &mut builder, &[]);
         assert!(result.is_ok(), "Extra fields in message should be ignored");
 
         let struct_array = builder.finish();
@@ -1237,12 +1244,12 @@ mod tests {
 
         // Old message with only "id" (before schema evolution)
         let old_value = json!({"id": 1});
-        append_value_to_struct_builder(old_value, &mut builder, None)
+        append_value_to_struct_builder(old_value, &mut builder, &[])
             .expect("old message should process successfully");
 
         // New message with all fields
         let new_value = json!({"id": 2, "name": "Alice", "age": 30, "active": true});
-        append_value_to_struct_builder(new_value, &mut builder, None)
+        append_value_to_struct_builder(new_value, &mut builder, &[])
             .expect("new message should process successfully");
 
         let struct_array = builder.finish();

@@ -18,16 +18,46 @@ use crate::{
     arrow::struct_builder::StructBuilder,
     cdc::{ChangeBatch, changes_schema},
     debezium::{
-        arrow::downcast_builder,
-        change_event::{ChangeEvent, Field as ChangeEventField, Op},
+        arrow::{downcast_builder, timestamp_semantic_types},
+        change_event::{ChangeEvent, Op, Schema as DebeziumSchema},
     },
     schema_projection::SchemaProjection,
 };
 use arrow::{
     array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder},
-    datatypes::{Schema, SchemaRef},
+    datatypes::{Fields, Schema, SchemaRef},
 };
 use snafu::prelude::*;
+use std::sync::Arc;
+
+/// The Debezium semantic types of the table's timestamp columns, resolved once
+/// for each distinct event schema. Events with an identical schema share one
+/// allocation (see `ChangeEvent::schema`), so consecutive events usually reuse
+/// the last resolution without reading their schema.
+#[derive(Default)]
+struct SemanticTypes<'a> {
+    resolved: bool,
+    schema: Option<&'a Arc<DebeziumSchema>>,
+    types: Vec<Option<&'a str>>,
+}
+
+impl<'a> SemanticTypes<'a> {
+    fn for_event(&mut self, fields: &Fields, change: &'a ChangeEvent) -> &[Option<&'a str>] {
+        let schema = change.schema.as_ref();
+        let reusable = self.resolved
+            && match (self.schema, schema) {
+                (Some(resolved), Some(schema)) => Arc::ptr_eq(resolved, schema),
+                (None, None) => true,
+                _ => false,
+            };
+        if !reusable {
+            self.types = timestamp_semantic_types(fields, change.row_fields());
+            self.schema = schema;
+            self.resolved = true;
+        }
+        &self.types
+    }
+}
 
 /// Converts a `ChangeEvent` into a `ChangeBatch`
 pub fn to_change_batch(
@@ -46,7 +76,7 @@ pub fn to_change_batch(
         primary_key,
         change,
         projection,
-        super::reads_source_timestamp_units(table_schema),
+        &timestamp_semantic_types(table_schema.fields(), change.row_fields()),
     )?;
 
     let struct_array = struct_builder.finish();
@@ -70,7 +100,7 @@ pub fn vector_to_change_batch(
     let schema = changes_schema(table_schema);
 
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), changes.len());
-    let read_source_fields = super::reads_source_timestamp_units(table_schema);
+    let mut semantic_types = SemanticTypes::default();
 
     for change in changes {
         append_change_event(
@@ -79,7 +109,7 @@ pub fn vector_to_change_batch(
             primary_key,
             change,
             projection,
-            read_source_fields,
+            semantic_types.for_event(table_schema.fields(), change),
         )?;
     }
 
@@ -101,15 +131,8 @@ fn append_change_event(
     primary_key: &[String],
     change: &ChangeEvent,
     projection: Option<&SchemaProjection>,
-    read_source_fields: bool,
+    semantic_types: &[Option<&str>],
 ) -> super::Result<()> {
-    // Each event carries its own copy of the schema, so it is read only when a
-    // column needs it.
-    let source_fields = if read_source_fields {
-        change.row_fields()
-    } else {
-        None
-    };
     if primary_key.is_empty() && matches!(change.payload.op, Op::Update) {
         let before = change
             .payload
@@ -122,7 +145,7 @@ fn append_change_event(
             primary_key,
             "d",
             before,
-            source_fields,
+            semantic_types,
             projection,
         )?;
         append_change_row(
@@ -131,7 +154,7 @@ fn append_change_event(
             primary_key,
             "c",
             change.payload.after.clone(),
-            source_fields,
+            semantic_types,
             projection,
         )?;
         return Ok(());
@@ -153,7 +176,7 @@ fn append_change_event(
         primary_key,
         op,
         change_data,
-        source_fields,
+        semantic_types,
         projection,
     )
 }
@@ -164,7 +187,7 @@ fn append_change_row(
     primary_key: &[String],
     op: &str,
     change_data: serde_json::Value,
-    source_fields: Option<&[ChangeEventField]>,
+    semantic_types: &[Option<&str>],
     projection: Option<&SchemaProjection>,
 ) -> super::Result<()> {
     struct_builder.append(true);
@@ -208,7 +231,7 @@ fn append_change_row(
                 super::append_value_to_struct_builder(
                     change_data,
                     data_struct_builder,
-                    source_fields,
+                    semantic_types,
                 )?;
             }
             _ => unreachable!("Unexpected field in changes schema {}", field.name()),
@@ -589,5 +612,76 @@ mod tests {
             .expect("change batch");
 
         assert_eq!(name_of(&batch.data(0)), None);
+    }
+
+    /// A Debezium create event for `{id, at}` whose `at` field has the given
+    /// semantic type.
+    fn timestamp_event(id: i32, semantic_type: &str, at: i64) -> ChangeEvent {
+        let row = serde_json::json!({"type": "struct", "optional": true, "fields": [
+            {"type": "int32", "optional": false, "field": "id"},
+            {"type": "int64", "optional": true, "name": semantic_type, "field": "at"},
+        ]});
+        let value = serde_json::json!({
+            "schema": {"type": "struct", "optional": false, "fields": [
+                {"field": "before", "type": "struct", "optional": true, "fields": row["fields"]},
+                {"field": "after", "type": "struct", "optional": true, "fields": row["fields"]},
+            ]},
+            "payload": {"before": null, "after": {"id": id, "at": at}, "op": "c", "ts_ms": 0},
+        });
+        serde_json::from_value(value).expect("valid change event")
+    }
+
+    /// The semantic types resolved for one event schema are reused only for
+    /// events with that schema: when the source changes a column from
+    /// microseconds to milliseconds mid-batch, each event keeps its own unit.
+    #[test]
+    fn each_event_schema_in_a_batch_keeps_its_own_timestamp_unit() {
+        const MICROS: &str = "io.debezium.time.MicroTimestamp";
+        const MILLIS: &str = "io.debezium.time.Timestamp";
+        let events = [
+            timestamp_event(1, MICROS, 1_795_035_600_123_456),
+            timestamp_event(2, MICROS, 1_795_035_600_123_457),
+            timestamp_event(3, MILLIS, 1_795_035_600_124),
+            timestamp_event(4, MICROS, 1_795_035_600_125_000),
+        ];
+        assert!(
+            Arc::ptr_eq(
+                events[0].schema.as_ref().expect("schema"),
+                events[1].schema.as_ref().expect("schema")
+            ),
+            "consecutive events with an identical schema share it"
+        );
+        let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let refs: Vec<&ChangeEvent> = events.iter().collect();
+
+        let batch = vector_to_change_batch(&table_schema, &["id".to_string()], &refs, None)
+            .expect("change batch");
+
+        let at: Vec<i64> = (0..events.len())
+            .map(|row| {
+                let data = batch.data(row);
+                data.column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                    .expect("at is Timestamp(ns)")
+                    .value(0)
+            })
+            .collect();
+        assert_eq!(
+            at,
+            vec![
+                1_795_035_600_123_456_000,
+                1_795_035_600_123_457_000,
+                1_795_035_600_124_000_000,
+                1_795_035_600_125_000_000,
+            ]
+        );
     }
 }
