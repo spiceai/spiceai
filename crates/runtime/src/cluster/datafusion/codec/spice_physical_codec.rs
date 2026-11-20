@@ -24,6 +24,7 @@ use data_connector_api::listing::{
     decode_nan_safe_listing_parquet_scan, is_nan_safe_listing_parquet_payload,
 };
 use datafusion::catalog::TableProvider;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -31,8 +32,13 @@ use datafusion::physical_expr::Partitioning;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_expr::ScalarUDF;
-use datafusion_proto::bytes::Serializeable;
+use datafusion_expr::{LogicalPlan, ScalarUDF};
+use datafusion_federation::schema_cast::SchemaCastScanExec as FederationSchemaCastScanExec;
+use datafusion_federation::sql::VirtualExecutionPlan;
+use datafusion_proto::bytes::{
+    Serializeable, logical_plan_from_bytes_with_extension_codec,
+    logical_plan_to_bytes_with_extension_codec,
+};
 use datafusion_proto::generated::datafusion_common;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::physical_plan::{PhysicalExtensionCodec, PhysicalProtoConverterExtension};
@@ -44,15 +50,17 @@ use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use runtime_execution_plans::{IcebergScanExec, UdtfExec};
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_proto::{
-    BytesProcessedExecNode, CayenneAccelerationExecNode, HttpExecNode, HttpPartition,
-    IcebergHashColumn, IcebergPartitioning, IcebergTableScanExecNode, SchemaCastScanExecNode,
-    SpicePhysicalPlanNode, UdtfExecNode, spice_physical_plan_node,
+    BytesProcessedExecNode, CayenneAccelerationExecNode, FederatedQueryExecNode,
+    FederatedSchemaCastScanExecNode, HttpExecNode, HttpPartition, IcebergHashColumn,
+    IcebergPartitioning, IcebergTableScanExecNode, SchemaCastScanExecNode, SpicePhysicalPlanNode,
+    UdtfExecNode, spice_physical_plan_node,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use super::header_projected_csv::{decode_header_projected_csv, encode_header_projected_csv};
 use super::spice_logical_codec::SpiceLogicalCodec;
+use crate::cluster::datafusion::federated_query_exec::FederatedQueryExec;
 
 /// Serialization support for custom Spice execution nodes
 pub struct SpicePhysicalCodec {
@@ -220,6 +228,40 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             }
             Some(spice_physical_plan_node::Node::HeaderProjectedCsvScan(node)) => {
                 decode_header_projected_csv(&node, ctx, self, proto_converter)
+            }
+            Some(spice_physical_plan_node::Node::FederatedSchemaCastScan(node)) => {
+                let [input] = inputs else {
+                    return exec_err!(
+                        "a federated SchemaCastScanExec has one input, but {} were decoded",
+                        inputs.len()
+                    );
+                };
+                let schema = datafusion_common::Schema::decode(&*node.schema)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                Ok(Arc::new(FederationSchemaCastScanExec::new(
+                    Arc::clone(input),
+                    Arc::new(Schema::try_from(&schema)?),
+                )))
+            }
+            Some(spice_physical_plan_node::Node::FederatedQuery(node)) => {
+                if !inputs.is_empty() {
+                    return exec_err!("a federated query must not have input execution plans");
+                }
+                // Resolves the query's tables against this process's datasets.
+                let runtime = self.runtime()?;
+                let codec = SpiceLogicalCodec::new_with_runtime(Arc::clone(&runtime));
+                let plan = logical_plan_from_bytes_with_extension_codec(
+                    &node.logical_plan,
+                    ctx,
+                    codec.as_ref(),
+                )?;
+                let schema = datafusion_common::Schema::decode(&*node.schema)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                Ok(Arc::new(FederatedQueryExec::try_new(
+                    plan,
+                    Arc::new(Schema::try_from(&schema)?),
+                    runtime,
+                )?))
             }
             Some(spice_physical_plan_node::Node::IcebergTableScan(node)) => {
                 let runtime = self.runtime()?;
@@ -472,6 +514,36 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     },
                 )),
             }
+        } else if let Some(cast) = node.downcast_ref::<FederationSchemaCastScanExec>() {
+            let mut schema_buf = vec![];
+            datafusion_common::Schema::try_from(cast.schema())?
+                .encode(&mut schema_buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            SpicePhysicalPlanNode {
+                node: Some(spice_physical_plan_node::Node::FederatedSchemaCastScan(
+                    FederatedSchemaCastScanExecNode { schema: schema_buf },
+                )),
+            }
+        } else if let Some(query) = node.downcast_ref::<VirtualExecutionPlan>() {
+            // Holds the connection to its source, which cannot be serialized;
+            // the executor plans the query again (see `FederatedQueryExec`).
+            // Filters pushed into the scan are applied only by this node, and
+            // the plan sent does not carry them, so a scan with any is refused.
+            let mut has_filters = false;
+            query.apply_expressions(&mut |_| {
+                has_filters = true;
+                Ok(TreeNodeRecursion::Stop)
+            })?;
+            if has_filters {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Failed to send the federated query over {} to a cluster executor: its scan applies filters that cannot be sent with it. Run the query with /v1/sql or Flight SQL instead.",
+                    scanned_tables(query.plan())
+                )));
+            }
+            federated_query_node(query.plan(), &query.schema())?
+        } else if let Some(query) = node.downcast_ref::<FederatedQueryExec>() {
+            // A scheduler that decoded the job from shared state encodes it again.
+            federated_query_node(query.plan(), &query.schema())?
         } else if node.is::<CayenneAccelerationExec>() {
             SpicePhysicalPlanNode {
                 node: Some(spice_physical_plan_node::Node::CayenneAcceleration(
@@ -492,6 +564,45 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
         self.runtime()?.df.ctx.udf(name)
     }
+}
+
+/// The node a federated query is sent to an executor as: its logical plan,
+/// with tables by reference.
+fn federated_query_node(plan: &LogicalPlan, schema: &Schema) -> Result<SpicePhysicalPlanNode> {
+    let logical_plan =
+        logical_plan_to_bytes_with_extension_codec(plan, SpiceLogicalCodec::new_codec().as_ref())
+            .map_err(|source| {
+                DataFusionError::NotImplemented(format!(
+                    "Failed to send the federated query over {} to a cluster executor: {source}. Run the query with /v1/sql or Flight SQL instead.",
+                    scanned_tables(plan)
+                ))
+            })?;
+    let mut schema_buf = vec![];
+    datafusion_common::Schema::try_from(schema)?
+        .encode(&mut schema_buf)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(SpicePhysicalPlanNode {
+        node: Some(spice_physical_plan_node::Node::FederatedQuery(
+            FederatedQueryExecNode {
+                logical_plan: logical_plan.to_vec(),
+                schema: schema_buf,
+            },
+        )),
+    })
+}
+
+/// The tables `plan` reads, quoted and comma-separated, for an error message.
+fn scanned_tables(plan: &LogicalPlan) -> String {
+    let mut tables = std::collections::BTreeSet::new();
+    // The closure never fails, and a table it does not reach is only left out
+    // of the message.
+    let _ = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            tables.insert(format!("'{}'", scan.table_name));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    tables.into_iter().collect::<Vec<_>>().join(", ")
 }
 
 fn validate_http_projected_schema(

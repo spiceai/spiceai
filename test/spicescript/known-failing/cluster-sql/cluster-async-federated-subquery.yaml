@@ -1,0 +1,52 @@
+# Known failing (#15539): on a cluster, an asynchronous `/v1/queries` job
+# fails when federation pushes a subquery down to the source, because a
+# subquery expression cannot be serialized for an executor yet ("t.id IN
+# (<subquery>) is not yet supported").
+name: cluster-async-federated-subquery
+description: >
+  A scheduler with two executors answers asynchronous `/v1/queries` jobs over
+  federated PostgreSQL tables whose query PostgreSQL runs whole with a
+  subquery, as PostgreSQL does.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-async-federated-subquery
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - { from: 'postgres:t', name: t, params: '${sources.src.params}' }
+    - { from: 'postgres:u', name: u, params: '${sources.src.params}' }
+
+defaults:
+  cluster: { executors: 2 }
+  also-async: true
+  expect: { oracle: src }
+
+steps:
+  - generate:
+      src:
+        table: t
+        rows: 500
+        seed: 41
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+  - generate:
+      src:
+        table: u
+        rows: 80
+        seed: 42
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 520] }
+          - { name: label, choice: [red, blue, green] }
+  - start: {}
+  - query: SELECT id FROM t WHERE id IN (SELECT t_id FROM u WHERE label = 'blue')
+  - query: SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id AND u.label = 'red')
+  - query: SELECT id, (SELECT count(*) FROM u WHERE u.t_id = t.id) AS n FROM t WHERE i > 40

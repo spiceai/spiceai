@@ -1,4 +1,33 @@
 {
+  "cluster-async-federated-subquery": [
+    {
+      "run": "cluster-async-federated-subquery",
+      "who": "default",
+      "key": "query: SELECT id FROM t WHERE id IN (SELECT t_id FROM u WHERE label = 'blue')",
+      "kind": "error",
+      "signature": "the /v1/queries job did not succeed: {\"status\":\"FAILED\",\"error\":{\"error_code\":\"EXECUTION_FAILED\",\"message\":\"Error planning job 01A1C-1E0-7BE-5B3E88: DataFusionError(Internal(\\\"Unsupported plan and extension codec failed with [This feature is not implemented: Failed to send the federated query over '",
+      "group": "cluster-sql",
+      "pattern": "Failed to send the federated query over 't', 'u' to a cluster executor: .*Proto serialization error: .* is not yet supported"
+    },
+    {
+      "run": "cluster-async-federated-subquery",
+      "who": "default",
+      "key": "query: SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id AND u.label = 'red')",
+      "kind": "error",
+      "signature": "the /v1/queries job did not succeed: {\"status\":\"FAILED\",\"error\":{\"error_code\":\"EXECUTION_FAILED\",\"message\":\"Error planning job 01A1C-1E0-7E1-862715: DataFusionError(Internal(\\\"Unsupported plan and extension codec failed with [This feature is not implemented: Failed to send the federated query over '",
+      "group": "cluster-sql",
+      "pattern": "Failed to send the federated query over 't', 'u' to a cluster executor: .*Proto serialization error: .* is not yet supported"
+    },
+    {
+      "run": "cluster-async-federated-subquery",
+      "who": "default",
+      "key": "query: SELECT id, (SELECT count(*) FROM u WHERE u.t_id = t.id) AS n FROM t WHERE i > 40",
+      "kind": "error",
+      "signature": "the /v1/queries job did not succeed: {\"status\":\"FAILED\",\"error\":{\"error_code\":\"EXECUTION_FAILED\",\"message\":\"Error planning job 01A1C-1E0-804-469C2E: DataFusionError(Internal(\\\"Unsupported plan and extension codec failed with [This feature is not implemented: Failed to send the federated query over '",
+      "group": "cluster-sql",
+      "pattern": "Failed to send the federated query over 't', 'u' to a cluster executor: .*Proto serialization error: .* is not yet supported"
+    }
+  ],
   "cluster-limit-offset": [
     {
       "run": "cluster-limit-offset[backend=postgres]",
