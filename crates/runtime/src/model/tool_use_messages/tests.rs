@@ -41,7 +41,11 @@ impl SpiceModelTool for Sql {
         )
     }
 
-    async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    fn access(&self) -> ::tools::ToolAccess {
+        ::tools::ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(json!([{"count": 3}]))
     }
@@ -703,7 +707,11 @@ impl SpiceModelTool for ContextProbe {
         None
     }
 
-    async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    fn access(&self) -> ::tools::ToolAccess {
+        ::tools::ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let current = RequestContext::current(AsyncMarker::new().await);
         self.seen.lock().push(Arc::ptr_eq(&current, &self.expected));
         Ok(json!([{"count": 3}]))
@@ -826,7 +834,11 @@ impl SpiceModelTool for OneDataset {
         None
     }
 
-    async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    fn access(&self) -> ::tools::ToolAccess {
+        ::tools::ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         Ok(
             json!({"datasets": [{"table": "spice.public.taxi_trips"}], "total": 1, "has_more": false}),
         )

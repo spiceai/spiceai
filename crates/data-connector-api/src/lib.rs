@@ -47,7 +47,7 @@ pub use connector::{
 /// its own dependency. `$crate` does not resolve inside an attribute-macro path,
 /// so the expansion has to name `linkme` unqualified.
 pub use linkme;
-pub use write_back::{DeliveryError, DeliveryResult, WriteBackDeliverer};
+pub use write_back::{DeliveryError, DeliveryResult, ReadFence, WriteBackDeliverer};
 // Glob rather than a named list: SNAFU generates ~25 context selectors
 // (`InvalidConfigurationSnafu`, …) alongside `DataConnectorError`, and every
 // connector builds its errors through them.

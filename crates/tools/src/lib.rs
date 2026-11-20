@@ -20,8 +20,11 @@ pub mod mcp;
 #[cfg(feature = "mcp")]
 pub use mcp::McpProxy;
 
+pub mod access;
 pub mod naming;
 pub mod rename;
+
+pub use access::{ToolAccess, ToolCallDenied, caller_can_write, set_runtime_authenticates_callers};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -35,6 +38,9 @@ use std::borrow::Cow;
 /// compiles, and the wrapper then answers with the trait's fallback rather than the wrapped
 /// tool's real value (spiceai/spiceai#13443). Its `assert_answers_for_inner` test asserts the
 /// methods below as they stand and cannot fail for one that is added, so extend that too.
+/// [`Self::call`] and [`Self::authorized_mcp_proxy`] are the exception: they authorize the
+/// caller, and a wrapper inherits them rather than forwarding, so the check runs once, for the
+/// tool's [`Self::access`].
 #[async_trait]
 pub trait SpiceModelTool: Sync + Send {
     fn name(&self) -> Cow<'_, str>;
@@ -50,13 +56,58 @@ pub trait SpiceModelTool: Sync + Send {
         None
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+    /// What a call to this tool can change, which decides who may call it (see [`ToolAccess`]).
+    ///
+    /// No default, so every tool states its own and a wrapper has to forward it: a default
+    /// would make a tool that forgot callable by every caller.
+    fn access(&self) -> ToolAccess;
+
+    /// Runs the tool with `arg`, its arguments as a JSON object.
+    ///
+    /// Only [`Self::call`] runs this, once the caller is authorized, and a wrapper forwards it
+    /// to the tool it wraps. Called from anywhere else it skips that check, so `clippy.toml`
+    /// disallows the call.
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Runs the tool for the caller of the current request, if [`Self::access`] allows that
+    /// caller to call it (see [`access`]); otherwise fails with [`ToolCallDenied`].
+    ///
+    /// Every path that runs a tool calls this, so the decision is the same on all of them. Do
+    /// not override it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one call of `run`, after the caller is authorized"
+    )]
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        access::authorize(&self.name(), self.access(), Some(arg)).await?;
+        self.run(arg).await
+    }
 
     /// If the tool is a proxy around an MCP tool, this method should return the proxy. Otherwise, it should return None.
     ///
-    /// This enables direct pass through of MCP tool calls.
+    /// Only [`Self::authorized_mcp_proxy`] calls this, and a wrapper forwards it. The proxy
+    /// calls the MCP server without checking the caller, so `clippy.toml` disallows other calls.
     #[cfg(feature = "mcp")]
     async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
         None
+    }
+
+    /// The proxy [`Self::as_mcp_proxy`] returns, if [`Self::access`] allows the caller of the
+    /// current request to call the tool; otherwise [`ToolCallDenied`]. `Ok(None)` when the tool
+    /// is not an MCP proxy.
+    ///
+    /// This enables direct pass through of MCP tool calls, under the same decision as
+    /// [`Self::call`]. Do not override it.
+    #[cfg(feature = "mcp")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the proxy is returned only once the caller is authorized"
+    )]
+    async fn authorized_mcp_proxy(&self) -> Result<Option<&dyn McpProxy>, ToolCallDenied> {
+        let Some(proxy) = self.as_mcp_proxy().await else {
+            return Ok(None);
+        };
+        access::authorize(&self.name(), self.access(), None).await?;
+        Ok(Some(proxy))
     }
 }

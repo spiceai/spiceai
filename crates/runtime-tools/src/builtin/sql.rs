@@ -17,7 +17,6 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use std::{borrow::Cow, sync::Arc};
 
-use crate::builtin::function_tool::current_principal_allows_write;
 use crate::result::{current_budget, encode_stream, result_schema};
 use crate::utils::parameters;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
@@ -25,7 +24,7 @@ use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess, caller_can_write};
 use tracing::Span;
 use tracing_futures::Instrument;
 
@@ -85,7 +84,13 @@ impl SpiceModelTool for SqlTool {
         Some(result_schema())
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Runs the query read-only unless the caller may write, so a caller without write access can
+    /// only read through it.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let SqlToolParams { query } = serde_json::from_str(arg)?;
@@ -93,7 +98,7 @@ impl SpiceModelTool for SqlTool {
             // Only a principal with write access may write; with no principal (no
             // `runtime.auth`) the query is read-only. Writes still need the target
             // to be writable (`access: read_write`).
-            let read_only = !current_principal_allows_write().await;
+            let read_only = !caller_can_write().await;
 
             // The query asks for one row more than the result shows, to know whether there are
             // more: sources and operators stop there, and the query finishes instead of being
