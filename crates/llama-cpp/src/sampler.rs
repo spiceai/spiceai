@@ -270,8 +270,9 @@ impl<'v> Sampler<'v> {
             }
         }
         // SAFETY: the context is live and its last decode marked row `index` for output.
-        let token =
-            unsafe { sys::llama_sampler_sample(self.raw.as_ptr(), context.as_ptr(), index) };
+        let token = context.waited(|| unsafe {
+            sys::llama_sampler_sample(self.raw.as_ptr(), context.as_ptr(), index)
+        });
         // the sample waited for the decode: a failed one leaves LLAMA_TOKEN_NULL
         context.computed()?;
         Ok(Token(token))
