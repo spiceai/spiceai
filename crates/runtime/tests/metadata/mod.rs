@@ -35,7 +35,7 @@ pub fn get_s3_hive_partitioned_dataset(
     name: &str,
     metadata_columns: Vec<MetadataColumn>,
 ) -> Dataset {
-    let mut dataset = Dataset::new("s3://spiceai-public-datasets/hive_partitioned_data/", name);
+    let mut dataset = Dataset::new("s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/", name);
     dataset.params = Some(Params::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
@@ -56,7 +56,7 @@ pub fn get_s3_hive_partitioned_dataset(
 
 fn get_docs_dataset() -> Dataset {
     let mut dataset = Dataset::new(
-        "s3://spiceai-public-datasets/test_documents_partitioned/",
+        "s3://spice-datasets-gjezag77s0hu/test_documents_partitioned/",
         "docs",
     );
     dataset.params = Some(Params::from_string_map(
@@ -149,7 +149,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT * FROM met_all WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
+                .query_builder("SELECT * FROM met_all WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
                 .build()
                 .run()
                 .await
@@ -165,7 +165,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("EXPLAIN SELECT * FROM met_all WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
+                .query_builder("EXPLAIN SELECT * FROM met_all WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
                 .build()
                 .run()
                 .await
@@ -181,7 +181,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("EXPLAIN SELECT * FROM met_location WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
+                .query_builder("EXPLAIN SELECT * FROM met_location WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
                 .build()
                 .run()
                 .await
@@ -236,7 +236,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("EXPLAIN SELECT * FROM met_location_last_modified WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
+                .query_builder("EXPLAIN SELECT * FROM met_location_last_modified WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
                 .build()
                 .run()
                 .await
@@ -252,7 +252,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("EXPLAIN SELECT * FROM met_location_size WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
+                .query_builder("EXPLAIN SELECT * FROM met_location_size WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, _location")
                 .build()
                 .run()
                 .await
@@ -305,7 +305,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
             // Projected query with location filter
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT value, _location FROM met_all WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY value")
+                .query_builder("SELECT value, _location FROM met_all WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY value")
                 .build()
                 .run()
                 .await
@@ -341,7 +341,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
             // Non-existent location with SELECT *
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT * FROM met_location WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/nonexistent.parquet' ORDER BY id")
+                .query_builder("SELECT * FROM met_location WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/nonexistent.parquet' ORDER BY id")
                 .build()
                 .run()
                 .await
@@ -358,7 +358,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
             // Non-existent location with projection
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT value, _location FROM met_all WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/nonexistent.parquet'")
+                .query_builder("SELECT value, _location FROM met_all WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/nonexistent.parquet'")
                 .build()
                 .run()
                 .await
@@ -392,7 +392,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
             // Multiple metadata columns with projection
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT id, _location, _size FROM met_all WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id")
+                .query_builder("SELECT id, _location, _size FROM met_all WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id")
                 .build()
                 .run()
                 .await
@@ -413,7 +413,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
             // Scalar function on metadata column with filter
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT value, _size, upper(_location) FROM met_all WHERE _location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY value")
+                .query_builder("SELECT value, _size, upper(_location) FROM met_all WHERE _location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY value")
                 .build()
                 .run()
                 .await
@@ -431,7 +431,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT value AS val, _location, day FROM met_location WHERE (id = 43) AND (_location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2022/month=1/day=2/data_4.parquet') AND (value IS NOT NULL)")
+                .query_builder("SELECT value AS val, _location, day FROM met_location WHERE (id = 43) AND (_location = 's3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2022/month=1/day=2/data_4.parquet') AND (value IS NOT NULL)")
                 .build()
                 .run()
                 .await
@@ -478,7 +478,7 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
                 &rt,
                 "SELECT doc_content, _location, day, size FROM docs \
                  WHERE document_id = 'doc_1' \
-                 AND _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
+                 AND _location = 's3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
                  AND doc_content IS NOT NULL",
                 "docs_file_metadata_with_location_pred",
             ).await;
@@ -488,7 +488,7 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
                 &rt,
                 "SELECT doc_content AS content, _location, day, size FROM docs \
                  WHERE document_id = 'doc_1' \
-                 AND _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
+                 AND _location = 's3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-01/data_0.parquet' \
                  AND doc_content IS NOT NULL",
                 "docs_file_metadata_with_location_pred_alias",
             ).await;
@@ -557,13 +557,13 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT * FROM docs WHERE _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
+                "SELECT * FROM docs WHERE _location = 's3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
                 "docs_location_eq_star",
             ).await;
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT document_id, filename FROM docs WHERE _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
+                "SELECT document_id, filename FROM docs WHERE _location = 's3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-02/data_0.parquet'",
                 "docs_location_eq_projected",
             ).await;
 
@@ -572,8 +572,8 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
                 &rt,
                 "SELECT document_id, _location FROM docs \
                  WHERE _location IN (\
-                 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet', \
-                 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-02-01/data_0.parquet') \
+                 's3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-01/data_0.parquet', \
+                 's3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-02-01/data_0.parquet') \
                  ORDER BY document_id",
                 "docs_location_in",
             ).await;
@@ -619,7 +619,7 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
             run_query_and_snapshot(
                 &rt,
                 "SELECT filename, _location FROM docs \
-                 WHERE document_id = 'doc_1' AND _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
+                 WHERE document_id = 'doc_1' AND _location = 's3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
                 "docs_file_location_filter",
             ).await;
 
@@ -634,7 +634,7 @@ async fn s3_metadata_columns_extended() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT COUNT(*) AS cnt FROM docs WHERE _location = 's3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
+                "SELECT COUNT(*) AS cnt FROM docs WHERE _location = 's3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-01/data_0.parquet'",
                 "docs_count_with_location",
             ).await;
 

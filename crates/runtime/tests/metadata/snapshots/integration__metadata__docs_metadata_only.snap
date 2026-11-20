@@ -5,9 +5,9 @@ expression: formatted
 +---------------------------------------------------------------------------------------+
 | _location                                                                             |
 +---------------------------------------------------------------------------------------+
-| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet |
-| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet |
-| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet |
-| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-02-01/data_0.parquet |
-| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-02-01/data_0.parquet |
+| s3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-01/data_0.parquet |
+| s3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-01/data_0.parquet |
+| s3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-01-02/data_0.parquet |
+| s3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-02-01/data_0.parquet |
+| s3://spice-datasets-gjezag77s0hu/test_documents_partitioned/day=2022-02-01/data_0.parquet |
 +---------------------------------------------------------------------------------------+

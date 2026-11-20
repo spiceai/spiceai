@@ -520,7 +520,7 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
 
             let scenario_result: Result<(), String> = async {
             let mut dataset = Dataset::new(
-                "s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
+                "s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet",
                 table_name.clone(),
             );
             dataset.access = AccessMode::ReadWrite;
