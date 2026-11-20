@@ -1,0 +1,13 @@
+auth:
+  apiKey:
+    existingSecret: spice-key
+service:
+  type: LoadBalancer
+command:
+  - /usr/local/bin/spiced
+  - --http
+  - 0.0.0.0:8090
+  - --flight
+  - 0.0.0.0:50051
+  - --set-runtime
+  - auth.api_key.enabled=false

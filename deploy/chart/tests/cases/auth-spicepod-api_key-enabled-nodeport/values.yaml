@@ -1,0 +1,12 @@
+service:
+  type: NodePort
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  runtime:
+    auth:
+      api_key:
+        enabled: true
+        keys: ['${ secrets:my_key }:rw']
+  datasets: []

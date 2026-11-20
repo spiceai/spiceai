@@ -22,8 +22,19 @@ Send it as `X-API-Key: <key>` over HTTP, or as the password of a Flight handshak
 The runtime reads the key from the `SPICE_API_KEY` environment variable. When `spicepod.secrets` declares secret stores, the chart reads it through the first `from: env` store without `params`. If there is none, the chart adds a `from: env` store named `spiceai_chart_env` before your stores, so your stores keep their order and are searched first for `${ secrets:KEY }`.
 
 - **Your own key**: create a Secret with an `api-key` entry and set `auth.apiKey.existingSecret` to its name.
-- **Your own `runtime.auth`**: when `spicepod.runtime.auth` is set, the chart adds no key and uses yours as written.
-- **No API key**: `auth.mode: none`, on a `ClusterIP` Service only; the chart refuses it with a `NodePort` or `LoadBalancer` Service. Anonymous callers then get the runtime's rules for unauthenticated callers on a non-loopback listener, and the chart adds the Service's names to the Spicepod's allowed hosts so in-cluster clients can address it by name: to `runtime.allowed_hosts`, or to the deprecated `runtime.mcp.allowed_hosts` when the Spicepod sets only that list.
+- **Your own `runtime.auth`**: when `spicepod.runtime.auth` is set, the chart adds no key and uses yours as written. Behind a `NodePort` or `LoadBalancer` Service it must enable an API key, unless the runtime requires client certificates; see [Services outside the cluster](#services-outside-the-cluster).
+- **No API key**: `auth.mode: none`. The chart refuses it with a `NodePort` or `LoadBalancer` Service unless the runtime requires client certificates; see [Services outside the cluster](#services-outside-the-cluster). Anonymous callers then get the runtime's rules for unauthenticated callers on a non-loopback listener, and the chart adds the Service's names to the Spicepod's allowed hosts so in-cluster clients can address it by name: to `runtime.allowed_hosts`, or to the deprecated `runtime.mcp.allowed_hosts` when the Spicepod sets only that list.
+
+### Services outside the cluster
+
+A `NodePort` or `LoadBalancer` Service serves callers outside the cluster, so the chart renders one only for a runtime that authenticates every caller, and refuses the render otherwise. The runtime authenticates every caller when either:
+
+- `runtime.auth` has an `api-key` entry (or its alias `api_key`) whose `enabled` is not `false`. `auth.mode: api_key`, the default, writes one; a `spicepod.runtime.auth` is read as written.
+- TLS is on and requires a client certificate: `spicepod.runtime.tls.enabled: true` and `spicepod.runtime.tls.client_auth_mode: required`. This holds with any `auth.mode`, `none` included. `client_auth_mode: request` admits callers without a certificate, and `client_auth_mode` has no effect while TLS is off, so neither counts.
+
+So the chart refuses `auth.mode: none` without required client certificates, and a `spicepod.runtime.auth` that is null or empty, has no `api-key` entry, has a null `api-key`, or sets `enabled: false`. Each refusal names the setting and its fix.
+
+The chart also reads the flags in a custom `command` that change this: `--tls-enabled true` turns TLS on, and `--tls-client-auth-mode` takes precedence over `spicepod.runtime.tls.client_auth_mode`. `--set-runtime` for `auth` or `tls` changes the Spicepod after the chart has read it, so the chart refuses it unless the setting it does not change authenticates callers; set those in `spicepod.runtime` instead. The chart cannot read flags that a script in `command` adds.
 
 ### GitOps (Argo CD, `helm template`)
 
@@ -50,7 +61,7 @@ A render that cannot read the cluster, such as `helm template`, `helm install --
 | `service.type`                     | Kubernetes Service type (`ClusterIP`, `NodePort`, `LoadBalancer`, or `null`) | `null`                            |
 | `service.additionalAnnotations`    | Additional annotations on the Service                                        | `{}`                              |
 | `service.ports`                    | The Service's ports                                                          | `http` and `flight`               |
-| `auth.mode`                        | `api_key`: require an API key; `none`: no API key (ClusterIP only)           | `api_key`                         |
+| `auth.mode`                        | `api_key`: require an API key; `none`: no API key (see Authentication)       | `api_key`                         |
 | `auth.apiKey.existingSecret`       | Secret with the API key under `api-key`; empty: the chart generates one      | `''`                              |
 | `livenessProbe`                    | Kubernetes liveness probe configuration                                      | see `values.yaml`                 |
 | `readinessProbe`                   | Kubernetes readiness probe configuration                                     | see `values.yaml`                 |

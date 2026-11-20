@@ -1,0 +1,19 @@
+auth:
+  mode: none
+service:
+  type: LoadBalancer
+command:
+  - /usr/local/bin/spiced
+  - --http
+  - 0.0.0.0:8090
+  - --flight
+  - 0.0.0.0:50051
+  - --tls-enabled
+  - "true"
+  - --tls-certificate-file
+  - /etc/spice/tls/tls.crt
+  - --tls-key-file
+  - /etc/spice/tls/tls.key
+  - --tls-client-auth-ca-file
+  - /etc/spice/tls/ca.crt
+  - --tls-client-auth-mode=required

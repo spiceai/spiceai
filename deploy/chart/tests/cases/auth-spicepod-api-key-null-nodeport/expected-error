@@ -1,0 +1,1 @@
+spicepod.runtime.auth.api-key is null and service.type is NodePort: the runtime would serve callers outside the cluster without an API key. Set spicepod.runtime.auth.api-key.keys, or remove spicepod.runtime.auth and the chart sets an API key (auth.mode: api_key), or use a ClusterIP Service.

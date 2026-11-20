@@ -200,6 +200,88 @@ spicepod
 {{- end -}}
 
 {{/*
+The render failure for a NodePort or LoadBalancer Service in front of a runtime that does not
+authenticate its callers; empty when the runtime authenticates every caller. It decides as
+`spiced` does, from the rendered Spicepod and the flags in `command` that override it:
+
+  - client certificates: TLS is on (`runtime.tls.enabled: true`, or `--tls-enabled true`)
+    and requires one (`runtime.tls.client_auth_mode: required`, or `--tls-client-auth-mode
+    required`, which takes precedence). This authenticates callers whatever `runtime.auth`
+    says. `request` admits a caller without a certificate, and `client_auth_mode` does
+    nothing while TLS is off, so neither counts;
+  - an API key: `runtime.auth` has an `api-key` entry (or its alias `api_key`) whose
+    `enabled` is not false. `auth.mode: api_key` writes one and `auth.mode: none` writes
+    none; a Spicepod that sets `runtime.auth` is read as written.
+
+`--set-runtime auth…` or `--set-runtime tls…` in `command` changes these after the chart has
+read them, so the chart refuses unless the path it does not change authenticates.
+*/}}
+{{- define "spiceai.unauthenticatedExposure" -}}
+{{- $type := .Values.service.type -}}
+{{- $runtime := .Values.spicepod.runtime | default dict -}}
+{{- $command := join " " (.Values.command | default list) -}}
+{{- $flagValue := "(=|\\s+)[\"']?" -}}
+{{- $end := "([\"']|\\s|$)" -}}
+{{- $authOverridden := regexMatch (printf "--set-runtime%sauth[.=]" $flagValue) $command -}}
+{{- $tlsOverridden := regexMatch (printf "--set-runtime%stls(=|\\.enabled=|\\.client_auth_mode=)" $flagValue) $command -}}
+{{- $tls := dict -}}
+{{- if kindIs "map" $runtime.tls -}}
+{{- $tls = $runtime.tls -}}
+{{- end -}}
+{{- $tlsOn := or (and (kindIs "bool" $tls.enabled) $tls.enabled) (regexMatch (printf "--tls-enabled%strue%s" $flagValue $end) $command) -}}
+{{- $certRequired := eq (toString $tls.client_auth_mode) "required" -}}
+{{- $modeFlags := len (regexFindAll "--tls-client-auth-mode(=|\\s|$)" $command -1) -}}
+{{- if $modeFlags -}}
+{{- $certRequired = eq $modeFlags (len (regexFindAll (printf "--tls-client-auth-mode%srequired%s" $flagValue $end) $command -1)) -}}
+{{- end -}}
+{{- if not (and $tlsOn $certRequired (not $tlsOverridden)) -}}
+{{- $reason := "" -}}
+{{- $fix := "" -}}
+{{- if not $authOverridden -}}
+{{- $mode := include "spiceai.authMode" . -}}
+{{- $removeAuth := "remove spicepod.runtime.auth and the chart sets an API key (auth.mode: api_key), or use a ClusterIP Service." -}}
+{{- if eq $mode "none" -}}
+{{- $reason = "auth.mode is none" -}}
+{{- $fix = "Set auth.mode to api_key, or use a ClusterIP Service." -}}
+{{- else if eq $mode "spicepod" -}}
+{{- $auth := $runtime.auth -}}
+{{- $addKey := printf "Add an `api-key` entry with `keys` to spicepod.runtime.auth, or %s" $removeAuth -}}
+{{- if kindIs "invalid" $auth -}}
+{{- $reason = "spicepod.runtime.auth is null" -}}
+{{- $fix = $addKey -}}
+{{- else if not (kindIs "map" $auth) -}}
+{{- $reason = "spicepod.runtime.auth is not a mapping" -}}
+{{- $fix = $addKey -}}
+{{- else if not (or (hasKey $auth "api-key") (hasKey $auth "api_key")) -}}
+{{- $reason = ternary "spicepod.runtime.auth is empty" "spicepod.runtime.auth has no `api-key` entry" (empty $auth) -}}
+{{- $fix = $addKey -}}
+{{- else -}}
+{{- range $name := list "api-key" "api_key" -}}
+{{- if and (not $reason) (hasKey $auth $name) -}}
+{{- $apiKey := index $auth $name -}}
+{{- $setting := printf "spicepod.runtime.auth.%s" $name -}}
+{{- if not (kindIs "map" $apiKey) -}}
+{{- $reason = printf "%s is %s" $setting (ternary "null" "not a mapping" (kindIs "invalid" $apiKey)) -}}
+{{- $fix = printf "Set %s.keys, or %s" $setting $removeAuth -}}
+{{- else if and (kindIs "bool" $apiKey.enabled) (not $apiKey.enabled) -}}
+{{- $reason = printf "%s.enabled is false" $setting -}}
+{{- $fix = printf "Set %s.enabled to true, or use a ClusterIP Service." $setting -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if or $authOverridden (and $reason $tlsOverridden) -}}
+{{- printf "command passes --set-runtime for runtime.auth or runtime.tls and service.type is %s: the chart cannot tell whether the runtime authenticates callers outside the cluster. Set runtime.auth and runtime.tls in spicepod.runtime instead, or use a ClusterIP Service." $type -}}
+{{- else if $reason -}}
+{{- printf "%s and service.type is %s: the runtime would serve callers outside the cluster without an API key. %s" $reason $type $fix -}}
+{{- if and $certRequired (not $tlsOn) }} spicepod.runtime.tls.client_auth_mode: required takes effect only with spicepod.runtime.tls.enabled: true.{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 The Secret holding the API key under `api-key`: `auth.apiKey.existingSecret`, or the one the
 chart creates.
 */}}

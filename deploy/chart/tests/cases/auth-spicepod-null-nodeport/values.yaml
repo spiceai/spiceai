@@ -1,0 +1,12 @@
+auth:
+  apiKey:
+    existingSecret: spice-key
+service:
+  type: NodePort
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  runtime:
+    auth: null
+  datasets: []
