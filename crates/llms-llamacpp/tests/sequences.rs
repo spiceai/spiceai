@@ -355,7 +355,9 @@ fn generate_seq(spec: &mut Mtp<'_>, seq: i32, prompt: &[Token], steps: usize) ->
     let mut sampler = Sampler::greedy();
     let mut history = prompt.to_vec();
     // the last read batch's last row is the prompt's last token
-    let mut id = sampler.sample(spec.target(), -1);
+    let mut id = sampler
+        .sample(spec.target(), -1)
+        .expect("a decoded row samples");
     let mut batch = Batch::new(512);
     let mut generation = Generation::default();
     for _ in 0..steps {
@@ -381,7 +383,9 @@ fn generate_seq(spec: &mut Mtp<'_>, seq: i32, prompt: &[Token], steps: usize) ->
         generation.1.push(id);
         let mut accepted = 0;
         let next = loop {
-            let token = sampler.sample(spec.target(), position(accepted));
+            let token = sampler
+                .sample(spec.target(), position(accepted))
+                .expect("a decoded row samples");
             if accepted < draft.len() && token == draft[accepted] {
                 history.push(token);
                 generation.1.push(token);
@@ -470,7 +474,9 @@ fn generate_together(
     for seq in 0..2 {
         spec.begin(position(seq), &history[seq])
             .expect("drafting begins");
-        id[seq] = sampler.sample(spec.target(), last_row[seq]);
+        id[seq] = sampler
+            .sample(spec.target(), last_row[seq])
+            .expect("a decoded row samples");
     }
     let mut generations: [Generation; 2] = Default::default();
     for _ in 0..steps {
@@ -520,7 +526,9 @@ fn generate_together(
             generations[seq].1.push(id[seq]);
             let mut accepted = 0;
             let next = loop {
-                let token = sampler.sample(spec.target(), first_row[seq] + position(accepted));
+                let token = sampler
+                    .sample(spec.target(), first_row[seq] + position(accepted))
+                    .expect("a decoded row samples");
                 if accepted < draft.len() && token == draft[accepted] {
                     history[seq].push(token);
                     generations[seq].1.push(token);
