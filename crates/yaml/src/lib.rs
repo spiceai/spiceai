@@ -47,6 +47,7 @@ mod error;
 mod ser;
 mod value;
 
+pub use de::ValueDeserializer;
 pub use error::{Error, Location, Result};
 pub use value::{Index, Mapping, Number, Value};
 

@@ -81,6 +81,10 @@ QUIET_BASELINE_SECONDS = {
     "cayenne::integration::lookup_index_widening_test": 140.9,
     # bulk_load_with_repeats_is_indexed_when_it_returns_impl_sqlite, run 41136640039 (04-01).
     "cayenne::integration::bulk_load_index_coverage_test": 91.7,
+    # The slowest pass of the Hugging Face NSQL test in the
+    # `integration tests (models)` runs from 2026-11-05 to 2026-11-19: trunk's
+    # nightly run 42539095133, on `mbp-runner-05`.
+    "runtime::integration_models#models::hf::nsql::huggingface_test_nsql": 326.8,
 }
 
 # Worst same-test slowdown measured between a quiet pool and a saturated one.
