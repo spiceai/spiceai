@@ -361,6 +361,26 @@ fn glue_format_selected_file_extension(input_format: InputFormat) -> Option<&'st
 }
 
 impl InputFormat {
+    /// The format Spice reads `table` as, checked from its Glue definition
+    /// alone: a supported format, and where to read it from (an `s3://`
+    /// storage location, or for Iceberg a `metadata_location`). Building the
+    /// table makes the same checks.
+    pub(crate) fn of_listing(table: &Table) -> Result<Self, Error> {
+        let format = Self::try_from(table)?;
+        if format == Self::Iceberg {
+            get_metadata_location(table)?;
+        } else {
+            let location = table
+                .storage_descriptor()
+                .and_then(|descriptor| descriptor.location())
+                .ok_or_else(|| Error::MissingStorageLocation {
+                    table: table.name().to_string(),
+                })?;
+            s3_storage_location(table.name(), table.name(), location)?;
+        }
+        Ok(format)
+    }
+
     /// Return the file format of the [`InputFormat`]. For
     /// [`InputFormat::Iceberg`], it's not a file format but we return a value
     /// rather than have to use an `Option` return type for convenience.

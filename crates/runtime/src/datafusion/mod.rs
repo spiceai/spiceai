@@ -2007,6 +2007,8 @@ impl DataFusion {
         catalog: Arc<dyn CatalogProvider>,
     ) -> Result<()> {
         if let Some(deferred_catalog) = catalog.downcast_ref::<DeferredCatalogProvider>() {
+            // A deferred catalog gets its access when it loads.
+            self.restrict_catalog_access(name, &AccessMode::Read)?;
             self.deferred_catalogs
                 .write()
                 .await
@@ -2020,12 +2022,7 @@ impl DataFusion {
             };
 
             self.ctx.register_catalog(name, catalog_to_register);
-
-            if access.allows_ddl() {
-                self.mark_catalog_ddl_enabled(name)?;
-            } else if access.allows_write() {
-                self.mark_catalog_writable(name)?;
-            }
+            self.set_catalog_access(name, access)?;
         }
 
         Ok(())
@@ -2256,6 +2253,36 @@ impl DataFusion {
             .write()
             .map_err(|_| Error::UnableToLockWritableCatalogs {})?
             .insert(catalog_name.to_string());
+        Ok(())
+    }
+
+    /// Makes a registered catalog writable, DDL-enabled or neither, as `access` allows,
+    /// replacing the access an earlier registration under the same name allowed.
+    pub fn set_catalog_access(&self, catalog_name: &str, access: &AccessMode) -> Result<()> {
+        self.restrict_catalog_access(catalog_name, access)?;
+        if access.allows_ddl() {
+            self.mark_catalog_ddl_enabled(catalog_name)
+        } else if access.allows_write() {
+            self.mark_catalog_writable(catalog_name)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Withdraws the write and DDL access that `access` does not allow from a catalog.
+    pub fn restrict_catalog_access(&self, catalog_name: &str, access: &AccessMode) -> Result<()> {
+        if !access.allows_ddl() {
+            self.ddl_enabled_catalogs
+                .write()
+                .map_err(|_| Error::UnableToLockDdlEnabledCatalogs {})?
+                .remove(catalog_name);
+        }
+        if !access.allows_write() {
+            self.writable_catalogs
+                .write()
+                .map_err(|_| Error::UnableToLockWritableCatalogs {})?
+                .remove(catalog_name);
+        }
         Ok(())
     }
 
@@ -3138,11 +3165,7 @@ impl DataFusion {
         if let Some(catalog) = deferred_catalogs.get(name) {
             if let Ok(provider) = catalog.get_catalog_provider().await {
                 self.ctx.register_catalog(name, Arc::clone(&provider));
-                if access.allows_ddl() {
-                    self.mark_catalog_ddl_enabled(name)?;
-                } else if access.allows_write() {
-                    self.mark_catalog_writable(name)?;
-                }
+                self.set_catalog_access(name, access)?;
             }
 
             drop(deferred_catalogs);
@@ -4415,6 +4438,12 @@ impl DataFusion {
         accelerated_table_builder.cdc_apply_runtime(self.cdc_apply_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        accelerated_table_builder.data_update_publisher(Some(
+            crate::dataupdate::DataUpdatePublisher::new(
+                self.data_update_broadcaster.clone(),
+                qualify_dataset_reference(self.normalize_table_reference(dataset.name.clone())),
+            ),
+        ));
         accelerated_table_builder.cdc_param_overrides(
             crate::accelerated::refresh_task::changes::extract_cdc_param_overrides(
                 &acceleration_settings.params,
@@ -9794,5 +9823,41 @@ mod tests {
                 "no refresh was ever recorded, and none can be now the table is gone"
             );
         }
+    }
+}
+
+/// The fully qualified name a dataset registers under, which is the name its
+/// `DoExchange` subscribers are keyed by. A dataset's accelerated table is
+/// built before the dataset registers, so normalizing its name then can still
+/// leave it bare. A bare or partial name registers in the default catalog and
+/// schema, the same defaults `get_table_provider` resolves with.
+fn qualify_dataset_reference(table_reference: TableReference) -> TableReference {
+    match table_reference {
+        TableReference::Full { .. } => table_reference,
+        TableReference::Partial { schema, table } => {
+            TableReference::full(SPICE_DEFAULT_CATALOG, schema, table)
+        }
+        TableReference::Bare { table } => {
+            TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, table)
+        }
+    }
+}
+
+#[cfg(test)]
+mod qualify_dataset_reference_tests {
+    use super::*;
+
+    #[test]
+    fn a_dataset_publishes_under_the_name_it_registers_with() {
+        assert_eq!(
+            qualify_dataset_reference(TableReference::bare("events")),
+            TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "events")
+        );
+        assert_eq!(
+            qualify_dataset_reference(TableReference::partial("audit", "events")),
+            TableReference::full(SPICE_DEFAULT_CATALOG, "audit", "events")
+        );
+        let placed = TableReference::full("pg", "public", "events");
+        assert_eq!(qualify_dataset_reference(placed.clone()), placed);
     }
 }

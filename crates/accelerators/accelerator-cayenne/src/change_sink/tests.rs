@@ -32,9 +32,8 @@ use datafusion::{
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-use runtime_acceleration::change_sink::ChangeSink;
-use runtime_acceleration::change_sink::SetKey;
 use runtime_acceleration::change_sink::batching::{AppendIngress, CoalescingLimits};
+use runtime_acceleration::change_sink::{ChangeBatch, ChangeSink, ScopedRows, SetKey};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -415,14 +414,13 @@ fn cache_write(
         })
         .into_iter()
         .collect();
+    let rows = ScopedRows::try_new(scope, Arc::clone(schema), rows).expect("cache write");
+    let lane = Some(Arc::clone(lane));
     if replaces {
-        ChangeBatch::replace_set(scope, Arc::clone(schema), rows)
+        ChangeBatch::Replace { rows, lane }
     } else {
-        ChangeBatch::append_scoped(scope, Arc::clone(schema), rows)
+        ChangeBatch::AppendScoped { rows, lane }
     }
-    .expect("cache write")
-    .with_append_ingress(Arc::clone(lane))
-    .expect("append lane")
 }
 
 type StoredResponse = (String, String, Option<String>, String);

@@ -233,7 +233,7 @@ mod tests {
         let i = idx();
         let batches = vec![]; // empty is fine — we only care that compute_index doesn't mutate
         let out = i.compute_index(batches).await.expect("ok");
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [RecordBatch; 0]);
     }
 
     #[test]

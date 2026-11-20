@@ -2904,7 +2904,7 @@ mod tests {
     #[test]
     fn test_encode_batches_to_ipc_empty_is_empty() {
         let encoded = encode_batches_to_ipc(&[]).expect("encoding empty slice should succeed");
-        assert!(encoded.is_empty());
+        assert_eq!(encoded, [] as [u8; 0]);
     }
 
     /// Round-trips multiple batches through a single IPC stream. This both

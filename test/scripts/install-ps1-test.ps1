@@ -35,6 +35,17 @@ $script:Release = @{}
 $script:GhCalls = @()
 # How many times each stubbed URL kind was requested: Sums, Api.
 $script:Requests = @{}
+# Every stubbed request, with the Authorization header it carried: Uri, Auth.
+$script:Calls = @()
+# The archive the stubbed release serves for $asset, when a test installs end to end.
+$script:Archive = $null
+
+function Add-Call {
+    param([string]$Uri, $Headers)
+    $auth = $null
+    if ($Headers) { $auth = $Headers["Authorization"] }
+    $script:Calls += [pscustomobject]@{ Uri = $Uri; Auth = $auth }
+}
 
 # An error like the one Invoke-WebRequest and Invoke-RestMethod throw for an HTTP status, which
 # carries the response and its status code.
@@ -47,6 +58,11 @@ function New-HttpError {
 
 function Invoke-WebRequest {
     param([string]$Uri, [string]$OutFile, $Headers, [switch]$UseBasicParsing)
+    Add-Call $Uri $Headers
+    if ($Uri -like "*/$asset" -and $script:Archive) {
+        Copy-Item -Path $script:Archive -Destination $OutFile
+        return
+    }
     if ($Uri -like "*/SHA256SUMS") {
         $script:Requests.Sums += 1
         if ($script:Requests.Sums -le $script:Release.SumsTransient) {
@@ -65,6 +81,13 @@ function Invoke-WebRequest {
 
 function Invoke-RestMethod {
     param([string]$Uri, $Headers)
+    Add-Call $Uri $Headers
+    if ($Uri -like "*/releases/latest") {
+        if ($script:Release.LatestRateLimited) {
+            throw (New-HttpError 403 "rate limit exceeded")
+        }
+        return [pscustomobject]@{ tag_name = $tag }
+    }
     $script:Requests.Api += 1
     if ($script:Requests.Api -le $script:Release.ApiTransient) {
         throw (New-HttpError 504 "Gateway Timeout: $Uri")
@@ -166,6 +189,75 @@ Assert-RequestCount "does not retry a missing SHA256SUMS" 1 1
 Test-Case "does not retry a rate-limited API request" @{ ApiFails = $true } "stopped" "the GitHub API request for its asset sha256 failed"
 Assert-RequestCount "does not retry a rate-limited API request" 1 1
 
+# Install-SpiceCli end to end, into a directory of $work: the latest release lookup, the download,
+# its verification and the extraction. The install directory variables are the script's own.
+$spiceCliFileName = "spice.exe"
+$spiceCliInstallDir = Join-Path $work "bin"
+$spiceCliFullPath = Join-Path $spiceCliInstallDir $spiceCliFileName
+$pkg = Join-Path $work "pkg"
+New-Item -Path $pkg -ItemType Directory > $null
+Set-Content -Path (Join-Path $pkg $spiceCliFileName) -Value "stub" -NoNewline
+$script:Archive = Join-Path $work "archive.tar.gz"
+tar -czf $script:Archive -C $pkg $spiceCliFileName
+if ($LASTEXITCODE -ne 0) { throw "tar could not create the test archive" }
+$archiveDigest = (Get-FileHash -Algorithm SHA256 -Path $script:Archive).Hash.ToLowerInvariant()
+$savedToken = $env:GITHUB_TOKEN
+
+function Test-Install {
+    param([string]$Name, [hashtable]$Release, [string]$Expect, [string]$Message, [string]$Token)
+    $script:Release = $Release
+    $script:GhCalls = @()
+    $script:Calls = @()
+    $script:Requests = @{ Sums = 0; Api = 0 }
+    $env:GITHUB_TOKEN = if ($Token) { $Token } else { $null }
+    Remove-Item -Path $spiceCliInstallDir -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -Path $spiceCliInstallDir -ItemType Directory > $null
+    $output = ""
+    $outcome = "installed"
+    try {
+        $output = (Install-SpiceCli 3>&1 | Out-String)
+    } catch {
+        $outcome = "stopped"
+        $output = $_.Exception.Message
+    }
+    $installed = Test-Path $spiceCliFullPath
+    if ($outcome -eq $Expect -and $installed -eq ($Expect -eq "installed") -and $output -like "*$Message*") {
+        Write-Output "[PASS] $Name"
+    } else {
+        Write-Output "[FAIL] $Name`n  expected $Expect with '$Message'`n  got $outcome (installed: $installed) with '$output'"
+        $script:failures += 1
+    }
+}
+
+# Fails test $Name unless the stubbed requests, in order, are exactly $Expected, each "<uri> <auth>"
+# with <auth> the Authorization header, or "none".
+function Assert-Calls {
+    param([string]$Name, [string[]]$Expected)
+    $actual = @($script:Calls | ForEach-Object { "$($_.Uri) $(if ($_.Auth) { $_.Auth } else { 'none' })" })
+    if (($actual -join "`n") -ne ($Expected -join "`n")) {
+        Write-Output "[FAIL] $Name`n  expected requests:`n    $($Expected -join "`n    ")`n  got:`n    $($actual -join "`n    ")"
+        $script:failures += 1
+    }
+}
+
+$api = "https://api.github.com/repos/spiceai/spiceai/releases"
+$dl = "https://github.com/spiceai/spiceai/releases/download/$tag"
+
+# With no token, no request carries an Authorization header, and the install still verifies.
+Test-Install "installs without a token" @{ Digest = "sha256:$archiveDigest" } "installed" "Verified the sha256 of $asset against the sha256 GitHub recorded for $asset in release $tag."
+Assert-Calls "installs without a token, sending no Authorization header" @(
+    "$api/latest none", "$dl/$asset none", "$dl/SHA256SUMS none", "$api/tags/$tag none")
+
+# The control for the test above: with GITHUB_TOKEN set, every request carries it.
+Test-Install "installs with a token" @{ Digest = "sha256:$archiveDigest" } "installed" "against the sha256 GitHub recorded" -Token "installer-test-token"
+Assert-Calls "sends GITHUB_TOKEN with every request" @(
+    "$api/latest token installer-test-token", "$dl/$asset token installer-test-token",
+    "$dl/SHA256SUMS token installer-test-token", "$api/tags/$tag token installer-test-token")
+
+Test-Install "stops when the latest release lookup is rate limited" @{ LatestRateLimited = $true } "stopped" 'If the GitHub API rate limit was exceeded, set $env:GITHUB_TOKEN and run the installer again.'
+Assert-Calls "makes no other request when the latest release lookup is rate limited" @("$api/latest none")
+
+$env:GITHUB_TOKEN = $savedToken
 Remove-Item -Path $work -Recurse -Force
 $env:SPICE_INSTALL_ALLOW_UNVERIFIED = $null
 if ($failures -gt 0) {
