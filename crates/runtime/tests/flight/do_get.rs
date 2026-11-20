@@ -31,7 +31,7 @@ async fn test_flight_do_get_dict_types() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let ds = Dataset::new(
-                "s3://spiceai-public-datasets/test_different_formats/dictionaries.parquet",
+                "s3://spice-datasets-gjezag77s0hu/test_different_formats/dictionaries.parquet",
                 "test_table_dict_types",
             );
 
