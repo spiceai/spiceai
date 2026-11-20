@@ -200,7 +200,8 @@ impl Container {
         };
         let (created_id, name) = create_detached(docker.clone(), spec.clone(), config)
             .await
-            .context("the task creating the container ended without an answer")??;
+            .context("the task creating the container ended without an answer")??
+            .take();
         let container = Self {
             docker,
             id: created_id,
@@ -460,13 +461,15 @@ impl Container {
 /// Creates `spec`'s network and container in a task of its own, which runs
 /// to its end even when the caller stops waiting (a combination whose other
 /// source failed to start drops the future that started this), so a
-/// container the daemon created is never left untracked. If the caller is
-/// gone by the time it is created, the task removes it.
+/// container the daemon created is never left untracked. The container is
+/// handed over as a [`Created`], which removes it unless the caller takes it:
+/// whether the caller is gone before the hand-over or after it, before
+/// receiving it, the container is removed.
 fn create_detached(
     docker: Docker,
     spec: ContainerSpec,
     config: Config<String>,
-) -> tokio::sync::oneshot::Receiver<Result<(String, String)>> {
+) -> tokio::sync::oneshot::Receiver<Result<Created>> {
     let (created_tx, created_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let (docker, spec) = (&docker, &spec);
@@ -548,19 +551,66 @@ fn create_detached(
             .await
             .with_context(|| format!("Failed to create container {}", spec.name))?;
             crate::cleanup::track_container(&created_id, &name, spec.network.as_deref());
-            Ok::<_, anyhow::Error>((created_id, name))
+            Ok::<_, anyhow::Error>(Created {
+                docker: docker.clone(),
+                network: spec.network.clone(),
+                id: created_id,
+                name,
+                taken: false,
+            })
         }
         .await;
-        if let Err(Ok((created_id, _))) = created_tx.send(created) {
-            remove_abandoned(docker, spec, &created_id).await;
-        }
+        // A caller already gone hands the container back, and dropping it
+        // here removes it; one gone later drops it unreceived, which does too.
+        drop(created_tx.send(created));
     });
     created_rx
 }
 
+/// A container [`create_detached`] made and its caller has not yet taken.
+/// Dropped untaken (the caller was cancelled before it received it), it
+/// removes the container.
+struct Created {
+    docker: Docker,
+    network: Option<String>,
+    id: String,
+    name: String,
+    taken: bool,
+}
+
+impl Created {
+    /// The container's id and name, for the [`Container`] that now owns it.
+    fn take(mut self) -> (String, String) {
+        self.taken = true;
+        (std::mem::take(&mut self.id), std::mem::take(&mut self.name))
+    }
+}
+
+impl Drop for Created {
+    fn drop(&mut self) {
+        if self.taken {
+            return;
+        }
+        let (docker, network, id) = (
+            self.docker.clone(),
+            self.network.take(),
+            std::mem::take(&mut self.id),
+        );
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime
+                    .spawn(async move { remove_abandoned(&docker, network.as_deref(), &id).await });
+            }
+            // No runtime to remove it on: the synchronous `docker rm` that
+            // `Container`'s `Drop` uses.
+            Err(_) => crate::cleanup::remove_if_tracked(&id),
+        }
+    }
+}
+
 /// Removes a container its creator stopped waiting for (and its network,
 /// once empty), unless containers are kept.
-async fn remove_abandoned(docker: &Docker, spec: &ContainerSpec, id: &str) {
+async fn remove_abandoned(docker: &Docker, network: Option<&str>, id: &str) {
     if crate::cleanup::keeping_containers() {
         return;
     }
@@ -576,7 +626,7 @@ async fn remove_abandoned(docker: &Docker, spec: &ContainerSpec, id: &str) {
         )
         .await;
     // Fails while another container is still on it; the last one removes it.
-    if let Some(network) = spec.network.as_deref().filter(|n| !is_shared_network(n)) {
+    if let Some(network) = network.filter(|n| !is_shared_network(n)) {
         let _ = docker.remove_network(network).await;
     }
 }
@@ -1205,15 +1255,11 @@ mod detached_create_tests {
             .count()
     }
 
-    /// The caller is gone before the daemon answers the create, as when a
-    /// combination drops a source start because another source failed: the
-    /// task creating the container must remove it.
-    #[tokio::test]
-    async fn a_container_created_after_its_caller_stopped_waiting_is_removed() {
-        let (docker, requests) = recording_daemon(Duration::from_millis(300)).await;
-        drop(super::create_detached(docker, spec(), Config::default()));
+    /// Waits for the daemon to see container `c1` removed, then checks it was
+    /// removed once.
+    async fn expect_c1_removed_once(requests: &Mutex<Vec<String>>) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while removals_of_c1(&requests) == 0 {
+        while removals_of_c1(requests) == 0 {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "container c1 was never removed; the daemon saw {:?}",
@@ -1221,7 +1267,58 @@ mod detached_create_tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(removals_of_c1(&requests), 1, "{:?}", requests.lock());
+        assert_eq!(removals_of_c1(requests), 1, "{:?}", requests.lock());
+    }
+
+    /// A container handed over and never taken, with no timing involved: the
+    /// hand-over succeeds, then the receiver goes.
+    #[tokio::test]
+    async fn an_untaken_handover_removes_its_container() {
+        let (docker, requests) = recording_daemon(Duration::ZERO).await;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let created = super::Created {
+            docker,
+            network: None,
+            id: "c1".into(),
+            name: "src".into(),
+            taken: false,
+        };
+        assert!(sender.send(created).is_ok(), "the receiver is still there");
+        drop(receiver);
+        expect_c1_removed_once(&requests).await;
+    }
+
+    /// The caller is gone before the daemon answers the create, as when a
+    /// combination drops a source start because another source failed: the
+    /// task creating the container must remove it.
+    #[tokio::test]
+    async fn a_container_created_after_its_caller_stopped_waiting_is_removed() {
+        let (docker, requests) = recording_daemon(Duration::from_millis(300)).await;
+        drop(super::create_detached(docker, spec(), Config::default()));
+        expect_c1_removed_once(&requests).await;
+    }
+
+    /// The create is answered and the container handed to the caller's
+    /// channel, but the caller is dropped before it takes it, as when another
+    /// source fails between the two: the container must still be removed.
+    #[tokio::test]
+    async fn a_container_handed_over_but_never_taken_is_removed() {
+        let (docker, requests) = recording_daemon(Duration::ZERO).await;
+        let receiver = super::create_detached(docker, spec(), Config::default());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !requests
+            .lock()
+            .iter()
+            .any(|r| r.contains("/containers/create"))
+        {
+            assert!(tokio::time::Instant::now() < deadline, "no create was sent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Long past the daemon's answer, so the task has handed the container
+        // to the channel before the receiver goes.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(receiver);
+        expect_c1_removed_once(&requests).await;
     }
 
     /// While the caller waits, the container is handed over, not removed.
@@ -1231,7 +1328,8 @@ mod detached_create_tests {
         let (id, name) = super::create_detached(docker, spec(), Config::default())
             .await
             .expect("the task answers")
-            .expect("the container is created");
+            .expect("the container is created")
+            .take();
         crate::cleanup::untrack_container(&id);
         assert_eq!((id.as_str(), name.as_str()), ("c1", "src"));
         // Give a wrongly sent removal time to arrive.
