@@ -16,11 +16,11 @@ limitations under the License.
 
 //! An executor serves a peer's shuffle fetch only from its shuffle work
 //! directory, including when `shuffle_location` is a relative path: a fetch is
-//! judged by the file it would open, so parent components that climb out of
-//! the executor's current directory, and symbolic links under the work
-//! directory that lead out of it, are refused on both fetch paths, while
-//! shuffle output under the work directory is served whether it is named
-//! relative or absolute.
+//! judged by the files it would open, so parent components that climb out of
+//! the executor's current directory, an index beside the work directory, and
+//! symbolic links under the work directory that lead out of it, are refused on
+//! both fetch paths, while shuffle output under the work directory is served
+//! whether it is named relative or absolute.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -289,8 +289,9 @@ async fn a_relative_shuffle_location_serves_fetches_only_from_its_work_directory
                     vec![marker.clone()],
                 );
 
-                // (3) Parent components that climb out of the current directory
-                //     are refused before any byte is read, on both fetch paths.
+                // (3) Parent components that climb out of the current directory,
+                //     and an index beside the work directory, are refused before
+                //     any byte is read, on both fetch paths.
                 //     Every outcome is collected first, so a failure lists each
                 //     path that was not refused.
                 let mut outcomes = Vec::new();
@@ -306,6 +307,16 @@ async fn a_relative_shuffle_location_serves_fetches_only_from_its_work_directory
                 ] {
                     outcomes.push(batches_outcome(&channel, path, Opens::Data).await?);
                 }
+                // An index request names the data file the index sits beside.
+                // Named after the work directory itself, that index is a
+                // sibling of the work directory, outside it.
+                std::fs::write(cwd.join("shuffle.arrow.index"), b"outside the work directory")?;
+                write_marker_stream(
+                    &cwd.join("shuffle.rangeidx.arrow"),
+                    "outside the work directory",
+                )?;
+                outcomes.push(block_outcome(&channel, "shuffle", Opens::SortIndex).await);
+                outcomes.push(batches_outcome(&channel, "shuffle", Opens::RangeIndex).await?);
                 assert_eq!(
                     outcomes,
                     [
@@ -313,6 +324,8 @@ async fn a_relative_shuffle_location_serves_fetches_only_from_its_work_directory
                         "IO_BLOCK_TRANSPORT shuffle/../../../shuffle/marker.txt: PermissionDenied",
                         "do_get ../../shuffle/marker.arrow: PermissionDenied",
                         "do_get shuffle/../../../shuffle/marker.arrow: PermissionDenied",
+                        "IO_BLOCK_TRANSPORT shuffle: PermissionDenied",
+                        "do_get shuffle: PermissionDenied",
                     ],
                     "every fetch outside the work directory is refused"
                 );

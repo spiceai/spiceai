@@ -175,6 +175,19 @@ impl ShuffleWorkDir {
             if file == data {
                 continue;
             }
+            // Beside a resolved data file every directory on the way is real,
+            // so a file there that is not itself a link is its own resolved
+            // path, and one `lstat` stands in for resolving it.
+            if forwarded.is_some() {
+                match std::fs::symlink_metadata(&file) {
+                    Ok(meta) if !meta.file_type().is_symlink() => {
+                        self.ensure_inside(&file, &file)?;
+                        continue;
+                    }
+                    Err(e) if is_missing(&e) => continue,
+                    _ => {}
+                }
+            }
             if let Some(resolved) = resolve_existing(&file)? {
                 self.ensure_inside(&file, &resolved)?;
             }
@@ -200,12 +213,18 @@ impl ShuffleWorkDir {
 fn resolve_existing(path: &Path) -> Result<Option<PathBuf>, Refusal> {
     match std::fs::canonicalize(path) {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(None),
+        Err(e) if is_missing(&e) => Ok(None),
         Err(source) => Err(Refusal::Unresolvable {
             file: path.to_path_buf(),
             source,
         }),
     }
+}
+
+/// Whether `e` says the path names nothing: no such file, or a component on the
+/// way that is not a directory.
+fn is_missing(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
 }
 
 /// `encoded`, a Ballista fetch action, with the file path it names replaced by
@@ -620,6 +639,11 @@ mod tests {
         std::fs::write(outside.join("key.pem"), b"secret").expect("write outside file");
 
         std::fs::write(job.join("data.arrow"), b"data").expect("write data");
+        std::fs::write(job.join("indexed.arrow"), b"data").expect("write data");
+        std::fs::write(job.join("indexed.arrow.index"), b"index").expect("write index");
+        // An index named after the work directory itself sits beside it.
+        std::fs::write(root.join("disk").join("shuffle.arrow.index"), b"index")
+            .expect("write index");
         std::fs::write(job.join("sorted.arrow"), b"data").expect("write data");
         symlink(outside.join("key.pem"), job.join("sorted.arrow.index")).expect("link");
         symlink(outside.join("key.pem"), job.join("link.arrow")).expect("link");
@@ -642,6 +666,9 @@ mod tests {
         let outcomes: Vec<String> = [
             (configured.join("data.arrow"), passthrough, data),
             (configured.join("alias.arrow"), passthrough, data),
+            (configured.join("indexed.arrow"), sort, data),
+            (configured.join("indexed.arrow"), sort, index),
+            (root.join("shuffle"), sort, index),
             (configured.join("never-written.arrow"), passthrough, data),
             (configured.join("dangling.arrow"), passthrough, data),
             (configured.join("link.arrow"), passthrough, data),
@@ -659,6 +686,9 @@ mod tests {
             [
                 "forward disk/shuffle/job-1/0/data.arrow",
                 "forward disk/shuffle/job-1/0/data.arrow",
+                "forward disk/shuffle/job-1/0/indexed.arrow",
+                "forward disk/shuffle/job-1/0/indexed.arrow",
+                "refuse disk/shuffle.arrow.index -> disk/shuffle.arrow.index",
                 "forward unchanged",
                 "forward unchanged",
                 "refuse shuffle/job-1/0/link.arrow -> secrets/key.pem",
