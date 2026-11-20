@@ -567,9 +567,7 @@ impl Spiced {
                     self.log_path().display()
                 );
             }
-            if let Ok(r) = self.http_client.get(&url).send().await
-                && r.status().is_success()
-            {
+            if probe_succeeds(&self.http_client, &url, deadline).await {
                 self.wait_loaded_after_ready().await;
                 return self.wait_flight(deadline, timeout).await;
             }
@@ -662,9 +660,7 @@ impl Spiced {
             if !self.is_running() {
                 bail!("spiced exited; see {}", self.log_path().display());
             }
-            if let Ok(r) = self.http_client.get(&url).send().await
-                && r.status().is_success()
-            {
+            if probe_succeeds(&self.http_client, &url, deadline).await {
                 return Ok(());
             }
             if tokio::time::Instant::now() > deadline {
@@ -688,9 +684,7 @@ impl Spiced {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
-            if let Ok(r) = self.bare_client.get(&url).send().await
-                && r.status().is_success()
-            {
+            if probe_succeeds(&self.bare_client, &url, deadline).await {
                 bail!(
                     "spiced started and answered /health, but it was expected to exit with an error matching `{pattern}`; see {}",
                     self.log_path().display()
@@ -1397,6 +1391,24 @@ mod bridge_tests {
     }
 }
 
+/// How long one readiness or health probe may wait for an answer. A listener that accepts the
+/// connection and then stalls would otherwise hold a wait for the client's whole request timeout.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether `url` answers with a success status, waiting no later than `deadline` and no longer
+/// than [`PROBE_TIMEOUT`].
+async fn probe_succeeds(
+    client: &reqwest::Client,
+    url: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let until = deadline.min(tokio::time::Instant::now() + PROBE_TIMEOUT);
+    matches!(
+        tokio::time::timeout_at(until, client.get(url).send()).await,
+        Ok(Ok(response)) if response.status().is_success()
+    )
+}
+
 #[cfg(test)]
 mod wait_exit_tests {
     use super::Spiced;
@@ -1457,5 +1469,62 @@ mod wait_exit_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in for `spiced` that runs until it is killed.
+    fn sleeping_binary(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("sleeping-spiced");
+        std::fs::write(&path, "#!/bin/sh\nsleep 60\n").expect("write the stand-in binary");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in binary executable");
+        path
+    }
+
+    /// Regression test: a `/health` that accepts the connection and never answers must not
+    /// hold `exits:` past its timeout; the instance is killed when the timeout ends.
+    #[tokio::test]
+    async fn exits_ends_at_its_timeout_when_health_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let holder = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "spicescript-wait-exit-stall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("create the instance directory");
+        let binary = sleeping_binary(&dir);
+        let mut spiced =
+            Spiced::new(binary, dir.clone(), BTreeMap::new()).expect("create the instance");
+        spiced.http = port;
+        spiced.start("version: v1\n").expect("start the stand-in");
+        let pattern = regex::Regex::new("never logged").expect("valid pattern");
+
+        let started = tokio::time::Instant::now();
+        let error = spiced
+            .wait_exit(Duration::from_millis(500), &pattern)
+            .await
+            .expect_err("a stand-in that never exits must fail `exits:`");
+        let waited = started.elapsed();
+
+        holder.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            error.to_string().contains("was still running"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "`exits:` with a 500ms timeout waited {waited:?}"
+        );
     }
 }
