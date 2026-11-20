@@ -35,7 +35,10 @@ pub fn get_s3_hive_partitioned_dataset(
     name: &str,
     metadata_columns: Vec<MetadataColumn>,
 ) -> Dataset {
-    let mut dataset = Dataset::new("s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/", name);
+    let mut dataset = Dataset::new(
+        "s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/",
+        name,
+    );
     dataset.params = Some(Params::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),

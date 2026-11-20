@@ -1679,7 +1679,10 @@ mod tests {
         )
         .expect("virtual-hosted endpoint should parse");
 
-        assert_eq!(endpoint, "https://spice-datasets-gjezag77s0hu.t3.storage.dev");
+        assert_eq!(
+            endpoint,
+            "https://spice-datasets-gjezag77s0hu.t3.storage.dev"
+        );
     }
 
     #[test]
