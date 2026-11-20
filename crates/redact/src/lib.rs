@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Credential redaction for URLs and for messages that embed them.
+//! Credential redaction for URLs, for component sources that hold one, and for
+//! messages that embed them.
 //!
 //! A URL can carry a credential in two places: its userinfo
 //! (`https://user:password@host/...`) and the values of secret-looking query keys
@@ -252,8 +253,47 @@ pub fn redact_url_credentials(url: &str) -> String {
     }
 }
 
+/// `from`, a component's whole source, without credentials: the URL at its start,
+/// or right after its connector prefix, redacted as [`redact_url_credentials`] would.
+///
+/// A source can carry credentials in its URL, either directly
+/// (`https://user:password@host/file.csv`) or after a connector prefix with any
+/// delimiter a source accepts (`iceberg:https://...`, `iceberg/https://...`,
+/// `iceberg://https://...`, `openai:https://...`). The URL runs to the end of
+/// `from`, so a password or query value with a space in it is removed whole, which
+/// [`redact_message_credentials`] cannot do for a URL in free text: use this for a
+/// source, including where a message quotes one. Only the URL at the start of
+/// `from`, or right after its connector prefix, is redacted; a `://` later in a
+/// path is left alone. A source without credentials is returned unchanged.
+#[must_use]
+pub fn redact_source_credentials(from: &str) -> String {
+    let redacted = redact_url_credentials(from);
+    if redacted != from {
+        return redacted;
+    }
+    match connector_prefix_len(from) {
+        Some(len) => format!("{}{}", &from[..len], redact_url_credentials(&from[len..])),
+        None => redacted,
+    }
+}
+
+/// How many bytes of `from` its connector prefix and delimiter take: up to the first
+/// `:` or `/`, and the `//` after a `:` (`iceberg://`). These are the delimiters
+/// dataset and catalog sources are split at (`find_first_delimiter` in
+/// `runtime-component`), and cover the `:` model and embedding sources use.
+fn connector_prefix_len(from: &str) -> Option<usize> {
+    let pos = from.find([':', '/'])?;
+    Some(if from[pos..].starts_with("://") {
+        pos + "://".len()
+    } else {
+        pos + 1
+    })
+}
+
 /// `message` with every URL in it redacted as [`redact_url_credentials`]
 /// would. For error messages, which connectors often build from a source URL.
+/// A URL in free text ends at whitespace or a quote, so a message that quotes a
+/// whole source redacts it with [`redact_source_credentials`] instead.
 #[must_use]
 pub fn redact_message_credentials(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
@@ -405,6 +445,189 @@ mod tests {
             ),
         ] {
             assert_eq!(redact_message_credentials(message), expected, "{message}");
+        }
+    }
+
+    #[test]
+    fn redact_source_credentials_removes_userinfo() {
+        for (from, expected) in [
+            (
+                "https://user:secret@files.example.com/data.csv",
+                "https://files.example.com/data.csv",
+            ),
+            (
+                "http://token@files.example.com:8080/data.csv",
+                "http://files.example.com:8080/data.csv",
+            ),
+            (
+                "https://:secret@files.example.com",
+                "https://files.example.com",
+            ),
+            (
+                "postgres://user:secret@db.example.com:5432/app?sslmode=require",
+                "postgres://db.example.com:5432/app?sslmode=require",
+            ),
+            // `@` inside the password: everything up to the last `@` goes.
+            (
+                "https://user:p@ss@files.example.com/data.csv",
+                "https://files.example.com/data.csv",
+            ),
+            // Forms WHATWG parsers accept for special schemes.
+            (
+                "https:///user:secret@files.example.com/data.csv",
+                "https:///files.example.com/data.csv",
+            ),
+            (
+                "https:user:secret@files.example.com/data.csv",
+                "https:files.example.com/data.csv",
+            ),
+            (
+                "HTTPS:\\\\user:secret@files.example.com/data.csv",
+                "HTTPS:\\\\files.example.com/data.csv",
+            ),
+            // Every delimiter `DatasetSpec::path` / `CatalogSpec::catalog_id` accept.
+            (
+                "iceberg:https://user:secret@catalog.example.com/v1/ns",
+                "iceberg:https://catalog.example.com/v1/ns",
+            ),
+            (
+                "iceberg/https://user:secret@catalog.example.com/v1/ns",
+                "iceberg/https://catalog.example.com/v1/ns",
+            ),
+            (
+                "iceberg://https://user:secret@catalog.example.com/v1/ns",
+                "iceberg://https://catalog.example.com/v1/ns",
+            ),
+            // Malformed authorities fail closed.
+            (
+                "https://user:secret@files.example.com:invalid/data.csv",
+                "https://files.example.com:invalid/data.csv",
+            ),
+            (
+                "iceberg:https://user:secret@catalog.example.com:bad/v1",
+                "iceberg:https://catalog.example.com:bad/v1",
+            ),
+            ("https://user:secret@", "https://"),
+            // Secret query values.
+            (
+                "https://files.example.com/data.csv?api_key=secret&format=csv",
+                "https://files.example.com/data.csv?api_key=***&format=csv",
+            ),
+            (
+                "https://acct.blob.example.com/c/data.csv?sv=2024&sig=abc%2Fdef#frag",
+                "https://acct.blob.example.com/c/data.csv?sv=2024&sig=***#frag",
+            ),
+            (
+                "iceberg:https://user:pw@catalog.example.com/v1?Token=abc",
+                "iceberg:https://catalog.example.com/v1?Token=***",
+            ),
+        ] {
+            assert_eq!(redact_source_credentials(from), expected, "from: {from}");
+        }
+    }
+
+    #[test]
+    fn redact_source_credentials_keeps_sources_without_credentials() {
+        for from in [
+            "postgres:public.orders",
+            "s3://bucket/path/trips.parquet",
+            "s3://bucket/reports/https://alice@example.csv",
+            "abfs://container/path/",
+            "abfss://container@account.dfs.core.windows.net/data.csv",
+            "https://files.example.com/data.csv",
+            "https://files.example.com/users/@me/data.csv",
+            "https://files.example.com/data.csv?owner=a@example.com",
+            "https://files.example.com/data.csv#a@b",
+            "HTTPS://Files.Example.com:8443/Data.csv",
+            "file:../data/orders.csv",
+            "file:///home/me/a@b/orders.csv",
+            "memory:store",
+            "spice.ai:spiceai/quickstart/datasets/taxi_trips",
+            "",
+        ] {
+            assert_eq!(redact_source_credentials(from), from);
+        }
+    }
+
+    /// Passwords with characters a URL parser would treat as delimiters,
+    /// percent-encoded secret keys, and keys that only look like secrets.
+    #[test]
+    fn redact_source_credentials_handles_delimiters_in_secrets() {
+        for (from, want) in [
+            ("https://u:pa?ss@h/f.csv", "https://h/f.csv"),
+            ("https://u:pa#ss@h/f.csv", "https://h/f.csv"),
+            ("https://u:pa\"ss@h/f.csv", "https://h/f.csv"),
+            ("https://u:pa\tss@h/f.csv", "https://h/f.csv"),
+            ("https://h/f.csv?%74oken=T0K", "https://h/f.csv?%74oken=***"),
+            (
+                "https://[::1]:8443/f.csv?a=1",
+                "https://[::1]:8443/f.csv?a=1",
+            ),
+            (
+                "https://h/f.csv?author=alice",
+                "https://h/f.csv?author=alice",
+            ),
+            (
+                "https://h/f.csv?monkey=banana&sort_key=date",
+                "https://h/f.csv?monkey=banana&sort_key=date",
+            ),
+            (
+                "https://h/f.csv?api_key=K&X-Amz-Signature=S",
+                "https://h/f.csv?api_key=***&X-Amz-Signature=***",
+            ),
+            (
+                "iceberg://https://u:S@h/x?token=T",
+                "iceberg://https://h/x?token=***",
+            ),
+            ("https://u:123?SECRET@h/x", "https://h/x"),
+            ("https://u:p@ss?SECRET@h/x", "https://h/x"),
+            ("file://alice@report.csv", "file://alice@report.csv"),
+            (
+                "https://alice:p'ass@h/x?token=abc'def",
+                "https://h/x?token=***",
+            ),
+            (
+                "https://h/f.csv?email=a@b.example",
+                "https://h/f.csv?email=a@b.example",
+            ),
+            (
+                "https://h:8443?email=a@b.example",
+                "https://h:8443?email=a@b.example",
+            ),
+            ("https://u:123#SECRET@h/x", "https://h/x"),
+        ] {
+            assert_eq!(redact_source_credentials(from), want, "{from}");
+        }
+    }
+
+    /// The URL in a source runs to its end, so a password, token or query value with a
+    /// space in it is removed whole, after a connector prefix too.
+    #[test]
+    fn redact_source_credentials_removes_secrets_with_spaces() {
+        for (from, want) in [
+            (
+                "https://alice:MY PASSWORD@models.example.invalid/v1",
+                "https://models.example.invalid/v1",
+            ),
+            (
+                "openai:https://alice:MY PASSWORD@models.example.invalid/v1",
+                "openai:https://models.example.invalid/v1",
+            ),
+            (
+                "https://MY TOKEN@models.example.invalid/v1",
+                "https://models.example.invalid/v1",
+            ),
+            (
+                "custom:https://h/v1?api_key=MY KEY&region=us",
+                "custom:https://h/v1?api_key=***&region=us",
+            ),
+            (
+                "iceberg/https://u:pa ss@h/x?token=a b#frag",
+                "iceberg/https://h/x?token=***#frag",
+            ),
+            ("iceberg://https://u:pa ss@h/x", "iceberg://https://h/x"),
+        ] {
+            assert_eq!(redact_source_credentials(from), want, "{from}");
         }
     }
 }

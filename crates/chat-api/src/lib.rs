@@ -141,10 +141,11 @@ pub enum Error {
     },
 
     /// `from` is shown without the credentials a URL in it can carry: the message is logged
-    /// and reported by `/v1/models`.
+    /// and reported by `/v1/models`. It is redacted as a whole source, so a secret with a
+    /// space in it goes too.
     #[snafu(display(
         "An unsupported model source was specified in the 'from' parameter: '{}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models",
-        redact::redact_message_credentials(from)
+        redact::redact_source_credentials(from)
     ))]
     UnknownModelSource { from: String },
 
@@ -685,6 +686,45 @@ mod tests {
             error.to_string(),
             "An unsupported model source was specified in the 'from' parameter: 'https://models.example.com/v1?api_key=***&region=us'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
         );
+    }
+
+    /// `from` is a whole source, so the URL in it runs to its end: a password, token or
+    /// query value with a space in it stays out of the message, after a connector prefix
+    /// too.
+    #[test]
+    fn unknown_model_source_message_leaves_out_credentials_with_spaces() {
+        let cases = [
+            (
+                "openai:https://alice:MY PASSWORD@models.example.invalid/v1",
+                "openai:https://models.example.invalid/v1",
+            ),
+            (
+                "custom:https://models.example.invalid/v1?api_key=MY KEY&region=us",
+                "custom:https://models.example.invalid/v1?api_key=***&region=us",
+            ),
+            (
+                "https://MY TOKEN@models.example.invalid/v1",
+                "https://models.example.invalid/v1",
+            ),
+        ];
+        let messages: Vec<String> = cases
+            .iter()
+            .map(|(from, _)| {
+                Error::UnknownModelSource {
+                    from: (*from).to_string(),
+                }
+                .to_string()
+            })
+            .collect();
+        let expected: Vec<String> = cases
+            .iter()
+            .map(|(_, shown)| {
+                format!(
+                    "An unsupported model source was specified in the 'from' parameter: '{shown}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
+                )
+            })
+            .collect();
+        assert_eq!(messages, expected);
     }
 
     #[test]
