@@ -109,6 +109,21 @@ StatefulSet is also used when `stateful.enabled` requests one for any role.
 {{- end -}}
 
 {{/*
+The name of the Deployment or StatefulSet. A Deployment takes `<fullname>`. A StatefulSet takes
+`<fullname>` cut to 52 characters, because Kubernetes builds two values from it that must stay
+within 63 characters: each pod's name, `<name>-<ordinal>`, which is also the first DNS label of
+the address a cluster node advertises; and each pod's `controller-revision-hash` label value,
+`<name>-<hash>`, whose hash is up to 10 characters.
+*/}}
+{{- define "spiceai.workloadName" -}}
+{{- if include "spiceai.useStatefulSet" . -}}
+{{- include "spiceai.fullname" . | trunc 52 | trimSuffix "-" -}}
+{{- else -}}
+{{- include "spiceai.fullname" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 The headless Service that gives cluster node pods their stable per-pod DNS names:
 `<fullname>-headless`. A Service name is a DNS label of at most 63 characters, so a fullname
 longer than 54 characters is cut to leave room for the whole suffix. The name must differ from

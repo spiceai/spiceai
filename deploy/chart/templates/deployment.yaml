@@ -9,7 +9,7 @@ metadata:
   labels:
     {{- include "spiceai.labels" . | indent 4 }}
     app: {{ .Release.Name }}
-  name: {{ template "spiceai.fullname" .  }}
+  name: {{ template "spiceai.workloadName" . }}
   namespace: {{ template "spiceai.namespace" . }}
 spec:
   {{- if .Values.replicaCount }}

@@ -1,4 +1,134 @@
 ---
+# Source: spiceai/templates/deployment.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai
+  name: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  namespace: spice
+spec:
+  replicas: 1
+  serviceName: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-headless
+  selector:
+    matchLabels:      
+      app.kubernetes.io/name: spiceai
+      app.kubernetes.io/instance: spiceai
+      app: spiceai
+  template:
+    metadata:
+      labels:        
+        helm.sh/chart: VERSION
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/part-of: spiceai
+        app.kubernetes.io/name: spiceai
+        app.kubernetes.io/instance: spiceai
+        app.kubernetes.io/version: VERSION
+        app: spiceai
+      annotations:
+        checksum/spicepod: 3ef7d91eb13dfc0601191f7dc2f68c5f876018f01bd6b7191284597d3f3931ca
+    spec:
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        runAsNonRoot: true
+      containers:
+        - name: spiceai
+          image: ghcr.io/spiceai/spiceai-nightly:latest-models
+          imagePullPolicy: Always
+          workingDir: /app
+          command:
+            [
+              "/usr/local/bin/spiced",
+              "--http",
+              "0.0.0.0:8090",
+              "--metrics",
+              "0.0.0.0:9090",
+              "--flight",
+              "0.0.0.0:50051"
+            ]
+          args:
+            - --role
+            - executor
+            - --node-bind-address
+            - "0.0.0.0:50052"
+            - --node-advertise-address
+            - "$(POD_NAME).spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-headless.spice.svc.cluster.local"
+            - --scheduler-address
+            - "https://spice-scheduler-spiceai:50052"
+            - --node-mtls-ca-certificate-file
+            - /etc/spice/cluster-tls/ca.crt
+            - --node-mtls-certificate-file
+            - /etc/spice/cluster-tls/tls.crt
+            - --node-mtls-key-file
+            - /etc/spice/cluster-tls/tls.key
+          env:
+            - name: SPICE_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: 8090
+              name: http
+            - containerPort: 9090
+              name: metrics
+            - containerPort: 50051
+              name: flight
+            - containerPort: 50052
+              name: cluster
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /health
+              port: 8090
+            periodSeconds: 10
+            timeoutSeconds: 1
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /health
+              port: 8090
+            periodSeconds: 10
+            timeoutSeconds: 1
+          startupProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /health
+              port: 8090
+            periodSeconds: 10
+            timeoutSeconds: 1
+          volumeMounts:
+            - name: spiceai-config-volume
+              mountPath: /app/spicepod.yaml
+              subPath: spicepod.yaml
+            - name: spiceai-cluster-tls
+              mountPath: /etc/spice/cluster-tls
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+      volumes:
+        - name: spiceai-config-volume
+          configMap:
+            name: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-headless-spicepod
+        - name: spiceai-cluster-tls
+          secret:
+            secretName: spice-executor-tls
+            defaultMode: 0440
+---
 # Source: spiceai/templates/service.yaml
 apiVersion: v1
 kind: Service
