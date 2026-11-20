@@ -1,0 +1,38 @@
+---
+# Source: spiceai/templates/spiceai-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai
+  name: spiceai-spicepod
+  namespace: spice
+data:
+  spicepod.yaml: |
+    datasets: []
+    kind: Spicepod
+    name: app
+    runtime:
+      auth:
+        api-key:
+          enabled: true
+          keys:
+          - ${ spiceai_chart_env_1:SPICE_API_KEY }:rw
+    secrets:
+    - description: Added by the Helm chart to read the API key in SPICE_API_KEY.
+      from: env
+      name: spiceai_chart_env_1
+    - from: env
+      name: env
+      params:
+        file_path: /secrets/app.env
+    - from: kubernetes:spice-secrets
+      name: spiceai_chart_env
+    version: v1

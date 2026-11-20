@@ -19,6 +19,8 @@ kubectl get secret spiceai-spiceai-api-key -o jsonpath='{.data.api-key}' | base6
 
 Send it as `X-API-Key: <key>` over HTTP, or as the password of a Flight handshake. The `/health` and `/v1/ready` probes need no key.
 
+The runtime reads the key from the `SPICE_API_KEY` environment variable. When `spicepod.secrets` declares secret stores, the chart reads it through the first `from: env` store without `params`. If there is none, the chart adds a `from: env` store named `spiceai_chart_env` before your stores, so your stores keep their order and are searched first for `${ secrets:KEY }`.
+
 - **Your own key**: create a Secret with an `api-key` entry and set `auth.apiKey.existingSecret` to its name.
 - **Your own `runtime.auth`**: when `spicepod.runtime.auth` is set, the chart adds no key and uses yours as written.
 - **No API key**: `auth.mode: none`, on a `ClusterIP` Service only; the chart refuses it with a `NodePort` or `LoadBalancer` Service. Anonymous callers then get the runtime's rules for unauthenticated callers on a non-loopback listener, and the chart adds the Service's names to the Spicepod's allowed hosts so in-cluster clients can address it by name: to `runtime.allowed_hosts`, or to the deprecated `runtime.mcp.allowed_hosts` when the Spicepod sets only that list.

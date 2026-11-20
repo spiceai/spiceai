@@ -221,7 +221,15 @@ list, empty or not, whenever the cluster is readable, including before the names
 The Spicepod the runtime reads: `spicepod`, plus what `auth.mode` adds to it.
 
 api_key: `runtime.auth` with one read-write key, the `SPICE_API_KEY` that the Deployment sets
-from the API key Secret.
+from the API key Secret. A `${ store:KEY }` reference resolves only through a store the
+Spicepod declares, and the runtime adds its own `env` store only when the Spicepod declares
+none, so the key is read through:
+  - `env`, when `secrets` is empty;
+  - else the first `from: env` store without `params`, which reads the process environment
+    first (a `file_path` store reads its file first, and the file could hold another key);
+  - else a `from: env` store the chart adds, with a name no declared store has. It goes first
+    in `secrets`: the last-declared store wins `${ secrets:KEY }`, so the chart's store is
+    consulted after every store the Spicepod declares.
 
 none: the Service's own names, so that in-cluster clients that address the Service by name are
 answered. They join the hosts list the Spicepod already has, `runtime.allowed_hosts` or the
@@ -233,7 +241,33 @@ deprecated `runtime.mcp.allowed_hosts` (the runtime refuses to start with both),
 {{- $runtime := $pod.runtime | default dict -}}
 {{- $mode := include "spiceai.authMode" . -}}
 {{- if eq $mode "api_key" -}}
-{{- $_ := set $runtime "auth" (dict "api-key" (dict "enabled" true "keys" (list "${ env:SPICE_API_KEY }:rw"))) -}}
+{{- $store := "env" -}}
+{{- $secrets := $pod.secrets | default list -}}
+{{- if $secrets -}}
+{{- $names := list -}}
+{{- $envStores := list -}}
+{{- range $secrets -}}
+{{- $names = append $names .name -}}
+{{- if and (eq (toString .from) "env") (not .params) -}}
+{{- $envStores = append $envStores .name -}}
+{{- end -}}
+{{- end -}}
+{{- if $envStores -}}
+{{- $store = first $envStores -}}
+{{- else -}}
+{{- $store = "spiceai_chart_env" -}}
+{{- range $i := until 10 -}}
+{{- if has $store $names -}}
+{{- $store = printf "spiceai_chart_env_%d" (add1 $i) -}}
+{{- end -}}
+{{- end -}}
+{{- if has $store $names -}}
+{{- fail "spicepod.secrets declares stores named spiceai_chart_env through spiceai_chart_env_10, so the chart has no name left for the store it reads the API key through. Add a `from: env` store without `params` to spicepod.secrets, and the chart reads the key through that store." -}}
+{{- end -}}
+{{- $_ := set $pod "secrets" (prepend $secrets (dict "from" "env" "name" $store "description" "Added by the Helm chart to read the API key in SPICE_API_KEY.")) -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set $runtime "auth" (dict "api-key" (dict "enabled" true "keys" (list (printf "${ %s:SPICE_API_KEY }:rw" $store)))) -}}
 {{- else if eq $mode "none" -}}
 {{- $name := include "spiceai.fullname" . -}}
 {{- $namespace := include "spiceai.namespace" . -}}
