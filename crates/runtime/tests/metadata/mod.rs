@@ -197,7 +197,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("EXPLAIN SELECT * FROM met_last_modified WHERE _last_modified = '2024-10-10T05:37:00Z' ORDER BY id, _last_modified")
+                .query_builder("EXPLAIN SELECT * FROM met_last_modified WHERE _last_modified = '2026-11-20T09:59:37Z' ORDER BY id, _last_modified")
                 .build()
                 .run()
                 .await
@@ -213,7 +213,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             run_query_and_snapshot(
                 &rt,
-                "SELECT id FROM met_last_modified WHERE _last_modified = '2024-10-10T05:37:00Z' ORDER BY id",
+                "SELECT id FROM met_last_modified WHERE _last_modified = '2026-11-20T09:59:37Z' ORDER BY id",
                 "met_last_modified_filtered",
             )
             .await;

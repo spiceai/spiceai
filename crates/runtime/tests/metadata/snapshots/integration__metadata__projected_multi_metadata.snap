@@ -2,9 +2,9 @@
 source: crates/runtime/tests/metadata/mod.rs
 expression: projected_multi_metadata
 ---
-+----+-------------------------------------------------------------------------------------------+-------+
-| id | _location                                                                                 | _size |
-+----+-------------------------------------------------------------------------------------------+-------+
++----+-----------------------------------------------------------------------------------------------+-------+
+| id | _location                                                                                     | _size |
++----+-----------------------------------------------------------------------------------------------+-------+
 | 10 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
 | 11 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
 | 12 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
@@ -15,4 +15,4 @@ expression: projected_multi_metadata
 | 17 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
 | 18 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
 | 19 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
-+----+-------------------------------------------------------------------------------------------+-------+
++----+-----------------------------------------------------------------------------------------------+-------+

@@ -2,9 +2,9 @@
 source: crates/runtime/tests/metadata/mod.rs
 expression: projected_partition_metadata
 ---
-+------+-------+-------------------------------------------------------------------------------------------+
-| year | month | _location                                                                                 |
-+------+-------+-------------------------------------------------------------------------------------------+
++------+-------+-----------------------------------------------------------------------------------------------+
+| year | month | _location                                                                                     |
++------+-------+-----------------------------------------------------------------------------------------------+
 | 2022 | 1     | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
 | 2022 | 1     | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
 | 2022 | 1     | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
@@ -15,4 +15,4 @@ expression: projected_partition_metadata
 | 2022 | 1     | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
 | 2022 | 1     | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
 | 2022 | 1     | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2022/month=1/day=1/data_0.parquet |
-+------+-------+-------------------------------------------------------------------------------------------+
++------+-------+-----------------------------------------------------------------------------------------------+
