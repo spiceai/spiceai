@@ -109,10 +109,19 @@ StatefulSet is also used when `stateful.enabled` requests one for any role.
 {{- end -}}
 
 {{/*
-The headless Service that gives cluster node pods their stable per-pod DNS names.
+The headless Service that gives cluster node pods their stable per-pod DNS names:
+`<fullname>-headless`. A Service name is a DNS label of at most 63 characters, so a fullname
+longer than 54 characters is cut to leave room for the whole suffix. The name must differ from
+the main Service's, `<fullname>`: a fullname of 62 or 63 characters that already ends in
+`-headless` comes back unchanged from that cut, so it is cut two characters shorter.
 */}}
 {{- define "spiceai.headlessServiceName" -}}
-{{- printf "%s-headless" (include "spiceai.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- $fullname := include "spiceai.fullname" . -}}
+{{- $name := printf "%s-headless" ($fullname | trunc 54 | trimSuffix "-") -}}
+{{- if eq $name $fullname -}}
+{{- $name = printf "%s-headless" ($fullname | trunc 52 | trimSuffix "-") -}}
+{{- end -}}
+{{- $name -}}
 {{- end -}}
 
 {{/*

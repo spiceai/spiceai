@@ -1,0 +1,70 @@
+---
+# Source: spiceai/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai
+  name: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  namespace: spice
+spec:
+  ports:
+    - port: 8090
+      name: http
+    - port: 9090
+      name: metrics
+    - port: 50051
+      name: flight
+    - port: 50052
+      name: cluster
+  selector:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai
+---
+# Source: spiceai/templates/service.yaml
+# Headless Service: gives each scheduler or executor pod a stable DNS name
+# `<pod>.<this-service>.<namespace>.svc.cluster.local`, which its certificate
+# covers with one wildcard SAN, so other cluster nodes reach each pod at a name
+# its certificate names (https://spiceai.org/docs/features/distributed-query).
+# Clients keep using the Service above.
+apiVersion: v1
+kind: Service
+metadata:
+  labels:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai
+  name: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-headless
+  namespace: spice
+spec:
+  clusterIP: None
+  # Give each pod its DNS record as soon as it exists, before it is ready, so
+  # other cluster nodes can reach a pod while it joins.
+  publishNotReadyAddresses: true
+  ports:
+    - port: 50052
+      name: cluster
+    - port: 50051
+      name: flight
+  selector:    
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app: spiceai
