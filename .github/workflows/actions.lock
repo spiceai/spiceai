@@ -246,7 +246,7 @@ workflows:
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         - 'docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550'
-    '.github/workflows/spicescript_long.yml':
+    '.github/workflows/spicescript_nightly.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         - 'docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550'
