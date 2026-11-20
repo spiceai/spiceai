@@ -1150,23 +1150,7 @@ async fn create_instances(
                 source_ctx.insert(name.clone(), Value::Object(entry));
                 namespaces.insert(name.clone(), namespace);
             }
-            // `spiced` serves HTTP on every interface when `rootless_reach`
-            // is set, so its port must be free on the wildcard address too.
-            // A port served beyond loopback must be free there too: a loopback
-            // probe misses a listener on another address. Bridged nodes serve
-            // the scheduler and executor ports at the routable address.
-            let wide_ip: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
-            let loopback_ip: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
-            let http_port = crate::docker::free_port_on(if rootless_reach || bridge.is_some() {
-                wide_ip
-            } else {
-                loopback_ip
-            })?;
-            let node_ip = if bridge.is_some() {
-                wide_ip
-            } else {
-                loopback_ip
-            };
+            let probe = ProbeAddresses::new(rootless_reach, bridge.is_some(), variant.listen);
             // A read-write API key of this instance's own, for a client that cannot be told
             // the script's (a CDC sink). `spiced` requires it when this runner binds it beyond
             // loopback; see `wide_listener` below.
@@ -1175,9 +1159,9 @@ async fn create_instances(
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
-                "instance": { "name": label, "dir": dir.display().to_string(), "api_key": instance_api_key, "port": crate::docker::free_port_on(node_ip)?,
-                    "executor_port": crate::docker::free_port_on(node_ip)?, "http_port": http_port,
-                    "flight_port": crate::docker::free_port_on(node_ip)?,
+                "instance": { "name": label, "dir": dir.display().to_string(), "api_key": instance_api_key, "port": crate::docker::free_port_on(probe.node)?,
+                    "executor_port": crate::docker::free_port_on(probe.node)?, "http_port": crate::docker::free_port_on(probe.http)?,
+                    "flight_port": crate::docker::free_port_on(probe.flight)?,
                     "host_from_container": host_from_container },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
                 "pki": { "dir": options.pki.display().to_string() },
@@ -1191,7 +1175,9 @@ async fn create_instances(
             // otherwise (a rootless daemon, a bridge container). Without `runtime.auth` such a
             // listener serves a caller without credentials read-only, so the runner configures
             // the instance's own read-write key there, as a user exposing `spiced` would, and
-            // sends it with every step that names no other.
+            // sends it with every step that names no other. A `listen: every-interface` variant
+            // binds beyond loopback to check what such a caller is served there, so it gets no
+            // key, though its ports are probed on every interface (see `ProbeAddresses`).
             let wide_listener = rootless_reach || bridge.is_some();
             let injected_api_key = (wide_listener
                 && spicepod.pointer("/runtime/auth").is_none_or(Value::is_null))
@@ -1359,6 +1345,10 @@ async fn create_instances(
                 .transpose()
                 .context("the sidecar")?;
             let mut spiced = Spiced::new(first_binary, dir, env)?;
+            // Widen the listeners first, so the ports the script was told in advance, set
+            // below and probed where they are served, are served as given.
+            spiced.set_http_on_every_interface(rootless_reach)?;
+            spiced.set_every_interface(variant.listen == crate::script::Listen::EveryInterface)?;
             let port = |name: &str| {
                 context["instance"][name]
                     .as_u64()
@@ -1367,8 +1357,6 @@ async fn create_instances(
             if let Some(port) = port("http_port") {
                 spiced.set_http_port(port);
             }
-            spiced.set_http_on_every_interface(rootless_reach);
-            spiced.set_every_interface(variant.listen == crate::script::Listen::EveryInterface);
             if let Some(port) = port("flight_port") {
                 spiced.set_flight_port(port);
             }
@@ -1405,6 +1393,38 @@ async fn create_instances(
         }
     }
     Ok(instances)
+}
+
+/// The address each port a script is told in advance (`${instance.http_port}` and its
+/// siblings) is probed on before it is given out: the address its listener binds, because a
+/// loopback probe misses a listener on another address (see `docker::free_port_on`).
+#[derive(Debug, PartialEq, Eq)]
+struct ProbeAddresses {
+    http: std::net::IpAddr,
+    flight: std::net::IpAddr,
+    /// The scheduler and executor ports of a cluster node.
+    node: std::net::IpAddr,
+}
+
+impl ProbeAddresses {
+    /// HTTP binds every interface behind a rootless Docker daemon, which cannot reach this
+    /// machine's loopback; a bridged cluster's nodes serve at the routable address; and
+    /// `listen: every-interface` binds HTTP and Flight on every interface.
+    fn new(rootless_reach: bool, bridged: bool, listen: crate::script::Listen) -> Self {
+        let every_interface = listen == crate::script::Listen::EveryInterface;
+        let at = |wide: bool| -> std::net::IpAddr {
+            if wide {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
+            } else {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            }
+        };
+        Self {
+            http: at(rootless_reach || bridged || every_interface),
+            flight: at(bridged || every_interface),
+            node: at(bridged),
+        }
+    }
 }
 
 /// The sidecar of the instance whose placeholders are `context`, in a
@@ -1995,6 +2015,50 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Each port a script is told in advance is probed where its listener binds: on every
+    /// interface for `listen: every-interface`, for HTTP behind a rootless daemon, and for a
+    /// bridged cluster, and otherwise at loopback.
+    #[test]
+    fn a_port_is_probed_where_its_listener_binds() {
+        use crate::script::Listen;
+        let every: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
+        let loopback: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        let probe = |http, flight, node| ProbeAddresses { http, flight, node };
+        for (rootless_reach, bridged, listen, expected) in [
+            (
+                false,
+                false,
+                Listen::Loopback,
+                probe(loopback, loopback, loopback),
+            ),
+            (
+                false,
+                false,
+                Listen::EveryInterface,
+                probe(every, every, loopback),
+            ),
+            (
+                true,
+                false,
+                Listen::Loopback,
+                probe(every, loopback, loopback),
+            ),
+            (
+                true,
+                false,
+                Listen::EveryInterface,
+                probe(every, every, loopback),
+            ),
+            (false, true, Listen::Loopback, probe(every, every, every)),
+        ] {
+            assert_eq!(
+                ProbeAddresses::new(rootless_reach, bridged, listen),
+                expected,
+                "rootless reach: {rootless_reach}, bridged: {bridged}, {listen:?}"
+            );
+        }
+    }
 
     /// An executor gives back its share of the combination's reservation the
     /// first time it starts, and only then: a restart (after `kill-executor`)
