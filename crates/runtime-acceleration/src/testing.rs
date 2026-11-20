@@ -40,7 +40,6 @@ use datafusion::common::TableReference;
 use runtime_secrets::Secrets;
 use tokio::sync::RwLock;
 
-use crate::Engine;
 use crate::acceleration::{Acceleration, Mode};
 use crate::acceleration_source::AccelerationSource;
 use crate::schema_change::OnSchemaChange;
