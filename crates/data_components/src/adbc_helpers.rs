@@ -1204,6 +1204,6 @@ mod bigquery_query_result_table_skip_tests {
         let error = skip_bigquery_query_result_tables(&mut database)
             .expect_err("a driver without the option rejects it");
         assert_eq!(error.status, Status::NotImplemented);
-        assert!(database.set.is_empty());
+        assert_eq!(database.set, Vec::<(String, String)>::new());
     }
 }
