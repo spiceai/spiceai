@@ -19,7 +19,7 @@ use app::App;
 use async_trait::async_trait;
 use datafusion::common::TableReference;
 use itertools::Itertools;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
@@ -76,7 +76,12 @@ impl SpiceModelTool for ListDatasetsTool {
         parameters::<ListDatasetsParams>()
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Lists the datasets the caller can query.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name().to_string(), input = arg);
 
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
@@ -693,7 +698,11 @@ mod tests {
             None
         }
 
-        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let count = match self.grow_after {
                 Some(after) if call >= after => self.count + 1,

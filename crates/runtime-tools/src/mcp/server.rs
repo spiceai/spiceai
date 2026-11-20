@@ -418,10 +418,12 @@ impl RuntimeServer {
             // expired page (`Runtime::get_tool`); using it here when a
             // listed spec exists would execute Zone after Streamable
             // HTTP authorized Region.
+            // A catalog's tool is resolved under the name it is exposed as, so it is named the
+            // same in its errors and `task_history` whichever path called it.
             if let Some(tool) = listed_gateway_spec(catalog.as_ref(), &name) {
                 return self.resolved_against_snapshot(
                     validated_schema.as_ref(),
-                    tool,
+                    with_name(&tool, &exposed_name),
                     exposed_name,
                     Some(catalog_name),
                 );
@@ -435,7 +437,7 @@ impl RuntimeServer {
             if let Some(tool) = catalog.get(&name).await {
                 return self.resolved_against_snapshot(
                     validated_schema.as_ref(),
-                    tool,
+                    with_name(&tool, &exposed_name),
                     exposed_name,
                     Some(catalog_name),
                 );
@@ -608,9 +610,9 @@ impl RuntimeServer {
 /// rmcp's Streamable HTTP transport runs `call_tool` on a session worker
 /// task (`tokio::spawn`) that does **not** inherit the task-local
 /// [`SpiceRequestContext`] installed by the HTTP `track_metrics` middleware.
-/// Without re-entering that context here, `current_principal_requires_read_only`
-/// sees no principal and treats the call as auth-disabled (writes allowed) —
-/// a privilege escalation for read-only API keys.
+/// Without re-entering that context here, the tool call sees no principal, so
+/// it is refused a read-write tool even for a read-write API key, and it would
+/// run under no identity of its own.
 ///
 /// Each `/v1/mcp` request carries its own `http::request::Parts` (injected by
 /// rmcp). Auth and metrics middleware stash the concrete
@@ -717,8 +719,18 @@ impl RuntimeServer {
             }
         };
 
-        // If possible, we pass the call through to the MCP server.
-        if let Some(mcp_proxy) = resolved.tool.as_mcp_proxy().await {
+        // If possible, we pass the call through to the MCP server, once the caller is
+        // authorized for the tool as `call` below would authorize it. A refusal is reported
+        // in-band, like any other failure to run the tool.
+        let mcp_proxy = match resolved.tool.authorized_mcp_proxy().await {
+            Ok(proxy) => proxy,
+            Err(denied) => {
+                return Ok(
+                    CallToolResult::error(vec![ContentBlock::text(denied.to_string())]).into(),
+                );
+            }
+        };
+        if let Some(mcp_proxy) = mcp_proxy {
             tracing::debug!("{tool_name} uses MCP. Will call directly");
 
             // `call_tool_once` forwards the whole MRTR request
@@ -1093,7 +1105,6 @@ fn tools_listed_by_name_vec(mut tools: Vec<Tool>) -> Vec<Tool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtin::function_tool::current_principal_requires_read_only;
     use crate::catalog::SpiceToolCatalog;
     use rmcp::model::InputRequiredResult;
     use rmcp::service::ServiceError;
@@ -1114,10 +1125,11 @@ mod tests {
         fn parameters(&self) -> Option<Value> {
             None
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Value::Null)
         }
     }
@@ -1202,10 +1214,11 @@ mod tests {
                 }
             }))
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({ "executed": "Zone" }))
         }
     }
@@ -1228,10 +1241,11 @@ mod tests {
                 }
             }))
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({ "executed": "Region" }))
         }
     }
@@ -2742,7 +2756,11 @@ mod tests {
                     }
                 }))
             }
-            async fn call(
+            fn access(&self) -> ::tools::ToolAccess {
+                ::tools::ToolAccess::ReadOnly
+            }
+
+            async fn run(
                 &self,
                 _arg: &str,
             ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -3536,10 +3554,11 @@ mod tests {
         async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
             Some(self)
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({ "ok": true }))
         }
     }
@@ -3669,6 +3688,7 @@ mod tests {
 
     struct RecordingProxyTool {
         forwarded: std::sync::atomic::AtomicU64,
+        access: ::tools::ToolAccess,
     }
 
     #[async_trait::async_trait]
@@ -3685,10 +3705,11 @@ mod tests {
         async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
             Some(self)
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            self.access
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({ "ok": true }))
         }
     }
@@ -3716,6 +3737,7 @@ mod tests {
     async fn proxied_call_rejects_oversized_request_state_before_forward() {
         let tool = Arc::new(RecordingProxyTool {
             forwarded: std::sync::atomic::AtomicU64::new(0),
+            access: ::tools::ToolAccess::ReadOnly,
         });
         let mut tools = HashMap::new();
         tools.insert(
@@ -4340,17 +4362,19 @@ mod tests {
         fn parameters(&self) -> Option<Value> {
             Some(json!({"type": "object", "properties": {}}))
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({
-                "read_only": current_principal_requires_read_only().await
+                "read_only": !::tools::caller_can_write().await
             }))
         }
     }
 
-    /// Tool that refuses when the principal is read-only (mimics `sql` / `store_memory`).
+    /// A read-write tool, as an MCP server's tools and `store_memory` are: only a caller with
+    /// write access may call it, and it records whether it ran.
     struct WriteGatedTool;
 
     #[async_trait::async_trait]
@@ -4364,13 +4388,11 @@ mod tests {
         fn parameters(&self) -> Option<Value> {
             Some(json!({"type": "object", "properties": {}}))
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-            if current_principal_requires_read_only().await {
-                return Err("read-only SQL context: write rejected".into());
-            }
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadWrite
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({"wrote": true}))
         }
     }
@@ -4450,10 +4472,11 @@ mod tests {
         fn output_schema(&self) -> Option<Value> {
             self.declares_schema.then(crate::result::result_schema)
         }
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!({"columns": ["n"], "rows": [[1]]}))
         }
     }
@@ -4535,7 +4558,7 @@ mod tests {
         let restored = spice_request_context_from_http_parts(&parts)
             .expect("must restore RequestContext from Parts");
         let read_only = restored
-            .scope(async { current_principal_requires_read_only().await })
+            .scope(async { !::tools::caller_can_write().await })
             .await;
         assert!(
             read_only,
@@ -4550,7 +4573,7 @@ mod tests {
         let restored = spice_request_context_from_http_parts(&parts)
             .expect("must restore RequestContext from Parts");
         let read_only = restored
-            .scope(async { current_principal_requires_read_only().await })
+            .scope(async { !::tools::caller_can_write().await })
             .await;
         assert!(
             !read_only,
@@ -4569,7 +4592,7 @@ mod tests {
         let restored = spice_request_context_from_http_parts(&parts)
             .expect("must rebuild from AuthPrincipalRef");
         let read_only = restored
-            .scope(async { current_principal_requires_read_only().await })
+            .scope(async { !::tools::caller_can_write().await })
             .await;
         assert!(read_only, "rebuilt RO principal must require read-only");
     }
@@ -4731,18 +4754,87 @@ mod tests {
             http::StatusCode::OK,
             "MCP returns 200 with error payload: {json}"
         );
-        // A refused write is the tool's own failure, reported in its result.
+        // A refused call is reported in the tool's result, like any failure to run it.
         assert_eq!(
             json.pointer("/result/isError").and_then(Value::as_bool),
             Some(true),
             "RO key must reject write_gated tool; got {json}"
         );
-        assert!(
+        assert_eq!(
             json.pointer("/result/content/0/text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("read-only")),
+                .and_then(Value::as_str),
+            Some(READ_ONLY_KEY_REFUSAL_WRITE_GATED),
             "RO key must reject write_gated tool; got {json}"
         );
+    }
+
+    /// What a read-only key gets for `write_gated`.
+    const READ_ONLY_KEY_REFUSAL_WRITE_GATED: &str = "Failed to call tool 'write_gated': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth";
+
+    /// A server with one MCP pass-through tool of `access`, and the tool, to count what reached
+    /// the MCP server.
+    fn recording_proxy_server(
+        access: ::tools::ToolAccess,
+    ) -> (RuntimeServer, Arc<RecordingProxyTool>) {
+        let tool = Arc::new(RecordingProxyTool {
+            forwarded: std::sync::atomic::AtomicU64::new(0),
+            access,
+        });
+        let mut tools = HashMap::new();
+        tools.insert(
+            "ask".to_string(),
+            Tooling::Tool(Arc::clone(&tool) as Arc<dyn SpiceModelTool>),
+        );
+        (RuntimeServer::new(Arc::new(RwLock::new(tools))), tool)
+    }
+
+    /// The pass-through to an MCP server is held to the tool's access like `call` is: a
+    /// read-only key is refused a read-write MCP tool before anything reaches its server, and
+    /// a read-write key's call is forwarded.
+    #[tokio::test]
+    async fn mcp_pass_through_refuses_read_only_key_before_forwarding() {
+        let (server, tool) = recording_proxy_server(::tools::ToolAccess::ReadWrite);
+        let service = mcp_http_service(server);
+
+        let (status, json) = post_tools_call_with_spice_ctx(
+            &service,
+            "ask",
+            Some(spice_ctx_with_api_key("topsecret123")),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+        assert_eq!(
+            json.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true),
+            "RO key must be refused; got {json}"
+        );
+        assert_eq!(
+            json.pointer("/result/content/0/text")
+                .and_then(Value::as_str),
+            Some(
+                "Failed to call tool 'ask': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
+            ),
+            "got {json}"
+        );
+        assert_eq!(
+            tool.forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused call must not reach the MCP server"
+        );
+
+        let (status, json) = post_tools_call_with_spice_ctx(
+            &service,
+            "ask",
+            Some(spice_ctx_with_api_key("writer456:rw")),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+        assert_ne!(
+            json.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true),
+            "RW key must be forwarded; got {json}"
+        );
+        assert_eq!(tool.forwarded.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -4780,7 +4872,11 @@ mod tests {
                 "required": ["query"]
             }))
         }
-        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             #[derive(serde::Deserialize)]
             struct Args {
                 query: String,
