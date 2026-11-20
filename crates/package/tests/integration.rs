@@ -376,3 +376,27 @@ async fn a_package_within_its_budget_is_built() {
     .expect("nine files and 2 MiB fit");
     assert_eq!(archive_entries(&zip).len(), FILES + 1);
 }
+
+/// A component file over the byte budget is refused for its size, even when the file with the
+/// other YAML extension does not exist.
+#[tokio::test]
+async fn a_component_file_over_the_budget_is_refused_for_its_size() {
+    let spicepod = "version: v1\nkind: Spicepod\nname: pkg\ndatasets:\n  - ref: datasets/big\n";
+    let store = store_with(
+        spicepod,
+        &[("datasets/big/dataset.yaml", incompressible(3, 2 << 20))],
+    )
+    .await;
+    let error = package::make_zip_within(
+        &store,
+        &Path::from("spicepod.yaml"),
+        package::PackageBudget::new(10_000, 1 << 20),
+    )
+    .await
+    .expect_err("a 2 MiB component file is over a 1 MiB budget");
+    assert!(error.is_over_budget(), "not a budget error: {error}");
+    assert_eq!(
+        error.to_string(),
+        "its files total more than 1 MiB, the most a package may hold, and 'datasets/big/dataset.yaml' alone adds 2 MiB. Make that file smaller. See https://spiceai.org/docs/api/http/packages"
+    );
+}

@@ -727,6 +727,9 @@ async fn get_file_bytes_from_reference(
                     .context(LinkedFileNotAValidPathSnafu)?;
                 match download(store, &file_path, budget, &origin, 1, &mut 0).await {
                     Ok(bytes) => return Ok(bytes),
+                    // The package is over its budget; the other extension cannot change that,
+                    // and its absence must not replace the explanation.
+                    Err(e) if e.is_over_budget() => return Err(e),
                     Err(e) => error = Some(e),
                 }
             }
