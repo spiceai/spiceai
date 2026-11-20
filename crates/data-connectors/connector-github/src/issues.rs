@@ -310,6 +310,11 @@ fn gql_schema() -> SchemaRef {
 mod tests {
     use super::*;
     use crate::test_util::shared_component;
+    use datafusion::prelude::{col, lit};
+    use datafusion::scalar::ScalarValue;
+    use graphql_parser::query::{
+        Definition, OperationDefinition, Selection, Value as GraphQLValue,
+    };
     use serde_json::json;
 
     fn auto_args() -> IssuesTableArgs {
@@ -447,5 +452,123 @@ mod tests {
                 "issues emits '{key}' but the schema does not declare it"
             );
         }
+    }
+
+    /// Offers `filters` to a search-mode issues table and returns the pushdown answer
+    /// for each filter and the terms of the search query sent to GitHub.
+    fn search_terms_after_pushdown(
+        filters: &[Expr],
+    ) -> (Vec<TableProviderFilterPushDown>, Vec<String>) {
+        let args = search_args();
+        let results: Vec<FilterPushdownResult> = filters
+            .iter()
+            .map(|filter| args.filter_pushdown(filter).expect("pushdown to succeed"))
+            .collect();
+
+        let mut query =
+            GraphQLQuery::try_from(args.get_graphql_values().query).expect("query to parse");
+        args.inject_parameters(&results, &mut query)
+            .expect("parameters to inject");
+
+        let search = query
+            .ast()
+            .definitions
+            .iter()
+            .find_map(|definition| match definition {
+                Definition::Operation(OperationDefinition::SelectionSet(selection_set)) => {
+                    selection_set.items.iter().find_map(|item| match item {
+                        Selection::Field(field) if field.name == "search" => Some(field),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("query to contain a search");
+        let Some((_, GraphQLValue::String(search_query))) =
+            search.arguments.iter().find(|(name, _)| name == "query")
+        else {
+            panic!("search to have a string query argument");
+        };
+
+        (
+            results.into_iter().map(|r| r.filter_pushdown).collect(),
+            search_query
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn search_mode_pushes_down_single_term_values() {
+        // 2026-01-01T00:00:00Z: a timestamp value contains `:` and still pushes down.
+        let created = ScalarValue::TimestampMillisecond(Some(1_767_225_600_000), None);
+        let (pushdown, terms) = search_terms_after_pushdown(&[
+            col("author").eq(lit("octocat")),
+            col("state").eq(lit("OPEN")),
+            col("title").like(lit("panic")),
+            col("created_at").gt_eq(lit(created)),
+        ]);
+
+        assert_eq!(pushdown, vec![TableProviderFilterPushDown::Inexact; 4]);
+        assert_eq!(
+            terms,
+            [
+                "repo:spiceai/spiceai",
+                "type:issue",
+                "author:octocat",
+                "is:open",
+                "panic",
+                "in:title",
+                "created:>=2026-01-01T00:00:00+00:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn search_mode_does_not_push_down_a_value_with_extra_search_terms() {
+        for filter in [
+            col("author").not_eq(lit("x repo:other/repo")),
+            col("state").eq(lit("open repo:other/repo")),
+            col("title").like(lit("%a repo:other/repo%")),
+            col("body").like(lit("panic OR crash")),
+            col("title").like(lit("repo:other/repo")),
+            col("title").like(lit("\"panic")),
+            col("title").like(lit("-panic")),
+        ] {
+            let (pushdown, terms) = search_terms_after_pushdown(std::slice::from_ref(&filter));
+
+            assert_eq!(
+                pushdown,
+                [TableProviderFilterPushDown::Unsupported],
+                "{filter}"
+            );
+            assert_eq!(terms, ["repo:spiceai/spiceai", "type:issue"], "{filter}");
+        }
+    }
+
+    #[test]
+    fn search_mode_does_not_push_down_a_boolean_operator_value() {
+        let (pushdown, terms) = search_terms_after_pushdown(&[
+            col("title").like(lit("OR")),
+            col("state").eq(lit("open")),
+        ]);
+
+        assert_eq!(
+            pushdown,
+            [
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
+            ]
+        );
+        assert_eq!(terms, ["repo:spiceai/spiceai", "type:issue", "is:open"]);
+    }
+
+    #[test]
+    fn search_mode_does_not_push_down_a_value_with_parentheses() {
+        let (pushdown, terms) = search_terms_after_pushdown(&[col("title").like(lit("a)OR(b"))]);
+
+        assert_eq!(pushdown, [TableProviderFilterPushDown::Unsupported]);
+        assert_eq!(terms, ["repo:spiceai/spiceai", "type:issue"]);
     }
 }

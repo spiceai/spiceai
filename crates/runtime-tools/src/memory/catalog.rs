@@ -128,10 +128,21 @@ impl SpiceToolCatalog for MemoryToolCatalog {
     }
 
     async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        if !has_memory_dataset(self.app.read().await.as_deref()) {
+            return None;
+        }
         self.get_tool(name, None, None)
     }
 
     fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        // A contended lock resolves the tool rather than hiding it, as in `try_all`.
+        if self
+            .app
+            .try_read()
+            .is_ok_and(|app| !has_memory_dataset(app.as_deref()))
+        {
+            return None;
+        }
         self.get_tool(name, None, None)
     }
 
@@ -148,5 +159,51 @@ impl SpiceToolCatalog for MemoryToolCatalog {
             .iter()
             .filter_map(|id| self.get_tool(id, None, None))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::AppBuilder;
+    use runtime_query_engine::session::QuerySession;
+    use spicepod::component::dataset::Dataset;
+
+    fn catalog(app: App) -> MemoryToolCatalog {
+        MemoryToolCatalog::new(
+            Arc::new(QuerySession::default_session()),
+            Arc::new(RwLock::new(Some(Arc::new(app)))),
+        )
+    }
+
+    /// `memory__load` / `memory__store` must not resolve when no `memory:` dataset exists,
+    /// matching `all` / `try_all`, which do not list them.
+    #[tokio::test]
+    async fn memory_tools_do_not_resolve_without_memory_dataset() {
+        let catalog = catalog(AppBuilder::new("no_memory").build());
+
+        assert!(catalog.all().await.is_empty());
+        assert!(catalog.try_all().is_empty());
+        for name in ["load", "store"] {
+            assert!(catalog.get(name).await.is_none(), "get({name})");
+            assert!(catalog.try_get(name).is_none(), "try_get({name})");
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_tools_resolve_with_memory_dataset() {
+        let catalog = catalog(
+            AppBuilder::new("with_memory")
+                .with_dataset(Dataset::new("memory:store", "llm_memory"))
+                .build(),
+        );
+
+        assert_eq!(catalog.all().await.len(), 2);
+        assert_eq!(catalog.try_all().len(), 2);
+        for name in ["load", "store"] {
+            assert!(catalog.get(name).await.is_some(), "get({name})");
+            assert!(catalog.try_get(name).is_some(), "try_get({name})");
+        }
+        assert!(catalog.get("unknown").await.is_none());
     }
 }

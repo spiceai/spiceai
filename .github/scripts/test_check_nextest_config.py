@@ -48,6 +48,15 @@ filter = '(binary_id(=cayenne::integration) & test(/^bulk_load_index_coverage_te
 slow-timeout = {{ period = "120s", terminate-after = 5 }}
 """
 
+# The ceiling for the Hugging Face NSQL test, one test of the
+# `runtime::integration_models` binary named exactly.
+HF_NSQL_TEST = "models::hf::nsql::huggingface_test_nsql"
+HF_NSQL_OVERRIDE = f"""
+[[profile.default.overrides]]
+filter = '(binary_id(=runtime::integration_models) & test(={HF_NSQL_TEST}))'
+slow-timeout = {{ period = "120s", terminate-after = 16 }}
+"""
+
 # The fix: the same overrides, plus an explicit ceiling for the slow binaries.
 # `mutation_model_test` is split out at a lower ceiling, mirroring the real
 # config: its baseline is a third of the others', so 960s already clears the
@@ -67,7 +76,7 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 filter = '(binary_id(=cayenne::integration) & test(/^result_correctness_vs_duckdb_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_vs_sqlite_test::/)) | (binary_id(=runtime::integration) & test(/^result_correctness::/))'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }
-""" + SLOW_SIGN_OFF_TESTS
+""" + SLOW_SIGN_OFF_TESTS + HF_NSQL_OVERRIDE
 
 # The ceiling sized against the 3.7x contention factor measured for #12336: high
 # enough to clear every baseline at that factor, and still reached once the pool
@@ -481,12 +490,17 @@ class CheckConfigTest(unittest.TestCase):
 
         `CONTENTION_FACTOR` is the worst slowdown seen so far, not a bound, so
         matching it exactly is the sizing that keeps having to be redone (#12811).
-        1200s clears every baseline x 4.6 and is still rejected for the widest one.
+        1200s clears every baseline x 4.6 in the 1440s Cayenne blocks and is still
+        rejected for the widest of them.
         """
         config = FIXED_CONFIG.replace("terminate-after = 12", "terminate-after = 10")
         with tempfile.TemporaryDirectory() as tmp:
             problems = check_nextest_config.check_config(write(tmp, config))
-        widest = max(check_nextest_config.QUIET_BASELINE_SECONDS.values())
+        widest = max(
+            baseline
+            for key, baseline in check_nextest_config.QUIET_BASELINE_SECONDS.items()
+            if key.startswith("cayenne::integration::")
+        )
         self.assertGreater(1200, widest * check_nextest_config.CONTENTION_FACTOR)
         self.assertTrue(any("partition_chunking_test is killed after 1200s" in p for p in problems))
 
@@ -503,6 +517,31 @@ class CheckConfigTest(unittest.TestCase):
             "bulk_load_index_coverage_test is killed after 360s",
         ):
             self.assertTrue(any(needle in p for p in problems), (needle, problems))
+
+    def test_rejects_the_global_ceiling_for_the_hf_nsql_test(self):
+        """Without its override, the NSQL test is killed at 360s again."""
+        without = FIXED_CONFIG.replace(HF_NSQL_OVERRIDE, "")
+        self.assertNotEqual(without, FIXED_CONFIG)
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, without))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(
+            f"runtime::integration_models#{HF_NSQL_TEST} is killed after 360s", problems[0]
+        )
+
+    def test_rejects_an_hf_nsql_ceiling_one_period_short(self):
+        """1800s is short of 326.8 x 5.75 = 1879s, so 15 periods is rejected."""
+        undersized = FIXED_CONFIG.replace(
+            HF_NSQL_OVERRIDE, HF_NSQL_OVERRIDE.replace("terminate-after = 16", "terminate-after = 15")
+        )
+        self.assertNotEqual(undersized, FIXED_CONFIG)
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, undersized))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(
+            f"runtime::integration_models#{HF_NSQL_TEST} is killed after 1800s", problems[0]
+        )
+        self.assertIn("needs at least 1879s", problems[0])
 
     def test_rejects_a_test_ceiling_one_period_short(self):
         """The exact-test ceiling is held to its own baseline: 600s < 122.5 x 5.75."""
