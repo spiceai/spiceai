@@ -373,6 +373,36 @@ fn null_primary_key_lists_group_as_keyless_rows() {
     );
 }
 
+/// The truncate that opens a `DoExchange` snapshot has no keys and a null data
+/// struct, whose non-nullable columns hold the row's null. It groups as a
+/// truncate without reading its data, which cannot be read as a batch.
+#[test]
+fn a_truncate_without_data_groups_over_non_nullable_columns() {
+    use super::provider::cdc::{ChangeOperationType, group_into_sub_batches};
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let changes = SourceBatch::try_new(
+        RecordBatch::try_new(
+            Arc::new(changes_schema(&schema)),
+            vec![
+                Arc::new(StringArray::from(vec!["t"])),
+                Arc::new(ListArray::new_null(
+                    Arc::new(Field::new("item", DataType::Utf8, false)),
+                    1,
+                )),
+                arrow::array::new_null_array(&DataType::Struct(schema.fields().clone()), 1),
+            ],
+        )
+        .expect("the truncate a DoExchange snapshot opens with"),
+    )
+    .expect("valid CDC batch");
+
+    assert_eq!(
+        group_into_sub_batches(&changes),
+        vec![(ChangeOperationType::Truncate, vec![0])]
+    );
+}
+
 #[tokio::test]
 async fn mixed_primary_key_lists_preserve_deletes() {
     use super::provider::cdc::{ChangeOperationType, group_into_sub_batches};

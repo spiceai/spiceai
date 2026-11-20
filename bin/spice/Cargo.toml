@@ -18,7 +18,7 @@ clap.workspace = true
 clap_complete = "4"
 
 # Async runtime
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "sync"] }
 
 # Async utilities
 futures.workspace = true
@@ -53,6 +53,7 @@ dirs = "6"
 
 # Deterministic per-instance-directory service names (`spice cloud service`)
 sha2.workspace = true
+base64.workspace = true
 
 # Semver comparison
 semver = "1"

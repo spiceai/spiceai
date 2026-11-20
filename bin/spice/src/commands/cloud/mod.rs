@@ -19,6 +19,7 @@ limitations under the License.
 pub mod bytes;
 pub(crate) mod client;
 pub mod org;
+pub(crate) mod refresh;
 
 use crate::commands::login::LoginOutput;
 use crate::context::RuntimeContext;
@@ -486,8 +487,9 @@ impl fmt::Debug for LoginMethod {
 
 #[derive(Args, Debug)]
 pub struct SubscriptionLoginArgs {
-    /// Don't open a browser; print the URL and a one-time code to enter on
-    /// another device. Useful over SSH or in headless shells.
+    /// Don't open a browser; print the sign-in URL. A browser on another
+    /// machine shows an error page after you approve: paste that page's
+    /// address at the prompt. Useful over SSH or in headless shells.
     #[arg(long)]
     pub device: bool,
 }
@@ -1054,6 +1056,13 @@ pub async fn execute(ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         org::validate_org_name(org)?;
     }
     let org = args.org.as_deref();
+
+    if !matches!(
+        args.command,
+        CloudCommands::Login(_) | CloudCommands::Logout(_)
+    ) {
+        refresh::renew_expiring_sign_ins().await;
+    }
 
     match &args.command {
         CloudCommands::Login(login_args) => execute_login(login_args, org).await,
@@ -1770,7 +1779,7 @@ async fn execute_login_token(args: &TokenLoginArgs, target: &LoginTarget<'_>) ->
         true,
     )?;
 
-    save_token_and_print_login_result(&token, target).await
+    save_token_and_print_login_result(&token, None, target).await
 }
 
 async fn execute_login_api(args: &ApiLoginArgs, target: &LoginTarget<'_>) -> Result<()> {
@@ -1898,6 +1907,18 @@ fn credential_key(org: Option<&str>) -> String {
     }
 }
 
+/// The `merge_auth_config` key the refresh token for [`credential_key`] is
+/// filed under; the inverse of [`org::org_refresh_token_var`].
+fn refresh_credential_key(org: Option<&str>) -> String {
+    let var = match org {
+        Some(org) if !org.is_empty() => org::org_refresh_token_var(org),
+        _ => org::DEFAULT_REFRESH_TOKEN_VAR.to_string(),
+    };
+    var.strip_prefix("SPICE_SPICEAI_")
+        .unwrap_or("REFRESH_TOKEN")
+        .to_string()
+}
+
 /// The `merge_auth_config` key the app API key is filed under.
 ///
 /// Inverse of [`org::org_api_key_var`], for the same reason as
@@ -1921,6 +1942,7 @@ fn api_key_credential_key(org: Option<&str>) -> String {
 /// or replace the default data-plane key.
 fn user_login_values<'a>(
     token: &'a str,
+    refresh_token: Option<&'a str>,
     api_key: Option<&'a str>,
     token_org: Option<&str>,
     store_org: Option<&str>,
@@ -1943,6 +1965,14 @@ fn user_login_values<'a>(
             .iter()
             .map(|org| (credential_key(Some(org)), token)),
     );
+    if let Some(refresh_token) = refresh_token {
+        values.push((refresh_credential_key(None), refresh_token));
+        values.extend(
+            credential_orgs
+                .iter()
+                .map(|org| (refresh_credential_key(Some(org)), refresh_token)),
+        );
+    }
 
     if let Some(api_key) = api_key {
         if store_org.is_none() {
@@ -2024,6 +2054,7 @@ fn persist_login_values(
         return write_json(&serde_json::Value::Object(result));
     }
 
+    let _lock = refresh::lock_credentials()?;
     if output == LoginOutput::Keychain {
         org::remember_keychain_orgs(&keychain_login_orgs(spiceai))?;
     }
@@ -2034,10 +2065,26 @@ fn persist_login_values(
     if !cloud.is_empty() {
         save_credentials(output, "CLOUD", cloud)?;
     }
+    remove_env_keys(&unpaired_refresh_vars(spiceai))?;
 
     clear_login_shadows(output, spiceai, cloud)?;
     select_login_org(login_org, spiceai)?;
     Ok(())
+}
+
+/// Refresh-token variables beside access tokens this login wrote without one.
+///
+/// A token or API login replaces the access token but not a refresh token
+/// left by an earlier browser sign-in, and renewal must never pair the two.
+fn unpaired_refresh_vars(spiceai: &[(&str, &str)]) -> Vec<String> {
+    let written: BTreeSet<&str> = spiceai.iter().map(|(key, _)| *key).collect();
+    written
+        .iter()
+        .filter(|key| **key == "TOKEN" || key.starts_with("TOKEN_"))
+        .map(|key| format!("REFRESH_{key}"))
+        .filter(|refresh| !written.contains(refresh.as_str()))
+        .map(|refresh| format!("SPICE_SPICEAI_{refresh}"))
+        .collect()
 }
 
 /// Make later commands select the organization authenticated by this login.
@@ -2240,7 +2287,11 @@ fn ensure_login_values_active(spiceai: &[(&str, &str)], cloud: &[(&str, &str)]) 
     Ok(())
 }
 
-async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>) -> Result<()> {
+async fn save_token_and_print_login_result(
+    token: &str,
+    signed_in: Option<&crate::commands::login::session::SignedIn>,
+    target: &LoginTarget<'_>,
+) -> Result<()> {
     let authed_client = CloudClient::with_token_for_org(token, target.requested_org)?;
     let auth_context_result = authed_client.get_auth_context().await;
 
@@ -2264,13 +2315,23 @@ async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>
     } else {
         user_login_org(&authed_client, store_org.as_deref(), token_org.as_deref()).await?
     };
-    let values = user_login_values(
+    let mut values = user_login_values(
         token,
+        signed_in.map(|signed_in| signed_in.grant.refresh_token.as_str()),
         api_key,
         token_org.as_deref(),
         store_org.as_deref(),
         selected_org.as_deref(),
     );
+    if let Some(signed_in) = signed_in {
+        values.push((
+            org::CLIENT_ID_VAR
+                .strip_prefix("SPICE_SPICEAI_")
+                .unwrap_or("CLIENT_ID")
+                .to_string(),
+            signed_in.client_id.as_str(),
+        ));
+    }
     let value_refs: Vec<(&str, &str)> = values
         .iter()
         .map(|(key, value)| (key.as_str(), *value))
@@ -2390,19 +2451,14 @@ async fn print_post_login_org_context(
 }
 
 async fn execute_login_device_flow(open_browser: bool, target: &LoginTarget<'_>) -> Result<()> {
-    use crate::commands::login::session::{BrowserLogin, BrowserLoginOutcome};
-
-    let flow = BrowserLogin::at(client::portal_base_url());
-    if target.output != LoginOutput::Json {
-        flow.announce();
-    }
-    if open_browser {
-        flow.open_browser();
-    }
-    let BrowserLoginOutcome::Granted { access_token, .. } = flow.authenticate().await? else {
-        return Err(Error::DeviceAuthorizationDenied);
-    };
-    save_token_and_print_login_result(&access_token, target).await
+    let signed_in = crate::commands::login::session::sign_in(
+        &client::portal_base_url(),
+        org::read_credential(org::CLIENT_ID_VAR),
+        open_browser,
+        target.requested_org,
+    )
+    .await?;
+    save_token_and_print_login_result(&signed_in.grant.access_token, Some(&signed_in), target).await
 }
 
 fn print_post_login_help() {
@@ -2418,13 +2474,14 @@ fn print_post_login_help() {
 }
 
 fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
+    let _lock = refresh::lock_credentials()?;
     let mut cleared = Vec::new();
     let mut already_logged_out: Option<String> = None;
 
     match args.scope {
         LogoutScope::All => {
             for org in org::orgs_with_stored_tokens()? {
-                if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
+                if remove_env_keys(&org_credential_keys(&org))? {
                     cleared.push(org);
                 }
             }
@@ -2436,7 +2493,7 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
             if let Some(org) = resolve_org(flag_org)? {
                 ensure_active_org_logout_is_isolated(&org, org::default_token().is_some())?;
                 if org::has_org_token(&org) {
-                    if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
+                    if remove_env_keys(&org_credential_keys(&org))? {
                         cleared.push(org.clone());
                     }
                     org::forget_keychain_org(&org)?;
@@ -2479,11 +2536,22 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Credential variables stored for `org`.
+fn org_credential_keys(org: &str) -> [String; 3] {
+    [
+        org::org_token_var(org),
+        org::org_refresh_token_var(org),
+        org::org_api_key_var(org),
+    ]
+}
+
 /// Credential variables that belong to no particular org.
 fn default_credential_keys() -> Vec<String> {
     vec![
         org::DEFAULT_TOKEN_VAR.to_string(),
+        org::DEFAULT_REFRESH_TOKEN_VAR.to_string(),
         org::DEFAULT_API_KEY_VAR.to_string(),
+        org::CLIENT_ID_VAR.to_string(),
         "SPICE_CLOUD_CLIENT_ID".to_string(),
         "SPICE_CLOUD_CLIENT_SECRET".to_string(),
     ]
@@ -2684,11 +2752,98 @@ fn ensure_keychain_credentials_removed(failures: &[String]) -> Result<()> {
 /// form the reader accepts, leaving such a credential readable but not
 /// removable — so logout reported success while it stayed live.
 fn assigns_any(line: &str, keys: &[String]) -> bool {
-    let Some((lhs, _)) = line.split_once('=') else {
-        return false;
-    };
-    let name = lhs.trim().trim_start_matches("export ").trim();
-    keys.iter().any(|key| key == name)
+    assigned_name(line).is_some_and(|name| keys.iter().any(|key| key == name))
+}
+
+/// The variable an env-file line assigns, if any.
+fn assigned_name(line: &str) -> Option<&str> {
+    let (lhs, _) = line.split_once('=')?;
+    Some(lhs.trim().trim_start_matches("export ").trim())
+}
+
+/// A replacement for the env file, created before its contents are known.
+///
+/// [`Self::prepare`] refuses a link or any other non-regular file and creates
+/// an owner-only file beside the env file, so the caller learns that the env
+/// file can be replaced before it spends anything it cannot get back.
+/// [`Self::replace_values`] writes the new contents there and renames the file
+/// over the env file, so a concurrent reader sees the old file or the new one,
+/// never a partial one.
+pub(crate) struct EnvFileReplacement {
+    path: std::path::PathBuf,
+    file: tempfile::NamedTempFile,
+}
+
+impl EnvFileReplacement {
+    pub(crate) fn prepare() -> Result<Self> {
+        let path = crate::commands::login::env_file_path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|source| Error::ConfigIo {
+            operation: "read",
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(Error::ConfigIo {
+                operation: "write",
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "credentials are written only to a regular file",
+                ),
+            });
+        }
+        let directory = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        };
+        let file =
+            tempfile::NamedTempFile::new_in(&directory).map_err(|source| Error::ConfigIo {
+                operation: "create",
+                path: directory,
+                source,
+            })?;
+        Ok(Self { path, file })
+    }
+
+    /// Replace the values of variables the env file already assigns, keeping
+    /// every other line byte-for-byte for the same reasons as
+    /// [`remove_env_file_keys`].
+    pub(crate) fn replace_values(mut self, values: &[(&str, &str)]) -> Result<()> {
+        let path = self.path;
+        let io_error = |operation: &'static str| {
+            let path = path.clone();
+            move |source| Error::ConfigIo {
+                operation,
+                path,
+                source,
+            }
+        };
+        let content = std::fs::read_to_string(&path).map_err(io_error("read"))?;
+
+        let mut updated = content
+            .lines()
+            .map(|line| {
+                let replacement = assigned_name(line)
+                    .and_then(|name| values.iter().find(|(var, _)| *var == name))
+                    .zip(line.split_once('='));
+                match replacement {
+                    Some(((_, value), (lhs, _))) => format!("{lhs}={value}"),
+                    None => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if content.ends_with('\n') {
+            updated.push('\n');
+        }
+
+        std::io::Write::write_all(&mut self.file, updated.as_bytes()).map_err(io_error("write"))?;
+        self.file.as_file().sync_all().map_err(io_error("write"))?;
+        self.file
+            .persist(&path)
+            .map_err(|e| io_error("replace")(e.error))?;
+        Ok(())
+    }
 }
 
 async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()> {
@@ -3040,10 +3195,12 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
         .map_err(|source| Error::CloudConnectIo {
             message: format!("read the enrolled identity before linking: {source}"),
         })?;
-    let endpoint = identity
-        .as_ref()
-        .and_then(|identity| identity.control_plane_endpoint.clone())
-        .unwrap_or_else(client::get_base_url);
+    let endpoint = cloud_connect_login_endpoint(
+        identity
+            .as_ref()
+            .and_then(|identity| identity.control_plane_endpoint.as_deref()),
+        &client::get_base_url(),
+    )?;
 
     let target = if let Some(project) = args.project.as_deref() {
         resolve_project_target(Some(project), flag_org).await?
@@ -3440,15 +3597,14 @@ async fn execute_unlink() -> Result<()> {
         service_backend.authorize_uninstall(manifest)?;
     }
 
-    let configured_endpoint = client::get_base_url();
-    let endpoint = release_endpoint(
+    let endpoint = cloud_connect_login_endpoint(
         identity.control_plane_endpoint.as_deref(),
-        &configured_endpoint,
-    );
+        &client::get_base_url(),
+    )?;
     let requested_org = identity.org_name.as_deref().filter(|org| !org.is_empty());
     let token =
-        user_token_for_cloud_connect(endpoint, requested_org, "Unlinking", "unlink").await?;
-    match runtime_cloud_connect::release::release(endpoint, &identity, &token, None).await {
+        user_token_for_cloud_connect(&endpoint, requested_org, "Unlinking", "unlink").await?;
+    match runtime_cloud_connect::release::release(&endpoint, &identity, &token, None).await {
         Ok(_) => {}
         Err(error) if error.is_not_found() => {}
         Err(error) => {
@@ -3479,11 +3635,31 @@ async fn execute_unlink() -> Result<()> {
     Ok(())
 }
 
-fn release_endpoint<'a>(
-    identity_endpoint: Option<&'a str>,
-    configured_endpoint: &'a str,
-) -> &'a str {
-    identity_endpoint.unwrap_or(configured_endpoint)
+/// The Spice Cloud endpoint that `link` and `unlink` send the stored user
+/// login to.
+///
+/// The identity file is in the instance directory, which the user may not have
+/// written, so its endpoint is accepted only when it is the configured one.
+fn cloud_connect_login_endpoint(
+    identity_endpoint: Option<&str>,
+    configured_endpoint: &str,
+) -> Result<String> {
+    let Some(identity_endpoint) = identity_endpoint else {
+        return Ok(configured_endpoint.to_string());
+    };
+    let normalize = runtime_cloud_connect::config::normalize_control_plane_endpoint;
+    match (normalize(identity_endpoint), normalize(configured_endpoint)) {
+        (Ok(identity), Ok(configured)) if identity == configured => {
+            Ok(configured_endpoint.to_string())
+        }
+        _ => Err(Error::cloud_with_hint(
+            CloudErrorCode::InvalidRequest,
+            format!(
+                "This directory's Cloud Connect identity uses the Spice Cloud endpoint {identity_endpoint:?}, but the configured Spice Cloud endpoint is {configured_endpoint:?}. Spice sends your login only to the configured Spice Cloud endpoint."
+            ),
+            "To use a different Spice Cloud, set SPICE_CLOUD_API_URL.",
+        )),
+    }
 }
 
 async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result<()> {
@@ -6017,6 +6193,7 @@ mod tests {
     fn keychain_login_indexes_every_per_org_token_and_no_other_credential() {
         let values = user_login_values(
             "user-token",
+            None,
             Some("personal-api-key"),
             Some("personal"),
             Some("acme"),
@@ -6034,9 +6211,50 @@ mod tests {
     }
 
     #[test]
+    fn a_login_without_a_refresh_token_removes_the_old_one_beside_its_tokens() {
+        let stale =
+            unpaired_refresh_vars(&[("TOKEN", "pat"), ("TOKEN_ACME", "pat"), ("API_KEY", "key")]);
+        assert_eq!(
+            stale,
+            [
+                org::DEFAULT_REFRESH_TOKEN_VAR.to_string(),
+                org::org_refresh_token_var("acme"),
+            ]
+        );
+
+        let browser = unpaired_refresh_vars(&[("TOKEN", "access"), ("REFRESH_TOKEN", "refresh")]);
+        assert!(browser.is_empty(), "{browser:?}");
+    }
+
+    #[test]
+    fn a_browser_sign_in_stores_its_refresh_token_beside_every_token_copy() {
+        let values = user_login_values(
+            "access",
+            Some("refresh"),
+            None,
+            Some("personal"),
+            Some("acme"),
+            Some("acme"),
+        );
+
+        for org in [None, Some("personal"), Some("acme")] {
+            assert!(values.contains(&(credential_key(org), "access")), "{org:?}");
+            assert!(
+                values.contains(&(refresh_credential_key(org), "refresh")),
+                "{org:?}"
+            );
+        }
+        assert_eq!(
+            format!("SPICE_SPICEAI_{}", refresh_credential_key(Some("acme"))),
+            org::org_refresh_token_var("acme")
+        );
+    }
+
+    #[test]
     fn a_user_login_without_an_app_key_does_not_clear_data_plane_credentials() {
         let values = user_login_values(
             "user-token",
+            None,
             None,
             Some("personal"),
             Some("acme"),
@@ -6053,6 +6271,7 @@ mod tests {
     fn a_cross_org_user_login_does_not_relabel_or_replace_the_data_plane_key() {
         let values = user_login_values(
             "user-token",
+            None,
             Some("personal-api-key"),
             Some("personal"),
             Some("acme"),
@@ -6069,13 +6288,67 @@ mod tests {
     }
 
     #[test]
-    fn unlink_uses_the_configured_cloud_api_when_identity_has_no_endpoint() {
+    fn cloud_connect_login_goes_to_the_configured_endpoint_without_an_identity_endpoint() {
         let configured = "https://staging.api.spice.ai";
 
-        assert_eq!(release_endpoint(None, configured), configured);
         assert_eq!(
-            release_endpoint(Some("https://identity.example"), configured),
-            "https://identity.example"
+            cloud_connect_login_endpoint(None, configured).expect("configured endpoint"),
+            configured
+        );
+    }
+
+    #[test]
+    fn cloud_connect_login_accepts_an_identity_on_the_configured_endpoint() {
+        for (identity, configured) in [
+            ("https://api.spice.ai", "https://api.spice.ai"),
+            ("https://dev-api.spice.ai/", "https://dev-api.spice.ai"),
+            ("https://api.spice.ai", "https://API.spice.ai/"),
+        ] {
+            assert_eq!(
+                cloud_connect_login_endpoint(Some(identity), configured)
+                    .expect("matching endpoint"),
+                configured,
+                "identity {identity} on configured {configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_connect_login_refuses_an_identity_on_another_endpoint() {
+        let configured = "https://api.spice.ai";
+        for identity in [
+            "https://identity.example",
+            "https://dev-api.spice.ai",
+            "https://api.spice.ai:8443",
+            "https://api.spice.ai/other",
+            "http://api.spice.ai",
+        ] {
+            let err = cloud_connect_login_endpoint(Some(identity), configured)
+                .expect_err("a different endpoint must not receive the login");
+            assert_eq!(err.cloud_code(), Some(CloudErrorCode::InvalidRequest));
+            let message = err.to_string();
+            assert!(
+                message.contains(identity) && message.contains(configured),
+                "the error names both endpoints: {message}"
+            );
+            assert!(
+                message.contains("SPICE_CLOUD_API_URL"),
+                "the error names the setting: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_connect_login_error_escapes_the_identity_endpoint() {
+        let err = cloud_connect_login_endpoint(
+            Some("https://identity.example\n\u{1b}[2Kanother line"),
+            "https://api.spice.ai",
+        )
+        .expect_err("a different endpoint must not receive the login");
+        let message = err.to_string();
+        assert!(
+            !message.contains('\n') && !message.contains('\u{1b}'),
+            "control characters from the identity file are escaped: {message:?}"
         );
     }
 
@@ -6104,6 +6377,13 @@ mod tests {
         let keys = default_credential_keys();
         assert!(keys.contains(&org::DEFAULT_TOKEN_VAR.to_string()));
         assert!(keys.contains(&org::DEFAULT_API_KEY_VAR.to_string()));
+        assert!(keys.contains(&org::DEFAULT_REFRESH_TOKEN_VAR.to_string()));
+        assert!(keys.contains(&org::CLIENT_ID_VAR.to_string()));
+
+        let org_keys = org_credential_keys("acme");
+        assert!(org_keys.contains(&org::org_token_var("acme")));
+        assert!(org_keys.contains(&org::org_refresh_token_var("acme")));
+        assert!(org_keys.contains(&org::org_api_key_var("acme")));
     }
 
     fn instance(phase: &str, spiced: Option<SpicedStatus>) -> InstanceStatus {
@@ -6720,7 +7000,7 @@ mod tests {
     }
 
     fn persist_user_login(output: LoginOutput, token: &str, org: &str) -> Result<()> {
-        let values = user_login_values(token, None, Some(org), None, Some(org));
+        let values = user_login_values(token, None, None, Some(org), None, Some(org));
         let refs: Vec<(&str, &str)> = values
             .iter()
             .map(|(key, value)| (key.as_str(), *value))
@@ -6819,6 +7099,7 @@ mod tests {
 
         let values = user_login_values(
             "fresh-token",
+            None,
             None,
             Some("personal-org"),
             None,

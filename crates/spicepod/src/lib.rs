@@ -42,6 +42,7 @@ pub mod component;
 pub mod dependency;
 pub mod drasi;
 pub mod extension;
+mod field_path;
 pub mod fts;
 pub mod host_program;
 mod keywords;
@@ -139,6 +140,18 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Parses a Spicepod definition from an in-memory YAML value. A type error names
+/// the failing field path, e.g. `datasets[0].acceleration.enabled: Invalid type ...`.
+///
+/// # Errors
+///
+/// Returns the deserialization error when `value` does not match the Spicepod schema.
+pub fn parse_definition_value(
+    value: yaml::Value,
+) -> std::result::Result<SpicepodDefinition, yaml::Error> {
+    field_path::from_value(value)
+}
 
 impl Error {
     /// Whether the Spicepod file is absent, as opposed to present but
@@ -321,7 +334,7 @@ impl Spicepod {
         validate_spicepod_header(&raw, &path)?;
 
         let spicepod_definition: SpicepodDefinition =
-            yaml::from_value(raw).context(UnableToParseSpicepodSnafu)?;
+            field_path::from_value(raw).context(UnableToParseSpicepodSnafu)?;
 
         let resolved_datasets = component::resolve_component_references(
             fs,
@@ -498,8 +511,10 @@ impl Spicepod {
             .context(UnableToOpenSpicepodSnafu { path: path.clone() })?
             .context(SpicepodNotFoundSnafu { path: path.clone() })?;
 
-        let spicepod_definition: SpicepodDefinition =
+        let raw: yaml::Value =
             yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+        let spicepod_definition: SpicepodDefinition =
+            field_path::from_value(raw).context(UnableToParseSpicepodSnafu)?;
 
         Ok(spicepod_definition)
     }
