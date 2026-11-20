@@ -21,6 +21,7 @@ mod distributed_cayenne_catalog;
 mod distributed_http;
 mod distributed_iceberg;
 mod distributed_task_history;
+mod executor_flight_authorization;
 pub mod harness;
 mod in_memory_shuffle;
 mod instance_identity;
