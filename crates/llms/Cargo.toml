@@ -34,6 +34,7 @@ governor.workspace = true
 huggingface-hub = { path = "../huggingface-hub" }
 http.workspace = true
 http-body-limit = { path = "../http-body-limit" }
+http-retry = { path = "../http-retry" }
 insta = { workspace = true, features = ["filters"] }
 itertools.workspace = true
 parking_lot.workspace = true

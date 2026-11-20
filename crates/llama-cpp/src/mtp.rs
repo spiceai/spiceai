@@ -22,7 +22,7 @@ use std::ptr::NonNull;
 
 use snafu::{OptionExt, ensure};
 
-use crate::context::{Batch, Context, ContextParams};
+use crate::context::{Batch, Context, ContextParams, with_logged};
 use crate::model::Model;
 use crate::{CreateContextSnafu, Error, MtpInitSnafu, Result, Token, sys};
 
@@ -182,18 +182,16 @@ impl<'m> Mtp<'m> {
     /// Starts a generation in sequence `seq`; its prompt must already be decoded and processed.
     pub fn begin(&mut self, seq: i32, prompt: &[Token]) -> Result<()> {
         // SAFETY: `prompt` holds `len` transparent `llama_token`s for the call.
-        let status = unsafe {
+        self.call(|| unsafe {
             sys::spice_mtp_begin(self.raw.as_ptr(), seq, prompt.as_ptr().cast(), prompt.len())
-        };
-        self.check(status)
+        })
     }
 
     /// Hands the head a batch the target just decoded. Each sequence's tokens must be
     /// contiguous in the batch.
     pub fn process(&mut self, batch: &Batch) -> Result<()> {
         // SAFETY: the batch is live for the call; the shim copies what it keeps.
-        let status = unsafe { sys::spice_mtp_process(self.raw.as_ptr(), batch.raw()) };
-        self.check(status)
+        self.call(|| unsafe { sys::spice_mtp_process(self.raw.as_ptr(), batch.raw()) })
     }
 
     /// The most tokens one draft proposes.
@@ -244,9 +242,9 @@ impl<'m> Mtp<'m> {
             .collect();
         // SAFETY: each request's history and output buffer are live and as long as it says for
         // the call, and the shim writes at most `capacity` tokens to each buffer.
-        let status =
-            unsafe { sys::spice_mtp_draft(self.raw.as_ptr(), raw.as_mut_ptr(), raw.len()) };
-        self.check(status)?;
+        self.call(|| unsafe {
+            sys::spice_mtp_draft(self.raw.as_ptr(), raw.as_mut_ptr(), raw.len())
+        })?;
         for (out, request) in drafts.iter_mut().zip(&raw) {
             out.truncate(request.n_out);
         }
@@ -263,9 +261,9 @@ impl<'m> Mtp<'m> {
         let mut n: usize = 0;
         // SAFETY: the state is live; the shim points `data` at `n` bytes it keeps until its next
         // call, which are copied before then.
-        let status =
-            unsafe { sys::spice_mtp_get_state(self.raw.as_ptr(), seq, &raw mut data, &raw mut n) };
-        self.check(status)?;
+        self.call(|| unsafe {
+            sys::spice_mtp_get_state(self.raw.as_ptr(), seq, &raw mut data, &raw mut n)
+        })?;
         if n == 0 || data.is_null() {
             return Ok(None);
         }
@@ -278,19 +276,36 @@ impl<'m> Mtp<'m> {
     /// Restores a state [`Mtp::state`] returned for sequence `seq`.
     pub fn restore_state(&mut self, seq: i32, state: &[u8]) -> Result<()> {
         // SAFETY: `state` holds `state.len()` readable bytes for the call; the shim copies them.
-        let status = unsafe {
+        self.call(|| unsafe {
             sys::spice_mtp_set_state(self.raw.as_ptr(), seq, state.as_ptr(), state.len())
-        };
-        self.check(status)
+        })
     }
 
     /// Reports how many of sequence `seq`'s drafted tokens the target accepted.
     pub fn accept(&mut self, seq: i32, accepted: u16) -> Result<()> {
         // SAFETY: the state is live.
-        let status = unsafe { sys::spice_mtp_accept(self.raw.as_ptr(), seq, accepted) };
+        self.call(|| unsafe { sys::spice_mtp_accept(self.raw.as_ptr(), seq, accepted) })
+    }
+
+    /// Runs `call` into the shim, which reads and decodes the target's and the head's contexts
+    /// and so may wait for work either queued; see [`Context::waited`].
+    fn call(&self, call: impl FnOnce() -> sys::spice_mtp_status) -> Result<()> {
+        crate::log::clear_last_error();
+        let status = call();
+        if self.target.compute_failed() || self.draft.compute_failed() {
+            let logged = crate::log::reported_errors();
+            for context in [&self.target, &self.draft] {
+                if context.compute_failed() {
+                    context.keep_cause(logged.clone());
+                }
+            }
+        }
         self.check(status)
     }
 
+    /// Fails with the shim's error when `status` is not OK. When a backend failed computing the
+    /// target's or the head's work, the shim says so, and the error carries the cause llama.cpp
+    /// logged, of the target's failure when both failed, as the shim names the target's.
     fn check(&self, status: sys::spice_mtp_status) -> Result<()> {
         if status == sys::spice_mtp_status_SPICE_MTP_OK {
             return Ok(());
@@ -299,7 +314,13 @@ impl<'m> Mtp<'m> {
         let message = unsafe { CStr::from_ptr(sys::spice_mtp_error(self.raw.as_ptr())) }
             .to_string_lossy()
             .into_owned();
-        Err(Error::Mtp { message })
+        let cause = [&self.target, &self.draft]
+            .into_iter()
+            .find(|context| context.compute_failed())
+            .and_then(Context::cause);
+        Err(Error::Mtp {
+            message: with_logged(&message, cause),
+        })
     }
 }
 

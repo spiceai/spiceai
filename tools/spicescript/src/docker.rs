@@ -141,22 +141,6 @@ impl Container {
             .await
             .context("Docker did not answer; start Docker (or OrbStack) and retry")?;
         pull_if_missing(&docker, &spec.image).await?;
-        if let Some(network) = spec.network.as_ref().filter(|n| !is_shared_network(n))
-            && docker
-                .inspect_network::<String>(network, None)
-                .await
-                .is_err()
-        {
-            let pid = std::process::id().to_string();
-            docker
-                .create_network(bollard::network::CreateNetworkOptions {
-                    name: network.as_str(),
-                    labels: HashMap::from([(RUNNER_LABEL, pid.as_str())]),
-                    ..Default::default()
-                })
-                .await
-                .with_context(|| format!("Failed to create network {network}"))?;
-        }
 
         let also = also_publish_on();
         let mut ports = HashMap::new();
@@ -214,70 +198,10 @@ impl Container {
             }),
             ..Default::default()
         };
-        // A container left behind by an interrupted run would hold the name.
-        let _ = docker
-            .remove_container(
-                &spec.name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        let (created_id, name) = create_or_adopt(
-            CREATE_ATTEMPTS,
-            CREATE_RETRY_PAUSE,
-            &spec.name,
-            |name| {
-                let docker = &docker;
-                let mut config = config.clone();
-                // Under another name, keep the original as an alias on the
-                // container's network, so its peers still find it by it.
-                let aliases: Vec<String> = (name != spec.name)
-                    .then(|| spec.name.clone())
-                    .into_iter()
-                    .chain(spec.alias.clone())
-                    .collect();
-                if !aliases.is_empty()
-                    && let Some(network) = spec.network.as_deref().filter(|n| !is_shared_network(n))
-                {
-                    config.networking_config = Some(NetworkingConfig {
-                        endpoints_config: HashMap::from([(
-                            network.to_string(),
-                            EndpointSettings {
-                                aliases: Some(aliases),
-                                ..Default::default()
-                            },
-                        )]),
-                    });
-                }
-                async move {
-                    docker
-                        .create_container(
-                            Some(CreateContainerOptions {
-                                name: name.as_str(),
-                                platform: None,
-                            }),
-                            config,
-                        )
-                        .await
-                        .map(|created| created.id)
-                }
-            },
-            |holder| {
-                let docker = &docker;
-                async move {
-                    docker
-                        .inspect_container(&holder, None)
-                        .await
-                        .map(|found| found.id.unwrap_or(holder))
-                }
-            },
-        )
-        .await
-        .with_context(|| format!("Failed to create container {}", spec.name))?;
-        crate::cleanup::track_container(&created_id, &name, spec.network.as_deref());
+        let (created_id, name) = create_detached(docker.clone(), spec.clone(), config)
+            .await
+            .context("the task creating the container ended without an answer")??
+            .take();
         let container = Self {
             docker,
             id: created_id,
@@ -531,6 +455,196 @@ impl Container {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+}
+
+/// Creates `spec`'s network and container in a task of its own, which runs
+/// to its end even when the caller stops waiting (a combination whose other
+/// source failed to start drops the future that started this), so a
+/// container the daemon created is never left untracked. The container is
+/// handed over as a [`Created`], which removes it unless the caller takes it:
+/// whether the caller is gone before the hand-over or after it, before
+/// receiving it, the container is removed.
+fn create_detached(
+    docker: Docker,
+    spec: ContainerSpec,
+    config: Config<String>,
+) -> tokio::sync::oneshot::Receiver<Result<Created>> {
+    let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (docker, spec) = (&docker, &spec);
+        let created = async {
+            if let Some(network) = spec.network.as_ref().filter(|n| !is_shared_network(n))
+                && docker
+                    .inspect_network::<String>(network, None)
+                    .await
+                    .is_err()
+            {
+                let pid = std::process::id().to_string();
+                let created = docker
+                    .create_network(bollard::network::CreateNetworkOptions {
+                        name: network.as_str(),
+                        // A daemon older than API 1.44 would otherwise create a
+                        // second network of the same name for a source starting
+                        // beside this one, and the two would not reach each
+                        // other.
+                        check_duplicate: true,
+                        labels: HashMap::from([(RUNNER_LABEL, pid.as_str())]),
+                        ..Default::default()
+                    })
+                    .await;
+                match created {
+                    // Another source of the run, starting at the same time,
+                    // created it first.
+                    Ok(_)
+                    | Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 409,
+                        ..
+                    }) => {}
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("Failed to create network {network}"));
+                    }
+                }
+            }
+            // A container left behind by an interrupted run would hold the name.
+            let _ = docker
+                .remove_container(
+                    &spec.name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            let (created_id, name) = create_or_adopt(
+                CREATE_ATTEMPTS,
+                CREATE_RETRY_PAUSE,
+                &spec.name,
+                |name| {
+                    let mut config = config.clone();
+                    // Under another name, keep the original as an alias on the
+                    // container's network, so its peers still find it by it.
+                    let aliases: Vec<String> = (name != spec.name)
+                        .then(|| spec.name.clone())
+                        .into_iter()
+                        .chain(spec.alias.clone())
+                        .collect();
+                    if !aliases.is_empty()
+                        && let Some(network) =
+                            spec.network.as_deref().filter(|n| !is_shared_network(n))
+                    {
+                        config.networking_config = Some(NetworkingConfig {
+                            endpoints_config: HashMap::from([(
+                                network.to_string(),
+                                EndpointSettings {
+                                    aliases: Some(aliases),
+                                    ..Default::default()
+                                },
+                            )]),
+                        });
+                    }
+                    async move {
+                        docker
+                            .create_container(
+                                Some(CreateContainerOptions {
+                                    name: name.as_str(),
+                                    platform: None,
+                                }),
+                                config,
+                            )
+                            .await
+                            .map(|created| created.id)
+                    }
+                },
+                |holder| async move {
+                    docker
+                        .inspect_container(&holder, None)
+                        .await
+                        .map(|found| found.id.unwrap_or(holder))
+                },
+            )
+            .await
+            .with_context(|| format!("Failed to create container {}", spec.name))?;
+            crate::cleanup::track_container(&created_id, &name, spec.network.as_deref());
+            Ok::<_, anyhow::Error>(Created {
+                docker: docker.clone(),
+                network: spec.network.clone(),
+                id: created_id,
+                name,
+                taken: false,
+            })
+        }
+        .await;
+        // A caller already gone hands the container back, and dropping it
+        // here removes it; one gone later drops it unreceived, which does too.
+        drop(created_tx.send(created));
+    });
+    created_rx
+}
+
+/// A container [`create_detached`] made and its caller has not yet taken.
+/// Dropped untaken (the caller was cancelled before it received it), it
+/// removes the container.
+struct Created {
+    docker: Docker,
+    network: Option<String>,
+    id: String,
+    name: String,
+    taken: bool,
+}
+
+impl Created {
+    /// The container's id and name, for the [`Container`] that now owns it.
+    fn take(mut self) -> (String, String) {
+        self.taken = true;
+        (std::mem::take(&mut self.id), std::mem::take(&mut self.name))
+    }
+}
+
+impl Drop for Created {
+    fn drop(&mut self) {
+        if self.taken {
+            return;
+        }
+        let (docker, network, id) = (
+            self.docker.clone(),
+            self.network.take(),
+            std::mem::take(&mut self.id),
+        );
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime
+                    .spawn(async move { remove_abandoned(&docker, network.as_deref(), &id).await });
+            }
+            // No runtime to remove it on: the synchronous `docker rm` that
+            // `Container`'s `Drop` uses.
+            Err(_) => crate::cleanup::remove_if_tracked(&id),
+        }
+    }
+}
+
+/// Removes a container its creator stopped waiting for (and its network,
+/// once empty), unless containers are kept.
+async fn remove_abandoned(docker: &Docker, network: Option<&str>, id: &str) {
+    if crate::cleanup::keeping_containers() {
+        return;
+    }
+    crate::cleanup::untrack_container(id);
+    let _ = docker
+        .remove_container(
+            id,
+            Some(RemoveContainerOptions {
+                force: true,
+                v: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    // Fails while another container is still on it; the last one removes it.
+    if let Some(network) = network.filter(|n| !is_shared_network(n)) {
+        let _ = docker.remove_network(network).await;
     }
 }
 
@@ -1076,6 +1190,168 @@ mod timeout_tests {
             .await
             .expect("the create is answered within the patient timeout");
         assert_eq!(created.id, "c1");
+    }
+}
+
+#[cfg(test)]
+mod detached_create_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use bollard::{API_DEFAULT_VERSION, Docker, container::Config};
+    use parking_lot::Mutex;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// A Docker API that records each request as `METHOD path` and answers a
+    /// create, after `create_delay`, with the id `c1`.
+    async fn recording_daemon(create_delay: Duration) -> (Docker, Arc<Mutex<Vec<String>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let seen = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut parts = line.split(' ');
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    seen.lock().push(format!("{method} {path}"));
+                    let response = if method == "POST" && path.contains("/containers/create") {
+                        tokio::time::sleep(create_delay).await;
+                        let body = r#"{"Id":"c1","Warnings":[]}"#;
+                        format!(
+                            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let docker = Docker::connect_with_http(&format!("http://{addr}"), 30, API_DEFAULT_VERSION)
+            .expect("client");
+        (docker, requests)
+    }
+
+    fn spec() -> super::ContainerSpec {
+        super::ContainerSpec {
+            name: "src".into(),
+            image: "img".into(),
+            env: Vec::new(),
+            command: None,
+            ports: Vec::new(),
+            healthcheck: None,
+            network: None,
+            alias: None,
+        }
+    }
+
+    fn removals_of_c1(requests: &Mutex<Vec<String>>) -> usize {
+        requests
+            .lock()
+            .iter()
+            .filter(|r| r.starts_with("DELETE ") && r.contains("/containers/c1"))
+            .count()
+    }
+
+    /// Waits for the daemon to see container `c1` removed, then checks it was
+    /// removed once.
+    async fn expect_c1_removed_once(requests: &Mutex<Vec<String>>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while removals_of_c1(requests) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "container c1 was never removed; the daemon saw {:?}",
+                requests.lock()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(removals_of_c1(requests), 1, "{:?}", requests.lock());
+    }
+
+    /// A container handed over and never taken, with no timing involved: the
+    /// hand-over succeeds, then the receiver goes.
+    #[tokio::test]
+    async fn an_untaken_handover_removes_its_container() {
+        let (docker, requests) = recording_daemon(Duration::ZERO).await;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let created = super::Created {
+            docker,
+            network: None,
+            id: "c1".into(),
+            name: "src".into(),
+            taken: false,
+        };
+        assert!(sender.send(created).is_ok(), "the receiver is still there");
+        drop(receiver);
+        expect_c1_removed_once(&requests).await;
+    }
+
+    /// The caller is gone before the daemon answers the create, as when a
+    /// combination drops a source start because another source failed: the
+    /// task creating the container must remove it.
+    #[tokio::test]
+    async fn a_container_created_after_its_caller_stopped_waiting_is_removed() {
+        let (docker, requests) = recording_daemon(Duration::from_millis(300)).await;
+        drop(super::create_detached(docker, spec(), Config::default()));
+        expect_c1_removed_once(&requests).await;
+    }
+
+    /// The create is answered and the container handed to the caller's
+    /// channel, but the caller is dropped before it takes it, as when another
+    /// source fails between the two: the container must still be removed.
+    #[tokio::test]
+    async fn a_container_handed_over_but_never_taken_is_removed() {
+        let (docker, requests) = recording_daemon(Duration::ZERO).await;
+        let receiver = super::create_detached(docker, spec(), Config::default());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !requests
+            .lock()
+            .iter()
+            .any(|r| r.contains("/containers/create"))
+        {
+            assert!(tokio::time::Instant::now() < deadline, "no create was sent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Long past the daemon's answer, so the task has handed the container
+        // to the channel before the receiver goes.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(receiver);
+        expect_c1_removed_once(&requests).await;
+    }
+
+    /// While the caller waits, the container is handed over, not removed.
+    #[tokio::test]
+    async fn a_container_whose_caller_waits_is_handed_over() {
+        let (docker, requests) = recording_daemon(Duration::from_millis(300)).await;
+        let (id, name) = super::create_detached(docker, spec(), Config::default())
+            .await
+            .expect("the task answers")
+            .expect("the container is created")
+            .take();
+        crate::cleanup::untrack_container(&id);
+        assert_eq!((id.as_str(), name.as_str()), ("c1", "src"));
+        // Give a wrongly sent removal time to arrive.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(removals_of_c1(&requests), 0, "{:?}", requests.lock());
     }
 }
 

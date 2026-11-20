@@ -805,7 +805,7 @@ fn claim_value(text: &str) -> String {
 /// following a 307 or 308 would send the identity token in the request body to wherever it
 /// points.
 fn exchange_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    http_retry::client_builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
