@@ -116,9 +116,12 @@ impl<'m> Mtp<'m> {
         let draft = unsafe {
             sys::llama_init_from_model(head.as_ptr(), params.raw(Some((&target, mtp.kind))))
         };
-        let draft = Context::from_raw(NonNull::new(draft).with_context(|| CreateContextSnafu {
-            reason: crate::log::last_error(),
-        })?);
+        let draft = Context::from_raw(
+            NonNull::new(draft).with_context(|| CreateContextSnafu {
+                reason: crate::log::last_error(),
+            })?,
+            params,
+        );
         ensure!(
             draft.n_seq_max() == target.n_seq_max()
                 && draft.n_ctx_seq() >= target.n_ctx_seq()

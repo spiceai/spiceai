@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Safe bindings to the parts of llama.cpp that Spice's GGUF engine uses: loading a model,
-//! decoding batches into a context, sampling, and MTP speculative decoding.
+//! Safe bindings to the parts of llama.cpp that Spice's GGUF engine uses: loading a model and
+//! its `LoRA` adapters, decoding batches into a context, reading hidden states, sampling, and
+//! MTP speculative decoding.
 //!
 //! llama.cpp is built from the `spiceai/llama.cpp` fork at a tagged upstream release
 //! ([`RELEASE`]), with CUDA or Metal when the `cuda` or `metal` feature is on.
@@ -27,6 +28,7 @@ limitations under the License.
 mod context;
 mod devices;
 mod log;
+mod lora;
 mod model;
 mod mtp;
 pub mod rpc;
@@ -38,6 +40,7 @@ use snafu::Snafu;
 
 pub use context::{Batch, Context, ContextParams, Truncation};
 pub use devices::gpu_free_memory;
+pub use lora::LoraAdapter;
 pub use model::{Model, ModelParams, Vocab};
 pub use mtp::{DraftKind, DraftRequest, Mtp, MtpParams};
 pub use sampler::Sampler;
@@ -68,6 +71,15 @@ pub enum Error {
 
     #[snafu(display("The model path '{path}' cannot be passed to llama.cpp: {source}"))]
     ModelPath {
+        path: String,
+        source: std::ffi::NulError,
+    },
+
+    #[snafu(display("llama.cpp could not load the LoRA adapter '{path}': {reason}"))]
+    LoadLora { path: String, reason: String },
+
+    #[snafu(display("The LoRA adapter path '{path}' cannot be passed to llama.cpp: {source}"))]
+    LoraPath {
         path: String,
         source: std::ffi::NulError,
     },
