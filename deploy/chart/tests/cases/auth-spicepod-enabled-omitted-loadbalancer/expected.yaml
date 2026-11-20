@@ -1,0 +1,59 @@
+---
+# Source: spiceai/templates/spiceai-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai
+  name: spiceai-spicepod
+  namespace: spice
+data:
+  spicepod.yaml: |
+    datasets: []
+    kind: Spicepod
+    name: app
+    runtime:
+      auth:
+        api-key:
+          keys:
+          - ${ secrets:my_key }:rw
+    version: v1
+---
+# Source: spiceai/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai
+  name: spiceai
+  namespace: spice
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 8090
+      name: http
+    - port: 50051
+      name: flight
+  selector:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai

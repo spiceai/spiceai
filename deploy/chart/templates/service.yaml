@@ -1,5 +1,7 @@
-{{- if and (eq (include "spiceai.authMode" .) "none") (has .Values.service.type (list "NodePort" "LoadBalancer")) }}
-{{- fail (printf "auth.mode is none and service.type is %s: the runtime would serve callers outside the cluster without an API key. Set auth.mode to api_key, or use a ClusterIP Service." .Values.service.type) }}
+{{- if has .Values.service.type (list "NodePort" "LoadBalancer") }}
+{{- with include "spiceai.unauthenticatedExposure" . }}
+{{- fail . }}
+{{- end }}
 {{- end }}
 ---
 apiVersion: v1

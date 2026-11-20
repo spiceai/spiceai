@@ -44,8 +44,12 @@ cluster:
 auth:
   # api_key: HTTP and Flight require an API key (default).
   # none:    no API key. Anonymous callers get the runtime's rules for unauthenticated
-  #          callers on a non-loopback listener. Refused with a NodePort or LoadBalancer Service.
-  # Ignored when the Spicepod below configures `runtime.auth` itself.
+  #          callers on a non-loopback listener. Refused with a NodePort or LoadBalancer Service
+  #          unless the Spicepod requires client certificates (`runtime.tls.client_auth_mode:
+  #          required` with `runtime.tls.enabled: true`).
+  # Ignored when the Spicepod below configures `runtime.auth` itself; with a NodePort or
+  # LoadBalancer Service, that `runtime.auth` must then enable an API key, or the Spicepod
+  # must require client certificates.
   mode: api_key
   apiKey:
     # A Secret holding the read-write API key under the entry `api-key`. Empty: on first
