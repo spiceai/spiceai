@@ -10465,13 +10465,34 @@ mod tests {
             )]
         };
 
+        // The resolution includes the write rate measured in the table's data and
+        // metastore directories, or in the parent of one that does not exist. The default
+        // directories are under the working directory, which every test process of this
+        // crate shares, so another test creating or removing one of them between the calls
+        // below would change what is measured and report the line again. The test's own
+        // directories, created up front, keep the resolution unchanged.
+        let dirs = tempfile::tempdir().expect("temp dir");
+        let data_dir = dirs.path().join("data");
+        let metadata_dir = dirs.path().join("metadata");
+        std::fs::create_dir_all(data_dir.join(TABLE)).expect("table data dir");
+        std::fs::create_dir_all(&metadata_dir).expect("metastore dir");
+
         let app = Arc::new(AppBuilder::new("test").build());
         let build = |params: Vec<(String, String)>| {
+            let mut params: HashMap<String, String> = params.into_iter().collect();
+            params.insert(
+                "cayenne_file_path".to_string(),
+                data_dir.to_string_lossy().into_owned(),
+            );
+            params.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.to_string_lossy().into_owned(),
+            );
             let mut dataset = TestAccelerationSource::new(TABLE).with_app(Arc::clone(&app));
             dataset.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
-                params: params.into_iter().collect(),
+                params,
                 ..Default::default()
             });
             dataset
