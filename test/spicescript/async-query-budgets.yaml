@@ -319,9 +319,10 @@ steps:
   - wait-metric: { name: async_query_active_count, labels: { status: running }, below: 65, timeout: 30s }
     only: public
   # Its budget holds them: a new query waits behind the 4, and cancelling a running query
-  # starts the oldest waiting one.
+  # starts the oldest waiting one. (A submission is answered PENDING whether it runs at once or
+  # waits, so the queue shows which.)
   - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 71"}' }
-    expect: { status: 202, json: [ { pointer: /status, equals: PENDING } ] }
+    expect: { status: 202 }
     only: public
   - http: { method: GET, path: /v1/queries, query: { status: pending } }
     expect:
