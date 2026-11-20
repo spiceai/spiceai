@@ -215,24 +215,71 @@ authenticate its callers; empty when the runtime authenticates every caller. It 
 
 `--set-runtime auth…` or `--set-runtime tls…` in `command` changes these after the chart has
 read them, so the chart refuses unless the path it does not change authenticates.
+
+`command` is read one argument at a time, as `spiced`'s parser reads it: a flag's value is the
+argument after it, or the text after its `=`, and text inside a value is never read as a flag.
+An argument that starts with `-` is a flag, so it is never the value of the flag before it.
+Everything after `--` is a positional argument.
 */}}
 {{- define "spiceai.unauthenticatedExposure" -}}
 {{- $type := .Values.service.type -}}
 {{- $runtime := .Values.spicepod.runtime | default dict -}}
-{{- $command := join " " (.Values.command | default list) -}}
-{{- $flagValue := "(=|\\s+)[\"']?" -}}
-{{- $end := "([\"']|\\s|$)" -}}
-{{- $authOverridden := regexMatch (printf "--set-runtime%sauth[.=]" $flagValue) $command -}}
-{{- $tlsOverridden := regexMatch (printf "--set-runtime%stls(=|\\.enabled=|\\.client_auth_mode=)" $flagValue) $command -}}
+{{- $flags := list "--tls-enabled" "--tls-client-auth-mode" "--set-runtime" -}}
+{{- $values := dict "--tls-enabled" (list) "--tls-client-auth-mode" (list) "--set-runtime" (list) -}}
+{{- $pending := "" -}}
+{{- $positional := false -}}
+{{- range $arg := .Values.command | default list -}}
+{{- $arg = toString $arg -}}
+{{- if $positional -}}
+{{- else if and $pending (not (hasPrefix "-" $arg)) -}}
+{{- $_ := set $values $pending (append (get $values $pending) $arg) -}}
+{{- $pending = "" -}}
+{{- else -}}
+{{- $pending = "" -}}
+{{- if eq $arg "--" -}}
+{{- $positional = true -}}
+{{- else if has $arg $flags -}}
+{{- $pending = $arg -}}
+{{- else -}}
+{{- range $flag := $flags -}}
+{{- if hasPrefix (printf "%s=" $flag) $arg -}}
+{{- $_ := set $values $flag (append (get $values $flag) (trimPrefix (printf "%s=" $flag) $arg)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $authOverridden := false -}}
+{{- $tlsOverridden := false -}}
+{{- range $value := get $values "--set-runtime" -}}
+{{- if regexMatch "^auth[.=]" $value -}}
+{{- $authOverridden = true -}}
+{{- end -}}
+{{- if regexMatch "^tls(=|\\.enabled=|\\.client_auth_mode=)" $value -}}
+{{- $tlsOverridden = true -}}
+{{- end -}}
+{{- end -}}
 {{- $tls := dict -}}
 {{- if kindIs "map" $runtime.tls -}}
 {{- $tls = $runtime.tls -}}
 {{- end -}}
-{{- $tlsOn := or (and (kindIs "bool" $tls.enabled) $tls.enabled) (regexMatch (printf "--tls-enabled%strue%s" $flagValue $end) $command) -}}
+{{- $tlsFlagValues := get $values "--tls-enabled" -}}
+{{- $tlsFlagOn := gt (len $tlsFlagValues) 0 -}}
+{{- range $value := $tlsFlagValues -}}
+{{- if ne $value "true" -}}
+{{- $tlsFlagOn = false -}}
+{{- end -}}
+{{- end -}}
+{{- $tlsOn := or (and (kindIs "bool" $tls.enabled) $tls.enabled) $tlsFlagOn -}}
 {{- $certRequired := eq (toString $tls.client_auth_mode) "required" -}}
-{{- $modeFlags := len (regexFindAll "--tls-client-auth-mode(=|\\s|$)" $command -1) -}}
-{{- if $modeFlags -}}
-{{- $certRequired = eq $modeFlags (len (regexFindAll (printf "--tls-client-auth-mode%srequired%s" $flagValue $end) $command -1)) -}}
+{{- $modeFlagValues := get $values "--tls-client-auth-mode" -}}
+{{- if $modeFlagValues -}}
+{{- $certRequired = true -}}
+{{- range $value := $modeFlagValues -}}
+{{- if ne $value "required" -}}
+{{- $certRequired = false -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- if not (and $tlsOn $certRequired (not $tlsOverridden)) -}}
 {{- $reason := "" -}}
