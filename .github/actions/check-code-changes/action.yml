@@ -44,6 +44,8 @@ inputs:
         - 'install/**'
         - 'Cargo.toml'
         - 'Cargo.lock'
+        # The spice CLI embeds the Spicepod schema (`include_str!`) to type `--set` values.
+        - '.schema/spicepod.schema.json'
         - 'version.txt'
         - '**/*.snap'
         - '**/*.proto'
@@ -104,8 +106,10 @@ runs:
     - name: Check for relevant changes
       id: check_changes
       shell: bash
+      env:
+        CHANGED_CODE_FILES_CODE_CHANGES: ${{ steps.changed-code-files.outputs.code_changes }}
       run: |
-        result='${{ steps.changed-code-files.outputs.code_changes }}'
+        result="${CHANGED_CODE_FILES_CODE_CHANGES}"
         if [ "$result" != "true" ] && [ "$result" != "false" ]; then
           echo "::error::check-code-changes: the 'filters' input must define a 'code_changes' group"
           exit 1

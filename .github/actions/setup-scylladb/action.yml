@@ -40,6 +40,9 @@ runs:
     - name: Bootstrap TPC-H data
       if: inputs.load-tpch == 'true'
       shell: bash
+      env:
+        INPUT_KEYSPACE: ${{ inputs.keyspace }}
+        INPUT_DATA_DIR: ${{ inputs.data-dir }}
       run: |
         python -m pip install 'duckdb==1.4.4'
         python <<'PY'
@@ -49,7 +52,7 @@ runs:
         out_dir = '/tmp/tpch_tbl'
         os.makedirs(out_dir, exist_ok=True)
 
-        conn = duckdb.connect('${{ inputs.data-dir }}/tpch.db', read_only=True)
+        conn = duckdb.connect(os.environ['INPUT_DATA_DIR'] + '/tpch.db', read_only=True)
         tables = ['region', 'nation', 'customer', 'supplier', 'part', 'partsupp', 'orders', 'lineitem']
         for table in tables:
             path = os.path.join(out_dir, f'{table}.tbl')
@@ -58,5 +61,5 @@ runs:
         conn.close()
         PY
 
-        SCYLLADB_CONTAINER=scylladb SCYLLADB_KEYSPACE=${{ inputs.keyspace }} \
+        SCYLLADB_CONTAINER=scylladb SCYLLADB_KEYSPACE="${INPUT_KEYSPACE}" \
           bash test/tpc-bench/scylladb/load_tpch.sh /tmp/tpch_tbl
