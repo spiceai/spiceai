@@ -18,6 +18,14 @@ chart=$(dirname "$dir")
 if [ "$#" -eq 0 ]; then
   set -- $(ls "$dir/cases")
 fi
+# Helm 4 ends each rendered document with the empty lines its template ends
+# with, and Helm 3 trims them. Drop the empty lines just before a `---`
+# separator, so both versions render the same text; every line inside a
+# document is still compared.
+drop_blank_before_separator() {
+  awk '$0 == "" { blank++; next }
+    { if ($0 != "---") for (; blank > 0; blank--) print ""; blank = 0; print }'
+}
 failed=0
 diff_file=$(mktemp)
 trap 'rm -f "$diff_file"' EXIT
@@ -30,7 +38,7 @@ for name in "$@"; do
   status=$?
   # The chart's version is in every label; leave it out of the comparison.
   out=$(printf '%s\n' "$out" | sed -e 's/^\( *helm.sh\/chart:\) .*/\1 VERSION/' \
-    -e 's/^\( *app.kubernetes.io\/version:\) .*/\1 VERSION/')
+    -e 's/^\( *app.kubernetes.io\/version:\) .*/\1 VERSION/' | drop_blank_before_separator)
   if [ -f "$case_dir/expected-error" ]; then
     if [ "$status" -eq 0 ]; then
       echo "FAIL $name: the render succeeded, but it must fail with: $(cat "$case_dir/expected-error")"
