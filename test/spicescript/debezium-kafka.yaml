@@ -100,7 +100,7 @@ steps:
     expect: { rows: [['1']] }
   # The snapshot of the empty table `e` publishes nothing, so its topic exists
   # with no messages.
-  - source-query: { kafka: "rpk topic create ${sources.src.namespace}.public.e >/dev/null && rpk topic describe ${sources.src.namespace}.public.e -p | awk 'NR > 1 { print $NF }'" }
+  - source-query: { kafka: "rpk topic create -X brokers=127.0.0.1:9093 ${sources.src.namespace}.public.e >/dev/null && rpk topic describe -X brokers=127.0.0.1:9093 ${sources.src.namespace}.public.e -p | awk 'NR > 1 { print $NF }'" }
     expect: { rows: [['0']] }
   - start: {}
   - query: SELECT * FROM t
