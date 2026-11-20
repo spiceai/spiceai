@@ -193,33 +193,64 @@ impl Context<'_> {
             -1 => Err(Error::Decode {
                 reason: "the batch is invalid".to_string(),
             }),
+            -3 if self.compute_failed() => Err(compute_failed()),
+            -3 => Err(Error::Decode {
+                reason: "the GPU or another backend failed computing it".to_string(),
+            }),
             status => Err(Error::Decode {
                 reason: format!("llama.cpp returned {status}"),
             }),
         }
     }
 
+    /// Whether a backend failed computing something the context queued (a GPU fault, for one).
+    /// The outputs and state the context holds are then not the computation's, and every later
+    /// decode fails. llama.cpp finds the failure when it waits for the computation, which every
+    /// read of the outputs and of the state does; this waits for nothing.
+    fn compute_failed(&self) -> bool {
+        // SAFETY: the context is live.
+        unsafe { sys::llama_get_compute_status(self.raw.as_ptr()) != 0 }
+    }
+
+    /// Fails when the read that just waited for the last decode found that a backend failed
+    /// computing it: what the read returned is then not the decode's.
+    pub(crate) fn computed(&self) -> Result<()> {
+        if self.compute_failed() {
+            return Err(compute_failed());
+        }
+        Ok(())
+    }
+
     /// The logits of output row `index` of the last decoded batch, one per token of the
     /// model's vocabulary, by token id. `None` when the last decode did not output that row,
-    /// or when a backend sampler, which leaves only its own candidates, sampled it.
-    pub(crate) fn logits(&self, index: i32) -> Option<&[f32]> {
+    /// or when a backend sampler, which leaves only its own candidates, sampled it. Fails when a
+    /// backend failed computing the decode, whose logits are then not its own.
+    pub(crate) fn logits(&self, index: i32) -> Result<Option<&[f32]>> {
         let ctx = self.raw.as_ptr();
         // SAFETY: `raw` is live while `self` is (see `Context`). The call waits once for the
         // last decode to finish, then returns where it left row `index`: null when the decode
-        // did not output that row, or when a backend sampler sampled it. Checking the sampled
-        // getters one by one and then reading the row would wait in each of them, and on a
-        // model split across nodes each wait reaches every rank.
-        let row = NonNull::new(unsafe { sys::llama_get_unsampled_logits_ith(ctx, index) })?;
+        // did not output that row, when a backend sampler sampled it, or when a backend failed
+        // the decode. Checking the sampled getters one by one and then reading the row would
+        // wait in each of them, and on a model split across nodes each wait reaches every rank.
+        let row = unsafe { sys::llama_get_unsampled_logits_ith(ctx, index) };
+        self.computed()?;
+        let Some(row) = NonNull::new(row) else {
+            return Ok(None);
+        };
         // SAFETY: as above; the model outlives the context, and its vocabulary the model.
         let n_vocab = unsafe {
             sys::llama_vocab_n_tokens(sys::llama_model_get_vocab(sys::llama_get_model(ctx)))
         };
-        let n_vocab = usize::try_from(n_vocab).ok()?;
+        let Ok(n_vocab) = usize::try_from(n_vocab) else {
+            return Ok(None);
+        };
         // SAFETY: llama.cpp keeps a row of logits per output, one per vocabulary token. It
         // writes them while it decodes, and when the first read after a decode puts the rows in
         // batch order, which the call above has done. Only another decode queues writes again,
         // and it takes `&mut self`, so it cannot start while the returned row borrows `self`.
-        Some(unsafe { std::slice::from_raw_parts(row.as_ptr(), n_vocab) })
+        Ok(Some(unsafe {
+            std::slice::from_raw_parts(row.as_ptr(), n_vocab)
+        }))
     }
 
     /// Turns the argmax output on or off for the decodes that follow. With it on, a model whose
@@ -247,11 +278,12 @@ impl Context<'_> {
     /// The greedy pick of output row `index` of the last decoded batch: the token with the
     /// largest logit, the first on a tie, token 0 when the row's first logit is a NaN, as
     /// llama.cpp's greedy sampler picks it. `None` when the last decode did not output that row,
-    /// or when a backend sampler sampled it.
-    pub(crate) fn argmax(&self, index: i32) -> Option<Token> {
+    /// or when a backend sampler sampled it. Fails when a backend failed computing the decode.
+    pub(crate) fn argmax(&self, index: i32) -> Result<Option<Token>> {
         // SAFETY: the context is live; the call waits for the last decode to finish.
         let token = unsafe { sys::llama_get_argmax_ith(self.raw.as_ptr(), index) };
-        (token >= 0).then_some(Token(token))
+        self.computed()?;
+        Ok((token >= 0).then_some(Token(token)))
     }
 
     /// Waits for the computation queued by earlier decodes to finish: a decode returns once
@@ -318,13 +350,38 @@ impl Context<'_> {
     /// `None` for a sequence the context does not hold.
     #[must_use]
     pub fn partial_state_seq(&self, seq: i32) -> Option<Vec<u8>> {
+        self.state_seq_with(seq, PARTIAL_ONLY)
+    }
+
+    /// Sequence `seq`'s whole state: its attention cache cells with their positions, and any
+    /// recurrent state, as llama.cpp's server saves a prompt to host memory. Restored with
+    /// [`Context::restore_state_seq`] into an empty sequence of a context like this one, it
+    /// decodes as the sequence it was saved from would have. `None` for a sequence the context
+    /// does not hold or that holds nothing.
+    #[must_use]
+    pub fn state_seq(&self, seq: i32) -> Option<Vec<u8>> {
+        self.state_seq_with(seq, 0)
+    }
+
+    /// How many bytes [`Context::state_seq`] would return for sequence `seq`, counted without
+    /// reading any cell's data; 0 for a sequence the context does not hold.
+    #[must_use]
+    pub fn state_seq_size(&self, seq: i32) -> usize {
+        if !self.holds(seq) {
+            return 0;
+        }
+        // SAFETY: `raw` is live while `self` is (see `Context`), `seq` is one of its sequences,
+        // and sizing a sequence's state reads the context without changing it.
+        unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, 0) }
+    }
+
+    fn state_seq_with(&self, seq: i32, flags: sys::llama_state_seq_flags) -> Option<Vec<u8>> {
         if !self.holds(seq) {
             return None;
         }
         // SAFETY: `raw` is live while `self` is (see `Context`), `seq` is one of its sequences,
         // and sizing a sequence's state reads the context without changing it.
-        let size =
-            unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, PARTIAL_ONLY) };
+        let size = unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), seq, flags) };
         let mut state = vec![0u8; size];
         // SAFETY: `raw` is live (see `Context`), and llama.cpp writes at most `size` bytes into
         // `state`, which holds `size` writable bytes.
@@ -334,7 +391,7 @@ impl Context<'_> {
                 state.as_mut_ptr(),
                 size,
                 seq,
-                PARTIAL_ONLY,
+                flags,
             )
         };
         (size > 0 && written == size).then_some(state)
@@ -349,6 +406,23 @@ impl Context<'_> {
     /// Restores a state [`Context::partial_state_seq`] saved into sequence `seq`. Returns false
     /// for a sequence the context does not hold, or when llama.cpp does not read all of it.
     pub fn restore_partial_state_seq(&mut self, seq: i32, state: &[u8]) -> bool {
+        self.restore_state_seq_with(seq, state, PARTIAL_ONLY)
+    }
+
+    /// Restores a state [`Context::state_seq`] saved into sequence `seq`, which must hold
+    /// nothing. Returns false for a sequence the context does not hold, or when llama.cpp does
+    /// not read all of it, as when the cache has no room for its cells; llama.cpp then leaves
+    /// the sequence empty.
+    pub fn restore_state_seq(&mut self, seq: i32, state: &[u8]) -> bool {
+        self.restore_state_seq_with(seq, state, 0)
+    }
+
+    fn restore_state_seq_with(
+        &mut self,
+        seq: i32,
+        state: &[u8],
+        flags: sys::llama_state_seq_flags,
+    ) -> bool {
         if !self.holds(seq) {
             return false;
         }
@@ -361,10 +435,20 @@ impl Context<'_> {
                 state.as_ptr(),
                 state.len(),
                 seq,
-                PARTIAL_ONLY,
+                flags,
             )
         };
         !state.is_empty() && read == state.len()
+    }
+}
+
+/// The error of a context a backend failed: what it computed is lost, and llama.cpp refuses to
+/// decode on it again.
+fn compute_failed() -> Error {
+    Error::Decode {
+        reason: "the GPU or another backend failed computing work this context queued, so its \
+            results are discarded and the context decodes nothing more; reload the model"
+            .to_string(),
     }
 }
 

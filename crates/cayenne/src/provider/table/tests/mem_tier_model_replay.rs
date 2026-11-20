@@ -819,7 +819,12 @@ async fn replay(
             counts.matched_durable_plus_pending += 1;
             // Carry this exact observed publication into subsequent model prefixes,
             // including Crash/Recover. An explicit later Flush remains a no-op.
-            assert!(!expected.pending_changes.is_empty());
+            assert_ne!(
+                expected.pending_changes.len(),
+                0,
+                "{:?}",
+                expected.pending_changes
+            );
             model_actions.push("Flush".into());
         } else {
             let error = format!(
@@ -1066,7 +1071,7 @@ async fn mem_tier_model_replay_early_publisher() {
     eprintln!("PUBLISHER detached footer persisted_upserts={persisted}");
     assert!(persisted > 0);
     let added = &after[before.len()..];
-    assert!(!added.is_empty());
+    assert_ne!(added.len(), 0, "{added:?}");
     let checkpoints = added
         .iter()
         .filter(|(_, actions)| actions.contains(&"SetGroup"))

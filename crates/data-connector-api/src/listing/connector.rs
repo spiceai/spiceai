@@ -1162,6 +1162,22 @@ pub trait ListingTableConnector: DataConnector {
             detected_extension.and_then(|ext| ext.compression),
         )?;
 
+        // An explicitly empty `file_format` (for example `""`, or a secret
+        // reference that resolved to nothing) is a configuration error. It
+        // used to fall through to the unknown-format text-table path and load
+        // a CSV as a one-row document table while the dataset reported Ready.
+        if file_format_param
+            .as_deref()
+            .is_some_and(|format| format.trim().is_empty())
+        {
+            return Err(crate::DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: empty_file_format_message(dataset, params),
+                connector_component: ConnectorComponent::from(dataset),
+                source: "Empty file format".into(),
+            });
+        }
+
         // Annotate before `?` so rustc unifies each arm as `Arc<dyn FileFormat>`
         // instead of pinning the match to the first (`CsvFormat`) arm.
         let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, ListingSuffix)> =
@@ -2666,6 +2682,20 @@ fn adjacent_transposition_match(typo: &str, valid: &[&str]) -> Option<String> {
     None
 }
 
+/// Error message for an explicitly empty `file_format`, naming the secret
+/// reference when the value came from one.
+fn empty_file_format_message(dataset: &DatasetSpec, params: &Parameters) -> String {
+    let valid_list = valid_listing_file_formats().join(", ");
+    let dataset_name = dataset.name.to_string();
+    let source_clause = params
+        .secret_source("file_format")
+        .map(|source| format!(" (it came from {source})"))
+        .unwrap_or_default();
+    format!(
+        "The `file_format` parameter for dataset '{dataset_name}' is empty{source_clause}. Set it to one of: {valid_list}, or remove it to infer the format from the file extension. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
+}
+
 fn unknown_file_format_message(dataset: &DatasetSpec, params: &Parameters, format: &str) -> String {
     let valid = valid_listing_file_formats();
     let valid_list = valid.join(", ");
@@ -3423,6 +3453,72 @@ mod tests {
                 "Cannot setup the dataset test (TestConnector) with an invalid configuration. The required 'file_format' parameter is missing. Ensure the parameter is provided, and try again."
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_empty_file_format_is_rejected_not_loaded_as_text() {
+        // An empty `file_format` used to fall through to the text-table path,
+        // so a CSV loaded as a one-row `location`/`content` table.
+        for format in ["", "  "] {
+            let (connector, dataset, _dir) = setup_listed_connector(&["nation.csv"], format);
+            let err = connector
+                .get_file_format_and_extension(&dataset)
+                .await
+                .expect_err("an empty file_format must fail dataset setup");
+            let message = err.to_string();
+            assert!(
+                message.contains("The `file_format` parameter for dataset 'test' is empty"),
+                "{message}"
+            );
+            assert!(
+                message.contains("csv"),
+                "must list valid formats: {message}"
+            );
+        }
+
+        // The same CSV with an explicit `csv` format is unchanged.
+        let (connector, dataset, _dir) = setup_listed_connector(&["nation.csv"], "csv");
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv resolves");
+        assert!(file_format.is_some(), "csv uses the structured reader");
+        assert_eq!(extension, ".csv");
+    }
+
+    #[tokio::test]
+    async fn test_empty_file_format_from_secret_names_the_reference() {
+        const REFERENCE: &str = "${ secrets:FMT }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("nation.csv"), "a\n1\n").expect("write csv");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([("file_format".to_string(), String::new())]))
+                    .into_iter()
+                    .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/nation.csv", dir.path().display()),
+            TableReference::bare("test"),
+        );
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("an empty secret-derived file_format must fail");
+        let message = err.to_string();
+        assert!(message.contains("is empty"), "{message}");
+        assert!(
+            message.contains(REFERENCE),
+            "must name the reference: {message}"
+        );
     }
 
     fn setup_listed_connector(

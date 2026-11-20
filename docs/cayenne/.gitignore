@@ -1,9 +1,0 @@
-# Built artifacts.
-# waterfall.svg is committed (referenced by cayenne.md); regenerate it with gen_waterfall.py.
-# Cayenne.pdf is produced in CI; cayenne.html and waterfall_ls.pdf are local previews.
-Cayenne.pdf
-cayenne.html
-waterfall_ls.pdf
-
-# Diagram renderer (see package.json); install with `npm ci`.
-node_modules/

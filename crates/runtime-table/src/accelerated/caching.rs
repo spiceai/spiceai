@@ -845,6 +845,66 @@ fn requested_cache_keys(filters: &[Expr]) -> Option<Vec<RequestedCacheKey>> {
     Some(keys)
 }
 
+/// Whether `filters` name a request key that no row of `cached_batches` holds.
+///
+/// Decided without expanding the key combinations: the number of combinations
+/// is the product of each request-key column's distinct values, and each
+/// cached row matches at most one of them. `false` when the filters do not name
+/// a discrete request-key set, the same cases [`requested_cache_keys`] skips.
+fn names_uncached_request_key(filters: &[Expr], cached_batches: &[RecordBatch]) -> bool {
+    if filters.iter().any(|filter| {
+        rejects_http_cross_column_or(filter) || has_negated_request_key_in_list(filter)
+    }) {
+        return false;
+    }
+
+    let requested: Vec<HashSet<&str>> = REQUEST_KEY_COLUMNS
+        .iter()
+        .map(|column| {
+            HttpTableProvider::request_filter_values(filters, column)
+                .into_iter()
+                .collect()
+        })
+        .collect();
+    if requested.iter().all(HashSet::is_empty) {
+        return false;
+    }
+    // An overflowing product names more keys than any cache holds.
+    let Some(requested_count) = requested.iter().try_fold(1_usize, |count, values| {
+        count.checked_mul(values.len().max(1))
+    }) else {
+        return true;
+    };
+
+    let mut present = HashSet::new();
+    for cached in cached_request_keys(cached_batches) {
+        let dims = [
+            cached.path.as_deref(),
+            cached.query.as_deref(),
+            cached.body.as_deref(),
+        ];
+        let named = requested
+            .iter()
+            .zip(dims)
+            .all(|(values, value)| values.is_empty() || value.is_some_and(|v| values.contains(v)));
+        if named {
+            let projected: Vec<Option<String>> = requested
+                .iter()
+                .zip(dims)
+                .map(|(values, value)| {
+                    if values.is_empty() {
+                        None
+                    } else {
+                        value.map(ToOwned::to_owned)
+                    }
+                })
+                .collect();
+            present.insert(projected);
+        }
+    }
+    requested_count > present.len()
+}
+
 fn cached_request_key(batch: &RecordBatch, row_idx: usize) -> RequestedCacheKey {
     RequestedCacheKey {
         path: utf8_cell(batch, "request_path", row_idx),
@@ -4301,6 +4361,25 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     }
                 }
 
+                // A connector request limit (the HTTP connector's
+                // `max_request_partitions`) covers every request key the query
+                // names. A miss plans the full filter set and is refused over
+                // the limit, but the fetch below splits the missing keys into
+                // scans that each pass it on their own. Plan the full set first,
+                // before the keys are expanded, so a partial hit is refused
+                // where a miss is. Planning sends no request.
+                if names_uncached_request_key(&fill_filters, &cached_batches)
+                    && let Err(e) = federated
+                        .scan(session_state.as_ref(), None, &fill_filters, limit)
+                        .await
+                {
+                    let error_stream = RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema_clone),
+                        futures::stream::once(async move { Err(e) }),
+                    );
+                    return Box::pin(error_stream) as SendableRecordBatchStream;
+                }
+
                 // Data is fresh or stale. A hit that returned some rows is not
                 // enough when the query named several request keys: missing
                 // keys must still be fetched from the origin.
@@ -5907,12 +5986,13 @@ mod tests {
                 ));
             }
 
-            // Record the filters for later verification
+            // Record the filters when the scan executes, as an origin would
+            // see the request.
             let filter_strings: Vec<String> = filters
                 .iter()
                 .map(|f| f.human_display().to_string())
                 .collect();
-            self.recorded_filters.write().push(filter_strings);
+            let recorded_filters = Arc::clone(&self.recorded_filters);
 
             let data = match (self.honor_request_keys, requested_cache_keys(filters)) {
                 (true, Some(requested)) => self
@@ -5932,9 +6012,14 @@ mod tests {
             };
 
             // Return the configured data
-            Ok(Arc::new(DataSourceExec::new(Arc::new(
-                MemorySourceConfig::try_new(&[data], Arc::clone(&self.schema), None)?,
-            ))))
+            Ok(RecordOnExecute::wrap(
+                Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
+                    &[data],
+                    Arc::clone(&self.schema),
+                    None,
+                )?))),
+                move || recorded_filters.write().push(filter_strings.clone()),
+            ))
         }
     }
 
@@ -6116,6 +6201,343 @@ mod tests {
             current.as_ref().and_then(ComponentStatus::error_message),
             Some("refresh failed"),
             "cache writes succeeding again says nothing about a refresh that is still failing"
+        );
+    }
+
+    // Partial hits against the HTTP connector's `max_request_partitions`.
+
+    /// Local HTTP origin that answers every request with a one-line text body
+    /// and records each request line, so a test can count origin requests.
+    async fn request_limit_counting_origin() -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let url = format!("http://{}/", listener.local_addr().expect("address"));
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_by_server = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = Arc::clone(&seen_by_server);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0; 4096];
+                        let Ok(size) = socket.read(&mut buffer).await else {
+                            return;
+                        };
+                        if size == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..size]);
+                        if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request);
+                    seen.lock()
+                        .push(text.lines().next().unwrap_or_default().to_string());
+                    let payload = "ok";
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                payload.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    fn request_limit_http_source(
+        url: &str,
+        paths: &[String],
+        cap: Option<usize>,
+    ) -> Arc<dyn TableProvider> {
+        use data_components::http::provider::HttpTableProvider;
+        #[expect(
+            clippy::default_trait_access,
+            reason = "this crate has no direct reqwest dependency"
+        )]
+        let provider = HttpTableProvider::new(
+            url.parse().expect("URL"),
+            Default::default(),
+            "text".into(),
+            true,
+        )
+        .with_allowed_paths(paths.iter().map(String::as_str))
+        .expect("allow probe paths")
+        .enable_query_filters(1024)
+        .enable_body_filters(1024)
+        .with_max_request_partitions(cap)
+        .with_max_retries(0);
+        Arc::new(provider)
+    }
+
+    /// Runs a caching-mode scan whose accelerator holds `cached`.
+    async fn request_limit_run_caching_scan(
+        source: &Arc<dyn TableProvider>,
+        cached: Vec<RecordBatch>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Vec<RecordBatch>> {
+        let schema = source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            cached.clone(),
+        ));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[cached], Arc::clone(&schema), None).expect("cache input"),
+        )));
+        let in_flight: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (tx, _consumer) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let exec = CachingAccelerationScanExec::new(
+            input,
+            Some(Duration::from_mins(10)),
+            None,
+            StaleIfError::Disabled,
+            Arc::clone(source),
+            accelerator,
+            "items".to_string(),
+            Handle::current(),
+            filters,
+            None,
+            None,
+            Arc::new(Mutex::new(())),
+            in_flight,
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            tx,
+        );
+        exec.execute(0, Arc::new(TaskContext::default()))?
+            .try_collect()
+            .await
+    }
+
+    /// Fetches one key straight from the origin, to seed the cache.
+    async fn request_limit_warm(
+        source: &Arc<dyn TableProvider>,
+        filters: &[Expr],
+    ) -> Vec<RecordBatch> {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let plan = source
+            .scan(&state, None, filters, None)
+            .await
+            .expect("warm scan");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("warm collect")
+    }
+
+    fn request_limit_lits(values: &[String]) -> Vec<Expr> {
+        values.iter().map(|value| lit(value.as_str())).collect()
+    }
+
+    fn request_limit_strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    fn request_limit_summary(result: &datafusion::error::Result<Vec<RecordBatch>>) -> String {
+        match result {
+            Ok(batches) => format!(
+                "Ok(rows={})",
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+            ),
+            Err(e) => format!("Err({e})"),
+        }
+    }
+
+    const REQUEST_LIMIT_OVER_3: &str = "The HTTP connector would create 6 request partitions, which exceeds max_request_partitions=3.";
+
+    /// A partial hit is refused where a miss is: the query names 6 request
+    /// keys with `max_request_partitions = 3`, so it must not reach the origin
+    /// even though one key is cached. Regression test for the partial-hit fetch
+    /// (#16153), which split the missing keys into scans of 1, 2 and 2 that each
+    /// passed the limit.
+    #[tokio::test]
+    async fn partial_hit_over_request_limit_is_refused_like_a_miss() {
+        let paths = request_limit_strings(&["/a", "/b", "/c"]);
+        let queries = request_limit_strings(&["x=1", "y=1"]);
+        let (url, seen) = request_limit_counting_origin().await;
+        let source = request_limit_http_source(&url, &paths, Some(3));
+        let filters = vec![
+            col("request_path").in_list(request_limit_lits(&paths), false),
+            col("request_query").in_list(request_limit_lits(&queries), false),
+        ];
+
+        let cold = request_limit_run_caching_scan(&source, Vec::new(), filters.clone()).await;
+        assert_eq!(
+            seen.lock().drain(..).count(),
+            0,
+            "a refused miss sends nothing"
+        );
+        let cold_error = cold
+            .expect_err("a miss over the limit is refused")
+            .to_string();
+        assert!(cold_error.contains(REQUEST_LIMIT_OVER_3), "{cold_error}");
+
+        let warm = request_limit_warm(
+            &source,
+            &[
+                col("request_path").eq(lit("/a")),
+                col("request_query").eq(lit("x=1")),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen.lock().drain(..).collect::<Vec<_>>(),
+            vec!["GET /a?x=1 HTTP/1.1"]
+        );
+
+        let partial = request_limit_run_caching_scan(&source, warm, filters).await;
+        let summary = request_limit_summary(&partial);
+        let requests = seen.lock().drain(..).collect::<Vec<_>>();
+        eprintln!("partial hit over the limit: {summary} origin_requests={requests:?}");
+        assert_eq!(
+            requests,
+            Vec::<String>::new(),
+            "no origin request: {summary}"
+        );
+        let partial_error = partial
+            .expect_err("a partial hit over the limit is refused")
+            .to_string();
+        assert_eq!(
+            partial_error, cold_error,
+            "the partial hit fails as the miss does"
+        );
+    }
+
+    /// Within the limit, a partial hit still fetches exactly the missing keys
+    /// and returns every named key (#16153).
+    #[tokio::test]
+    async fn partial_hit_within_request_limit_fetches_missing_keys() {
+        let paths = request_limit_strings(&["/a", "/b", "/c"]);
+        let (url, seen) = request_limit_counting_origin().await;
+        let source = request_limit_http_source(&url, &paths, Some(3));
+        let filters = vec![
+            col("request_path").in_list(request_limit_lits(&paths), false),
+            col("request_query").eq(lit("x=1")),
+        ];
+        let warm = request_limit_warm(
+            &source,
+            &[
+                col("request_path").eq(lit("/a")),
+                col("request_query").eq(lit("x=1")),
+            ],
+        )
+        .await;
+        seen.lock().clear();
+
+        let batches = request_limit_run_caching_scan(&source, warm, filters)
+            .await
+            .expect("a partial hit within the limit succeeds");
+        let mut requests = seen.lock().drain(..).collect::<Vec<_>>();
+        requests.sort();
+        assert_eq!(
+            requests,
+            vec!["GET /b?x=1 HTTP/1.1", "GET /c?x=1 HTTP/1.1"],
+            "only the missing keys are fetched"
+        );
+        let mut paths_returned: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("request_path")
+                    .expect("request_path")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 request_path");
+                (0..column.len())
+                    .map(|i| column.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        paths_returned.sort();
+        assert_eq!(paths_returned, vec!["/a", "/b", "/c"]);
+    }
+
+    /// A full hit sends no request, so the limit does not apply: six cached
+    /// keys are served with `max_request_partitions = 3`.
+    #[tokio::test]
+    async fn full_hit_over_request_limit_is_served_from_cache() {
+        let paths = request_limit_strings(&["/a", "/b", "/c"]);
+        let queries = request_limit_strings(&["x=1", "y=1"]);
+        let (url, seen) = request_limit_counting_origin().await;
+        let source = request_limit_http_source(&url, &paths, Some(3));
+        let mut cached = Vec::new();
+        for path in &paths {
+            for query in &queries {
+                cached.extend(
+                    request_limit_warm(
+                        &source,
+                        &[
+                            col("request_path").eq(lit(path.as_str())),
+                            col("request_query").eq(lit(query.as_str())),
+                        ],
+                    )
+                    .await,
+                );
+            }
+        }
+        seen.lock().clear();
+        let filters = vec![
+            col("request_path").in_list(request_limit_lits(&paths), false),
+            col("request_query").in_list(request_limit_lits(&queries), false),
+        ];
+
+        let batches = request_limit_run_caching_scan(&source, cached, filters)
+            .await
+            .expect("a full hit is served");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 6);
+        assert_eq!(seen.lock().drain(..).count(), 0, "a full hit sends nothing");
+    }
+
+    /// A partial hit over the limit is refused before its request keys are
+    /// expanded: the error counts the query's 1,000,000 keys, not the
+    /// keys of one split scan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_hit_over_request_limit_is_refused_before_expansion() {
+        let paths: Vec<String> = (0..50).map(|i| format!("/p{i}")).collect();
+        let queries: Vec<String> = (0..200).map(|i| format!("q={i}")).collect();
+        let bodies: Vec<String> = (0..100).map(|i| format!("b{i}")).collect();
+        let (url, seen) = request_limit_counting_origin().await;
+        let source = request_limit_http_source(&url, &paths, Some(3));
+        let filters = vec![
+            col("request_path").in_list(request_limit_lits(&paths), false),
+            col("request_query").in_list(request_limit_lits(&queries), false),
+            col("request_body").in_list(request_limit_lits(&bodies), false),
+        ];
+        let warm = request_limit_warm(
+            &source,
+            &[
+                col("request_path").eq(lit("/p0")),
+                col("request_query").eq(lit("q=0")),
+                col("request_body").eq(lit("b0")),
+            ],
+        )
+        .await;
+        seen.lock().clear();
+
+        let started = std::time::Instant::now();
+        let partial = request_limit_run_caching_scan(&source, warm, filters).await;
+        let elapsed = started.elapsed();
+        eprintln!(
+            "partial hit, 1000000 keys: {elapsed:?} {}",
+            request_limit_summary(&partial)
+        );
+        assert_eq!(seen.lock().drain(..).count(), 0);
+        let error = partial.expect_err("refused").to_string();
+        assert!(
+            error.contains(
+                "would create 1000000 request partitions, which exceeds max_request_partitions=3"
+            ),
+            "{error}"
         );
     }
 
@@ -9348,16 +9770,16 @@ mod tests {
             _filters: &[Expr],
             _limit: Option<usize>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.session_ids
-                .write()
-                .push(state.session_id().to_string());
-            Ok(Arc::new(DataSourceExec::new(Arc::new(
-                MemorySourceConfig::try_new(
+            let session_ids = Arc::clone(&self.session_ids);
+            let session_id = state.session_id().to_string();
+            Ok(RecordOnExecute::wrap(
+                Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
                     std::slice::from_ref(&self.data),
                     Arc::clone(&self.schema),
                     None,
-                )?,
-            ))))
+                )?))),
+                move || session_ids.write().push(session_id.clone()),
+            ))
         }
     }
 
@@ -9651,6 +10073,88 @@ mod tests {
     /// Unix nanoseconds for `ago` before `now_nanos`.
     fn nanos_ago(now_nanos: i64, ago: Duration) -> i64 {
         now_nanos - i64::try_from(ago.as_nanos()).expect("duration fits in i64 nanoseconds")
+    }
+
+    /// Runs `record` each time the plan executes. A mock origin records here,
+    /// not in `scan()`: an HTTP origin is contacted when a plan runs, while
+    /// planning alone (the request-limit check on a partial hit) sends nothing.
+    struct RecordOnExecute {
+        inner: Arc<dyn ExecutionPlan>,
+        record: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl RecordOnExecute {
+        fn wrap(
+            inner: Arc<dyn ExecutionPlan>,
+            record: impl Fn() + Send + Sync + 'static,
+        ) -> Arc<dyn ExecutionPlan> {
+            Arc::new(Self {
+                inner,
+                record: Arc::new(record),
+            })
+        }
+    }
+
+    impl fmt::Debug for RecordOnExecute {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.debug_struct("RecordOnExecute")
+                .field("inner", &self.inner)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl DisplayAs for RecordOnExecute {
+        fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            self.inner.fmt_as(t, f)
+        }
+    }
+
+    impl ExecutionPlan for RecordOnExecute {
+        fn name(&self) -> &'static str {
+            "RecordOnExecute"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                inner: Arc::clone(&children[0]),
+                record: Arc::clone(&self.record),
+            }))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            (self.record)();
+            self.inner.execute(partition, context)
+        }
     }
 
     #[derive(Debug)]

@@ -1231,7 +1231,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new(CACHE_NAMESPACE_COLUMN, DataType::Utf8, false),
         ]);
-        assert!(entry_key_columns(&schema).is_empty());
+        assert_eq!(entry_key_columns(&schema), [] as [String; 0]);
     }
 
     /// An entry for tests that never resolve a key — only `partition_doomed`'s
@@ -2779,7 +2779,7 @@ mod tests {
             ),
         ]);
 
-        assert!(unmeasurable_payload_columns(&schema).is_empty());
+        assert_eq!(unmeasurable_payload_columns(&schema), [] as [String; 0]);
     }
 
     #[test]

@@ -945,7 +945,7 @@ async fn a_copied_location_serves_the_same_rows_from_its_own_objects() {
         .try_collect()
         .await
         .expect("list the location");
-    assert!(!objects.is_empty());
+    assert_ne!(objects, [] as [ObjectMeta; 0]);
     for meta in &objects {
         let rest = meta
             .location

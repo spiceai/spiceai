@@ -19,9 +19,12 @@ datafusion-datasource.workspace = true
 datafusion-physical-expr.workspace = true
 object_store.workspace = true
 snafu.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tokio-util = { workspace = true, features = ["io", "io-util"] }
 tracing.workspace = true
 
 [dev-dependencies]
+flate2 = "1.1"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

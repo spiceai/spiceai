@@ -236,15 +236,35 @@ fn initial_protected_rows_and_fenced_rewrite_durable_cleanup() {
             "Recover",
         ],
     );
-    assert!(steps[0].durable_current_rows.is_empty());
+    assert_eq!(
+        steps[0].durable_current_rows.len(),
+        0,
+        "{:?}",
+        steps[0].durable_current_rows
+    );
     assert_eq!(
         steps[0].durable_protected_rows,
         vec![(1, vec![(0, 1), (1, 2)])]
     );
-    assert!(!steps[5].durable_delete_vectors.is_empty());
+    assert_ne!(
+        steps[5].durable_delete_vectors.len(),
+        0,
+        "{:?}",
+        steps[5].durable_delete_vectors
+    );
     assert_eq!(steps[5].durable_insert_records, [4, 0]);
-    assert!(steps[7].durable_protected_rows.is_empty());
-    assert!(steps[7].durable_delete_vectors.is_empty());
+    assert_eq!(
+        steps[7].durable_protected_rows.len(),
+        0,
+        "{:?}",
+        steps[7].durable_protected_rows
+    );
+    assert_eq!(
+        steps[7].durable_delete_vectors.len(),
+        0,
+        "{:?}",
+        steps[7].durable_delete_vectors
+    );
     assert_eq!(steps[7].durable_insert_records, [0, 0]);
     assert_eq!(steps[9].live_rows, vec![(0, 10), (1, 2)]);
 }
@@ -449,8 +469,18 @@ fn sqlite_stage_is_commit_and_flush_is_idempotent() {
     let actions = ["Upsert(0, 10)", "CkCapture", "CkPrecompute", "CkStage"];
     let deferred = trace("mem-tier-seal-delete-only", &actions);
     let sqlite = trace("mem-tier-seal-delete-only-sqlite", &actions);
-    assert!(!deferred[3].pending_changes.is_empty());
-    assert!(sqlite[3].pending_changes.is_empty());
+    assert_ne!(
+        deferred[3].pending_changes.len(),
+        0,
+        "{:?}",
+        deferred[3].pending_changes
+    );
+    assert_eq!(
+        sqlite[3].pending_changes.len(),
+        0,
+        "{:?}",
+        sqlite[3].pending_changes
+    );
     assert_eq!(sqlite[3].durable, deferred[3].durable_plus_pending);
     assert_ne!(deferred[3].durable, deferred[3].durable_plus_pending);
     assert_eq!(deferred[3].durable_plus_pending.insert_records, [4, 0]);
