@@ -218,9 +218,15 @@ list, empty or not, whenever the cluster is readable, including before the names
 {{- end -}}
 
 {{/*
-The Spicepod the runtime reads: `spicepod`, plus the `runtime.auth` that reads the chart's API
-key (`auth.mode: api_key`), or the Service's own names in `runtime.allowed_hosts`
-(`auth.mode: none`), so in-cluster clients that address the Service by name are answered.
+The Spicepod the runtime reads: `spicepod`, plus what `auth.mode` adds to it.
+
+api_key: `runtime.auth` with one read-write key, the `SPICE_API_KEY` that the Deployment sets
+from the API key Secret.
+
+none: the Service's own names, so that in-cluster clients that address the Service by name are
+answered. They join the hosts list the Spicepod already has, `runtime.allowed_hosts` or the
+deprecated `runtime.mcp.allowed_hosts` (the runtime refuses to start with both), or
+`runtime.allowed_hosts` when it has neither.
 */}}
 {{- define "spiceai.spicepod" -}}
 {{- $pod := deepCopy .Values.spicepod -}}
@@ -231,8 +237,14 @@ key (`auth.mode: api_key`), or the Service's own names in `runtime.allowed_hosts
 {{- else if eq $mode "none" -}}
 {{- $name := include "spiceai.fullname" . -}}
 {{- $namespace := include "spiceai.namespace" . -}}
-{{- $hosts := concat ($runtime.allowed_hosts | default list) (list $name (printf "%s.%s" $name $namespace) (printf "%s.%s.svc" $name $namespace) (printf "%s.%s.svc.cluster.local" $name $namespace)) -}}
-{{- $_ := set $runtime "allowed_hosts" ($hosts | uniq) -}}
+{{- $serviceHosts := list $name (printf "%s.%s" $name $namespace) (printf "%s.%s.svc" $name $namespace) (printf "%s.%s.svc.cluster.local" $name $namespace) -}}
+{{- $mcp := $runtime.mcp | default dict -}}
+{{- if and (kindIs "invalid" $runtime.allowed_hosts) (not (kindIs "invalid" $mcp.allowed_hosts)) -}}
+{{- $_ := set $mcp "allowed_hosts" (concat $mcp.allowed_hosts $serviceHosts | uniq) -}}
+{{- $_ := set $runtime "mcp" $mcp -}}
+{{- else -}}
+{{- $_ := set $runtime "allowed_hosts" (concat ($runtime.allowed_hosts | default list) $serviceHosts | uniq) -}}
+{{- end -}}
 {{- end -}}
 {{- if $runtime -}}
 {{- $_ := set $pod "runtime" $runtime -}}

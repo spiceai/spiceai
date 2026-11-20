@@ -21,7 +21,7 @@ Send it as `X-API-Key: <key>` over HTTP, or as the password of a Flight handshak
 
 - **Your own key**: create a Secret with an `api-key` entry and set `auth.apiKey.existingSecret` to its name.
 - **Your own `runtime.auth`**: when `spicepod.runtime.auth` is set, the chart adds no key and uses yours as written.
-- **No API key**: `auth.mode: none`, on a `ClusterIP` Service only; the chart refuses it with a `NodePort` or `LoadBalancer` Service. Anonymous callers then get the runtime's rules for unauthenticated callers on a non-loopback listener, and the chart adds the Service's names to `runtime.allowed_hosts` so in-cluster clients can address it by name.
+- **No API key**: `auth.mode: none`, on a `ClusterIP` Service only; the chart refuses it with a `NodePort` or `LoadBalancer` Service. Anonymous callers then get the runtime's rules for unauthenticated callers on a non-loopback listener, and the chart adds the Service's names to the Spicepod's allowed hosts so in-cluster clients can address it by name: to `runtime.allowed_hosts`, or to the deprecated `runtime.mcp.allowed_hosts` when the Spicepod sets only that list.
 
 ### GitOps (Argo CD, `helm template`)
 
