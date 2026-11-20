@@ -842,7 +842,7 @@ mod tests {
             ],
         );
         assert_eq!(id.primary_key, cols(&["tenant", "sku"]));
-        assert!(id.identity_index.is_empty());
+        assert_eq!(id.identity_index, [] as [String; 0]);
     }
 
     #[test]
@@ -854,7 +854,7 @@ mod tests {
                 (Some(false), Some(true), Some("b".to_string())),
             ],
         );
-        assert!(id.primary_key.is_empty());
+        assert_eq!(id.primary_key, [] as [String; 0]);
         assert_eq!(id.identity_index, cols(&["a", "b"]));
     }
 
@@ -869,7 +869,7 @@ mod tests {
                 (Some(false), Some(true), None),
             ],
         );
-        assert!(id.identity_index.is_empty());
+        assert_eq!(id.identity_index, [] as [String; 0]);
     }
 
     #[test]
@@ -877,8 +877,8 @@ mod tests {
         // A keyless table returns a single all-NULL index row (just the mode).
         let id =
             accumulate_replica_identity(ReplicaIdentityMode::Default, vec![(None, None, None)]);
-        assert!(id.primary_key.is_empty());
-        assert!(id.identity_index.is_empty());
+        assert_eq!(id.primary_key, [] as [String; 0]);
+        assert_eq!(id.identity_index, [] as [String; 0]);
     }
 
     #[test]

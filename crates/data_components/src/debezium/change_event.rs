@@ -460,7 +460,7 @@ mod tests {
         .to_string();
 
         let key = ChangeEventKey::from_bytes(key_json.as_bytes()).expect("key parses");
-        assert!(key.get_primary_key().is_empty());
+        assert_eq!(key.get_primary_key(), [] as [String; 0]);
     }
 
     #[test]

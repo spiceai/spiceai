@@ -1874,7 +1874,7 @@ async fn kill_at_every_request(step: Step) {
     let steps = process.instance.steps();
     process.table.quiesce().await;
     drop(process);
-    assert!(!steps.is_empty());
+    assert_ne!(steps, [] as [String; 0]);
     eprintln!("{step:?}: {} storage requests", steps.len());
     if matches!(step, Step::Append | Step::Upsert | Step::ChangeStreamUpsert) {
         // Each data file is written once, at its final key: nothing is staged,
