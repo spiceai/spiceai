@@ -28,11 +28,18 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     flight_service_server::FlightService,
 };
+use ballista_core::execution_plans::range_shuffle::index_path as range_index_path;
+use ballista_core::execution_plans::sort_shuffle::get_index_path;
 use ballista_core::serde::decode_protobuf;
+use ballista_core::serde::protobuf;
 use ballista_core::serde::scheduler::Action as BallistaAction;
+use ballista_core::serde::scheduler::{ShuffleFileKind, ShuffleLayout};
 use ballista_executor::flight_service::BallistaFlightService;
+use prost::Message;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::flight::Service as SpiceFlightService;
@@ -56,7 +63,7 @@ pub struct CompositeFlightService {
     /// path. `None` when the executor has no work directory, or when the
     /// current directory cannot be read to resolve it; every explicit path is
     /// then refused.
-    work_dir: Option<ShuffleWorkDir>,
+    work_dir: Option<Arc<ShuffleWorkDir>>,
 }
 
 /// A shuffle work directory and the directory relative paths resolve against,
@@ -69,6 +76,22 @@ struct ShuffleWorkDir {
     base: PathBuf,
     /// The work directory, absolute and lexically normalized.
     dir: PathBuf,
+    /// The work directory with its symbolic links resolved, read from the
+    /// filesystem the first time a fetch finds it there.
+    resolved: OnceLock<PathBuf>,
+}
+
+/// Why a fetch was refused after its path was resolved.
+#[derive(Debug)]
+enum Refusal {
+    /// `file`, a file the fetch would open, resolves to `resolved`, which is
+    /// outside the work directory.
+    Outside { file: PathBuf, resolved: PathBuf },
+    /// `file`, a file the fetch would open, could not be resolved.
+    Unresolvable {
+        file: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl ShuffleWorkDir {
@@ -82,7 +105,11 @@ impl ShuffleWorkDir {
             configured
         };
         let dir = absolute_lexically(&base, Path::new(configured));
-        Ok(Self { base, dir })
+        Ok(Self {
+            base,
+            dir,
+            resolved: OnceLock::new(),
+        })
     }
 
     /// Whether `path`, made absolute and normalized, sits inside the work
@@ -90,6 +117,110 @@ impl ShuffleWorkDir {
     fn contains(&self, path: &str) -> bool {
         absolute_lexically(&self.base, Path::new(path)).starts_with(&self.dir)
     }
+
+    /// The work directory with its symbolic links resolved, or `None` while
+    /// it does not exist.
+    fn resolved(&self) -> Option<&Path> {
+        if let Some(dir) = self.resolved.get() {
+            return Some(dir);
+        }
+        let dir = std::fs::canonicalize(&self.dir).ok()?;
+        Some(self.resolved.get_or_init(|| dir))
+    }
+
+    /// Checks every file Ballista opens to serve a fetch for `path` against
+    /// the work directory, with symbolic links resolved on both sides, and
+    /// returns the path to forward in place of `path`: the requested file
+    /// with its links resolved, or `None` when it does not exist, so the fetch
+    /// reaches Ballista unchanged and fails as it always has (a missing file is
+    /// an empty partition that was never written).
+    ///
+    /// Ballista opens the file the fetch names, which is the data file or, for
+    /// an index request, the index its `layout` puts beside it; and it reads the
+    /// sort shuffle's index beside that file whenever one exists. Each of them
+    /// that exists must resolve inside the work directory.
+    ///
+    /// Ballista opens files by path, so a path component replaced with a
+    /// symbolic link after this check and before Ballista opens the file is
+    /// still followed. Closing that window takes an open that refuses to
+    /// follow links at each component, which belongs to the fetch service that
+    /// opens the file.
+    ///
+    /// This blocks on the filesystem.
+    fn resolve_fetch(
+        &self,
+        path: &str,
+        layout: ShuffleLayout,
+        file_kind: ShuffleFileKind,
+    ) -> Result<Option<PathBuf>, Refusal> {
+        let requested = self.base.join(path);
+        let forwarded = match resolve_existing(&requested)? {
+            Some(resolved) => {
+                self.ensure_inside(&requested, &resolved)?;
+                Some(resolved)
+            }
+            None => None,
+        };
+        let data = forwarded.as_deref().unwrap_or(requested.as_path());
+        let named = match file_kind {
+            ShuffleFileKind::Data => data.to_path_buf(),
+            ShuffleFileKind::Index => match layout {
+                ShuffleLayout::Sort => get_index_path(data),
+                ShuffleLayout::Passthrough => range_index_path(data),
+            },
+        };
+        let sort_index = get_index_path(&named);
+        for file in [named, sort_index] {
+            // `data` itself was resolved above.
+            if file == data {
+                continue;
+            }
+            if let Some(resolved) = resolve_existing(&file)? {
+                self.ensure_inside(&file, &resolved)?;
+            }
+        }
+        Ok(forwarded)
+    }
+
+    /// Refuses `file` unless `resolved`, its path with links resolved, lies
+    /// inside the work directory with its links resolved.
+    fn ensure_inside(&self, file: &Path, resolved: &Path) -> Result<(), Refusal> {
+        match self.resolved() {
+            Some(dir) if resolved.starts_with(dir) => Ok(()),
+            _ => Err(Refusal::Outside {
+                file: file.to_path_buf(),
+                resolved: resolved.to_path_buf(),
+            }),
+        }
+    }
+}
+
+/// `path` with every symbolic link resolved, or `None` when it does not exist
+/// (opening it then fails without reading anything).
+fn resolve_existing(path: &Path) -> Result<Option<PathBuf>, Refusal> {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(None),
+        Err(source) => Err(Refusal::Unresolvable {
+            file: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// `encoded`, a Ballista fetch action, with the file path it names replaced by
+/// `path`.
+fn with_fetch_path(encoded: &[u8], path: String) -> Result<bytes::Bytes, Status> {
+    let mut action = protobuf::Action::decode(encoded)
+        .map_err(|e| Status::invalid_argument(format!("invalid fetch action: {e}")))?;
+    let Some(protobuf::action::ActionType::FetchPartition(fetch)) = action.action_type.as_mut()
+    else {
+        return Err(Status::invalid_argument(
+            "invalid fetch action: it names no partition",
+        ));
+    };
+    fetch.path = path;
+    Ok(action.encode_to_vec().into())
 }
 
 impl CompositeFlightService {
@@ -100,20 +231,27 @@ impl CompositeFlightService {
         Self {
             ballista: BallistaFlightService::new(),
             spice,
-            work_dir: work_dir.and_then(|dir| ShuffleWorkDir::new(&dir).ok()),
+            work_dir: work_dir.and_then(|dir| ShuffleWorkDir::new(&dir).ok().map(Arc::new)),
         }
     }
 
     /// Refuses a Ballista fetch whose explicit file path escapes this executor's
-    /// shuffle work directory. A shuffle fetch names the output file a map task
-    /// wrote under the work directory; a path outside it — or a traversal out of
-    /// it — would read an unrelated file the executor process can open, so it is
-    /// refused. An empty path (resolved by the executor from the fetch
-    /// identifiers) and a `memory://` key address no file and pass through.
-    fn ensure_fetch_within_work_dir(&self, action: &BallistaAction) -> Result<(), Status> {
-        let BallistaAction::FetchPartition { path, .. } = action;
+    /// shuffle work directory, and returns the path to forward to Ballista in
+    /// its place. A shuffle fetch names the output file a map task wrote under
+    /// the work directory; a path outside it — a traversal out of it, or a
+    /// symbolic link under it that leads out — would read an unrelated file the
+    /// executor process can open, so it is refused. An empty path (resolved by
+    /// the executor from the fetch identifiers) and a `memory://` key address
+    /// no file and pass through unchanged, as does a file that does not exist.
+    async fn confine_fetch(&self, action: &BallistaAction) -> Result<Option<String>, Status> {
+        let BallistaAction::FetchPartition {
+            path,
+            layout,
+            file_kind,
+            ..
+        } = action;
         if path.is_empty() || path.starts_with("memory://") {
-            return Ok(());
+            return Ok(None);
         }
         let Some(work_dir) = &self.work_dir else {
             tracing::warn!(
@@ -123,16 +261,64 @@ impl CompositeFlightService {
                 "shuffle fetch by explicit path is not served by this executor",
             ));
         };
-        if work_dir.contains(path) {
-            return Ok(());
+        if !work_dir.contains(path) {
+            tracing::warn!(
+                "Refused a cluster shuffle fetch for '{path}', which is outside this executor's shuffle work directory '{}': a cluster peer may fetch only shuffle output this executor wrote there.",
+                work_dir.dir.display()
+            );
+            return Err(Status::permission_denied(
+                "shuffle fetch path is outside this executor's work directory",
+            ));
         }
-        tracing::warn!(
-            "Refused a cluster shuffle fetch for '{path}', which is outside this executor's shuffle work directory '{}': a cluster peer may fetch only shuffle output this executor wrote there.",
-            work_dir.dir.display()
-        );
-        Err(Status::permission_denied(
-            "shuffle fetch path is outside this executor's work directory",
-        ))
+        // Resolving links reads the filesystem, so it runs off the async
+        // threads, in a single blocking task that checks every file the fetch
+        // opens.
+        let resolution = {
+            let work_dir = Arc::clone(work_dir);
+            let path = path.clone();
+            let (layout, file_kind) = (*layout, *file_kind);
+            tokio::task::spawn_blocking(move || work_dir.resolve_fetch(&path, layout, file_kind))
+                .await
+        };
+        match resolution {
+            Ok(Ok(None)) => Ok(None),
+            Ok(Ok(Some(resolved))) => match resolved.into_os_string().into_string() {
+                Ok(resolved) => Ok(Some(resolved)),
+                Err(resolved) => {
+                    tracing::warn!(
+                        "Refused a cluster shuffle fetch for '{path}': it resolves to '{}', a path that is not valid UTF-8, which this executor cannot serve.",
+                        resolved.display()
+                    );
+                    Err(Status::permission_denied(
+                        "shuffle fetch path cannot be served by this executor",
+                    ))
+                }
+            },
+            Ok(Err(Refusal::Outside { file, resolved })) => {
+                tracing::warn!(
+                    "Refused a cluster shuffle fetch for '{path}': '{}' resolves to '{}', which is outside this executor's shuffle work directory '{}': a cluster peer may fetch only shuffle output this executor wrote there.",
+                    file.display(),
+                    resolved.display(),
+                    work_dir.dir.display()
+                );
+                Err(Status::permission_denied(
+                    "shuffle fetch path is outside this executor's work directory",
+                ))
+            }
+            Ok(Err(Refusal::Unresolvable { file, source })) => {
+                tracing::warn!(
+                    "Refused a cluster shuffle fetch for '{path}': '{}' could not be resolved to check that it is inside this executor's shuffle work directory '{}'. Cause: {source}",
+                    file.display(),
+                    work_dir.dir.display()
+                );
+                Err(Status::permission_denied(
+                    "shuffle fetch path cannot be resolved inside this executor's work directory",
+                ))
+            }
+            Err(e) => Err(Status::internal(format!(
+                "shuffle fetch path could not be checked: {e}"
+            ))),
+        }
     }
 }
 
@@ -145,11 +331,10 @@ impl CompositeFlightService {
 /// is not known here, and is dropped at the root of an absolute path, which
 /// the operating system resolves `/..` to.
 ///
-/// The check is lexical and does not resolve symbolic links: a link under the
-/// work directory that points elsewhere passes it. It is a first gate on the
-/// request, not a guarantee about the file that is opened; that takes an open
-/// that refuses to follow links, which belongs to the fetch service that
-/// opens the file.
+/// This is the first gate on a request, and it does not resolve symbolic
+/// links: [`ShuffleWorkDir::resolve_fetch`] resolves them next, for every file
+/// the fetch opens, and the fetch is forwarded with the requested file's
+/// resolved path.
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -243,9 +428,18 @@ impl FlightService for CompositeFlightService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         // A Ballista-format ticket is a shuffle fetch: confine it to the work
-        // directory before serving the file it names.
+        // directory before serving the file it names, by its resolved path.
         if let Ok(action) = decode_protobuf(&request.get_ref().ticket) {
-            self.ensure_fetch_within_work_dir(&action)?;
+            let request = match self.confine_fetch(&action).await? {
+                Some(path) => {
+                    let (metadata, extensions, ticket) = request.into_parts();
+                    let ticket = Ticket {
+                        ticket: with_fetch_path(&ticket.ticket, path)?,
+                    };
+                    Request::from_parts(metadata, extensions, ticket)
+                }
+                None => request,
+            };
             return self.ballista.do_get(request).await;
         }
         // Otherwise route to Spice for SQL/FlightSQL
@@ -259,10 +453,20 @@ impl FlightService for CompositeFlightService {
         // Route based. BallistaFlightService only handles IO_BLOCK_TRANSPORT actions.
         if request.get_ref().r#type == "IO_BLOCK_TRANSPORT" {
             // The action body names a file to serve; confine it to the work
-            // directory first.
+            // directory first, and serve it by its resolved path.
             let action = decode_protobuf(&request.get_ref().body)
                 .map_err(|e| Status::invalid_argument(format!("invalid fetch action: {e}")))?;
-            self.ensure_fetch_within_work_dir(&action)?;
+            let request = match self.confine_fetch(&action).await? {
+                Some(path) => {
+                    let (metadata, extensions, action) = request.into_parts();
+                    let action = Action {
+                        r#type: action.r#type,
+                        body: with_fetch_path(&action.body, path)?,
+                    };
+                    Request::from_parts(metadata, extensions, action)
+                }
+                None => request,
+            };
             return self.ballista.do_action(request).await;
         }
         // All other actions go to Spice
@@ -285,7 +489,7 @@ impl FlightService for CompositeFlightService {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShuffleWorkDir, normalize_lexically};
+    use super::{Refusal, ShuffleFileKind, ShuffleLayout, ShuffleWorkDir, normalize_lexically};
     use std::path::Path;
 
     #[test]
@@ -369,5 +573,101 @@ mod tests {
             Path::new("../../y")
         );
         assert_eq!(normalize_lexically(Path::new("a/./..")), Path::new(""));
+    }
+
+    /// The outcome of resolving a fetch for `path`, with paths shown relative
+    /// to `root` so the expectations read the same wherever the test runs.
+    fn resolution(
+        work_dir: &ShuffleWorkDir,
+        root: &Path,
+        path: &Path,
+        layout: ShuffleLayout,
+        file_kind: ShuffleFileKind,
+    ) -> String {
+        let shown = |p: &Path| {
+            p.strip_prefix(root)
+                .map_or_else(|_| p.display().to_string(), |p| p.display().to_string())
+        };
+        let path = path.to_str().expect("utf-8 path");
+        match work_dir.resolve_fetch(path, layout, file_kind) {
+            Ok(Some(resolved)) => format!("forward {}", shown(&resolved)),
+            Ok(None) => "forward unchanged".to_string(),
+            Err(Refusal::Outside { file, resolved }) => {
+                format!("refuse {} -> {}", shown(&file), shown(&resolved))
+            }
+            Err(Refusal::Unresolvable { file, source }) => {
+                format!("unresolvable {}: {:?}", shown(&file), source.kind())
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fetch_is_judged_by_the_files_its_links_lead_to() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        // The work directory is configured through a link, as an operator's
+        // mount or the platform's temporary directory may be: its files must
+        // still count as inside it.
+        let real = root.join("disk").join("shuffle");
+        let job = real.join("job-1").join("0");
+        std::fs::create_dir_all(&job).expect("create work dir");
+        symlink(&real, root.join("shuffle")).expect("link work dir");
+        let outside = root.join("secrets");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        std::fs::write(outside.join("key.pem"), b"secret").expect("write outside file");
+
+        std::fs::write(job.join("data.arrow"), b"data").expect("write data");
+        std::fs::write(job.join("sorted.arrow"), b"data").expect("write data");
+        symlink(outside.join("key.pem"), job.join("sorted.arrow.index")).expect("link");
+        symlink(outside.join("key.pem"), job.join("link.arrow")).expect("link");
+        symlink(&outside, real.join("escape")).expect("link");
+        symlink(outside.join("key.pem"), job.join("ranged.rangeidx.arrow")).expect("link");
+        symlink(job.join("data.arrow"), job.join("alias.arrow")).expect("link");
+        symlink(outside.join("missing.pem"), job.join("dangling.arrow")).expect("link");
+        symlink(job.join("loop-b.arrow"), job.join("loop-a.arrow")).expect("link");
+        symlink(job.join("loop-a.arrow"), job.join("loop-b.arrow")).expect("link");
+
+        let work_dir =
+            ShuffleWorkDir::new(root.join("shuffle").to_str().expect("utf-8 path")).expect("cwd");
+        let configured = root.join("shuffle").join("job-1").join("0");
+        let (data, sort, index) = (
+            ShuffleFileKind::Data,
+            ShuffleLayout::Sort,
+            ShuffleFileKind::Index,
+        );
+        let passthrough = ShuffleLayout::Passthrough;
+        let outcomes: Vec<String> = [
+            (configured.join("data.arrow"), passthrough, data),
+            (configured.join("alias.arrow"), passthrough, data),
+            (configured.join("never-written.arrow"), passthrough, data),
+            (configured.join("dangling.arrow"), passthrough, data),
+            (configured.join("link.arrow"), passthrough, data),
+            (root.join("shuffle/escape/key.pem"), passthrough, data),
+            (configured.join("sorted.arrow"), sort, data),
+            (configured.join("sorted.arrow"), sort, index),
+            (configured.join("ranged.arrow"), passthrough, index),
+            (configured.join("loop-a.arrow"), passthrough, data),
+        ]
+        .into_iter()
+        .map(|(path, layout, kind)| resolution(&work_dir, &root, &path, layout, kind))
+        .collect();
+        assert_eq!(
+            outcomes,
+            [
+                "forward disk/shuffle/job-1/0/data.arrow",
+                "forward disk/shuffle/job-1/0/data.arrow",
+                "forward unchanged",
+                "forward unchanged",
+                "refuse shuffle/job-1/0/link.arrow -> secrets/key.pem",
+                "refuse shuffle/escape/key.pem -> secrets/key.pem",
+                "refuse disk/shuffle/job-1/0/sorted.arrow.index -> secrets/key.pem",
+                "refuse disk/shuffle/job-1/0/sorted.arrow.index -> secrets/key.pem",
+                "refuse shuffle/job-1/0/ranged.rangeidx.arrow -> secrets/key.pem",
+                "unresolvable shuffle/job-1/0/loop-a.arrow: FilesystemLoop",
+            ]
+        );
     }
 }

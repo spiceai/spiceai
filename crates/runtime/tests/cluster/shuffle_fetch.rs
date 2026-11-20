@@ -17,7 +17,8 @@ limitations under the License.
 //! An executor serves a peer's shuffle fetch only from its shuffle work
 //! directory, including when `shuffle_location` is a relative path: a fetch is
 //! judged by the file it would open, so parent components that climb out of
-//! the executor's current directory are refused on both fetch paths, while
+//! the executor's current directory, and symbolic links under the work
+//! directory that lead out of it, are refused on both fetch paths, while
 //! shuffle output under the work directory is served whether it is named
 //! relative or absolute.
 
@@ -34,7 +35,9 @@ use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{Action, Ticket};
 use ballista_core::extension::SessionConfigExt;
-use ballista_core::serde::protobuf::{self, FetchPartition, action::ActionType};
+use ballista_core::serde::protobuf::{
+    self, FetchPartition, ShuffleFileKind, ShuffleLayout, action::ActionType,
+};
 use futures::TryStreamExt;
 use prost::Message;
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
@@ -48,13 +51,31 @@ use super::peer_identity::connect_verifying;
 
 const NAMES_CSV: &str = include_str!("../acceleration/data/names.csv");
 
-/// A `FetchPartition` for the file at `path`, encoded as both fetch paths carry
-/// it: the `IO_BLOCK_TRANSPORT` action body and the `do_get` ticket.
-fn fetch_partition(path: &str) -> Vec<u8> {
+/// Which file beside a fetch's `path` the executor opens.
+#[derive(Clone, Copy)]
+enum Opens {
+    /// The file at `path`.
+    Data,
+    /// The sort shuffle's index beside it.
+    SortIndex,
+    /// The range shuffle's value index beside it.
+    RangeIndex,
+}
+
+/// A `FetchPartition` for `path`, encoded as both fetch paths carry it: the
+/// `IO_BLOCK_TRANSPORT` action body and the `do_get` ticket.
+fn fetch_partition(path: &str, opens: Opens) -> Vec<u8> {
+    let (layout, file_kind) = match opens {
+        Opens::Data => (ShuffleLayout::Passthrough, ShuffleFileKind::Data),
+        Opens::SortIndex => (ShuffleLayout::Sort, ShuffleFileKind::Index),
+        Opens::RangeIndex => (ShuffleLayout::Passthrough, ShuffleFileKind::Index),
+    };
     protobuf::Action {
         action_type: Some(ActionType::FetchPartition(FetchPartition {
             job_id: "probe-job".to_string(),
             path: path.to_string(),
+            layout: layout.into(),
+            file_kind: file_kind.into(),
             ..Default::default()
         })),
         settings: Vec::new(),
@@ -64,10 +85,20 @@ fn fetch_partition(path: &str) -> Vec<u8> {
 
 /// The bytes an executor serves for `path` over `IO_BLOCK_TRANSPORT`.
 async fn fetch_block(channel: &Channel, path: &str) -> Result<Vec<u8>, tonic::Status> {
+    fetch_block_opening(channel, path, Opens::Data).await
+}
+
+/// The bytes an executor serves over `IO_BLOCK_TRANSPORT` for the file
+/// `opens` names beside `path`.
+async fn fetch_block_opening(
+    channel: &Channel,
+    path: &str,
+    opens: Opens,
+) -> Result<Vec<u8>, tonic::Status> {
     let stream = FlightServiceClient::new(channel.clone())
         .do_action(Action {
             r#type: "IO_BLOCK_TRANSPORT".to_string(),
-            body: fetch_partition(path).into(),
+            body: fetch_partition(path, opens).into(),
         })
         .await?
         .into_inner();
@@ -77,9 +108,19 @@ async fn fetch_block(channel: &Channel, path: &str) -> Result<Vec<u8>, tonic::St
 
 /// The record batches an executor serves for `path` over `do_get`.
 async fn fetch_batches(channel: &Channel, path: &str) -> Result<Vec<RecordBatch>, FlightError> {
+    fetch_batches_opening(channel, path, Opens::Data).await
+}
+
+/// The record batches an executor serves over `do_get` for the file `opens`
+/// names beside `path`.
+async fn fetch_batches_opening(
+    channel: &Channel,
+    path: &str,
+    opens: Opens,
+) -> Result<Vec<RecordBatch>, FlightError> {
     let stream = FlightServiceClient::new(channel.clone())
         .do_get(Ticket {
-            ticket: fetch_partition(path).into(),
+            ticket: fetch_partition(path, opens).into(),
         })
         .await?
         .into_inner()
@@ -87,6 +128,37 @@ async fn fetch_batches(channel: &Channel, path: &str) -> Result<Vec<RecordBatch>
     FlightRecordBatchStream::new_from_flight_data(stream)
         .try_collect()
         .await
+}
+
+/// What an `IO_BLOCK_TRANSPORT` fetch for `path` returned: the bytes served,
+/// or the status code it was refused with.
+async fn block_outcome(channel: &Channel, path: &str, opens: Opens) -> String {
+    match fetch_block_opening(channel, path, opens).await {
+        Ok(served) => format!(
+            "IO_BLOCK_TRANSPORT {path}: served {:?}",
+            String::from_utf8_lossy(&served)
+        ),
+        Err(refused) => format!("IO_BLOCK_TRANSPORT {path}: {:?}", refused.code()),
+    }
+}
+
+/// What a `do_get` fetch for `path` returned: the rows served, or the status
+/// code it was refused with.
+async fn batches_outcome(
+    channel: &Channel,
+    path: &str,
+    opens: Opens,
+) -> Result<String, anyhow::Error> {
+    Ok(match fetch_batches_opening(channel, path, opens).await {
+        Ok(served) => format!(
+            "do_get {path}: served {}",
+            arrow::util::pretty::pretty_format_batches(&served)?
+                .to_string()
+                .replace('\n', " ")
+        ),
+        Err(FlightError::Tonic(refused)) => format!("do_get {path}: {:?}", refused.code()),
+        Err(other) => format!("do_get {path}: {other:?}"),
+    })
 }
 
 /// Writes one batch with a single `marker` column as an Arrow IPC stream, the
@@ -226,30 +298,13 @@ async fn a_relative_shuffle_location_serves_fetches_only_from_its_work_directory
                     "../../shuffle/marker.txt",
                     "shuffle/../../../shuffle/marker.txt",
                 ] {
-                    outcomes.push(match fetch_block(&channel, path).await {
-                        Ok(served) => format!(
-                            "IO_BLOCK_TRANSPORT {path}: served {:?}",
-                            String::from_utf8_lossy(&served)
-                        ),
-                        Err(refused) => format!("IO_BLOCK_TRANSPORT {path}: {:?}", refused.code()),
-                    });
+                    outcomes.push(block_outcome(&channel, path, Opens::Data).await);
                 }
                 for path in [
                     "../../shuffle/marker.arrow",
                     "shuffle/../../../shuffle/marker.arrow",
                 ] {
-                    outcomes.push(match fetch_batches(&channel, path).await {
-                        Ok(served) => format!(
-                            "do_get {path}: served {}",
-                            arrow::util::pretty::pretty_format_batches(&served)?
-                                .to_string()
-                                .replace('\n', " ")
-                        ),
-                        Err(FlightError::Tonic(refused)) => {
-                            format!("do_get {path}: {:?}", refused.code())
-                        }
-                        Err(other) => format!("do_get {path}: {other:?}"),
-                    });
+                    outcomes.push(batches_outcome(&channel, path, Opens::Data).await?);
                 }
                 assert_eq!(
                     outcomes,
@@ -272,7 +327,40 @@ async fn a_relative_shuffle_location_serves_fetches_only_from_its_work_directory
                     "{absolute}"
                 );
                 let absolute = inside.join("stream.arrow").display().to_string();
-                assert_eq!(fetch_batches(&channel, &absolute).await?, vec![marker]);
+                assert_eq!(fetch_batches(&channel, &absolute).await?, vec![marker.clone()]);
+
+                // (5) A missing file under the work directory is an empty
+                //     partition, never written: both fetch paths report it as
+                //     not found, which the fetching executor reads as empty.
+                let missing = "shuffle/probe-job/1/0/never-written.arrow";
+                let refused = fetch_block(&channel, missing)
+                    .await
+                    .expect_err("a missing partition file is not served");
+                assert_eq!(refused.code(), tonic::Code::NotFound, "{refused:?}");
+                assert!(
+                    refused
+                        .message()
+                        .starts_with("partition file not found (empty partition)"),
+                    "{refused:?}"
+                );
+                match fetch_batches(&channel, missing).await {
+                    Err(FlightError::Tonic(refused)) => {
+                        assert_eq!(refused.code(), tonic::Code::NotFound, "{refused:?}");
+                        assert!(
+                            refused.message().starts_with(&format!(
+                                "partition file not found (empty partition) at {missing:?}"
+                            )),
+                            "{refused:?}"
+                        );
+                    }
+                    other => anyhow::bail!("expected NotFound for {missing}, got {other:?}"),
+                }
+
+                #[cfg(unix)]
+                symlinks_out_of_the_work_directory_are_refused(
+                    &channel, &cwd, &outside, &inside, &marker,
+                )
+                .await?;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -280,4 +368,86 @@ async fn a_relative_shuffle_location_serves_fetches_only_from_its_work_directory
             result
         })
         .await
+}
+
+/// (6) A symbolic link under the work directory is judged by the file it
+/// leads to: one that leads out of the work directory is refused on both
+/// fetch paths, whether it names the requested file, a directory on the way to
+/// it, or the index the executor opens beside it, while one that stays inside
+/// is served.
+#[cfg(unix)]
+async fn symlinks_out_of_the_work_directory_are_refused(
+    channel: &Channel,
+    cwd: &Path,
+    outside: &Path,
+    inside: &Path,
+    marker: &RecordBatch,
+) -> Result<(), anyhow::Error> {
+    use std::os::unix::fs::symlink;
+
+    // `inside` is `<cwd>/shuffle/probe-job/1/0`; `outside` holds the markers.
+    symlink(outside.join("marker.txt"), inside.join("link.txt"))?;
+    symlink(outside.join("marker.arrow"), inside.join("link.arrow"))?;
+    symlink(
+        outside,
+        cwd.join("shuffle").join("probe-job").join("escape"),
+    )?;
+    // Indexes the executor derives from a data file's name, for data files
+    // that were never written.
+    symlink(
+        outside.join("marker.txt"),
+        inside.join("sorted.arrow.index"),
+    )?;
+    symlink(
+        outside.join("marker.arrow"),
+        inside.join("ranged.rangeidx.arrow"),
+    )?;
+    // A link that stays inside the work directory.
+    symlink(inside.join("stream.arrow"), inside.join("alias.arrow"))?;
+
+    let absolute_link = inside.join("link.txt").display().to_string();
+    let outcomes = vec![
+        block_outcome(channel, "shuffle/probe-job/1/0/link.txt", Opens::Data).await,
+        block_outcome(channel, &absolute_link, Opens::Data).await,
+        block_outcome(channel, "shuffle/probe-job/escape/marker.txt", Opens::Data).await,
+        block_outcome(
+            channel,
+            "shuffle/probe-job/1/0/sorted.arrow",
+            Opens::SortIndex,
+        )
+        .await,
+        batches_outcome(channel, "shuffle/probe-job/1/0/link.arrow", Opens::Data).await?,
+        batches_outcome(
+            channel,
+            "shuffle/probe-job/escape/marker.arrow",
+            Opens::Data,
+        )
+        .await?,
+        batches_outcome(
+            channel,
+            "shuffle/probe-job/1/0/ranged.arrow",
+            Opens::RangeIndex,
+        )
+        .await?,
+    ];
+    assert_eq!(
+        outcomes,
+        [
+            "IO_BLOCK_TRANSPORT shuffle/probe-job/1/0/link.txt: PermissionDenied".to_string(),
+            format!("IO_BLOCK_TRANSPORT {absolute_link}: PermissionDenied"),
+            "IO_BLOCK_TRANSPORT shuffle/probe-job/escape/marker.txt: PermissionDenied".to_string(),
+            "IO_BLOCK_TRANSPORT shuffle/probe-job/1/0/sorted.arrow: PermissionDenied".to_string(),
+            "do_get shuffle/probe-job/1/0/link.arrow: PermissionDenied".to_string(),
+            "do_get shuffle/probe-job/escape/marker.arrow: PermissionDenied".to_string(),
+            "do_get shuffle/probe-job/1/0/ranged.arrow: PermissionDenied".to_string(),
+        ],
+        "every symbolic link that leads out of the work directory is refused"
+    );
+
+    assert_eq!(
+        fetch_batches(channel, "shuffle/probe-job/1/0/alias.arrow").await?,
+        vec![marker.clone()],
+        "a link that stays inside the work directory is served"
+    );
+    Ok(())
 }
