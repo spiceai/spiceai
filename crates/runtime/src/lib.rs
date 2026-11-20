@@ -810,6 +810,14 @@ pub struct Runtime {
     /// The Spicepod tool loads in progress, so a Spicepod change can stop the load of a
     /// configuration it replaces or removes.
     tool_loads: Arc<init::model::LoadTasks>,
+    /// The embedding model loads in progress, kept apart from `model_loads` because a model and
+    /// an embedding model can share a name.
+    embedding_loads: Arc<init::model::LoadTasks>,
+    /// The reranker loads in progress.
+    reranker_loads: Arc<init::model::LoadTasks>,
+    /// The catalog loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    catalog_loads: Arc<init::model::LoadTasks>,
     /// Names of the SQL functions registered for `as_sql` tools.
     tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// The installed app's `row_id` keys, read by `/v1/search` and `vector_search`.
@@ -1744,6 +1752,16 @@ impl Runtime {
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
+        // A request with no principal may call read-write tools only when the runtime
+        // authenticates no caller, as it may then write through `/v1/sql`.
+        ::tools::set_runtime_authenticates_callers(
+            endpoint_auth.http_auth.is_some()
+                || !matches!(
+                    endpoint_auth.identity_source,
+                    runtime_auth::IdentitySource::Anonymous
+                ),
+        );
+
         // Executors: mark cluster status Initializing before any await so a
         // concurrent `load_components` cannot report ready from dataset-only
         // status while task slots are still closed (Fix B for #11758).
@@ -2580,7 +2598,12 @@ impl Runtime {
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
             && let Some(tool) = catalog.get(&name).await
         {
-            return Some(tool);
+            // Under the name it is listed as, as `list_all_tools` returns it, so the tool is
+            // named the same in its errors and `task_history` whichever path called it.
+            return Some(with_name(
+                &tool,
+                encode_tool_name(&catalog_name, &name).as_str(),
+            ));
         }
         // Fall back to a direct (non-catalog) lookup — covers top-level tools
         // whose names legitimately contain the `__` catalog separator.

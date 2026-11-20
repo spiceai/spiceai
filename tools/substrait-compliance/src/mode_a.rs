@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(table.columns[0].type_token, "string");
         assert_eq!(table.columns[1].name, "n");
         assert_eq!(table.columns[1].type_token, "integer");
-        assert!(table.rows.is_empty());
+        assert_eq!(table.rows, [] as [Vec<String>; 0]);
     }
 
     /// Isthmus TPC-H emits `LiteralType::VarChar`. Without spiceai/datafusion#215

@@ -1701,7 +1701,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn getent_is_only_ever_run_from_an_absolute_path() {
-        assert!(!GETENT_PATHS.is_empty());
+        assert_ne!(GETENT_PATHS, [] as [&str; 0]);
         for candidate in GETENT_PATHS {
             let path = std::path::Path::new(candidate);
             assert!(

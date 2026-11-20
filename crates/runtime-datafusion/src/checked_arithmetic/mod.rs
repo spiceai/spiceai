@@ -32,6 +32,7 @@ mod sum;
 mod sum_plus_literal;
 
 pub use analyzer::CheckedIntegerOverflow;
+pub(crate) use analyzer::checked_integer_arith;
 pub use decomposability::complete_preaggregate_would_narrow_early;
 pub use eager::{
     CheckedEagerAggregation, install_checked_eager_aggregation,

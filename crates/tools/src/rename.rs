@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::SpiceModelTool;
+use crate::{SpiceModelTool, ToolAccess};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::{borrow::Cow, sync::Arc};
@@ -67,11 +67,30 @@ impl SpiceModelTool for RenamedTool {
         self.tool.parameters()
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        self.tool.call(arg).await
+    fn output_schema(&self) -> Option<Value> {
+        self.tool.output_schema()
+    }
+
+    fn access(&self) -> ToolAccess {
+        self.tool.access()
+    }
+
+    // `call` and `authorized_mcp_proxy` are inherited: they authorize the caller for this
+    // tool's `access`, the inner tool's, and then reach the inner tool through the two below.
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "forwards a call `SpiceModelTool::call` authorized for the wrapped tool's access"
+    )]
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.tool.run(arg).await
     }
 
     #[cfg(feature = "mcp")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "forwards to `authorized_mcp_proxy`, which authorizes for the wrapped tool's access"
+    )]
     async fn as_mcp_proxy(&self) -> Option<&dyn crate::McpProxy> {
         self.tool.as_mcp_proxy().await
     }
@@ -80,9 +99,19 @@ impl SpiceModelTool for RenamedTool {
 #[cfg(test)]
 mod tests {
     use super::{SpiceModelTool, with_name};
+    use crate::{
+        ToolAccess, ToolCallDenied,
+        access::test_support::{as_caller, read_only, read_write},
+    };
     use async_trait::async_trait;
     use serde_json::Value;
-    use std::{borrow::Cow, sync::Arc};
+    use std::{
+        borrow::Cow,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     #[cfg(feature = "mcp")]
     struct StubProxy;
@@ -100,6 +129,8 @@ mod tests {
 
     struct InnerTool {
         strict: Option<bool>,
+        access: ToolAccess,
+        runs: AtomicUsize,
         #[cfg(feature = "mcp")]
         proxy: Option<StubProxy>,
     }
@@ -111,6 +142,8 @@ mod tests {
         fn answering(strict: bool) -> Arc<dyn SpiceModelTool> {
             Arc::new(Self {
                 strict: Some(strict),
+                access: ToolAccess::ReadWrite,
+                runs: AtomicUsize::new(0),
                 #[cfg(feature = "mcp")]
                 proxy: Some(StubProxy),
             })
@@ -122,8 +155,20 @@ mod tests {
         fn silent() -> Arc<dyn SpiceModelTool> {
             Arc::new(Self {
                 strict: None,
+                access: ToolAccess::ReadOnly,
+                runs: AtomicUsize::new(0),
                 #[cfg(feature = "mcp")]
                 proxy: None,
+            })
+        }
+
+        fn read_write() -> Arc<Self> {
+            Arc::new(Self {
+                strict: None,
+                access: ToolAccess::ReadWrite,
+                runs: AtomicUsize::new(0),
+                #[cfg(feature = "mcp")]
+                proxy: Some(StubProxy),
             })
         }
     }
@@ -146,7 +191,17 @@ mod tests {
             Some(serde_json::json!({ "type": "object" }))
         }
 
-        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn output_schema(&self) -> Option<Value> {
+            self.strict
+                .map(|_| serde_json::json!({ "type": "object", "required": ["rows"] }))
+        }
+
+        fn access(&self) -> ToolAccess {
+            self.access
+        }
+
+        async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
             Ok(Value::String(format!("inner called with {arg}")))
         }
 
@@ -176,13 +231,35 @@ mod tests {
             "strict() must forward the inner tool's value, not the trait's None"
         );
         assert_eq!(
-            renamed.call("x").await.expect("the inner call succeeds"),
-            inner.call("x").await.expect("the inner call succeeds")
+            renamed.output_schema(),
+            inner.output_schema(),
+            "output_schema() must forward the inner tool's schema, not the trait's None"
+        );
+        assert_eq!(
+            renamed.access(),
+            inner.access(),
+            "access() must forward the inner tool's access, or the wrapper decides who may call it"
+        );
+        // A caller with write access may call either kind of tool, so the comparison
+        // reaches `run` through `call` whatever the fixture's access.
+        assert_eq!(
+            as_caller(read_write(), renamed.call("x"))
+                .await
+                .expect("the inner call succeeds"),
+            as_caller(read_write(), inner.call("x"))
+                .await
+                .expect("the inner call succeeds")
         );
         #[cfg(feature = "mcp")]
         assert_eq!(
-            renamed.as_mcp_proxy().await.is_some(),
-            inner.as_mcp_proxy().await.is_some(),
+            as_caller(read_write(), renamed.authorized_mcp_proxy())
+                .await
+                .expect("a read-write caller is authorized")
+                .is_some(),
+            as_caller(read_write(), inner.authorized_mcp_proxy())
+                .await
+                .expect("a read-write caller is authorized")
+                .is_some(),
             "as_mcp_proxy() must forward the inner tool's proxy, not the trait's None"
         );
     }
@@ -200,8 +277,14 @@ mod tests {
         // while the fixture's answers differ from the defaults a non-forwarding
         // wrapper would return; assert that here so it cannot pass vacuously.
         assert_eq!(inner.strict(), Some(true));
+        assert_eq!(inner.access(), ToolAccess::ReadWrite);
         #[cfg(feature = "mcp")]
-        assert!(inner.as_mcp_proxy().await.is_some());
+        assert!(
+            as_caller(read_write(), inner.authorized_mcp_proxy())
+                .await
+                .expect("a read-write caller is authorized")
+                .is_some()
+        );
 
         assert_answers_for_inner(&renamed, &inner).await;
     }
@@ -226,8 +309,14 @@ mod tests {
         let renamed = with_name(&inner, "catalog__inner");
 
         assert_eq!(renamed.strict(), None);
+        assert_eq!(renamed.access(), ToolAccess::ReadOnly);
         #[cfg(feature = "mcp")]
-        assert!(renamed.as_mcp_proxy().await.is_none());
+        assert!(
+            as_caller(read_write(), renamed.authorized_mcp_proxy())
+                .await
+                .expect("a read-write caller is authorized")
+                .is_none()
+        );
         assert_answers_for_inner(&renamed, &inner).await;
     }
 
@@ -240,5 +329,49 @@ mod tests {
 
         assert_eq!(renamed.name(), "twice");
         assert_answers_for_inner(&renamed, &inner).await;
+    }
+
+    /// A catalog-qualified name is another way to reach the same tool, so it is held to the
+    /// wrapped tool's access: a caller without write access is refused a read-write tool under
+    /// its renamed spelling too, before the tool runs.
+    #[tokio::test]
+    async fn renamed_read_write_tool_refuses_a_caller_without_write_access() {
+        let inner = InnerTool::read_write();
+        let inner_dyn: Arc<dyn SpiceModelTool> = Arc::clone(&inner) as Arc<dyn SpiceModelTool>;
+        let renamed = with_name(&with_name(&inner_dyn, "once"), "twice");
+
+        let error = as_caller(read_only(), renamed.call("x"))
+            .await
+            .expect_err("a read-only caller is refused a read-write tool");
+        assert_eq!(
+            error.to_string(),
+            "Failed to call tool 'twice': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
+        );
+        let error = renamed
+            .call("x")
+            .await
+            .expect_err("a caller with no principal is refused a read-write tool");
+        assert!(
+            matches!(
+                error.downcast_ref::<ToolCallDenied>(),
+                Some(ToolCallDenied::NoCredentials { tool }) if tool == "twice"
+            ),
+            "unexpected error: {error}"
+        );
+        #[cfg(feature = "mcp")]
+        assert!(matches!(
+            as_caller(read_only(), renamed.authorized_mcp_proxy()).await,
+            Err(ToolCallDenied::ReadOnlyCredentials { .. })
+        ));
+        assert_eq!(
+            inner.runs.load(Ordering::SeqCst),
+            0,
+            "a refused call must not reach the tool"
+        );
+
+        as_caller(read_write(), renamed.call("x"))
+            .await
+            .expect("a read-write caller may call it");
+        assert_eq!(inner.runs.load(Ordering::SeqCst), 1);
     }
 }

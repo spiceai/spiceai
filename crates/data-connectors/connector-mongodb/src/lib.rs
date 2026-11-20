@@ -1138,7 +1138,7 @@ mod inferred_schema_tests {
         // yields a primary-key-ascending sort and nothing else; the constant `_id`
         // primary key the caller adds is enough for change streams.
         let details = MongoCatalogDetails::primary_key_only(&["_id".to_string()]);
-        assert!(details.indexes.is_empty());
+        assert_eq!(details.indexes, [] as [InferredIndex; 0]);
         assert_eq!(
             details.sort_columns,
             vec![InferredSortColumn {

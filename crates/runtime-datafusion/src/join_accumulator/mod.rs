@@ -83,7 +83,7 @@ pub fn maximum_shared_inlist_memory_bytes() -> usize {
 /// most recent builder raise the shared budget for existing instances.
 pub fn clamp_maximum_shared_inlist_memory_bytes(limit: usize) {
     let configured_limit = limit.min(UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES.saturating_sub(1));
-    let _ = MAXIMUM_SHARED_INLIST_MEMORY_BYTES.fetch_update(
+    let _ = MAXIMUM_SHARED_INLIST_MEMORY_BYTES.try_update(
         AtomicOrdering::Relaxed,
         AtomicOrdering::Relaxed,
         |current| {
@@ -136,7 +136,7 @@ fn reserve_inlist_memory_with_limit(bytes: usize, limit: usize) -> bool {
     }
 
     CURRENT_INLIST_MEMORY_BYTES
-        .fetch_update(
+        .try_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
             |current| current.checked_add(bytes).filter(|next| *next <= limit),
@@ -1361,7 +1361,7 @@ mod tests {
         accumulator
             .update_batch(&batch)
             .expect("Should update with batch");
-        assert!(accumulator.arrays.is_empty());
+        assert_eq!(accumulator.arrays, [] as [std::sync::Arc<dyn Array>; 0]);
         assert!(accumulator.exact_values_exceeded_memory_limit);
 
         let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
@@ -1397,7 +1397,7 @@ mod tests {
             .expect("Should update batch with NULLs and values");
 
         assert!(accumulator.exact_values_exceeded_memory_limit);
-        assert!(accumulator.arrays.is_empty());
+        assert_eq!(accumulator.arrays, [] as [std::sync::Arc<dyn Array>; 0]);
 
         let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
         let physical_expr = column_bounds
@@ -1425,13 +1425,13 @@ mod tests {
             .update_batch(&first_batch)
             .expect("Should update first batch");
         assert_eq!(1, accumulator.arrays.len());
-        assert!(accumulator.range_bounds.intervals.is_empty());
+        assert_eq!(accumulator.range_bounds.intervals, [] as [RangeInterval; 0]);
         assert!(!accumulator.exact_values_exceeded_memory_limit);
 
         accumulator
             .update_batch(&second_batch)
             .expect("Should update second batch");
-        assert!(accumulator.arrays.is_empty());
+        assert_eq!(accumulator.arrays, [] as [std::sync::Arc<dyn Array>; 0]);
         assert!(accumulator.exact_values_exceeded_memory_limit);
 
         let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
@@ -1464,7 +1464,7 @@ mod tests {
         accumulator
             .update_batch(&second_batch)
             .expect("Should update second batch");
-        assert!(accumulator.arrays.is_empty());
+        assert_eq!(accumulator.arrays, [] as [std::sync::Arc<dyn Array>; 0]);
         assert!(accumulator.exact_values_exceeded_memory_limit);
 
         let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");

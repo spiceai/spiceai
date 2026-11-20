@@ -148,7 +148,7 @@ fn a_lone_exclusive_bound_is_its_own_key_condition() {
         query.key_condition_expression.as_deref(),
         Some("#n0 = :v0 AND #n1 > :v1")
     );
-    assert!(query.residual.is_empty());
+    assert_eq!(query.residual, [] as [SortPredicate; 0]);
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn filters_beyond_one_expression_are_left_to_check_on_the_rows_read() {
     let (remote, local) = builder
         .split_within_limits(&filters, &schema, None)
         .expect("split");
-    assert!(!local.is_empty());
+    assert_ne!(local, [] as [datafusion::prelude::Expr; 0]);
     assert_eq!(remote.len() + local.len(), filters.len());
     let plan = builder
         .build_request_plan(&remote, &schema, None, None)

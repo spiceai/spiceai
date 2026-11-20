@@ -1501,7 +1501,6 @@ fn backfill_envelopes(
 
 /// SQS long-poll change stream for one S3 listing dataset, with a periodic
 /// listing backfill so objects missed while the runtime was down still apply.
-#[must_use]
 fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
     Box::pin(try_stream! {
         let S3ChangesStreamParts {
@@ -3189,7 +3188,7 @@ mod tests {
         assert_eq!(result.keys, vec!["events/new.parquet".to_string()]);
         assert_eq!(result.batches.len(), 1);
         assert_eq!(result.batches[0].num_rows(), 1);
-        assert!(result.unread_keys.is_empty());
+        assert_eq!(result.unread_keys, [] as [String; 0]);
     }
 
     #[tokio::test]

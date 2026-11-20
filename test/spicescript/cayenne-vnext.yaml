@@ -1,13 +1,18 @@
 name: cayenne-vnext
 description: >
   `runtime.params.cayenne_vnext: enabled` puts new Cayenne datasets on the
-  object-native metastore and never moves an existing one: a dataset whose
-  metastore differs from the flag stops with a message naming the dataset and
-  the fix, in either direction. Starting it once with `mode: file_create`
-  reloads it from its source into the metastore the flag names, and it stays
-  there across a restart. Every answer matches the PostgreSQL source
-  throughout, and a value other than `enabled` or `disabled` stops the dataset
-  with a message naming the param.
+  object-native metastore and never moves one already on SQLite: that dataset
+  stops with a message naming it and the fix, and starting it once with
+  `mode: file_create` reloads it from its source into the object-native
+  metastore, where it stays across a restart. With the flag off, a dataset in
+  the object-native metastore stops the same way, with a message naming it
+  and the fix, until a `mode: file_create` start reloads it from its source
+  into SQLite; and an object-store data path (an `s3://` `cayenne_file_path`,
+  S3 Express included) fails to load with a message naming the dataset, the
+  path and the fix. Turning the flag on again stops the datasets now on
+  SQLite rather than moving them.
+  Every answer matches the PostgreSQL source throughout, and a value other than
+  `enabled` or `disabled` stops the dataset with a message naming the param.
 
 sources:
   src: { kind: postgres }
@@ -78,37 +83,39 @@ steps:
     eventually: 60s
 
   # The flag off: both datasets are in the object-native metastore, so both
-  # stop rather than moving to SQLite.
+  # stop rather than move to SQLite, as before_flag stopped rather than move
+  # when the flag came on. Starting them once with `mode: file_create` reloads
+  # them from the source into SQLite (the changes made just before the restart
+  # are in the answers, which an older copy would not have).
+  - source-exec: { src: "UPDATE after_flag SET v = 'flag off' WHERE id % 5 = 0; UPDATE before_flag SET v = 'flag off' WHERE id % 13 = 0" }
   - restart:
       ready: false
       patch: { spicepod: { runtime: { params: { cayenne_vnext: disabled } } } }
-  - assert-status: { dataset: after_flag, status: Error, message-contains: "Dataset 'after_flag' is accelerated in the object-native Cayenne metastore, but `runtime.params.cayenne_vnext` is not enabled" }
+  - assert-status: { dataset: after_flag, status: Error, message-contains: "Dataset 'after_flag' is accelerated in the object-native Cayenne metastore, but `runtime.params.cayenne_vnext` is not enabled, and an existing acceleration is not moved to the SQLite metastore. Set `runtime.params.cayenne_vnext: enabled` to keep serving it, or start it once with `acceleration.mode: file_create`" }
     eventually: 60s
-  - assert-status: { dataset: before_flag, status: Error, message-contains: "Dataset 'before_flag' is accelerated in the object-native Cayenne metastore" }
+  - assert-status: { dataset: before_flag, status: Error, message-contains: "Dataset 'before_flag' is accelerated in the object-native Cayenne metastore, but `runtime.params.cayenne_vnext` is not enabled" }
     eventually: 60s
-
-  # `mode: file_create` reloads after_flag into SQLite; before_flag still stops.
-  - source-exec: { src: "UPDATE after_flag SET v = 'to sqlite' WHERE id % 5 = 0" }
   - restart:
-      ready: false
-      patch: { datasets: { after_flag: { acceleration: { mode: file_create } } } }
+      patch: { datasets: { after_flag: { acceleration: { mode: file_create } }, before_flag: { acceleration: { mode: file_create } } } }
   - query: SELECT * FROM after_flag
     eventually: 60s
-  - assert-status: { dataset: before_flag, status: Error, message-contains: "Dataset 'before_flag' is accelerated in the object-native Cayenne metastore" }
-    eventually: 60s
-
-  # The flag on again: before_flag is served from the object-native metastore,
-  # and after_flag, now on SQLite, stops. Its object-native copy is gone, so the
-  # recreate left nothing for it to fall back to.
-  - restart:
-      ready: false
-      patch:
-        spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
-        datasets: { after_flag: { acceleration: { mode: file } } }
-  - refresh: before_flag
   - query: SELECT * FROM before_flag
     eventually: 60s
+  - restart:
+      patch: { datasets: { after_flag: { acceleration: { mode: file } }, before_flag: { acceleration: { mode: file } } } }
+  - query: SELECT * FROM after_flag
+    eventually: 60s
+  - query: SELECT * FROM before_flag
+    eventually: 60s
+
+  # The flag on again: both datasets are on SQLite now, so both stop rather
+  # than move to the object-native metastore.
+  - restart:
+      ready: false
+      patch: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
   - assert-status: { dataset: after_flag, status: Error, message-contains: "Dataset 'after_flag' is accelerated in the SQLite Cayenne metastore" }
+    eventually: 60s
+  - assert-status: { dataset: before_flag, status: Error, message-contains: "Dataset 'before_flag' is accelerated in the SQLite Cayenne metastore" }
     eventually: 60s
 
   # A value the flag does not take.
@@ -117,3 +124,20 @@ steps:
       patch: { spicepod: { runtime: { params: { cayenne_vnext: 'yes' } } } }
   - assert-status: { dataset: after_flag, status: Error, message-contains: "`runtime.params.cayenne_vnext` is 'yes'. Set it to 'enabled' or 'disabled'." }
     eventually: 60s
+
+  # The flag off: an object-store data path fails to load, a standard bucket
+  # and an S3 Express one alike, before anything is read or written there.
+  - restart:
+      ready: false
+      patch:
+        spicepod: { runtime: { params: { cayenne_vnext: disabled } } }
+        datasets:
+          after_flag: { acceleration: { params: { cayenne_file_path: 's3://cayenne-vnext-data/prefix' } } }
+          before_flag: { acceleration: { params: { cayenne_file_path: 's3://cayenne-vnext--usw2-az1--x-s3/prefix' } } }
+  - assert-status: { dataset: after_flag, status: Error, message-contains: "Failed to load dataset 'after_flag' (cayenne): `cayenne_file_path` 's3://cayenne-vnext-data/prefix' is an object-store path, which Cayenne does not support for a dataset's own data. Remove `cayenne_file_path` (and `cayenne_s3_zone_ids`) to keep the data on local disk; Cayenne data in a bucket comes with `runtime.state.location`." }
+    eventually: 60s
+  - assert-status: { dataset: before_flag, status: Error, message-contains: "Failed to load dataset 'before_flag' (cayenne): `cayenne_file_path` 's3://cayenne-vnext--usw2-az1--x-s3/prefix' is an object-store path" }
+    eventually: 60s
+  - assert-log:
+      contains: ["Failed to load dataset 'after_flag' \\(cayenne\\): `cayenne_file_path` 's3://cayenne-vnext-data/prefix' is an object-store path, which Cayenne does not support for a dataset's own data\\. .*See: https://spiceai\\.org/docs/components/data-accelerators/cayenne"]
+  - assert-files: { lacks: ['s3:'] }
