@@ -8,6 +8,7 @@
   "append-time-partition": 4,
   "async-queries": 21,
   "async-query-budgets": 141,
+  "async-query-budgets-schedulers": 10,
   "auth": 3,
   "azure-model-credentials": 5,
   "builtins": 4,

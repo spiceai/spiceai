@@ -214,10 +214,11 @@ steps:
     expect: { status: 202 }
 
   # Every scheduler lists the jobs of the shared state location: 2 x 64 running, 2 x 6 waiting.
-  - http: { method: GET, path: /v1/queries, query: { status: running } }
+  # A listing returns 100 queries unless `limit` asks for more.
+  - http: { method: GET, path: /v1/queries, query: { status: running, limit: '1000' } }
     expect: { status: 200, json: [ { pointer: /total_count, equals: 128 } ] }
     eventually: 90s
-  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+  - http: { method: GET, path: /v1/queries, query: { status: pending, limit: '1000' } }
     expect: { status: 200, json: [ { pointer: /total_count, equals: 12 } ] }
     eventually: 30s
 
