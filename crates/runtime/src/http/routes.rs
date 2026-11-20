@@ -2057,7 +2057,7 @@ mod mcp_origin_tests {
 
     #[tokio::test]
     async fn default_cors_wildcard_accepts_localhost_non_default_port_post() {
-        let config = mcp_server_config(None, &CorsConfig::default());
+        let config = mcp_server_config(&CorsConfig::default());
         assert!(
             config
                 .allowed_origins
