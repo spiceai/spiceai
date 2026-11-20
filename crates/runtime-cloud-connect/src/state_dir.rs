@@ -176,55 +176,159 @@ pub fn check(dir: &Path, create: bool) -> Result<Presence, Error> {
 
 #[cfg(unix)]
 fn check_unix(dir: &Path, create: bool) -> Result<Presence, Error> {
-    use std::os::unix::fs::{
-        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let parent = match dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if create {
+        std::fs::create_dir_all(parent).map_err(Error::io(parent))?;
+    }
+    // A link in the config directory's path is followed: only the state
+    // directory itself must be a real directory.
+    let parent = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent)
+    {
+        Ok(parent) => parent,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound && !create => {
+            return Ok(Presence::Absent);
+        }
+        Err(source) => return Err(Error::io(dir)(source)),
+    };
+    Ok(match open_at(&parent, dir, create)? {
+        Some(_) => Presence::Present,
+        None => Presence::Absent,
+    })
+}
+
+/// Open the state directory `dir` inside the open directory `parent`, and
+/// apply the trust rule to the descriptor that was opened.
+///
+/// The name is opened without following a link, and created `0700` when
+/// `create` is set and it is missing. Every decision is made on the returned
+/// descriptor, so the directory inspected is the one repaired and the one a
+/// caller goes on to use; looking the name up again could reach another one.
+/// `dir` is the path messages name; only its file name is looked up.
+///
+/// Returns `None` when the directory is missing and `create` is not set.
+///
+/// # Errors
+///
+/// As [`check`].
+#[cfg(unix)]
+pub(crate) fn open_at(
+    parent: &std::fs::File,
+    dir: &Path,
+    create: bool,
+) -> Result<Option<std::fs::File>, Error> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let name = dir.file_name().ok_or_else(|| {
+        Error::io(dir)(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "it has no directory name",
+        ))
+    })?;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        Error::io(dir)(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "its name contains a NUL byte",
+        ))
+    })?;
+    let open = || {
+        // SAFETY: `name` is NUL-terminated and `parent` is a live descriptor
+        // for the duration of the call; no pointer is retained.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `openat` returned a new descriptor this process owns.
+        Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
     };
 
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
     let mut created_by_this_process = false;
-    match std::fs::symlink_metadata(dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(Error::io(dir)(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "it is a symbolic link, and Spice keeps this state only in a real directory",
-            )));
-        }
-        Ok(_) => {}
+    let directory = match open() {
+        Ok(directory) => directory,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             if !create {
-                return Ok(Presence::Absent);
+                return Ok(None);
             }
-            if let Some(parent) = dir.parent() {
-                std::fs::create_dir_all(parent).map_err(Error::io(parent))?;
+            // SAFETY: as for `openat` above.
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+                created_by_this_process = true;
+            } else {
+                let source = std::io::Error::last_os_error();
+                if source.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(Error::io(dir)(source));
+                }
             }
-            match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-                Ok(()) => created_by_this_process = true,
-                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(Error::io(dir)(source)),
-            }
+            open().map_err(|source| not_a_real_directory(parent, &name, dir, source))?
         }
-        Err(source) => return Err(Error::io(dir)(source)),
-    }
+        Err(source) => return Err(not_a_real_directory(parent, &name, dir, source)),
+    };
 
-    // Every decision below is made on this descriptor, so the directory
-    // inspected is the one repaired.
-    let directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dir)
-        .map_err(Error::io(dir))?;
-    if created_by_this_process
-        && me == 0
-        && let Some(parent) = dir.parent()
-    {
+    if created_by_this_process && me == 0 {
         // A privileged command creates it for the account that owns the
         // config directory, as it does the lock file, so that account's
         // runtime can keep writing it.
-        let parent = std::fs::metadata(parent).map_err(Error::io(parent))?;
+        let parent = parent.metadata().map_err(Error::io(dir))?;
         std::os::unix::fs::fchown(&directory, Some(parent.uid()), Some(parent.gid()))
             .map_err(Error::io(dir))?;
     }
+    apply_rule(dir, &directory, me)?;
+    Ok(Some(directory))
+}
+
+/// The error for a state directory name that could not be opened as a
+/// directory: a link is named as one, and anything else keeps its own error.
+#[cfg(unix)]
+fn not_a_real_directory(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    dir: &Path,
+    source: std::io::Error,
+) -> Error {
+    use std::os::fd::AsRawFd as _;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is NUL-terminated, `parent` is live, and `stat` is valid
+    // for writes of one `libc::stat`.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    // SAFETY: `fstatat` initialized `stat` when it returned 0.
+    if result == 0 && unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Error::io(dir)(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "it is a symbolic link, and Spice keeps this state only in a real directory",
+        ));
+    }
+    Error::io(dir)(source)
+}
+
+/// The trust rule (see [`check`]), applied to an open state directory.
+#[cfg(unix)]
+fn apply_rule(dir: &Path, directory: &std::fs::File, me: u32) -> Result<(), Error> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
     let metadata = directory.metadata().map_err(Error::io(dir))?;
     if !metadata.is_dir() {
         return Err(Error::io(dir)(std::io::Error::new(
@@ -244,10 +348,10 @@ fn check_unix(dir: &Path, create: bool) -> Result<Presence, Error> {
                 .map_err(Error::io(dir))?;
             log_repair_once(dir, mode, repaired);
         }
-        return Ok(Presence::Present);
+        return Ok(());
     }
     if !writable_by_others && (owner == 0 || me == 0) {
-        return Ok(Presence::Present);
+        return Ok(());
     }
     Err(Error::Untrusted {
         untrusted: if me == 0 {

@@ -24,7 +24,9 @@ limitations under the License.
 //! one enrollment operation in this foundation layer: once a caller needs both,
 //! it takes this lock first and the enrollment lock second, never the reverse.
 //! Taking it applies the state-directory rule ([`crate::state_dir::check`]) to
-//! the directory it lives in, creating that directory owner-only.
+//! the directory it lives in, creating that directory owner-only. The rule is
+//! applied to the open descriptor the lock file is then created in and that the
+//! lock retains, so the directory checked is the directory locked.
 //!
 //! It lives here, below the CLI, so that the runtime can take the same lock:
 //! it reaches the same state through the control stream, and two exclusion
@@ -141,7 +143,9 @@ impl MutationLock {
                 if rule == StateRule::Apply {
                     prepare_state_directory(&config_dir)?;
                 }
-                acquire_lock(&config_dir, action, timeout)
+                #[cfg(test)]
+                acquire_hooks::run(&config_dir);
+                acquire_lock(&config_dir, action, timeout, rule)
             })
         })
         .await
@@ -276,9 +280,10 @@ enum StateRule {
     Skip,
 }
 
-/// Apply the state-directory rule to the directory the lock lives in,
-/// creating it owner-only. A privileged caller still may not create the
-/// config directory above it: enrollment as the intended account does that.
+/// Refuse a privileged caller that would create the config directory above
+/// the state directory: enrollment as the intended account does that. On Unix
+/// the state-directory rule itself is applied in [`acquire_lock`], to the
+/// descriptor the lock is created in.
 fn prepare_state_directory(state_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     if unsafe { libc::geteuid() } == 0
@@ -294,41 +299,49 @@ fn prepare_state_directory(state_dir: &Path) -> Result<()> {
             ),
         });
     }
+    #[cfg(not(unix))]
     crate::state_dir::check(state_dir, true).context(StateDirectorySnafu)?;
     Ok(())
 }
 
-fn acquire_lock(config_dir: &Path, action: &str, timeout: Duration) -> Result<MutationLock> {
-    let config_dir = canonical_config_directory(config_dir)?;
-    validate_existing_directory_chain(&config_dir)?;
+fn acquire_lock(
+    dir: &Path,
+    action: &str,
+    timeout: Duration,
+    rule: StateRule,
+) -> Result<MutationLock> {
     #[cfg(unix)]
-    if unsafe { libc::geteuid() } == 0
-        && std::fs::symlink_metadata(&config_dir)
-            .is_err_and(|source| source.kind() == std::io::ErrorKind::NotFound)
-    {
-        return Err(Error::Io {
-            path: config_dir,
-            source: std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "a privileged Cloud Connect mutation cannot create the config directory; enroll as the intended service account first",
-            ),
-        });
-    }
-    std::fs::create_dir_all(&config_dir).context(IoSnafu {
-        path: config_dir.clone(),
-    })?;
-    validate_existing_directory_chain(&config_dir)?;
+    let (config_dir, mut file, lock_directory) = {
+        let (config_dir, lock_directory) = match rule {
+            StateRule::Apply => open_state_directory(dir)?,
+            StateRule::Skip => open_config_directory(dir)?,
+        };
+        let file = crate::lock_file::create_or_open_lock_at(&lock_directory, c"connect.lock")
+            .map_err(|source| Error::Io {
+                path: config_dir.join(MUTATION_LOCK_FILE),
+                source,
+            })?;
+        (config_dir, file, lock_directory)
+    };
+    #[cfg(not(unix))]
+    let (config_dir, mut file) = {
+        let _ = rule;
+        let config_dir = canonical_config_directory(dir)?;
+        validate_existing_directory_chain(&config_dir)?;
+        std::fs::create_dir_all(&config_dir).context(IoSnafu {
+            path: config_dir.clone(),
+        })?;
+        validate_existing_directory_chain(&config_dir)?;
+        let path = config_dir.join(MUTATION_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .context(IoSnafu { path })?;
+        (config_dir, file)
+    };
     let path = config_dir.join(MUTATION_LOCK_FILE);
-    #[cfg(unix)]
-    let (mut file, lock_directory) = open_unix_lock_file(&config_dir, &path)?;
-    #[cfg(not(unix))]
-    let mut options = std::fs::OpenOptions::new();
-    #[cfg(not(unix))]
-    options.create(true).read(true).write(true);
-    #[cfg(not(unix))]
-    let mut file = options
-        .open(&path)
-        .context(IoSnafu { path: path.clone() })?;
     let metadata = file.metadata().context(IoSnafu { path: path.clone() })?;
     if !metadata.is_file() {
         return Err(Error::Io {
@@ -430,15 +443,83 @@ fn acquire_lock(config_dir: &Path, action: &str, timeout: Duration) -> Result<Mu
     })
 }
 
-/// Open the canonical directory one component at a time without following
-/// symlinks, then create/open the lock relative to that held descriptor.
+/// Open the state directory `state_dir` for its lock, applying the
+/// state-directory rule to the descriptor that was opened.
 ///
-/// `O_NOFOLLOW` on the lock alone protects only its final name. Guarded
+/// The config directory above it is resolved like any config path: a link
+/// there or higher up is followed to the directory it names, and then opened
+/// one component at a time without following links. The state directory is
+/// opened relative to that descriptor without following a link, created
+/// owner-only when missing, and checked on its own descriptor. That descriptor
+/// is the one the lock is created in and retains, so no lookup of the name
+/// after the check can make the lock hold another directory.
+#[cfg(unix)]
+fn open_state_directory(state_dir: &Path) -> Result<(PathBuf, File)> {
+    let Some(name) = state_dir.file_name() else {
+        return Err(Error::Io {
+            path: state_dir.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the Cloud Connect state directory path has no directory name",
+            ),
+        });
+    };
+    let parent = match state_dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let config_dir = canonical_config_directory(parent)?;
+    validate_existing_directory_chain(&config_dir)?;
+    std::fs::create_dir_all(&config_dir).context(IoSnafu {
+        path: config_dir.clone(),
+    })?;
+    validate_existing_directory_chain(&config_dir)?;
+    let parent = open_directory_chain(&config_dir)?;
+    let directory = crate::state_dir::open_at(&parent, state_dir, true)
+        .context(StateDirectorySnafu)?
+        .ok_or_else(|| Error::Io {
+            path: state_dir.to_path_buf(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        })?;
+    Ok((config_dir.join(name), directory))
+}
+
+/// Open the config directory itself for its lock, where a CLI that predates
+/// the state directory takes it. A link anywhere in its path is followed to
+/// the directory it names.
+#[cfg(unix)]
+fn open_config_directory(dir: &Path) -> Result<(PathBuf, File)> {
+    let config_dir = canonical_config_directory(dir)?;
+    validate_existing_directory_chain(&config_dir)?;
+    if unsafe { libc::geteuid() } == 0
+        && std::fs::symlink_metadata(&config_dir)
+            .is_err_and(|source| source.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(Error::Io {
+            path: config_dir,
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "a privileged Cloud Connect mutation cannot create the config directory; enroll as the intended service account first",
+            ),
+        });
+    }
+    std::fs::create_dir_all(&config_dir).context(IoSnafu {
+        path: config_dir.clone(),
+    })?;
+    validate_existing_directory_chain(&config_dir)?;
+    let directory = open_directory_chain(&config_dir)?;
+    Ok((config_dir, directory))
+}
+
+/// Open the canonical directory one component at a time without following
+/// symlinks.
+///
+/// `O_NOFOLLOW` on the final name alone protects only that name. Guarded
 /// descriptor traversal makes an ancestor rename/symlink substitution either
 /// irrelevant (the already-open directory remains authoritative) or an error,
 /// including in a privileged installer.
 #[cfg(unix)]
-fn open_unix_lock_file(config_dir: &Path, path: &Path) -> Result<(File, File)> {
+fn open_directory_chain(config_dir: &Path) -> Result<File> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
@@ -496,14 +577,7 @@ fn open_unix_lock_file(config_dir: &Path, path: &Path) -> Result<(File, File)> {
             }
         }
     }
-
-    let lock = crate::lock_file::create_or_open_lock_at(&directory, c"connect.lock").map_err(
-        |source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        },
-    )?;
-    Ok((lock, directory))
+    Ok(directory)
 }
 
 /// Resolve every existing component of a config path before creating or
@@ -643,9 +717,196 @@ fn read_bounded_lock_diagnostics(file: &mut File) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Lets a test act on the filesystem just before a lock acquisition opens the
+/// directory it locks, the way another account sharing the config directory
+/// could.
+#[cfg(test)]
+pub(crate) mod acquire_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    /// Keyed by the directory passed to the acquisition, so tests running in
+    /// parallel never run each other's hooks.
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> = LazyLock::new(Mutex::default);
+
+    /// Run `hook` once, when the next acquisition for `dir` is about to open
+    /// the directory it locks.
+    pub(crate) fn before_opening(dir: &Path, hook: impl FnOnce() + Send + 'static) {
+        HOOKS
+            .lock()
+            .expect("acquire hooks lock")
+            .insert(dir.to_path_buf(), Box::new(hook));
+    }
+
+    pub(super) fn run(dir: &Path) {
+        let hook = HOOKS.lock().expect("acquire hooks lock").remove(dir);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a lock acquisition locked, after the state directory's name was
+    /// changed just before the lock opened it.
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct Acquisition {
+        acquired: bool,
+        /// Which directory the lock's retained descriptor is.
+        locked: Option<&'static str>,
+        /// That directory's permission bits, in octal.
+        locked_mode: Option<String>,
+        /// Whether a lock file was created in the directory a link points to.
+        lock_created_through_link: bool,
+    }
+
+    #[cfg(unix)]
+    fn identify(file: &File, candidates: &[(&'static str, &Path)]) -> &'static str {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let held = file.metadata().expect("stat the retained directory");
+        candidates
+            .iter()
+            .find(|(_, path)| {
+                let candidate = std::fs::symlink_metadata(path).expect("stat a candidate");
+                candidate.dev() == held.dev() && candidate.ino() == held.ino()
+            })
+            .map_or("another directory", |(name, _)| name)
+    }
+
+    #[cfg(unix)]
+    fn mode_of(file: &File) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        format!(
+            "{:04o}",
+            file.metadata().expect("stat").permissions().mode() & 0o7777
+        )
+    }
+
+    /// An existing owner-only state directory, as enrollment leaves it.
+    #[cfg(unix)]
+    fn existing_state_directory(root: &Path) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let config_dir = root.join(".spice");
+        std::fs::create_dir(&config_dir).expect("create the config directory");
+        let state = crate::state_dir::state_dir(&config_dir);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .expect("create the state directory");
+        state
+    }
+
+    /// A writable-by-anyone directory the state directory's name is pointed
+    /// at, as another account sharing the config directory could.
+    #[cfg(unix)]
+    fn shared_directory(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let shared = root.join("shared");
+        std::fs::create_dir(&shared).expect("create the shared directory");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+            .expect("make the shared directory writable by anyone");
+        shared
+    }
+
+    /// The state directory's name is replaced by a link after it was checked
+    /// and before the lock opens it. The lock must not end up in the link's
+    /// target, a directory the state rule never looked at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_state_directory_replaced_by_a_link_before_locking_is_refused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = existing_state_directory(root.path());
+        let moved = root.path().join("moved-state");
+        let shared = shared_directory(root.path());
+        acquire_hooks::before_opening(&state, {
+            let (state, moved, shared) = (state.clone(), moved.clone(), shared.clone());
+            move || {
+                std::fs::rename(&state, &moved).expect("move the checked state directory");
+                std::os::unix::fs::symlink(&shared, &state).expect("link its name elsewhere");
+            }
+        });
+
+        let result =
+            MutationLock::acquire_with_timeout(&state, "connect", Duration::from_millis(50)).await;
+
+        let candidates = [("checked", moved.as_path()), ("shared", shared.as_path())];
+        let held = result.as_ref().ok();
+        assert_eq!(
+            Acquisition {
+                acquired: held.is_some(),
+                locked: held.map(|held| identify(&held.directory, &candidates)),
+                locked_mode: held.map(|held| mode_of(&held.directory)),
+                lock_created_through_link: shared.join(MUTATION_LOCK_FILE).exists(),
+            },
+            Acquisition {
+                acquired: false,
+                locked: None,
+                locked_mode: None,
+                lock_created_through_link: false,
+            }
+        );
+        assert_eq!(
+            result.expect_err("checked above").to_string(),
+            format!(
+                "could not use the Spice Cloud Connect state directory '{}': it is a symbolic link, and Spice keeps this state only in a real directory",
+                state.display()
+            )
+        );
+    }
+
+    /// The state directory is replaced by another real directory, writable by
+    /// group and others, after it was checked and before the lock opens it.
+    /// The rule must be applied to the directory the lock holds, so its mode
+    /// is repaired before the lock is taken in it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_state_directory_replaced_before_locking_is_held_to_the_state_rule() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = existing_state_directory(root.path());
+        let moved = root.path().join("moved-state");
+        acquire_hooks::before_opening(&state, {
+            let (state, moved) = (state.clone(), moved.clone());
+            move || {
+                std::fs::rename(&state, &moved).expect("move the checked state directory");
+                std::fs::create_dir(&state).expect("create a replacement");
+                std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777))
+                    .expect("make the replacement writable by anyone");
+            }
+        });
+
+        let result =
+            MutationLock::acquire_with_timeout(&state, "connect", Duration::from_millis(50)).await;
+
+        let candidates = [
+            ("checked", moved.as_path()),
+            ("replacement", state.as_path()),
+        ];
+        let held = result.as_ref().ok();
+        assert_eq!(
+            Acquisition {
+                acquired: held.is_some(),
+                locked: held.map(|held| identify(&held.directory, &candidates)),
+                locked_mode: held.map(|held| mode_of(&held.directory)),
+                lock_created_through_link: false,
+            },
+            Acquisition {
+                acquired: true,
+                locked: Some("replacement"),
+                locked_mode: Some("0755".to_string()),
+                lock_created_through_link: false,
+            }
+        );
+    }
 
     /// The lock is the directory's exclusion: while one operation holds it, the
     /// next waits and then reports who has it; once it is dropped, the directory
