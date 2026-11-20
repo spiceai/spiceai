@@ -74,6 +74,8 @@ runs:
     - name: Set up Rust toolchain (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
+      env:
+        INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
       run: |
         set -euo pipefail
 
@@ -86,7 +88,7 @@ runs:
         fi
 
         # Resolve which toolchain to use.
-        toolchain='${{ inputs.toolchain }}'
+        toolchain="${INPUT_TOOLCHAIN}"
         if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
           toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
         fi
@@ -193,6 +195,8 @@ runs:
     - name: Set up Rust toolchain (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
       run: |
         echo "$env:USERPROFILE\.cargo\bin" >> $env:GITHUB_PATH
         if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
@@ -201,7 +205,7 @@ runs:
           Start-Process -FilePath "rustup-init.exe" -ArgumentList "-q", "-y", "--default-toolchain", "none", "--profile", "default" -Wait
         }
 
-        $toolchain = "${{ inputs.toolchain }}"
+        $toolchain = "${env:INPUT_TOOLCHAIN}"
         if (-not $toolchain) {
           $activeToolchain = rustup show active-toolchain 2>$null
           if ($activeToolchain) {
