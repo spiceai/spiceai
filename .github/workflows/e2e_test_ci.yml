@@ -2956,6 +2956,9 @@ jobs:
           python3 -m unittest discover -s test/spicescript/corpus -p test_sql_surface.py
           python3 test/spicescript/corpus/sql_surface.py --check
 
+      - name: Test update_durations.py
+        run: python3 -m unittest discover -s test/spicescript -p test_update_durations.py
+
       - name: Build spicescript
         uses: $/.github/actions/build-tool
         with:
@@ -2985,11 +2988,8 @@ jobs:
           - { name: 'spicescript: scripts (2/4)', partition: 2/4, args: test/spicescript }
           - { name: 'spicescript: scripts (3/4)', partition: 3/4, args: test/spicescript }
           - { name: 'spicescript: scripts (4/4)', partition: 4/4, args: test/spicescript }
-          # Scripts that reproduce open bugs: each must fail exactly as its
-          # group's recordings/expected-failures.json says, so a fix or a
-          # change in how a bug shows also fails the job.
-          - { name: 'spicescript: known failing (1/2)', partition: 1/2, args: --max-wait 30s test/spicescript/known-failing }
-          - { name: 'spicescript: known failing (2/2)', partition: 2/2, args: --max-wait 30s test/spicescript/known-failing }
+          # Scripts that reproduce open bugs (test/spicescript/known-failing)
+          # run nightly in spicescript_nightly.yml, not here.
           # The shards above read DuckDB and DuckLake sources with the newest
           # release test/duckdb_versions.json lists; this one runs the scripts
           # with DuckDB sources again on each older listed release.
@@ -3240,9 +3240,8 @@ jobs:
       - graceful_shutdown_test_full
       - test_cold_start_unkeyed_append
       - build_spicescript
-      # Every spicescript job gates: the passing scripts, the known-failing
-      # scripts (which must fail exactly as recorded), the older DuckDB releases
-      # and the live providers. A failing shard names its failing scripts in
+      # Every spicescript job gates: the passing scripts, the older DuckDB
+      # releases and the live providers. A failing shard names its failing scripts in
       # its own log.
       - test_spicescript
     steps:

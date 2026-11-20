@@ -22,6 +22,9 @@ limitations under the License.
 //! stream runs for as long as data keeps arriving. A response is read whole, up to
 //! [`Limits::max_response_bytes`] once decoded, unless it is the successful answer to a request
 //! that asked for a stream; then each of its server-sent events is held to that size instead.
+//!
+//! A request is sent again only when the endpoint never received it, as [`http_retry`]
+//! describes.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -71,13 +74,13 @@ impl Default for Limits {
 }
 
 impl Limits {
-    /// A `reqwest` client with these timeouts.
+    /// A `reqwest` client with these timeouts and the [`http_retry`] policy.
     #[expect(
         clippy::expect_used,
-        reason = "timeouts add no failure: the build fails only where `reqwest::Client::new()` panics"
+        reason = "timeouts and the retry policy add no failure: the build fails only where `reqwest::Client::new()` panics"
     )]
     pub(crate) fn http_client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
+        http_retry::client_builder()
             .connect_timeout(self.connect_timeout)
             .read_timeout(self.read_timeout)
             .build()
@@ -91,8 +94,8 @@ pub(crate) fn client<C: Config>(config: C, limits: Limits) -> Client<C> {
     Client::build(service.http_client().clone(), config).with_http_service(service)
 }
 
-/// Sends each request once, as `async-openai`'s `ReqwestService` does, and holds its response to
-/// [`Limits::max_response_bytes`].
+/// Sends each request to the endpoint once, as `async-openai`'s `ReqwestService` does, and holds
+/// its response to [`Limits::max_response_bytes`].
 #[derive(Clone, Debug)]
 pub(crate) struct BoundedService {
     client: reqwest::Client,
