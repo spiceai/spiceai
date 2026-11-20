@@ -247,11 +247,11 @@ async fn a_package_holds_one_downloaded_file_at_a_time() {
     expected.sort();
     assert_eq!(archive_entries(&zip), expected);
 
-    // The root spicepod.yaml is held until it is packaged last.
+    // The root spicepod.yaml is packaged first, and is not held while the folder's files are.
     let peak = store.held.peak.load(Ordering::SeqCst);
     assert_eq!(
         peak,
-        FILE_BYTES + spicepod.len(),
+        FILE_BYTES,
         "at most one downloaded file may be held at once; {peak} bytes of {} were held together",
         FILES * FILE_BYTES + spicepod.len()
     );
@@ -276,6 +276,86 @@ async fn a_file_referenced_more_than_once_is_packaged_once() {
             ("data/a.csv".to_string(), data),
             ("spicepod.yaml".to_string(), spicepod.as_bytes().to_vec()),
         ]
+    );
+}
+
+/// A folder that holds a component file, listed before the component that references the file,
+/// counts that file once: it was downloaded and counted to find the files it references, and
+/// the folder does not download or count it again. A package of exactly the files and bytes its
+/// budget allows is built, and one with a file or a byte fewer is refused.
+#[tokio::test]
+async fn a_folder_holding_a_component_file_counts_it_once() {
+    let spicepod = "version: v1\nkind: Spicepod\nname: pkg\ndatasets:\n  - from: file:data\n    name: all\n  - ref: data/one\n";
+    let component = "from: file:data/a.csv\nname: one\n";
+    let files = [
+        ("data/a.csv", incompressible(11, FILE_BYTES)),
+        ("data/b.csv", incompressible(12, FILE_BYTES)),
+        ("data/one/dataset.yaml", component.as_bytes().to_vec()),
+    ];
+    let store = store_with(spicepod, &files).await;
+    let mut expected: Vec<(String, Vec<u8>)> = files
+        .iter()
+        .map(|(path, data)| ((*path).to_string(), data.clone()))
+        .collect();
+    expected.push(("spicepod.yaml".to_string(), spicepod.as_bytes().to_vec()));
+    expected.sort();
+    let size = |len: usize| u64::try_from(len).expect("a test file's size fits in u64");
+    let package_files = expected.len();
+    let package_bytes: u64 = expected.iter().map(|(_, data)| size(data.len())).sum();
+    assert_eq!(package_files, 4);
+
+    store.gets.store(0, Ordering::SeqCst);
+    let zip = package::make_zip_within(
+        &store,
+        &Path::from("spicepod.yaml"),
+        package::PackageBudget::new(package_files, package_bytes),
+    )
+    .await
+    .expect("a package of exactly the files and bytes of its budget is built");
+    assert_eq!(archive_entries(&zip), expected);
+    assert_eq!(
+        store.gets.load(Ordering::SeqCst),
+        package_files,
+        "each file is downloaded once"
+    );
+
+    let error = package::make_zip_within(
+        &store,
+        &Path::from("spicepod.yaml"),
+        package::PackageBudget::new(package_files - 1, package_bytes),
+    )
+    .await
+    .expect_err("four files are over a three-file budget");
+    assert_eq!(
+        error.to_string(),
+        "it references more than 3 files, the most a package may hold, and dataset 'all' ('file:data') alone lists 2. Reference fewer files in that dataset. See https://spiceai.org/docs/api/http/packages"
+    );
+
+    let error = package::make_zip_within(
+        &store,
+        &Path::from("spicepod.yaml"),
+        package::PackageBudget::new(10_000, package_bytes - 1),
+    )
+    .await
+    .expect_err("the package's bytes are over a budget one byte smaller");
+    let package::Error::TooManyBytes {
+        origin,
+        bytes,
+        max_bytes,
+    } = error
+    else {
+        panic!("not a byte-budget error: {error}");
+    };
+    assert_eq!(
+        (origin, bytes, max_bytes),
+        (
+            package::Origin::Dataset {
+                name: "all".to_string(),
+                from: "file:data".to_string(),
+            },
+            2 * size(FILE_BYTES),
+            package_bytes - 1,
+        )
     );
 }
 

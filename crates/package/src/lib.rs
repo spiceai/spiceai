@@ -351,11 +351,12 @@ fn is_folder_reference(path: &PathReference) -> bool {
 ///
 /// It will parse the spicepod and find all of the linked files, and add them to the returned zip archive.
 ///
-/// A data file (a view's SQL, a dataset's file, or each file of a dataset's folder) is added to the
-/// archive as soon as it is downloaded and is not kept after that, so besides the archive the
-/// package holds the Spicepod and component files it parsed and at most one data file. A file
-/// referenced more than once (by two datasets, or by a folder and a file in it) is downloaded and
-/// added once.
+/// The Spicepod and component files, downloaded first to find the files they reference, are added
+/// to the archive before anything else. A data file (a view's SQL, a dataset's file, or each file
+/// of a dataset's folder) is added as soon as it is downloaded and is not kept after that, so
+/// besides the archive the package then holds at most one data file. A path referenced more than
+/// once (by two datasets, by a folder and a file in it, or by a folder and a Spicepod or component
+/// file in it) is downloaded, counted against the budget, and added once.
 pub async fn make_zip(store: &dyn ObjectStore, spicepod_path: &Path) -> Result<Bytes> {
     make_zip_within(store, spicepod_path, PackageBudget::default()).await
 }
@@ -378,8 +379,15 @@ pub async fn make_zip_within(
         linked_paths.len()
     );
 
+    // The Spicepod and component files were downloaded, and counted against the budget, to find
+    // the files they reference. They are added first, so a folder that holds one finds it in the
+    // archive and neither downloads nor counts it again.
+    let (retrieved, referenced): (Vec<_>, Vec<_>) = linked_paths
+        .into_iter()
+        .partition(|path| matches!(path, PathReference::Retrieved { .. }));
+
     let mut zip = ZipArchive::new();
-    for linked_path in linked_paths {
+    for linked_path in retrieved.into_iter().chain(referenced) {
         tracing::debug!("[zip package] Extracting content for linked path: {linked_path:?}");
         let origin = linked_path.origin();
         if is_folder_reference(&linked_path) {
