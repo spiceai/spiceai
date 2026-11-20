@@ -27,7 +27,7 @@ import tempfile
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DURATIONS_FILE = Path("recordings/durations.json")
 # The workflows whose runs carry spicescript results, and the event of the runs to read.
-SOURCES = [("e2e_test_ci.yml", "merge_group"), ("spicescript_nightly.yml", "schedule")]
+SOURCES = [("e2e_test_ci.yml", "merge_group"), ("nightly_tests.yml", "schedule")]
 
 
 def gh(*args):

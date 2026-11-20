@@ -1,5 +1,4 @@
 name: postgres-cdc-parity
-tags: [smoke]
 description: >
   Postgres CDC converges to the source after inserts, updates, deletes, key
   changes and large transactions, across a clean restart and a kill: Cayenne

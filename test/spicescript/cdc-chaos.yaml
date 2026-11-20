@@ -1,5 +1,4 @@
 name: cdc-chaos
-tags: [smoke]
 description: >
   On one spiced, readers of Cayenne accelerations (full refresh and CDC) get
   the right answer or an error, never a wrong one, while the spicepod is

@@ -1,4 +1,5 @@
 name: mysql-join-capabilities
+tags: [long]
 description: Full joins stay local for MySQL while supported joins still federate.
 sources:
   my: { kind: mysql }

@@ -746,7 +746,7 @@ mod tests {
     use super::*;
 
     fn tagged_scripts() -> Vec<script::Script> {
-        ["[]", "[smoke]", "[long]", "[smoke, long]"]
+        ["[]", "[long]", "[]"]
             .into_iter()
             .map(|tags| {
                 script::Script::parse(&format!(
@@ -758,38 +758,18 @@ mod tests {
     }
 
     #[test]
-    fn only_tags_match_any_repeated_tag() {
+    fn only_tag_selects_the_tagged_scripts() {
         assert_eq!(
-            select_scripts(
-                &tagged_scripts(),
-                &[script::Tag::Smoke, script::Tag::Long],
-                &[],
-                None
-            )
-            .expect("selection"),
-            (vec![1, 2, 3], 3)
-        );
-    }
-
-    #[test]
-    fn excluded_tags_win_over_only_tags() {
-        assert_eq!(
-            select_scripts(
-                &tagged_scripts(),
-                &[script::Tag::Smoke],
-                &[script::Tag::Long],
-                None
-            )
-            .expect("selection"),
+            select_scripts(&tagged_scripts(), &[script::Tag::Long], &[], None).expect("selection"),
             (vec![1], 1)
         );
     }
 
     #[test]
-    fn exclude_tags_alone() {
+    fn exclude_tag_drops_the_tagged_scripts() {
         assert_eq!(
             select_scripts(&tagged_scripts(), &[], &[script::Tag::Long], None).expect("selection"),
-            (vec![0, 1], 2)
+            (vec![0, 2], 2)
         );
     }
 
@@ -797,51 +777,42 @@ mod tests {
     fn no_tag_flags_select_all() {
         assert_eq!(
             select_scripts(&tagged_scripts(), &[], &[], None).expect("selection"),
-            (vec![0, 1, 2, 3], 4)
+            (vec![0, 1, 2], 3)
         );
     }
 
     #[test]
     fn tags_filter_before_partition() {
-        // smoke 100s, untagged 95s, smoke 10s, smoke 5s. Over the three smoke
-        // scripts, share 2/2 gets 10s and 5s (both behind 100s). Dealing all
-        // four first would put 95s in share 2, the 10s with it and the 5s in
-        // share 1, so filtering afterwards would leave share 2 with only 10s.
-        let scripts: Vec<script::Script> = [
-            ("[smoke]", 100),
-            ("[]", 95),
-            ("[smoke]", 10),
-            ("[smoke]", 5),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(i, (tags, secs))| {
-            let mut s = script::Script::parse(&format!(
-                "name: s{i}\ntags: {tags}\nspicepod: {{}}\nsteps: [{{start: {{}}}}]"
-            ))
-            .expect("tagged script parses");
-            s.file_stem = format!("s{i}");
-            s.duration = Some(std::time::Duration::from_secs(secs));
-            s
-        })
-        .collect();
+        // untagged 100s, long 95s, untagged 10s, untagged 5s. Over the three
+        // untagged scripts, share 2/2 gets 10s and 5s (both behind 100s).
+        // Dealing all four first would put 95s in share 2, the 10s with it and
+        // the 5s in share 1, so filtering afterwards would leave share 2 with
+        // only 10s.
+        let scripts: Vec<script::Script> = [("[]", 100), ("[long]", 95), ("[]", 10), ("[]", 5)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (tags, secs))| {
+                let mut s = script::Script::parse(&format!(
+                    "name: s{i}\ntags: {tags}\nspicepod: {{}}\nsteps: [{{start: {{}}}}]"
+                ))
+                .expect("tagged script parses");
+                s.file_stem = format!("s{i}");
+                s.duration = Some(std::time::Duration::from_secs(secs));
+                s
+            })
+            .collect();
+        let long = [script::Tag::Long];
         assert_eq!(
-            select_scripts(&scripts, &[script::Tag::Smoke], &[], Some((2, 2))).expect("selection"),
+            select_scripts(&scripts, &[], &long, Some((2, 2))).expect("selection"),
             (vec![2, 3], 3)
         );
         assert_eq!(
-            select_scripts(&scripts, &[script::Tag::Smoke], &[], Some((1, 2))).expect("selection"),
+            select_scripts(&scripts, &[], &long, Some((1, 2))).expect("selection"),
             (vec![0], 3)
         );
         assert_eq!(
-            select_scripts(&tagged_scripts(), &[script::Tag::Smoke], &[], Some((1, 2)))
-                .expect("selection"),
-            (vec![1], 2)
-        );
-        assert_eq!(
-            select_scripts(&tagged_scripts(), &[script::Tag::Smoke], &[], Some((3, 3)))
-                .expect("empty share is allowed"),
-            (vec![], 2)
+            select_scripts(&scripts, &[], &long, Some((4, 4))).expect("empty share is allowed"),
+            (vec![], 3)
         );
     }
 
@@ -850,13 +821,13 @@ mod tests {
         assert_eq!(
             select_scripts(
                 &tagged_scripts(),
-                &[script::Tag::Smoke],
-                &[script::Tag::Smoke],
+                &[script::Tag::Long],
+                &[script::Tag::Long],
                 None
             )
             .expect_err("empty selection")
             .to_string(),
-            "--only-tag/--exclude-tag selected none of the 4 scripts given; check the tags in the scripts and on the command line"
+            "--only-tag/--exclude-tag selected none of the 3 scripts given; check the tags in the scripts and on the command line"
         );
     }
 

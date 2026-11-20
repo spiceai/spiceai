@@ -9,10 +9,10 @@ cargo build -p spicescript
 target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spicescript
 ```
 
-Scripts use `tags: [smoke]` for the merge-queue smoke set and `tags: [long]`
-for waits on a source's clock, such as DynamoDB iterator expiry. Select with
-`--only-tag smoke`, or use `--exclude-tag long` for a quick local run.
-Nightly runs use no tag filter to run everything.
+The merge queue runs every script here except those tagged `tags: [long]`
+(`--exclude-tag long`), plus any script the PR adds or changes.
+`nightly_tests.yml` runs every script after merge, on trunk. Use
+`--exclude-tag long` for a quick local run.
 
 ## Layout
 
@@ -20,7 +20,7 @@ Nightly runs use no tag filter to run everything.
 | --- | --- |
 | `*.yaml` | Scripts that pass; CI runs them against the commit's `spiced`. |
 | `variants.yaml` | The shared variants scripts name instead of writing the patch (`cayenne: cayenne-file`), for every script here and in the directories below. Not a script. |
-| `known-failing/<group>/` | Scripts that reproduce open bugs, grouped by the component a fix would touch (one issue per group). The merge queue does not run them; `spicescript_nightly.yml` runs them nightly against the nightly `spiced` and requires each to fail exactly as recorded, and on demand against an E2E Test CI build (`gh workflow run spicescript_nightly.yml -f run_id=<run>`). A script moves up to `test/spicescript/` once its bug is fixed. |
+| `known-failing/<group>/` | Scripts that reproduce open bugs, grouped by the component a fix would touch (one issue per group). The merge queue runs one only when the PR adds or changes it; `nightly_tests.yml` runs them all after merge, on trunk, and requires each to fail exactly as recorded, and on demand against an E2E Test CI build (`gh workflow run nightly_tests.yml -f run_id=<run>`). A script moves up to `test/spicescript/` once its bug is fixed. |
 | `snapshots/` | Scripts that need a `spiced` built with the `snapshots` feature; `snapshots/known-failing/<group>/` holds those that reproduce open bugs. CI runs neither: its `spiced` is built without the feature. |
 | `spicebench/` | Scripts that need the `spicebench` feature, such as the Cayenne catalog connector; `spicebench/known-failing/<group>/` holds those that reproduce open bugs. CI runs neither: it does not pass `spicebench/` to `spicescript`, and its `spiced` is built without the feature. |
 | `from-release/` | Scripts that only mean something with `--from` a released `spiced`, because they start on behavior the build under test no longer has, such as the Turso Cayenne metastore. CI does not run them: it passes neither `from-release/` nor `--from`. |

@@ -1,5 +1,4 @@
 name: cron-and-reload
-tags: [smoke]
 description: >
   refresh_cron refreshes a Cayenne acceleration on its schedule: a full
   refresh, an append and an accelerated view each follow the source with no

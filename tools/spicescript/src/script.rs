@@ -30,13 +30,14 @@ use indexmap::IndexMap;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
-/// A script's scheduling categories, shared by YAML and CLI filters.
+/// A script's tags, which `--only-tag` and `--exclude-tag` select on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tag {
-    /// Runs in the merge queue as the pre-merge smoke set.
-    Smoke,
-    /// Waits on a source's own clock for many minutes; exclude for a quick local run.
+    /// Too slow for the run before every merge, for what it catches there: the
+    /// merge queue runs `--exclude-tag long`, and the post-merge run on trunk
+    /// runs every script. As with Go's `-short`, a script runs before merge
+    /// unless it opts out.
     Long,
 }
 
@@ -2938,29 +2939,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tags_parse_smoke_and_long() {
-        let script = Script::parse("name: s\ntags: [smoke, long]\nspicepod: {}\nsteps: []")
-            .expect("tags parse");
-        assert_eq!(script.tags, vec![Tag::Smoke, Tag::Long]);
+    fn tags_parse() {
+        let script =
+            Script::parse("name: s\ntags: [long]\nspicepod: {}\nsteps: []").expect("tags parse");
+        assert_eq!(script.tags, vec![Tag::Long]);
     }
 
     #[test]
     fn tags_reject_unknown_tag() {
         let error = Script::parse("name: s\ntags: [slow]\nspicepod: {}\nsteps: []")
             .expect_err("unknown tag");
-        assert_eq!(
-            error.to_string(),
-            "unknown variant `slow`, expected `smoke` or `long`"
-        );
+        assert_eq!(error.to_string(), "unknown variant `slow`, expected `long`");
     }
 
     #[test]
     fn tags_reject_duplicate_tag() {
-        let error = Script::parse("name: s\ntags: [smoke, smoke]\nspicepod: {}\nsteps: []")
+        let error = Script::parse("name: s\ntags: [long, long]\nspicepod: {}\nsteps: []")
             .expect_err("duplicate tag");
         assert_eq!(
             error.to_string(),
-            "Duplicate tag `smoke`; list each tag only once"
+            "Duplicate tag `long`; list each tag only once"
         );
     }
 

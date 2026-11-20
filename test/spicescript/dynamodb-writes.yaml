@@ -1,5 +1,4 @@
 name: dynamodb-writes
-tags: [smoke]
 description: >
   DynamoDB through Spice: INSERT (several types) and DELETE (by key, by a
   composite key tuple) write to the table, as a scan of it shows; and tables

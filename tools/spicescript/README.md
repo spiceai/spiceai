@@ -90,7 +90,7 @@ this run's other combinations have reserved does not count toward that.
 | `--from-release FROM=VERSION` | Start the runs whose `from:` is `FROM` (such as `2.3.x`) on release `VERSION` (such as `2.3.2`) instead of the one it resolves to (see [Upgrades](#upgrades)). Repeat it for several. |
 | `--cluster` | Run every instance as a scheduler plus one executor over node mTLS. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped, as are instances whose `spiced-args` choose a `--role` other than `server`, such as `sidecar`; a `--role server` gives way to the scheduler role. |
 | `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors and sidecar included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
-| `--only-tag TAG` | Select scripts with any of these tags (`smoke`, `long`); repeat for several. Applies to explicit files too, before `--partition`. |
+| `--only-tag TAG` | Select only scripts with any of these tags (see [`tags:`](#scripts)); repeat for several. Applies to explicit files too, before `--partition`. |
 | `--exclude-tag TAG` | Exclude scripts with any of these tags; repeat for several. Exclusion wins over `--only-tag`. Tag flags print the selected and total counts; selecting zero scripts is an error, but an empty partition share is allowed. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
 | `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. CI shards by these times, so refresh them from CI's own runs with `python3 test/spicescript/update_durations.py`, which writes each script's median over the newest merge-queue and nightly runs. |
@@ -136,7 +136,7 @@ networks named after the dead runner's pid.
 
 ```yaml
 name: orders-cdc
-tags: [smoke]
+tags: [long]
 description: >
   What the script shows, in a sentence or two.
 sources:
@@ -165,11 +165,12 @@ steps:
     eventually: 60s
 ```
 
-Optional top-level `tags:` is a list of `smoke` (the merge-queue pre-merge
-smoke set) and `long` (waits on a source's own clock for many minutes).
-Unknown and duplicate tags are rejected. Without tag flags, all scripts are
-selected; use `--exclude-tag long` for a quick local run or
-`--only-tag smoke test/spicescript` for the smoke set.
+`tags:` is optional. The one tag is `long`: the script is too slow for the
+run before every merge, for what it catches there, so the merge queue skips it
+(`--exclude-tag long`) and it runs after merge, on trunk, in
+`nightly_tests.yml`. A script without it runs before every merge. Leave a new
+script untagged unless it is slow; tag it `long` when its CI time is high and
+its failure history low. Unknown and duplicate tags are rejected.
 
 ### Sources
 
@@ -768,9 +769,11 @@ runner loads them in bulk (`COPY` on PostgreSQL, multi-row `INSERT` elsewhere).
   replace the local one (`test/spicescript/update_durations.py`).
 - A script that reproduces an open bug goes in
   `test/spicescript/known-failing/<group>/`. It moves to `test/spicescript/`
-  once the bug is fixed. The merge queue does not run `known-failing/`:
-  `spicescript_nightly.yml` does, so run the script yourself in the PR that
-  fixes its bug, or the next nightly run fails on the fix.
+  once the bug is fixed. The merge queue runs a known-failing script only in
+  the PR that adds or changes it; the rest of `known-failing/` runs after
+  merge in `nightly_tests.yml`. A PR that fixes a bug without touching its
+  script learns from the next nightly run, so run the script yourself in that
+  PR.
 
 ## Expected failures
 
@@ -786,7 +789,8 @@ A run fails on:
   answer, a row count moved);
 - a listed check that passes: if it is fixed, re-record and move the script
   out of `known-failing/` (for a script in `known-failing/`, this shows up in
-  the nightly run of `spicescript_nightly.yml`, not in the merge queue);
+  the post-merge run of `nightly_tests.yml`, unless the PR changes the
+  script);
 - an entry with no group.
 
 When a run fails before its steps (a source or instance that did not start),

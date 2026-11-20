@@ -1,5 +1,4 @@
 name: acceleration-dml-arithmetic
-tags: [smoke]
 description: >
   UPDATE and DELETE with integer arithmetic on an acceleration that takes its
   own writes (`access: read_write`, `write_mode: acceleration`) change the rows

@@ -1,4 +1,5 @@
 name: cayenne-transactions
+tags: [long]
 description: >
   A SQL transaction (`BEGIN; SELECT assert(<gate>); UPDATE …; INSERT …;
   COMMIT;`) that writes two Cayenne accelerations commits both or neither,

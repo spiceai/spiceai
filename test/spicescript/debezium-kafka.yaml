@@ -1,4 +1,5 @@
 name: debezium-kafka
+tags: [long]
 description: >
   Debezium Server reading PostgreSQL publishes its change events to Kafka
   (Redpanda), and Spice follows the topic (`from: debezium:`): the initial

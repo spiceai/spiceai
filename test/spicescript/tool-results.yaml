@@ -1,5 +1,4 @@
 name: tool-results
-tags: [smoke]
 description: >
   The data tools (`sql`, `random_sample`, `top_n_sample`,
   `sample_distinct_columns`) return `{"columns": [...], "rows": [[...]]}`

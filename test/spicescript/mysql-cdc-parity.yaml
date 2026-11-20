@@ -1,5 +1,4 @@
 name: mysql-cdc-parity
-tags: [smoke]
 description: >
   MySQL binlog CDC converges to the source after inserts, updates, deletes, key
   changes and large transactions, across a clean stop and a kill: Cayenne
