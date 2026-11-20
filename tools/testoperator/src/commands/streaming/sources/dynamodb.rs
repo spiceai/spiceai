@@ -1223,6 +1223,14 @@ pub fn transform_spicepod(
                     },
                 ],
             });
+
+            // Temporary credentials carry a session token; static keys have none.
+            if std::env::var("DYNAMODB_AWS_SESSION_TOKEN").is_ok() {
+                d.params.get_or_insert_with(Params::default).data.insert(
+                    "dynamodb_aws_session_token".to_string(),
+                    ParamValue::String("${secrets:DYNAMODB_AWS_SESSION_TOKEN}".to_string()),
+                );
+            }
         }
     }
 
