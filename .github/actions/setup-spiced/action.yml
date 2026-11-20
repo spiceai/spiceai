@@ -47,24 +47,28 @@ runs:
       shell: bash
       env:
         REF: ${{ inputs.ref }}
+        INPUT_WITH_ODBC: ${{ inputs.with_odbc }}
+        PLATFORM_OS: ${{ steps.platform.outputs.os }}
+        PLATFORM_ARCH: ${{ steps.platform.outputs.arch }}
+        PLATFORM_EXT: ${{ steps.platform.outputs.ext }}
       run: |
         git fetch --depth=10 origin -- "$REF"
         echo "Fetching latest 10 commits from $REF"
 
         commit_hashes=($(git log FETCH_HEAD --pretty=format:"%H" -n 10))
 
-        if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
+        if [[ "${INPUT_WITH_ODBC}" == "true" ]]; then
           features="odbc_"
         else
           features=""
         fi
 
-        PLATFORM="${{ steps.platform.outputs.os }}_${{ steps.platform.outputs.arch }}"
-        EXT="${{ steps.platform.outputs.ext }}"
+        PLATFORM="${PLATFORM_OS}_${PLATFORM_ARCH}"
+        EXT="${PLATFORM_EXT}"
 
         for hash in "${commit_hashes[@]}"; do
           echo "Checking $hash in MinIO for $PLATFORM"
-          if mc stat spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$hash/spiced_${features}${PLATFORM}.${EXT}; then
+          if mc stat "spice-minio/artifacts/spiced/${PLATFORM_OS}-${PLATFORM_ARCH}/$hash/spiced_${features}${PLATFORM}.${EXT}"; then
             echo "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
             exit 0
@@ -77,8 +81,15 @@ runs:
     - name: Set SPICED_COMMIT from workflow input
       shell: bash
       if: ${{ inputs.spiced_commit }}
+      env:
+        INPUT_SPICED_COMMIT: ${{ inputs.spiced_commit }}
       run: |
-        echo "SPICED_COMMIT=${{ inputs.spiced_commit }}" >> $GITHUB_ENV
+        # Appended to $GITHUB_ENV as NAME=value: a newline would inject more entries.
+        if [[ "${INPUT_SPICED_COMMIT}" == *$'\n'* || "${INPUT_SPICED_COMMIT}" == *$'\r'* ]]; then
+          echo "::error::setup-spiced: spiced_commit must not contain a newline"
+          exit 1
+        fi
+        echo "SPICED_COMMIT=${INPUT_SPICED_COMMIT}" >> $GITHUB_ENV
 
     - name: Output SPICED_COMMIT
       id: output_spiced_commit
@@ -87,14 +98,19 @@ runs:
 
     - name: Download spiced from MinIO
       shell: bash
+      env:
+        INPUT_WITH_ODBC: ${{ inputs.with_odbc }}
+        PLATFORM_OS: ${{ steps.platform.outputs.os }}
+        PLATFORM_ARCH: ${{ steps.platform.outputs.arch }}
+        PLATFORM_EXT: ${{ steps.platform.outputs.ext }}
       run: |
-        if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
+        if [[ "${INPUT_WITH_ODBC}" == "true" ]]; then
           features="odbc_"
         else
           features=""
         fi
-        PLATFORM="${{ steps.platform.outputs.os }}_${{ steps.platform.outputs.arch }}"
-        EXT="${{ steps.platform.outputs.ext }}"
-        mc cp "spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$SPICED_COMMIT/spiced_${features}${PLATFORM}.${EXT}" spiced_${features}${PLATFORM}.${EXT}
+        PLATFORM="${PLATFORM_OS}_${PLATFORM_ARCH}"
+        EXT="${PLATFORM_EXT}"
+        mc cp "spice-minio/artifacts/spiced/${PLATFORM_OS}-${PLATFORM_ARCH}/$SPICED_COMMIT/spiced_${features}${PLATFORM}.${EXT}" spiced_${features}${PLATFORM}.${EXT}
         tar -xzf spiced_${features}${PLATFORM}.${EXT}
         sudo cp ./spiced /usr/local/bin/spiced
