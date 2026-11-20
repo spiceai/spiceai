@@ -138,6 +138,9 @@ tokio-stream.workspace = true
 tonic.workspace = true
 # Issues the cluster nodes' mTLS certificates for the executor export test.
 test-framework = { path = "../../crates/test-framework" }
+# `spice run` reads these arguments to find the Spicepod they load; its
+# reading is tested against this parser.
+spice = { path = "../spice" }
 
 [features]
 adbc = ["dep:connector-adbc", "dep:connector-duckdb", "runtime/adbc"]

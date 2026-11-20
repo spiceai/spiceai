@@ -1677,9 +1677,89 @@ mod build {
     }
 
     /// `spice run production.yaml` builds the functions of `production.yaml`,
-    /// the manifest the runtime is given, not of the `spicepod.yaml` beside it.
+    /// the manifest the runtime is given, not of the `spicepod.yaml` beside it,
+    /// wherever the path stands among the runtime's options.
     #[test]
     fn test_run_builds_the_manifest_it_names() {
+        for args in [
+            &["production.yaml"][..],
+            &["--very-verbose", "production.yaml"],
+            &["--tls-enabled", "false", "production.yaml"],
+            &[
+                "--set-runtime=results_cache.enabled=false",
+                "production.yaml",
+            ],
+            &["production.yaml", "--very-verbose"],
+        ] {
+            let project = two_manifest_project();
+            let bin = TempDir::new().expect("create the runtime directory");
+            let record = bin.path().join("runtime-saw");
+            let spiced = stub_runtime(&bin, &record);
+
+            let output = spice_cmd()
+                .current_dir(project.path())
+                .env("SPICED_PATH", &spiced)
+                .arg("run")
+                .args(args)
+                .timeout(std::time::Duration::from_mins(1))
+                .output()
+                .expect("run spice run");
+
+            let printed = printed(&output);
+            assert!(
+                printed.contains(&format!(
+                    "Built 'score' -> ./score.wasm (sha256 {})",
+                    sha256_hex(b"production")
+                )),
+                "{args:?}: {printed}"
+            );
+            assert!(!printed.contains("decoy"), "{args:?}: {printed}");
+            assert!(
+                !project.path().join("decoy.wasm").exists(),
+                "{args:?}: the other manifest's build must not run: {printed}"
+            );
+            let saw = runtime_saw(&record, &printed);
+            assert!(
+                saw.args.iter().any(|arg| arg == "production.yaml"),
+                "{args:?}: the runtime loads the same manifest: {:?} {printed}",
+                saw.args
+            );
+            assert_eq!(saw.module, "production", "{args:?}: {printed}");
+        }
+    }
+
+    /// When `spice run` cannot tell which manifest the runtime loads, it
+    /// builds neither and says so, rather than run the commands of a
+    /// manifest the runtime may never load.
+    #[test]
+    fn test_run_builds_nothing_when_it_cannot_tell_which_manifest_the_runtime_loads() {
+        let project = two_manifest_project();
+        let bin = TempDir::new().expect("create the runtime directory");
+        let record = bin.path().join("runtime-saw");
+        let spiced = stub_runtime(&bin, &record);
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .env("SPICED_PATH", &spiced)
+            .args(["run", "--not-a-runtime-option", "production.yaml"])
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        assert!(
+            printed.contains("`spice run` does not recognize the runtime argument '--not-a-runtime-option', so it cannot tell which Spicepod the runtime will load and built no function module. Run `spice build` to build them, or `spice upgrade` if the runtime is newer than the CLI. See: https://spiceai.org/docs/components/functions/wasm"),
+            "{printed}"
+        );
+        assert!(!printed.contains("Building function"), "{printed}");
+        assert!(!project.path().join("decoy.wasm").exists(), "{printed}");
+        assert!(!project.path().join("score.wasm").exists(), "{printed}");
+    }
+
+    /// An app directory holding `spicepod.yaml`, whose function `decoy`
+    /// builds `decoy.wasm`, and `production.yaml`, whose function `score`
+    /// writes `production` to `score.wasm`.
+    fn two_manifest_project() -> TempDir {
         let project = TempDir::new().expect("create the project");
         write_project(
             project.path(),
@@ -1704,38 +1784,7 @@ mod build {
             ),
         )
         .expect("write production.yaml");
-        let bin = TempDir::new().expect("create the runtime directory");
-        let record = bin.path().join("runtime-saw");
-        let spiced = stub_runtime(&bin, &record);
-
-        let output = spice_cmd()
-            .current_dir(project.path())
-            .env("SPICED_PATH", &spiced)
-            .args(["run", "production.yaml"])
-            .timeout(std::time::Duration::from_mins(1))
-            .output()
-            .expect("run spice run");
-
-        let printed = printed(&output);
-        assert!(
-            printed.contains(&format!(
-                "Built 'score' -> ./score.wasm (sha256 {})",
-                sha256_hex(b"production")
-            )),
-            "{printed}"
-        );
-        assert!(!printed.contains("decoy"), "{printed}");
-        assert!(
-            !project.path().join("decoy.wasm").exists(),
-            "the other manifest's build must not run: {printed}"
-        );
-        let saw = runtime_saw(&record, &printed);
-        assert!(
-            saw.args.iter().any(|arg| arg == "production.yaml"),
-            "the runtime loads the same manifest: {:?} {printed}",
-            saw.args
-        );
-        assert_eq!(saw.module, "production", "{printed}");
+        project
     }
 
     /// From the app's parent directory, `spice run ./app/spicepod.yaml` builds

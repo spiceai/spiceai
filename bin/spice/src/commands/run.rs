@@ -16,10 +16,14 @@ limitations under the License.
 
 //! Run command implementation - starts the Spice runtime.
 
+use crate::commands::build::FUNCTIONS_DOCS;
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::runtime_launcher::{ConnectionReport, RunConfig, run_runtime};
 use clap::Args;
+use spiced_args::RuntimeSpicepod;
+
+pub mod spiced_args;
 
 /// Arguments for the run command.
 #[derive(Args, Debug)]
@@ -98,17 +102,25 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
     .await
 }
 
-/// The local Spicepod `spiced` will load, exactly as it is named: the leading
-/// positional argument passed through to it (`spice run ./app/production.yaml`,
-/// a manifest file or a directory holding `spicepod.yaml`), or the runtime
-/// directory. A remote Spicepod (`s3://`, `https://`) has nothing local to
-/// build.
+/// The local Spicepod `spiced` will load, exactly as it is named: the path
+/// argument passed through to it, wherever it stands among the runtime's
+/// options (`spice run --tls-enabled false ./app/production.yaml`, a manifest
+/// file or a directory holding `spicepod.yaml`), or the runtime directory.
+/// A remote Spicepod (`s3://`, `https://`) has nothing local to build, and
+/// neither has a runtime that loads none.
 fn local_spicepod(runtime_dir: &std::path::Path, args: &[String]) -> Option<std::path::PathBuf> {
-    let Some(spicepod) = args.first().filter(|arg| !arg.starts_with('-')) else {
-        return Some(runtime_dir.to_path_buf());
-    };
-    if spicepod.contains("://") {
-        return None;
+    match spiced_args::runtime_spicepod(args) {
+        RuntimeSpicepod::WorkingDirectory => Some(runtime_dir.to_path_buf()),
+        RuntimeSpicepod::Path(spicepod) if spicepod.contains("://") => None,
+        RuntimeSpicepod::Path(spicepod) => Some(runtime_dir.join(spicepod)),
+        RuntimeSpicepod::NotLoaded => None,
+        RuntimeSpicepod::Unrecognized(argument) => {
+            // Building a guess could run the commands of a Spicepod the
+            // runtime never loads.
+            tracing::warn!(
+                "`spice run` does not recognize the runtime argument '{argument}', so it cannot tell which Spicepod the runtime will load and built no function module. Run `spice build` to build them, or `spice upgrade` if the runtime is newer than the CLI. See: {FUNCTIONS_DOCS}"
+            );
+            None
+        }
     }
-    Some(runtime_dir.join(spicepod))
 }

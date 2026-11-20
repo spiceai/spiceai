@@ -20527,6 +20527,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "snmalloc-rs",
+ "spice",
  "spice-cloud",
  "telemetry",
  "tempfile",

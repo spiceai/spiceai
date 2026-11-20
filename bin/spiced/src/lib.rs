@@ -157,6 +157,8 @@ mod log_capture;
 pub mod open_file_limit;
 mod runtime_lock;
 pub use runtime_lock::{InstanceClaim, claim_instance_directory};
+#[cfg(test)]
+mod spice_run_args_tests;
 #[path = "tracing.rs"]
 mod spiced_tracing;
 pub use spiced_tracing::otel_logs;
