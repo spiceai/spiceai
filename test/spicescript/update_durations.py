@@ -34,6 +34,22 @@ def gh(*args):
     return subprocess.run(["gh", *args], check=True, capture_output=True, text=True).stdout
 
 
+def medians(result_files):
+    """Each script's median run time, in whole seconds rounded up, over `--results` files.
+
+    Only runs whose outcome is `passed` count, which includes a known-failing
+    script that failed exactly as recorded: a script that failed otherwise
+    may have stopped early (a source that never started ends it in under a
+    second), and its time says nothing about how long it takes.
+    """
+    times = collections.defaultdict(list)
+    for path in result_files:
+        for script in json.loads(Path(path).read_text())["scripts"]:
+            if script["outcome"] == "passed":
+                times[script["file"]].append(script["seconds"])
+    return {file: math.ceil(statistics.median(seconds)) for file, seconds in times.items()}
+
+
 def recent_runs(repo, per_source):
     runs = []
     for workflow, event in SOURCES:
@@ -58,8 +74,8 @@ def main():
     if not runs:
         raise SystemExit("no runs to read")
 
-    times = collections.defaultdict(list)
     with tempfile.TemporaryDirectory() as tmp:
+        files = []
         for run in runs:
             dest = Path(tmp) / run
             try:
@@ -69,27 +85,26 @@ def main():
                 continue
             # Only full runs of a script: the older-DuckDB job's files
             # (spicescript-results-duckdb-*.json) run a narrowed matrix.
-            for path in dest.glob("*/spicescript-results.json"):
-                for script in json.loads(path.read_text())["scripts"]:
-                    times[script["file"]].append(script["seconds"])
+            files += dest.glob("*/spicescript-results.json")
             print(f"run {run}: read")
+        measured = medians(files)
 
     by_dir = collections.defaultdict(dict)
-    for file, seconds in times.items():
+    for file, seconds in measured.items():
         file = Path(file)
-        by_dir[file.parent][file.stem] = math.ceil(statistics.median(seconds))
+        by_dir[file.parent][file.stem] = seconds
     changed = 0
-    for directory, measured in sorted(by_dir.items()):
+    for directory, in_dir in sorted(by_dir.items()):
         path = REPO_ROOT / directory / DURATIONS_FILE
         if not path.exists():
             print(f"skipping {directory}: it has no {DURATIONS_FILE}")
             continue
         recorded = json.loads(path.read_text())
-        updated = {**recorded, **{k: v for k, v in measured.items() if k in recorded}}
+        updated = {**recorded, **{k: v for k, v in in_dir.items() if k in recorded}}
         if updated != recorded:
             changed += sum(updated[k] != recorded[k] for k in recorded)
             path.write_text(json.dumps(dict(sorted(updated.items())), indent=2) + "\n")
-    print(f"{len(times)} scripts measured over {len(runs)} runs; {changed} durations changed")
+    print(f"{len(measured)} scripts measured over {len(runs)} runs; {changed} durations changed")
 
 
 if __name__ == "__main__":

@@ -2956,6 +2956,9 @@ jobs:
           python3 -m unittest discover -s test/spicescript/corpus -p test_sql_surface.py
           python3 test/spicescript/corpus/sql_surface.py --check
 
+      - name: Test update_durations.py
+        run: python3 -m unittest discover -s test/spicescript -p test_update_durations.py
+
       - name: Build spicescript
         uses: $/.github/actions/build-tool
         with:
