@@ -2,23 +2,15 @@
 source: crates/runtime/tests/s3/mod.rs
 expression: schema
 ---
-+-----------------+-------------------+-------------+
-| column_name     | data_type         | is_nullable |
-+-----------------+-------------------+-------------+
-| L_ORDERKEY      | Decimal128(38, 0) | NO          |
-| L_PARTKEY       | Decimal128(38, 0) | NO          |
-| L_SUPPKEY       | Decimal128(38, 0) | NO          |
-| L_LINENUMBER    | Decimal128(38, 0) | NO          |
-| L_QUANTITY      | Decimal128(12, 2) | NO          |
-| L_EXTENDEDPRICE | Decimal128(12, 2) | NO          |
-| L_DISCOUNT      | Decimal128(12, 2) | NO          |
-| L_TAX           | Decimal128(12, 2) | NO          |
-| L_RETURNFLAG    | LargeUtf8         | NO          |
-| L_LINESTATUS    | LargeUtf8         | NO          |
-| L_SHIPDATE      | Date32            | NO          |
-| L_COMMITDATE    | Date32            | NO          |
-| L_RECEIPTDATE   | Date32            | NO          |
-| L_SHIPINSTRUCT  | LargeUtf8         | NO          |
-| L_SHIPMODE      | LargeUtf8         | NO          |
-| L_COMMENT       | LargeUtf8         | NO          |
-+-----------------+-------------------+-------------+
++--------------+-------------------+-------------+
+| column_name  | data_type         | is_nullable |
++--------------+-------------------+-------------+
+| C_CUSTKEY    | Decimal128(38, 0) | NO          |
+| C_NAME       | LargeUtf8         | NO          |
+| C_ADDRESS    | LargeUtf8         | NO          |
+| C_NATIONKEY  | Decimal128(38, 0) | NO          |
+| C_PHONE      | LargeUtf8         | NO          |
+| C_ACCTBAL    | Decimal128(12, 2) | NO          |
+| C_MKTSEGMENT | LargeUtf8         | YES         |
+| C_COMMENT    | LargeUtf8         | YES         |
++--------------+-------------------+-------------+

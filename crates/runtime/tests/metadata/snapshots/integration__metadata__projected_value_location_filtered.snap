@@ -2,9 +2,9 @@
 source: crates/runtime/tests/metadata/mod.rs
 expression: projected_value_location_filtered
 ---
-+---------+-------------------------------------------------------------------------------------------+
-| value   | _location                                                                                 |
-+---------+-------------------------------------------------------------------------------------------+
++---------+-----------------------------------------------------------------------------------------------+
+| value   | _location                                                                                     |
++---------+-----------------------------------------------------------------------------------------------+
 | value_0 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet |
 | value_1 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet |
 | value_2 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet |
@@ -15,4 +15,4 @@ expression: projected_value_location_filtered
 | value_7 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet |
 | value_8 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet |
 | value_9 | s3://spice-datasets-gjezag77s0hu/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet |
-+---------+-------------------------------------------------------------------------------------------+
++---------+-----------------------------------------------------------------------------------------------+
