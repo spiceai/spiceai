@@ -131,19 +131,30 @@ therefore get different names, and a release keeps its name across upgrades.
 {{- end -}}
 
 {{/*
-The headless Service that gives cluster node pods their stable per-pod DNS names:
-`<fullname>-headless`. A Service name is a DNS label of at most 63 characters, so a fullname
-longer than 54 characters is cut to leave room for the whole suffix. The name must differ from
-the main Service's, `<fullname>`: a fullname of 62 or 63 characters that already ends in
-`-headless` comes back unchanged from that cut, so it is cut two characters shorter.
+The headless Service that gives cluster node pods their stable per-pod DNS names, and so the
+name a wildcard certificate for those pods covers. A Service name is a DNS label of at most 63
+characters. A fullname of at most 54 characters gives `<fullname>-headless`. A longer fullname is
+cut to 47 characters, with every trailing `-` the cut leaves removed, and followed by `-`, the
+first 6 hex characters of the SHA-256 of the whole fullname, and `-headless`. Two releases whose
+fullnames differ only after the cut therefore get different Services, and a release keeps its
+name across upgrades.
+
+The name must also differ from the main Service's, `<fullname>`. Only a 62- or 63-character
+fullname that ends in its own hash and `-headless` could match; it is cut to 45 characters
+instead, which gives a shorter name.
 */}}
 {{- define "spiceai.headlessServiceName" -}}
 {{- $fullname := include "spiceai.fullname" . -}}
-{{- $name := printf "%s-headless" ($fullname | trunc 54 | trimSuffix "-") -}}
+{{- if le (len $fullname) 54 -}}
+{{- printf "%s-headless" $fullname -}}
+{{- else -}}
+{{- $hash := sha256sum $fullname | trunc 6 -}}
+{{- $name := printf "%s-%s-headless" (regexReplaceAll "-+$" ($fullname | trunc 47) "") $hash -}}
 {{- if eq $name $fullname -}}
-{{- $name = printf "%s-headless" ($fullname | trunc 52 | trimSuffix "-") -}}
+{{- $name = printf "%s-%s-headless" (regexReplaceAll "-+$" ($fullname | trunc 45) "") $hash -}}
 {{- end -}}
 {{- $name -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

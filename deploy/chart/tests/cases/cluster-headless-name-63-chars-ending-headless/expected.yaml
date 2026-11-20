@@ -16,7 +16,7 @@ metadata:
   namespace: spice
 spec:
   replicas: 1
-  serviceName: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-headless
+  serviceName: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-d8c215-headless
   selector:
     matchLabels:      
       app.kubernetes.io/name: spiceai
@@ -62,7 +62,7 @@ spec:
             - --node-bind-address
             - "0.0.0.0:50052"
             - --node-advertise-address
-            - "$(POD_NAME).spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-headless.spice.svc.cluster.local"
+            - "$(POD_NAME).spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-d8c215-headless.spice.svc.cluster.local"
             - --scheduler-address
             - "https://spice-scheduler-spiceai:50052"
             - --node-mtls-ca-certificate-file
@@ -182,7 +182,7 @@ metadata:
     app.kubernetes.io/instance: spiceai
     app.kubernetes.io/version: VERSION
     app: spiceai
-  name: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-headless
+  name: spice-executor-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-d8c215-headless
   namespace: spice
 spec:
   clusterIP: None
