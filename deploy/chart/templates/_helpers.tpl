@@ -3,23 +3,24 @@
 Expand the name of the chart.
 */}}
 {{- define "spiceai.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (default .Chart.Name .Values.nameOverride | trunc 63) "" -}}
 {{- end -}}
 
 {{/*
 Create a default fully qualified app name.
 We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
+A name must end in a letter or digit, so every trailing `-` the cut leaves is removed, not only the last.
 If release name contains chart name it will be used as a full name.
 */}}
 {{- define "spiceai.fullname" -}}
 {{- if .Values.fullnameOverride -}}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (.Values.fullnameOverride | trunc 63) "" -}}
 {{- else -}}
 {{- $name := default .Chart.Name .Values.nameOverride -}}
 {{- if contains $name .Release.Name -}}
-{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (.Release.Name | trunc 63) "" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (printf "%s-%s" .Release.Name $name | trunc 63) "" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -50,7 +51,7 @@ Allow the release namespace to be overridden for multi-namespace deployments in 
 Create chart name and version as used by the chart label.
 */}}
 {{- define "spiceai.chart" -}}
-{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63) "" -}}
 {{- end -}}
 
 {{/*
@@ -113,11 +114,12 @@ The name of the Deployment or StatefulSet. A Deployment takes `<fullname>`. A St
 `<fullname>` cut to 52 characters, because Kubernetes builds two values from it that must stay
 within 63 characters: each pod's name, `<name>-<ordinal>`, which is also the first DNS label of
 the address a cluster node advertises; and each pod's `controller-revision-hash` label value,
-`<name>-<hash>`, whose hash is up to 10 characters.
+`<name>-<hash>`, whose hash is up to 10 characters. A name must end in a letter or digit, so
+every trailing `-` the cut leaves is removed.
 */}}
 {{- define "spiceai.workloadName" -}}
 {{- if include "spiceai.useStatefulSet" . -}}
-{{- include "spiceai.fullname" . | trunc 52 | trimSuffix "-" -}}
+{{- regexReplaceAll "-+$" (include "spiceai.fullname" . | trunc 52) "" -}}
 {{- else -}}
 {{- include "spiceai.fullname" . -}}
 {{- end -}}
