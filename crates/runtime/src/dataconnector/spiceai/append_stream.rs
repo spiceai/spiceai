@@ -25,6 +25,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -91,20 +92,34 @@ impl ReloadBudget {
 /// The datasets whose append stream keeps serving data older than its source,
 /// because a reload was refused or discarded, and how often each reload was
 /// refused.
+///
+/// A dataset can have more than one stream running, such as the outgoing and
+/// the incoming stream of a Spicepod reload, so each stream's staleness is
+/// tracked on its own: one stream's reload cannot report another's current,
+/// and a stream that stops takes its staleness with it.
 #[derive(Default)]
 pub(super) struct StaleDatasets {
     datasets: parking_lot::Mutex<HashMap<String, Staleness>>,
+    /// The id the next registered stream gets.
+    next_stream: AtomicU64,
 }
 
 #[derive(Default)]
 struct Staleness {
-    /// The append streams of the dataset that are running; the dataset is
-    /// reported, at 0 while current, for as long as one is.
-    subscribers: usize,
-    /// When the dataset last changed, while a reload of it is outstanding.
-    stale_since: Option<tokio::time::Instant>,
+    /// The append streams of the dataset that are running, each with when the
+    /// data it serves last changed while a reload of it is outstanding (`None`
+    /// while it is current). The dataset is reported, at 0 while every stream
+    /// is current, for as long as one runs.
+    streams: HashMap<u64, Option<tokio::time::Instant>>,
     /// Reloads refused because staging them needed more memory than the pool had.
     refused: u64,
+}
+
+impl Staleness {
+    /// When the data of the dataset's stalest stream last changed.
+    fn stale_since(&self) -> Option<tokio::time::Instant> {
+        self.streams.values().flatten().min().copied()
+    }
 }
 
 /// The process-wide [`StaleDatasets`] and the instruments that publish it.
@@ -152,38 +167,22 @@ impl StaleDatasets {
         Arc::clone(&PUBLISHED_STALE_DATASETS.0)
     }
 
-    /// Reports `dataset`, current and with no refused reloads, until the returned
-    /// guard drops, so its metrics read 0 from the moment its append stream
-    /// starts rather than appearing only once it goes stale.
+    /// Reports a new append stream of `dataset`, current, until the returned
+    /// guard drops, so the dataset's metrics read 0 from the moment its first
+    /// stream starts rather than appearing only once it goes stale.
     fn register(self: &Arc<Self>, dataset: &str) -> Registration {
+        let stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
         self.datasets
             .lock()
             .entry(dataset.to_string())
             .or_default()
-            .subscribers += 1;
-        Registration {
+            .streams
+            .insert(stream, None);
+        Registration(StreamStaleness {
             stale: Arc::clone(self),
             dataset: dataset.to_string(),
-        }
-    }
-
-    /// `dataset` keeps serving data that last changed at `last_changed`.
-    fn mark_stale(&self, dataset: &str, last_changed: Option<tokio::time::Instant>, refused: bool) {
-        let mut datasets = self.datasets.lock();
-        let entry = datasets.entry(dataset.to_string()).or_default();
-        if entry.stale_since.is_none() {
-            entry.stale_since = Some(last_changed.unwrap_or_else(tokio::time::Instant::now));
-        }
-        if refused {
-            entry.refused += 1;
-        }
-    }
-
-    /// `dataset` was reloaded and is current again.
-    fn mark_current(&self, dataset: &str) {
-        if let Some(entry) = self.datasets.lock().get_mut(dataset) {
-            entry.stale_since = None;
-        }
+            stream,
+        })
     }
 
     /// Whether `dataset` is reported at all.
@@ -198,7 +197,7 @@ impl StaleDatasets {
         self.datasets
             .lock()
             .get(dataset)
-            .and_then(|entry| entry.stale_since)
+            .and_then(Staleness::stale_since)
             .map(|since| since.elapsed())
     }
 
@@ -219,7 +218,7 @@ impl StaleDatasets {
                 (
                     dataset.clone(),
                     entry
-                        .stale_since
+                        .stale_since()
                         .map_or(0, |since| since.elapsed().as_secs()),
                 )
             })
@@ -235,19 +234,68 @@ impl StaleDatasets {
     }
 }
 
-/// Keeps a dataset reported in [`StaleDatasets`] while its append stream runs.
-struct Registration {
+/// One append stream's entry in [`StaleDatasets`].
+#[derive(Clone)]
+struct StreamStaleness {
     stale: Arc<StaleDatasets>,
     dataset: String,
+    stream: u64,
+}
+
+impl StreamStaleness {
+    /// The stream keeps serving data that last changed at `last_changed`, or
+    /// now when it never changed. A stream that has stopped is not reported
+    /// again.
+    fn mark_stale(&self, last_changed: Option<tokio::time::Instant>, refused: bool) {
+        let mut datasets = self.stale.datasets.lock();
+        let Some(entry) = datasets.get_mut(&self.dataset) else {
+            return;
+        };
+        if refused {
+            entry.refused += 1;
+        }
+        if let Some(stale_since) = entry.streams.get_mut(&self.stream) {
+            stale_since
+                .get_or_insert_with(|| last_changed.unwrap_or_else(tokio::time::Instant::now));
+        }
+    }
+
+    /// The stream was reloaded and is current again.
+    fn mark_current(&self) {
+        if let Some(stale_since) = self
+            .stale
+            .datasets
+            .lock()
+            .get_mut(&self.dataset)
+            .and_then(|entry| entry.streams.get_mut(&self.stream))
+        {
+            *stale_since = None;
+        }
+    }
+}
+
+/// Keeps an append stream reported in [`StaleDatasets`] while it runs, and its
+/// dataset for as long as one of its streams does.
+struct Registration(StreamStaleness);
+
+impl Registration {
+    fn stream(&self) -> &StreamStaleness {
+        &self.0
+    }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        let mut datasets = self.stale.datasets.lock();
-        if let Some(entry) = datasets.get_mut(&self.dataset) {
-            entry.subscribers = entry.subscribers.saturating_sub(1);
-            if entry.subscribers == 0 {
-                datasets.remove(&self.dataset);
+        let StreamStaleness {
+            stale,
+            dataset,
+            stream,
+        } = &self.0;
+        let mut datasets = stale.datasets.lock();
+        if let Some(entry) = datasets.get_mut(dataset) {
+            entry.streams.remove(stream);
+            if entry.streams.is_empty() {
+                datasets.remove(dataset);
             }
         }
     }
@@ -280,8 +328,6 @@ struct Reload {
     /// `None` for a snapshot batch.
     staged: Vec<(Option<u64>, ChangeBatch)>,
     reservation: MemoryReservation,
-    /// The dataset being reloaded, reported current once the swap commits.
-    dataset: String,
 }
 
 impl Reload {
@@ -290,7 +336,6 @@ impl Reload {
             staged: Vec::new(),
             reservation: MemoryConsumer::new(format!("append_stream_reload[{dataset}]"))
                 .register(memory_pool),
-            dataset: dataset.to_string(),
         }
     }
 
@@ -308,12 +353,15 @@ impl Reload {
 
     /// The overwrite that replaces the dataset with the staged rows. An update
     /// whose commit the snapshot holds (`sequence <= snapshot_sequence`) does
-    /// not survive, and a truncate drops what was staged before it.
+    /// not survive, and a truncate drops what was staged before it. `stream`
+    /// is reported current once the replacement commits, or stale since
+    /// `last_changed`, when the dataset last changed, if it is dropped first.
     fn into_replacement(
         self,
         snapshot_sequence: u64,
         data_schema: &SchemaRef,
-        stale: &Arc<StaleDatasets>,
+        stream: &StreamStaleness,
+        last_changed: Option<tokio::time::Instant>,
     ) -> Result<ChangeEnvelope, String> {
         let mut rows: Vec<arrow::array::RecordBatch> = Vec::new();
         for (sequence, batch) in self.staged {
@@ -345,8 +393,9 @@ impl Reload {
         Ok(ChangeEnvelope::from_parts(
             Box::new(ReplacementCommitter {
                 _reservation: reservation,
-                stale: Arc::clone(stale),
-                dataset: self.dataset,
+                stream: stream.clone(),
+                last_changed,
+                committed: AtomicBool::new(false),
             }),
             batch,
             true,
@@ -356,20 +405,32 @@ impl Reload {
 }
 
 /// The committer of a reload's replacement: it holds the replacement's memory
-/// reservation for as long as the envelope lives, and reports the dataset
+/// reservation for as long as the envelope lives, and reports its stream
 /// current only once the apply loop has written the replacement. A replacement
-/// that fails to apply or is dropped leaves the dataset reported stale.
+/// that fails to apply or is dropped reports its stream stale since the dataset
+/// last changed before the reload.
 struct ReplacementCommitter {
     _reservation: MemoryReservation,
-    stale: Arc<StaleDatasets>,
-    dataset: String,
+    stream: StreamStaleness,
+    /// When the dataset last changed before this reload.
+    last_changed: Option<tokio::time::Instant>,
+    committed: AtomicBool,
 }
 
 #[async_trait::async_trait]
 impl cdc::CommitChange for ReplacementCommitter {
     async fn commit(&self) -> Result<(), cdc::CommitError> {
-        self.stale.mark_current(&self.dataset);
+        self.stream.mark_current();
+        self.committed.store(true, Ordering::Release);
         Ok(())
+    }
+}
+
+impl Drop for ReplacementCommitter {
+    fn drop(&mut self) {
+        if !*self.committed.get_mut() {
+            self.stream.mark_stale(self.last_changed, false);
+        }
     }
 }
 
@@ -401,7 +462,7 @@ where
     stream! {
         // Report the dataset's staleness metrics, at 0, for as long as the
         // stream runs.
-        let _registered = budget.stale.register(&table_reference);
+        let registered = budget.stale.register(&table_reference);
         let mut resubscribes = 0_u32;
         // Reloads refused in a row for lack of memory.
         let mut refusals = 0_u32;
@@ -513,8 +574,12 @@ where
                                 let snapshot_sequence = subscription.snapshot_sequence().unwrap_or(0);
                                 let envelope = match reload.take() {
                                     Some(reload) => {
-                                        let replacement =
-                                            reload.into_replacement(snapshot_sequence, schema, &budget.stale);
+                                        let replacement = reload.into_replacement(
+                                            snapshot_sequence,
+                                            schema,
+                                            registered.stream(),
+                                            last_applied_at,
+                                        );
                                         if replacement.is_ok() {
                                             refusals = 0;
                                         }
@@ -618,7 +683,7 @@ where
                     // Dropping the staged reload returns its reservation.
                     drop(reload.take());
                     drop(stream);
-                    budget.stale.mark_stale(&table_reference, last_applied_at, true);
+                    registered.stream().mark_stale(last_applied_at, true);
                     refusals += 1;
                     let retry_in = refused_reload_backoff(refusals);
                     tracing::error!(
@@ -631,7 +696,7 @@ where
                 }
             };
             if reload.take().is_some() {
-                budget.stale.mark_stale(&table_reference, last_applied_at, false);
+                registered.stream().mark_stale(last_applied_at, false);
                 tracing::error!(
                     dataset = %table_reference,
                     "The append stream for dataset '{table_reference}' could not finish reloading from its source ({reason}), so the reload was discarded and the dataset keeps serving its previous data, which last changed {stale_for} ago."
@@ -1238,9 +1303,9 @@ mod tests {
             .expect("staged");
         assert!(memory_pool.reserved() > 0, "staging is reserved");
         let stale = Arc::new(StaleDatasets::default());
-        stale.mark_stale(DATASET, None, false);
+        let registered = stale.register(DATASET);
         let replacement = reload
-            .into_replacement(0, &schema, &stale)
+            .into_replacement(0, &schema, registered.stream(), None)
             .expect("replacement");
         assert!(memory_pool.reserved() > 0, "the replacement is reserved");
         drop(replacement);
@@ -1565,6 +1630,190 @@ mod tests {
             "west's reload does not clear east's stale flag"
         );
         assert_eq!(stale.refused(EAST), 1);
+    }
+
+    /// An append stream of [`DATASET`] over `subscriptions`, reporting to `stale`.
+    fn stream_of(
+        subscriptions: Vec<Messages>,
+        memory_pool: Arc<dyn MemoryPool>,
+        stale: &Arc<StaleDatasets>,
+    ) -> BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>> {
+        let mut subscriptions: VecDeque<Messages> = subscriptions.into();
+        append_stream(
+            move || {
+                let next = subscriptions.pop_front();
+                async move {
+                    next.map(FlightDataDecoder::new)
+                        .ok_or("no more subscriptions")
+                }
+            },
+            DATASET.to_string(),
+            ReloadBudget {
+                memory_pool,
+                stale: Arc::clone(stale),
+            },
+        )
+        .boxed()
+    }
+
+    /// Two streams of one dataset, such as the outgoing and the incoming stream
+    /// of a Spicepod reload, are tracked apart: a reload that commits for one
+    /// does not report the other's refused reload current.
+    #[tokio::test]
+    async fn a_reload_of_one_stream_does_not_clear_another_streams_refused_reload() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (refused_first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let (current_first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let (too_large, _) =
+            through_end(producer(&datafusion, &broadcaster, table((1..=50_000).collect())).await)
+                .await;
+        let (fits, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+
+        let stale = Arc::new(StaleDatasets::default());
+        tokio::time::pause();
+        let mut refused = stream_of(
+            vec![reset_after(refused_first), held_open(too_large)],
+            Arc::new(GreedyMemoryPool::new(64 * 1024)),
+            &stale,
+        );
+        let mut current = stream_of(
+            vec![reset_after(current_first), held_open(fits)],
+            Arc::new(UnboundedMemoryPool::default()),
+            &stale,
+        );
+        assert_eq!(snapshots(&mut refused, 1).await, vec![snapshot_of(1)]);
+        assert_eq!(snapshots(&mut current, 1).await, vec![snapshot_of(1)]);
+        // The first stream's reload is refused, and it waits to retry.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), refused.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(stale.refused(DATASET), 1);
+        assert!(stale.stale_for(DATASET).is_some());
+
+        replacement_envelope(&mut current)
+            .await
+            .commit()
+            .await
+            .expect("commit the swap");
+        assert!(
+            stale.stale_for(DATASET).is_some(),
+            "the other stream's reload does not report the refused one current"
+        );
+        drop(refused);
+        assert_eq!(
+            stale.stale_for(DATASET),
+            None,
+            "current once the stream whose reload was refused stops"
+        );
+        assert!(stale.is_reported(DATASET));
+    }
+
+    /// A stream does not inherit another stream's refused reload: once the
+    /// outgoing stream of a Spicepod reload stops, the dataset reads as current
+    /// as the incoming stream that replaced it.
+    #[tokio::test]
+    async fn a_stopped_streams_refused_reload_leaves_with_it() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (outgoing_first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let (too_large, _) =
+            through_end(producer(&datafusion, &broadcaster, table((1..=50_000).collect())).await)
+                .await;
+        let (incoming_first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+
+        let stale = Arc::new(StaleDatasets::default());
+        tokio::time::pause();
+        let mut outgoing = stream_of(
+            vec![reset_after(outgoing_first), held_open(too_large)],
+            Arc::new(GreedyMemoryPool::new(64 * 1024)),
+            &stale,
+        );
+        assert_eq!(snapshots(&mut outgoing, 1).await, vec![snapshot_of(1)]);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), outgoing.next())
+                .await
+                .is_err()
+        );
+        assert!(stale.stale_for(DATASET).is_some());
+
+        let mut incoming = stream_of(
+            vec![held_open(incoming_first)],
+            Arc::new(UnboundedMemoryPool::default()),
+            &stale,
+        );
+        assert_eq!(snapshots(&mut incoming, 1).await, vec![snapshot_of(2)]);
+        assert!(
+            stale.stale_for(DATASET).is_some(),
+            "the outgoing stream still serves its previous data"
+        );
+        drop(outgoing);
+        assert_eq!(
+            stale.stale_for(DATASET),
+            None,
+            "the incoming stream is current"
+        );
+        assert_eq!(
+            stale.refused(DATASET),
+            1,
+            "the dataset's refused reloads are counted while it is reported"
+        );
+    }
+
+    /// A reload's replacement that is dropped before it commits, as the apply
+    /// loop drops one it fails to write, leaves the dataset reported stale since
+    /// it last changed, until a later reload commits.
+    #[tokio::test]
+    async fn a_replacement_dropped_before_it_commits_leaves_the_dataset_stale() {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = runtime.datafusion();
+        let broadcaster = DataUpdateBroadcaster::new();
+        let (first, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1])).await).await;
+        let (dropped, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
+        let (committed, _) =
+            through_end(producer(&datafusion, &broadcaster, table(vec![1, 2, 3])).await).await;
+
+        let stale = Arc::new(StaleDatasets::default());
+        tokio::time::pause();
+        let mut stream = stream_of(
+            vec![
+                reset_after(first),
+                reset_after(dropped),
+                held_open(committed),
+            ],
+            Arc::new(UnboundedMemoryPool::default()),
+            &stale,
+        );
+        assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
+        drop(replacement_envelope(&mut stream).await);
+        assert!(
+            stale
+                .stale_for(DATASET)
+                .is_some_and(|stale_for| stale_for >= resubscribe_backoff(1)),
+            "stale since the first snapshot, before the reload: {:?}",
+            stale.stale_for(DATASET)
+        );
+        replacement_envelope(&mut stream)
+            .await
+            .commit()
+            .await
+            .expect("commit the swap");
+        assert_eq!(
+            stale.stale_for(DATASET),
+            None,
+            "current once a later reload commits"
+        );
     }
 
     /// Updates that arrive during a reload are staged with it, and their
