@@ -16,7 +16,7 @@ limitations under the License.
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use std::fmt::Write;
 use tokio::fs;
 use tonic::async_trait;
