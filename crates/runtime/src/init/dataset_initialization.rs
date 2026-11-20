@@ -206,7 +206,9 @@ impl DatasetInitialization {
     /// Like [`Self::initialize`], and when the bring-up fails for a reason a later attempt
     /// can clear (the source is unavailable), hands the plan back to try again.
     /// Configuration errors, which no retry clears, return no plan.
-    pub async fn initialize_retriable(self) -> std::result::Result<DatasetReady, InitializeFailure> {
+    pub async fn initialize_retriable(
+        self,
+    ) -> std::result::Result<DatasetReady, InitializeFailure> {
         let mut retry = None;
         self.run(&mut retry)
             .await
@@ -688,14 +690,25 @@ mod tests {
         let (runtime, dataset) = ready_deferred_dataset().await;
         let (builder, calls) = failing_then_serving(1, || "no data files yet".into());
 
-        let failure = match plan(&runtime, &dataset, builder).initialize_retriable().await {
+        let failure = match plan(&runtime, &dataset, builder)
+            .initialize_retriable()
+            .await
+        {
             Ok(_) => panic!("the first attempt must fail"),
             Err(failure) => failure,
         };
         let retry = failure.retry.expect("an unavailable source can be retried");
-        assert!(runtime.status.get_dataset_status(&dataset.name).is_some_and(|s| s.is_error()));
+        assert!(
+            runtime
+                .status
+                .get_dataset_status(&dataset.name)
+                .is_some_and(|s| s.is_error())
+        );
 
-        retry.initialize().await.expect("the retry brings the dataset up");
+        retry
+            .initialize()
+            .await
+            .expect("the retry brings the dataset up");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
             runtime.status.get_dataset_status(&dataset.name),
@@ -716,11 +729,17 @@ mod tests {
             })
         });
 
-        let failure = match plan(&runtime, &dataset, builder).initialize_retriable().await {
+        let failure = match plan(&runtime, &dataset, builder)
+            .initialize_retriable()
+            .await
+        {
             Ok(_) => panic!("the attempt must fail"),
             Err(failure) => failure,
         };
-        assert!(failure.retry.is_none(), "a configuration error has no retry");
+        assert!(
+            failure.retry.is_none(),
+            "a configuration error has no retry"
+        );
     }
 
     /// The production builder boxes a `RuntimeError`; a configuration error inside it stays
@@ -739,11 +758,17 @@ mod tests {
             })
         });
 
-        let failure = match plan(&runtime, &dataset, builder).initialize_retriable().await {
+        let failure = match plan(&runtime, &dataset, builder)
+            .initialize_retriable()
+            .await
+        {
             Ok(_) => panic!("the attempt must fail"),
             Err(failure) => failure,
         };
-        assert!(failure.retry.is_none(), "a configuration error has no retry");
+        assert!(
+            failure.retry.is_none(),
+            "a configuration error has no retry"
+        );
     }
 
     /// `ensure_ready` does not keep an unavailable-source failure: a call inside the backoff
@@ -761,9 +786,15 @@ mod tests {
             plan(&runtime, &dataset, builder),
         );
 
-        provider.ensure_ready().await.expect_err("the source is unavailable");
+        provider
+            .ensure_ready()
+            .await
+            .expect_err("the source is unavailable");
         assert!(!provider.is_initialized());
-        provider.ensure_ready().await.expect_err("still inside the backoff");
+        provider
+            .ensure_ready()
+            .await
+            .expect_err("still inside the backoff");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -794,7 +825,10 @@ mod tests {
             plan(&runtime, &dataset, builder),
         );
 
-        provider.ensure_ready().await.expect_err("a configuration error");
+        provider
+            .ensure_ready()
+            .await
+            .expect_err("a configuration error");
         assert!(provider.is_initialized());
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         provider.ensure_ready().await.expect_err("kept");
