@@ -1,4 +1,5 @@
 name: readiness
+tags: [smoke]
 description: >
   `ready_state` decides when an accelerated dataset counts as ready while its
   first load is slow: `on_registration` and `on_schema_resolved` are ready at

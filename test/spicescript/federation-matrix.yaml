@@ -1,4 +1,5 @@
 name: federation-matrix
+tags: [smoke]
 description: >
   The pushdown and SQL-semantics corpora answer the same through Spice
   whichever database a table federates to, PostgreSQL, MySQL, ClickHouse,

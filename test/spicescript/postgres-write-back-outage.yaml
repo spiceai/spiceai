@@ -1,4 +1,5 @@
 name: postgres-write-back-outage
+tags: [smoke]
 description: >
   Write-back keeps every write it acknowledges: writes accepted while Postgres
   is down are served at once, survive a kill with their delivery still pending,

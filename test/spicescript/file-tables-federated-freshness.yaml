@@ -1,4 +1,5 @@
 name: file-tables-federated-freshness
+tags: [smoke]
 description: >
   A federated table of Parquet or CSV part files, on local disk or in an
   S3-compatible store, read at query time, answers like the same rows in a

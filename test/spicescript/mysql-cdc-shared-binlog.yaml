@@ -1,4 +1,5 @@
 name: mysql-cdc-shared-binlog
+tags: [smoke]
 description: >
   Datasets on one MySQL connection share one binlog reader and each follows its
   own table, including a transaction spanning tables; across a clean restart

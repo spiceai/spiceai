@@ -1,4 +1,5 @@
 name: http-caching-keys
+tags: [smoke]
 description: >
   More of Cayenne's `refresh_mode: caching` over an HTTP API: entries keyed by
   query string and by method (a GET and a POST to one path are different

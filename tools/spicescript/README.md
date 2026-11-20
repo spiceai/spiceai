@@ -90,6 +90,8 @@ this run's other combinations have reserved does not count toward that.
 | `--from-release FROM=VERSION` | Start the runs whose `from:` is `FROM` (such as `2.3.x`) on release `VERSION` (such as `2.3.2`) instead of the one it resolves to (see [Upgrades](#upgrades)). Repeat it for several. |
 | `--cluster` | Run every instance as a scheduler plus one executor over node mTLS. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped, as are instances whose `spiced-args` choose a `--role` other than `server`, such as `sidecar`; a `--role server` gives way to the scheduler role. |
 | `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors and sidecar included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
+| `--only-tag TAG` | Select scripts with any of these tags (`smoke`, `long`); repeat for several. Applies to explicit files too, before `--partition`. |
+| `--exclude-tag TAG` | Exclude scripts with any of these tags; repeat for several. Exclusion wins over `--only-tag`. Tag flags print the selected and total counts; selecting zero scripts is an error, but an empty partition share is allowed. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
 | `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. CI shards by these times, so refresh them from CI's own runs with `python3 test/spicescript/update_durations.py`, which writes each script's median over the newest merge-queue and nightly runs. |
 | `--max-wait DURATION` | Cap every wait (`eventually`, readiness, refreshes) at this length. For known-failing scripts, which otherwise wait out every limit. |
@@ -134,6 +136,7 @@ networks named after the dead runner's pid.
 
 ```yaml
 name: orders-cdc
+tags: [smoke]
 description: >
   What the script shows, in a sentence or two.
 sources:
@@ -161,6 +164,12 @@ steps:
   - query: SELECT * FROM orders
     eventually: 60s
 ```
+
+Optional top-level `tags:` is a list of `smoke` (the merge-queue pre-merge
+smoke set) and `long` (waits on a source's own clock for many minutes).
+Unknown and duplicate tags are rejected. Without tag flags, all scripts are
+selected; use `--exclude-tag long` for a quick local run or
+`--only-tag smoke test/spicescript` for the smoke set.
 
 ### Sources
 

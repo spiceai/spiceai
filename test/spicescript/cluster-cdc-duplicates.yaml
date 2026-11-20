@@ -1,4 +1,5 @@
 name: cluster-cdc-duplicates
+tags: [smoke]
 description: >
   On a cluster of two executors, a CDC (`refresh_mode: changes`) Cayenne
   dataset answers each row once, as the source does, before and after

@@ -1,4 +1,5 @@
 name: pushdown-shapes
+tags: [smoke]
 description: >
   Filters, projections, limits (alone, under ORDER BY, with OFFSET),
   aggregates, DISTINCT, same-source joins, IN subqueries, CASE, LIKE, date

@@ -1,4 +1,5 @@
 name: hive-null-partition-upgrade
+tags: [smoke]
 description: >
   A Cayenne file acceleration of a Hive-partitioned dataset written by the 2.4
   release, which reads the `__HIVE_DEFAULT_PARTITION__` directory as that

@@ -1,4 +1,5 @@
 name: postgres-cdc-truncate
+tags: [smoke]
 description: >
   PostgreSQL CDC into Cayenne, file and memory, through TRUNCATE: of one
   table, then written to again; truncated and refilled with overlapping

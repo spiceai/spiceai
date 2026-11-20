@@ -1,4 +1,5 @@
 name: postgres-dml
+tags: [smoke]
 description: >
   DELETE and UPDATE through Spice reach PostgreSQL (write-through), by key, by
   predicate and for every row: on a federated dataset, and on a Cayenne acceleration, whose refresh then serves what PostgreSQL holds.

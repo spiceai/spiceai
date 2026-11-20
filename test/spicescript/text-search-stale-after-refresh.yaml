@@ -2,6 +2,7 @@
 # as before no longer answers with it, with the SQL and search results caches
 # disabled or enabled (#15392).
 name: text-search-stale-after-refresh
+tags: [smoke]
 description: >
   After a refresh, text_search answers from the refreshed rows whatever the
   query's text. (From search.yaml:) Full-text and vector search answer correctly on every acceleration engine:

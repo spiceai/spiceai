@@ -25,14 +25,27 @@ limitations under the License.
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use clap::ValueEnum as _;
 use indexmap::IndexMap;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
+
+/// A script's scheduling categories, shared by YAML and CLI filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tag {
+    /// Runs in the merge queue as the pre-merge smoke set.
+    Smoke,
+    /// Waits on a source's own clock for many minutes; exclude for a quick local run.
+    Long,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Script {
     pub name: String,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -1114,6 +1127,14 @@ impl Script {
             .context("A script needs `steps`")?;
         expand_shared_variants(&mut root, shared)?;
         let mut script: Script = serde_json::from_value(root)?;
+        for (i, tag) in script.tags.iter().enumerate() {
+            ensure!(
+                !script.tags[..i].contains(tag),
+                "Duplicate tag `{}`; list each tag only once",
+                tag.to_possible_value()
+                    .map_or_else(String::new, |value| value.get_name().to_string())
+            );
+        }
         let Value::Array(steps) = steps else {
             bail!("`steps` must be a list");
         };
@@ -2915,6 +2936,33 @@ fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tags_parse_smoke_and_long() {
+        let script = Script::parse("name: s\ntags: [smoke, long]\nspicepod: {}\nsteps: []")
+            .expect("tags parse");
+        assert_eq!(script.tags, vec![Tag::Smoke, Tag::Long]);
+    }
+
+    #[test]
+    fn tags_reject_unknown_tag() {
+        let error = Script::parse("name: s\ntags: [slow]\nspicepod: {}\nsteps: []")
+            .expect_err("unknown tag");
+        assert_eq!(
+            error.to_string(),
+            "unknown variant `slow`, expected `smoke` or `long`"
+        );
+    }
+
+    #[test]
+    fn tags_reject_duplicate_tag() {
+        let error = Script::parse("name: s\ntags: [smoke, smoke]\nspicepod: {}\nsteps: []")
+            .expect_err("duplicate tag");
+        assert_eq!(
+            error.to_string(),
+            "Duplicate tag `smoke`; list each tag only once"
+        );
+    }
 
     #[test]
     fn sample_objects_takes_its_bounds_and_needs_six_samples() {

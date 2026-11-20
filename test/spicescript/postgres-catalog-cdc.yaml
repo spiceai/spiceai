@@ -1,4 +1,5 @@
 name: postgres-catalog-cdc
+tags: [smoke]
 description: >
   A PostgreSQL catalog accelerated by change capture accelerates every table it
   can key (a primary key, a replica identity index, or FULL) on one shared

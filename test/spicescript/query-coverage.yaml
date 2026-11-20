@@ -1,4 +1,5 @@
 name: query-coverage
+tags: [smoke]
 description: >
   An extended corpus (window functions, CTEs, set operations, outer and self
   joins, grouping sets, casts, dates, strings, NULL semantics, aggregates,

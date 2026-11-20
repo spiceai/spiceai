@@ -1,4 +1,5 @@
 name: builtins
+tags: [smoke]
 description: >
   DataFusion's built-in functions (trims, hex, digests, regular expressions,
   ordered aggregates, windows ignoring NULLs, approximate and statistical

@@ -1,4 +1,5 @@
 name: csv-header-binding
+tags: [smoke]
 description: >
   A headered CSV file binds its columns by header name, not by position:
   after the file is rewritten with the same rows and its columns in an order
