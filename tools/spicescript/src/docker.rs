@@ -481,14 +481,31 @@ fn create_detached(
                     .is_err()
             {
                 let pid = std::process::id().to_string();
-                docker
+                let created = docker
                     .create_network(bollard::network::CreateNetworkOptions {
                         name: network.as_str(),
+                        // A daemon older than API 1.44 would otherwise create a
+                        // second network of the same name for a source starting
+                        // beside this one, and the two would not reach each
+                        // other.
+                        check_duplicate: true,
                         labels: HashMap::from([(RUNNER_LABEL, pid.as_str())]),
                         ..Default::default()
                     })
-                    .await
-                    .with_context(|| format!("Failed to create network {network}"))?;
+                    .await;
+                match created {
+                    // Another source of the run, starting at the same time,
+                    // created it first.
+                    Ok(_)
+                    | Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 409,
+                        ..
+                    }) => {}
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("Failed to create network {network}"));
+                    }
+                }
             }
             // A container left behind by an interrupted run would hold the name.
             let _ = docker
