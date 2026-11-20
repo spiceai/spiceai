@@ -179,28 +179,32 @@ impl Context<'_> {
     }
 
     /// Decodes `batch`, computing the logits of the tokens it marks for output.
+    ///
+    /// A failed decode's reason ends with the errors llama.cpp logged during this call, on this
+    /// thread. Only this call's: the thread may serve other contexts, such as an MTP draft
+    /// context, whose errors are not this decode's reason. A GPU backend computes
+    /// asynchronously, so a command buffer that failed after an earlier decode is reported
+    /// while the thread waits for it; that line is not carried, but the backend then refuses
+    /// every later graph and says so during the decode that returns -3.
     pub fn decode(&mut self, batch: &Batch) -> Result<()> {
+        crate::log::clear_last_error();
         // SAFETY: the batch's arrays hold `n_tokens` entries; llama.cpp copies what it keeps.
         let status = unsafe { sys::llama_decode(self.raw.as_ptr(), batch.raw) };
-        match status {
-            0 => Ok(()),
-            1 => Err(Error::Decode {
-                reason: "the context has no room left for the batch".to_string(),
-            }),
-            2 => Err(Error::Decode {
-                reason: "decoding was aborted".to_string(),
-            }),
-            -1 => Err(Error::Decode {
-                reason: "the batch is invalid".to_string(),
-            }),
-            -3 if self.compute_failed() => Err(compute_failed()),
-            -3 => Err(Error::Decode {
-                reason: "the GPU or another backend failed computing it".to_string(),
-            }),
-            status => Err(Error::Decode {
-                reason: format!("llama.cpp returned {status}"),
-            }),
-        }
+        let what = match status {
+            0 => return Ok(()),
+            1 => "the context has no room left for the batch".to_string(),
+            2 => "decoding was aborted".to_string(),
+            -1 => "the batch is invalid".to_string(),
+            -3 if self.compute_failed() => COMPUTE_FAILED.to_string(),
+            -3 => "the GPU or another backend failed computing it".to_string(),
+            status => format!("llama.cpp returned {status}"),
+        };
+        Err(Error::Decode {
+            reason: match crate::log::reported_errors() {
+                Some(reported) => format!("{what}: {reported}"),
+                None => what,
+            },
+        })
     }
 
     /// Whether a backend failed computing something the context queued (a GPU fault, for one).
@@ -446,11 +450,13 @@ impl Context<'_> {
 /// decode on it again.
 fn compute_failed() -> Error {
     Error::Decode {
-        reason: "the GPU or another backend failed computing work this context queued, so its \
-            results are discarded and the context decodes nothing more; reload the model"
-            .to_string(),
+        reason: COMPUTE_FAILED.to_string(),
     }
 }
+
+/// Why a context a backend failed decodes nothing more.
+const COMPUTE_FAILED: &str = "the GPU or another backend failed computing work this context \
+    queued, so its results are discarded and the context decodes nothing more; reload the model";
 
 impl Drop for Context<'_> {
     fn drop(&mut self) {
