@@ -17,7 +17,7 @@ limitations under the License.
 //! real S3 storage with AWS SSO credentials. To run:
 //!
 //! 1. Authenticate with AWS SSO: `aws sso login`
-//! 2. Run benchmarks: `cargo bench -p runtime-acceleration --bench snapshot_operations --features "duckdb,sqlite"`
+//! 2. Run benchmarks: `cargo bench -p runtime-acceleration --bench snapshot_operations`
 //!
 //! Benchmarks include:
 //! - S3 upload/download operations
@@ -178,12 +178,7 @@ fn create_metadata_json(
 
 /// Available acceleration engines for benchmarking.
 fn available_engines() -> Vec<(&'static str, AccelerationEngine)> {
-    let mut engines = vec![("cayenne", AccelerationEngine::Cayenne)];
-
-    #[cfg(feature = "sqlite")]
-    engines.push(("sqlite", AccelerationEngine::Sqlite));
-
-    engines
+    vec![("cayenne", AccelerationEngine::Cayenne)]
 }
 
 /// Fetch TPC-H parquet data from the public demo bucket.

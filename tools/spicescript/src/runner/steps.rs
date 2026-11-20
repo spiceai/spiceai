@@ -232,6 +232,7 @@ pub(super) fn one_line(s: &str, max: usize) -> String {
 }
 
 pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> Result<String> {
+    let started = Instant::now();
     match action {
         Action::StartSource(name) | Action::UnpauseSource(name) => {
             sources.set(name, SourceState::Running).await
@@ -244,7 +245,7 @@ pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> R
         }
         _ => unreachable!("only source steps reach here"),
     }
-    .map(|()| String::new())
+    .map(|()| format!(" ({:.1}s)", started.elapsed().as_secs_f64()))
 }
 
 /// Runs a step on the `spiced` it reaches. Without a sidecar, that is the
