@@ -6,9 +6,10 @@ description: >
   above 100 GiB is refused with 400; the scheduler publishes how many it
   holds. When the scheduler holding the queries is killed and started
   again, it starts with an empty budget and the queries it takes over count
-  against it: a public caller's waiting queries keep their order and count,
-  and an authenticated caller's fail with a request to resubmit, as its
-  running ones do. (Two schedulers each admitting up to 64:
+  against it: it publishes a public caller's 64 running and 4 waiting queries
+  as its own, a new query waits behind them, and the waiting ones start in
+  their order; an authenticated caller's fail with a request to resubmit, as
+  its running ones do. (Two schedulers each admitting up to 64:
   async-query-budgets-schedulers.yaml.)
 
 sources:
@@ -305,3 +306,58 @@ steps:
     only: authenticated
   - http: { method: GET, path: /v1/queries, query: { status: cancelled } }
     expect: { status: 200, json: [ { pointer: /total_count, equals: 1 } ] }
+
+  # The job records above read the same whether or not the started scheduler took the queries
+  # over, so what it holds shows that it did: the 4 waiting queries wait here, and the 64
+  # running hold the caller's 64 running slots here.
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, above: 3, timeout: 120s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, below: 5, timeout: 30s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, above: 63, timeout: 60s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, below: 65, timeout: 30s }
+    only: public
+  # Its budget holds them: a new query waits behind the 4, and cancelling a running query
+  # starts the oldest waiting one.
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 71"}' }
+    expect: { status: 202, json: [ { pointer: /status, equals: PENDING } ] }
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 5 }
+        - { pointer: /queries/*/sql_preview, matches: '> (67|68|69|70|71)$' }
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect: { status: 200, json: [ { pointer: /queries/0/sql_preview, matches: '> 66$' } ] }
+    capture: { newest_running: /queries/0/query_id }
+    only: public
+  - http: { method: POST, path: '/v1/queries/${captured.newest_running}/cancel' }
+    expect: { status: 200, json: [ { pointer: /status, equals: CANCELLED } ] }
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 4 }
+        - { pointer: /queries/*/sql_preview, matches: '> (68|69|70|71)$' }
+    eventually: 30s
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 64 }
+        - { pointer: /queries/*/sql_preview, matches: '> 67$', count: 1 }
+    eventually: 30s
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, above: 63, timeout: 30s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, below: 65, timeout: 30s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, above: 3, timeout: 30s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, below: 5, timeout: 30s }
+    only: public

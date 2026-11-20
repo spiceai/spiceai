@@ -684,6 +684,9 @@ impl JobExecutor {
 
         tokio::spawn(
             async move {
+                // A job taken over runs here, so it counts as running here, as a job started here
+                // does.
+                async_query_metrics::add_active(ActiveStatus::Running, 1);
                 let budgets = Arc::clone(&runner.budgets);
                 let on_written =
                     |written: u64| budgets.record_written(&owner, &job_id_owned, written);
@@ -702,6 +705,7 @@ impl JobExecutor {
                     let mut active = active_jobs.write().await;
                     active.remove(&job_id_owned);
                 }
+                async_query_metrics::add_active(ActiveStatus::Running, -1);
 
                 let stored = report_job_end(&job_id_owned, result, "Job recovery failed");
                 runner.finished(&owner, &job_id_owned, stored);
