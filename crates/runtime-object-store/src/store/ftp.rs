@@ -37,8 +37,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
-    process_directory_entries_shallow, resolve_range, should_skip_entry,
+    DirEntry, build_byte_range, build_object_meta, generic_error, guard_buffered_read,
+    process_directory_entries, process_directory_entries_shallow, reserve_within, resolve_range,
+    should_skip_entry,
 };
 
 const STORE_NAME: &str = "FTP";
@@ -464,7 +465,7 @@ async fn read_ftp_data(
         .await
         .map_err(|e| generic_error(STORE_NAME, e))?;
 
-    let mut result = Vec::with_capacity(read_size);
+    let mut result = Vec::new();
     let mut buf = vec![0; 4096];
     let mut total = 0;
     let mut reached_eof = false;
@@ -485,6 +486,7 @@ async fn read_ftp_data(
         }
 
         let bytes_to_take = read_size.saturating_sub(total).min(n);
+        reserve_within(STORE_NAME, &mut result, bytes_to_take, read_size)?;
         result.extend_from_slice(&buf[..bytes_to_take]);
         total += n;
     }
@@ -587,13 +589,14 @@ impl ObjectStore for FTPObjectStore {
         }
 
         let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
+        let read_size = guard_buffered_read(STORE_NAME, data_to_read)?;
 
         #[expect(clippy::cast_possible_truncation)]
         let data = read_ftp_data(
             client,
             location_string,
             start as usize,
-            data_to_read as usize,
+            read_size,
             end == size,
             self.inner.config.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
         )

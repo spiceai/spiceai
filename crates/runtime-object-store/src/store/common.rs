@@ -193,6 +193,66 @@ pub fn resolve_range(range: Option<&GetRange>, file_size: u64) -> (u64, u64, u64
     }
 }
 
+/// Hard cap on the bytes one `get_opts` buffers in memory.
+///
+/// The length of a read comes from a size the server reports, so without a cap a large
+/// object, or a server that reports an inflated size, could make the process allocate more
+/// than it has and abort.
+pub const MAX_BUFFERED_READ: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Refuse a read whose resolved length exceeds [`MAX_BUFFERED_READ`], before anything is
+/// allocated for it, and return the length as a `usize` to size the read with.
+///
+/// # Errors
+///
+/// Returns an error naming `len` and the cap when `len` exceeds [`MAX_BUFFERED_READ`].
+pub fn guard_buffered_read(store: &'static str, len: u64) -> object_store::Result<usize> {
+    if len > MAX_BUFFERED_READ {
+        return Err(generic_error(
+            store,
+            format!(
+                "{store} read of {len} bytes exceeds {MAX_BUFFERED_READ}-byte cap; reduce range or stream"
+            ),
+        ));
+    }
+    usize::try_from(len).map_err(|_| {
+        generic_error(
+            store,
+            format!("{store} read of {len} bytes does not fit in memory"),
+        )
+    })
+}
+
+/// Make room in `buffer` for `additional` more bytes without growing its capacity past
+/// `limit`, so a buffer is sized by the bytes that arrive rather than by the size reported.
+///
+/// Capacity grows geometrically, so filling a buffer from many short reads stays linear,
+/// and a failed allocation is returned as an error rather than aborting the process.
+///
+/// # Errors
+///
+/// Returns an error when the allocator cannot provide the grown capacity.
+pub fn reserve_within(
+    store: &'static str,
+    buffer: &mut Vec<u8>,
+    additional: usize,
+    limit: usize,
+) -> object_store::Result<()> {
+    let needed = buffer.len().saturating_add(additional);
+    if needed <= buffer.capacity() {
+        return Ok(());
+    }
+    let target = buffer.capacity().saturating_mul(2).min(limit).max(needed);
+    buffer
+        .try_reserve_exact(target - buffer.len())
+        .map_err(|error| {
+            generic_error(
+                store,
+                format!("{store} read could not allocate {target} bytes: {error}"),
+            )
+        })
+}
+
 /// Build a byte `Range` from resolved start and end offsets.
 #[inline]
 #[must_use]
@@ -278,6 +338,57 @@ mod tests {
         let range = GetRange::Suffix(2000);
         let (start, end, to_read) = resolve_range(Some(&range), 1000);
         assert_eq!((start, end, to_read), (0, 1000, 1000));
+    }
+
+    #[test]
+    fn guard_buffered_read_refuses_one_byte_over_the_cap() {
+        assert_eq!(
+            guard_buffered_read("SFTP", MAX_BUFFERED_READ).expect("exactly at cap is allowed"),
+            2_147_483_648
+        );
+        assert_eq!(
+            guard_buffered_read("SFTP", 0).expect("empty reads are allowed"),
+            0
+        );
+
+        for len in [MAX_BUFFERED_READ + 1, u64::MAX] {
+            let err = guard_buffered_read("SFTP", len).expect_err("over the cap must be refused");
+            let object_store::Error::Generic { store, source } = &err else {
+                panic!("expected a generic store error, got {err:?}");
+            };
+            assert_eq!(*store, "SFTP");
+            assert_eq!(
+                source.to_string(),
+                format!(
+                    "SFTP read of {len} bytes exceeds 2147483648-byte cap; reduce range or stream"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn reserve_within_grows_geometrically_but_never_past_the_limit() {
+        let limit = 100;
+        let mut buffer = Vec::new();
+        let mut capacities = Vec::new();
+        while buffer.len() < limit {
+            let filled = buffer.len();
+            let additional = 7.min(limit - filled);
+            reserve_within("SFTP", &mut buffer, additional, limit)
+                .expect("a reservation within the limit succeeds");
+            buffer.resize(filled + additional, 0);
+            capacities.push(buffer.capacity());
+        }
+
+        assert_eq!(buffer.len(), limit);
+        assert_eq!(buffer.capacity(), limit);
+        assert!(
+            capacities.windows(2).all(|pair| pair[0] <= pair[1]),
+            "capacity must not shrink, got {capacities:?}"
+        );
+        let mut distinct = capacities.clone();
+        distinct.dedup();
+        assert_eq!(distinct, vec![7, 14, 28, 56, 100]);
     }
 
     #[test]
