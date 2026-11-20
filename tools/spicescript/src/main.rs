@@ -124,9 +124,9 @@ struct Cli {
     #[arg(long, value_name = "I/N", value_parser = parse_partition)]
     partition: Option<(usize, usize)>,
 
-    /// Cap every wait for a condition (`eventually`, readiness, a refresh)
-    /// at this long, such as `20s`: for scripts expected to fail, which
-    /// otherwise wait out every limit in full.
+    /// Cap every wait for a condition (`eventually`, a refresh) at this long,
+    /// such as `20s`: for scripts expected to fail, which otherwise wait out
+    /// every limit in full. A start's readiness wait keeps its own limit.
     #[arg(long = "max-wait", value_name = "DURATION", value_parser = humantime::parse_duration)]
     max_wait: Option<std::time::Duration>,
 

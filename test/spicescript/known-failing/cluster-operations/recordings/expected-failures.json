@@ -13,9 +13,33 @@
     {
       "run": "cluster-dataset-writes[layout=plain,mode=file,policy=upsert]",
       "who": "upsert",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.src\",\"name\":\"ev\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
+      "key": "spice-exec: INSERT INTO ev VALUES (2, 'us', 'beta_updated', 999, 9.5, '2024-02-02 00:00:00'), (6, 'eu', 'epsilon', 600, 6.5, '2024-02-06 00:00:00')",
+      "kind": "error",
+      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: Error during planning: INSERT on ev is not supported on a cluster scheduler: its writes go only to the acceleration, which the executors hold",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-dataset-writes[layout=plain,mode=file,policy=upsert]",
+      "who": "upsert",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 5 }",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-dataset-writes[layout=plain,mode=file,policy=upsert]",
+      "who": "upsert",
+      "key": "spice-exec: INSERT INTO ev VALUES (7, 'us', 'first', 1, 1.0, NULL), (7, 'us', 'second', 2, 2.0, NULL), (8, 'asia', 'only', 8, 8.0, NULL)",
+      "kind": "error",
+      "signature": "Spice rejected the statement: 400 Bad Request: Failed to execute query: Error during planning: INSERT on ev is not supported on a cluster scheduler: its writes go only to the acceleration, which the executors hold",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-dataset-writes[layout=plain,mode=file,policy=upsert]",
+      "who": "upsert",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 5 }",
       "group": "cluster-operations"
     }
   ],
@@ -23,9 +47,145 @@
     {
       "run": "cluster-executor-loss-cayenne",
       "who": "cayenne",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:t\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"},{\"acceleration_enabled\":true,\"from\":\"postgres:u\",\"name\":\"u\",\"properti",
+      "key": "query: SELECT count(*) AS n FROM t #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT count(*) AS n FROM t #3",
+      "kind": "error",
+      "signature": "stopped matching after <duration> (<n> attempts): Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "stopped matching after <duration> (<n> attempts): Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT id, i, d, s, dt FROM t #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT count(*) AS n, sum(i) AS si, sum(d) AS sd, min(dt) AS lo, max(dt) AS hi FROM t #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT s, count(*) AS n, avg(d) AS ad FROM t GROUP BY s #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE i > 40 AND s = 'apple' #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT t.id, u.label FROM t JOIN u ON t.id = u.t_id WHERE u.label = 'red' #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT u.label, count(*) AS n, sum(t.d) AS sd FROM t JOIN u ON t.id = u.t_id GROUP BY u.label #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT id, d FROM t ORDER BY d DESC NULLS LAST, id LIMIT 10 #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT dt, count(*) AS n FROM t GROUP BY dt ORDER BY n DESC, dt LIMIT 5 #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT count(DISTINCT s) AS ns, count(DISTINCT dt) AS nd FROM t #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cluster-executor-loss-cayenne",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE id IN (SELECT t_id FROM u WHERE label = 'blue') #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query u: no ready executor serves 2 of its 5 partitions; retry the query: Cannot query u: no ready executor serves 2 of its 5 partitions; retry the query",
+      "also": [
+        "Spice rejected the query: Query execution failed. Cannot query u: no ready executor serves 3 of its 5 partitions; retry the query: Cannot query u: no ready executor serves 3 of its 5 partitions; retry the query"
+      ],
+      "varies": true,
       "group": "cluster-operations"
     }
   ],
@@ -79,9 +239,9 @@
     {
       "run": "cluster-refresh-status",
       "who": "default",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":true,\"from\":\"postgres:public.t\",\"name\":\"t\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Refreshing\"}]; see <path>",
+      "key": "query: SELECT id, v FROM t #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 51, actual: 50 }",
       "group": "cluster-operations"
     }
   ]
