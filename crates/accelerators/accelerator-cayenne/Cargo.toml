@@ -21,6 +21,7 @@ version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
+autotests = false
 description = "Cayenne data accelerator: implements data-accelerator-api::DataAccelerator over the native Cayenne engine."
 
 [dependencies]
@@ -98,6 +99,10 @@ object_store_occ = { path = "../../object_store_occ" }
 object_store_sim = { path = "../../object_store_sim" }
 cayenne-metastore-actions = { path = "../../cayenne-metastore-actions" }
 prost.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true

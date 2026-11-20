@@ -591,7 +591,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         // No WAL dir at all — recovery on a freshly-opened table.
         let all = PartitionedWal::read_all_in(tmp.path()).await.expect("read");
-        assert!(all.is_empty());
+        assert_eq!(all, [] as [(PartitionedWal, PathBuf); 0]);
     }
 
     #[tokio::test]
@@ -670,11 +670,11 @@ mod tests {
             .await
             .expect("idempotent");
 
-        assert!(
+        assert_eq!(
             PartitionedWal::read_all_in(tmp.path())
                 .await
-                .expect("read after remove")
-                .is_empty()
+                .expect("read after remove"),
+            [] as [(PartitionedWal, PathBuf); 0]
         );
     }
 

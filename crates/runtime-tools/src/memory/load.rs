@@ -31,7 +31,7 @@ use crate::utils::parameters;
 use app::App;
 use runtime_query_engine::query_engine::QueryEngine;
 use tokio::sync::RwLock;
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 
 use super::memory_table_name;
 
@@ -116,7 +116,12 @@ impl SpiceModelTool for LoadMemoryTool {
         parameters::<LoadMemoryParams>()
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Reads the memory dataset.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::load_memory", tool = self.name().to_string(), input = arg);
 
         let table_name = memory_table_name(&self.app).await?;

@@ -2127,7 +2127,7 @@ mod tests {
 
         let data = opener.open(file)?.await?.try_collect::<Vec<_>>().await?;
 
-        assert!(data.is_empty());
+        assert_eq!(data, [] as [RecordBatch; 0]);
         assert_eq!(take_scans_built(), 0);
         Ok(())
     }
@@ -2448,7 +2448,10 @@ mod tests {
             2,
             "both min/max bounds conjuncts are pushed into the scan"
         );
-        assert!(conjuncts.unpushed.is_empty());
+        assert_eq!(
+            conjuncts.unpushed,
+            [] as [Arc<dyn datafusion_physical_expr::PhysicalExpr>; 0]
+        );
         assert_eq!(
             conjuncts.skipped_dynamic.len(),
             1,

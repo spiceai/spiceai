@@ -577,10 +577,11 @@ async fn under_tool_choice_none_a_json_schema_reply_keeps_its_schema() {
 #[tokio::test]
 async fn a_model_dropped_under_a_stalled_stream_stops_promptly() {
     // The stream's buffer holds 64 tokens, and only the count drained after the drop shows it
-    // was full. Alone, Qwen3-0.6B decodes 64 tokens in well under a second, but this binary
-    // loads a model per test and runs them at once, and on a contended runner the buffer has
-    // held 48 chunks 3 s after the first. So an attempt whose buffer was not yet full is run
-    // again with twice the wait, until one shows the decode thread blocked on a full buffer.
+    // stopped filling, with the decode thread waiting on the client. Alone, Qwen3-0.6B decodes
+    // 64 tokens in well under a second, but this binary loads a model per test and runs them at
+    // once, and on a contended runner the buffer has held 48 chunks 3 s after the first. So an
+    // attempt whose buffer was still filling is run again with twice the wait, until one shows
+    // the decode thread waiting on a stalled client.
     let mut last = 0;
     for wait in [3, 6, 12, 24, 48].map(std::time::Duration::from_secs) {
         let model = qwen3().await;
@@ -612,7 +613,10 @@ async fn a_model_dropped_under_a_stalled_stream_stops_promptly() {
         while let Some(Ok(_)) = stream.next().await {
             buffered += 1;
         }
-        if buffered >= 64 {
+        // The scheduler decodes for a request only while its buffer has room for one step's
+        // events, 2 x (drafts + 1) + 4 = 6 for this model without drafts, so a stalled client's
+        // buffer stops filling at 64 - 5.
+        if buffered >= llms_llamacpp::STREAM_BUFFER - 5 {
             return;
         }
         last = buffered;

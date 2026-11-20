@@ -249,29 +249,32 @@ impl<'v> Sampler<'v> {
     }
 
     /// Picks the token for output row `index` of the last decoded batch. A greedy sampler takes
-    /// a context's argmax output when it is on, which has no logits to read.
-    pub fn sample(&mut self, context: &Context<'_>, index: i32) -> Token {
+    /// a context's argmax output when it is on, which has no logits to read. Fails when a backend
+    /// failed computing the decode, which leaves nothing to pick from.
+    pub fn sample(&mut self, context: &Context<'_>, index: i32) -> Result<Token> {
         debug_assert!(
             self.greedy || !context.argmax_output(),
             "only a greedy sampler picks from a context's argmax output, which has no logits"
         );
-        let greedy_pick = || {
-            if context.argmax_output() {
-                context.argmax(index)
+        if self.greedy {
+            let pick = if context.argmax_output() {
+                context.argmax(index)?
             } else {
-                context.logits(index).and_then(first_max)
+                context.logits(index)?.and_then(first_max)
+            };
+            if let Some(token) = pick {
+                // SAFETY: the sampler is live. `llama_sampler_sample` tells the sampler of its
+                // pick the same way, which leaves a greedy sampler as it was.
+                unsafe { sys::llama_sampler_accept(self.raw.as_ptr(), token.0) };
+                return Ok(token);
             }
-        };
-        if self.greedy
-            && let Some(token) = greedy_pick()
-        {
-            // SAFETY: the sampler is live. `llama_sampler_sample` tells the sampler of its pick
-            // the same way, which leaves a greedy sampler as it was.
-            unsafe { sys::llama_sampler_accept(self.raw.as_ptr(), token.0) };
-            return token;
         }
         // SAFETY: the context is live and its last decode marked row `index` for output.
-        Token(unsafe { sys::llama_sampler_sample(self.raw.as_ptr(), context.as_ptr(), index) })
+        let token =
+            unsafe { sys::llama_sampler_sample(self.raw.as_ptr(), context.as_ptr(), index) };
+        // the sample waited for the decode: a failed one leaves LLAMA_TOKEN_NULL
+        context.computed()?;
+        Ok(Token(token))
     }
 }
 

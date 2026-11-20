@@ -1246,8 +1246,8 @@ mod not_yet_loaded_tests {
         assert_eq!(not_yet_loaded(text, &declared), ["u", "b", "d"]);
         // Nothing listed yet: every declared dataset is missing.
         assert_eq!(not_yet_loaded("[]", &declared), ["a", "u", "b"]);
-        assert!(not_yet_loaded("[]", &[]).is_empty());
-        assert!(declared_datasets("not: [yaml").is_empty());
+        assert_eq!(not_yet_loaded("[]", &[]), [] as [String; 0]);
+        assert_eq!(declared_datasets("not: [yaml"), [] as [String; 0]);
     }
 }
 

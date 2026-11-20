@@ -113,7 +113,10 @@ async fn headlog_500_records_cold_open_and_lagging_poll() {
         let (mut reader, empty) = Reader::open(Arc::clone(&backend.store), backend.prefix.clone())
             .await
             .expect("empty open");
-        assert!(empty.records.is_empty());
+        assert_eq!(
+            empty.records,
+            [] as [object_store_occ::headlog::RecordWithCommit; 0]
+        );
         assert_eq!(reader.poll().await.expect("304"), Poll::Unchanged);
         let mut expected = Vec::new();
         let mut seen = Vec::new();
@@ -777,7 +780,7 @@ async fn headlog_group_persists_before_send_and_upload_is_immutable() {
             })
             .await
             .expect("group commit");
-        assert!(!saved.is_empty());
+        assert_ne!(saved, [] as [u8; 0]);
         assert_eq!(outcome, Outcome::Accepted { commit: 1 });
         let (_, opened) = Reader::open(Arc::clone(&backend.store), backend.prefix.clone())
             .await

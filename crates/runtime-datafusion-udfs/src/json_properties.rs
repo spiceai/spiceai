@@ -1906,9 +1906,9 @@ mod tests {
 
     #[test]
     fn malformed_input_yields_zero_rows() {
-        assert!(flatten("not json").is_empty());
-        assert!(flatten("{broken").is_empty());
-        assert!(flatten("").is_empty());
+        assert_eq!(flatten("not json"), [] as [PropertyRow; 0]);
+        assert_eq!(flatten("{broken"), [] as [PropertyRow; 0]);
+        assert_eq!(flatten(""), [] as [PropertyRow; 0]);
     }
 
     #[test]
@@ -1919,7 +1919,7 @@ mod tests {
         };
         let big = r#"{"properties": {"a": {"type": "string"}, "b": {"type": "integer"}}}"#;
         assert!(big.len() > 32);
-        assert!(flatten_with_options(big, &opts).is_empty());
+        assert_eq!(flatten_with_options(big, &opts), [] as [PropertyRow; 0]);
     }
 
     #[test]
@@ -1981,7 +1981,7 @@ mod tests {
         };
         assert!(json.len() <= opts.max_bytes);
         let rows = flatten_with_options(&json, &opts);
-        assert!(!rows.is_empty());
+        assert_ne!(rows, [] as [PropertyRow; 0]);
         assert!(
             rows.len() < 64,
             "{} rows of 512 empty enum values each",
@@ -2009,9 +2009,9 @@ mod tests {
 
     #[test]
     fn documents_without_properties_yield_zero_rows() {
-        assert!(flatten(r#"{"foo": "bar"}"#).is_empty());
-        assert!(flatten(r#"{"properties": {}}"#).is_empty());
-        assert!(flatten(r"[1, 2, 3]").is_empty());
+        assert_eq!(flatten(r#"{"foo": "bar"}"#), [] as [PropertyRow; 0]);
+        assert_eq!(flatten(r#"{"properties": {}}"#), [] as [PropertyRow; 0]);
+        assert_eq!(flatten(r"[1, 2, 3]"), [] as [PropertyRow; 0]);
     }
 
     #[tokio::test]
@@ -2389,7 +2389,7 @@ mod tests {
             ..FlattenOptions::default()
         };
         let rows = flatten_with_options(&doc, &opts);
-        assert!(!rows.is_empty());
+        assert_ne!(rows, [] as [PropertyRow; 0]);
         for row in &rows {
             assert!(row.path.matches("[*]").count() <= 5, "path {}", row.path);
         }
