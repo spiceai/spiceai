@@ -462,14 +462,20 @@ impl ToolUsingResponses {
             .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
         {
             tracing::debug!("User asked for no tools, calling inner chat model");
-            return self.inner_responses.responses_request(req).await;
+            return self
+                .inner_responses
+                .responses_request(without_orphan_tool_settings(req))
+                .await;
         }
 
         if recursion_limit.is_some_and(|f| f == 0) {
             tracing::debug!(
                 "Tool-use recursion limit reached. Will call model, but not process further"
             );
-            return self.inner_responses.responses_request(req).await;
+            return self
+                .inner_responses
+                .responses_request(without_orphan_tool_settings(req))
+                .await;
         }
 
         // Append spiced runtime tools to the request.
@@ -523,14 +529,20 @@ impl ToolUsingResponses {
             .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
         {
             tracing::debug!("User asked for no tools, calling inner responses model");
-            return self.inner_responses.responses_stream(req).await;
+            return self
+                .inner_responses
+                .responses_stream(without_orphan_tool_settings(req))
+                .await;
         }
 
         if recursion_limit.is_some_and(|f| f == 0) {
             tracing::debug!(
                 "Tool-use recursion limit reached. Will call model, but not process further"
             );
-            return self.inner_responses.responses_stream(req).await;
+            return self
+                .inner_responses
+                .responses_stream(without_orphan_tool_settings(req))
+                .await;
         }
 
         // Append spiced runtime tools to the request.
@@ -570,9 +582,7 @@ impl ToolUsingResponses {
             )
             .collect::<Vec<_>>();
         if tools.is_empty() {
-            req.tool_choice = None;
-            req.parallel_tool_calls = None;
-            return req;
+            return without_orphan_tool_settings(req);
         }
         req.tools = Some(tools);
         if let Some(ToolChoiceParam::AllowedTools(allowed)) = &mut req.tool_choice {
@@ -587,11 +597,14 @@ impl ToolUsingResponses {
         req
     }
 
+    /// `req` with the Spice tools its caller may call (see [`Self::runtime_tools`]) beside the
+    /// model's hosted tools. A request left with no tool at all sends none, and so no tool
+    /// settings either.
     async fn add_runtime_tools(&self, req: &CreateResponse) -> CreateResponse {
         let mut runtime_tools = self.runtime_tools(::tools::caller_can_write().await);
         if runtime_tools.is_empty() {
             tracing::debug!("No runtime tools available, returning original request");
-            req.clone()
+            without_orphan_tool_settings(req.clone())
         } else {
             runtime_tools.extend(req.tools.clone().unwrap_or_default());
             // Ensure function names are unique. Tool-use recursion sometimes creates duplicates.
@@ -1135,6 +1148,20 @@ fn next_round_tool_choice(choice: Option<ToolChoiceParam>) -> Option<ToolChoiceP
     }
 }
 
+/// `req` without `tools`, `tool_choice` and `parallel_tool_calls` when it offers no tool: a
+/// request whose caller may call none of the Spice tools, on a model with no hosted tools, would
+/// otherwise carry an empty `tools` list and tool settings with no tool to apply to, which a
+/// provider may reject (issue #14821). The Responses counterpart of
+/// `tool_use::without_orphan_tool_choice`.
+fn without_orphan_tool_settings(mut req: CreateResponse) -> CreateResponse {
+    if req.tools.as_ref().is_none_or(Vec::is_empty) {
+        req.tools = None;
+        req.tool_choice = None;
+        req.parallel_tool_calls = None;
+    }
+    req
+}
+
 fn to_input_item(input: InputParam) -> Vec<InputItem> {
     match input {
         InputParam::Text(text) => vec![InputItem::EasyMessage(EasyInputMessage {
@@ -1229,7 +1256,9 @@ mod tests {
         ToolChoiceTypes,
     };
     use parking_lot::Mutex;
+    use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
     use runtime_request_context::Protocol;
+    use spicepod::component::runtime::ApiKey;
     use std::borrow::Cow;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2192,6 +2221,142 @@ mod tests {
                 (vec!["web_search".to_string()], last_choice),
                 "{choice:?}"
             );
+        }
+    }
+
+    /// A `store_note` Spice tool whose calls write, so only a caller with write access is
+    /// offered it.
+    struct StoreNote;
+
+    #[async_trait]
+    impl SpiceModelTool for StoreNote {
+        fn name(&self) -> Cow<'_, str> {
+            "store_note".into()
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadWrite
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!("stored"))
+        }
+    }
+
+    /// A request context whose caller authenticated with an API key that may write, or not.
+    fn api_key_caller(can_write: bool) -> Arc<RequestContext> {
+        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+        let key = "key-1".to_string();
+        let principal = if can_write {
+            ApiKey::ReadWrite { key }
+        } else {
+            ApiKey::ReadOnly { key }
+        };
+        context
+            .set_auth_principal(Arc::new(principal) as AuthPrincipalRef)
+            .expect("auth principal should be set");
+        context
+    }
+
+    /// The tool fields of the one request `provider` received, as it is sent: `tools`,
+    /// `tool_choice` and `parallel_tool_calls`, each only when the request carries it.
+    fn sent_tool_fields(provider: &ScriptedResponses) -> Value {
+        let requests = provider.requests.lock();
+        assert_eq!(requests.len(), 1, "one request reaches the provider");
+        let sent = serde_json::to_value(&requests[0]).expect("a serializable request");
+        Value::Object(
+            ["tools", "tool_choice", "parallel_tool_calls"]
+                .into_iter()
+                .filter_map(|field| Some((field.to_string(), sent.get(field)?.clone())))
+                .collect(),
+        )
+    }
+
+    /// A caller without write access is not offered a Spice tool that writes. When that leaves no
+    /// tool at all, the request reaches the provider without `tools`, rather than with an empty
+    /// list, and without the `tool_choice` and `parallel_tool_calls` a request with no tools may
+    /// not carry (#14821): whatever the client's tool choice, and on a model that runs no tool
+    /// rounds, streamed or not.
+    #[tokio::test]
+    async fn test_a_caller_offered_no_tools_is_sent_no_tool_fields() {
+        let mut sent = Vec::new();
+        let mut expected = Vec::new();
+        for stream in [false, true] {
+            for (choice, limit) in [
+                (ToolChoiceOptions::Auto, None),
+                (ToolChoiceOptions::Required, None),
+                (ToolChoiceOptions::None, None),
+                (ToolChoiceOptions::Auto, Some(0)),
+            ] {
+                let provider = ScriptedResponses::new(vec![]);
+                let model = ToolUsingResponses::new(
+                    Arc::clone(&provider) as Arc<dyn Responses>,
+                    vec![],
+                    vec![Arc::new(StoreNote) as Arc<dyn SpiceModelTool>],
+                    limit,
+                );
+                let mut request = request(stream);
+                request.tool_choice = Some(ToolChoiceParam::Mode(choice));
+                request.parallel_tool_calls = Some(true);
+
+                api_key_caller(false)
+                    .scope(output_through_spice(&model, request))
+                    .await;
+
+                let case = format!("stream: {stream}, tool_choice: {choice:?}, limit: {limit:?}");
+                sent.push((case.clone(), sent_tool_fields(&provider)));
+                expected.push((case, json!({})));
+            }
+        }
+        assert_eq!(sent, expected);
+    }
+
+    /// A caller offered no Spice tool is still offered the model's hosted tools, with the
+    /// client's tool settings, which apply to them. A caller with write access is offered the
+    /// Spice tool beside them.
+    #[tokio::test]
+    async fn test_a_caller_offered_no_spice_tools_keeps_the_hosted_tools() {
+        let web_search = json!({ "type": "web_search" });
+        let store_note = json!({ "type": "function", "name": "store_note", "parameters": {} });
+        for stream in [false, true] {
+            for (can_write, choice, tools) in [
+                (false, ToolChoiceOptions::Auto, json!([web_search])),
+                (false, ToolChoiceOptions::None, json!([web_search])),
+                (
+                    true,
+                    ToolChoiceOptions::Auto,
+                    json!([store_note, web_search]),
+                ),
+            ] {
+                let provider = ScriptedResponses::new(vec![]);
+                let model = ToolUsingResponses::new(
+                    Arc::clone(&provider) as Arc<dyn Responses>,
+                    vec![OpenAIResponsesTools::WebSearch],
+                    vec![Arc::new(StoreNote) as Arc<dyn SpiceModelTool>],
+                    None,
+                );
+                let mut request = request(stream);
+                request.tool_choice = Some(ToolChoiceParam::Mode(choice));
+                request.parallel_tool_calls = Some(true);
+
+                api_key_caller(can_write)
+                    .scope(output_through_spice(&model, request))
+                    .await;
+
+                assert_eq!(
+                    sent_tool_fields(&provider),
+                    json!({ "tools": tools, "tool_choice": choice, "parallel_tool_calls": true }),
+                    "stream: {stream}, can write: {can_write}, tool_choice: {choice:?}"
+                );
+            }
         }
     }
 

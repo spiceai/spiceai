@@ -2912,4 +2912,120 @@ mod tests {
             assert_eq!(sent.parallel_tool_calls, None);
         }
     }
+
+    /// A `store_note` Spice tool whose calls write, so only a caller with write access is
+    /// offered it.
+    struct StoreNote;
+
+    #[async_trait]
+    impl SpiceModelTool for StoreNote {
+        fn name(&self) -> Cow<'_, str> {
+            "store_note".into()
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadWrite
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!("stored"))
+        }
+    }
+
+    /// The tool fields of the one request `provider` received, as it is sent: `tools`,
+    /// `tool_choice` and `parallel_tool_calls`, each only when the request carries it.
+    fn sent_tool_fields(provider: &ScriptedChat) -> Value {
+        let requests = provider.requests.lock();
+        assert_eq!(requests.len(), 1, "one request reaches the provider");
+        let sent = serde_json::to_value(&requests[0]).expect("a serializable request");
+        Value::Object(
+            ["tools", "tool_choice", "parallel_tool_calls"]
+                .into_iter()
+                .filter_map(|field| Some((field.to_string(), sent.get(field)?.clone())))
+                .collect(),
+        )
+    }
+
+    /// A caller without write access is not offered a Spice tool that writes. When that leaves no
+    /// tool at all, the request reaches the provider without `tools`, and without the
+    /// `tool_choice` and `parallel_tool_calls` a request with no tools may not carry (#14821),
+    /// streamed or not. A client's own function stays, with the client's tool settings, and a
+    /// caller with write access is offered the Spice tool.
+    #[tokio::test]
+    async fn test_a_caller_offered_no_tools_is_sent_no_tool_fields() {
+        let lookup = json!({ "type": "function", "function": { "name": "lookup_order" } });
+        let store_note = json!({ "type": "function", "function": { "name": "store_note" } });
+        let none = ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None);
+        let auto = ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto);
+        let required = ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required);
+        for stream in [false, true] {
+            for (can_write, client_tools, choice, expected) in [
+                (false, json!(null), &auto, json!({})),
+                (false, json!(null), &required, json!({})),
+                (false, json!(null), &none, json!({})),
+                (
+                    false,
+                    json!([lookup]),
+                    &auto,
+                    json!({ "tools": [lookup], "tool_choice": "auto", "parallel_tool_calls": true }),
+                ),
+                (
+                    true,
+                    json!(null),
+                    &auto,
+                    json!({ "tools": [store_note], "tool_choice": "auto", "parallel_tool_calls": true }),
+                ),
+            ] {
+                let provider = ScriptedChat::new(vec![Reply::Answer("D")]);
+                let model = model(
+                    &provider,
+                    vec![Arc::new(StoreNote) as Arc<dyn SpiceModelTool>],
+                );
+                let mut req = request(vec![user("A")]);
+                req.tools = serde_json::from_value(client_tools.clone()).expect("valid tools");
+                req.tool_choice = Some(choice.clone());
+                req.parallel_tool_calls = Some(true);
+
+                let key = "key-1".to_string();
+                let principal = if can_write {
+                    ApiKey::ReadWrite { key }
+                } else {
+                    ApiKey::ReadOnly { key }
+                };
+                let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+                context
+                    .set_auth_principal(Arc::new(principal) as AuthPrincipalRef)
+                    .expect("auth principal should be set");
+                context
+                    .scope(async {
+                        if stream {
+                            let chunks: Vec<_> = model
+                                .chat_stream(req)
+                                .await
+                                .expect("a stream")
+                                .collect()
+                                .await;
+                            assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+                        } else {
+                            model.chat_request(req).await.expect("a response");
+                        }
+                    })
+                    .await;
+
+                assert_eq!(
+                    sent_tool_fields(&provider),
+                    expected,
+                    "stream: {stream}, can write: {can_write}, tools: {client_tools}, {choice:?}"
+                );
+            }
+        }
+    }
 }
