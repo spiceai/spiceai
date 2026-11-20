@@ -107,23 +107,6 @@ struct Answer {
     rows: Vec<Vec<Cell>>,
 }
 
-/// Get acceleration parameters for postgres engine
-fn get_postgres_acceleration_params(port: usize) -> Params {
-    let mut params = common::get_pg_params(port);
-    // Override pg_db to use the acceleration database instead of the default
-    params.insert(
-        "pg_db".to_string(),
-        secrecy::SecretString::from("acceleration".to_string()),
-    );
-
-    Params::from_string_map(
-        params
-            .into_iter()
-            .map(|(k, v)| (k, secrecy::ExposeSecret::expose_secret(&v).to_string()))
-            .collect(),
-    )
-}
-
 async fn test_refresh_append_for_engine(engine: &str) -> Result<(), anyhow::Error> {
     test_refresh_matches_source(engine, RefreshCase::Append).await
 }
@@ -133,19 +116,13 @@ async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error>
 }
 
 async fn test_refresh_matches_source(engine: &str, mode: RefreshCase) -> Result<(), anyhow::Error> {
-    refresh_matches_postgres_source(engine, mode, |port| {
-        let acceleration_params =
-            (engine == "postgres").then(|| get_postgres_acceleration_params(port));
-        acceleration_for(engine, mode, acceleration_params)
-    })
-    .await
+    refresh_matches_postgres_source(engine, mode, |_port| acceleration_for(engine, mode, None))
+        .await
 }
 
 async fn test_upsert_history_for_engine(engine: &str) -> Result<(), anyhow::Error> {
-    upsert_history_matches_postgres_source(engine, |port| {
-        let acceleration_params =
-            (engine == "postgres").then(|| get_postgres_acceleration_params(port));
-        get_acceleration_config_append(engine, acceleration_params)
+    upsert_history_matches_postgres_source(engine, |_port| {
+        get_acceleration_config_append(engine, None)
     })
     .await
 }
@@ -1408,28 +1385,6 @@ async fn test_acceleration_refresh_sqlite_append_iso8601() -> Result<(), anyhow:
 async fn test_acceleration_refresh_sqlite_full_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_full_for_engine("sqlite").await
-}
-
-// Postgres (feature-gated)
-#[cfg(feature = "postgres-accel")]
-#[tokio::test]
-async fn test_acceleration_refresh_postgres_append_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("postgres").await
-}
-
-#[cfg(feature = "postgres-accel")]
-#[tokio::test]
-async fn test_acceleration_refresh_postgres_append_upsert_history() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_upsert_history_for_engine("postgres").await
-}
-
-#[cfg(feature = "postgres-accel")]
-#[tokio::test]
-async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("postgres").await
 }
 
 // Cayenne

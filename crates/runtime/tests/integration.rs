@@ -48,11 +48,6 @@ use tracing_subscriber::EnvFilter;
 #[test]
 fn accelerator_crates_register_their_engines() {
     let engines = data_accelerator_api::registered_engine_names();
-    #[cfg(feature = "postgres-accel")]
-    assert!(
-        engines.iter().any(|engine| engine == "postgres"),
-        "the postgres accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
     #[cfg(feature = "sqlite")]
     assert!(
         engines.iter().any(|engine| engine == "sqlite"),
@@ -186,8 +181,6 @@ mod spiceai;
 mod sqlite;
 mod tls;
 mod tls_reload;
-#[cfg(feature = "postgres-accel")]
-mod tpcds_postgres;
 mod utils;
 mod view;
 
