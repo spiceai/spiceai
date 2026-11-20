@@ -112,7 +112,7 @@ impl HostProgram {
 /// | Component | Runs on the host |
 /// | --- | --- |
 /// | `tools` with `from: mcp:<command>` (stdio MCP server) | Yes: [`HostProgram::Program`] |
-/// | `tools` with `from: mcp:https://…` (remote MCP server) | No |
+/// | `tools` with `from: mcp:https://…` (remote MCP server) | No: see [`mcp_target_starts_no_program`] |
 /// | `functions` with a `build:` block | Yes: [`HostProgram::BuildCommand`] (CLI only) |
 /// | `functions` with `from: wasm` and `params.module` | No: runs in the WebAssembly sandbox |
 /// | `datasets`/`catalogs` from `adbc` with a driver given as a path | Yes: [`HostProgram::NativeLibrary`] |
@@ -150,12 +150,30 @@ pub fn host_program(component: ComponentRef<'_>) -> Option<HostProgram> {
 /// The program a `from: mcp:<target>` tool starts, or `None` for a remote
 /// (HTTP) MCP server or a tool that is not MCP.
 fn stdio_mcp_program(from: &str) -> Option<String> {
-    let target = from.strip_prefix("mcp:")?.trim();
-    let lowercase = target.to_ascii_lowercase();
-    if target.is_empty() || lowercase.starts_with("http://") || lowercase.starts_with("https://") {
+    let target = from.strip_prefix("mcp:")?;
+    if mcp_target_starts_no_program(target) {
         return None;
     }
-    Some(target.to_string())
+    Some(target.trim().to_string())
+}
+
+/// Whether the `<target>` of a `from: mcp:<target>` tool starts no program on
+/// the host: it is empty, or it names a remote MCP server (`http://` or
+/// `https://` in any case, ignoring surrounding whitespace).
+///
+/// A dependency's tool with such a target is loaded without trust, so the
+/// runtime must connect to it over HTTP or refuse it, and never start it as a
+/// program, even when it is not a valid URL. The runtime decides with this same
+/// function, so the two cannot disagree.
+#[must_use]
+pub fn mcp_target_starts_no_program(target: &str) -> bool {
+    let target = target.trim();
+    target.is_empty()
+        || ["http://", "https://"].iter().any(|scheme| {
+            target
+                .get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        })
 }
 
 /// The library an `adbc` dataset or catalog loads by path, or `None` when it
