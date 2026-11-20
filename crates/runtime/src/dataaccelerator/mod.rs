@@ -41,6 +41,10 @@ mod test {
     use ::arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+    // Links the `sqlite` engine's registration into this test binary, which
+    // `test_file_mode_sqlite_creation` resolves through the engine registry.
+    #[cfg(feature = "sqlite")]
+    use accelerator_sqlite as _;
     // Config types now live in `runtime-component`/`runtime-acceleration` (not re-exported
     // by the accelerator shim glob), and `Secrets` in `runtime-secrets`.
     use crate::component::dataset::acceleration::{Acceleration, Engine, IndexType, Mode};
