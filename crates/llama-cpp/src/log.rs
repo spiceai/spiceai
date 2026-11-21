@@ -40,12 +40,14 @@ pub(crate) fn clear_last_error() {
 /// joined, or a placeholder when it reported none. Its specific reason comes first and its
 /// summary ("failed to load model") last, so both are kept.
 pub(crate) fn last_error() -> String {
+    reported_errors().unwrap_or_else(|| "llama.cpp reported no reason".to_string())
+}
+
+/// The errors llama.cpp reported on this thread since [`clear_last_error`], in order and
+/// joined, or `None` when it reported none. Like [`last_error`], it forgets them.
+pub(crate) fn reported_errors() -> Option<String> {
     let errors = ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()));
-    if errors.is_empty() {
-        "llama.cpp reported no reason".to_string()
-    } else {
-        errors.join("; ")
-    }
+    (!errors.is_empty()).then(|| errors.join("; "))
 }
 
 /// llama.cpp's own lines are debug output: what a user needs from an error reaches them in

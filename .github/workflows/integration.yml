@@ -496,7 +496,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -508,7 +508,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
           role-session-name: gha-dynamodb-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -520,7 +520,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_S3_VECTORS_ROLE_ARN }}
           role-session-name: gha-s3-vectors-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -581,7 +581,7 @@ jobs:
           AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
           AWS_ICEBERG_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
           AWS_ICEBERG_REGION: ${{ vars.AWS_ICEBERG_REGION }}
-          AWS_ICEBERG_ACCOUNT_ID: ${{ vars.AWS_ICEBERG_ACCOUNT_ID }}
+          AWS_ICEBERG_ACCOUNT_ID: ${{ vars.CI_AWS_ICEBERG_ACCOUNT_ID }}
           AWS_GLUE_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
           AWS_GLUE_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
           AWS_GLUE_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
@@ -1312,7 +1312,7 @@ jobs:
         env:
           AWS_EC2_METADATA_DISABLED: true
           AWS_REGION: ${{ vars.AWS_REGION }}
-          AWS_ROLE_ARN: ${{ vars.AWS_WEB_IDENTITY_TEST_ROLE_ARN }}
+          AWS_ROLE_ARN: ${{ vars.CI_AWS_WEB_IDENTITY_TEST_ROLE_ARN }}
         # A GitHub OIDC token lives 5 minutes, enough for these tests' STS exchanges.
         run: |
           set -euo pipefail
@@ -1390,7 +1390,7 @@ jobs:
         if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false

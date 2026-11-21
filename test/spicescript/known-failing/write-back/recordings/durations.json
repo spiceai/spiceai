@@ -1,6 +1,6 @@
 {
-  "postgres-upgrade": 107,
-  "postgres-write-back-pending-across-rebuild": 22,
-  "postgres-write-through-arithmetic": 5,
-  "postgres-write-through-expressions": 3
+  "postgres-upgrade": 63,
+  "postgres-write-back-pending-across-rebuild": 70,
+  "postgres-write-through-arithmetic": 9,
+  "postgres-write-through-expressions": 4
 }

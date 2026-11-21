@@ -69,7 +69,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
         .with_dataset(make_duckdb_dataset(
             "csv_remote",
             "csv",
-            "'s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.csv', HEADER=true",
+            "'s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.csv', HEADER=true",
         ))
         .with_dataset(make_duckdb_dataset(
             "csv_local",
@@ -79,12 +79,12 @@ async fn duckdb_from_functions() -> Result<(), String> {
         .with_dataset(make_duckdb_dataset(
             "parquet_remote",
             "parquet",
-            "'s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet'",
+            "'s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.parquet'",
         ))
         .with_dataset(make_duckdb_dataset(
             "json_remote",
             "json",
-            "'s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.json'",
+            "'s3://spice-datasets-gjezag77s0hu/taxi_small_samples/taxi_sample.json'",
         ))
         .with_dataset(make_duckdb_dataset(
             "json_local",
