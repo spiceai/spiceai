@@ -29,6 +29,11 @@ name: Trunk tests
 # scripts, and these jobs have id-token: write on the self-hosted runners.
 
 on:
+  # Temporary: exercises this workflow from a branch before it is on trunk.
+  # Never merged; the probe branch is deleted after the run.
+  push:
+    branches:
+      - ben/trunk-tests-probe
   schedule:
     - cron: '0 4,16 * * *'
   workflow_dispatch:
