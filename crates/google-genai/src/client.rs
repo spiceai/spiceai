@@ -54,7 +54,7 @@ impl Client {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let http_client = reqwest::Client::builder()
+        let http_client = http_retry::client_builder()
             .default_headers(headers)
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_mins(5))
