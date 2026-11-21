@@ -39,7 +39,7 @@ use mistralrs::core::{
     GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs,
     MistralRsBuilder, ModelPaths, MultimodalLoaderBuilder, MultimodalLoaderType,
     MultimodalSpecificConfig, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig,
-    Pipeline, RequestMessage, TokenSource,
+    Pipeline, RequestMessage, TokenSource, TokenizationRequest,
 };
 use mistralrs::{
     ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
@@ -67,9 +67,15 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 /// the same cap so enabling cache-aware scheduling does not change request parallelism.
 const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
 
+/// The context, in tokens, a local model is served with when the `context_length` model
+/// parameter is not set. The same default as the llama.cpp engine on trunk.
+const DEFAULT_CONTEXT_LENGTH: usize = 8192;
+
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
     counter: AtomicUsize,
+    /// The operator's `context_length`, if set.
+    context_length: Option<usize>,
     /// RAII drop guard that keeps the per-node `RING_CONFIG` temp file alive for
     /// the model's lifetime (its `Drop` deletes the file on model teardown).
     /// `None` for single-node models. Never read directly.
@@ -189,7 +195,13 @@ impl MistralLlama {
             )?,
         };
 
-        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
+        Ok(Self::from_pipeline(
+            pipeline,
+            paged_attn_requested,
+            ring_config_path,
+            context_length,
+        )
+        .await)
     }
 
     /// Create paths object, [`ModelPaths`], to create new [`MistralLlama`].
@@ -531,13 +543,14 @@ impl MistralLlama {
             )
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?;
 
-        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
+        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path, None).await)
     }
 
     async fn from_pipeline(
         pipeline: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
         paged_attn_requested: bool,
         ring_config: Option<tempfile::TempPath>,
+        context_length: Option<usize>,
     ) -> Self {
         let scheduler_config = Self::scheduler_config(&pipeline, paged_attn_requested).await;
         Self {
@@ -545,8 +558,52 @@ impl MistralLlama {
                 .build()
                 .await,
             counter: AtomicUsize::new(0),
+            context_length,
             ring_config,
         }
+    }
+
+    /// Rejects a request whose prompt does not fit the model's context, before it reaches
+    /// the engine. An over-context prompt otherwise keeps the host's CPU and memory busy
+    /// for minutes, even after the client has gone.
+    async fn check_prompt_fits(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> Result<(), OpenAIError> {
+        let messages = req
+            .messages
+            .iter()
+            .map(message_to_mistral)
+            .collect::<Vec<_>>();
+        let tools: Option<Vec<Tool>> = req
+            .tools
+            .as_ref()
+            .map(|t| t.iter().map(convert_tool).collect());
+        let (tx, mut rx) = channel(1);
+        let sender = self
+            .pipeline
+            .get_sender(None)
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        sender
+            .send(MistralRequest::Tokenize(TokenizationRequest {
+                text: either::Either::Left(messages),
+                tools,
+                add_generation_prompt: true,
+                add_special_tokens: false,
+                enable_thinking: None,
+                reasoning_effort: None,
+                response: tx,
+            }))
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        let Some(Ok(tokens)) = rx.recv().await else {
+            // The engine cannot count the prompt; leave the request to its own checks.
+            tracing::debug!("Could not tokenize the prompt to check it against the context");
+            return Ok(());
+        };
+        let engine_limit = self.pipeline.max_sequence_length(None).ok().flatten();
+        let limit = context_limit(self.context_length, engine_limit);
+        prompt_fits(tokens.len(), limit).map_err(OpenAIError::InvalidArgument)
     }
 
     // TODO: handle passing in [`SamplingParams`] from request.
@@ -772,6 +829,7 @@ impl Chat for MistralLlama {
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let tool_choice = request_tool_choice(&req)?;
+        self.check_prompt_fits(&req).await?;
         let recver = self.send_message(req, tool_choice).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -788,6 +846,7 @@ impl Chat for MistralLlama {
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let tool_choice = request_tool_choice(&req)?;
+        self.check_prompt_fits(&req).await?;
         let mut recver = self.send_message(req, tool_choice).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -807,6 +866,24 @@ impl Chat for MistralLlama {
 
         Self::post_process_req(resp).map(|z| to_openai_response(&z))?
     }
+}
+
+/// The context, in tokens, requests are held to: the operator's `context_length` or the
+/// default, and never more than the engine says the model supports.
+fn context_limit(configured: Option<usize>, engine_max: Option<usize>) -> usize {
+    let limit = configured.unwrap_or(DEFAULT_CONTEXT_LENGTH);
+    engine_max.map_or(limit, |max| limit.min(max))
+}
+
+/// Fails, with the wording the llama.cpp engine uses on trunk, when a prompt of
+/// `prompt_tokens` leaves no room to generate in a context of `limit` tokens.
+fn prompt_fits(prompt_tokens: usize, limit: usize) -> Result<(), String> {
+    if prompt_tokens >= limit {
+        return Err(format!(
+            "the prompt is {prompt_tokens} tokens, and the model's context holds {limit}. Shorten the conversation, or raise `context_length`."
+        ));
+    }
+    Ok(())
 }
 
 fn stream_from_response(
@@ -1146,6 +1223,26 @@ mod tests {
         let converted = convert_tool_choice(&choice(serde_json::json!("required")))
             .expect("required is supported");
         assert!(matches!(converted, ToolChoice::Required), "{converted:?}");
+    }
+
+    #[test]
+    fn an_over_context_prompt_is_rejected_with_a_clear_error() {
+        let message = prompt_fits(13_954, 8192).expect_err("over the context");
+        assert_eq!(
+            message,
+            "the prompt is 13954 tokens, and the model's context holds 8192. Shorten the conversation, or raise `context_length`."
+        );
+        // No room left to generate.
+        prompt_fits(8192, 8192).expect_err("a prompt that fills the context");
+        prompt_fits(6_000, 8192).expect("a prompt that fits");
+    }
+
+    #[test]
+    fn the_context_limit_is_the_setting_the_default_or_the_engines_max() {
+        assert_eq!(context_limit(None, None), DEFAULT_CONTEXT_LENGTH);
+        assert_eq!(context_limit(Some(16_384), Some(32_768)), 16_384);
+        assert_eq!(context_limit(None, Some(4096)), 4096);
+        assert_eq!(context_limit(Some(65_536), Some(32_768)), 32_768);
     }
 
     #[test]
