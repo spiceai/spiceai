@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+http-retry = { path = "../http-retry" }
 reqwest = { workspace = true, features = ["json", "stream"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream.workspace = true

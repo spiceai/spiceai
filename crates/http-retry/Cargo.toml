@@ -1,0 +1,33 @@
+[package]
+name = "http-retry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "A retry policy for HTTP clients that sends a request again only when the server never received it"
+autotests = false
+
+[dependencies]
+# The HTTP/2 implementation `reqwest` uses through hyper, so its errors can be read for the
+# stream refusals `reqwest` retries by default.
+h2 = "0.4"
+reqwest.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+http.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+rstest = "0.26.1"
+rustls.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio-rustls = "0.26"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true

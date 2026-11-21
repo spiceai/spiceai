@@ -141,10 +141,13 @@ pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
 /// operator put on a loopback or private address (a local Ollama, an in-cluster vLLM) stays
 /// reachable and a public endpoint cannot later resolve to an internal address.
 ///
+/// The client also sends a request again when the provider never received it, as
+/// [`http_retry`] describes.
+///
 /// Each call starts a new egress state, so each client pins the hosts it reaches on its own.
 pub fn guarded_client_builder() -> reqwest::ClientBuilder {
     http_egress::origin_bound(
-        reqwest::Client::builder(),
+        http_retry::client_builder(),
         "a model's client follows a redirect only within its endpoint's origin",
     )
 }
@@ -153,6 +156,7 @@ pub fn guarded_client_builder() -> reqwest::ClientBuilder {
 /// `5xx` responses by default; Spice retries and rate-controls requests itself, so a second layer
 /// would multiply attempts and hide the provider's first answer.
 ///
+/// The client does send a request again when the provider never received it. See [`http_retry`].
 /// The endpoint is held to the egress policy of [`guarded_client_builder`], a connect timeout, a
 /// read timeout and a bound on what one response may hold in memory ([`crate::model_http`]).
 ///

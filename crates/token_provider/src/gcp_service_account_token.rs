@@ -307,7 +307,7 @@ async fn exchange_token(
     // The request carries a signed assertion that grants a token to whoever presents it, so it
     // never follows the token endpoint to another origin.
     let client = http_egress::origin_bound(
-        reqwest::Client::builder(),
+        http_retry::client_builder(),
         "a service account token request follows a redirect only within its token endpoint's origin",
     )
     .user_agent(util::spiceai_user_agent())
