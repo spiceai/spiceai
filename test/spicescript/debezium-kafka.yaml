@@ -4,9 +4,7 @@ description: >
   (Redpanda), and Spice follows the topic (`from: debezium:`): the initial
   snapshot, inserts, updates and deletes are applied once each, and the
   Cayenne acceleration answers as PostgreSQL does, before and after spiced
-  restarts. A dataset with declared `columns` on a topic with no messages yet
-  is ready with no rows, then follows the topic once changes arrive. (An
-  Arrow acceleration of the topic fails to start:
+  restarts. (An Arrow acceleration of the topic fails to start:
   known-failing/debezium/debezium-kafka-arrow.yaml.)
 
 sources:
@@ -48,6 +46,8 @@ spicepod:
         kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
         kafka_security_protocol: plaintext
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    # Declared `columns` on a topic with no messages yet: the dataset is ready
+    # with no rows, then follows the topic once changes arrive.
     - from: debezium:${sources.src.namespace}.public.e
       name: e
       params:
