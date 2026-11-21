@@ -410,16 +410,23 @@ impl Reader {
         }
     }
 
+    /// Where text read now goes ([`Reader::text`]), without reading it.
+    pub(crate) fn goes_to(&self) -> Text {
+        match &self.route {
+            Route::Reasoning => Text::Reasoning,
+            Route::Content { .. } => Text::Content,
+            Route::Header(_) | Route::Call { .. } | Route::Dropped => Text::Held,
+        }
+    }
+
     /// Reads `text`, which is not a marker, and says where it goes.
     pub(crate) fn text(&mut self, text: &str) -> Text {
         match &mut self.route {
             Route::Header(header) => header.push_str(text),
             Route::Call { arguments, .. } => arguments.push_str(text),
-            Route::Reasoning => return Text::Reasoning,
-            Route::Content { .. } => return Text::Content,
-            Route::Dropped => {}
+            Route::Reasoning | Route::Content { .. } | Route::Dropped => {}
         }
-        Text::Held
+        self.goes_to()
     }
 }
 

@@ -144,11 +144,20 @@ impl Reply {
 
     /// Starts the reply where the prompt left it when it `goes_on` from there, and returns the
     /// text the prompt began the opened block's body with, to send first. Otherwise the reply
-    /// starts afresh, where the grammar, built again at its root, holds it.
+    /// starts afresh, where the grammar, built again at its root, holds it. The returned text
+    /// is read already: it is sent where [`Reply::goes_to`] says, not read again.
     pub(crate) fn begin(&mut self, goes_on: bool) -> String {
         match self {
             Self::Harmony(reader) => reader.begin(goes_on),
             Self::Inkling(reader) => reader.begin(goes_on),
+        }
+    }
+
+    /// Where text read now goes ([`Reply::text`]), without reading it.
+    pub(crate) fn goes_to(&self) -> Text {
+        match self {
+            Self::Harmony(reader) => reader.goes_to(),
+            Self::Inkling(reader) => reader.goes_to(),
         }
     }
 

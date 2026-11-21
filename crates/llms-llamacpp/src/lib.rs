@@ -2221,12 +2221,17 @@ impl Output {
     }
 
     /// Starts the reply where the prompt left it when it `goes_on` from there, sending the
-    /// text the prompt began the opened block with first; otherwise afresh.
+    /// text the prompt began the opened block with first; otherwise afresh. The reader read
+    /// that text with the prompt, so it is sent as what it is rather than read again: read
+    /// twice, a structured body's JSON would be doubled and could no longer end at its marker.
     fn begin(&mut self, goes_on: bool) {
         if let Some(reader) = self.reply.as_mut() {
             let begun = reader.begin(goes_on);
-            // A client that is gone is found at the next send, as it is for any other.
-            self.route(&begun);
+            let goes_to = reader.goes_to();
+            if !self.called && !begun.is_empty() {
+                // A client that is gone is found at the next send, as it is for any other.
+                self.send_text(goes_to, begun);
+            }
         }
     }
 
@@ -2353,13 +2358,8 @@ impl Output {
             return None;
         }
         if let Some(reader) = self.reply.as_mut() {
-            return match reader.text(text) {
-                reply::Text::Reasoning => {
-                    (!self.send(Event::Reasoning(text.to_string()))).then_some(FinishReason::Stop)
-                }
-                reply::Text::Content => self.content(text.to_string()),
-                reply::Text::Held => None,
-            };
+            let goes_to = reader.text(text);
+            return self.send_text(goes_to, text.to_string());
         }
         let (reasoning, content) = match self.reasoning.as_mut() {
             Some(parser) => {
@@ -2374,6 +2374,17 @@ impl Output {
             return Some(FinishReason::Stop);
         }
         self.content(content.unwrap_or_default())
+    }
+
+    /// Sends text a reply's reader has read where the reader says it goes.
+    fn send_text(&mut self, goes_to: reply::Text, text: String) -> Option<FinishReason> {
+        match goes_to {
+            reply::Text::Reasoning => {
+                (!self.send(Event::Reasoning(text))).then_some(FinishReason::Stop)
+            }
+            reply::Text::Content => self.content(text),
+            reply::Text::Held => None,
+        }
     }
 
     fn content(&mut self, content: String) -> Option<FinishReason> {

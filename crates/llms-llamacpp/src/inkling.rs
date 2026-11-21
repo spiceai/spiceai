@@ -375,24 +375,23 @@ impl Reader {
         std::mem::take(&mut self.calls)
     }
 
+    /// Where text read now goes ([`Reader::text`]), without reading it.
+    pub(crate) fn goes_to(&self) -> Text {
+        match &self.route {
+            Route::Between | Route::Content { .. } => Text::Content,
+            Route::Reasoning => Text::Reasoning,
+            Route::Header(_) | Route::Call { .. } => Text::Held,
+        }
+    }
+
     /// Reads `text`, which is not a marker, and says where it goes.
     pub(crate) fn text(&mut self, text: &str) -> Text {
         match &mut self.route {
-            Route::Between | Route::Content { json: None } => Text::Content,
-            Route::Content { json: Some(body) } => {
-                body.push_str(text);
-                Text::Content
-            }
-            Route::Reasoning => Text::Reasoning,
-            Route::Header(name) => {
-                name.push_str(text);
-                Text::Held
-            }
-            Route::Call { body, .. } => {
-                body.push_str(text);
-                Text::Held
-            }
+            Route::Content { json: Some(body) } | Route::Call { body, .. } => body.push_str(text),
+            Route::Header(name) => name.push_str(text),
+            Route::Between | Route::Content { json: None } | Route::Reasoning => {}
         }
+        self.goes_to()
     }
 }
 

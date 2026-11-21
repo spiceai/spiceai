@@ -361,3 +361,32 @@ async fn held_inkling_text_spells_no_marker_opening() {
         "the refused thinking is not sent: {pieces:?}"
     );
 }
+
+/// The JSON the prompt began a structured text block with is read once. Read twice,
+/// `{"answer":` would be `{"answer":{"answer":`, which the reply's `"Paris"}` leaves an
+/// unfinished JSON value, so the block's `<|end_message|>` would be read as text of its body
+/// and sent as content.
+#[tokio::test]
+async fn json_the_prompt_began_is_read_once() {
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let gguf = gguf(scratch.path()).await;
+    let model = load(
+        &gguf,
+        &template("<|message_model|><|content_text|>{\"answer\":"),
+    )
+    .await;
+    let (pieces, finish) = streamed(&model, structured()).await;
+    assert_eq!(
+        pieces.first().map(String::as_str),
+        Some("{\"answer\":"),
+        "the body the prompt began is sent first: {pieces:?}"
+    );
+    assert_eq!(
+        (pieces.concat(), finish),
+        (
+            "{\"answer\": \"Paris\"}".to_string(),
+            Some(FinishReason::Stop)
+        ),
+        "{pieces:?}"
+    );
+}
