@@ -72,7 +72,7 @@ async fn run_inner(
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
-    let health_monitor = HealthMonitor::spawn()?;
+    let health_monitor = HealthMonitor::spawn(spiced_instance.http_base_url())?;
 
     // Create the appropriate query executor based on args
     let executor = super::create_query_executor(args, &spiced_instance).await?;

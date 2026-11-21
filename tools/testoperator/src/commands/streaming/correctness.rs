@@ -163,6 +163,7 @@ pub async fn run_correctness(args: &StreamingDynamodbCorrectnessArgs) -> Result<
 
     // Start Spice with metrics enabled
     let mut start_request = StartRequest::new(args.common.spiced_path_buf(), transformed)?
+        .with_ports(args.common.spiced_ports())
         .with_additional_args(vec!["--metrics".to_string(), "0.0.0.0:9090".to_string()]);
 
     if let Some(ref data_dir) = args.common.data_dir {

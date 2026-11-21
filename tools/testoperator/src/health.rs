@@ -26,7 +26,7 @@ use crate::metrics;
 
 use test_framework::{
     anyhow::{self, Context},
-    constants::{HEALTH_ENDPOINT, HTTP_BASE_URL, READY_ENDPOINT},
+    constants::{HEALTH_ENDPOINT, READY_ENDPOINT},
     opentelemetry::KeyValue,
     tokio_util::sync::CancellationToken,
 };
@@ -277,8 +277,12 @@ impl HealthCheckReport {
 /// Probes one endpoint once, recording the latency metric and logging any
 /// threshold breach. Logs here, not under the stats lock, to keep I/O out of the
 /// critical section.
-async fn probe(client: &reqwest::Client, endpoint: &'static str) -> ProbeSample {
-    let url = format!("{HTTP_BASE_URL}{endpoint}");
+async fn probe(
+    client: &reqwest::Client,
+    http_base_url: &str,
+    endpoint: &'static str,
+) -> ProbeSample {
+    let url = format!("{http_base_url}{endpoint}");
     let start = Instant::now();
     let response = client.get(&url).send().await;
     let latency = start.elapsed();
@@ -388,6 +392,7 @@ fn breach_log_line(
 /// breaches for a fault that isn't its own.
 async fn sample_endpoint(
     client: reqwest::Client,
+    http_base_url: Arc<str>,
     endpoint: &'static str,
     stats: Arc<Mutex<BTreeMap<&'static str, EndpointStats>>>,
     token: CancellationToken,
@@ -407,7 +412,7 @@ async fn sample_endpoint(
         // timeout, so shutdown is prompt even against a hung endpoint.
         let sample = tokio::select! {
             () = token.cancelled() => return,
-            sample = probe(&client, endpoint) => sample,
+            sample = probe(&client, &http_base_url, endpoint) => sample,
         };
 
         if let Some(entry) = stats.lock().get_mut(endpoint) {
@@ -425,13 +430,15 @@ pub(crate) struct HealthMonitor {
 }
 
 impl HealthMonitor {
-    pub(crate) fn spawn() -> anyhow::Result<Self> {
+    /// Starts probing the spiced instance at `http_base_url`.
+    pub(crate) fn spawn(http_base_url: &str) -> anyhow::Result<Self> {
         let cancel_token = CancellationToken::new();
 
         let client = reqwest::Client::builder()
             .timeout(PROBE_TIMEOUT)
             .build()
             .context("Failed to create health monitor HTTP client")?;
+        let http_base_url: Arc<str> = Arc::from(http_base_url);
 
         let stats: Arc<Mutex<BTreeMap<&'static str, EndpointStats>>> = Arc::new(Mutex::new(
             ENDPOINTS
@@ -445,6 +452,7 @@ impl HealthMonitor {
             .map(|endpoint| {
                 tokio::spawn(sample_endpoint(
                     client.clone(),
+                    Arc::clone(&http_base_url),
                     endpoint,
                     Arc::clone(&stats),
                     cancel_token.clone(),
