@@ -93,6 +93,9 @@ pub(crate) const fn rewritten(sql: &'static str, oracle: &'static str) -> Case {
 /// A row as its cells, each rendered, or `None` for NULL.
 pub(crate) type Row = Vec<Option<String>>;
 
+/// A check of an `EXPLAIN` answer, which says what the plan does wrong.
+pub(crate) type PlanCheck<'a> = &'a dyn Fn(&[Row]) -> Result<(), String>;
+
 /// One operator of a physical plan: its name, and its depth in the tree.
 pub(crate) struct Operator<'a> {
     pub(crate) name: &'a str,
@@ -294,17 +297,15 @@ pub(crate) fn check_federated(
         ));
     };
     let keeps = |op: &&Operator| op.line.to_uppercase().contains(&expr.to_uppercase());
-    let other: Vec<&str> = local
+    let only_kept = local
         .iter()
-        .filter(|op| !keeps(op) && !PLUMBING.contains(&op.name))
-        .map(|op| op.name)
-        .collect();
+        .all(|op| keeps(op) || PLUMBING.contains(&op.name));
     let sent = remote.iter().any(|op| {
         sent_sql(op.line)
             .to_uppercase()
             .contains(&expr.to_uppercase())
     });
-    if local.iter().any(keeps) && other.is_empty() && !sent {
+    if local.iter().any(keeps) && only_kept && !sent {
         Ok(())
     } else {
         Err(format!(

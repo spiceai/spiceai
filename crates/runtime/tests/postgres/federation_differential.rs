@@ -65,8 +65,8 @@ use crate::{
     acceleration::has_vortex_file,
     configure_test_datafusion,
     federation_differential::{
-        Case, Row, agreement, check_cayenne_sources, check_federated, check_sources, empty,
-        operators, ordered, physical_plan, rows, spice_rows,
+        Case, PlanCheck, Row, agreement, check_cayenne_sources, check_federated, check_sources,
+        empty, operators, ordered, physical_plan, rows, spice_rows,
     },
     init_tracing,
     postgres::common::{self, get_pg_params},
@@ -474,7 +474,7 @@ async fn compare_case(
         // DataFusion over a wider scan and compares nothing the accelerated side
         // does not. A Cayenne side must read only Cayenne, or its agreement says
         // nothing about what Cayenne stored.
-        let check: Option<&dyn Fn(&[Row]) -> Result<(), String>> = match subject.kind {
+        let check: Option<PlanCheck> = match subject.kind {
             Kind::Federated => {
                 Some(&|plan| check_federated(plan, &REMOTE_SCANS, "PostgreSQL", case.kept_local))
             }

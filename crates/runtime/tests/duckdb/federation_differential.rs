@@ -61,8 +61,8 @@ use crate::{
     acceleration::has_vortex_file,
     configure_test_datafusion,
     federation_differential::{
-        Case, Row, agreement, check_cayenne_sources, check_federated, empty, ordered, render,
-        rewritten, rows, spice_rows,
+        Case, PlanCheck, Row, agreement, check_cayenne_sources, check_federated, empty, ordered,
+        render, rewritten, rows, spice_rows,
     },
     init_tracing,
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
@@ -108,7 +108,6 @@ const fn backslash_like(sql: &'static str, duckdb: &'static str) -> Case {
     }
 }
 
-#[expect(clippy::too_many_lines, reason = "one corpus, one case per line")]
 fn cases() -> Vec<Case> {
     vec![
         // Comparison and NULL semantics.
@@ -416,7 +415,7 @@ async fn compare_case(
         // expression the case keeps local, or it is DataFusion over a wider scan
         // and checks no translation. A Cayenne side must read only Cayenne, or
         // its agreement says nothing about what Cayenne stored.
-        let check: Option<&dyn Fn(&[Row]) -> Result<(), String>> = match subject.kind {
+        let check: Option<PlanCheck> = match subject.kind {
             Kind::Federated => {
                 Some(&|plan| check_federated(plan, &REMOTE_SCANS, "DuckDB", case.kept_local))
             }
