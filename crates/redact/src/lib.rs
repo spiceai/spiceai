@@ -92,6 +92,27 @@ fn is_host_and_port(authority: &str) -> bool {
     }
 }
 
+/// Where the authority of the URL that `s` starts with begins, or `None` when `s` does not
+/// start with a URL that has one. A special scheme (`https`, `ftp`, ...) takes any run of
+/// `/` and `\\` after its `:`, or none (`https:host`), as URL parsers read it; any other
+/// scheme needs `//`.
+fn authority_start(s: &str) -> Option<usize> {
+    let colon = s.find(':')?;
+    let scheme = &s[..colon];
+    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) || !scheme.chars().all(is_scheme_char)
+    {
+        return None;
+    }
+    let after_colon = &s[colon + 1..];
+    if SPECIAL_URL_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()) {
+        Some(colon + 1 + (after_colon.len() - after_colon.trim_start_matches(['/', '\\']).len()))
+    } else if after_colon.starts_with("//") {
+        Some(colon + 1 + "//".len())
+    } else {
+        None
+    }
+}
+
 /// If `s` starts with a URL that has an authority, `s`'s URL prefix with the
 /// userinfo removed and secret query values replaced, plus how many bytes of
 /// `s` that prefix covers. `None` when `s` does not start with such a URL.
@@ -103,21 +124,8 @@ fn is_host_and_port(authority: &str) -> bool {
 /// parser would reject (a bad port, an unknown scheme, a raw `?`, `#` or quote
 /// inside the password).
 fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
-    let colon = s.find(':')?;
-    let scheme = &s[..colon];
-    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) || !scheme.chars().all(is_scheme_char)
-    {
-        return None;
-    }
-    let scheme = scheme.to_ascii_lowercase();
-    let after_colon = &s[colon + 1..];
-    let authority_start = if SPECIAL_URL_SCHEMES.contains(&scheme.as_str()) {
-        colon + 1 + (after_colon.len() - after_colon.trim_start_matches(['/', '\\']).len())
-    } else if after_colon.starts_with("//") {
-        colon + 1 + "//".len()
-    } else {
-        return None;
-    };
+    let authority_start = authority_start(s)?;
+    let scheme = s[..s.find(':')?].to_ascii_lowercase();
     let ends_url = |c: char| embedded && ends_embedded_url(c);
 
     // A connector prefix written with `://` (`iceberg://https://u:p@h/...`):
@@ -277,7 +285,7 @@ pub fn redact_source_credentials(from: &str) -> String {
     if let Some(len) = connector_prefix_len(source) {
         let (prefix, rest) = source.split_at(len);
         let (gap, url) = split_leading_filler(rest);
-        if starts_with_scheme(url) {
+        if authority_start(url).is_some() {
             return format!("{lead}{prefix}{gap}{}", redact_url_credentials(url));
         }
     }
@@ -289,13 +297,6 @@ pub fn redact_source_credentials(from: &str) -> String {
 fn split_leading_filler(text: &str) -> (&str, &str) {
     let rest = text.trim_start_matches(|c: char| c.is_whitespace() || c.is_control());
     text.split_at(text.len() - rest.len())
-}
-
-/// Whether `text` starts with a URL scheme and `://`.
-fn starts_with_scheme(text: &str) -> bool {
-    text.split_once("://").is_some_and(|(scheme, _)| {
-        scheme.starts_with(|c: char| c.is_ascii_alphabetic()) && scheme.chars().all(is_scheme_char)
-    })
 }
 
 /// How many bytes of `from` its connector prefix and delimiter take: up to the first
@@ -674,6 +675,15 @@ mod tests {
             (
                 "iceberg:// https://u:pa ss@h/x?sig=S",
                 "iceberg:// https://h/x?sig=***",
+            ),
+            // A special scheme needs no `//` after its `:`, after a prefix too.
+            (
+                "custom:https:alice:PASSWORD@host/v1?token=KEY",
+                "custom:https:host/v1?token=***",
+            ),
+            (
+                "custom: https:\\\\alice:PASSWORD@host/v1?token=KEY",
+                "custom: https:\\\\host/v1?token=***",
             ),
             // Without credentials, whitespace and all, the source is unchanged.
             (" https://h/v1?region=us", " https://h/v1?region=us"),
