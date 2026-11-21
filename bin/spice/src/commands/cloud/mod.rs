@@ -6946,6 +6946,13 @@ mod tests {
             )
         };
         let expected_errors = [still_sets(&regular), still_sets(&fifo)];
+        // While a link is renamed over, macOS 26 can fail `stat` or `open` of its
+        // name with EINVAL. That read reports an error, as any failure to read the
+        // target does: it neither blocks nor reports the key as removed.
+        let failed_mid_rename = format!(
+            "Failed to read configuration at '{}': Invalid argument (os error 22)",
+            link.display()
+        );
         let (mut from_fifo, mut from_file) = (0_usize, 0_usize);
         for outcome in outcomes {
             match outcome {
@@ -6954,6 +6961,7 @@ mod tests {
                     assert!(!removed, "nothing is ever removed through a link");
                     from_fifo += 1;
                 }
+                Err(err) if err.to_string() == failed_mid_rename => {}
                 // The regular file still sets the key; the error names the
                 // file the link resolved to when the error was built.
                 Err(err) => {
