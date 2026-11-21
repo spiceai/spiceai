@@ -155,6 +155,7 @@ rmcp = { workspace = true, optional = true, features = [
     "transport-streamable-http-server",
     "transport-streamable-http-client-reqwest",
 ] }
+redact = { path = "../redact" }
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
