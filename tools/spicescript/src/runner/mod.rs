@@ -1209,7 +1209,7 @@ async fn create_instances(
             // key, though its ports are probed on every interface (see `ProbeAddresses`).
             let api_key = default_api_key(
                 &mut spicepod,
-                rootless_reach || bridge.is_some(),
+                runner_configures_auth(rootless_reach, bridge.is_some(), variant.listen),
                 &instance_api_key,
                 script.defaults.api_key.as_deref(),
             );
@@ -1915,6 +1915,18 @@ fn default_api_key(
     script_api_key.map(str::to_string)
 }
 
+/// Whether this runner configures the instance's own key in `runtime.auth`: where it binds
+/// `spiced` beyond loopback only so that a container can reach it (a rootless daemon, a bridge
+/// container). A `listen: every-interface` variant binds beyond loopback to check what a caller
+/// without credentials is served there, so it is left without a key.
+fn runner_configures_auth(
+    rootless_reach: bool,
+    bridged: bool,
+    listen: crate::script::Listen,
+) -> bool {
+    (rootless_reach || bridged) && listen != crate::script::Listen::EveryInterface
+}
+
 /// Configures `runtime.auth` on `spicepod` with one read-write API key, `key`.
 fn require_api_key(spicepod: &mut Value, key: &str) {
     let Value::Object(root) = spicepod else {
@@ -2101,6 +2113,28 @@ mod tests {
         ] {
             assert_eq!(
                 ProbeAddresses::new(rootless_reach, bridged, listen),
+                expected,
+                "rootless reach: {rootless_reach}, bridged: {bridged}, {listen:?}"
+            );
+        }
+    }
+
+    /// The runner configures the instance's own key only where it widened the listener so a
+    /// container can reach it; a `listen: every-interface` variant keeps serving callers
+    /// without credentials, which is what it checks.
+    #[test]
+    fn an_every_interface_variant_is_left_without_a_key() {
+        use crate::script::Listen;
+        for (rootless_reach, bridged, listen, expected) in [
+            (false, false, Listen::Loopback, false),
+            (false, false, Listen::EveryInterface, false),
+            (true, false, Listen::Loopback, true),
+            (true, false, Listen::EveryInterface, false),
+            (false, true, Listen::Loopback, true),
+            (false, true, Listen::EveryInterface, false),
+        ] {
+            assert_eq!(
+                runner_configures_auth(rootless_reach, bridged, listen),
                 expected,
                 "rootless reach: {rootless_reach}, bridged: {bridged}, {listen:?}"
             );
