@@ -479,6 +479,10 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: spiceai-dev-runners
     timeout-minutes: 15
+    # A failure here (the API refused a lookup) shows as a failed job but
+    # leaves the run's conclusion to the test jobs: Trunk Health reads that
+    # conclusion as trunk's verdict.
+    continue-on-error: true
     permissions:
       actions: write   # dispatch this workflow for each branch
       contents: read
@@ -495,7 +499,13 @@ jobs:
           while read -r branch sha; do
             when=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" -q .commit.committer.date)
             [ "$(date -u -d "$when" +%s)" -ge "$cutoff" ] || continue
-            if ! gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/trunk_tests.yml?ref=$sha" --silent 2>/dev/null; then
+            # Absence counts only from a listing that succeeded; a lookup that
+            # fails stops the job rather than skipping the branch.
+            if ! workflows=$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$sha" -q '.[].name'); then
+              echo "::error::Could not list the workflows of $branch at $sha, so cannot tell whether it needs testing"
+              exit 1
+            fi
+            if ! grep -qx trunk_tests.yml <<<"$workflows"; then
               echo "$branch at ${sha:0:12}: predates the post-merge split; its merge queue ran the full suite"
               continue
             fi

@@ -114,7 +114,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      statuses: read
+      contents: read   # whether the commit has trunk_tests.yml
+      statuses: read   # its trunk-tests status
     steps:
       - name: Require a green trunk-tests status on the release commit
         if: ${{ inputs.release_version != '' }}
@@ -127,7 +128,13 @@ jobs:
           set -euo pipefail
           # A commit without trunk_tests.yml predates the post-merge split: its
           # own merge queue ran the full suite, so it needs no post-merge verdict.
-          if ! gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/trunk_tests.yml?ref=$SHA" --silent 2>/dev/null; then
+          # Absence counts only from a listing that succeeded; a lookup that
+          # fails must not exempt a release.
+          if ! workflows=$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$SHA" -q '.[].name'); then
+            echo "::error::Could not list the workflows of commit $SHA, so cannot tell whether it needs a trunk-tests result. Re-run this job."
+            exit 1
+          fi
+          if ! grep -qx trunk_tests.yml <<<"$workflows"; then
             echo "::notice::Commit $SHA predates trunk_tests.yml; its merge queue ran the full suite, so no trunk-tests result is required."
             exit 0
           fi
