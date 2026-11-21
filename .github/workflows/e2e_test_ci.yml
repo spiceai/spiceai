@@ -3000,7 +3000,9 @@ jobs:
       # commit on a push. Scripts are the *.yaml files directly in
       # test/spicescript and in test/spicescript/known-failing/<group>/; the
       # other directories under it are not run by CI (see its README), and the
-      # live scripts need the provider tokens only nightly_tests.yml mints.
+      # live scripts need the provider tokens only nightly_tests.yml mints. A
+      # changed known-failing ledger (a re-record) runs its whole group against
+      # the new ledger.
       - name: Find changed scripts
         id: changed
         if: ${{ matrix.changed }}
@@ -3015,8 +3017,19 @@ jobs:
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           passing=$(git diff --name-only --diff-filter=AMR "$BASE_SHA" HEAD -- \
             ':(glob)test/spicescript/*.yaml' ':(exclude)test/spicescript/variants.yaml' | xargs)
-          known=$(git diff --name-only --diff-filter=AMR "$BASE_SHA" HEAD -- \
-            ':(glob)test/spicescript/known-failing/*/*.yaml' | xargs)
+          groups=$(git diff --name-only --diff-filter=AMRD "$BASE_SHA" HEAD -- \
+            ':(glob)test/spicescript/known-failing/*/recordings/expected-failures.json' \
+            | sed 's#/recordings/expected-failures.json$##' | while read -r dir; do
+              [ -d "$dir" ] && echo "$dir"
+            done | sort -u)
+          known=$( {
+            echo "$groups"
+            git diff --name-only --diff-filter=AMR "$BASE_SHA" HEAD -- \
+              ':(glob)test/spicescript/known-failing/*/*.yaml' | while read -r script; do
+                # A script whose whole group already runs is not listed again.
+                grep -qx "$(dirname "$script")" <<<"$groups" || echo "$script"
+              done
+          } | sed '/^$/d' | xargs)
           echo "Changed scripts: ${passing:-none}"
           echo "Changed known-failing scripts: ${known:-none}"
           {
