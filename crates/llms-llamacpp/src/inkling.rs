@@ -26,10 +26,12 @@ limitations under the License.
 //!
 //! The blocks are read as llama.cpp's server reads them, so both engines agree: a thinking
 //! block is the reasoning, a text block the content, and a `content_invoke_tool_json` block a
-//! call to the tool its header names, whose arguments are the `args` of the JSON it holds.
-//! Calls are the last blocks of a turn, and a turn may make several, so a call does not end the
-//! reply: the reply makes its calls when it ends. A call to a tool the request does not offer
-//! is dropped. As the model's tokenizer configuration reads them, a `content_tool_error` or a
+//! call to the tool its header names, whose arguments are the `args` of the JSON it holds. A
+//! call block is exactly `NAME<|content_invoke_tool_json|>{"name":NAME,"args":{…}}`, naming a
+//! tool the request offers; any other is dropped. Calls are the last blocks of a turn, and a
+//! turn may make several when the request allows parallel calls, so a call does not end the
+//! reply: the reply makes its calls when it ends. Without parallel calls, the turn's first call
+//! ends it. As the model's tokenizer configuration reads them, a `content_tool_error` or a
 //! `content_invoke_tool_text` block is content too, and so is text outside any block, as when a
 //! model skips a header.
 //!
@@ -43,8 +45,6 @@ limitations under the License.
 //! value, or once it can never become one.
 //!
 //! The markers are read as tokens, never as text, so text that spells one is only text.
-
-use std::collections::HashMap;
 
 use llama_cpp::{Token, Vocab};
 use mistralrs_core::ToolCallResponse;
@@ -164,6 +164,9 @@ pub(crate) struct Reader {
     markers: Markers,
     /// The tools a call may name.
     tools: Vec<String>,
+    /// Whether the reply may make more than one call; without parallel calls, its first call
+    /// ends it.
+    parallel: bool,
     held: Held,
     route: Route,
     /// The calls the reply has made, which it sends when it ends.
@@ -183,12 +186,21 @@ impl Reader {
         Self {
             markers,
             tools,
+            parallel: true,
             held,
             route: Route::Between,
             calls: Vec::new(),
             pending: String::new(),
             begun: String::new(),
         }
+    }
+
+    /// Allows the reply `parallel` calls, as it is by default, as `parallel_tool_calls` is; or
+    /// not, so the reply ends at its first call's `<|end_message|>`, as llama.cpp's grammar
+    /// then allows nothing after it.
+    pub(crate) fn parallel_calls(mut self, parallel: bool) -> Self {
+        self.parallel = parallel;
+        self
     }
 
     /// Starts the reply where `text`, what the rendered prompt leaves of it ([`reply_text`]),
@@ -312,6 +324,9 @@ impl Reader {
             // `<|end_message|>` closes the block.
             Route::Call { name, body } => {
                 self.call(&name, &body);
+                if !self.parallel && !self.calls.is_empty() {
+                    return Mark::Calls(std::mem::take(&mut self.calls));
+                }
                 Route::Between
             }
             Route::Reasoning | Route::Content { .. } => Route::Between,
@@ -331,7 +346,7 @@ impl Reader {
             }
         } else if token == m.call {
             Route::Call {
-                name: name.trim().to_string(),
+                name: name.to_string(),
                 body: String::new(),
             }
         } else if token == m.call_text || token == m.tool_error {
@@ -418,27 +433,28 @@ fn closes(body: &str) -> bool {
     }
 }
 
-/// The call a closed call block makes: one whose `body` is `{"name":NAME,"args":ARGS}`, to the
-/// tool its `header` names, or the wrapper names when the header names none, which must be a
-/// tool the request offers, with ARGS, as the model wrote them, as its arguments. A body that
-/// is not such JSON, or whose wrapper names another tool than its header, makes no call.
+/// What a call block holds: exactly `{"name":NAME,"args":ARGS}`, in either order and any JSON
+/// spacing, with no other key and neither key twice.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Invoke<'b> {
+    name: String,
+    #[serde(borrow)]
+    args: &'b RawValue,
+}
+
+/// The call a closed call block makes, as llama.cpp's server reads one: its `header` names a
+/// tool the request offers, and its `body` is the wrapper ([`Invoke`]) naming the same tool,
+/// whose ARGS is a JSON object, which is the call's arguments as the model wrote them. Any
+/// other call block makes no call.
 fn call(header: &str, body: &str, tools: &[String]) -> Option<ToolCallResponse> {
-    let fields: HashMap<String, &RawValue> = serde_json::from_str(body).ok()?;
-    let named = match fields.get("name") {
-        Some(name) => Some(serde_json::from_str::<String>(name.get()).ok()?),
-        None => None,
-    };
-    let name = match (header, named) {
-        (header, None) => header.to_string(),
-        ("", Some(named)) => named,
-        (header, Some(named)) if header == named => named,
-        _ => return None,
-    };
-    if !tools.contains(&name) {
-        return None;
-    }
-    let arguments = fields.get("args")?;
-    Some(reply::call(name, arguments.get()))
+    let invoke: Invoke<'_> = serde_json::from_str(body).ok()?;
+    let arguments = invoke.args.get().trim();
+    let made = !header.is_empty()
+        && invoke.name == header
+        && tools.iter().any(|tool| tool == header)
+        && arguments.starts_with('{');
+    made.then(|| reply::call(invoke.name, arguments))
 }
 
 /// Markers for tests, as a vocabulary with them as tokens 11 to 18 would hold them.
@@ -582,6 +598,35 @@ mod tests {
         );
     }
 
+    /// Without parallel calls, the first call a reply makes ends it at its `<|end_message|>`,
+    /// as llama.cpp's grammar then allows nothing after it; a dropped call block makes no call,
+    /// so it does not.
+    #[test]
+    fn without_parallel_calls_the_first_call_ends_the_reply() {
+        let one_call =
+            || Reader::new(TEST_MARKERS, names(&["f", "g"]), Held::Nothing).parallel_calls(false);
+        let mut reader = one_call();
+        for (token, text) in spell(
+            "<|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"a\":1}}",
+        ) {
+            match token {
+                Some(token) => assert!(matches!(reader.mark(token), Mark::Next)),
+                None => assert_eq!(reader.text(&text), Text::Held),
+            }
+        }
+        let Mark::Calls(calls) = reader.mark(TEST_MARKERS.end) else {
+            panic!("the call's `<|end_message|>` ends the reply");
+        };
+        assert_eq!(called(calls), ["f({\"a\":1})"]);
+        assert_eq!(
+            read_as(
+                one_call(),
+                "<|message_model|>h<|content_invoke_tool_json|>{\"name\":\"h\",\"args\":{}}<|end_message|><|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{}}<|end_message|><|message_model|>g<|content_invoke_tool_json|>{\"name\":\"g\",\"args\":{}}<|end_message|><|content_model_end_sampling|>"
+            ),
+            answer("", "", &["f({})"])
+        );
+    }
+
     /// A call block does not end the reply: a turn's calls are its last blocks, and each is
     /// made when the reply ends.
     #[test]
@@ -614,31 +659,47 @@ mod tests {
         );
     }
 
-    /// The tool is the one the header names; a wrapper that names another, or a body that is
-    /// not the wrapper, makes no call. A header that names none leaves the wrapper's name.
+    /// A call block is made only as llama.cpp's server reads one: its header names an offered
+    /// tool, and its body is `{"name":NAME,"args":{…}}` naming the same tool, with no other key,
+    /// in either order and any JSON spacing. Any other call block is dropped.
     #[test]
     fn a_call_names_its_tool_in_its_header_and_its_wrapper() {
         let tools = ["f", "g"];
-        assert_eq!(
+        let block = |header: &str, body: &str| {
             read(
-                "<|message_model|>f<|content_invoke_tool_json|>{\"name\":\"g\",\"args\":{}}<|end_message|><|content_model_end_sampling|>",
-                &tools
-            ),
-            answer("", "", &[])
+                &format!(
+                    "<|message_model|>{header}<|content_invoke_tool_json|>{body}<|end_message|><|content_model_end_sampling|>"
+                ),
+                &tools,
+            )
+        };
+        let dropped = [
+            // no header name
+            ("", "{\"name\":\"g\",\"args\":{}}"),
+            // the header and the wrapper name different tools
+            ("f", "{\"name\":\"g\",\"args\":{}}"),
+            // a key beside the two, or one of them twice
+            ("f", "{\"name\":\"f\",\"args\":{},\"id\":1}"),
+            ("f", "{\"name\":\"f\",\"name\":\"f\",\"args\":{}}"),
+            // arguments that are not an object
+            ("f", "{\"name\":\"f\",\"args\":[1]}"),
+            ("f", "{\"name\":\"f\",\"args\":\"{}\"}"),
+            // a missing key, a name that is not a string, another key, or no JSON at all
+            ("f", "{\"name\":\"f\"}"),
+            ("f", "{\"name\":1,\"args\":{}}"),
+            ("f", "{\"name\":\"f\",\"arguments\":{}}"),
+            ("f", "not json"),
+            // a header that names the tool with more than its name
+            (" f", "{\"name\":\"f\",\"args\":{}}"),
+        ];
+        assert_eq!(
+            dropped.map(|(header, body)| ((header, body), block(header, body))),
+            dropped.map(|case| (case, answer("", "", &[])))
         );
+        // the keys in either order, with JSON spacing: the arguments as the model wrote them
         assert_eq!(
-            read(
-                "<|message_model|>f<|content_invoke_tool_json|>{\"arguments\":{}}<|end_message|><|message_model|>f<|content_invoke_tool_json|>not json<|end_message|><|content_model_end_sampling|>",
-                &tools
-            ),
-            answer("", "", &[])
-        );
-        assert_eq!(
-            read(
-                "<|message_model|><|content_invoke_tool_json|>{\"name\":\"g\",\"args\":{}}<|end_message|><|content_model_end_sampling|>",
-                &tools
-            ),
-            answer("", "", &["g({})"])
+            block("f", "{ \"args\": {\"a\": 1}, \"name\": \"f\" }"),
+            answer("", "", &["f({\"a\": 1})"])
         );
     }
 

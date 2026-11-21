@@ -11939,6 +11939,7 @@ dependencies = [
  "rand 0.10.1",
  "runtime-request-context",
  "runtime-resources",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

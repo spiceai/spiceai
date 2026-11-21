@@ -687,6 +687,8 @@ impl LlamaCpp {
             .is_some_and(ToolCallingMatcher::requires_tool_call);
         let ban_eog = require_tool_call && !call_held && content.is_none();
         let nameable = nameable_tools(&callable, &obliged);
+        // `OpenAI`'s default: a turn may make several calls.
+        let parallel = req.parallel_tool_calls.unwrap_or(true);
         let held = if !obliged.is_empty() {
             reply::Held::Call
         } else if content.is_some() {
@@ -702,7 +704,7 @@ impl LlamaCpp {
             let conversation = self
                 .prompt(&req.messages, reasoning, tools.clone(), false)
                 .ok();
-            format.reader(nameable, held, &prompt, conversation.as_deref())
+            format.reader(nameable, held, parallel, &prompt, conversation.as_deref())
         });
         // A grammar over a format's markers holds the whole reply by the vocabulary's markers,
         // from where the prompt leaves it.
@@ -713,11 +715,9 @@ impl LlamaCpp {
             Some(Reply::Harmony(reader)) => {
                 content.map(|reply| harmony_reply(reader.markers(), &reply, reader.opened()))
             }
-            Some(Reply::Inkling(reader)) if call_held => Some(inkling_call(
-                reader.markers(),
-                &obliged,
-                req.parallel_tool_calls.unwrap_or(true),
-            )?),
+            Some(Reply::Inkling(reader)) if call_held => {
+                Some(inkling_call(reader.markers(), &obliged, parallel)?)
+            }
             Some(Reply::Inkling(reader)) => {
                 content.map(|reply| inkling_reply(reader.markers(), &reply))
             }
@@ -5337,6 +5337,65 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// With `parallel_tool_calls` off, an Inkling reply ends at its first call's
+    /// `<|end_message|>`, under every `tool_choice`, so no token after it is read; with them on,
+    /// as by default, the reply goes on and makes every call.
+    #[test]
+    fn without_parallel_calls_an_inkling_reply_ends_at_its_first_call() {
+        let first = "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>";
+        let reply = format!(
+            "{first}<|message_model|>get_weather<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":{{\"city\":\"Rome\"}}}}<|end_message|><|content_model_end_sampling|>"
+        );
+        // the tokens `generate_inkling` makes of `text`: a marker is one, other text one a
+        // character
+        let tokens = |text: &str| -> usize {
+            inkling::spell(text)
+                .iter()
+                .map(|(marker, text)| marker.map_or_else(|| text.chars().count(), |_| 1))
+                .sum()
+        };
+        let named =
+            serde_json::json!({ "type": "function", "function": { "name": "get_weather" } });
+        let read = |tool_choice: serde_json::Value, parallel: Option<bool>| {
+            let mut request = weather_tools("auto");
+            request["tool_choice"] = tool_choice;
+            if let Some(parallel) = parallel {
+                request["parallel_tool_calls"] = serde_json::json!(parallel);
+            }
+            let (_llama, _, _, mut out, rx) =
+                inkling_job(INKLING, request).expect("the request is queued");
+            out.begin(true);
+            let (finish, read) = generate_inkling(&mut out, &reply);
+            let finish = finish.expect("the reply ends");
+            let outcome = out.finish(finish, 1).expect("the request succeeds");
+            (outcome.finish, read, events(rx))
+        };
+        let paris = "get_weather({\"city\":\"Paris\"})";
+        for tool_choice in [
+            serde_json::json!("auto"),
+            serde_json::json!("required"),
+            named,
+        ] {
+            assert_eq!(
+                read(tool_choice.clone(), Some(false)),
+                (
+                    FinishReason::ToolCalls,
+                    tokens(first),
+                    vec![format!("t:{paris}")]
+                ),
+                "{tool_choice}"
+            );
+        }
+        let both = vec![format!("t:{paris} get_weather({{\"city\":\"Rome\"}})")];
+        for parallel in [None, Some(true)] {
+            assert_eq!(
+                read(serde_json::json!("auto"), parallel),
+                (FinishReason::ToolCalls, tokens(&reply), both.clone()),
+                "{parallel:?}"
+            );
+        }
     }
 
     /// A structured reply beside tools needs a grammar that allows either, which no tool-call

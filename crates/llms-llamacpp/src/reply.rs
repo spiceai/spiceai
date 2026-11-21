@@ -95,14 +95,16 @@ pub(crate) enum Format {
 }
 
 impl Format {
-    /// The reader of one reply that may call `tools` and is held to a grammar as `held` says,
-    /// started where `prompt`, rendered with the template's generation prompt, leaves the
-    /// reply; `conversation` is the same conversation rendered without it, which tells what the
-    /// generation prompt adds.
+    /// The reader of one reply that may call `tools`, more than once when `parallel`, and is
+    /// held to a grammar as `held` says, started where `prompt`, rendered with the template's
+    /// generation prompt, leaves the reply; `conversation` is the same conversation rendered
+    /// without it, which tells what the generation prompt adds. A Harmony reply ends at its
+    /// first call whatever `parallel` says.
     pub(crate) fn reader(
         self,
         tools: Vec<String>,
         held: Held,
+        parallel: bool,
         prompt: &str,
         conversation: Option<&str>,
     ) -> Reply {
@@ -115,11 +117,9 @@ impl Format {
                 )),
             ),
             Self::Inkling(markers) => Reply::Inkling(
-                inkling::Reader::new(markers, tools, held).after(inkling::reply_text(
-                    &markers,
-                    prompt,
-                    conversation,
-                )),
+                inkling::Reader::new(markers, tools, held)
+                    .parallel_calls(parallel)
+                    .after(inkling::reply_text(&markers, prompt, conversation)),
             ),
         }
     }
