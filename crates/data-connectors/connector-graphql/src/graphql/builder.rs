@@ -38,7 +38,7 @@ pub struct GraphQLClientBuilder {
     semaphore: Option<Arc<Semaphore>>,
     auth_header: Option<reqwest::header::HeaderName>,
     nested_pager: Option<super::client::NestedConnectionPager>,
-    egress: Option<http_egress::Egress>,
+    egress: Option<(http_egress::Egress, http_egress::OnOriginChange)>,
 }
 
 impl GraphQLClientBuilder {
@@ -115,11 +115,16 @@ impl GraphQLClientBuilder {
         self
     }
 
-    /// Follow redirects under `egress`; the client passed to [`Self::build`] must be built
-    /// with [`http_egress::configure`] and the same `egress`.
+    /// Follow redirects under `egress`, refusing every one that leaves the endpoint's origin
+    /// when `on_origin_change` is [`http_egress::OnOriginChange::Refuse`]; the client passed to
+    /// [`Self::build`] must be built with [`http_egress::configure`] and the same `egress`.
     #[must_use]
-    pub fn with_egress(mut self, egress: http_egress::Egress) -> Self {
-        self.egress = Some(egress);
+    pub fn with_egress(
+        mut self,
+        egress: http_egress::Egress,
+        on_origin_change: http_egress::OnOriginChange,
+    ) -> Self {
+        self.egress = Some((egress, on_origin_change));
         self
     }
 
@@ -149,7 +154,9 @@ impl GraphQLClientBuilder {
         )?;
         let graphql_client = graphql_client.with_nested_pager(self.nested_pager);
         Ok(match self.egress {
-            Some(egress) => graphql_client.with_egress(egress),
+            Some((egress, on_origin_change)) => {
+                graphql_client.with_egress(egress, on_origin_change)
+            }
             None => graphql_client,
         })
     }

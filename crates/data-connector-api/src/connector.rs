@@ -35,6 +35,8 @@ use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::ParameterSpec;
 
+pub use http_egress::OnOriginChange;
+
 use crate::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use crate::federated::FederatedTableProvider;
 use crate::parameters::{ConnectorContext, ConnectorParams};
@@ -55,20 +57,24 @@ const DEFAULT_SPICE_CLIENT_MAX_REDIRECTS: usize = 10;
 const OFF_HOST_REDIRECT_REFUSED: &str = "a redirect off the request's host to a private, loopback, or link-local address is not followed";
 
 /// Creates a default reqwest client with standard Spice settings. Its redirects follow the
-/// `http-egress` policy: a redirect within the request's origin is followed, one that changes
-/// the origin is refused when it leads to a private, loopback, or link-local address (an IP
-/// literal, a well-known internal name, or a host that resolves to one) or downgrades HTTPS to
-/// HTTP, and the request's own host keeps the class of its first DNS answer.
+/// `http-egress` policy: a redirect within the request's origin is followed. One that changes
+/// the origin is refused when it downgrades HTTPS to HTTP or leads to a private, loopback, or
+/// link-local address (an IP literal, a well-known internal name, or a host that resolves to
+/// one), and every one is refused when `on_origin_change` is [`OnOriginChange::Refuse`]. The
+/// request's own host keeps the class of its first DNS answer.
 ///
-/// `reqwest` follows the redirects, and drops only `Authorization`, `Cookie` and
-/// `Proxy-Authorization` when one changes the origin. A request that carries a credential in a
-/// custom header or its body must use a client built with [`http_egress::origin_bound`] or sent
-/// through [`http_egress::send`] instead.
+/// With [`OnOriginChange::Follow`], `reqwest` follows the redirects and drops only
+/// `Authorization`, `Cookie` and `Proxy-Authorization` when one changes the origin. A request
+/// that carries a credential in a custom header or its body must refuse an origin change, or be
+/// sent through [`http_egress::send`].
 ///
 /// # Errors
 ///
 /// Returns an error if the client cannot be built.
-pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
+pub fn default_spice_client(
+    content_type: &'static str,
+    on_origin_change: OnOriginChange,
+) -> reqwest::Result<reqwest::Client> {
     use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
     let mut headers = HeaderMap::new();
@@ -92,7 +98,7 @@ pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwe
         .default_headers(headers)
         .redirect(http_egress::redirect_policy(
             egress.clone(),
-            http_egress::OnOriginChange::Follow,
+            on_origin_change,
         ))
         .dns_resolver(Arc::new(http_egress::Resolver::new(egress)))
         .build()
@@ -522,7 +528,7 @@ impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
 
 #[cfg(test)]
 mod tests {
-    use super::default_spice_client;
+    use super::{OnOriginChange, default_spice_client};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -580,7 +586,8 @@ mod tests {
             move |_| redirect_to(&target)
         })
         .await;
-        let client = default_spice_client("application/json").expect("build the client");
+        let client = default_spice_client("application/json", OnOriginChange::Follow)
+            .expect("build the client");
 
         let error = client
             .post(format!("http://localhost:{origin_port}/graphql"))
@@ -609,7 +616,8 @@ mod tests {
         let (target_port, target_requests) = serve(|_| OK_RESPONSE.to_string()).await;
         let (origin_port, _) =
             serve(move |_| redirect_to(&format!("http://localhost.:{target_port}/graphql"))).await;
-        let client = default_spice_client("application/json").expect("build the client");
+        let client = default_spice_client("application/json", OnOriginChange::Follow)
+            .expect("build the client");
 
         let error = client
             .post(format!("http://127.0.0.1:{origin_port}/graphql"))
@@ -620,6 +628,48 @@ mod tests {
         let message = error_chain(&error);
         assert!(
             message.contains("Refused to connect to localhost.: a redirect off the request's host to a private, loopback, or link-local address is not followed"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            target_requests.load(Ordering::SeqCst),
+            0,
+            "the redirect target is never reached"
+        );
+    }
+
+    /// A client that refuses an origin change follows a redirect within the request's origin,
+    /// and refuses one to another origin before that origin's host is resolved or reached.
+    #[tokio::test]
+    async fn a_client_that_refuses_an_origin_change_follows_only_the_request_origin() {
+        let (target_port, target_requests) = serve(|_| OK_RESPONSE.to_string()).await;
+        let (origin_port, _) = serve(move |path| match path {
+            "/graphql" => redirect_to("/graphql/"),
+            "/graphql/" => OK_RESPONSE.to_string(),
+            _ => redirect_to(&format!("http://localhost.:{target_port}/graphql")),
+        })
+        .await;
+        let client = default_spice_client("application/json", OnOriginChange::Refuse)
+            .expect("build the client");
+
+        let response = client
+            .post(format!("http://127.0.0.1:{origin_port}/graphql"))
+            .send()
+            .await
+            .expect("the redirect within the origin is followed");
+        assert_eq!(response.url().path(), "/graphql/");
+
+        let error = client
+            .post(format!("http://127.0.0.1:{origin_port}/away"))
+            .send()
+            .await
+            .expect_err("the redirect off the origin is refused");
+        let message = error_chain(&error);
+        assert!(
+            message.contains(&format!(
+                "the server redirected to another origin, http://localhost.:{target_port}, and \
+                 this request carries a credential that is sent only to \
+                 http://127.0.0.1:{origin_port}"
+            )),
             "unexpected error: {message}"
         );
         assert_eq!(
@@ -641,7 +691,8 @@ mod tests {
             }
         })
         .await;
-        let client = default_spice_client("application/json").expect("build the client");
+        let client = default_spice_client("application/json", OnOriginChange::Follow)
+            .expect("build the client");
 
         let response = client
             .post(format!("http://127.0.0.1:{port}/graphql"))

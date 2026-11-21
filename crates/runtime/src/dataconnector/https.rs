@@ -4832,9 +4832,14 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             .expect("build the HTTP client");
 
         let request = client.get(&origin).build().expect("the request builds");
-        let error = http_egress::send(&client, request, &egress)
-            .await
-            .expect_err("the redirect is refused");
+        let error = http_egress::send(
+            &client,
+            request,
+            &egress,
+            http_egress::OnOriginChange::Follow,
+        )
+        .await
+        .expect_err("the redirect is refused");
 
         let message =
             std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {

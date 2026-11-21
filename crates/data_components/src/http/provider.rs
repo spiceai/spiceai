@@ -1513,7 +1513,14 @@ impl HttpTableProvider {
             .get(test_url.clone())
             .build()
             .map_err(|e| Error::http_request(&self.base_url, e))?;
-        match http_egress::send(&self.client, probe, &self.egress).await {
+        match http_egress::send(
+            &self.client,
+            probe,
+            &self.egress,
+            http_egress::OnOriginChange::Follow,
+        )
+        .await
+        {
             Ok(response) => {
                 self.update_rate_limiter_from_headers(response.headers())
                     .await;
@@ -1980,23 +1987,28 @@ impl HttpTableProvider {
             .build()
             .map_err(|e| RetryError::Permanent(Error::http_request(&self.base_url, e)))?;
         // Waiting on the origin: a distributed task can lend its slot meanwhile.
-        let response = http_egress::send(&self.client, request, &self.egress)
-            .io_wait()
-            .await
-            .map_err(|e| {
-                let refused_redirect = e.as_http().is_none();
-                let err = self.send_error(e);
-                tracing::debug!("{err}");
-                if refused_redirect {
-                    // The origin answered; asking again gets the same redirect.
-                    return RetryError::Permanent(err);
-                }
-                // A timeout or connection error is a failure signal for adaptive
-                // rate control: the origin is unreachable or too slow, so admit
-                // fewer requests until it recovers.
-                self.record_request_outcome(RequestOutcome::Failure);
-                RetryError::transient(err)
-            })?;
+        let response = http_egress::send(
+            &self.client,
+            request,
+            &self.egress,
+            http_egress::OnOriginChange::Follow,
+        )
+        .io_wait()
+        .await
+        .map_err(|e| {
+            let refused_redirect = e.as_http().is_none();
+            let err = self.send_error(e);
+            tracing::debug!("{err}");
+            if refused_redirect {
+                // The origin answered; asking again gets the same redirect.
+                return RetryError::Permanent(err);
+            }
+            // A timeout or connection error is a failure signal for adaptive
+            // rate control: the origin is unreachable or too slow, so admit
+            // fewer requests until it recovers.
+            self.record_request_outcome(RequestOutcome::Failure);
+            RetryError::transient(err)
+        })?;
 
         let status = response.status();
         let status_code = status.as_u16();

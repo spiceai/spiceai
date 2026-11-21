@@ -123,6 +123,7 @@ async fn a_redirect_to_another_origin_carries_no_credential() {
         &client,
         get_with_credentials(&client, &format!("{}/data", origin.url)),
         &egress,
+        OnOriginChange::Follow,
     )
     .await
     .expect("the redirect is followed");
@@ -162,6 +163,7 @@ async fn a_redirect_within_the_origin_keeps_the_credential() {
         &client,
         get_with_credentials(&client, &format!("{}/data", origin.url)),
         &egress,
+        OnOriginChange::Follow,
     )
     .await
     .expect("the redirect is followed");
@@ -182,6 +184,68 @@ async fn a_redirect_within_the_origin_keeps_the_credential() {
     }
 }
 
+/// A request whose credential only its own origin may receive is sent refusing an origin
+/// change: a redirect within the origin keeps the credential, and one that leaves it fails the
+/// request before the other origin is contacted, even as a `302` `send` would otherwise follow
+/// without the credential.
+#[tokio::test]
+async fn sending_refusing_an_origin_change_stays_on_the_request_origin() {
+    let elsewhere = Server::ok("[]").await;
+    let away = format!("{}/landing", elsewhere.url);
+    let origin = Server::start(move |request| match request.path.as_str() {
+        "/data" => (StatusCode::FOUND, [(LOCATION, "/moved".to_string())]).into_response(),
+        "/moved" => "[]".into_response(),
+        _ => (StatusCode::FOUND, [(LOCATION, away.clone())]).into_response(),
+    })
+    .await;
+    let egress = Egress::default();
+    let client = client(&egress);
+
+    let response = send(
+        &client,
+        get_with_credentials(&client, &format!("{}/data", origin.url)),
+        &egress,
+        OnOriginChange::Refuse,
+    )
+    .await
+    .expect("the redirect within the origin is followed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let seen = origin.seen();
+    assert_eq!(
+        seen.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        ["/data", "/moved"]
+    );
+    assert_eq!(
+        seen[1]
+            .headers
+            .get(API_KEY)
+            .and_then(|value| value.to_str().ok()),
+        Some(SECRET)
+    );
+
+    let message = send(
+        &client,
+        get_with_credentials(&client, &format!("{}/away", origin.url)),
+        &egress,
+        OnOriginChange::Refuse,
+    )
+    .await
+    .expect_err("the redirect off the origin is refused")
+    .to_string();
+    assert_eq!(
+        message,
+        format!(
+            "the server redirected to another origin, {}, and this request carries a credential \
+             that is sent only to {}",
+            elsewhere.url, origin.url
+        )
+    );
+    assert!(
+        elsewhere.seen().is_empty(),
+        "the other origin is never contacted"
+    );
+}
+
 /// A `307` keeps the method and the body. Sending that body to another origin would replay
 /// whatever it carries there, so the redirect is refused before the other origin is contacted.
 #[tokio::test]
@@ -200,7 +264,7 @@ async fn a_307_never_resends_a_body_to_another_origin() {
         .build()
         .expect("the request builds");
 
-    let message = send(&client, request, &egress)
+    let message = send(&client, request, &egress, OnOriginChange::Follow)
         .await
         .expect_err("the redirect is refused")
         .to_string();
@@ -238,7 +302,9 @@ async fn a_303_is_followed_as_a_get_without_the_body() {
         .build()
         .expect("the request builds");
 
-    let response = send(&client, request, &egress).await.expect("followed");
+    let response = send(&client, request, &egress, OnOriginChange::Follow)
+        .await
+        .expect("followed");
     assert_eq!(response.text().await.expect("body"), "done");
     let seen = origin.seen();
     assert_eq!(seen.len(), 2);
@@ -331,7 +397,7 @@ async fn another_port_on_an_internal_configured_host_is_a_new_destination() {
             .get(format!("{origin_url}/hop"))
             .build()
             .expect("the request builds");
-        let response = send(&client, request, &egress)
+        let response = send(&client, request, &egress, OnOriginChange::Follow)
             .await
             .unwrap_or_else(|e| panic!("{host}: a redirect within the origin is followed: {e}"));
         assert_eq!(response.text().await.expect("body"), "ok");
@@ -340,7 +406,7 @@ async fn another_port_on_an_internal_configured_host_is_a_new_destination() {
             .get(format!("{origin_url}/data"))
             .build()
             .expect("the request builds");
-        let message = send(&client, request, &egress)
+        let message = send(&client, request, &egress, OnOriginChange::Follow)
             .await
             .expect_err("another port is refused")
             .to_string();
