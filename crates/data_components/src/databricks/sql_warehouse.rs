@@ -2886,7 +2886,7 @@ mod tests {
                     let body =
                         serde_json::to_string(&response_json).expect("should serialize response");
                     let http_response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -2957,7 +2957,7 @@ mod tests {
                     };
 
                     let mut http_response = format!(
-                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                         response.status_line,
                         response.body.len()
                     );
@@ -3055,7 +3055,7 @@ mod tests {
                     drop(permit);
 
                     let mut http_response = format!(
-                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                         response.status_line,
                         response.body.len()
                     );
@@ -3834,7 +3834,7 @@ mod tests {
                     let body =
                         serde_json::to_string(&response_json).expect("should serialize response");
                     let http_response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -3921,7 +3921,7 @@ mod tests {
                     };
 
                     let mut http_response = format!(
-                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                         response.status_line,
                         response.body.len()
                     );

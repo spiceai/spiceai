@@ -129,7 +129,11 @@ impl Runtime {
             ],
         );
 
-        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
+        tracing::info!(
+            "Loading model [{}] from {}...",
+            m.name,
+            crate::http::v1::redact_source_credentials(&m.from)
+        );
 
         // TODO: Have downstream code using model parameters to accept `Hashmap<String, Value>`.
         // This will require handling secrets with `Value` type.

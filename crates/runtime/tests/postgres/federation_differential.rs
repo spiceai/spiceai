@@ -51,8 +51,6 @@ use std::{
 };
 
 use app::AppBuilder;
-use arrow::array::RecordBatch;
-use arrow::util::display::{ArrayFormatter, FormatOptions};
 use runtime::Runtime;
 use secrecy::ExposeSecret;
 use spicepod::{
@@ -65,9 +63,14 @@ use tokio_postgres::SimpleQueryMessage;
 
 use crate::{
     acceleration::has_vortex_file,
-    configure_test_datafusion, init_tracing,
+    configure_test_datafusion,
+    federation_differential::{
+        Case, PlanCheck, Row, agreement, check_cayenne_sources, check_federated, check_sources,
+        empty, operators, ordered, physical_plan, rows, spice_rows,
+    },
+    init_tracing,
     postgres::common::{self, get_pg_params},
-    utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 /// The rows of the fixture table, so a load that dropped some fails up front.
@@ -102,128 +105,8 @@ const SEED: &[&str] = &[
        (NULL, 'nowhere'), (7, 'unused')",
 ];
 
-/// One query, with `{items}` and `{regions}` standing for the tables.
-struct Case {
-    sql: &'static str,
-    /// Whether the rows' order is part of the answer: the query's top-level
-    /// `ORDER BY` covers a unique key, so the order is fixed.
-    ordered: bool,
-    /// Whether no row is the right answer. Every other case must return rows,
-    /// so two empty answers cannot pass for agreement.
-    empty: bool,
-}
-
-const fn rows(sql: &'static str) -> Case {
-    Case {
-        sql,
-        ordered: false,
-        empty: false,
-    }
-}
-
-const fn ordered(sql: &'static str) -> Case {
-    Case {
-        sql,
-        ordered: true,
-        empty: false,
-    }
-}
-
-const fn empty(sql: &'static str) -> Case {
-    Case {
-        sql,
-        ordered: false,
-        empty: true,
-    }
-}
-
-/// The operators a federated plan may run in Spice: wrappers that pass rows
-/// through, and the scan that sends SQL to `PostgreSQL`. Both tables come from
-/// one `PostgreSQL` database, so federation sends the whole query there. Any
-/// other operator means Spice evaluated part of the query itself, over a wider
-/// scan: a filter, an aggregate, a join, a sort, a window, or a computed
-/// column. The answer can still match, but then it compares `DataFusion` with
-/// `PostgreSQL`, which the accelerated side already does, and not the
-/// translation this test exists to check.
-const PASS_THROUGH: [&str; 3] = [
-    "SchemaCastScanExec",
-    "CooperativeExec",
-    "BytesProcessedExec",
-];
+/// The scans that send SQL to `PostgreSQL`, or to a `SQLite` acceleration.
 const REMOTE_SCANS: [&str; 2] = ["VirtualExecutionPlan", "SqlExec"];
-
-/// One operator of a physical plan: its name, and its depth in the tree.
-struct Operator<'a> {
-    name: &'a str,
-    depth: usize,
-    /// The operator's whole line, with its details.
-    line: &'a str,
-}
-
-/// The physical plan text in `plan`, an `EXPLAIN` answer.
-fn physical_plan(plan: &[Row]) -> Result<String, String> {
-    plan.iter()
-        .find(|row| row.first().and_then(Option::as_deref) == Some("physical_plan"))
-        .and_then(|row| row.get(1).cloned().flatten())
-        .ok_or_else(|| format!("the plan has no physical plan: {plan:?}"))
-}
-
-/// The operators of `physical`, in plan order, each with its indentation as
-/// its depth.
-fn operators(physical: &str) -> Vec<Operator<'_>> {
-    physical
-        .lines()
-        .filter_map(|line| {
-            let name = line.split([':', ' ']).find(|token| !token.is_empty())?;
-            Some(Operator {
-                name,
-                depth: line.len() - line.trim_start().len(),
-                line,
-            })
-        })
-        .collect()
-}
-
-/// Each operator of `operators` with no child, a source its rows come from,
-/// with the names of the operators above it.
-fn leaves<'o, 'a>(operators: &'o [Operator<'a>]) -> Vec<(&'o Operator<'a>, Vec<&'a str>)> {
-    let mut above: Vec<&Operator<'a>> = Vec::new();
-    let mut leaves = Vec::new();
-    for (i, op) in operators.iter().enumerate() {
-        while above.last().is_some_and(|parent| parent.depth >= op.depth) {
-            above.pop();
-        }
-        if operators
-            .get(i + 1)
-            .is_none_or(|next| next.depth <= op.depth)
-        {
-            leaves.push((op, above.iter().map(|parent| parent.name).collect()));
-        }
-        above.push(op);
-    }
-    leaves
-}
-
-/// Checks that the physical plan in `plan`, an `EXPLAIN` answer, runs nothing
-/// in Spice but [`PASS_THROUGH`] operators over one of [`REMOTE_SCANS`].
-fn check_nothing_local(plan: &[Row]) -> Result<(), String> {
-    let physical = physical_plan(plan)?;
-    let operators: Vec<&str> = operators(&physical).iter().map(|op| op.name).collect();
-    let local: Vec<&str> = operators
-        .iter()
-        .copied()
-        .filter(|op| !PASS_THROUGH.contains(op) && !REMOTE_SCANS.contains(op))
-        .collect();
-    if !local.is_empty() {
-        return Err(format!(
-            "Spice evaluates {local:?} itself instead of sending it to PostgreSQL:\n{physical}"
-        ));
-    }
-    if !operators.iter().any(|op| REMOTE_SCANS.contains(op)) {
-        return Err(format!("the plan sends no SQL to PostgreSQL:\n{physical}"));
-    }
-    Ok(())
-}
 
 fn cases() -> Vec<Case> {
     vec![
@@ -356,12 +239,6 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// A row as its cells, each rendered, or `None` for NULL.
-type Row = Vec<Option<String>>;
-
-/// A check of an `EXPLAIN` answer, which says what the plan does wrong.
-type PlanCheck = fn(&[Row]) -> Result<(), String>;
-
 /// How a dataset reads `PostgreSQL`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -471,37 +348,6 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
     ds
 }
 
-fn render(batches: &[RecordBatch]) -> Result<Vec<Row>, String> {
-    let options = FormatOptions::default();
-    let mut rendered = Vec::new();
-    for batch in batches {
-        let formatters = batch
-            .columns()
-            .iter()
-            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        for row in 0..batch.num_rows() {
-            rendered.push(
-                batch
-                    .columns()
-                    .iter()
-                    .zip(&formatters)
-                    .map(|(column, formatter)| {
-                        (!column.is_null(row)).then(|| formatter.value(row).to_string())
-                    })
-                    .collect(),
-            );
-        }
-    }
-    Ok(rendered)
-}
-
-async fn spice_rows(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<Row>, String> {
-    let batches = run_query(rt, sql).await.map_err(|e| e.to_string())?;
-    render(&batches)
-}
-
 /// The oracle: `sql` sent to `PostgreSQL` over the simple query protocol, which
 /// returns every cell in `PostgreSQL`'s own text form.
 async fn postgres_rows(client: &tokio_postgres::Client, sql: &str) -> Result<Vec<Row>, String> {
@@ -517,18 +363,6 @@ async fn postgres_rows(client: &tokio_postgres::Client, sql: &str) -> Result<Vec
             _ => None,
         })
         .collect())
-}
-
-fn agreement(subject: &[Row], oracle: &[Row], ordered: bool) -> Result<(), &'static str> {
-    if ordered {
-        return (subject == oracle)
-            .then_some(())
-            .ok_or("rows or their order differ");
-    }
-    let (mut subject, mut oracle) = (subject.to_vec(), oracle.to_vec());
-    subject.sort();
-    oracle.sort();
-    (subject == oracle).then_some(()).ok_or("rows differ")
 }
 
 /// One Spice side of the comparison: the datasets it reads, and how they read
@@ -593,51 +427,6 @@ const SUBJECTS: &[Subject] = &[
     },
 ];
 
-/// The operator that scans a Cayenne acceleration.
-const CAYENNE_SCAN: &str = "CayenneAccelerationExec";
-
-/// Sources that read no table: `DataFusion` plans one when it answers from the
-/// table's statistics, such as `count(*) ... WHERE grp > 100` folded to `0`
-/// over one placeholder row because Cayenne reports `grp` at most 6. The
-/// constant then comes from Cayenne's statistics, so it is still Cayenne's
-/// answer to get right.
-const CONSTANT_SOURCES: [&str; 2] = ["PlaceholderRowExec", "EmptyExec"];
-
-/// Checks that every source of the physical plan in `plan`, an `EXPLAIN`
-/// answer, is one `accepts` admits, given the operators above it, or is one of
-/// [`CONSTANT_SOURCES`]. A side with any other source answered from somewhere
-/// other than `what`, and its agreement says nothing about it.
-fn check_sources(
-    plan: &[Row],
-    accepts: impl Fn(&Operator, &[&str]) -> bool,
-    what: &str,
-) -> Result<(), String> {
-    let physical = physical_plan(plan)?;
-    let operators = operators(&physical);
-    let other: Vec<&str> = leaves(&operators)
-        .into_iter()
-        .filter(|(leaf, above)| !accepts(leaf, above) && !CONSTANT_SOURCES.contains(&leaf.name))
-        .map(|(leaf, _)| leaf.name)
-        .collect();
-    if other.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the plan reads {other:?}, not only {what}:\n{physical}"
-        ))
-    }
-}
-
-/// Checks that every source of the physical plan in `plan` is read through a
-/// [`CAYENNE_SCAN`], so a Cayenne side answers from what Cayenne stored.
-fn check_cayenne_sources(plan: &[Row]) -> Result<(), String> {
-    check_sources(
-        plan,
-        |leaf, above| leaf.name == CAYENNE_SCAN || above.contains(&CAYENNE_SCAN),
-        "the Cayenne acceleration (CayenneAccelerationExec)",
-    )
-}
-
 /// Checks that every source of the physical plan in `plan` is SQL sent to the
 /// `SQLite` acceleration, so a `SQLite` side answers from `SQLite`.
 #[cfg(feature = "sqlite")]
@@ -655,10 +444,7 @@ async fn compare_case(
     case: &Case,
     failures: &mut Vec<String>,
 ) -> Result<bool, anyhow::Error> {
-    let oracle_sql = case
-        .sql
-        .replace("{items}", "diff_items")
-        .replace("{regions}", "diff_regions");
+    let oracle_sql = case.oracle_sql("diff_items", "diff_regions");
     let oracle = postgres_rows(client, &oracle_sql)
         .await
         .map_err(|e| anyhow::anyhow!("PostgreSQL rejected `{oracle_sql}`: {e}"))?;
@@ -673,10 +459,7 @@ async fn compare_case(
     let mut all_remote = true;
     for subject in SUBJECTS {
         let name = subject.name;
-        let sql = case
-            .sql
-            .replace("{items}", subject.items)
-            .replace("{regions}", subject.regions);
+        let sql = Case::bind(case.sql, subject.items, subject.regions);
         match spice_rows(rt, &sql).await {
             Ok(spice) => {
                 if let Err(reason) = agreement(&spice, &oracle, case.ordered) {
@@ -692,13 +475,15 @@ async fn compare_case(
         // does not. A Cayenne side must read only Cayenne, or its agreement says
         // nothing about what Cayenne stored.
         let check: Option<PlanCheck> = match subject.kind {
-            Kind::Federated => Some(check_nothing_local),
+            Kind::Federated => {
+                Some(&|plan| check_federated(plan, &REMOTE_SCANS, "PostgreSQL", case.kept_local))
+            }
             Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
-                Some(check_cayenne_sources)
+                Some(&check_cayenne_sources)
             }
             Kind::Accelerated | Kind::PartitionedArrow => None,
             #[cfg(feature = "sqlite")]
-            Kind::SqliteMemory | Kind::SqliteFile => Some(check_sqlite_sources),
+            Kind::SqliteMemory | Kind::SqliteFile => Some(&check_sqlite_sources),
         };
         if let Some(check) = check {
             let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))

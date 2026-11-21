@@ -232,7 +232,9 @@ jobs:
         timeout-minutes: 150
         uses: $/.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,postgres-accel'
+          # `http-functions` for test/spicescript/secret-redaction.yaml, which registers
+          # remote functions.
+          features: 'tpc-extension,models,postgres-accel,http-functions'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -251,7 +253,7 @@ jobs:
         timeout-minutes: 180
         uses: $/.github/actions/build-spiced
         with:
-          features: 'tpc-extension,models,postgres-accel,metal'
+          features: 'tpc-extension,models,postgres-accel,http-functions,metal'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -900,7 +902,7 @@ jobs:
         run: |
           echo "datasets:" >> spicepod.yaml
           echo "  - name: test_parquet_table" >> spicepod.yaml
-          echo "    from: s3://spiceai-public-datasets/test_parquet_table/" >> spicepod.yaml
+          echo "    from: s3://spice-datasets-gjezag77s0hu/test_parquet_table/" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      file_format: parquet" >> spicepod.yaml
 

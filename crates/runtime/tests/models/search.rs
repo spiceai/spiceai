@@ -681,7 +681,7 @@ pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
     let mut ds_tpcds_cp = Dataset::new(
         // pre-apply ordering and filtering due to https://github.com/spiceai/spiceai/issues/6876
         // ordering will create more deterministic tests to prevent flakiness
-        "s3://spiceai-public-datasets/integration/tpcds/catalog_page.parquet".to_string(),
+        "s3://spice-datasets-gjezag77s0hu/integration/tpcds/catalog_page.parquet".to_string(),
         ds_name,
     );
     ds_tpcds_cp.params = Some(Params::from_string_map(
