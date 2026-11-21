@@ -370,7 +370,9 @@ fn validate_no_code_executing_functions(
                 if crate::datafusion::udf::is_code_executing_function(function_name) {
                     return Err(caller.refusal(&match caller {
                         ReadOnlyCaller::Principal => {
-                            format!("Function '{function_name}' requires a read-write API key and")
+                            format!(
+                                "Function '{function_name}' requires a read-write API key and is"
+                            )
                         }
                         ReadOnlyCaller::Anonymous => format!("Function '{function_name}' is"),
                     }));
@@ -1232,9 +1234,9 @@ mod tests {
 
         let err = validate_sql_query_read_only(&plan, ReadOnlyCaller::Principal)
             .expect_err("code-executing functions must be rejected");
-        assert!(
-            err.to_string().contains("read-write API key"),
-            "error should cite read-write API key requirement, got: {err}"
+        assert_eq!(
+            err.to_string(),
+            "Error during planning: Function 'code_exec_test_fn' requires a read-write API key and is not allowed in read-only SQL context."
         );
     }
 
