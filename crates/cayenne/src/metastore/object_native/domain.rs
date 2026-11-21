@@ -28,7 +28,7 @@ use super::{
 };
 use crate::{
     catalog::{CatalogError, CatalogResult},
-    metadata::CreateTableOptions,
+    metadata::{CreateTableOptions, TableStatistics},
 };
 use arrow_schema::SchemaRef;
 use cayenne_metastore_actions::{Action, DatasetState, Kind, ObjRef, Record, proto};
@@ -331,6 +331,25 @@ impl Inner {
             .await
             .map_err(invalid)?;
         Ok(reference)
+    }
+
+    /// The action that sets `stats`, with its blobs stored.
+    pub(super) async fn table_stats_action(
+        &self,
+        stats: &TableStatistics,
+    ) -> CatalogResult<Action> {
+        let blob = Some(self.blob(&stats.statistics_blob).await?);
+        let ndv = match &stats.ndv_sketches {
+            Some(bytes) => Some(self.blob(bytes).await?),
+            None => None,
+        };
+        Ok(Action::new(Kind::SetTableStats(proto::SetTableStats {
+            table_id: stats.table_id.clone(),
+            blob,
+            ndv,
+            num_rows: stats.num_rows,
+            exact: stats.num_rows_exact,
+        })))
     }
 
     pub(super) async fn commit(&mut self, actions: Vec<Action>) -> CatalogResult<()> {

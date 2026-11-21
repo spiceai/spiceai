@@ -64,3 +64,67 @@ removed from the prototype, each reports the broken guarantee instead:
 | lease check in `remove_if_finished` | control_fence_check | `step 4 Deliver(1, 0): records: participant 1 holds the transaction prepared and its records are gone` |
 | prepared check in `remove_if_finished` | control_prepared_check | `step 5 Forget(1): records: participant 0 holds the transaction prepared and its records are gone` |
 | intent check in `confirmed_outcome` | control_intent_check | `step 15 Report: report: the coordinator reports true where the decision is false` |
+
+## Mem-tier provider replay
+
+| File | Run | Content |
+|---|---|---|
+| mem-tier-seal-delete-only.jsonl | mem-tier-seal-delete-only | 7 witnesses + 20 walks (seed 42, 40 steps) |
+| mem-tier-seal-delete-only-sqlite.jsonl | mem-tier-seal-delete-only-sqlite | 7 witnesses + 20 walks (seed 42, 40 steps) |
+| mem-tier-current-3-exhaust.jsonl | mem-tier-current-3-exhaust | seal control witnesses |
+| mem-tier-no-one-call.jsonl | mem-tier-no-one-call | split-commit control witnesses |
+
+Generated serially from the repository root, starting with absent output files
+(`TRACE_JSON` appends):
+
+```sh
+cargo build --release -p cayenne-metastore-model
+EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-seal-delete-only.jsonl target/release/cayenne-metastore-model run mem-tier-seal-delete-only
+WALK=42:20:40 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-seal-delete-only.jsonl target/release/cayenne-metastore-model run mem-tier-seal-delete-only
+EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-seal-delete-only-sqlite.jsonl target/release/cayenne-metastore-model run mem-tier-seal-delete-only-sqlite
+WALK=42:20:40 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-seal-delete-only-sqlite.jsonl target/release/cayenne-metastore-model run mem-tier-seal-delete-only-sqlite
+EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-current-3-exhaust.jsonl target/release/cayenne-metastore-model run mem-tier-current-3-exhaust
+EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/mem-tier-no-one-call.jsonl target/release/cayenne-metastore-model run mem-tier-no-one-call
+```
+
+`provider/table/tests/mem_tier_model_replay.rs` drives the real CDC apply, seal,
+checkpoint, seq-prefix bake and full rewrite paths. Test-only rendezvous hooks
+park maintenance tasks at each modeled boundary. Every prefix checks live row
+multiplicity, source acknowledgement and recovery from a copied durable catalog
+and data directory with the unacknowledged source suffix redelivered.
+
+The control tests take the FAIL witness's schedule but require the candidate
+model's rows. Split-model `*StageRest` actions are omitted only for those control
+schedules because the guarded engine stages once. Positive traces refuse those
+actions. No production safeguard is disabled in the checked-in replay.
+
+The replay sets `compaction_trigger_protected_snapshots: 2`, giving the real
+bake zero kept-recent inputs; the model requires at least two eligible protected
+snapshots. Enabled bakes must commit and the positive suite requires actual
+index pruning. No candidate gate is bypassed.
+
+The durable comparison reads physical current/protected rows, inline rows and
+stamps, every vector entry and its stamps, and standalone insert records from the
+clone. Real reservation gaps are normalized to logical model sequences. On
+object-native, exactly the model's durable state or that state plus ALL pending
+changes is allowed, coupled with its corresponding recovered row multiset. An
+observed early flush is carried into later model prefixes. SQLite uses its own
+immediate-publication run. The suite checks whether all native traces are enabled
+in that run and otherwise uses its generated SQLite trace set.
+
+Original and probe reclamation are fenced while the copied directory occupies
+the persisted absolute path; probe maintenance and scan-statistics tasks are
+drained before paths are restored. Crash aborts and awaits the parked operation,
+then drains detached maintenance without checkpointing the RAM tier. This is an
+in-process approximation of process death, not a process-kill test.
+
+`mem_tier_model_replay_early_publisher` parks a cold SQL scan immediately before
+footer-statistics persistence and reads commit numbers/action names before and
+after releasing it. It requires the checkpoint's delete files, protected snapshot,
+insert records and table statistics to share one record. Output belongs in the
+run report, not this README.
+
+The control files retain historical FAIL schedules. The revised model includes
+the PK cache and reserve-ahead handout semantics; their historical labels do not
+assert a row failure under the revised model. Temporary engine mutations must
+still be detected by the same full catalog/row comparisons and then reverted.
