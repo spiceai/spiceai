@@ -1207,13 +1207,12 @@ async fn create_instances(
             // sends it with every step that names no other. A `listen: every-interface` variant
             // binds beyond loopback to check what such a caller is served there, so it gets no
             // key, though its ports are probed on every interface (see `ProbeAddresses`).
-            let wide_listener = rootless_reach || bridge.is_some();
-            let injected_api_key = (wide_listener
-                && spicepod.pointer("/runtime/auth").is_none_or(Value::is_null))
-            .then(|| {
-                require_api_key(&mut spicepod, &instance_api_key);
-                instance_api_key.clone()
-            });
+            let api_key = default_api_key(
+                &mut spicepod,
+                rootless_reach || bridge.is_some(),
+                &instance_api_key,
+                script.defaults.api_key.as_deref(),
+            );
             let spiced_args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
             let mut spiced_args: Vec<String> = serde_json::from_value(spiced_args)?;
             let cluster = runs_cluster(script, options);
@@ -1389,7 +1388,7 @@ async fn create_instances(
             if let Some(port) = port("flight_port") {
                 spiced.set_flight_port(port);
             }
-            spiced.set_api_key(script.defaults.api_key.clone().or(injected_api_key))?;
+            spiced.set_api_key(api_key)?;
             spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
             if let Some((scheduler, _)) = &cluster_args {
                 spiced_args.extend(scheduler.iter().cloned());
@@ -1897,6 +1896,25 @@ fn disable_results_cache_unless_configured(spicepod: &mut Value) {
         .or_insert_with(|| json!({ "enabled": false }));
 }
 
+/// The API key sent with each step that names none, for an instance whose spicepod is
+/// `spicepod`. When this runner binds `spiced` beyond loopback (`wide_listener`) and the
+/// spicepod configures no `runtime.auth`, the runner configures it with the instance's own
+/// read-write key, `instance_api_key`, the only key `spiced` then accepts, so that key is sent
+/// even when the script sets `defaults.api-key`, which nothing configured. The script's
+/// `defaults.api-key`, `script_api_key`, is sent otherwise.
+fn default_api_key(
+    spicepod: &mut Value,
+    wide_listener: bool,
+    instance_api_key: &str,
+    script_api_key: Option<&str>,
+) -> Option<String> {
+    if wide_listener && spicepod.pointer("/runtime/auth").is_none_or(Value::is_null) {
+        require_api_key(spicepod, instance_api_key);
+        return Some(instance_api_key.to_string());
+    }
+    script_api_key.map(str::to_string)
+}
+
 /// Configures `runtime.auth` on `spicepod` with one read-write API key, `key`.
 fn require_api_key(spicepod: &mut Value, key: &str) {
     let Value::Object(root) = spicepod else {
@@ -2085,6 +2103,56 @@ mod tests {
                 ProbeAddresses::new(rootless_reach, bridged, listen),
                 expected,
                 "rootless reach: {rootless_reach}, bridged: {bridged}, {listen:?}"
+            );
+        }
+    }
+
+    /// A step that names no API key is sent one the instance's `runtime.auth` accepts. Where
+    /// this runner binds `spiced` beyond loopback and the spicepod configures no `runtime.auth`,
+    /// the runner configures the instance's own key, the only one `spiced` then accepts, so that
+    /// key is sent whatever the script's `defaults.api-key`. Otherwise the spicepod is left as
+    /// the script wrote it, and the script's own key is sent.
+    #[test]
+    fn a_step_naming_no_key_is_sent_one_the_instance_accepts() {
+        let instance = "spicescript-run-0";
+        let no_auth = json!({ "datasets": [] });
+        let own_auth = json!({ "runtime": { "auth": { "api-key": { "enabled": true, "keys": ["writer:rw"] } } } });
+        for (wide_listener, spicepod, script_key, sent, accepted) in [
+            (
+                true,
+                &no_auth,
+                Some("writer"),
+                Some(instance),
+                Some(json!(["spicescript-run-0:rw"])),
+            ),
+            (
+                true,
+                &no_auth,
+                None,
+                Some(instance),
+                Some(json!(["spicescript-run-0:rw"])),
+            ),
+            (
+                true,
+                &own_auth,
+                Some("writer"),
+                Some("writer"),
+                Some(json!(["writer:rw"])),
+            ),
+            (false, &no_auth, Some("writer"), Some("writer"), None),
+            (false, &no_auth, None, None, None),
+        ] {
+            let case =
+                format!("wide listener: {wide_listener}, script key: {script_key:?}, {spicepod}");
+            let mut spicepod = spicepod.clone();
+            let key = default_api_key(&mut spicepod, wide_listener, instance, script_key);
+            assert_eq!(
+                (
+                    key.as_deref(),
+                    spicepod.pointer("/runtime/auth/api-key/keys").cloned()
+                ),
+                (sent, accepted),
+                "{case}"
             );
         }
     }
