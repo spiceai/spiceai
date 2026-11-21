@@ -296,7 +296,7 @@ async fn exchange_token(
     let jwt = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
         .context(UnableToGenerateJWTSnafu)?;
 
-    let client = reqwest::Client::builder()
+    let client = http_retry::client_builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))

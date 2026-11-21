@@ -384,6 +384,61 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         true
     }
 
+    /// [`Self::insert_if`] without the work [`Self::try_insert`] refuses.
+    ///
+    /// Admits only when `key` has no resident, under the conditions of
+    /// [`Self::try_insert`], after `admit(None)` accepts. The decision and the
+    /// write share the shard lock, as in [`Self::insert_if`]. Returns whether
+    /// `value` was stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns `value` untouched when admitting it would need that work, for
+    /// the caller to pass to [`Self::insert_if`].
+    pub fn try_insert_if<F>(&self, key: u64, value: V, weight: usize, admit: F) -> Result<bool, V>
+    where
+        F: FnOnce(Option<&V>) -> bool,
+    {
+        if matches!(self.policy, EvictionPolicy::TinyLfu) {
+            return Err(value);
+        }
+        let Ok(weight) = u64::try_from(weight) else {
+            return Err(value);
+        };
+        if weight > self.max_weight {
+            return Ok(false);
+        }
+        let shard_idx = shard_index(key);
+        let Some(_gate) = self.invalidate_gate.try_read() else {
+            return Err(value);
+        };
+        let Some(mut shard) = self.shards[shard_idx].0.try_lock() else {
+            return Err(value);
+        };
+        if shard.contains(key) {
+            return Err(value);
+        }
+        if !admit(None) {
+            return Ok(false);
+        }
+        let Some(mut buffered) = self.touch_buffers[shard_idx].0.keys.try_lock() else {
+            return Err(value);
+        };
+        let touches = std::mem::take(&mut *buffered);
+        drop(buffered);
+        for touched in touches {
+            shard.apply_touch(touched);
+        }
+        if !self.reserve_weight(weight) {
+            return Err(value);
+        }
+        let (_delta, displaced) = shard.insert(key, value, weight, Instant::now());
+        debug_assert!(displaced.is_none(), "no resident, so nothing is displaced");
+        drop(shard);
+        self.note_write();
+        Ok(true)
+    }
+
     /// Insert `value` under `key` only if admitting it needs no cache-wide work,
     /// and hand it back otherwise.
     ///
@@ -2171,6 +2226,200 @@ mod tests {
             via_try_insert.keys_in_lru_order(),
             via_insert.keys_in_lru_order()
         );
+    }
+
+    #[test]
+    fn try_insert_if_stores_into_an_empty_key_that_admit_accepts() {
+        let cache = cache(1024, Duration::from_mins(1));
+        let mut offered = Vec::new();
+        assert_eq!(
+            cache.try_insert_if(1, TestValue::new("x"), 1, |current| {
+                offered.push(current.cloned());
+                true
+            }),
+            Ok(true)
+        );
+        assert_eq!(offered, vec![None], "admit sees the empty key, once");
+        assert_eq!(cache.get(&1).map(|v| v.data.clone()), Some("x".to_string()));
+        assert_eq!(cache.weighted_size(), 1);
+    }
+
+    #[test]
+    fn try_insert_if_stores_nothing_when_admit_declines() {
+        let cache = cache(1024, Duration::from_mins(1));
+        assert_eq!(
+            cache.try_insert_if(1, TestValue::new("x"), 1, |_| false),
+            Ok(false)
+        );
+        assert!(cache.get(&1).is_none());
+        assert_eq!(
+            cache.weighted_size(),
+            0,
+            "a declined insert reserves nothing"
+        );
+    }
+
+    /// A resident is the case `insert_if` exists for, so the decision is left
+    /// to it: the fast path neither consults `admit` nor touches the resident.
+    #[test]
+    fn try_insert_if_hands_back_a_key_with_a_resident() {
+        let cache = cache(1024, Duration::from_mins(1));
+        cache.insert(1, TestValue::new("old"), 3);
+        assert_eq!(
+            cache.try_insert_if(1, TestValue::new("new"), 3, |_| {
+                unreachable!("admit is left to insert_if when there is a resident")
+            }),
+            Err(TestValue::new("new"))
+        );
+        assert_eq!(
+            cache.get(&1).map(|v| v.data.clone()),
+            Some("old".to_string())
+        );
+        assert_eq!(cache.weighted_size(), 3);
+    }
+
+    #[test]
+    fn try_insert_if_refuses_what_insert_if_refuses() {
+        let cache = cache(100, Duration::from_mins(1));
+        assert_eq!(
+            cache.try_insert_if(1, TestValue::with_size("big", 500), 500, |_| true),
+            Ok(false),
+            "a value heavier than the whole budget is refused, as insert_if refuses it"
+        );
+        assert!(!cache.insert_if(1, TestValue::with_size("big", 500), 500, |_| true));
+        assert!(cache.is_empty());
+        assert_eq!(cache.weighted_size(), 0);
+    }
+
+    #[test]
+    fn try_insert_if_hands_back_what_needs_room_or_a_tinylfu_admission() {
+        let full = cache(300, Duration::from_mins(1));
+        full.insert(1, TestValue::with_size("a", 300), 300);
+        assert_eq!(
+            full.try_insert_if(2, TestValue::with_size("b", 1), 1, |_| true),
+            Err(TestValue::with_size("b", 1)),
+            "an insert that needs an eviction is handed back"
+        );
+        assert_eq!(full.weighted_size(), 300);
+        let tiny: ShardedCache<TestValue> =
+            ShardedCache::new(1024, Duration::from_mins(1), EvictionPolicy::TinyLfu);
+        assert_eq!(
+            tiny.try_insert_if(1, TestValue::new("x"), 1, |_| true),
+            Err(TestValue::new("x")),
+            "W-TinyLFU admission expires the key's shard"
+        );
+        assert!(tiny.is_empty());
+    }
+
+    #[test]
+    fn try_insert_if_does_not_wait_for_a_held_lock() {
+        let cache = cache(1024, Duration::from_mins(1));
+        {
+            let _shard = cache.shards[shard_index(1)].0.lock();
+            assert_eq!(
+                cache.try_insert_if(1, TestValue::new("x"), 1, |_| true),
+                Err(TestValue::new("x")),
+                "the key's shard is locked"
+            );
+        }
+        {
+            let _gate = cache.invalidate_gate.write();
+            assert_eq!(
+                cache.try_insert_if(1, TestValue::new("x"), 1, |_| true),
+                Err(TestValue::new("x")),
+                "an invalidation holds the gate"
+            );
+        }
+        {
+            let _touches = cache.touch_buffers[shard_index(1)].0.keys.lock();
+            assert_eq!(
+                cache.try_insert_if(1, TestValue::new("x"), 1, |_| true),
+                Err(TestValue::new("x")),
+                "a hit is recording a promote for the key's shard"
+            );
+        }
+        assert_eq!(
+            cache.weighted_size(),
+            0,
+            "a declined insert reserves nothing"
+        );
+        assert_eq!(
+            cache.try_insert_if(1, TestValue::new("x"), 1, |_| true),
+            Ok(true)
+        );
+        assert_eq!(cache.weighted_size(), 1);
+    }
+
+    /// `try_insert_if` publishes under the same gate and write epoch as
+    /// `insert_if`, so an admission into an already-scanned shard cannot survive
+    /// `invalidate_matching`.
+    #[test]
+    fn invalidate_matching_rescans_a_try_insert_if_into_an_already_scanned_shard() {
+        let cache = Arc::new(cache(1024, Duration::from_mins(1)));
+        cache.insert(1, TestValue::new("stale"), 1);
+        let cache_for_hook = Arc::clone(&cache);
+        let inserted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cache.set_after_invalidate_shard(move |shard_idx| {
+            if shard_idx == 0 && !inserted.swap(true, Ordering::SeqCst) {
+                assert_eq!(
+                    cache_for_hook.try_insert_if(0, TestValue::new("stale"), 1, |_| true),
+                    Ok(true),
+                    "shard 0 is unlocked and the gate is free during the first pass"
+                );
+            }
+        });
+        let removed = cache.invalidate_matching(|value| value.data == "stale");
+        assert_eq!(removed, 2, "both matching entries must be removed");
+        assert!(
+            cache.get(&0).is_none(),
+            "the entry admitted mid-scan is gone"
+        );
+        assert!(cache.get(&1).is_none());
+    }
+
+    /// The results cache stores through `try_insert_if` and falls back to
+    /// `insert_if`, keeping a result only over one whose read began earlier. Of
+    /// writers racing on one key, the newest read must be what remains, however
+    /// the two paths interleave.
+    #[test]
+    fn racing_conditional_writers_leave_the_newest_read() {
+        const WRITERS: u64 = 8;
+        const ROUNDS: u64 = 200;
+        let start = Arc::new(std::sync::Barrier::new(
+            usize::try_from(WRITERS).expect("writer count fits in usize"),
+        ));
+        for round in 0..ROUNDS {
+            let cache = Arc::new(cache(1024, Duration::from_mins(1)));
+            let mut handles = Vec::new();
+            for writer in 0..WRITERS {
+                let cache = Arc::clone(&cache);
+                let start = Arc::clone(&start);
+                handles.push(std::thread::spawn(move || {
+                    // A distinct read order per round, so the newest writer is
+                    // not always the last one spawned.
+                    let read = (writer * 7 + round) % WRITERS;
+                    let newer = |current: Option<&TestValue>| {
+                        current.is_none_or(|existing| {
+                            existing.data.parse::<u64>().expect("read order") < read
+                        })
+                    };
+                    let value = TestValue::new(&read.to_string());
+                    start.wait();
+                    if let Err(value) = cache.try_insert_if(round, value, 1, newer) {
+                        cache.insert_if(round, value, 1, newer);
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("writer thread");
+            }
+            assert_eq!(
+                cache.get(&round).map(|v| v.data.clone()),
+                Some((WRITERS - 1).to_string()),
+                "round {round}: the newest read must remain"
+            );
+            assert_eq!(cache.weighted_size(), 1, "round {round}: one resident");
+        }
     }
 
     #[test]
