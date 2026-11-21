@@ -171,6 +171,26 @@ test('cancelled and skipped runs are not verdicts and are passed over', async ()
   assert.deepEqual(notTripped.failed, []);
 });
 
+test('the backstop pages past a full page of cancelled runs to find its verdicts', async () => {
+  const runs = [...Array(25).fill({ conclusion: 'cancelled' }), { conclusion: 'failure' }, { conclusion: 'failure' }];
+  const r = await gate(mergeGroup(), { runs });
+  assert.equal(r.failed.length, 1);
+  assert.match(r.failed[0], /last 2 post-merge runs on trunk failed/);
+  assert.deepEqual(r.calls.filter((c) => c.startsWith('actions.listWorkflowRuns page')), [
+    'actions.listWorkflowRuns page 1',
+    'actions.listWorkflowRuns page 2',
+  ]);
+});
+
+test('the backstop stops paging once it has its verdicts', async () => {
+  const runs = [{ conclusion: 'success' }, { conclusion: 'failure' }, ...Array(40).fill({ conclusion: 'failure' })];
+  const r = await gate(mergeGroup(), { runs });
+  assert.deepEqual(r.failed, []);
+  assert.deepEqual(r.calls.filter((c) => c.startsWith('actions.listWorkflowRuns page')), [
+    'actions.listWorkflowRuns page 1',
+  ]);
+});
+
 test('fewer completed runs than the backstop needs do not trip it', async () => {
   const r = await gate(mergeGroup(), { runs: [{ conclusion: 'failure' }] });
   assert.deepEqual(r.failed, []);
@@ -199,6 +219,22 @@ test('a PR closing a trunk-broken issue may merge', async () => {
   const r = await gate(mergeGroup(), { ...brokenIssue(7, 48), closing: { [PR]: [{ number: 7, labels: ['trunk-broken'] }] } });
   assert.deepEqual(r.failed, []);
   assert.match(r.summary, /it closes #7, which is labeled `trunk-broken`/);
+});
+
+test('closing another repository\'s labeled issue earns nothing', async () => {
+  const r = await gate(mergeGroup(), {
+    ...brokenIssue(7, 48),
+    closing: { [PR]: [{ number: 999, labels: ['trunk-broken'], repo: 'someone/sandbox' }] },
+  });
+  assert.equal(r.failed.length, 1);
+});
+
+test('a labeled closing issue past the first page of references still exempts', async () => {
+  const closing = Array.from({ length: 150 }, (_, i) => ({ number: 1000 + i, labels: [] }));
+  closing[120].labels = ['trunk-broken'];
+  const r = await gate(mergeGroup(), { ...brokenIssue(7, 48), closing: { [PR]: closing } });
+  assert.deepEqual(r.failed, []);
+  assert.match(r.summary, /it closes #1120, which is labeled `trunk-broken`/);
 });
 
 test('closing an issue without the label earns nothing', async () => {

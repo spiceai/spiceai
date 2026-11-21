@@ -313,6 +313,9 @@ jobs:
       # it. Only `.github/scripts` is checked out, without credentials.
       - name: Check out the base commit's scripts
         if: ${{ github.event_name == 'pull_request' }}
+        # Only the revert fast-track needs these. If the checkout fails, the
+        # import below fails too and the PR takes the normal sign-off path.
+        continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}

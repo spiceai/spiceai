@@ -53,6 +53,21 @@ test('reverting a commit that is not on the base is not pure', async () => {
   assert.equal(result.reason, `reverted commit ${A} is not on the base branch`);
 });
 
+// The list-commits API stops at 250, so a PR at the cap may hide a
+// non-revert commit the check never saw.
+test('a PR at the API\'s 250-commit listing cap is not pure', async () => {
+  const commits = Array.from({ length: 250 }, (_, i) => ({ sha: `${i}`.padStart(40, '0'), message: revertOf(A) }));
+  const result = await check({ commits: { 7: commits }, onBase: new Set([A]) });
+  assert.equal(result.pure, false);
+  assert.equal(
+    result.reason,
+    'the PR has at least 250 commits, more than the API lists, so not all could be checked'
+  );
+
+  const fewer = await check({ commits: { 7: commits.slice(1) }, onBase: new Set([A]) });
+  assert.equal(fewer.pure, true);
+});
+
 test('a PR with no commits is not pure', async () => {
   const result = await check({ commits: { 7: [] } });
   assert.equal(result.pure, false);
@@ -85,8 +100,10 @@ test('Attestation imports the rule from the base-commit checkout', () => {
   const workflow = readFileSync(fileURLToPath(new URL('../workflows/pr.yml', import.meta.url)), 'utf8');
   assert.match(workflow, /\/trusted\/\.github\/scripts\/pure_revert\.mjs/);
   const checkout = workflow.slice(workflow.indexOf("- name: Check out the base commit's scripts"));
-  assert.match(checkout.slice(0, 600), /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
-  assert.match(checkout.slice(0, 600), /persist-credentials: false/);
+  assert.match(checkout.slice(0, 900), /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  assert.match(checkout.slice(0, 900), /persist-credentials: false/);
+  // A failed checkout must fall through to the normal sign-off, not fail Attestation.
+  assert.match(checkout.slice(0, 900), /continue-on-error: true/);
   assert.ok(
     workflow.indexOf("- name: Check out the base commit's scripts") < workflow.indexOf('- name: Fast-track pure reverts'),
     'the checkout must come before the step that imports from it'

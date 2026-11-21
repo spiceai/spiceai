@@ -26,8 +26,8 @@
 // blocking item is the only override. See docs/dev/ci_signoff.md.
 //
 // The merge-queue run enforces. The pull_request run is advisory: it never
-// fails, and keeps one PR comment up to date instead, so a PR is not left with
-// a stale red check after trunk recovers.
+// fails, and posts or updates one PR comment on each of the PR's events
+// instead, so a PR is not left with a stale red check after trunk recovers.
 
 import { checkPureRevert } from './pure_revert.mjs';
 
@@ -40,6 +40,7 @@ export const COMMENT_MARKER = '<!-- trunk-health -->';
 
 const COMMENT_AUTHOR = 'github-actions[bot]';
 const HOUR_MS = 60 * 60 * 1000;
+const RUNS_PER_PAGE = 20;
 // Conclusions that say nothing about whether trunk is healthy.
 const IGNORED_CONCLUSIONS = new Set(['cancelled', 'skipped', 'neutral']);
 
@@ -110,24 +111,32 @@ export async function blockingItems({ github, owner, repo, now }) {
  * exist on the branch yet leaves the backstop inactive.
  */
 export async function postMergeRuns({ github, owner, repo, branch }) {
-  let data;
-  try {
-    ({ data } = await github.rest.actions.listWorkflowRuns({
-      owner,
-      repo,
-      workflow_id: POST_MERGE_WORKFLOW,
-      branch,
-      status: 'completed',
-      per_page: 20,
-    }));
-  } catch (error) {
-    if (error.status === 404) return { missing: true, failing: false, runs: [] };
-    throw error;
+  const runs = [];
+  // Page until BACKSTOP_RUNS runs with a verdict are found, however many
+  // cancelled ones sit between them, or the history runs out.
+  for (let page = 1; runs.length < BACKSTOP_RUNS; page += 1) {
+    let data;
+    try {
+      ({ data } = await github.rest.actions.listWorkflowRuns({
+        owner,
+        repo,
+        workflow_id: POST_MERGE_WORKFLOW,
+        branch,
+        status: 'completed',
+        per_page: RUNS_PER_PAGE,
+        page,
+      }));
+    } catch (error) {
+      if (error.status === 404) return { missing: true, failing: false, runs: [] };
+      throw error;
+    }
+    const pageRuns = data.workflow_runs ?? [];
+    for (const run of pageRuns) {
+      if (IGNORED_CONCLUSIONS.has(run.conclusion) || runs.length === BACKSTOP_RUNS) continue;
+      runs.push({ url: run.html_url, conclusion: run.conclusion, sha: run.head_sha });
+    }
+    if (pageRuns.length < RUNS_PER_PAGE) break;
   }
-  const runs = (data.workflow_runs ?? [])
-    .filter((run) => !IGNORED_CONCLUSIONS.has(run.conclusion))
-    .slice(0, BACKSTOP_RUNS)
-    .map((run) => ({ url: run.html_url, conclusion: run.conclusion, sha: run.head_sha }));
   const failing = runs.length === BACKSTOP_RUNS && runs.every((run) => run.conclusion !== 'success');
   return { missing: false, failing, runs };
 }
@@ -137,23 +146,37 @@ export async function exemption({ github, owner, repo, pr, baseSha }) {
   const labels = (pr.labels ?? []).map((label) => label.name);
   if (labels.includes(FIX_LABEL)) return `it is labeled \`${FIX_LABEL}\``;
 
-  const { repository } = await github.graphql(
-    `query($owner: String!, $repo: String!, $number: Int!) {
-      repository(owner: $owner, name: $repo) {
-        pullRequest(number: $number) {
-          closingIssuesReferences(first: 50) {
-            nodes { number labels(first: 50) { nodes { name } } }
+  // Only this repository's issues count: a closing link to another
+  // repository's issue, which anyone could create and label, earns nothing.
+  const thisRepo = `${owner}/${repo}`.toLowerCase();
+  let cursor = null;
+  do {
+    const { repository } = await github.graphql(
+      `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $number) {
+            closingIssuesReferences(first: 100, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                number
+                repository { nameWithOwner }
+                labels(first: 100) { nodes { name } }
+              }
+            }
           }
         }
+      }`,
+      { owner, repo, number: pr.number, cursor }
+    );
+    const references = repository.pullRequest.closingIssuesReferences;
+    for (const issue of references.nodes) {
+      if (issue.repository.nameWithOwner.toLowerCase() !== thisRepo) continue;
+      if (issue.labels.nodes.some((label) => label.name === BROKEN_LABEL)) {
+        return `it closes #${issue.number}, which is labeled \`${BROKEN_LABEL}\``;
       }
-    }`,
-    { owner, repo, number: pr.number }
-  );
-  for (const issue of repository.pullRequest.closingIssuesReferences.nodes) {
-    if (issue.labels.nodes.some((label) => label.name === BROKEN_LABEL)) {
-      return `it closes #${issue.number}, which is labeled \`${BROKEN_LABEL}\``;
     }
-  }
+    cursor = references.pageInfo.hasNextPage ? references.pageInfo.endCursor : null;
+  } while (cursor !== null);
 
   const revert = await checkPureRevert({ github, owner, repo, pullNumber: pr.number, baseSha });
   if (revert.pure) return 'it is a pure revert';

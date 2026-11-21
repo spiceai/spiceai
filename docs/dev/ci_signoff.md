@@ -793,14 +793,20 @@ history and needs no admin bypass.
 
 **Where it runs.** The merge-queue run is the one that blocks. The run on a
 pull request is advisory: it always passes, and when merging is blocked it
-posts one comment listing the blocking items and how to unblock, which it
-updates as things change and edits to say so once the block clears. A fork's
+posts one comment listing the blocking items and how to unblock. The run
+repeats only on the PR's own events (a push, a label, an edit), so the comment
+shows trunk's state as of the PR's last event: it can say blocked after the
+block cleared, and a PR that sees no events gets no warning when an item
+becomes overdue. The merge-queue run always reads the current state. A fork's
 token cannot comment, so on a fork PR the report is in the job summary. The
 gate reads labels, label events, workflow runs and the PR's closing issues
 with the job's token, and runs `.github/scripts/trunk_health.mjs` from the
-base commit, never the PR's, so a PR cannot change the rule that judges it.
-When it cannot read that state in the merge queue, it fails closed; re-run the
-check.
+base commit, never the PR's. The workflow file that runs it still comes from
+the PR, as for every check here, so a change to `trunk_health.yml` or to the
+gate's script is a change to the gate and gets the same review as any other
+`.github/` change (CODEOWNERS). When it cannot read that state in the merge
+queue, it fails closed; re-run the check. Only closing links to this
+repository's issues count toward the exemption.
 
 Anyone with triage permission can add or remove the labels, so they can block
 or unblock merging: the same trust level as approving or enqueueing a PR.

@@ -19,11 +19,15 @@
 // past the developer sign-off (`.github/workflows/pr.yml`), and Trunk Health
 // lets a pure revert merge while trunk is broken (`trunk_health.mjs`). Both
 // jobs import it from a checkout of the *base* commit, never the PR's, so a PR
-// cannot change the rule that judges it.
+// cannot change the rule that judges it without changing the workflows that
+// load it, which review covers.
 
 // The footer Git writes for each reverted commit (full 40-char SHA). `git
 // revert` creates one commit per reverted commit; a single --no-commit batch
 // can carry several footers, so every match counts.
+// GitHub's list-commits endpoint for a pull request returns at most this many.
+const MAX_LISTED_COMMITS = 250;
+
 const REVERT_FOOTER = /^This reverts commit ([0-9a-f]{40})\.$/gm;
 
 /**
@@ -62,6 +66,14 @@ export async function checkPureRevert({ github, owner, repo, pullNumber, baseSha
   }
   if (commits.length === 0) {
     return notPure('the PR introduces no commits');
+  }
+  // The API lists at most MAX_LISTED_COMMITS of a PR's commits, so a PR that
+  // reaches the cap may have more that were never examined.
+  if (commits.length >= MAX_LISTED_COMMITS) {
+    return notPure(
+      `the PR has at least ${MAX_LISTED_COMMITS} commits, more than the API lists, so not all could be checked`,
+      commits.length
+    );
   }
 
   const reverted = new Set();

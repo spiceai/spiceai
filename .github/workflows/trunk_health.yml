@@ -13,8 +13,8 @@ name: Trunk Health
 # .github/scripts/trunk_health.mjs; docs/dev/ci_signoff.md explains them.
 #
 # The merge-queue run enforces. The pull_request run is advisory: it always
-# passes, and keeps one PR comment up to date, so a PR is not left with a stale
-# red check after trunk recovers.
+# passes, and posts or updates one PR comment on each of the PR's events, so a
+# PR is not left with a stale red check after trunk recovers.
 
 on:
   pull_request:
@@ -52,8 +52,10 @@ jobs:
       # A fork PR's token stays read-only; the job then reports in its summary.
       pull-requests: write
     steps:
-      # The gate's code comes from the BASE commit, never the PR's, so a PR
-      # cannot edit the gate to pass itself. On the PR that adds this workflow
+      # The gate's script comes from the BASE commit, never the PR's, so a PR
+      # cannot change it by editing .github/scripts. This file still comes from
+      # the PR, as every workflow does, so editing it is reviewed like any other
+      # .github/ change (CODEOWNERS). On the PR that adds this workflow
       # the base has no script yet and the check fails; it is not required
       # until it is on trunk.
       - name: Check out the base commit's scripts

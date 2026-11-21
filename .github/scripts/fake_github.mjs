@@ -24,7 +24,7 @@ const httpError = (status, message) => Object.assign(new Error(message), { statu
  * - events: { [number]: [{ event, label, created_at }] }
  * - runs: [{ conclusion, head_sha }] newest first, or 'missing' for a 404
  * - pulls: { [number]: { labels: [name] } }
- * - closing: { [number]: [{ number, labels: [name] }] }
+ * - closing: { [number]: [{ number, labels: [name], repo? }] } (repo defaults to 'o/r')
  * - commits: { [number]: [{ sha, message }] }
  * - onBase: Set of SHAs that are ancestors of the base
  * - comments: { [number]: [{ id, body, login }] }
@@ -42,14 +42,20 @@ export function fakeGithub(state = {}) {
 
   const github = {
     paginate: async (method, params) => (await method(params)).data,
-    graphql: async (_query, { number }) => {
+    // Pages closing references 100 at a time, as `first: 100` asks.
+    graphql: async (_query, { number, cursor }) => {
       maybeFail('graphql');
+      const all = state.closing?.[number] ?? [];
+      const start = cursor === null || cursor === undefined ? 0 : Number(cursor);
+      const end = Math.min(start + 100, all.length);
       return {
         repository: {
           pullRequest: {
             closingIssuesReferences: {
-              nodes: (state.closing?.[number] ?? []).map((issue) => ({
+              pageInfo: { hasNextPage: end < all.length, endCursor: String(end) },
+              nodes: all.slice(start, end).map((issue) => ({
                 number: issue.number,
+                repository: { nameWithOwner: issue.repo ?? 'o/r' },
                 labels: { nodes: issue.labels.map((name) => ({ name })) },
               })),
             },
@@ -106,15 +112,18 @@ export function fakeGithub(state = {}) {
         },
       },
       actions: {
-        listWorkflowRuns: async ({ workflow_id, status }) => {
+        // Honours page and per_page, as the API does.
+        listWorkflowRuns: async ({ workflow_id, status, page = 1, per_page = 30 }) => {
           maybeFail('actions.listWorkflowRuns');
+          calls.push(`actions.listWorkflowRuns page ${page}`);
           if (state.runs === 'missing') throw httpError(404, `Not Found: ${workflow_id}`);
           if (status !== 'completed') throw new Error('only completed runs are modelled');
+          const start = (page - 1) * per_page;
           return {
             data: {
-              workflow_runs: (state.runs ?? []).map((run, index) => ({
-                html_url: `https://github.com/o/r/actions/runs/${index}`,
-                head_sha: run.head_sha ?? `${index}`.padStart(40, '0'),
+              workflow_runs: (state.runs ?? []).slice(start, start + per_page).map((run, i) => ({
+                html_url: `https://github.com/o/r/actions/runs/${start + i}`,
+                head_sha: run.head_sha ?? `${start + i}`.padStart(40, '0'),
                 conclusion: run.conclusion,
               })),
             },
