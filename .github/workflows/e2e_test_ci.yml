@@ -3020,7 +3020,9 @@ jobs:
           groups=$(git diff --name-only --diff-filter=AMRD "$BASE_SHA" HEAD -- \
             ':(glob)test/spicescript/known-failing/*/recordings/expected-failures.json' \
             | sed 's#/recordings/expected-failures.json$##' | while read -r dir; do
-              [ -d "$dir" ] && echo "$dir"
+              # A group a fix emptied is gone; under pipefail a bare test would
+              # end the loop with status 1 and abort this step.
+              if [ -d "$dir" ]; then echo "$dir"; fi
             done | sort -u)
           known=$( {
             echo "$groups"
