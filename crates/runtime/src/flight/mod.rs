@@ -913,16 +913,19 @@ pub(crate) fn transaction_outcome_to_flight_stream(
 }
 
 /// Returns `true` when the request has an authenticated principal that
-/// lacks write permission (`"write"` or `"read_write"` group).
-/// Returns `false` when there is no principal (auth not configured)
+/// lacks write permission (`"write"` or `"read_write"` group), or no principal
+/// and comes to an executor from a cluster node other than the scheduler, which
+/// only reads there.
+/// Returns `false` when there is no principal otherwise (auth not configured)
 /// or the principal has write access.
 pub(crate) fn is_auth_read_only(context: &RequestContext) -> bool {
-    context.auth_principal().is_some_and(|principal| {
-        !principal
+    match context.auth_principal() {
+        Some(principal) => !principal
             .groups()
             .iter()
-            .any(|g| *g == "write" || *g == "read_write")
-    })
+            .any(|g| *g == "write" || *g == "read_write"),
+        None => crate::cluster::peer::is_from_peer_executor(context),
+    }
 }
 
 /// If the current principal is read-only, validates that `sql` does not contain

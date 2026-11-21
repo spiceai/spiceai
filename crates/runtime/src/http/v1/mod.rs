@@ -130,10 +130,15 @@ pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
         .any(|group| *group == "write" || *group == "read_write")
 }
 
+/// Whether the current request may only read: its principal lacks write access,
+/// or it has none and comes to an executor from a cluster node other than the
+/// scheduler.
 pub(crate) async fn current_principal_requires_read_only() -> bool {
     let context = RequestContext::current(AsyncMarker::new().await);
-    runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
-        .is_some_and(|principal| !principal_has_write_access(principal))
+    match runtime_auth::AuthRequestContext::auth_principal(context.as_ref()) {
+        Some(principal) => !principal_has_write_access(principal),
+        None => crate::cluster::peer::is_from_peer_executor(&context),
+    }
 }
 
 /// Denies an OTLP gRPC export from a read-only API key. The OTLP gRPC services run on the
