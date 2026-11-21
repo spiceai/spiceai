@@ -19,7 +19,7 @@ steps:
   - start: { ready-timeout: 600s }
   - assert-log:
       count:
-        "INFO .*Model 'qwen3' loads quantization Q4_K_M \\(0\\.4 GB\\) from Hugging Face repo 'unsloth/Qwen3-0\\.6B-GGUF', the quantization a model with no `files` loads: its Q4_K_M, as llama\\.cpp loads it\\. To load another of its 26 complete GGUF quantizations, name it in the model's `files`: BF16 \\(1\\.2 GB\\), ": 1
+        "INFO .*Model 'qwen3' loads quantization Q4_K_M \\(1 file, 0\\.4 GB\\) from Hugging Face repo 'unsloth/Qwen3-0\\.6B-GGUF', the quantization a model with no `files` loads: its Q4_K_M, as llama\\.cpp loads it\\. To load another of its 26 complete GGUF quantizations, name it in the model's `files`: BF16 \\(1\\.2 GB\\), ": 1
   - http:
       method: POST
       path: /v1/chat/completions

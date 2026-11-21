@@ -247,12 +247,8 @@ fn choose_quantization<'q>(
         Budget::Free(memory) if default.bytes > gguf_files::weights_budget(memory) => memory,
         Budget::Free(_) | Budget::Unmeasured | Budget::Split => {
             tracing::info!(
-                "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the quantization a model with no `files` loads: {}. To load another of its {} complete GGUF quantizations, name it in the model's `files`: {}.",
-                describe(
-                    Some(&gguf_files::printable(&default.name)),
-                    default.files.len()
-                ),
-                gigabytes(default.bytes),
+                "Model '{name}' loads {} from Hugging Face repo '{repo}', the quantization a model with no `files` loads: {}. To load another of its {} complete GGUF quantizations, name it in the model's `files`: {}.",
+                describe_sized(default),
                 default_reason(quantizations, default),
                 quantizations.len(),
                 names()
@@ -263,12 +259,8 @@ fn choose_quantization<'q>(
     match gguf_files::choose(quantizations, gguf_files::weights_budget(memory)) {
         Ok(chosen) => {
             tracing::info!(
-                "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the largest of its {} complete GGUF quantizations whose weights fit the {} of memory free for it with room for the context; {} ({}), which a model with no `files` loads, does not. Pin it with `files: [{}]`.",
-                describe(
-                    Some(&gguf_files::printable(&chosen.name)),
-                    chosen.files.len()
-                ),
-                gigabytes(chosen.bytes),
+                "Model '{name}' loads {} from Hugging Face repo '{repo}', the largest of its {} complete GGUF quantizations whose weights fit the {} of memory free for it with room for the context; {} ({}), which a model with no `files` loads, does not. Pin it with `files: [{}]`.",
+                describe_sized(chosen),
                 quantizations.len(),
                 gibibytes(memory),
                 gguf_files::printable(&default.name),
@@ -309,6 +301,17 @@ fn default_reason(quantizations: &[Quantization], default: &Quantization) -> Str
             "its first by path, as llama.cpp loads it when a repository has neither {q4} nor {q8}"
         )
     }
+}
+
+/// `quantization Q4_K_M (1 file, 18.3 GB)`: a quantization Spice chose, with its size.
+fn describe_sized(quantization: &Quantization) -> String {
+    let files = quantization.files.len();
+    format!(
+        "quantization {} ({files} {}, {})",
+        gguf_files::printable(&quantization.name),
+        if files == 1 { "file" } else { "files" },
+        gigabytes(quantization.bytes)
+    )
 }
 
 /// `quantization UD-Q4_K_XL (6 files)`, or `3 files` when the files are no one quantization.
