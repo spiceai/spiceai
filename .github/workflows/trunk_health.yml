@@ -60,7 +60,16 @@ jobs:
       # The PR's labels, commits and closing issues, and the advisory comment.
       # A fork PR's token stays read-only; the job then reports in its summary.
       pull-requests: write
+    env:
+      # The branch the PR or merge group targets. The gate guards trunk only,
+      # and an older release branch's base has no gate script to load, so off
+      # trunk every step below is skipped and the check passes.
+      TARGET: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
     steps:
+      - name: Pass at once off trunk
+        if: env.TARGET != 'trunk' && env.TARGET != 'refs/heads/trunk'
+        run: echo "Trunk Health guards trunk only; nothing to check for $TARGET."
+
       # The gate's script comes from the BASE commit, never the PR's, so a PR
       # cannot change it by editing .github/scripts. This file still comes from
       # the PR, as every workflow does, so editing it is reviewed like any other
@@ -71,6 +80,7 @@ jobs:
       # must not leave a red required check behind; the merge-queue run, where
       # a failure blocks, stays fail-closed.
       - name: Check out the base commit's scripts
+        if: env.TARGET == 'trunk' || env.TARGET == 'refs/heads/trunk'
         continue-on-error: ${{ github.event_name == 'pull_request' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,6 +90,7 @@ jobs:
           persist-credentials: false
 
       - name: Check trunk health
+        if: env.TARGET == 'trunk' || env.TARGET == 'refs/heads/trunk'
         continue-on-error: ${{ github.event_name == 'pull_request' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:

@@ -495,6 +495,18 @@ test('the workflow runs the base commit\'s gate, never the PR\'s', () => {
     2
   );
   assert.doesNotMatch(workflow, /continue-on-error: true/);
+  // Off trunk nothing is checked out or imported: an older release branch's
+  // base has no gate script, and the import would fail the required check.
+  for (const step of ["- name: Check out the base commit's scripts", '- name: Check trunk health']) {
+    const at = workflow.indexOf(step);
+    assert.notEqual(at, -1, step);
+    assert.match(
+      workflow.slice(at, at + 200),
+      /if: env\.TARGET == 'trunk' \|\| env\.TARGET == 'refs\/heads\/trunk'/,
+      `${step} must run only for trunk`
+    );
+  }
+  assert.match(workflow, /TARGET: \$\{\{ github\.event\.pull_request\.base\.ref \|\| github\.event\.merge_group\.base_ref \}\}/);
 });
 
 await runAll();
