@@ -615,3 +615,75 @@ async fn a_cast_to_a_mixed_array_and_struct_type_past_the_limit_is_refused() {
         "{error}"
     );
 }
+
+/// apache/datafusion#23188, carried by spiceai/datafusion#306. `SIMILAR TO` was
+/// planned as an unanchored POSIX regex match, so `%` and `_` were literal and a
+/// pattern matched anywhere in the string: `'abc' SIMILAR TO 'a%'` was false and
+/// `'abc' SIMILAR TO 'b'` was true. It is a SQL pattern again: `%` is any string,
+/// `_` is one character, `.` is a literal, and the whole string must match. The
+/// answer is the same from a literal, an in-memory table and a Parquet table.
+#[tokio::test(flavor = "multi_thread")]
+async fn similar_to_matches_the_whole_string_with_sql_wildcards() {
+    let ctx = spice_session(|_| {});
+    assert_eq!(
+        answer(
+            &ctx,
+            "SELECT 'abc' SIMILAR TO 'a%', 'x' SIMILAR TO '_', 'abc' SIMILAR TO 'b', \
+             'abc' NOT SIMILAR TO 'b', 'a.' SIMILAR TO 'a.', 'ab' SIMILAR TO 'a.'"
+        )
+        .await,
+        Ok(owned(&["true,true,false,true,true,false"])),
+        "SIMILAR TO is anchored, with `%` and `_` as wildcards and `.` as a literal"
+    );
+
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let path = dir.path().join("similar_to_segments.parquet");
+    write_parquet(
+        &ctx,
+        "SELECT * FROM (VALUES ('AUTOMOBILE'), ('BUILDING'), ('FURNITURE'), ('MACHINERY'), \
+         ('HOUSEHOLD'), (NULL)) AS t(s)",
+        &path,
+    )
+    .await;
+    run_statements(
+        &ctx,
+        &[
+            "CREATE TABLE similar_to_memory(s VARCHAR) AS VALUES ('AUTOMOBILE'), ('BUILDING'), \
+             ('FURNITURE'), ('MACHINERY'), ('HOUSEHOLD'), (NULL)",
+            &format!(
+                "CREATE EXTERNAL TABLE similar_to_parquet STORED AS PARQUET LOCATION '{}'",
+                path.display()
+            ),
+        ],
+    )
+    .await;
+    for table in ["similar_to_memory", "similar_to_parquet"] {
+        for (predicate, expected) in [
+            (
+                "s SIMILAR TO '(AUTO|BUILD)%'",
+                &["AUTOMOBILE", "BUILDING"][..],
+            ),
+            (
+                "s NOT SIMILAR TO '(AUTO|BUILD)%'",
+                &["FURNITURE", "HOUSEHOLD", "MACHINERY"][..],
+            ),
+            ("s SIMILAR TO 'MACHIN'", &[][..]),
+            ("s SIMILAR TO '%URE'", &["FURNITURE"][..]),
+            ("s SIMILAR TO 'HOUSEHOL_'", &["HOUSEHOLD"][..]),
+        ] {
+            assert_eq!(
+                sorted_answer(&ctx, &format!("SELECT s FROM {table} WHERE {predicate}")).await,
+                Ok(sorted(expected)),
+                "{table} WHERE {predicate}"
+            );
+        }
+    }
+
+    // `ESCAPE` is refused rather than answered as if it were not there.
+    assert!(
+        answer(&ctx, "SELECT 'a%b' SIMILAR TO 'a!%b' ESCAPE '!'")
+            .await
+            .is_err(),
+        "SIMILAR TO ... ESCAPE must fail, not return a wrong answer"
+    );
+}
