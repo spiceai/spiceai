@@ -66,7 +66,10 @@ crates and runs, in order:
 
 1. `make lint-rust PACKAGES="…" FEATURES="…"` — lint the crates you touched
 2. `make nextest-packages PACKAGES="…" FEATURES="…"` — their unit tests
-3. `make lint-rust` — the full workspace lint
+3. `make lint-rust` — the full workspace lint, then `make check-rust-feature-sets`,
+   which compiles `runtime` with no features and as `tools/spiceschema` builds it,
+   and `runtime-tools` under its own `mcp` feature (the workspace lint unifies
+   `spiced`'s features into every crate, so it never compiles a set without them)
 4. `make nextest verify-cli` — all unit tests, then assert the `spice` binary exists
 
 Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
