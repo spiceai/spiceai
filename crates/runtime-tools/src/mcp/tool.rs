@@ -32,7 +32,7 @@ use tools::naming::encode_tool_name;
 use tools::{SpiceModelTool, ToolAccess};
 
 use super::{
-    MAX_TOOL_RESULT_SIZE, Result,
+    MAX_TOOL_RESULT_SIZE, McpCallTimeout, Result,
     catalog::{McpClient, Reconnector},
     task_name_for_exposed_tool,
 };
@@ -46,6 +46,9 @@ pub struct McpToolWrapper {
 
     /// Replaces `client` when a call finds its transport closed.
     reconnector: Arc<Reconnector>,
+
+    /// Longest wait for each upstream `tools/call`.
+    call_timeout: McpCallTimeout,
 }
 
 impl McpToolWrapper {
@@ -54,12 +57,14 @@ impl McpToolWrapper {
         spec: Tool,
         server_name: String,
         reconnector: Arc<Reconnector>,
+        call_timeout: McpCallTimeout,
     ) -> Self {
         Self {
             client,
             spec,
             server_name,
             reconnector,
+            call_timeout,
         }
     }
 
@@ -168,9 +173,19 @@ impl SpiceModelTool for McpToolWrapper {
             }
 
             let params = CallToolRequestParams::new(self.internal_name()).with_arguments(object(input));
-            let mut result = self.client.read().await.call_tool(params.clone()).await;
+            let mut result = self
+                .client
+                .read()
+                .await
+                .call_tool(params.clone(), self.call_timeout)
+                .await;
             if self.reconnected_after_close(&result).await {
-                result = self.client.read().await.call_tool(params).await;
+                result = self
+                    .client
+                    .read()
+                    .await
+                    .call_tool(params, self.call_timeout)
+                    .await;
             }
             // The transport error names the HTTP client type. Keep the
             // sentence that says what happened to the call.
@@ -237,9 +252,19 @@ impl McpProxy for McpToolWrapper {
         if let Some(arguments) = arguments {
             params = params.with_arguments(arguments);
         }
-        let mut result = self.client.read().await.call_tool(params.clone()).await;
+        let mut result = self
+            .client
+            .read()
+            .await
+            .call_tool(params.clone(), self.call_timeout)
+            .await;
         if self.reconnected_after_close(&result).await {
-            result = self.client.read().await.call_tool(params).await;
+            result = self
+                .client
+                .read()
+                .await
+                .call_tool(params, self.call_timeout)
+                .await;
         }
         result
     }
@@ -253,10 +278,15 @@ impl McpProxy for McpToolWrapper {
             .client
             .read()
             .await
-            .call_tool_once(request.clone())
+            .call_tool_once(request.clone(), self.call_timeout)
             .await;
         if self.reconnected_after_close(&result).await {
-            result = self.client.read().await.call_tool_once(request).await;
+            result = self
+                .client
+                .read()
+                .await
+                .call_tool_once(request, self.call_timeout)
+                .await;
         }
         result
     }

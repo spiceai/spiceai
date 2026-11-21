@@ -50,6 +50,15 @@ pub enum Error {
     InvalidMcpArgs { source: shell_words::ParseError },
 
     #[snafu(display(
+        "Invalid param '{MCP_CALL_TIMEOUT_PARAM}': '{value}' {source}. Use a duration such as `30s`, `10m` or `1h`, or remove the param to use the default of {} minutes.",
+        MCP_CALL_TOOL_TIMEOUT.as_secs() / 60
+    ))]
+    InvalidMcpCallTimeout {
+        value: String,
+        source: InvalidCallTimeout,
+    },
+
+    #[snafu(display(
         "Error occurred in underlying communication to MCP tool. Error: {}",
         source
     ))]
@@ -70,7 +79,9 @@ impl Error {
     pub fn is_configuration_error(&self) -> bool {
         matches!(
             self,
-            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. }
+            Error::InvalidMCPDirective { .. }
+                | Error::InvalidMcpArgs { .. }
+                | Error::InvalidMcpCallTimeout { .. }
         )
     }
 }
@@ -106,8 +117,9 @@ pub const MCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(2);
 /// Longest wait for a `tools/list` or `ping` answer.
 pub const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Longest wait for one `tools/call`. Tools do real work, so this is longer than
-/// [`MCP_REQUEST_TIMEOUT`]; it exists so that a stalled server cannot hold a caller forever.
+/// Default longest wait for one `tools/call`, which [`MCP_CALL_TIMEOUT_PARAM`] overrides. Tools
+/// do real work, so this is longer than [`MCP_REQUEST_TIMEOUT`]; it exists so that a stalled
+/// server cannot hold a caller forever.
 pub const MCP_CALL_TOOL_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Largest MCP response, in bytes, Spice accepts from an MCP server over
@@ -131,6 +143,59 @@ const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
 /// connector's `http_headers`. If the value contains `;`, only `;` separates
 /// headers (so values may contain `,`); otherwise `,` separates them.
 const MCP_HEADERS_PARAM: &str = "mcp_headers";
+/// Longest wait for one upstream `tools/call`, as a duration such as `30m`.
+const MCP_CALL_TIMEOUT_PARAM: &str = "mcp_call_timeout";
+
+/// Why a [`MCP_CALL_TIMEOUT_PARAM`] value is not a usable timeout.
+#[derive(Debug, Snafu)]
+pub enum InvalidCallTimeout {
+    #[snafu(display("is not a duration: {source}"))]
+    Unparsable { source: fundu::ParseError },
+    #[snafu(display("is zero, so every call would time out"))]
+    Zero,
+    /// `fundu` reads `inf`/`infinity`, and values too large to represent, as [`Duration::MAX`].
+    #[snafu(display("is not finite"))]
+    Infinite,
+}
+
+/// Longest wait for one upstream `tools/call` of an MCP tool component.
+///
+/// When it elapses, Spice fails the call and sends `notifications/cancelled` to the MCP server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct McpCallTimeout(Duration);
+
+impl Default for McpCallTimeout {
+    fn default() -> Self {
+        Self(MCP_CALL_TOOL_TIMEOUT)
+    }
+}
+
+impl McpCallTimeout {
+    /// Reads [`MCP_CALL_TIMEOUT_PARAM`]; unset is [`MCP_CALL_TOOL_TIMEOUT`].
+    pub(crate) fn from_params(params: &HashMap<String, SecretString>) -> Result<Self> {
+        let Some(value) = params.get(MCP_CALL_TIMEOUT_PARAM) else {
+            return Ok(Self::default());
+        };
+        let value = value.expose_secret();
+        Self::parse(value).context(InvalidMcpCallTimeoutSnafu { value })
+    }
+
+    fn parse(value: &str) -> Result<Self, InvalidCallTimeout> {
+        let timeout = fundu::parse_duration(value.trim()).context(UnparsableSnafu)?;
+        if timeout.is_zero() {
+            return Err(InvalidCallTimeout::Zero);
+        }
+        if timeout == Duration::MAX {
+            return Err(InvalidCallTimeout::Infinite);
+        }
+        Ok(Self(timeout))
+    }
+
+    #[must_use]
+    pub fn duration(self) -> Duration {
+        self.0
+    }
+}
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -388,6 +453,60 @@ mod tests {
                 );
             }
             MCPConfig::Stdio { .. } => panic!("expected https config"),
+        }
+    }
+
+    fn call_timeout_params(value: &str) -> HashMap<String, SecretString> {
+        HashMap::from([(
+            MCP_CALL_TIMEOUT_PARAM.to_string(),
+            SecretString::from(value),
+        )])
+    }
+
+    #[test]
+    fn mcp_call_timeout_defaults_to_ten_minutes() {
+        let timeout = McpCallTimeout::from_params(&HashMap::new()).expect("no param is valid");
+        assert_eq!(timeout.duration(), Duration::from_mins(10));
+        assert_eq!(timeout, McpCallTimeout::default());
+    }
+
+    #[test]
+    fn mcp_call_timeout_reads_a_duration() {
+        for (value, expected) in [
+            ("30m", Duration::from_mins(30)),
+            ("45s", Duration::from_secs(45)),
+            (" 2h ", Duration::from_mins(120)),
+            ("1500ms", Duration::from_millis(1500)),
+        ] {
+            let timeout = McpCallTimeout::from_params(&call_timeout_params(value))
+                .unwrap_or_else(|e| panic!("'{value}' is a valid timeout: {e}"));
+            assert_eq!(timeout.duration(), expected, "value '{value}'");
+        }
+    }
+
+    #[test]
+    fn mcp_call_timeout_rejects_unusable_values_as_configuration_errors() {
+        for (value, reason) in [
+            ("0", "is zero"),
+            ("0s", "is zero"),
+            ("inf", "is not finite"),
+            ("infinity", "is not finite"),
+            ("ten minutes", "is not a duration"),
+            ("", "is not a duration"),
+            ("-5m", "is not a duration"),
+        ] {
+            let Err(e) = McpCallTimeout::from_params(&call_timeout_params(value)) else {
+                panic!("'{value}' must be rejected");
+            };
+            assert!(
+                e.is_configuration_error(),
+                "'{value}' must be a configuration error, got: {e}"
+            );
+            let message = e.to_string();
+            assert!(
+                message.contains(MCP_CALL_TIMEOUT_PARAM) && message.contains(reason),
+                "'{value}': the error must name the param and say it {reason}, got: {message}"
+            );
         }
     }
 

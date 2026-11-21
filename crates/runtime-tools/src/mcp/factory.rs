@@ -24,7 +24,7 @@ use spicepod::component::tool::Tool;
 use crate::catalog::SpiceToolCatalog;
 use crate::factory::ToolCatalogFactory;
 
-use super::{MCPConfig, MCPType, catalog::McpToolCatalog};
+use super::{MCPConfig, MCPType, McpCallTimeout, catalog::McpToolCatalog};
 
 pub struct McpCatalogFactory {}
 
@@ -46,11 +46,16 @@ impl ToolCatalogFactory for McpCatalogFactory {
 
         let mcp_type = MCPType::from_str(id)?;
         let cfg = MCPConfig::from_type(&mcp_type, &params_with_secrets, &env)?;
+        let call_timeout = McpCallTimeout::from_params(&params_with_secrets)?;
 
-        let ctlg =
-            McpToolCatalog::try_new(cfg, component.name.as_str(), component.description.clone())
-                .await
-                .boxed()?;
+        let ctlg = McpToolCatalog::try_new(
+            cfg,
+            call_timeout,
+            component.name.as_str(),
+            component.description.clone(),
+        )
+        .await
+        .boxed()?;
 
         Ok(Arc::new(ctlg))
     }
