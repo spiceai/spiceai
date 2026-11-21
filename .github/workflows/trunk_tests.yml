@@ -91,12 +91,18 @@ jobs:
             run="$RUN_ID"
             sha=$(gh run view "$RUN_ID" -R "$GITHUB_REPOSITORY" --json headSha -q .headSha)
           else
-            # Always trunk HEAD, whatever ref a dispatch named: these jobs
-            # hold credentials, and a branch's code gets them only through a
-            # trusted run_id. The merge-queue run of a trunk commit built
-            # exactly that commit (the queue fast-forwards trunk to it), and so
-            # did its push run.
-            sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/trunk" -q .sha)
+            # Trunk, whatever ref a dispatch named: these jobs hold credentials,
+            # and a branch's code gets them only through a trusted run_id. A
+            # scheduled run tests the commit it started at, its own head_sha,
+            # so that the next run's commit range starts at the commit this run
+            # actually tested; a dispatch tests trunk HEAD. The merge-queue run
+            # of a trunk commit built exactly that commit (the queue
+            # fast-forwards trunk to it), and so did its push run.
+            if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+              sha="$GITHUB_SHA"
+            else
+              sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/trunk" -q .sha)
+            fi
             run=""
             for id in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/e2e_test_ci.yml/runs?head_sha=$sha&per_page=20" \
                 -q '.workflow_runs[] | select(.event == "merge_group" or .event == "push") | .id'); do
