@@ -165,7 +165,10 @@ jobs:
               {
                 name: "Linux x64",
                 builder: "spiceai-dev-runners",
-                runner: "ubuntu-latest",
+                // Each `spiceai-dev-runners` job is a pod of its own, with its own network
+                // and Docker daemon, so a Linux leg binds fixed ports and runs the database
+                // it tests as a service container.
+                runner: "spiceai-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               }, {
@@ -435,7 +438,9 @@ jobs:
     environment: secret-free
     name: Setup model strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-24.04
+    # Runs beside the builds, which take far longer, so a wait for a runner here does
+    # not delay the jobs that read its matrix.
+    runs-on: spiceai-dev-runners
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
@@ -1137,25 +1142,35 @@ jobs:
             { engine: cayenne, mode: file },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        # Linux only: the macOS leg would install this database on a shared host.
+        # Linux only: the database runs as a service container, which needs Docker on the runner.
         exclude:
           - target:
               target_os: 'darwin'
 
+    # The default PostgreSQL line of test/source_versions.json.
+    services:
+      postgres:
+        image: docker.io/library/postgres:18
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd "pg_isready -U postgres -d testdb"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 60
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install PostgreSQL
-        uses: $/.github/actions/install-postgres
-        with:
-          pg-db: testdb
-
       - name: Prepare PostgreSQL dataset
         env:
-          PGPASSWORD: postgres
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: |
-          psql -h localhost -U postgres -d testdb < test/scripts/setup-data-postgresql.sql
-          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM test_postgresql_table;'
+          docker exec -i "$POSTGRES_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d testdb < test/scripts/setup-data-postgresql.sql
+          docker exec "$POSTGRES_CONTAINER" psql -U postgres -d testdb -c 'SELECT * FROM test_postgresql_table;'
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1304,46 +1319,45 @@ jobs:
             { engine: cayenne, mode: file },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        # Linux only: the macOS leg would install this database on a shared host.
+        # Linux only: the database runs as a service container, which needs Docker on the runner.
         exclude:
           - target:
               target_os: 'darwin'
 
+    # The default MySQL line of test/source_versions.json. The image creates `testdb` and
+    # gives `test_user` every privilege on it.
+    services:
+      mysql:
+        image: docker.io/library/mysql:9.7
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: testdb
+          MYSQL_USER: test_user
+          MYSQL_PASSWORD: password
+        # Over TCP: the server the image runs while it initializes listens on no port,
+        # so this passes only once the real server accepts connections.
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 90
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Configure apt mirrors (Linux)
-        if: matrix.target.target_os == 'linux'
-        uses: $/.github/actions/configure-apt
-
-      - name: Install MySQL (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mysql-server
-          sudo systemctl start mysql.service
-          sleep 5
-          mysql -uroot -proot -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
-          mysql -uroot -proot -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
-          mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -utest_user -ppassword
-
-      - name: Wait for MySQL to start
-        run: |
-          for attempt in {1..30}; do
-            mysqladmin ping -h localhost --silent && exit 0
-            sleep 1
-          done
-          echo "::error::MySQL is not accepting connections on localhost after 30s"
-          exit 1
-
       - name: Check MySQL
-        run: echo 'SELECT VERSION();' | mysql -h localhost -utest_user -ppassword
+        env:
+          MYSQL_CONTAINER: ${{ job.services.mysql.id }}
+        run: docker exec "$MYSQL_CONTAINER" mysql -h 127.0.0.1 -utest_user -ppassword -e 'SELECT VERSION();'
 
       - name: Prepare MySQL dataset
+        env:
+          MYSQL_CONTAINER: ${{ job.services.mysql.id }}
         run: |
-
-          mysql -h localhost -utest_user -ppassword testdb < test/scripts/setup-data-mysql.sql
-          mysql -h localhost -utest_user -ppassword testdb -e "SELECT * FROM test_mysql_table;"
+          docker exec -i "$MYSQL_CONTAINER" mysql -h 127.0.0.1 -utest_user -ppassword testdb < test/scripts/setup-data-mysql.sql
+          docker exec "$MYSQL_CONTAINER" mysql -h 127.0.0.1 -utest_user -ppassword testdb -e "SELECT * FROM test_mysql_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1491,51 +1505,43 @@ jobs:
     strategy:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        # Linux only: the macOS leg would install this database on a shared host.
+        # Linux only: the database runs as a service container, which needs Docker on the runner.
         exclude:
           - target:
               target_os: 'darwin'
 
+    # The image creates `testdb` and `test_user`. Its native port is published on 9001,
+    # where the dataset below connects.
+    services:
+      clickhouse:
+        image: docker.io/clickhouse/clickhouse-server:26.3.9.8
+        ports:
+          - 9001:9000
+        env:
+          CLICKHOUSE_DB: testdb
+          CLICKHOUSE_USER: test_user
+          CLICKHOUSE_PASSWORD: password
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        options: >-
+          --health-cmd "clickhouse-client -u test_user --password password --query 'SELECT 1'"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 60
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Configure apt mirrors (Linux)
-        if: matrix.target.target_os == 'linux'
-        uses: $/.github/actions/configure-apt
-
-      - name: Install Clickhouse
-        if: matrix.target.target_os == 'linux'
-        run: |
-          CLICKHOUSE_VERSION="26.3.9.8"
-          curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-common-static=${CLICKHOUSE_VERSION} clickhouse-server=${CLICKHOUSE_VERSION} clickhouse-client=${CLICKHOUSE_VERSION}
-          sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
-          for attempt in {1..30}; do
-            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && break
-            sleep 1
-          done
-          clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
-          clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
-          clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
-
-      - name: Wait for Clickhouse to start
-        run: |
-          for attempt in {1..30}; do
-            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && exit 0
-            sleep 1
-          done
-          echo "::error::ClickHouse is not accepting connections on port 9001 after 30s"
-          exit 1
-
       - name: Check Clickhouse
-        run: clickhouse client --port 9001 -utest_user --password password --query="SELECT version();"
+        env:
+          CLICKHOUSE_CONTAINER: ${{ job.services.clickhouse.id }}
+        run: docker exec "$CLICKHOUSE_CONTAINER" clickhouse-client -u test_user --password password --query="SELECT version();"
 
       - name: Prepare Clickhouse dataset
+        env:
+          CLICKHOUSE_CONTAINER: ${{ job.services.clickhouse.id }}
         run: |
-          clickhouse client --port 9001 -m -n -utest_user --password password --database=testdb < test/scripts/setup-data-clickhouse.sql
-          clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
+          docker exec -i "$CLICKHOUSE_CONTAINER" clickhouse-client -m -n -u test_user --password password --database=testdb < test/scripts/setup-data-clickhouse.sql
+          docker exec "$CLICKHOUSE_CONTAINER" clickhouse-client -u test_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -2339,9 +2345,7 @@ jobs:
   mssql_connector_quickstart:
     environment: secret-free
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
-    # The Microsoft apt list below is the Ubuntu 24.04 repository. ubuntu-latest
-    # moves on its own, so this Linux-only job stays on ubuntu-24.04.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.target.runner }}
     needs:
       - build
       - setup-matrix
@@ -2365,27 +2369,23 @@ jobs:
         env:
           ACCEPT_EULA: Y
           SA_PASSWORD: 1StrongPwd!!
+        # The job's first step queries the server, so the job starts only once it answers.
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '1StrongPwd!!' -C -b -Q 'SELECT 1'"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 90
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Configure apt mirrors
-        uses: $/.github/actions/configure-apt
-
-      - name: Install mssql-tools
-        run: |
-          # Ubuntu 24.04 prod.list pins signed-by to this keyring path.
-          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /usr/share/keyrings/microsoft-prod.gpg >/dev/null
-          sudo chmod 644 /usr/share/keyrings/microsoft-prod.gpg
-          curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
-          sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
-          # echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
-          # source ~/.bashrc
-
+      # `sqlcmd` from the server's own image, so nothing is installed on the runner.
       - name: Setup MS SQL test database
+        env:
+          SQLSERVER_CONTAINER: ${{ job.services.sqlserver.id }}
         run: |
-          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
+          docker cp ./test/scripts/setup-data-mssql.sql "$SQLSERVER_CONTAINER":/tmp/setup-data-mssql.sql
+          docker exec "$SQLSERVER_CONTAINER" /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '1StrongPwd!!' -C -b -i /tmp/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -3291,6 +3291,9 @@ jobs:
   e2e-gate:
     environment: secret-free
     name: E2E Test CI
+    # GitHub-hosted on purpose: a one-minute job that starts only after every other
+    # job here has finished, and is the required merge-queue check, so a wait for a
+    # self-hosted runner would add straight to every merge.
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     # The gate only reads the results it already has. Bounding it matters because it is
