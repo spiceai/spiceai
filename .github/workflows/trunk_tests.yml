@@ -500,7 +500,7 @@ jobs:
               continue
             fi
             verdict=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/statuses?per_page=100" \
-              -q '[.[] | select(.context == "trunk-tests" and .creator.login == "github-actions[bot]")][0].state // ""')
+              -q '[.[] | select(.context == "trunk-tests" and .creator.login == "github-actions[bot]")] | sort_by(.created_at, .id) | last | .state // ""')
             if [ -n "$verdict" ]; then
               echo "$branch at ${sha:0:12}: already tested ($verdict)"
               continue

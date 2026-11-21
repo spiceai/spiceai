@@ -131,10 +131,10 @@ jobs:
             echo "::notice::Commit $SHA predates trunk_tests.yml; its merge queue ran the full suite, so no trunk-tests result is required."
             exit 0
           fi
-          # The newest trunk-tests status posted by this repository's Actions;
-          # statuses list newest first.
+          # The newest trunk-tests status posted by this repository's Actions,
+          # chosen by its own timestamp and id rather than the list's order.
           status=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/statuses?per_page=100" \
-            -q '[.[] | select(.context == "trunk-tests" and .creator.login == "github-actions[bot]")][0] // empty | "\(.state) \(.target_url)"')
+            -q '[.[] | select(.context == "trunk-tests" and .creator.login == "github-actions[bot]")] | sort_by(.created_at, .id) | last // empty | "\(.state) \(.target_url)"')
           state=${status%% *}
           url=${status#* }
           if [ "$state" = success ]; then
