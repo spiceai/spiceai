@@ -1471,10 +1471,12 @@ mod wait_exit_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A stand-in for `spiced` that runs until it is killed.
+    /// A stand-in for `spiced` that runs until it is killed. `exec` makes the
+    /// sleeper the process `start` spawned, so killing the instance kills it
+    /// rather than leaving it orphaned.
     fn sleeping_binary(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("sleeping-spiced");
-        std::fs::write(&path, "#!/bin/sh\nsleep 60\n").expect("write the stand-in binary");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").expect("write the stand-in binary");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("make the stand-in binary executable");
         path
