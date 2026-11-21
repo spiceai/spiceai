@@ -60,6 +60,7 @@ crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
 podswatcher = { path = "../../crates/podswatcher" }
 repl = { path = "../../crates/repl" }
+spiced-args = { path = "../../crates/spiced-args" }
 runtime-tls = { path = "../../crates/runtime-tls" }
 futures.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
@@ -92,7 +93,6 @@ webpki-root-certs.workspace = true
 webpki-roots.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
-zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }

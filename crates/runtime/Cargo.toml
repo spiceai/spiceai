@@ -161,6 +161,7 @@ runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
 runtime-component = { path = "../runtime-component" }
+runtime-config = { path = "../runtime-config" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }

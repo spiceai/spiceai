@@ -27,8 +27,6 @@ const _: () = assert!(
     "Spice runtime requires a 64-bit platform (usize must be at least 8 bytes)"
 );
 
-use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches};
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
 use telemetry::noop::NoopMeterProvider;
@@ -71,11 +69,6 @@ const fn get_allocator_name() -> Option<&'static str> {
     }
 }
 
-/// Whether `id` was given on the command line, rather than falling back to its default.
-fn chosen_on_command_line(matches: &clap::ArgMatches, id: &str) -> bool {
-    matches.value_source(id) == Some(ValueSource::CommandLine)
-}
-
 /// The line every run opens with: it names the build every later line came from,
 /// plus the allocator when one was compiled in over the default.
 fn log_startup_banner() {
@@ -97,33 +90,12 @@ fn main() {
     // produced it, without the commit, which a crash report has as a field of its own.
     let crash_reporting = spiced::crash_handler::install(&version_without_commit());
 
-    let (mut args, open_telemetry_deprecated, flight_chosen, http_chosen) = {
-        let mut matches = spiced::Args::command().get_matches();
-        let open_telemetry_deprecated =
-            matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
-        // `--repl-flight-endpoint` moves only the REPL's SQL target, leaving the HTTP endpoint that
-        // `nql` uses wherever it already was. Choosing one without the other leaves nothing pointing
-        // the HTTP endpoint at that runtime, so `nql` says so instead of answering from whatever
-        // that endpoint reaches. See #11005.
-        let flight_chosen = chosen_on_command_line(&matches, "repl_flight_endpoint");
-        let http_chosen = chosen_on_command_line(&matches, "http_endpoint");
-        let args =
-            spiced::Args::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit());
-        (args, open_telemetry_deprecated, flight_chosen, http_chosen)
-    };
-    // A usage error like clap's own conflicts, reported before anything starts.
-    if let Err(message) = args.runtime.cluster.validate_role() {
-        spiced::Args::command()
-            .error(clap::error::ErrorKind::ArgumentConflict, message)
-            .exit();
-    }
-    // Mutable extraction removes typed values from `ArgMatches`; ending its
-    // scope here also drops clap's remaining parse state before startup. The
-    // enrollment key is left only in the zeroizing `Args` value, which the
-    // Cloud Connect bootstrap removes immediately.
-    args.open_telemetry_deprecated = open_telemetry_deprecated;
-    args.repl_config.http_endpoint_may_be_another_runtime =
-        repl::http_endpoint_unpaired(flight_chosen, http_chosen);
+    // `spice run` parses the arguments it starts this process with through the
+    // same function, so both read them alike. Ending the parse here also drops
+    // clap's parse state before startup: the enrollment key is left only in the
+    // zeroizing `Args` value, which the Cloud Connect bootstrap removes
+    // immediately.
+    let args = spiced::try_parse_args(std::env::args_os()).unwrap_or_else(|err| err.exit());
 
     if args.version {
         println!("{}", get_version_string());
@@ -157,7 +129,7 @@ fn main() {
     // Before the runtime opens a listener or an acceleration file, so every file
     // and connection it holds counts against the raised limit. Logged by `run`
     // once its subscriber, and the verbosity it is configured with, is installed.
-    args.open_file_limit = spiced::open_file_limit::raise();
+    let open_file_limit = spiced::open_file_limit::raise();
 
     // Nothing may log before this: the banner dates the run and names the build, so
     // a line above it belongs to a build the reader cannot identify. Anything that
@@ -170,7 +142,7 @@ fn main() {
         }
     });
 
-    let runtime_failed = match load_and_run(args) {
+    let runtime_failed = match load_and_run(args, open_file_limit) {
         Ok(()) => false,
         Err(err) => {
             in_tracing_context(|| {
@@ -202,7 +174,10 @@ fn main() {
 /// parsed before the pool exists. It is loaded here on a throwaway
 /// current-thread runtime and handed to `spiced::run`, so it is read exactly
 /// once and all three configuration surfaces resolve through one path.
-fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
+fn load_and_run(
+    mut args: spiced::Args,
+    open_file_limit: Option<spiced::open_file_limit::OpenFileLimit>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Claimed before anything this process does can be observed from outside
     // it: a second runtime in one instance directory must refuse before it
     // redeems an enrollment key, binds a listener, or dials the gateway. Held
@@ -259,7 +234,7 @@ fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>
         .worker_threads(cpu_budget::cpu_budget().main_runtime_worker_threads())
         .enable_all()
         .build()?;
-    tokio_runtime.block_on(spiced::run(args, app_bundle))?;
+    tokio_runtime.block_on(spiced::run(args, app_bundle, open_file_limit))?;
     Ok(())
 }
 

@@ -1,0 +1,19 @@
+[package]
+description = "spiced's command line, parsed by spiced and by `spice run` with one parser"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "spiced-args"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+clap.workspace = true
+repl = { path = "../repl" }
+runtime-config = { path = "../runtime-config" }
+spicepod = { path = "../spicepod", default-features = false }
+zeroize = "1.8"
+
+[lints]
+workspace = true

@@ -24,6 +24,7 @@ limitations under the License.
 //! subcommand from another command would add a third process to every Ctrl-C
 //! and put the CLI's argument parsing between the caller and the runtime.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -170,17 +171,11 @@ async fn launch_resolved_runtime(
     config: &RunConfig,
     resolved: &ResolvedSpiced,
 ) -> Result<std::process::ExitStatus> {
-    // Route --endpoint to the appropriate endpoint based on scheme
-    let (http_endpoint, flight_endpoint) = resolve_endpoint(
-        config.endpoint.as_deref(),
-        config.http_endpoint.as_deref(),
-        config.flight_endpoint.as_deref(),
-    )?;
+    let run_args = runtime_args(ctx, config)?;
 
     tracing::info!("Spice.ai runtime starting...");
 
-    let spiced_args = spiced_args(config, flight_endpoint.as_deref());
-    let std_cmd = ctx.get_run_cmd(resolved, &spiced_args, http_endpoint.as_deref())?;
+    let std_cmd = ctx.runtime_command(resolved, run_args);
 
     // Convert std::process::Command to tokio::process::Command
     let mut cmd = tokio::process::Command::from(std_cmd);
@@ -237,8 +232,29 @@ fn absolute_from_parent(path: PathBuf) -> Result<PathBuf> {
         .context(RuntimeExecutionSnafu)
 }
 
+/// The arguments the runtime is started with for `config`, after the program
+/// name: exactly what [`run_runtime`] passes it.
+///
+/// # Errors
+///
+/// Returns an error when the endpoint flags conflict or `--endpoint` has no
+/// recognized scheme, or when a relative `--tls-root-certificate-file` cannot
+/// be made absolute.
+pub(crate) fn runtime_args(ctx: &RuntimeContext, config: &RunConfig) -> Result<Vec<OsString>> {
+    // Route --endpoint to the appropriate endpoint based on scheme
+    let (http_endpoint, flight_endpoint) = resolve_endpoint(
+        config.endpoint.as_deref(),
+        config.http_endpoint.as_deref(),
+        config.flight_endpoint.as_deref(),
+    )?;
+    ctx.run_args(
+        &spiced_args(config, flight_endpoint.as_deref()),
+        http_endpoint.as_deref(),
+    )
+}
+
 /// The `spiced` argument list a [`RunConfig`] resolves to, apart from the
-/// endpoint and defaults [`RuntimeContext::get_run_cmd`] supplies.
+/// endpoint and defaults [`RuntimeContext::run_args`] supplies.
 ///
 /// Pass-through arguments come first so a flag the caller repeats explicitly is
 /// the one `spiced`'s parser sees last only where that is intended.
@@ -358,7 +374,7 @@ async fn run_with_signal_forwarding(
 /// Returns `(http_endpoint, flight_endpoint)`. If `--endpoint` is provided, it takes precedence
 /// over the corresponding specific endpoint flag. An error is returned if `--endpoint` has no
 /// recognized scheme or conflicts with an already-specified endpoint.
-pub(crate) fn resolve_endpoint(
+fn resolve_endpoint(
     endpoint: Option<&str>,
     http_endpoint: Option<&str>,
     flight_endpoint: Option<&str>,

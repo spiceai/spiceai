@@ -17721,6 +17721,7 @@ dependencies = [
  "runtime-checkpoint-sqlite",
  "runtime-cluster",
  "runtime-component",
+ "runtime-config",
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
@@ -18048,7 +18049,6 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "arrow_tools",
- "clap",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -18059,6 +18059,7 @@ dependencies = [
  "logos",
  "opentelemetry 0.32.0",
  "runtime-acceleration",
+ "runtime-config",
  "serde",
  "snafu",
  "spicepod",
@@ -18066,6 +18067,14 @@ dependencies = [
  "tracing",
  "util",
  "yaml",
+]
+
+[[package]]
+name = "runtime-config"
+version = "2.5.0-unstable"
+dependencies = [
+ "clap",
+ "spicepod",
 ]
 
 [[package]]
@@ -20323,6 +20332,7 @@ dependencies = [
  "snafu",
  "spice-cloud-client",
  "spiceai",
+ "spiced-args",
  "spicepod",
  "system-open",
  "tar",
@@ -20529,6 +20539,7 @@ dependencies = [
  "snmalloc-rs",
  "spice",
  "spice-cloud",
+ "spiced-args",
  "telemetry",
  "tempfile",
  "test-framework",
@@ -20547,6 +20558,16 @@ dependencies = [
  "webpki-root-certs",
  "webpki-roots 1.0.11",
  "yaml",
+]
+
+[[package]]
+name = "spiced-args"
+version = "2.5.0-unstable"
+dependencies = [
+ "clap",
+ "repl",
+ "runtime-config",
+ "spicepod",
  "zeroize",
 ]
 

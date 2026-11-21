@@ -1784,6 +1784,57 @@ mod build {
         assert!(!record.exists(), "the runtime must not start: {printed}");
     }
 
+    /// Arguments the runtime refuses build nothing, whichever check refuses
+    /// them: a value, a repeated option, or an option that requires another.
+    /// The runtime is still started with exactly those arguments, so its own
+    /// parser reports the refusal.
+    #[test]
+    fn test_run_builds_nothing_when_the_runtime_refuses_its_arguments() {
+        for args in [
+            &["--tls-enabled", "maybe"][..],
+            &["--metrics", "not-an-address"],
+            &["--region", "us-west-2"],
+            &["--telemetry-enabled", "maybe"],
+            &["--set-runtime", "noequals"],
+            &["--metrics", "127.0.0.1:9090", "--metrics", "127.0.0.1:9091"],
+        ] {
+            let project = two_manifest_project();
+            let bin = TempDir::new().expect("create the runtime directory");
+            let record = bin.path().join("runtime-saw");
+            let spiced = stub_runtime(&bin, &record);
+
+            let output = spice_cmd()
+                .current_dir(project.path())
+                .env("SPICED_PATH", &spiced)
+                .arg("run")
+                .args(args)
+                .timeout(std::time::Duration::from_mins(1))
+                .output()
+                .expect("run spice run");
+
+            let printed = printed(&output);
+            assert!(
+                !printed.contains("Building function"),
+                "{args:?}: {printed}"
+            );
+            assert!(
+                !project.path().join("decoy.wasm").exists(),
+                "{args:?}: nothing may be built for a runtime that refuses its arguments: {printed}"
+            );
+            assert!(
+                !printed.contains("does not recognize"),
+                "{args:?}: every option here is one the runtime has: {printed}"
+            );
+            let saw = runtime_saw(&record, &printed);
+            assert!(
+                args.iter()
+                    .all(|arg| saw.args.iter().any(|seen| seen == arg)),
+                "{args:?}: the runtime is started with the arguments it refuses: {:?}",
+                saw.args
+            );
+        }
+    }
+
     /// An app directory holding `spicepod.yaml`, whose function `decoy`
     /// builds `decoy.wasm`, and `production.yaml`, whose function `score`
     /// writes `production` to `score.wasm`.
