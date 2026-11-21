@@ -58,7 +58,8 @@ pub(crate) fn add_deprecation_headers(headers: &mut http::HeaderMap) {
 }
 
 /// One package is built at a time on a runtime; a request that arrives while one is building is
-/// answered `503` at once rather than waiting.
+/// answered `503` at once rather than waiting. A build holds its permit until its last write to
+/// the archive ends, which can be after its request is dropped.
 static PACKAGE_BUILD: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 
 /// The longest a package build may take, from the moment it starts.
@@ -240,8 +241,19 @@ pub(crate) async fn generate(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
     };
 
-    let Ok(_build) = PACKAGE_BUILD.try_acquire() else {
-        let mut response = json_error(StatusCode::SERVICE_UNAVAILABLE, busy_message(&payload.from));
+    build_package(&PACKAGE_BUILD, &store, &path, &payload.from).await
+}
+
+/// Builds the package of the Spicepod at `path` in `store` while holding the one permit of
+/// `builds`: `503` at once if another build holds it, `504` past [`PACKAGE_BUILD_DEADLINE`].
+async fn build_package(
+    builds: &'static Semaphore,
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    from: &str,
+) -> Response {
+    let Ok(build) = builds.try_acquire() else {
+        let mut response = json_error(StatusCode::SERVICE_UNAVAILABLE, busy_message(from));
         response.headers_mut().insert(
             RETRY_AFTER,
             HeaderValue::from(PACKAGE_BUILD_RETRY_AFTER_SECS),
@@ -249,9 +261,13 @@ pub(crate) async fn generate(
         return response;
     };
 
-    match tokio::time::timeout(PACKAGE_BUILD_DEADLINE, package::make_zip(&store, &path)).await {
-        Err(_elapsed) => json_error(StatusCode::GATEWAY_TIMEOUT, deadline_message(&payload.from)),
-        Ok(Err(e)) => package_error_response(&payload.from, &e),
+    // The permit goes into the build, whose writes to the archive run on the blocking thread pool
+    // and are not stopped when this request is dropped (its deadline passes, or the client goes
+    // away), so it is released only when the last of them ends.
+    let build = package::make_zip_holding(store.as_ref(), path, build);
+    match tokio::time::timeout(PACKAGE_BUILD_DEADLINE, build).await {
+        Err(_elapsed) => json_error(StatusCode::GATEWAY_TIMEOUT, deadline_message(from)),
+        Ok(Err(e)) => package_error_response(from, &e),
         Ok(Ok(package_zip_bytes)) => (
             StatusCode::OK,
             [(CONTENT_TYPE, "application/zip")],
@@ -264,7 +280,16 @@ pub(crate) async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use futures::stream::BoxStream;
     use http_body_util::BodyExt;
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+        ObjectMeta, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     async fn body_json(response: Response) -> serde_json::Value {
         let bytes = response
@@ -359,6 +384,223 @@ mod tests {
                 "<https://spiceai.org/docs/api/http/packages#deprecation>; rel=\"deprecation\"; type=\"text/html\""
             ))
         );
+    }
+
+    /// The body of a download, counted in `held` until the last `Bytes` sharing it is dropped.
+    struct HeldBody {
+        data: Vec<u8>,
+        held: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for HeldBody {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl Drop for HeldBody {
+        fn drop(&mut self) {
+            self.held.fetch_sub(self.data.len(), Ordering::SeqCst);
+        }
+    }
+
+    /// An in-memory store whose downloads count as `held` until the package drops them, and that
+    /// records when `watched` has been downloaded.
+    #[derive(Debug)]
+    struct HoldingStore {
+        inner: InMemory,
+        watched: Path,
+        watched_downloaded: Arc<AtomicBool>,
+        held: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for HoldingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HoldingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for HoldingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let result = self.inner.get_opts(location, options).await?;
+            let meta = result.meta.clone();
+            let range = result.range.clone();
+            let attributes = result.attributes.clone();
+            let data = result.bytes().await?.to_vec();
+            self.held.fetch_add(data.len(), Ordering::SeqCst);
+            let body = Bytes::from_owner(HeldBody {
+                data,
+                held: Arc::clone(&self.held),
+            });
+            if *location == self.watched {
+                self.watched_downloaded.store(true, Ordering::SeqCst);
+            }
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(
+                    futures::stream::once(async { Ok(body) }).boxed(),
+                ),
+                meta,
+                range,
+                attributes,
+            })
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Bytes that do not compress, so writing them to the archive takes a while.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    /// A build whose request is dropped while its archive is still being written (its deadline
+    /// passed, or the client went away) keeps its permit until that work ends. The archive is
+    /// written on the blocking thread pool, which a dropped request does not stop, so releasing
+    /// the permit with the request would let a second build start alongside the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_build_holds_its_permit_until_its_archive_work_ends() {
+        static BUILDS: Semaphore = Semaphore::const_new(1);
+        const BIG_FILE_BYTES: usize = 32 << 20;
+
+        let watched = Path::from("data/big.bin");
+        let watched_downloaded = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicUsize::new(0));
+        let store = HoldingStore {
+            inner: InMemory::new(),
+            watched: watched.clone(),
+            watched_downloaded: Arc::clone(&watched_downloaded),
+            held: Arc::clone(&held),
+        };
+        store
+            .put(
+                &Path::from("spicepod.yaml"),
+                "version: v1\nkind: Spicepod\nname: pkg\ndatasets:\n  - from: file:data/big.bin\n    name: big\n"
+                    .as_bytes()
+                    .to_vec()
+                    .into(),
+            )
+            .await
+            .expect("spicepod.yaml is stored");
+        store
+            .put(&watched, incompressible(BIG_FILE_BYTES).into())
+            .await
+            .expect("big.bin is stored");
+        let store: Arc<dyn ObjectStore> = Arc::new(store);
+
+        let first = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                build_package(
+                    &BUILDS,
+                    &store,
+                    &Path::from("spicepod.yaml"),
+                    "github:org/repo/abc123/spicepod.yaml",
+                )
+                .await
+            }
+        });
+
+        // Once big.bin is downloaded, the build hands it to the archive and waits for it to be
+        // written: drop the request then.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !watched_downloaded.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "big.bin was not downloaded within 60 seconds; {} bytes held",
+                held.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        first.abort();
+        let dropped = first.await;
+        assert!(
+            dropped
+                .as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled),
+            "the first build finished before it was dropped: {:?}",
+            dropped.map(|response| response.status())
+        );
+
+        let second_build = BUILDS.try_acquire();
+        let still_writing = held.load(Ordering::SeqCst);
+        assert_eq!(
+            still_writing, BIG_FILE_BYTES,
+            "big.bin was written to the archive before the request was dropped, so this test checked nothing; make it larger"
+        );
+        assert!(
+            second_build.is_err(),
+            "a second build started while the dropped build was still writing {still_writing} bytes to its archive"
+        );
+
+        // When the archive work ends, the permit is released.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while BUILDS.try_acquire().is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the permit was not released within 120 seconds of the build being dropped; {} bytes held",
+                held.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(held.load(Ordering::SeqCst), 0);
     }
 
     #[test]

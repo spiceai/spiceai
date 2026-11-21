@@ -358,7 +358,19 @@ fn is_folder_reference(path: &PathReference) -> bool {
 /// once (by two datasets, by a folder and a file in it, or by a folder and a Spicepod or component
 /// file in it) is downloaded, counted against the budget, and added once.
 pub async fn make_zip(store: &dyn ObjectStore, spicepod_path: &Path) -> Result<Bytes> {
-    make_zip_within(store, spicepod_path, PackageBudget::default()).await
+    zip_package(store, spicepod_path, PackageBudget::default(), ()).await
+}
+
+/// [`make_zip`] that holds `held` (a build permit, say) for as long as any work on the package
+/// runs. The archive is written on the blocking thread pool, and dropping this future (its
+/// deadline passed, or its caller went away) does not stop the write in progress, so `held` is
+/// released when that write ends rather than when the future is dropped.
+pub async fn make_zip_holding<H: Send + 'static>(
+    store: &dyn ObjectStore,
+    spicepod_path: &Path,
+    held: H,
+) -> Result<Bytes> {
+    zip_package(store, spicepod_path, PackageBudget::default(), held).await
 }
 
 /// [`make_zip`] within `budget`. A package that would pass it is refused as soon as that is
@@ -367,7 +379,17 @@ pub async fn make_zip(store: &dyn ObjectStore, spicepod_path: &Path) -> Result<B
 pub async fn make_zip_within(
     store: &dyn ObjectStore,
     spicepod_path: &Path,
+    budget: PackageBudget,
+) -> Result<Bytes> {
+    zip_package(store, spicepod_path, budget, ()).await
+}
+
+/// Builds the package within `budget`, holding `held` as [`make_zip_holding`] describes.
+async fn zip_package<H: Send + 'static>(
+    store: &dyn ObjectStore,
+    spicepod_path: &Path,
     mut budget: PackageBudget,
+    held: H,
 ) -> Result<Bytes> {
     let (spicepod_references, spicepods) =
         load_spicepods(store, spicepod_path, &mut budget).await?;
@@ -386,7 +408,7 @@ pub async fn make_zip_within(
         .into_iter()
         .partition(|path| matches!(path, PathReference::Retrieved { .. }));
 
-    let mut zip = ZipArchive::new();
+    let mut zip = ZipArchive::new(held);
     for linked_path in retrieved.into_iter().chain(referenced) {
         tracing::debug!("[zip package] Extracting content for linked path: {linked_path:?}");
         let origin = linked_path.origin();
@@ -443,7 +465,11 @@ pub async fn make_zip_within(
 
 /// A zip archive built in memory. Compressing a file is CPU work, so each file is written on the
 /// blocking thread pool rather than on the async runtime.
-struct ZipArchive {
+///
+/// The archive owns `held` and takes it into each blocking task that writes to it, so `held` is
+/// released only when the last write ends, even when the future building the archive is dropped
+/// while a write runs (a blocking task runs to its end regardless).
+struct ZipArchive<H> {
     writer: zip::ZipWriter<std::io::Cursor<Vec<u8>>>,
     /// The directories already added to the archive.
     directories: HashSet<String>,
@@ -451,15 +477,18 @@ struct ZipArchive {
     files: HashSet<Path>,
     /// The bytes of the files added, before compression.
     input_bytes: usize,
+    /// Held as long as the archive is: see [`make_zip_holding`].
+    held: H,
 }
 
-impl ZipArchive {
-    fn new() -> Self {
+impl<H: Send + 'static> ZipArchive<H> {
+    fn new(held: H) -> Self {
         Self {
             writer: zip::ZipWriter::new(std::io::Cursor::new(Vec::new())),
             directories: HashSet::new(),
             files: HashSet::new(),
             input_bytes: 0,
+            held,
         }
     }
 
@@ -492,10 +521,15 @@ impl ZipArchive {
     }
 
     async fn finish(self) -> Result<Bytes> {
-        let archive = tokio::task::spawn_blocking(move || self.writer.finish())
-            .await
-            .context(ZipTaskFailedSnafu)?
-            .context(FailedToCreateZipSnafu)?;
+        let Self { writer, held, .. } = self;
+        let archive = tokio::task::spawn_blocking(move || {
+            let archive = writer.finish();
+            drop(held);
+            archive
+        })
+        .await
+        .context(ZipTaskFailedSnafu)?
+        .context(FailedToCreateZipSnafu)?;
         Ok(Bytes::from(archive.into_inner()))
     }
 }
