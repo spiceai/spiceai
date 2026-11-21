@@ -779,6 +779,91 @@ mod flight_prepared_statements {
             .await
     }
 
+    /// Every parameter is advertised as nullable, so a client that follows the
+    /// parameter schema (Arrow Flight SQL JDBC refuses `setNull` on a
+    /// non-nullable parameter) may bind NULL, and the bound NULL gives the SQL
+    /// answer.
+    ///
+    /// Regression test for #15950.
+    #[tokio::test]
+    async fn test_parameter_schema_advertises_nullable_parameters() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                let null_bigint = || {
+                    create_param_batch(
+                        vec![("$1", arrow::datatypes::DataType::Int64, true)],
+                        vec![Arc::new(Int64Array::from(vec![None])) as ArrayRef],
+                    )
+                };
+                let cases = [
+                    (
+                        "SELECT CAST($1 AS BIGINT) AS n",
+                        null_bigint()?,
+                        "+---+\n| n |\n+---+\n|   |\n+---+",
+                    ),
+                    (
+                        "SELECT CAST($1 AS BIGINT) IS NULL AS is_null",
+                        null_bigint()?,
+                        "+---------+\n| is_null |\n+---------+\n| true    |\n+---------+",
+                    ),
+                    (
+                        "SELECT COALESCE(CAST($1 AS BIGINT), 42) AS n",
+                        null_bigint()?,
+                        "+----+\n| n  |\n+----+\n| 42 |\n+----+",
+                    ),
+                    (
+                        "SELECT COALESCE($1, 'default') AS s",
+                        create_param_batch(
+                            vec![("$1", arrow::datatypes::DataType::Utf8, true)],
+                            vec![
+                                Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef
+                            ],
+                        )?,
+                        "+---------+\n| s       |\n+---------+\n| default |\n+---------+",
+                    ),
+                ];
+
+                for (sql, params, expected) in cases {
+                    let stmt = get_prepared_statement(&mut client, sql).await?;
+                    let parameter_schema = stmt.parameter_schema()?.clone();
+                    assert_eq!(parameter_schema.fields().len(), 1, "{sql}");
+                    assert!(
+                        parameter_schema.field(0).is_nullable(),
+                        "parameter $1 of {sql} is advertised as non-nullable: {parameter_schema:?}"
+                    );
+
+                    let results = execute_prepared_statement(&mut client, stmt, params).await?;
+                    let results_str = arrow::util::pretty::pretty_format_batches(&results)?;
+                    assert_eq!(results_str.to_string(), expected, "{sql}");
+                }
+
+                // Several parameters of different types, in a WHERE clause and a
+                // LIMIT: each one is advertised as nullable.
+                let stmt = get_prepared_statement(
+                    &mut client,
+                    "SELECT x FROM (VALUES (1), (2)) AS t(x) WHERE x = $1 OR $2 IS NULL LIMIT $3",
+                )
+                .await?;
+                let parameter_schema = stmt.parameter_schema()?;
+                assert_eq!(parameter_schema.fields().len(), 3);
+                for field in parameter_schema.fields() {
+                    assert!(
+                        field.is_nullable(),
+                        "parameter {} is advertised as non-nullable: {parameter_schema:?}",
+                        field.name()
+                    );
+                }
+
+                Ok(())
+            })
+            .await
+    }
+
     /// Test prepared statement with no parameters.
     ///
     /// Verifies that prepared statements work correctly when no parameters are bound.
