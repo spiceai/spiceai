@@ -228,7 +228,9 @@ with each other, and each ran the writes separately.
 **Variants** are [JSON merge patches](https://www.rfc-editor.org/rfc/rfc7386).
 `spicepod:` patches the whole spicepod, and `datasets:` patches datasets by name
 (`*` for all), since a merge patch replaces a list wholesale. A variant may also
-set `env:` for `spiced`, whose values take the same placeholders, and `when: { <matrix key>: <value> }` to exist only in some
+set `env:` for `spiced`, whose values take the same placeholders,
+`http-bind: every-interface` to serve HTTP on `0.0.0.0` rather than
+`127.0.0.1` (the runner still reaches it at `127.0.0.1`), and `when: { <matrix key>: <value> }` to exist only in some
 combinations. Variants run in alphabetical order, and the first is the one the
 others are compared with.
 
@@ -260,7 +262,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 
 | Step | Does |
 | --- | --- |
-| `start: {}` | Start `spiced` and wait for `/v1/ready` and the Flight port (`ready-timeout:` to change the wait). Fails early if a dataset stays in `Error` while not ready. `{ ready: false }` waits only for HTTP, for datasets expected to fail. `patch:` (shaped like a variant) changes the spicepod for this and every later start. |
+| `start: {}` | Start `spiced` and wait for `/v1/ready` and the Flight port (`ready-timeout:` to change the wait). Fails early if a dataset stays in `Error` while not ready. `{ ready: false }` waits only for HTTP, for datasets expected to fail. `patch:` (shaped like a variant) changes the spicepod for this and every later start. `exits: <pattern>` expects `spiced` to refuse to start instead: it must exit with a failure, without answering `/health`, and its log must match the pattern; the steps after it run with `spiced` stopped. |
 | `stop: {}` | SIGTERM, then SIGKILL after 45 s; fails if the shutdown wasn't clean. |
 | `kill-spiced: {}` | SIGKILL; `{ signal: STOP-then-KILL }` freezes it first. |
 | `restart: {}` | Stop (or `{ kill: KILL }`) and start again; takes `start`'s options. |
@@ -481,10 +483,7 @@ dataset a key both or neither. The sidecar does not inherit
 `SPICEAI_API_KEY` from the runner's environment, which a dataset without a
 key would otherwise pick up, unless `sidecar.env` sets it. Nor does it read a
 `.env` or `.env.local` above its directory, such as the checkout's: its
-directory gets empty files of both names. An upstream with
-API keys refuses Flight queries after its 10,000th handshake
-([known-failing](../../test/spicescript/known-failing/flight-auth/flight-auth-handshake-limit.yaml)),
-so a script that loads a sidecar runs its upstream without them.
+directory gets empty files of both names.
 
 ### Load
 

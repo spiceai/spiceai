@@ -1,0 +1,11 @@
+service:
+  type: LoadBalancer
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  runtime:
+    auth:
+      api-key:
+        keys: ['${ secrets:my_key }:rw']
+  datasets: []

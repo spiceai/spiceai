@@ -382,10 +382,15 @@ async fn run_step(
             ready_timeout,
             wait_ready,
             patch,
+            exits,
         } => {
             apply_patch(instance, patch.as_ref())?;
             instance.spiced.start(&instance.spicepod_yaml)?;
             let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            if let Some(pattern) = exits {
+                instance.spiced.wait_exit(timeout, pattern).await?;
+                return Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()));
+            }
             // A scheduler with accelerations is ready only once an executor
             // has joined and loaded them, so the executor starts first.
             instance.spiced.wait_http(timeout).await?;

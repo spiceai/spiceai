@@ -1,0 +1,14 @@
+auth:
+  mode: none
+service:
+  type: LoadBalancer
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  runtime:
+    tls:
+      enabled: false
+      client_auth_ca_file: /etc/spice/tls/ca.crt
+      client_auth_mode: required
+  datasets: []

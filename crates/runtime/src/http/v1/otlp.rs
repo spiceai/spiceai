@@ -262,17 +262,12 @@ pub(crate) async fn encode_layer_errors(req: Request<Body>, next: Next) -> Respo
     encoded
 }
 
-/// The message of a layer's error body: a JSON `message` field, or the text itself.
+/// The message of a layer's error body (see [`super::layer_error_text`]).
 async fn layer_error_message(body: Body) -> Option<String> {
     let bytes = axum::body::to_bytes(body, MAX_LAYER_ERROR_BODY_BYTES)
         .await
         .ok()?;
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
-        && let Some(message) = value.get("message").and_then(serde_json::Value::as_str)
-    {
-        return Some(message.to_string());
-    }
-    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    let text = super::layer_error_text(&bytes);
     (!text.is_empty()).then_some(text)
 }
 

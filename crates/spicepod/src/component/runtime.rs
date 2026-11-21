@@ -76,6 +76,14 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
 
+    /// Extra host names the HTTP API answers to when the runtime does not
+    /// require authentication; `*` answers to any host. An entry is a host
+    /// (`spice.internal`), a `host:port`, a URL, or a name with a leading dot
+    /// (`.corp.example`), which also matches every name under it. HTTP only;
+    /// Flight is unaffected. Replaces the deprecated `runtime.mcp.allowed_hosts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight: Option<Flight>,
 
@@ -126,6 +134,17 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// The host names the HTTP API answers to: `runtime.allowed_hosts`, or the
+    /// deprecated `runtime.mcp.allowed_hosts` when only it is set.
+    #[must_use]
+    pub fn effective_allowed_hosts(&self) -> Option<&[String]> {
+        self.allowed_hosts.as_deref().or_else(|| {
+            self.mcp
+                .as_ref()
+                .and_then(|mcp| mcp.allowed_hosts.as_deref())
+        })
+    }
+
     /// Scheduler tuning config. When only `runtime.state` is set, the scheduler
     /// runs with default tuning. [`Self::scheduler_state`] gives where the
     /// scheduler keeps its state.
@@ -348,13 +367,14 @@ pub struct TlsConfig {
 /// audit-only deployments where every cert seen should be recorded
 /// but not enforced.
 ///
-/// `Required` enables strict mTLS: the server demands a valid client
-/// cert (verified against `client_auth_ca` / `client_auth_ca_file`)
-/// for every connection on the Flight listener; on the HTTP and
-/// metrics listeners the TLS handshake admits no-cert connections so
-/// Kubernetes liveness / readiness probes and Prometheus scrapes work
-/// without a client cert, but the HTTP route layer 401s any
-/// non-probe request whose connection has no verified client cert.
+/// `Required` enables strict mTLS: the server demands a valid client cert
+/// (verified against `client_auth_ca` / `client_auth_ca_file`) for every
+/// connection on the Flight listener; on the HTTP and metrics listeners the
+/// TLS handshake admits no-cert connections so Kubernetes liveness and
+/// readiness probes (`/health`, `/v1/ready`, and `/health` on the metrics
+/// port) work without a client cert, and every other request whose
+/// connection has no verified client cert, `/metrics` included, is
+/// answered 401.
 ///
 /// Whether a presented cert *also* becomes the request's auth
 /// principal is determined separately by whether `runtime.auth` is
@@ -896,11 +916,9 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct McpConfig {
-    /// Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.
-    /// Used to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),
-    /// host-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).
-    /// Set to `["*"]` to disable host checking entirely.
-    /// Unset or empty uses the defaults (`["localhost", "127.0.0.1", "::1"]`).
+    /// Deprecated: use `runtime.allowed_hosts`, which applies to the whole HTTP
+    /// API, `/v1/mcp` included. When `runtime.allowed_hosts` is not set, this
+    /// list is used in its place; setting both is a configuration error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<String>>,
 }
@@ -1958,6 +1976,8 @@ pub struct RuntimeDeserializer {
     pub auth: Option<Auth>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight: Option<Flight>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2077,6 +2097,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             drasi: deserializer.drasi,
             auth: deserializer.auth,
             cors: deserializer.cors,
+            allowed_hosts: deserializer.allowed_hosts,
             flight: deserializer.flight,
             mcp: deserializer.mcp,
             shutdown_timeout: deserializer.shutdown_timeout,

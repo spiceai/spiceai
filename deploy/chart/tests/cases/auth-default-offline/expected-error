@@ -1,0 +1,1 @@
+Spice requires an API key, and this render cannot read the cluster to reuse one (helm template, Argo CD). Create a Secret with an `api-key` entry and set auth.apiKey.existingSecret, or render with --dry-run=server. See https://spiceai.org/docs/deployment/kubernetes#authentication

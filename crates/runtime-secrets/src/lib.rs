@@ -818,6 +818,38 @@ impl Secrets {
         key: &str,
         param_str: ParamStr<'_>,
     ) -> std::result::Result<SecretString, Vec<UnresolvedSecretReference>> {
+        self.try_inject_secrets_with(key, param_str, EmptySecret::Accept)
+            .await
+    }
+
+    /// Like [`Self::try_inject_secrets`], for a credential such as an API key:
+    /// a reference that resolves to the empty string is also a failure.
+    ///
+    /// No part of a credential is optional. A template such as
+    /// `prefix-${ env:SUFFIX }` with `SUFFIX` defined as `""` would otherwise
+    /// produce `prefix-`, a shorter and more guessable credential than the one
+    /// configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns every reference in `param_str` that could not be resolved or
+    /// resolved to the empty string, in document order. No secret values are
+    /// included.
+    pub async fn try_inject_credential(
+        &self,
+        key: &str,
+        param_str: ParamStr<'_>,
+    ) -> std::result::Result<SecretString, Vec<UnresolvedSecretReference>> {
+        self.try_inject_secrets_with(key, param_str, EmptySecret::Reject)
+            .await
+    }
+
+    async fn try_inject_secrets_with(
+        &self,
+        key: &str,
+        param_str: ParamStr<'_>,
+        empty: EmptySecret,
+    ) -> std::result::Result<SecretString, Vec<UnresolvedSecretReference>> {
         tracing::trace!("Injecting secrets (strict) for: {}", key);
         let input = param_str.0;
         let mut result = String::with_capacity(input.len().saturating_add(256));
@@ -829,6 +861,17 @@ impl Secrets {
                 .resolve_reference(&secret_replacement.store_name, &secret_replacement.key)
                 .await
             {
+                Ok(secret) if empty == EmptySecret::Reject && secret.expose_secret().is_empty() => {
+                    let reference = format!(
+                        "${{ {}:{} }}",
+                        secret_replacement.store_name, secret_replacement.key
+                    );
+                    unresolved.push(UnresolvedSecretReference {
+                        cause: format!("Secret `{reference}` resolved to an empty value"),
+                        reference,
+                        kind: UnresolvedSecretKind::Empty,
+                    });
+                }
                 Ok(secret) => result.push_str(secret.expose_secret()),
                 Err(failure) => unresolved.push(failure),
             }
@@ -853,8 +896,8 @@ pub struct UnresolvedSecretReference {
     pub reference: String,
     /// Why the reference did not resolve, for retry classification.
     pub kind: UnresolvedSecretKind,
-    /// Why it did not resolve (not found, undefined store, store error).
-    /// Never contains a secret value.
+    /// Why it did not resolve (not found, undefined store, store error, or
+    /// an empty value where one is required). Never contains a secret value.
     pub cause: String,
 }
 
@@ -868,6 +911,19 @@ pub enum UnresolvedSecretKind {
     /// Every consulted store failed (for example an expired token or a
     /// network error), so the key may exist.
     StoreError,
+    /// The reference resolved to the empty string where a value is required
+    /// (see [`Secrets::try_inject_credential`]).
+    Empty,
+}
+
+/// Whether a strict injection accepts a reference that resolves to the empty
+/// string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptySecret {
+    /// An empty value is a deliberately optional secret.
+    Accept,
+    /// An empty value is a failure, as for a credential.
+    Reject,
 }
 
 /// A component's `params:` referenced secrets that could not be resolved.

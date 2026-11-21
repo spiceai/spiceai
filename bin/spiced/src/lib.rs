@@ -227,6 +227,14 @@ pub enum Error {
     #[snafu(display("Unable to configure TLS: {source}"))]
     UnableToInitializeTls { source: Box<dyn std::error::Error> },
 
+    #[snafu(display("{source}"))]
+    UnableToConfigureAuth { source: runtime::auth::Error },
+
+    #[snafu(display(
+        "Both `runtime.allowed_hosts` and the deprecated `runtime.mcp.allowed_hosts` are set. Remove `runtime.mcp.allowed_hosts`; `runtime.allowed_hosts` applies to `/v1/mcp` as well. See https://spiceai.org/docs/reference/spicepod/runtime#allowed_hosts"
+    ))]
+    BothAllowedHostsSet,
+
     #[snafu(display("Unable to initialize tracing: {source}"))]
     UnableToInitializeTracing {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -1197,9 +1205,22 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         rt.init_component_metrics();
     }
 
+    // Restore control-plane-delivered secrets from the local cache and register
+    // their store BEFORE resolving API keys and loading components. Both
+    // resolve `${ secrets:… }`, so a store installed after this point would
+    // arrive too late for every API key and component that referenced one —
+    // and a value a deployment rotates reaches the components holding the old
+    // one only by loading them again, which is this path. Local files only, no
+    // control-plane round trip, so this neither blocks nor fails when the
+    // gateway is unreachable.
+    let delivered_secrets =
+        cloud_connect::restore_delivered_secrets(&rt, cloud_connect_identity.as_ref()).await;
+
     let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
-        Some(app) => EndpointAuth::new(rt.secrets(), app).await,
+        Some(app) => EndpointAuth::new(rt.secrets(), app)
+            .await
+            .context(UnableToConfigureAuthSnafu)?,
         None => EndpointAuth::no_auth(),
     };
 
@@ -1252,6 +1273,36 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     }
     let endpoint_auth = endpoint_auth.with_identity_source(identity_source);
 
+    // `runtime.allowed_hosts`, and the MCP-only list it replaces.
+    if let Some(app) = app.as_ref() {
+        let mcp_allowed_hosts = app
+            .runtime
+            .mcp
+            .as_ref()
+            .and_then(|mcp| mcp.allowed_hosts.as_ref());
+        match (app.runtime.allowed_hosts.as_ref(), mcp_allowed_hosts) {
+            (Some(_), Some(_)) => return BothAllowedHostsSetSnafu.fail(),
+            (None, Some(_)) => tracing::warn!(
+                "`runtime.mcp.allowed_hosts` is deprecated and now applies to the whole HTTP API. Move its entries to `runtime.allowed_hosts`; `runtime.mcp.allowed_hosts` is removed in v2.6. See https://spiceai.org/docs/reference/spicepod/runtime#allowed_hosts"
+            ),
+            _ => {}
+        }
+    }
+    let answers_any_host = app
+        .as_ref()
+        .and_then(|app| app.runtime.effective_allowed_hosts())
+        .is_some_and(|hosts| hosts.iter().any(|host| host.trim() == "*"));
+    if !is_executor
+        && !runtime_auth_configured
+        && !matches!(client_auth_mode, ClientAuthMode::Required)
+        && !answers_any_host
+    {
+        tracing::info!(
+            "{}",
+            runtime::http_no_authentication_message(&args.runtime.http_bind_address.to_string())
+        );
+    }
+
     // Captured before `args` is moved into the server task below.
     let runtime_overrides = args.set_runtime.clone();
 
@@ -1271,17 +1322,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             result
         }
     });
-
-    // Restore control-plane-delivered secrets from the local cache and register
-    // their store BEFORE loading components. Component initialization is what
-    // resolves `${ secrets:… }`, so a store installed after this point would
-    // arrive too late for every component that referenced one — and a value a
-    // deployment rotates reaches the components holding the old one only by
-    // loading them again, which is this path. Local files only, no
-    // control-plane round trip, so this neither blocks nor fails when the
-    // gateway is unreachable.
-    let delivered_secrets =
-        cloud_connect::restore_delivered_secrets(&rt, cloud_connect_identity.as_ref()).await;
 
     // The connection report's two latches. The connection half is filled by the
     // control client on the first message Spice Cloud sends back; the serving

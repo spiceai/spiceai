@@ -1,0 +1,7 @@
+{{- if eq (include "spiceai.authMode" .) "api_key" }}
+Spice requires an API key on HTTP (8090) and Flight (50051). Read it with:
+
+  kubectl get secret -n {{ include "spiceai.namespace" . }} {{ include "spiceai.apiKeySecretName" . }} -o jsonpath='{.data.api-key}' | base64 -d
+
+and send it as `X-API-Key: <key>` (HTTP) or as the password of a Flight handshake. To use your own key, set auth.apiKey.existingSecret. See https://spiceai.org/docs/deployment/kubernetes#authentication
+{{- end }}

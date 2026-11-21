@@ -1,0 +1,1 @@
+spicepod.runtime.auth is empty and service.type is LoadBalancer: the runtime would serve callers outside the cluster without an API key. Add an `api-key` entry with `keys` to spicepod.runtime.auth, or remove spicepod.runtime.auth and the chart sets an API key (auth.mode: api_key), or use a ClusterIP Service.

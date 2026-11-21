@@ -66,6 +66,11 @@ where
         })
 }
 
+/// The `error` of the 401 that the HTTP and metrics listeners answer under
+/// [`ClientAuthEnforcement::Required`] to a non-probe request whose connection
+/// presented no verified client certificate.
+pub const CLIENT_CERTIFICATE_REQUIRED: &str = "This endpoint requires a client certificate signed by the configured client CA (`runtime.tls.client_auth_ca_file` or `client_auth_ca`), because `runtime.tls.client_auth_mode` is `required`. Configure the client's certificate and key; for Prometheus, set `tls_config.cert_file` and `key_file`. See https://docs.spice.ai/docs/enterprise";
+
 /// Process-wide TLS reload control plane.
 ///
 /// `TlsControl` is the single owner of the underlying [`CertWatcher`] for
@@ -132,10 +137,11 @@ impl TlsControl {
 /// - [`Self::http_server_config`] uses an `allow_unauthenticated`
 ///   verifier: the handshake succeeds without a client cert
 ///   (presented-but-invalid certs are still rejected at the handshake).
-///   The HTTP and metrics listeners use this. HTTP route middleware
-///   gates non-probe routes on the presence of a verified client cert
-///   so `/health` and `/v1/ready` remain reachable for Kubernetes
-///   liveness/readiness probes that cannot mount a client certificate.
+///   The HTTP and metrics listeners use this. Both gate every request
+///   except their probe routes (`/health` and `/v1/ready` on HTTP,
+///   `/health` on metrics) on the presence of a verified client cert,
+///   so Kubernetes liveness/readiness probes that cannot mount a client
+///   certificate still reach them.
 ///
 /// Under `client_auth_mode: request`, both listeners use the
 /// `allow_unauthenticated` verifier and the HTTP route layer does
@@ -202,9 +208,9 @@ pub enum ClientAuthEnforcement {
     /// `client_auth_mode: required`. Flight listener uses the strict
     /// verifier (no-cert handshakes rejected at TLS). HTTP and
     /// metrics listeners use the `allow_unauthenticated` verifier so
-    /// probes work without a client cert; the HTTP route layer 401s
-    /// any non-probe request whose connection has no
-    /// [`runtime_auth::ChannelIdentity`].
+    /// probes work without a client cert; both answer
+    /// [`CLIENT_CERTIFICATE_REQUIRED`] with a 401 to any non-probe
+    /// request whose connection presented no verified client cert.
     Required,
 }
 

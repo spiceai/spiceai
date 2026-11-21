@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ use crate::{
 };
 use runtime_auth::{FlightBasicAuth, GrpcAuth, HttpAuth, IdentitySource, api_key::ApiKeyAuth};
 use secrecy::ExposeSecret;
+use snafu::prelude::*;
 use spicepod::component::access::AccessMode;
 use spicepod::component::runtime::{ApiKey, ApiKeyAuth as SpicepodApiKeyAuth, ClientAuthMode};
 use std::sync::Arc;
@@ -27,6 +28,29 @@ use tokio::sync::RwLock;
 
 mod anonymous;
 pub mod no_auth;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("{}", unresolved_api_key_message(*position, causes)))]
+    UnresolvedApiKeySecret {
+        /// The key's 1-based position in `runtime.auth.api_key.keys`.
+        position: usize,
+        /// Why each reference did not resolve. Never contains a secret value.
+        causes: Vec<String>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// The error for an API key whose secret references did not all resolve to a
+/// value. It names the key by position, never by value: the literal parts of a
+/// key are part of the credential.
+fn unresolved_api_key_message(position: usize, causes: &[String]) -> String {
+    format!(
+        "Failed to load API key {position} of `runtime.auth.api_key.keys`: {}. The runtime does not start with an API key that is missing part of its value. Define each secret the key references with a non-empty value in a configured secret store, or remove the reference. See https://spiceai.org/docs/api/auth",
+        causes.join("; ")
+    )
+}
 
 #[derive(Clone)]
 pub struct EndpointAuth {
@@ -47,32 +71,38 @@ pub struct EndpointAuth {
 }
 
 impl EndpointAuth {
-    #[must_use]
-    pub async fn new(secrets: Arc<RwLock<Secrets>>, app: &App) -> Self {
+    /// The authentication `app` configures in `runtime.auth`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnresolvedApiKeySecret`] when an API key references a
+    /// secret that does not resolve, or resolves to an empty value. Such a key
+    /// would otherwise be accepted as only its literal parts.
+    pub async fn new(secrets: Arc<RwLock<Secrets>>, app: &App) -> Result<Self> {
         let Some(auth) = app.runtime.auth.as_ref() else {
-            return Self::no_auth();
+            return Ok(Self::no_auth());
         };
 
         if let Some(api_key_auth_config) = auth.api_key.as_ref() {
             if !api_key_auth_config.enabled {
-                return Self::no_auth();
+                return Ok(Self::no_auth());
             }
 
             let secrets = Secrets::snapshot(&secrets).await;
-            let api_key_auth = api_key_auth(&secrets, api_key_auth_config).await;
+            let api_key_auth = api_key_auth(&secrets, api_key_auth_config).await?;
             let http_auth = Arc::clone(&api_key_auth) as Arc<dyn HttpAuth + Send + Sync>;
             let flight_basic_auth =
                 Arc::clone(&api_key_auth) as Arc<dyn FlightBasicAuth + Send + Sync>;
             let grpc_auth = Arc::clone(&api_key_auth) as Arc<dyn GrpcAuth + Send + Sync>;
-            return Self {
+            return Ok(Self {
                 http_auth: Some(http_auth),
                 flight_basic_auth: Some(flight_basic_auth),
                 grpc_auth: Some(grpc_auth),
                 identity_source: IdentitySource::RuntimeAuth,
-            };
+            });
         }
 
-        Self::no_auth()
+        Ok(Self::no_auth())
     }
 
     #[must_use]
@@ -173,11 +203,27 @@ impl Default for EndpointAuth {
     }
 }
 
-#[must_use]
-async fn api_key_auth(secrets: &Secrets, api_key_auth: &SpicepodApiKeyAuth) -> Arc<ApiKeyAuth> {
+/// Resolves every configured API key in full.
+///
+/// A key is a credential, so it is resolved strictly: a reference that does
+/// not resolve, or resolves to the empty string, fails instead of leaving the
+/// key as its literal parts (`prefix-${ env:SUFFIX }` accepted as `prefix-`).
+async fn api_key_auth(
+    secrets: &Secrets,
+    api_key_auth: &SpicepodApiKeyAuth,
+) -> Result<Arc<ApiKeyAuth>> {
     let mut keys = Vec::with_capacity(api_key_auth.keys.len());
-    for key in &api_key_auth.keys {
-        let secret_key_box = secrets.inject_secrets("keys", ParamStr(key.as_ref())).await;
+    for (index, key) in api_key_auth.keys.iter().enumerate() {
+        let secret_key_box = secrets
+            .try_inject_credential("keys", ParamStr(key.as_ref()))
+            .await
+            .map_err(|unresolved| Error::UnresolvedApiKeySecret {
+                position: index.saturating_add(1),
+                causes: unresolved
+                    .into_iter()
+                    .map(|failure| failure.cause)
+                    .collect(),
+            })?;
         let secret_key = secret_key_box.expose_secret();
 
         let key = match key {
@@ -192,7 +238,7 @@ async fn api_key_auth(secrets: &Secrets, api_key_auth: &SpicepodApiKeyAuth) -> A
         keys.push(key);
     }
 
-    Arc::new(ApiKeyAuth::new(keys))
+    Ok(Arc::new(ApiKeyAuth::new(keys)))
 }
 
 impl std::fmt::Debug for EndpointAuth {
@@ -262,7 +308,9 @@ mod tests {
             keys: vec![ApiKey::parse_str(&format!("${{env:{secret_key}}}:rw"))],
         };
 
-        let auth = api_key_auth(&secrets, &api_key_auth_config).await;
+        let auth = api_key_auth(&secrets, &api_key_auth_config)
+            .await
+            .expect("every referenced secret resolves");
 
         // Verify the secret was replaced and the key works
         let parts = create_request_parts(Some(secret_value));
@@ -304,7 +352,9 @@ mod tests {
             keys: vec![ApiKey::parse_str(&format!("${{env:{secret_key}}}:ro"))],
         };
 
-        let auth = api_key_auth(&secrets, &api_key_auth_config).await;
+        let auth = api_key_auth(&secrets, &api_key_auth_config)
+            .await
+            .expect("every referenced secret resolves");
 
         // Verify the secret was replaced and the key works
         let parts = create_request_parts(Some(secret_value));
@@ -345,7 +395,9 @@ mod tests {
             ],
         };
 
-        let auth = api_key_auth(&secrets, &api_key_auth_config).await;
+        let auth = api_key_auth(&secrets, &api_key_auth_config)
+            .await
+            .expect("every referenced secret resolves");
 
         // Verify first key works
         let parts_1 = create_request_parts(Some(secret_value_1));
@@ -367,6 +419,69 @@ mod tests {
         unsafe {
             std::env::remove_var(&secret_key_1);
             std::env::remove_var(&secret_key_2);
+        };
+    }
+
+    /// Regression test: an API key whose secret part is missing or empty must
+    /// not be accepted as its literal part alone.
+    #[tokio::test]
+    async fn api_key_with_an_unresolved_or_empty_secret_is_an_error() {
+        let mut secrets = Secrets::new();
+        secrets
+            .load_from(&[])
+            .await
+            .expect("to load secrets successfully");
+
+        let missing = format!("TEST_API_KEY_MISSING_{}", rand::random::<u64>());
+        let empty = format!("TEST_API_KEY_EMPTY_{}", rand::random::<u64>());
+        let present = format!("TEST_API_KEY_PRESENT_{}", rand::random::<u64>());
+        // SAFETY: Setting environment variables for test purposes only
+        unsafe {
+            std::env::remove_var(&missing);
+            std::env::set_var(&empty, "");
+            std::env::set_var(&present, "resolved-secret");
+        };
+
+        let config = |keys: &[String]| SpicepodApiKeyAuth {
+            enabled: true,
+            keys: keys.iter().map(|key| ApiKey::parse_str(key)).collect(),
+        };
+
+        let err = api_key_auth(
+            &secrets,
+            &config(&[
+                format!("${{ env:{present} }}:rw"),
+                format!("prefix-${{ env:{missing} }}:rw"),
+            ]),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a key with a missing secret must not load"));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Failed to load API key 2 of `runtime.auth.api_key.keys`: Secret `${{ env:{missing} }}` not found in secret store `env`. The runtime does not start with an API key that is missing part of its value. Define each secret the key references with a non-empty value in a configured secret store, or remove the reference. See https://spiceai.org/docs/api/auth"
+            )
+        );
+
+        let err = api_key_auth(
+            &secrets,
+            &config(&[format!("prefix-${{ env:{empty} }}:ro")]),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a key with an empty secret must not load"));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Failed to load API key 1 of `runtime.auth.api_key.keys`: Secret `${{ env:{empty} }}` resolved to an empty value. The runtime does not start with an API key that is missing part of its value. Define each secret the key references with a non-empty value in a configured secret store, or remove the reference. See https://spiceai.org/docs/api/auth"
+            )
+        );
+
+        // SAFETY: Cleaning up environment variables
+        unsafe {
+            std::env::remove_var(&empty);
+            std::env::remove_var(&present);
         };
     }
 
@@ -411,6 +526,7 @@ mod tests {
         let secrets = Arc::new(RwLock::new(Secrets::new()));
         EndpointAuth::new(secrets, app)
             .await
+            .expect("the test app's API keys resolve")
             .unauthenticated_writes_warning(app, client_auth_mode)
     }
 
