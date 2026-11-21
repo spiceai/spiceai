@@ -22,7 +22,9 @@ limitations under the License.
 //! the HTTPS data connector applies it to every redirect and to every address a redirect's new
 //! host resolves to.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use object_store_spawn::DestinationGuard;
 use url::Url;
@@ -164,6 +166,130 @@ pub fn redirect_destination_guard() -> DestinationGuard {
     )
 }
 
+/// `host` as [`RedirectHostResolver`] keys it: `example.com.` and `example.com` name the same host.
+#[must_use]
+pub fn redirect_host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Resolves the hosts a redirect introduced through a [`DestinationGuard`], so a redirect cannot
+/// reach an internal address by name. Every other host, such as the request's own or a proxy's,
+/// resolves unchecked.
+#[derive(Clone, Debug)]
+pub struct RedirectHostResolver {
+    guard: DestinationGuard,
+    redirect_hosts: Arc<Mutex<HashSet<String>>>,
+}
+
+impl RedirectHostResolver {
+    #[must_use]
+    pub fn new(guard: DestinationGuard) -> Self {
+        Self {
+            guard,
+            redirect_hosts: Arc::default(),
+        }
+    }
+
+    /// Checks every later lookup of `host` with the guard.
+    pub fn check_host(&self, host: &str) {
+        self.redirect_hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(redirect_host_key(host));
+    }
+}
+
+impl reqwest::dns::Resolve for RedirectHostResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let checked = self
+            .redirect_hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&redirect_host_key(&host));
+        let guard = self.guard.clone();
+        Box::pin(async move {
+            let addresses: Vec<SocketAddr> = if checked {
+                guard.resolve(&host).await?
+            } else {
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect()
+            };
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Why [`guard_redirects`] refuses a redirect.
+const OFF_HOST_REDIRECT_REFUSED: &str = "a redirect off the request's host to a private, loopback, or link-local address is not followed";
+
+/// What [`guard_redirects`] does with one redirect.
+#[derive(Debug, PartialEq, Eq)]
+enum RedirectCheck {
+    /// The redirect stays on the request's own host, which is not checked.
+    OwnHost,
+    /// The redirect leaves for an internal IP literal or a well-known internal name.
+    Internal,
+    /// The redirect leaves for another host, whose addresses are checked when it resolves.
+    OtherHost,
+}
+
+/// Classifies a redirect to `target` from a request whose URLs so far are `previous`, the
+/// request's own URL first.
+fn check_redirect(previous: &[Url], target: &Url) -> RedirectCheck {
+    let own_host = previous
+        .first()
+        .and_then(Url::host_str)
+        .map(redirect_host_key);
+    if own_host.is_some() && own_host == target.host_str().map(redirect_host_key) {
+        RedirectCheck::OwnHost
+    } else if redirect_target_is_internal(target) {
+        RedirectCheck::Internal
+    } else {
+        RedirectCheck::OtherHost
+    }
+}
+
+/// Makes `builder` follow at most `max_redirects` redirects and refuse one that leaves the
+/// request's own host for a private, loopback, or link-local destination: an internal IP literal,
+/// a well-known internal name, or a host that resolves to an internal address. A redirect within
+/// the request's own host is followed, whatever that host resolves to.
+pub fn guard_redirects(
+    builder: reqwest::ClientBuilder,
+    max_redirects: usize,
+) -> reqwest::ClientBuilder {
+    let resolver = RedirectHostResolver::new(DestinationGuard::new(
+        is_internal_ip,
+        redirect_target_is_internal,
+        OFF_HOST_REDIRECT_REFUSED,
+    ));
+    let redirect_hosts = resolver.clone();
+    builder
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= max_redirects {
+                return attempt.error("too many redirects");
+            }
+            match check_redirect(attempt.previous(), attempt.url()) {
+                RedirectCheck::OwnHost => attempt.follow(),
+                RedirectCheck::Internal => {
+                    let refused = format!(
+                        "Refused to connect to {}: {OFF_HOST_REDIRECT_REFUSED}",
+                        attempt.url()
+                    );
+                    attempt.error(refused)
+                }
+                RedirectCheck::OtherHost => {
+                    // The policy cannot resolve DNS, so the resolver checks the addresses of
+                    // each new host a redirect names.
+                    if let Some(url::Host::Domain(host)) = attempt.url().host() {
+                        redirect_hosts.check_host(host);
+                    }
+                    attempt.follow()
+                }
+            }
+        }))
+        .dns_resolver(Arc::new(resolver))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +416,44 @@ mod tests {
                 "{url} is not a URL table store"
             );
         }
+    }
+
+    #[test]
+    fn check_redirect_refuses_only_an_internal_target_off_the_request_host() {
+        let previous = [Url::parse("http://graphql.example.com/graphql").expect("valid URL")];
+        for target in [
+            "http://127.0.0.1:18791/graphql",
+            "http://10.0.0.1/graphql",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/graphql",
+            "http://localhost/graphql",
+            "http://metadata.google.internal/computeMetadata/v1/",
+        ] {
+            let target = Url::parse(target).expect("valid URL");
+            assert_eq!(
+                check_redirect(&previous, &target),
+                RedirectCheck::Internal,
+                "{target} must be refused"
+            );
+        }
+        for target in [
+            "https://93.184.216.34/graphql",
+            "https://api.example.org/graphql",
+        ] {
+            let target = Url::parse(target).expect("valid URL");
+            assert_eq!(
+                check_redirect(&previous, &target),
+                RedirectCheck::OtherHost,
+                "{target} must be followed"
+            );
+        }
+
+        let previous = [Url::parse("http://127.0.0.1:4000/graphql").expect("valid URL")];
+        let target = Url::parse("http://127.0.0.1:4000/graphql/").expect("valid URL");
+        assert_eq!(
+            check_redirect(&previous, &target),
+            RedirectCheck::OwnHost,
+            "a redirect within the request's own host is followed"
+        );
     }
 }

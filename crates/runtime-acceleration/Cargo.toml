@@ -77,6 +77,10 @@ tempfile.workspace = true
 
 [[bench]]
 harness = false
+name = "change_sink_grouping"
+
+[[bench]]
+harness = false
 name = "snapshot_operations"
 
 [lints]

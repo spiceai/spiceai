@@ -39,6 +39,7 @@ pub mod query;
 pub mod refresh;
 pub mod run;
 pub mod search;
+pub mod set_value;
 pub mod sql;
 pub mod status;
 pub mod trace;

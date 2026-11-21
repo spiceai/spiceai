@@ -238,6 +238,7 @@ pub struct ValueDeserializer {
 
 impl ValueDeserializer {
     /// Create a new deserializer from an owned Value.
+    #[must_use]
     pub fn new(value: Value) -> Self {
         Self { value }
     }

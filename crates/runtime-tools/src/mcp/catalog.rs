@@ -101,14 +101,6 @@ fn forward_stderr(tool_name: String, stderr: ChildStderr) {
     });
 }
 
-/// Check if a hostname is localhost
-fn is_localhost(host: &str) -> bool {
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-    )
-}
-
 pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<McpClient>>,
 
@@ -642,7 +634,7 @@ impl McpToolCatalog {
 
                 // Security: Warn if using http (unencrypted) for non-localhost
                 let host = url.host_str().unwrap_or("<unknown>");
-                if url.scheme() == "http" && !is_localhost(host) {
+                if url.scheme() == "http" && !util::net::is_loopback_host(host) {
                     tracing::warn!(
                         "MCP HTTPS client using unencrypted HTTP connection to non-localhost host '{}': {}. This is insecure.",
                         host,
@@ -1245,10 +1237,10 @@ mod tests {
     use serde_json::{Value, json};
 
     /// A connection attempt that is given up on closes its connection. `handshake()` gives up at
-    /// `MCP_HANDSHAKE_TIMEOUT` by dropping the attempt; this drops it the same way at 500 ms.
-    /// rmcp sends the first handshake request outside its own cancellation, so without that each
-    /// retry against a server that never answers would leave one more connection, and the task
-    /// waiting on it, open.
+    /// `MCP_HANDSHAKE_TIMEOUT` by dropping the attempt; this drops it the same way, once its first
+    /// request has reached the server. rmcp sends that request outside its own cancellation, so
+    /// without that each retry against a server that never answers would leave one more
+    /// connection, and the task waiting on it, open.
     #[tokio::test]
     async fn test_abandoned_handshake_closes_its_connection() {
         use tokio::io::AsyncReadExt;
@@ -1257,12 +1249,16 @@ mod tests {
             .await
             .expect("bind a listener");
         let addr = listener.local_addr().expect("listener address");
+        let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
         let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept the handshake");
             // Read the request and never answer. A read of 0 bytes is the client closing.
             let mut buf = [0_u8; 4096];
-            while socket.read(&mut buf).await.is_ok_and(|read| read > 0) {}
+            if socket.read(&mut buf).await.is_ok_and(|read| read > 0) {
+                let _ = requested_tx.send(());
+                while socket.read(&mut buf).await.is_ok_and(|read| read > 0) {}
+            }
             let _ = closed_tx.send(());
         });
         let cfg = MCPConfig::StreamableHttp {
@@ -1271,15 +1267,19 @@ mod tests {
             headers: HashMap::new(),
         };
 
-        let attempt = tokio::time::timeout(
-            Duration::from_millis(500),
-            McpToolCatalog::create_client(&cfg, "silent"),
-        )
-        .await;
-        assert!(attempt.is_err(), "an unresponsive server must not connect");
+        // Give up only once the request is in flight, however long a loaded host takes to send
+        // it: an attempt given up before it connects has no connection to close.
+        let mut attempt = Box::pin(McpToolCatalog::create_client(&cfg, "silent"));
+        tokio::select! {
+            _ = &mut attempt => panic!("an unresponsive server must not connect"),
+            requested = tokio::time::timeout(Duration::from_secs(60), requested_rx) => assert!(
+                matches!(requested, Ok(Ok(()))),
+                "the handshake request never reached the server"
+            ),
+        }
         drop(attempt);
 
-        let closed = tokio::time::timeout(Duration::from_secs(5), closed_rx).await;
+        let closed = tokio::time::timeout(Duration::from_secs(30), closed_rx).await;
         server.abort();
         assert!(
             matches!(closed, Ok(Ok(()))),
@@ -1364,23 +1364,6 @@ mod tests {
             !DANGEROUS_PATH_GLOB_SET.is_match("./script.sh"),
             "./script.sh should be allowed"
         );
-    }
-
-    #[test]
-    fn test_is_localhost_ipv4() {
-        assert!(is_localhost("127.0.0.1"));
-        assert!(is_localhost("localhost"));
-        assert!(is_localhost("0.0.0.0"));
-        assert!(!is_localhost("192.168.1.1"));
-        assert!(!is_localhost("example.com"));
-    }
-
-    #[test]
-    fn test_is_localhost_ipv6() {
-        assert!(is_localhost("::1"));
-        assert!(is_localhost("[::1]"));
-        assert!(!is_localhost("::2"));
-        assert!(!is_localhost("2001:db8::1"));
     }
 
     fn sample_listed_tool(name: &'static str) -> rmcp::model::Tool {
