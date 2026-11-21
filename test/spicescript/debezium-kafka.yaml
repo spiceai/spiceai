@@ -49,6 +49,17 @@ spicepod:
         kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
         kafka_security_protocol: plaintext
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    # Declared `columns` on a topic with no messages yet: the dataset is ready
+    # with no rows, then follows the topic once changes arrive.
+    - from: debezium:${sources.src.namespace}.public.e
+      name: e
+      params:
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
+        kafka_security_protocol: plaintext
+      columns:
+        - { name: id, type: bigint }
+        - { name: v, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
     # Debezium sends `timestamptz` as an ISO 8601 string, `timestamp` as
     # microseconds and `timestamp(3)` as milliseconds; `timestamptz` and
     # `timestamp` hold nanoseconds, and `at_ms_us` converts milliseconds to
@@ -75,6 +86,8 @@ steps:
         CREATE TABLE t (id bigint PRIMARY KEY, v text, n bigint);
         ALTER TABLE t REPLICA IDENTITY FULL;
         INSERT INTO t SELECT g, 'v' || g, g * 10 FROM generate_series(1, 500) g;
+        CREATE TABLE e (id bigint PRIMARY KEY, v text);
+        ALTER TABLE e REPLICA IDENTITY FULL;
         CREATE TABLE tz (id bigint PRIMARY KEY, at_tz timestamptz, at_us timestamp, at_ms timestamp(3), at_ms_us timestamp(3));
         ALTER TABLE tz REPLICA IDENTITY FULL;
         INSERT INTO tz VALUES
@@ -101,7 +114,7 @@ steps:
         DEBEZIUM_SOURCE_DATABASE_PASSWORD=${sources.src.params.pg_pass}
         DEBEZIUM_SOURCE_DATABASE_DBNAME=${sources.src.params.pg_db}
         DEBEZIUM_SOURCE_TOPIC_PREFIX=${sources.src.namespace}
-        DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST=public.t,public.tz
+        DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST=public.t,public.e,public.tz
         DEBEZIUM_SOURCE_PLUGIN_NAME=pgoutput
         DEBEZIUM_SOURCE_SLOT_NAME=dbz_${sources.src.namespace}
         DEBEZIUM_SOURCE_PUBLICATION_NAME=dbz_${sources.src.namespace}
@@ -113,9 +126,15 @@ steps:
   - source-query: { kafka: "rpk topic list | awk '{ print $1 }' | grep -cxE '${sources.src.namespace}[.]public[.](t|tz)'" }
     expect: { rows: [['2']] }
     eventually: 60s
+  # The snapshot of the empty table `e` publishes nothing, so its topic exists
+  # with no messages.
+  - source-query: { kafka: "rpk topic create -X brokers=127.0.0.1:9093 ${sources.src.namespace}.public.e >/dev/null && rpk topic describe -X brokers=127.0.0.1:9093 ${sources.src.namespace}.public.e -p | awk 'NR > 1 { print $NF }'" }
+    expect: { rows: [['0']] }
   - start: {}
   - query: SELECT * FROM t
     eventually: 120s
+  - query: SELECT * FROM e
+    expect-empty: true
   - query: SELECT * FROM tz
     eventually: 60s
 
@@ -129,10 +148,15 @@ steps:
         DELETE FROM t WHERE id BETWEEN 200 AND 205;
         INSERT INTO t VALUES (1000, 'in a transaction', 1);
         COMMIT;
+        INSERT INTO e SELECT g, 'e' || g FROM generate_series(1, 50) g;
+        UPDATE e SET v = 'updated' WHERE id % 5 = 0;
+        DELETE FROM e WHERE id % 7 = 0;
         INSERT INTO tz VALUES (6, '2262-04-11 23:47:16.854775+00', '2000-02-29 12:34:56.789012', '2000-02-29 12:34:56.789', '9999-12-31 23:59:59.999');
         UPDATE tz SET at_tz = at_tz + interval '1 microsecond', at_us = at_us - interval '1 day' WHERE id = 1;
         DELETE FROM tz WHERE id = 2;
   - query: SELECT * FROM t
+    eventually: 60s
+  - query: SELECT * FROM e
     eventually: 60s
   - query: SELECT * FROM tz
     eventually: 60s
@@ -145,8 +169,11 @@ steps:
       src: |
         UPDATE t SET v = 'after restart' WHERE id <= 20;
         DELETE FROM t WHERE id > 590;
+        UPDATE e SET v = 'after restart' WHERE id <= 10;
         UPDATE tz SET at_ms = '2026-11-18 21:00:00.999', at_ms_us = '2026-11-18 21:00:00.999' WHERE id = 3;
   - query: SELECT * FROM t
+    eventually: 60s
+  - query: SELECT * FROM e
     eventually: 60s
   - query: SELECT * FROM tz
     eventually: 60s
