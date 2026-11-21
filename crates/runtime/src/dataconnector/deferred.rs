@@ -175,6 +175,10 @@ impl DataConnector for DeferredConnector {
         ComponentInitialization::OnTrigger
     }
 
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.inner.user_token_client_id()
+    }
+
     fn initialization_for_dataset(&self, _dataset: &DatasetSpec) -> ComponentInitialization {
         ComponentInitialization::OnTrigger
     }
