@@ -230,12 +230,80 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("sql_dialect"),
 ];
 
+/// The `key=value` attributes of an ODBC connection string, read the way the
+/// driver manager reads them: `;`-separated, keys trimmed and compared without
+/// case, and a value in `{…}` that may contain `;` and spells `}` as `}}`.
+fn connection_string_attributes(connection_string: &str) -> Vec<(String, String)> {
+    let mut attributes = Vec::new();
+    let mut rest = connection_string;
+    while !rest.is_empty() {
+        let Some((key, after_key)) = rest.split_once('=') else {
+            break;
+        };
+        let key = key
+            .trim()
+            .trim_start_matches(';')
+            .trim()
+            .to_ascii_lowercase();
+        let after_key = after_key.trim_start();
+        let (value, after_value) = if let Some(braced) = after_key.strip_prefix('{') {
+            let mut value = String::new();
+            let mut chars = braced.char_indices();
+            let mut end = braced.len();
+            while let Some((index, c)) = chars.next() {
+                if c == '}' {
+                    if braced[index + 1..].starts_with('}') {
+                        value.push('}');
+                        chars.next();
+                        continue;
+                    }
+                    end = index + 1;
+                    break;
+                }
+                value.push(c);
+            }
+            let after = braced[end..].split_once(';').map_or("", |(_, after)| after);
+            (value, after)
+        } else {
+            match after_key.split_once(';') {
+                Some((value, after)) => (value.trim().to_string(), after),
+                None => (after_key.trim().to_string(), ""),
+            }
+        };
+        if !key.is_empty() {
+            attributes.push((key, value));
+        }
+        rest = after_value;
+    }
+    attributes
+}
+
+/// Whether a connection string makes the driver manager load a library or
+/// read a DSN file named by path, rather than a driver installed through the
+/// driver manager: a `Driver` given as a path, or any `FILEDSN` or `SAVEFILE`.
+fn names_a_file(connection_string: &str) -> bool {
+    connection_string_attributes(connection_string)
+        .iter()
+        .any(|(key, value)| match key.as_str() {
+            "driver" => driver_is_file(value),
+            "filedsn" | "savefile" => true,
+            _ => false,
+        })
+}
+
+/// Whether a `Driver` value names a library file: a path with a directory
+/// separator or a shared-library extension, or a file that exists.
 fn driver_is_file(driver: &str) -> bool {
-    driver
-        .split('=')
-        .next_back()
-        .as_ref()
-        .is_some_and(|s| std::fs::metadata(s).is_ok())
+    let driver = driver.trim();
+    let lowercase = driver.to_ascii_lowercase();
+    !driver.is_empty()
+        && (driver.contains('/')
+            || driver.contains('\\')
+            || [".so", ".dylib", ".dll"]
+                .iter()
+                .any(|extension| lowercase.ends_with(extension))
+            || lowercase.contains(".so.")
+            || std::fs::metadata(driver).is_ok_and(|metadata| metadata.is_file()))
 }
 
 fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {
@@ -280,6 +348,16 @@ impl DataConnectorFactory for ODBCFactory {
             parameter_is_integer(&params.parameters, "max_bytes_per_batch")?;
             parameter_is_integer(&params.parameters, "max_num_rows_per_batch")?;
 
+            // Explicitly check if the user has tried to specify a file path,
+            // whatever else is configured: a driver given as a path, or a DSN
+            // file, makes the driver manager load native code from it.
+            if let Some(connection_string) =
+                params.parameters.get("connection_string").expose().ok()
+                && names_a_file(connection_string)
+            {
+                return Err(Error::DirectDriverNotPermitted {}.into());
+            }
+
             let (dialect, engine): (
                 Result<Option<Arc<dyn Dialect + Send + Sync>>>,
                 Option<String>,
@@ -299,11 +377,6 @@ impl DataConnectorFactory for ODBCFactory {
                     .split(';')
                     .find(|s| s.starts_with("driver="))
                     .context(NoDriverSpecifiedSnafu)?;
-
-                // explicitly check if the user has tried to specify a file path
-                if driver_is_file(driver) {
-                    return Err(Error::DirectDriverNotPermitted {}.into());
-                }
 
                 let profile = ODBCProfile::from(driver);
                 let engine = profile.engine().map(str::to_string);
@@ -488,19 +561,49 @@ mod test {
 
     #[test]
     fn test_odbc_driver_is_file() {
-        std::fs::File::create("something.so").expect("file should be created");
         std::fs::File::create("noextfile").expect("file should be created");
 
-        assert!(!driver_is_file("driver=foo"));
-        assert!(!driver_is_file("driver={mysql}"));
-        assert!(!driver_is_file("driver={microsoft sql server}"));
-        assert!(driver_is_file("driver=./something.so"));
-        assert!(driver_is_file("driver=something.so"));
-        assert!(driver_is_file("driver=noextfile"));
-        assert!(driver_is_file("driver=./noextfile"));
+        for named_driver in [
+            "Driver=foo",
+            "driver={mysql}",
+            "Driver={Microsoft SQL Server}",
+            "DRIVER={PostgreSQL Unicode};Server=localhost;Database=x",
+            "Driver={Amazon Athena ODBC Driver};\nCatalog=AwsDataCatalog;",
+            "DSN=sales;UID=me",
+        ] {
+            assert!(!names_a_file(named_driver), "{named_driver}");
+        }
+        for path in [
+            "driver=./something.so",
+            "driver=something.so",
+            "driver=noextfile",
+            "driver=./noextfile",
+            // Case is kept: a path with capitals is checked as written.
+            "Driver=/opt/Drivers/LibEvil.dylib;",
+            // Braces are the driver manager's quoting, not part of the path.
+            "Driver={/opt/drivers/libevil.so};",
+            "Driver = {C:\\drivers\\evil.dll};",
+            "Server=x; DRIVER=/opt/libevil.so.1",
+            // A DSN file names its driver, and SAVEFILE writes one.
+            "FILEDSN=/tmp/x.dsn;",
+            "Driver={PostgreSQL};SaveFile=/tmp/out.dsn",
+        ] {
+            assert!(names_a_file(path), "{path}");
+        }
 
-        std::fs::remove_file("something.so").expect("file should be deleted");
         std::fs::remove_file("noextfile").expect("file should be deleted");
+    }
+
+    #[test]
+    fn connection_string_attributes_follow_odbc_quoting() {
+        assert_eq!(
+            connection_string_attributes("Driver={a;b}}c}; Server = x ;PWD={p;w}"),
+            vec![
+                ("driver".to_string(), "a;b}c".to_string()),
+                ("server".to_string(), "x".to_string()),
+                ("pwd".to_string(), "p;w".to_string()),
+            ]
+        );
     }
 
     /// Regression test for #16082: TPC-H Q11 and Q17, planned by the runtime's

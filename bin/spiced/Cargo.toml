@@ -60,6 +60,7 @@ crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
 podswatcher = { path = "../../crates/podswatcher" }
 repl = { path = "../../crates/repl" }
+spiced-args = { path = "../../crates/spiced-args" }
 runtime-tls = { path = "../../crates/runtime-tls" }
 futures.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
@@ -92,7 +93,6 @@ webpki-root-certs.workspace = true
 webpki-roots.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
-zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
@@ -138,6 +138,9 @@ tokio-stream.workspace = true
 tonic.workspace = true
 # Issues the cluster nodes' mTLS certificates for the executor export test.
 test-framework = { path = "../../crates/test-framework" }
+# `spice run` reads these arguments to find the Spicepod they load; its
+# reading is tested against this parser.
+spice = { path = "../spice" }
 
 [features]
 adbc = ["dep:connector-adbc", "dep:connector-duckdb", "runtime/adbc"]
@@ -202,7 +205,6 @@ ftp = ["connector-ftp", "runtime/ftp"]
 http-functions = ["runtime/http-functions"]
 rate-control = ["runtime/rate-control"]
 wasm-functions = ["runtime/wasm-functions"]
-wasm-functions-compile = ["runtime/wasm-functions-compile"]
 iceberg-write = ["runtime/iceberg-write"]
 imap = ["connector-imap", "runtime/imap"]
 kafka = ["dep:connector-kafka", "runtime/kafka"]

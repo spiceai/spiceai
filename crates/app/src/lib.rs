@@ -16,7 +16,11 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -83,6 +87,70 @@ pub struct App {
     /// The deprecated top-level `snapshots` section as written. Use
     /// [`App::dataset_snapshots`], which resolves a dataset's snapshot configuration.
     pub snapshots: Option<Arc<Snapshots>>,
+
+    /// Components a Spicepod dependency declared but may not load, because
+    /// they run a program on the host and `spicepod.yaml` does not trust that
+    /// dependency. They are left out of the lists above; the runtime logs each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_components: Vec<RefusedComponent>,
+}
+
+/// A component a Spicepod dependency declared but may not load, because it
+/// runs a program on the host and the dependency is not trusted to do that.
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct RefusedComponent {
+    /// The dependency's reference, as written under `dependencies:`.
+    pub dependency: String,
+    /// The component's kind: `tool`, `dataset`, `catalog`.
+    pub kind: String,
+    pub name: String,
+    /// What the component runs: "the tool starts the program 'docker' on this
+    /// host".
+    pub reason: String,
+}
+
+impl RefusedComponent {
+    /// The error a user reads for this component, naming the fix.
+    #[must_use]
+    pub fn message(&self) -> String {
+        let RefusedComponent {
+            dependency,
+            kind,
+            name,
+            reason,
+        } = self;
+        format!(
+            "Failed to load {kind} '{name}' from Spicepod dependency '{dependency}': {reason}, and a dependency may do that only when spicepod.yaml trusts it. To trust it, replace `- {dependency}` under `dependencies:` with `- {{ from: {dependency}, trust: full }}`. See: https://spiceai.org/docs/reference/spicepod#dependencies"
+        )
+    }
+
+    /// Why `component`, declared by `dependency`, may not load, or `None` when
+    /// it may: the dependency is trusted, or the component runs nothing on the
+    /// host. A function's `build:` command never makes the runtime refuse the
+    /// function: the runtime never runs it, and the `spice` CLI applies trust
+    /// to the build.
+    #[must_use]
+    pub fn of(
+        dependency: &spicepod::dependency::Dependency,
+        component: spicepod::host_program::ComponentRef<'_>,
+    ) -> Option<Self> {
+        if dependency.trust() == spicepod::dependency::DependencyTrust::Full {
+            return None;
+        }
+        let program = spicepod::host_program::host_program(component)?;
+        if matches!(
+            program,
+            spicepod::host_program::HostProgram::BuildCommand(_)
+        ) {
+            return None;
+        }
+        Some(Self {
+            dependency: dependency.from().to_string(),
+            kind: component.kind().to_string(),
+            name: component.name().to_string(),
+            reason: program.reason(component.kind()),
+        })
+    }
 }
 
 /// The setting whose params a dataset's snapshots use.
@@ -269,6 +337,7 @@ impl Default for App {
             runtime: Runtime::default(),
             management: None,
             snapshots: None,
+            refused_components: vec![],
         }
     }
 }
@@ -711,6 +780,7 @@ impl AppBuilder {
             runtime: self.runtime,
             management: self.management,
             snapshots: self.snapshots.map(Arc::new),
+            refused_components: vec![],
         }
     }
 
@@ -720,6 +790,29 @@ impl AppBuilder {
             .await
             .context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
         Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
+    }
+
+    /// Build an app from a manifest file's contents, already read into memory.
+    ///
+    /// `manifest_path` is the file the bytes came from: errors name it, and
+    /// component references and dependencies resolve relative to its directory,
+    /// exactly as [`Self::build_from_path`] resolves them for that file. The
+    /// file itself is not reopened, so the app is built from the bytes the
+    /// caller read and checked.
+    pub async fn build_from_manifest_bytes(
+        bytes: Vec<u8>,
+        manifest_path: impl Into<PathBuf>,
+    ) -> Result<App> {
+        let path = manifest_path.into();
+        let base_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let spicepod_root = Spicepod::load_from_bytes(bytes, base_path.clone())
+            .await
+            .context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
+        Self::build_from_spicepod(spicepod_root, base_path).await
     }
 
     pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
@@ -777,9 +870,24 @@ impl AppBuilder {
 
         let root_spicepod_name = spicepod.name.clone();
         let mut spicepods: Vec<Spicepod> = vec![];
+        let mut refused_components: Vec<RefusedComponent> = vec![];
 
-        for dependency in &spicepod.dependencies {
+        for dependency_entry in &spicepod.dependencies {
+            let dependency = dependency_entry.from();
             let dependency_path = path.join("spicepods").join(dependency);
+            // A component that runs a program on the host is loaded from a
+            // dependency only when `spicepod.yaml` trusts it.
+            let mut admitted =
+                |component: spicepod::host_program::ComponentRef<'_>| match RefusedComponent::of(
+                    dependency_entry,
+                    component,
+                ) {
+                    Some(refused) => {
+                        refused_components.push(refused);
+                        false
+                    }
+                    None => true,
+                };
             let dependent_spicepod =
                 Spicepod::load(&dependency_path)
                     .await
@@ -787,10 +895,14 @@ impl AppBuilder {
                         path: &dependency_path,
                     })?;
             for catalog in &dependent_spicepod.catalogs {
-                catalogs.push(catalog.clone());
+                if admitted(spicepod::host_program::ComponentRef::Catalog(catalog)) {
+                    catalogs.push(catalog.clone());
+                }
             }
             for dataset in &dependent_spicepod.datasets {
-                datasets.push(dataset.clone());
+                if admitted(spicepod::host_program::ComponentRef::Dataset(dataset)) {
+                    datasets.push(dataset.clone());
+                }
             }
             for view in &dependent_spicepod.views {
                 views.push(view.clone());
@@ -807,7 +919,9 @@ impl AppBuilder {
             }
 
             for tool in &dependent_spicepod.tools {
-                tools.push(tool.clone());
+                if admitted(spicepod::host_program::ComponentRef::Tool(tool)) {
+                    tools.push(tool.clone());
+                }
             }
 
             for worker in &dependent_spicepod.workers {
@@ -867,6 +981,7 @@ impl AppBuilder {
             runtime,
             management,
             snapshots: snapshots.map(Arc::new),
+            refused_components,
         })
     }
 }
