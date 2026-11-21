@@ -444,12 +444,14 @@ impl DeltaTable {
                     .collect::<Vec<_>>(),
             )
             .build();
-        tracing::trace!(
-            table_parquet_options = ?self.table_parquet_options,
-            "Creating Delta Lake ParquetSource"
-        );
+        // Spark and Databricks write `timestamp` columns as INT96 by default. Read them at the
+        // table's microsecond UTC type: as nanoseconds, a value outside 1677-2262 wraps.
+        let mut table_parquet_options = self.table_parquet_options.clone();
+        table_parquet_options.global.coerce_int96 = Some("us".to_string());
+        table_parquet_options.global.coerce_int96_tz = Some("UTC".to_string());
+        tracing::trace!(?table_parquet_options, "Creating Delta Lake ParquetSource");
         let parquet_source = ParquetSource::new(table_schema)
-            .with_table_parquet_options(self.table_parquet_options.clone())
+            .with_table_parquet_options(table_parquet_options)
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
             .with_predicate(Arc::clone(physical_expr));
 
@@ -1363,9 +1365,31 @@ impl TableProvider for DeltaTable {
         if let Some(mapping) = &self.physical_schema_mapping {
             // Rewrite filter references, nested field names included, from logical to physical
             // names so ParquetSource can match them against the physical parquet schema.
-            let physical_df_schema = DFSchema::try_from(Arc::new(mapping.schema.clone()))?;
+            // Partition columns keep their logical names: the scan registers them under those.
+            let is_partition_col = |name: &str| table_partition_col_names.contains(&name);
+            let data_delta_schema = delta_kernel::schema::StructType::try_new(
+                self.delta_schema
+                    .fields()
+                    .filter(|field| !is_partition_col(field.name()))
+                    .cloned(),
+            )
+            .map_err(map_delta_error_to_datafusion_err)?;
+            let filter_fields = mapping
+                .schema
+                .fields()
+                .iter()
+                .map(
+                    |field| match mapping.physical_to_logical.get(field.name()) {
+                        Some(logical) if is_partition_col(logical) => Ok(Arc::new(
+                            self.arrow_schema.field_with_name(logical)?.clone(),
+                        )),
+                        _ => Ok(Arc::clone(field)),
+                    },
+                )
+                .collect::<Result<Vec<_>, arrow::error::ArrowError>>()?;
+            let physical_df_schema = DFSchema::try_from(Arc::new(Schema::new(filter_fields)))?;
             let physical_expr = physical_filter(state, filters, &physical_df_schema, |filter| {
-                rewrite_to_physical_names(filter, &self.delta_schema, mapping.column_mapping_mode)
+                rewrite_to_physical_names(filter, &data_delta_schema, mapping.column_mapping_mode)
             })?;
 
             let physical_non_partition_schema =
@@ -1472,20 +1496,10 @@ fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
 
     let root_url = &scan_context.table_root;
 
-    let path = if root_url.path().ends_with('/') {
-        format!("{}{}", root_url.path(), path)
-    } else {
-        format!("{}/{}", root_url.path(), path)
-    };
-
-    let partitioned_file_path = match object_store::path::Path::from_url_path(&path) {
+    let partitioned_file_path = match data_file_location(root_url, &path) {
         Ok(path) => path,
         Err(e) => {
-            scan_context
-                .errs
-                .push(datafusion::error::DataFusionError::Execution(format!(
-                    "Error parsing file path: {e}",
-                )));
+            scan_context.errs.push(e);
             return;
         }
     };
@@ -1522,6 +1536,55 @@ fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
         partition_values,
         _transform: transform,
     });
+}
+
+/// Resolves a data file's `path` from the Delta log to its location in the table's object store.
+///
+/// The path is a URL relative to the table root or, in a shallow clone, an absolute URL. It is
+/// resolved the way the Delta kernel resolves it. A relative path must stay inside the table root.
+/// The scan reads every file through the table's own object store, so a file in another store is
+/// refused. Hadoop's other scheme names for a store (`s3a`, `s3n`, `abfs`) name the same store.
+fn data_file_location(
+    table_root: &Url,
+    path: &str,
+) -> Result<object_store::path::Path, DataFusionError> {
+    fn object_store_of(url: &Url) -> (&str, &str) {
+        let scheme = match url.scheme() {
+            "s3a" | "s3n" => "s3",
+            "abfs" => "abfss",
+            scheme => scheme,
+        };
+        (
+            scheme,
+            &url[url::Position::BeforeUsername..url::Position::AfterPort],
+        )
+    }
+    fn shown(url: &Url) -> String {
+        format!(
+            "{}://{}{}",
+            url.scheme(),
+            url.host_str().unwrap_or_default(),
+            url.path()
+        )
+    }
+
+    let file_url = table_root
+        .join(path)
+        .map_err(|e| DataFusionError::Execution(format!("Error parsing file path: {e}")))?;
+
+    let is_absolute = Url::parse(path).is_ok();
+    if object_store_of(&file_url) != object_store_of(table_root)
+        || (!is_absolute && !file_url.path().starts_with(table_root.path()))
+    {
+        return Err(DataFusionError::Execution(format!(
+            "Delta Lake data file '{}' is outside the table's storage location '{}'.",
+            shown(&file_url),
+            shown(table_root),
+        )));
+    }
+
+    object_store::path::Path::from_url_path(file_url.path())
+        .map_err(|e| DataFusionError::Execution(format!("Error parsing file path: {e}")))
 }
 
 fn map_delta_error_to_datafusion_err(e: delta_kernel::Error) -> datafusion::error::DataFusionError {
@@ -3185,5 +3248,210 @@ mod column_mapping_filter_tests {
         })
         .expect("an unplannable filter must not fail the scan");
         assert_eq!(planned.to_string(), "true");
+    }
+}
+
+#[cfg(test)]
+mod table_read_tests {
+    //! Reads small Delta tables written to a temporary directory in the shapes Spark writes.
+    use super::*;
+    use chrono::NaiveDate;
+    use datafusion::assert_batches_eq;
+    use datafusion::execution::context::SessionContext;
+    use parquet::data_type::{Int32Type, Int96, Int96Type};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use std::path::Path;
+
+    const ID_TS_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"integer","nullable":true,"metadata":{}},{"name":"ts","type":"timestamp","nullable":true,"metadata":{}}]}"#;
+
+    /// Writes `rows` to `file` with `ts` stored as INT96, Spark's default for `timestamp` columns.
+    fn write_int96_file(file: &Path, rows: &[(i32, &str)]) -> u64 {
+        let schema =
+            parse_message_type("message spark_schema { optional int32 id; optional int96 ts; }")
+                .expect("schema");
+        let out = std::fs::File::create(file).expect("create parquet file");
+        let mut writer = SerializedFileWriter::new(
+            out,
+            Arc::new(schema),
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .expect("parquet writer");
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        let timestamps: Vec<Int96> = rows
+            .iter()
+            .map(|(_, ts)| {
+                let ts = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                    .expect("timestamp");
+                let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+                let julian_day = (ts.date() - epoch).num_days() + 2_440_588;
+                let nanos_of_day = (ts.time() - chrono::NaiveTime::MIN)
+                    .num_nanoseconds()
+                    .expect("nanoseconds of the day");
+                let mut value = Int96::new();
+                value.set_data(
+                    u32::try_from(nanos_of_day & 0xFFFF_FFFF).expect("low bits"),
+                    u32::try_from(nanos_of_day >> 32).expect("high bits"),
+                    u32::try_from(julian_day).expect("julian day"),
+                );
+                value
+            })
+            .collect();
+        let definition_levels = vec![1; rows.len()];
+        let mut row_group = writer.next_row_group().expect("row group");
+        let mut column = row_group.next_column().expect("id").expect("id column");
+        column
+            .typed::<Int32Type>()
+            .write_batch(&ids, Some(&definition_levels), None)
+            .expect("write id");
+        column.close().expect("close id");
+        let mut column = row_group.next_column().expect("ts").expect("ts column");
+        column
+            .typed::<Int96Type>()
+            .write_batch(&timestamps, Some(&definition_levels), None)
+            .expect("write ts");
+        column.close().expect("close ts");
+        row_group.close().expect("close row group");
+        writer.close().expect("close parquet file");
+        std::fs::metadata(file).expect("parquet file").len()
+    }
+
+    /// Writes version 0 of a Delta log that adds `files` (`add.path`, size).
+    fn write_delta_log(table: &Path, schema: &str, files: &[(String, u64)]) {
+        let log = table.join("_delta_log");
+        std::fs::create_dir_all(&log).expect("create _delta_log");
+        let mut actions = vec![
+            serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            serde_json::json!({"metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema,
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            }}),
+        ];
+        for (path, size) in files {
+            actions.push(serde_json::json!({"add": {
+                "path": path,
+                "partitionValues": {},
+                "size": size,
+                "modificationTime": 0,
+                "dataChange": true
+            }}));
+        }
+        let commit = actions
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(log.join("00000000000000000000.json"), commit).expect("write commit");
+    }
+
+    async fn query(table: &Path, sql: &str) -> Vec<RecordBatch> {
+        let provider = DeltaTable::from(
+            table.to_str().expect("utf-8 path").to_string(),
+            HashMap::new(),
+            &Handle::current(),
+        )
+        .expect("open Delta table");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register table");
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("execute")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn int96_timestamps_keep_their_value_outside_the_nanosecond_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let size = write_int96_file(
+            &dir.path().join("part-0.parquet"),
+            &[
+                (1, "9999-12-31 00:00:00"),
+                (2, "2024-01-01 12:00:00"),
+                (3, "0001-01-01 00:00:00"),
+            ],
+        );
+        write_delta_log(
+            dir.path(),
+            ID_TS_SCHEMA,
+            &[("part-0.parquet".to_string(), size)],
+        );
+
+        let rows = query(dir.path(), "SELECT id, ts FROM t ORDER BY id").await;
+        assert_batches_eq!(
+            [
+                "+----+----------------------+",
+                "| id | ts                   |",
+                "+----+----------------------+",
+                "| 1  | 9999-12-31T00:00:00Z |",
+                "| 2  | 2024-01-01T12:00:00Z |",
+                "| 3  | 0001-01-01T00:00:00Z |",
+                "+----+----------------------+",
+            ],
+            &rows
+        );
+
+        let rows = query(
+            dir.path(),
+            "SELECT id FROM t WHERE ts > TIMESTAMP '2100-01-01T00:00:00Z' ORDER BY id",
+        )
+        .await;
+        assert_batches_eq!(["+----+", "| id |", "+----+", "| 1  |", "+----+"], &rows);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shallow_clone_reads_files_by_their_absolute_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let clone = dir.path().join("clone");
+        std::fs::create_dir_all(&source).expect("source dir");
+        std::fs::create_dir_all(&clone).expect("clone dir");
+        let file = source.join("part-0.parquet");
+        let size = write_int96_file(
+            &file,
+            &[(1, "2024-01-01 00:00:00"), (2, "2024-01-02 00:00:00")],
+        );
+        let absolute = Url::from_file_path(&file).expect("file URL").to_string();
+        write_delta_log(&clone, ID_TS_SCHEMA, &[(absolute, size)]);
+
+        let rows = query(&clone, "SELECT id FROM t ORDER BY id").await;
+        assert_batches_eq!(
+            ["+----+", "| id |", "+----+", "| 1  |", "| 2  |", "+----+"],
+            &rows
+        );
+    }
+
+    #[test]
+    fn data_file_paths_resolve_against_the_table_root() {
+        let root = Url::parse("s3://bucket/tables/t/").expect("root");
+        let location = |path: &str| data_file_location(&root, path).map(|p| p.to_string());
+
+        assert_eq!(
+            location("part-0.parquet").expect("relative"),
+            "tables/t/part-0.parquet"
+        );
+        assert_eq!(
+            location("day=2024-01-01%2012%3A00%3A00/part-0.parquet").expect("encoded"),
+            "tables/t/day=2024-01-01 12:00:00/part-0.parquet"
+        );
+        assert_eq!(
+            location("s3://bucket/tables/source/part-0.parquet").expect("absolute"),
+            "tables/source/part-0.parquet"
+        );
+        assert_eq!(
+            location("s3a://bucket/tables/source/part-0.parquet").expect("Hadoop scheme name"),
+            "tables/source/part-0.parquet"
+        );
+        location("../source/part-0.parquet").expect_err("relative path above the root");
+        location("/tables/source/part-0.parquet").expect_err("path from the bucket root");
+        location("s3://other-bucket/tables/source/part-0.parquet").expect_err("other bucket");
+        location("gs://bucket/tables/source/part-0.parquet").expect_err("other store");
     }
 }
