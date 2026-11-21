@@ -184,19 +184,50 @@ export async function exemption({ github, owner, repo, pr, baseSha }) {
 }
 
 /** Whether PR `prNumber` may merge into `branch` now, and why. */
-export async function evaluate({ github, owner, repo, prNumber, baseSha, branch, now }) {
+/**
+ * The PRs a merge-queue entry would merge: its own and those of the entries
+ * ahead of it that have not merged yet. With grouping, GitHub merges a batch
+ * when the last entry's checks pass, so the entries ahead of it merge on this
+ * run's verdict too. They are the commits on the group's head that `branch`
+ * does not have yet, each a squash commit whose subject ends `(#N)`.
+ */
+export async function queuedPrs({ github, owner, repo, branch, headSha, prNumber }) {
+  const { data } = await github.rest.repos.compareCommitsWithBasehead({
+    owner,
+    repo,
+    basehead: `${branch}...${headSha}`,
+  });
+  const numbers = new Set();
+  for (const commit of data.commits ?? []) {
+    const subject = (commit.commit?.message ?? '').split('\n', 1)[0];
+    const match = /\(#(\d+)\)$/.exec(subject.trim());
+    if (!match) {
+      throw new Error(`could not tell which PR merge-queue commit ${commit.sha} belongs to`);
+    }
+    numbers.add(Number(match[1]));
+  }
+  numbers.add(prNumber);
+  return [...numbers];
+}
+
+/** Whether the PRs `prNumbers` may merge into `branch` now, and why. */
+export async function evaluate({ github, owner, repo, prNumbers, baseSha, branch, now }) {
   const items = await blockingItems({ github, owner, repo, now });
   const backstop = await postMergeRuns({ github, owner, repo, branch });
   const overdue = items.filter((item) => item.overdue);
   const backstopFires = backstop.failing && items.length === 0;
 
-  let exempt = null;
+  // Every PR that would merge must be exempt, not only the one this run is for.
+  const exemptions = [];
   if (overdue.length > 0 || backstopFires) {
-    const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-    exempt = await exemption({ github, owner, repo, pr, baseSha });
+    for (const number of prNumbers) {
+      const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+      exemptions.push({ number, reason: await exemption({ github, owner, repo, pr, baseSha }) });
+    }
   }
-  const blocked = (overdue.length > 0 || backstopFires) && exempt === null;
-  return { blocked, items, overdue, backstop, backstopFires, exempt };
+  const exempt = exemptions.length > 0 && exemptions.every((e) => e.reason !== null);
+  const blocked = (overdue.length > 0 || backstopFires) && !exempt;
+  return { blocked, items, overdue, backstop, backstopFires, exempt, exemptions, prNumbers };
 }
 
 const hours = (value) => `${Math.floor(value)}h`;
@@ -218,8 +249,14 @@ export function render(result) {
         ''
       );
     }
-  } else if (result.exempt !== null) {
-    lines.push(`### Trunk Health: this PR may merge because ${result.exempt}`, '');
+  } else if (result.exempt) {
+    if (result.exemptions.length === 1) {
+      lines.push(`### Trunk Health: this PR may merge because ${result.exemptions[0].reason}`, '');
+    } else {
+      lines.push('### Trunk Health: every PR in this merge group may merge', '');
+      for (const e of result.exemptions) lines.push(`- #${e.number}: ${e.reason}`);
+      lines.push('');
+    }
   } else if (result.items.length > 0) {
     lines.push(
       '### Trunk Health: trunk is broken',
@@ -243,6 +280,14 @@ export function render(result) {
     }
   }
 
+  if (result.blocked && result.prNumbers.length > 1) {
+    const notExempt = result.exemptions.filter((e) => e.reason === null).map((e) => `#${e.number}`);
+    lines.push(
+      '',
+      `This merge group would also merge ${result.prNumbers.length - 1} PR(s) queued ahead of this one; ` +
+        `each must be exempt. Not exempt: ${notExempt.join(', ')}.`
+    );
+  }
   if (result.blocked) {
     lines.push(
       '',
@@ -299,10 +344,12 @@ export async function run({ github, context, core, now = new Date() }) {
   let prNumber;
   let baseSha;
   let branch;
+  let headSha;
   if (enforce) {
     const group = context.payload.merge_group;
     prNumber = parseQueueRef(group?.head_ref);
     baseSha = group?.base_sha;
+    headSha = group?.head_sha;
     branch = (group?.base_ref ?? '').replace(/^refs\/heads\//, '');
     if (prNumber === null) {
       core.setFailed(
@@ -320,7 +367,10 @@ export async function run({ github, context, core, now = new Date() }) {
 
   let result;
   try {
-    result = await evaluate({ github, owner, repo, prNumber, baseSha, branch, now });
+    const prNumbers = enforce
+      ? await queuedPrs({ github, owner, repo, branch, headSha, prNumber })
+      : [prNumber];
+    result = await evaluate({ github, owner, repo, prNumbers, baseSha, branch, now });
   } catch (error) {
     const message =
       `Could not determine trunk health (${error.message}), so Trunk Health cannot tell ` +

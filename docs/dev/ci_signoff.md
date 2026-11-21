@@ -786,6 +786,12 @@ tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
   fast-tracked](#reverts-are-fast-tracked)
   (`.github/scripts/pure_revert.mjs`), except that a fork's revert also counts.
 
+The merge queue merges up to three entries together once the last one's checks
+pass, so the entries queued ahead of a PR merge on its run as well. In the
+merge queue the gate therefore judges every PR the group would merge: its own
+and those ahead of it not yet on `trunk`. A fix can't carry an unrelated PR
+past the block by being queued behind it.
+
 **Removing the label is the only override.** If an item should not block
 merging (a flake, an infrastructure fault, a failure in a test that is being
 retired), a maintainer removes its label. That is visible in the issue's

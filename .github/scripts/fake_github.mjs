@@ -28,6 +28,7 @@ const httpError = (status, message) => Object.assign(new Error(message), { statu
  * - commits: { [number]: [{ sha, message }] }
  * - onBase: Set of SHAs that are ancestors of the base
  * - comments: { [number]: [{ id, body, login }] }
+ * - queue: [{ sha?, message }] — a merge group's commits not yet on its branch
  * - fail: { [method]: Error } — that call throws
  */
 export function fakeGithub(state = {}) {
@@ -147,10 +148,19 @@ export function fakeGithub(state = {}) {
         },
       },
       repos: {
+        // `<branch>...<group head>` lists the merge group's commits not yet on
+        // the branch (state.queue, default: one commit for PR 42); `<sha>...<sha>`
+        // answers the pure-revert ancestry check from state.onBase.
         compareCommitsWithBasehead: async ({ basehead }) => {
           maybeFail('repos.compareCommitsWithBasehead');
-          const sha = basehead.split('...')[1];
-          return { data: { ahead_by: state.onBase?.has(sha) ? 0 : 1 } };
+          const [base, head] = basehead.split('...');
+          if (!/^[0-9a-f]{40}$/.test(base)) {
+            const queue = state.queue ?? [{ sha: head, message: 'feat: something (#42)' }];
+            return {
+              data: { commits: queue.map((c) => ({ sha: c.sha ?? head, commit: { message: c.message } })) },
+            };
+          }
+          return { data: { ahead_by: state.onBase?.has(head) ? 0 : 1 } };
         },
       },
     },

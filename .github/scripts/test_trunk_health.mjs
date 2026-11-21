@@ -24,6 +24,7 @@ const mergeGroup = (pr = PR) => ({
       head_ref: `refs/heads/gh-readonly-queue/trunk/pr-${pr}-${'1'.repeat(40)}`,
       base_ref: 'refs/heads/trunk',
       base_sha: BASE,
+      head_sha: 'e'.repeat(40),
     },
   },
 });
@@ -265,6 +266,50 @@ test('a revert of a commit not on trunk is not exempt', async () => {
 test('exemptions are not looked up when nothing blocks', async () => {
   const r = await gate(mergeGroup(), {});
   assert.ok(!r.calls.includes('pulls.get') && !r.calls.includes('graphql'), r.calls.join(', '));
+});
+
+// --- Merge groups ----------------------------------------------------------
+
+// With HEADGREEN grouping, the entries queued ahead merge on the last entry's
+// run, so every PR the group carries must be exempt.
+test('a group whose earlier PR is not exempt is blocked, though this PR is', async () => {
+  const r = await gate(mergeGroup(), {
+    ...brokenIssue(7, 48),
+    queue: [{ message: 'feat: unrelated (#41)' }, { message: 'fix: the trunk failure (#42)' }],
+    pulls: { 42: { labels: ['fixes-trunk'] } },
+  });
+  assert.equal(r.failed.length, 1);
+  assert.match(r.failed[0], /would also merge 1 PR\(s\) queued ahead of this one; each must be exempt\. Not exempt: #41\./);
+});
+
+test('a group of exempt PRs may merge, each named with its reason', async () => {
+  const r = await gate(mergeGroup(), {
+    ...brokenIssue(7, 48),
+    queue: [{ message: 'fix: part one (#41)' }, { message: 'fix: part two (#42)' }],
+    pulls: { 41: { labels: ['fixes-trunk'] }, 42: { labels: ['fixes-trunk'] } },
+  });
+  assert.deepEqual(r.failed, []);
+  assert.match(r.summary, /every PR in this merge group may merge\n\n- #41: it is labeled `fixes-trunk`\n- #42: it is labeled `fixes-trunk`/);
+});
+
+test('a queue commit that names no PR fails closed', async () => {
+  const r = await gate(mergeGroup(), { queue: [{ sha: 'd'.repeat(40), message: 'a direct commit' }] });
+  assert.equal(r.failed.length, 1);
+  assert.match(r.failed[0], new RegExp(`could not tell which PR merge-queue commit ${'d'.repeat(40)} belongs to`));
+});
+
+test('the PR of the queue ref is judged even when the compare lists nothing', async () => {
+  const blocked = await gate(mergeGroup(), { ...brokenIssue(7, 48), queue: [] });
+  assert.equal(blocked.failed.length, 1);
+  assert.match(blocked.failed[0], /merging is blocked/);
+
+  const exempt = await gate(mergeGroup(), {
+    ...brokenIssue(7, 48),
+    queue: [],
+    pulls: { 42: { labels: ['fixes-trunk'] } },
+  });
+  assert.deepEqual(exempt.failed, []);
+  assert.match(exempt.summary, /this PR may merge because it is labeled `fixes-trunk`/);
 });
 
 // --- Advisory pull_request runs --------------------------------------------
