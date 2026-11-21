@@ -1544,7 +1544,7 @@ async fn start_otel_logs(
         Ok(()) => {
             let protocol = if exporter.is_http() { "http" } else { "grpc" };
             tracing::info!(
-                endpoint = %exporter.endpoint,
+                endpoint = %redact::redact_url_credentials(&exporter.endpoint),
                 protocol = protocol,
                 "OTEL logs exporter enabled"
             );
@@ -1684,7 +1684,7 @@ fn init_metrics(
                 provider_builder = provider_builder.with_reader(otel_reader);
                 let protocol = if config.is_http() { "http" } else { "grpc" };
                 tracing::info!(
-                    endpoint = %config.endpoint,
+                    endpoint = %redact::redact_url_credentials(&config.endpoint),
                     protocol = protocol,
                     push_interval = %config.push_interval,
                     temporality = ?config.temporality,

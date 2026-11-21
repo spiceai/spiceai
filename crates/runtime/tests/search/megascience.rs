@@ -189,7 +189,7 @@ impl TableOptions {
                 ],
                 vec![
                     Dataset::new(
-                        "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
+                        "s3://spice-datasets-gjezag77s0hu/MegaScience/mega-science-small.jsonl",
                         "megascience",
                     )
                     .with_params(Params::from_string_map(HashMap::from([(
@@ -202,7 +202,7 @@ impl TableOptions {
                 vec![],
                 vec![
                     Dataset::new(
-                        "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
+                        "s3://spice-datasets-gjezag77s0hu/MegaScience/mega-science-small.jsonl",
                         "qs",
                     )
                     .with_params(Params::from_string_map(HashMap::from([(

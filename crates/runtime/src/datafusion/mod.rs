@@ -478,7 +478,8 @@ pub enum Error {
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
     #[snafu(display(
-        "Acceleration mode `append` requires `time_column` parameter for source {from}. Configure `time_column` parameter and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
+        "Acceleration mode `append` requires `time_column` parameter for source {}. Configure `time_column` parameter and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column",
+        crate::http::v1::redact_source_credentials(from)
     ))]
     AppendRequiresTimeColumn { from: String },
 
@@ -8070,6 +8071,18 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    /// The dataset's source is named without the credentials its URL carries.
+    #[test]
+    fn append_requires_time_column_message_leaves_out_url_credentials() {
+        let error = Error::AppendRequiresTimeColumn {
+            from: "https://alice:hunter2@api.example.com/rows.csv?api_key=abc123".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Acceleration mode `append` requires `time_column` parameter for source https://api.example.com/rows.csv?api_key=***. Configure `time_column` parameter and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
+        );
+    }
 
     #[test]
     fn settings_rebuild_messages_name_the_dataset_the_change_and_the_outcome() {

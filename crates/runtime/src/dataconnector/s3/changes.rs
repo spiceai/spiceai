@@ -128,7 +128,8 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` needs `from` to name an S3 prefix, but '{from}' contains a wildcard. Point `from` at the prefix that holds the objects (for example 's3://bucket/events/') and narrow it with `s3_changes_key_prefix`. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` needs `from` to name an S3 prefix, but '{}' contains a wildcard. Point `from` at the prefix that holds the objects (for example 's3://bucket/events/') and narrow it with `s3_changes_key_prefix`. See: {S3_DOCS}",
+        crate::http::v1::redact_source_credentials(from)
     ))]
     FromIsGlob { dataset_name: String, from: String },
 
@@ -1761,6 +1762,21 @@ mod tests {
     use tokio::sync::{Mutex, RwLock};
 
     const QUEUE_URL: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/s3-events";
+
+    /// The dataset's `from` is named without the credentials its URL carries.
+    #[test]
+    fn from_is_glob_message_leaves_out_url_credentials() {
+        let error = Error::FromIsGlob {
+            dataset_name: "events".to_string(),
+            from: "s3://alice:hunter2@bucket/events/*.parquet".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed to register dataset events (s3): `refresh_mode: changes` needs `from` to name an S3 prefix, but 's3://bucket/events/*.parquet' contains a wildcard. Point `from` at the prefix that holds the objects (for example 's3://bucket/events/') and narrow it with `s3_changes_key_prefix`. See: {S3_DOCS}"
+            )
+        );
+    }
 
     #[derive(Debug)]
     struct StaticFederated(Arc<dyn TableProvider>);

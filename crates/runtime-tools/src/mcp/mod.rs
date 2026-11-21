@@ -38,7 +38,12 @@ use snafu::{ResultExt, Snafu};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid MCP directive 'from: mcp:{}'", id))]
+    /// A URL directive is shown without its credentials; the message is logged and kept as
+    /// the tool's status.
+    #[snafu(display(
+        "Invalid MCP directive 'from: mcp:{}'",
+        redact::redact_url_credentials(id)
+    ))]
     InvalidMCPDirective { id: String },
 
     #[snafu(display("Could not construct tool `{}`. Error: {}", name, e))]
@@ -311,6 +316,18 @@ mod tests {
                 "how the runtime connects to 'mcp:{target}'"
             );
         }
+    }
+
+    /// A directive that does not parse is named without the credentials its URL carries.
+    #[test]
+    fn invalid_directive_message_leaves_out_url_credentials() {
+        let error = MCPType::from_str(r#"https://alice:pa"ss@tools.example.com/sse?token=abc123"#)
+            .err()
+            .expect("a quote does not parse");
+        assert_eq!(
+            error.to_string(),
+            "Invalid MCP directive 'from: mcp:https://tools.example.com/sse?token=***'"
+        );
     }
 
     #[test]

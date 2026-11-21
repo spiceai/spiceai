@@ -85,7 +85,8 @@ async fn a_sequence_replies_the_same_whatever_another_sequence_holds() {
 
 /// The draft head and the context refuse a sequence they do not hold, and a batch whose
 /// sequences are interleaved, with an error instead of the assertion that would end the process
-/// inside llama.cpp.
+/// inside llama.cpp. The context refuses a token outside the vocabulary saying why in the lines
+/// llama.cpp logged about it, and only those: a second refusal does not carry the first's.
 #[tokio::test]
 async fn a_sequence_outside_the_context_is_refused_not_asserted() {
     let gguf = qwen35_gguf().await;
@@ -155,6 +156,23 @@ async fn a_sequence_outside_the_context_is_refused_not_asserted() {
         None,
         "a sequence the context does not hold has no state"
     );
+
+    let mut outside = Batch::new(1);
+    outside
+        .add(Token(i32::MAX), 0, true)
+        .expect("the batch has room");
+    let refused = "llama.cpp could not decode the batch: the batch is invalid. llama.cpp \
+        reported: init: invalid token[0] = 2147483647; decode: failed to initialize batch; \
+        llama_decode: failed to decode, ret = -1";
+    for attempt in ["first", "second"] {
+        assert_eq!(
+            spec.target_mut()
+                .decode(&outside)
+                .map_err(|e| e.to_string()),
+            Err(refused.to_string()),
+            "the {attempt} refusal of a token outside the vocabulary"
+        );
+    }
 }
 
 /// A prompt checkpoint saved for one sequence restores into that sequence, beside another that

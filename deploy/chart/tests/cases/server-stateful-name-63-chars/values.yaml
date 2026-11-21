@@ -1,0 +1,3 @@
+fullnameOverride: spice-server-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+stateful:
+  enabled: true

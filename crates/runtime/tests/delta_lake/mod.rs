@@ -275,7 +275,7 @@ async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
         .scope(async {
             let path = setup_test_data(
                 "https://public-data.spiceai.org/delta_table_partition.zip",
-                "delta_table_partition",
+                "delta_table_partition_pruning",
             )
             .await?;
             let _hook = FileCleanup { path: path.clone() };
@@ -339,7 +339,7 @@ async fn query_delta_lake_with_timestamp_pruning() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let path = setup_test_data(
-                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_firewall_events.zip",
+                "https://spice-datasets-gjezag77s0hu.s3.us-east-1.amazonaws.com/delta_firewall_events.zip",
                 "delta_firewall_events",
             )
             .await?;
@@ -427,7 +427,7 @@ async fn query_delta_lake_column_mapping_mode_name() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let path = setup_test_data(
-                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_column_mapping_name.zip",
+                "https://spice-datasets-gjezag77s0hu.s3.us-east-1.amazonaws.com/delta_column_mapping_name.zip",
                 "delta_column_mapping_name",
             )
             .await?;
@@ -580,7 +580,7 @@ async fn query_delta_lake_column_mapping_mode_id() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let path = setup_test_data(
-                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_column_mapping_id.zip",
+                "https://spice-datasets-gjezag77s0hu.s3.us-east-1.amazonaws.com/delta_column_mapping_id.zip",
                 "delta_column_mapping_id",
             )
             .await?;
@@ -706,7 +706,7 @@ async fn query_delta_lake_column_mapping_with_partitions() -> Result<(), String>
     test_request_context()
         .scope(async {
             let path = setup_test_data(
-                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_column_mapping_partitioned.zip",
+                "https://spice-datasets-gjezag77s0hu.s3.us-east-1.amazonaws.com/delta_column_mapping_partitioned.zip",
                 "delta_column_mapping_partitioned",
             )
             .await?;
@@ -759,6 +759,22 @@ async fn query_delta_lake_column_mapping_with_partitions() -> Result<(), String>
                         "+------+------+",
                         "| part | col1 |",
                         "+------+------+",
+                        "| 3    | 3    |",
+                        "| 3    | 13   |",
+                        "| 3    | 23   |",
+                        "| 3    | 33   |",
+                        "| 3    | 43   |",
+                        "+------+------+",
+                    ],
+                ),
+                // A filter that mixes the partition column and a data column
+                (
+                    "SELECT part, col1 FROM cm_partitioned WHERE part = 3 OR col1 = 42 ORDER BY part, col1",
+                    vec![
+                        "+------+------+",
+                        "| part | col1 |",
+                        "+------+------+",
+                        "| 2    | 42   |",
                         "| 3    | 3    |",
                         "| 3    | 13   |",
                         "| 3    | 23   |",
