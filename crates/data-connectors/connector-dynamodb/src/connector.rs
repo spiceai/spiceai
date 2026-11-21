@@ -43,6 +43,7 @@ use snafu::ResultExt;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoff, RetryBackoffBuilder};
 use util::time_format::is_valid_format;
 
 // If we get `ShardNotFound` or `StreamBeyondRetention` on startup and checkpoint is old enough,
@@ -509,33 +510,33 @@ impl DataConnector for DynamoDB {
                 let dataset_name = dataset.name.clone();
                 let dynamodb = Arc::new(dynamodb_ref.clone());
 
-                let (should_bootstrap, checkpoint, checkpoint_updated_at) = match snapshot_mode {
+                let start = match snapshot_mode {
                     // `always`: scan on every start from a fresh stream tip,
                     // discarding any saved checkpoint.
-                    InitialSnapshotMode::Always => (
-                        true,
-                        get_latest_checkpoint(&dynamodb, &dataset_name).await?,
-                        None,
-                    ),
+                    InitialSnapshotMode::Always => get_latest_checkpoint(&dynamodb, &dataset_name)
+                        .await
+                        .map(|checkpoint| (true, checkpoint, None)),
                     // `disabled`: never scan — resume from the saved checkpoint
                     // when present, otherwise begin at the current stream tip.
-                    InitialSnapshotMode::Disabled => {
-                        let (_, checkpoint, updated_at) = load_or_initialize_checkpoint(
-                            &dynamodb,
-                            dynamodb_sys.as_ref(),
-                            &dataset_name,
-                        )
-                        .await?;
-                        (false, checkpoint, updated_at)
-                    }
+                    InitialSnapshotMode::Disabled => load_or_initialize_checkpoint(
+                        &dynamodb,
+                        dynamodb_sys.as_ref(),
+                        &dataset_name,
+                    )
+                    .await
+                    .map(|(_, checkpoint, updated_at)| (false, checkpoint, updated_at)),
                     InitialSnapshotMode::Auto => {
                         load_or_initialize_checkpoint(
                             &dynamodb,
                             dynamodb_sys.as_ref(),
                             &dataset_name,
                         )
-                        .await?
+                        .await
                     }
+                };
+                let (should_bootstrap, checkpoint, checkpoint_updated_at) = match start {
+                    Ok(start) => start,
+                    Err(error) => return Some(stream_start_failed(error)),
                 };
 
                 if should_bootstrap {
@@ -569,12 +570,13 @@ impl DataConnector for DynamoDB {
 /// re-initialization (a fresh scan) when there is no store, no persisted checkpoint,
 /// the persisted value can't be deserialized, *or* the store read fails — a store-read
 /// failure is logged and treated as an at-least-once re-bootstrap.
-/// Returns (`should_bootstrap`, checkpoint, `checkpoint_updated_at`).
+/// Returns (`should_bootstrap`, checkpoint, `checkpoint_updated_at`), or the error
+/// that stopped a fresh checkpoint from being read after retrying.
 async fn load_or_initialize_checkpoint(
     dynamodb: &Arc<DynamoDBTableProvider>,
     dynamodb_sys: Option<&Arc<dyn BlobCheckpointStore>>,
     dataset_name: &TableReference,
-) -> Option<(bool, Checkpoint, Option<SystemTime>)> {
+) -> Result<(bool, Checkpoint, Option<SystemTime>), Error> {
     let Some(dynamodb_sys) = dynamodb_sys else {
         return get_latest_checkpoint(dynamodb, dataset_name)
             .await
@@ -583,7 +585,7 @@ async fn load_or_initialize_checkpoint(
 
     match dynamodb_sys.get().await {
         Ok(Some(metadata)) => match serde_json::from_str::<Checkpoint>(&metadata.data) {
-            Ok(checkpoint) => Some((false, checkpoint, metadata.updated_at)),
+            Ok(checkpoint) => Ok((false, checkpoint, metadata.updated_at)),
             Err(err) => {
                 tracing::warn!(
                     dataset = %dataset_name,
@@ -617,27 +619,104 @@ async fn load_or_initialize_checkpoint(
 async fn get_latest_checkpoint(
     dynamodb: &Arc<DynamoDBTableProvider>,
     dataset_name: &TableReference,
-) -> Option<Checkpoint> {
-    match dynamodb.latest_global_checkpoint().await {
-        Ok(checkpoint) => Some(checkpoint),
-        Err(err) => {
-            if let Error::FailedToInitializeStream { source: e } = err {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    error = %e,
-                    "Failed to initialize DynamoDB Stream"
-                );
-            } else {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    error = %err,
-                    "Failed to initialize DynamoDB Stream lag"
-                );
-            }
-
-            None
+) -> Result<Checkpoint, Error> {
+    retry_stream_start(
+        dataset_name,
+        "read the shards",
+        stream_start_backoff(),
+        || dynamodb.latest_global_checkpoint(),
+    )
+    .await
+    .inspect_err(|err| {
+        if let Error::FailedToInitializeStream { source: e } = err {
+            tracing::error!(
+                dataset = %dataset_name,
+                error = %e,
+                "Failed to initialize DynamoDB Stream"
+            );
+        } else {
+            tracing::error!(
+                dataset = %dataset_name,
+                error = %err,
+                "Failed to initialize DynamoDB Stream lag"
+            );
         }
+    })
+}
+
+/// How many times starting a change stream retries an AWS call that failed, and
+/// the longest wait between attempts. The waits follow a Fibonacci sequence from
+/// one second, so the attempts span about two minutes: long enough to outlast a
+/// stream that is still being enabled or a burst of throttling.
+const STREAM_START_MAX_RETRIES: usize = 10;
+const STREAM_START_MAX_INTERVAL: Duration = Duration::from_secs(30);
+
+fn stream_start_backoff() -> RetryBackoff {
+    RetryBackoffBuilder::new()
+        .method(BackoffMethod::Fibonacci)
+        .max_retries(Some(STREAM_START_MAX_RETRIES))
+        .max_duration(Some(STREAM_START_MAX_INTERVAL))
+        .build()
+}
+
+/// Whether a failure to start reading the stream may succeed on another attempt.
+/// An expired shard or a checkpoint past the stream's retention will not, and
+/// each has its own handling (see [`resume_from_checkpoint_stream`]).
+fn is_retryable_stream_start_error(error: &Error) -> bool {
+    !matches!(
+        error,
+        Error::FailedToInitializeCheckpoint {
+            source: dynamodb_streams::Error::ShardNotFound
+                | dynamodb_streams::Error::StreamBeyondRetention
+        } | Error::FailedToInitializeStream {
+            source: dynamodb_streams::Error::ShardNotFound
+                | dynamodb_streams::Error::StreamBeyondRetention
+        }
+    )
+}
+
+/// Runs `attempt`, one of the AWS calls that start a change stream, retrying a
+/// retryable failure with `backoff`. A change stream that fails to start is never
+/// started again, so without this a single transient error (throttling, or a
+/// stream still being enabled) leaves the dataset loading forever.
+async fn retry_stream_start<T, F, Fut>(
+    dataset_name: &TableReference,
+    step: &str,
+    mut backoff: RetryBackoff,
+    mut attempt: F,
+) -> Result<T, Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Error>>,
+{
+    let mut retries = 0usize;
+    loop {
+        let error = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) if !is_retryable_stream_start_error(&error) => return Err(error),
+            Err(error) => error,
+        };
+        let Some(delay) = backoff.next_backoff() else {
+            return Err(error);
+        };
+        retries += 1;
+        tracing::warn!(
+            "Dataset '{dataset_name}' failed to {step} of its DynamoDB Stream, so it is not ready yet; retrying in {} (retry {retries} of {STREAM_START_MAX_RETRIES}). Cause: {error}",
+            humantime::format_duration(Duration::from_millis(
+                u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+            )),
+        );
+        tokio::time::sleep(delay).await;
     }
+}
+
+/// A change stream whose only item is the error that stopped it from starting,
+/// so the dataset reports that error instead of loading forever.
+fn stream_start_failed(error: Error) -> ChangesStream {
+    stream::once(
+        async move { Err(DynamoDBStreamError::FailedToStartStream { source: error }.into()) },
+    )
+    .boxed()
 }
 
 /// Initializes the accelerator from a full `DynamoDB` table scan, then transitions to
@@ -697,7 +776,7 @@ async fn emit_overwrite_then_live(
                 error = %e,
                 "Failed to start DynamoDB overwrite bootstrap stream"
             );
-            return None;
+            return Some(stream_start_failed(e));
         }
     };
 
@@ -739,7 +818,7 @@ async fn emit_overwrite_then_live(
                 error = %e,
                 "Failed to start DynamoDB changes stream after initialization"
             );
-            return None;
+            return Some(stream_start_failed(e));
         }
     };
 
@@ -879,13 +958,14 @@ fn resume_from_checkpoint_stream(
                     }
                 }
                 Err(err) => {
-                    // Other errors - log and return None
+                    // Any other error has already been retried; report it so the
+                    // dataset shows the failure instead of loading forever.
                     tracing::error!(
                         dataset = %dataset_name,
                         error = %err,
                         "Failed to get stream from lag"
                     );
-                    None
+                    Some(stream_start_failed(err))
                 }
             }
         })
@@ -907,7 +987,13 @@ async fn changes_stream_from_checkpoint(
         "Starting DynamoDB stream from lag"
     );
 
-    let stream = dynamodb.stream_from_checkpoint(checkpoint).await?;
+    let stream = retry_stream_start(
+        &dataset_name,
+        "open the shards",
+        stream_start_backoff(),
+        || dynamodb.stream_from_checkpoint(checkpoint.clone()),
+    )
+    .await?;
 
     Ok(stream
         .map(move |msg| {
@@ -988,7 +1074,14 @@ async fn do_rebootstrap(
 ) -> Option<ChangesStream> {
     // Capture a new global checkpoint FIRST (before the scan) so live changes
     // since the scan are re-delivered by the resumed stream, not missed.
-    let new_checkpoint = match dynamodb.latest_global_checkpoint().await {
+    let new_checkpoint = match retry_stream_start(
+        dataset_name,
+        "read the shards",
+        stream_start_backoff(),
+        || dynamodb.latest_global_checkpoint(),
+    )
+    .await
+    {
         Ok(cp) => cp,
         Err(e) => {
             tracing::error!(
@@ -996,7 +1089,7 @@ async fn do_rebootstrap(
                 error = ?e,
                 "Failed to get new checkpoint for re-initialization"
             );
-            return None;
+            return Some(stream_start_failed(e));
         }
     };
 
@@ -1212,6 +1305,105 @@ impl CommitChange for DynamoDBStreamCommitter {
                     source: Box::new(e),
                 })
         }))
+    }
+}
+
+#[cfg(test)]
+mod stream_start_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn transient() -> Error {
+        Error::FailedToInitializeCheckpoint {
+            source: dynamodb_streams::Error::Throttled,
+        }
+    }
+
+    fn dataset() -> TableReference {
+        TableReference::bare("d")
+    }
+
+    /// A stream that fails to start a few times (here, a stream still being
+    /// enabled) starts once the call succeeds, after waiting between attempts.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_is_retried_until_it_succeeds() {
+        let calls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let value = retry_stream_start(
+            &dataset(),
+            "open the shards",
+            stream_start_backoff(),
+            || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move { if call < 3 { Err(transient()) } else { Ok(call) } }
+            },
+        )
+        .await
+        .expect("succeeds on the fourth call");
+        assert_eq!(value, 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An expired shard or a checkpoint past retention cannot succeed on retry,
+    /// and the resume path handles each, so they are returned at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_shard_or_checkpoint_is_not_retried() {
+        for source in [
+            dynamodb_streams::Error::ShardNotFound,
+            dynamodb_streams::Error::StreamBeyondRetention,
+        ] {
+            let calls = AtomicUsize::new(0);
+            let mut source = Some(source);
+            let error = retry_stream_start(
+                &dataset(),
+                "open the shards",
+                stream_start_backoff(),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let source = source.take().expect("called once");
+                    async move { Err::<(), _>(Error::FailedToInitializeCheckpoint { source }) }
+                },
+            )
+            .await
+            .expect_err("not retried");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(!is_retryable_stream_start_error(&error));
+        }
+    }
+
+    /// A failure that outlasts every retry is returned, and the change stream
+    /// then carries it, so the dataset reports the error instead of loading
+    /// forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_persistent_failure_ends_as_a_stream_error() {
+        let calls = AtomicUsize::new(0);
+        let error = retry_stream_start(
+            &dataset(),
+            "open the shards",
+            stream_start_backoff(),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>(transient()) }
+            },
+        )
+        .await
+        .expect_err("gives up");
+        assert_eq!(calls.load(Ordering::SeqCst), STREAM_START_MAX_RETRIES + 1);
+
+        let items: Vec<_> = stream_start_failed(error).collect().await;
+        assert_eq!(items.len(), 1);
+        let Some(Err(item)) = items.into_iter().next() else {
+            panic!("expected one error item");
+        };
+        assert_eq!(
+            item.to_string(),
+            "DynamoDB error: Failed to start reading the DynamoDB Stream, so the dataset receives no changes until Spice restarts. Check that the table's stream is enabled and reachable: Failed to initialize DynamoDB Stream checkpoint: Request has been throttled. Try again later"
+        );
     }
 }
 

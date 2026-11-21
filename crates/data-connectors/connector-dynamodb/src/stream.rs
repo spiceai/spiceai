@@ -47,6 +47,11 @@ pub enum StreamError {
     ))]
     StreamBeyondRetention { source: dynamodb_streams::Error },
 
+    #[snafu(display(
+        "Failed to start reading the DynamoDB Stream, so the dataset receives no changes until Spice restarts. Check that the table's stream is enabled and reachable: {source}"
+    ))]
+    FailedToStartStream { source: Error },
+
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,
 
