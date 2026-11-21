@@ -48,7 +48,22 @@ pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 /// HTTPS connector derives them from its `client_timeout` parameter.
 pub const DEFAULT_SPICE_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Creates a default reqwest client with standard Spice settings.
+/// Redirects the client [`default_spice_client`] builds follows before a request fails.
+const DEFAULT_SPICE_CLIENT_MAX_REDIRECTS: usize = 10;
+
+/// Why the client [`default_spice_client`] builds refuses a redirect.
+const OFF_HOST_REDIRECT_REFUSED: &str = "a redirect off the request's host to a private, loopback, or link-local address is not followed";
+
+/// Creates a default reqwest client with standard Spice settings. Its redirects follow the
+/// `http-egress` policy: a redirect within the request's origin is followed, one that changes
+/// the origin is refused when it leads to a private, loopback, or link-local address (an IP
+/// literal, a well-known internal name, or a host that resolves to one) or downgrades HTTPS to
+/// HTTP, and the request's own host keeps the class of its first DNS answer.
+///
+/// `reqwest` follows the redirects, and drops only `Authorization`, `Cookie` and
+/// `Proxy-Authorization` when one changes the origin. A request that carries a credential in a
+/// custom header or its body must use a client built with [`http_egress::origin_bound`] or sent
+/// through [`http_egress::send`] instead.
 ///
 /// # Errors
 ///
@@ -59,11 +74,27 @@ pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwe
     let mut headers = HeaderMap::new();
     headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
 
+    let egress = http_egress::Egress::new(
+        Some(
+            http_egress::DestinationGuard::new(
+                http_egress::is_internal_ip,
+                http_egress::redirect_target_is_internal,
+                OFF_HOST_REDIRECT_REFUSED,
+            )
+            .redirects_only(),
+        ),
+        DEFAULT_SPICE_CLIENT_MAX_REDIRECTS,
+    );
     reqwest::Client::builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(DEFAULT_SPICE_CLIENT_TIMEOUT)
         .default_headers(headers)
+        .redirect(http_egress::redirect_policy(
+            egress.clone(),
+            http_egress::OnOriginChange::Follow,
+        ))
+        .dns_resolver(Arc::new(http_egress::Resolver::new(egress)))
         .build()
 }
 
@@ -486,5 +517,141 @@ pub trait MetricsProviderComponent: Debug + Send + Sync + 'static {
 impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         self.metrics_provider()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_spice_client;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    /// Answers every request with `respond(path)` and counts the requests.
+    async fn serve(respond: impl Fn(&str) -> String + Send + 'static) -> (u16, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test server");
+        let port = listener.local_addr().expect("test server address").port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let _ = socket.write_all(respond(path).as_bytes()).await;
+            }
+        });
+        (port, requests)
+    }
+
+    fn error_chain(error: &reqwest::Error) -> String {
+        std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |e| {
+            e.source()
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+    }
+
+    #[tokio::test]
+    async fn a_redirect_off_the_host_to_a_loopback_address_is_refused() {
+        let (target_port, target_requests) = serve(|_| OK_RESPONSE.to_string()).await;
+        let target = format!("http://127.0.0.1:{target_port}/graphql");
+        let (origin_port, origin_requests) = serve({
+            let target = target.clone();
+            move |_| redirect_to(&target)
+        })
+        .await;
+        let client = default_spice_client("application/json").expect("build the client");
+
+        let error = client
+            .post(format!("http://localhost:{origin_port}/graphql"))
+            .send()
+            .await
+            .expect_err("the redirect is refused");
+
+        let message = error_chain(&error);
+        assert!(
+            message.contains(&format!("Refused to connect to {target}: a redirect off the request's host to a private, loopback, or link-local address is not followed")),
+            "unexpected error: {message}"
+        );
+        assert_eq!(origin_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            target_requests.load(Ordering::SeqCst),
+            0,
+            "the redirect target is never reached"
+        );
+    }
+
+    /// `localhost.` resolves to a loopback address but, with its trailing dot, is not a
+    /// well-known internal name, so only its resolved address shows that the redirect reaches
+    /// an internal host.
+    #[tokio::test]
+    async fn a_redirect_off_the_host_to_a_name_that_resolves_to_loopback_is_refused() {
+        let (target_port, target_requests) = serve(|_| OK_RESPONSE.to_string()).await;
+        let (origin_port, _) =
+            serve(move |_| redirect_to(&format!("http://localhost.:{target_port}/graphql"))).await;
+        let client = default_spice_client("application/json").expect("build the client");
+
+        let error = client
+            .post(format!("http://127.0.0.1:{origin_port}/graphql"))
+            .send()
+            .await
+            .expect_err("the redirect is refused");
+
+        let message = error_chain(&error);
+        assert!(
+            message.contains("Refused to connect to localhost.: a redirect off the request's host to a private, loopback, or link-local address is not followed"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            target_requests.load(Ordering::SeqCst),
+            0,
+            "the redirect target is never reached"
+        );
+    }
+
+    /// The operator chose the request's host, so a redirect within it is followed even when it
+    /// is a loopback address.
+    #[tokio::test]
+    async fn a_redirect_within_the_host_is_followed() {
+        let (port, requests) = serve(|path| {
+            if path == "/graphql" {
+                redirect_to("/graphql/")
+            } else {
+                OK_RESPONSE.to_string()
+            }
+        })
+        .await;
+        let client = default_spice_client("application/json").expect("build the client");
+
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/graphql"))
+            .send()
+            .await
+            .expect("the redirect is followed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.url().path(), "/graphql/");
+        assert_eq!(response.text().await.expect("the body is read"), "{}");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 }

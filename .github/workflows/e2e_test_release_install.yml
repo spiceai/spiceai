@@ -61,6 +61,11 @@ jobs:
         run: python3 .github/scripts/verify_install_site.py
 
   test-install:
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # pipe the fork's install.sh into a shell here. Non-PR events and same-repo
+    # PRs still run; test-install-windows-wsl still tests a fork's install.sh on
+    # a GitHub-hosted runner.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     environment: secret-free
     name: install on ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
