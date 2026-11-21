@@ -1087,38 +1087,60 @@ fn hex_value(b: u8) -> Option<u8> {
 /// deflate as `PDFium` does, returning the bytes produced but reading no more
 /// than `limit` of them.
 fn inflate_bounded(data: &[u8], limit: u64) -> Vec<u8> {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
-    use std::io::Read;
-
     let mut out = Vec::new();
-    if ZlibDecoder::new(data)
-        .take(limit)
-        .read_to_end(&mut out)
-        .is_ok()
-        && !out.is_empty()
-    {
-        return out;
-    }
-    // A non-conformant producer may omit the zlib header; PDFium accepts the
-    // raw deflate, so the budget must see it too.
-    out.clear();
-    let _ = DeflateDecoder::new(data).take(limit).read_to_end(&mut out);
+    inflate(data, limit, |block| out.extend_from_slice(block));
     out
 }
 
-/// Inflates `data` as Flate (zlib, then raw deflate) and returns the number of
-/// bytes produced, reading no more than `limit` of them and discarding the
-/// output. Holds no more than one decoder block, so counting an 8 GiB bomb
-/// costs the CPU to inflate `limit` bytes and essentially no memory.
+/// Inflates `data` as Flate and returns the number of bytes produced, reading
+/// no more than `limit` of them and discarding the output. Holds no more than
+/// one decoder block, so counting an 8 GiB bomb costs the CPU to inflate
+/// `limit` bytes and essentially no memory.
 fn inflate_counting(data: &[u8], limit: u64) -> u64 {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
-    use std::io::{Read, copy, sink};
+    inflate(data, limit, |_| {})
+}
 
-    let zlib = copy(&mut ZlibDecoder::new(data).take(limit), &mut sink()).unwrap_or(0);
-    if zlib > 0 {
-        return zlib;
+/// Inflates `data` as zlib or, when that produces nothing, as raw deflate,
+/// handing each block of output to `sink` until the stream ends, the decoder
+/// fails, or `limit` bytes have come out. Returns the number of bytes produced.
+/// A non-conformant producer may omit the zlib header; `PDFium` accepts the raw
+/// deflate, so the budget must see it too.
+///
+/// Output produced before a failure, such as a bad checksum or truncated data,
+/// is kept and counted, because `PDFium` keeps it. Decoding through
+/// `std::io::Read` would lose it: the read that meets the failure returns the
+/// error, not the bytes it produced.
+fn inflate(data: &[u8], limit: u64, mut sink: impl FnMut(&[u8])) -> u64 {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    const BLOCK: usize = 64 * 1024;
+    let mut block = vec![0u8; BLOCK];
+    let mut decoder = Decompress::new(true);
+    for zlib_header in [true, false] {
+        decoder.reset(zlib_header);
+        while decoder.total_out() < limit {
+            let (in_before, out_before) = (decoder.total_in(), decoder.total_out());
+            let room = usize::try_from(limit - out_before).map_or(BLOCK, |n| n.min(BLOCK));
+            let rest = usize::try_from(in_before).map_or(data.len(), |n| n.min(data.len()));
+            let status =
+                decoder.decompress(&data[rest..], &mut block[..room], FlushDecompress::None);
+            let written = usize::try_from(decoder.total_out() - out_before).unwrap_or(room);
+            sink(&block[..written]);
+            match status {
+                Ok(Status::StreamEnd) | Err(_) => break,
+                // No output and no input taken means the data ran out mid-stream.
+                Ok(Status::Ok | Status::BufError) => {
+                    if written == 0 && decoder.total_in() == in_before {
+                        break;
+                    }
+                }
+            }
+        }
+        if decoder.total_out() > 0 {
+            return decoder.total_out();
+        }
     }
-    copy(&mut DeflateDecoder::new(data).take(limit), &mut sink()).unwrap_or(0)
+    0
 }
 
 /// Decodes a PDF `/ASCII85Decode` stream up to `limit` output bytes. The output
@@ -1555,6 +1577,52 @@ mod tests {
             pdf.windows(b"xref".len()).any(|w| w == b"xref"),
             "the fixture must be a loadable PDF with an xref"
         );
+        assert_eq!(
+            pdf_too_large_reason(&pdf),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// `data` with its zlib checksum (the last four bytes) inverted, so a zlib
+    /// decoder produces every byte of the stream and then reports an error.
+    fn with_bad_checksum(mut data: Vec<u8>) -> Vec<u8> {
+        let len = data.len();
+        for byte in &mut data[len - 4..] {
+            *byte ^= 0xFF;
+        }
+        data
+    }
+
+    /// `PDFium` keeps the bytes a Flate stream produced before its checksum
+    /// fails, so the budget counts them too. Two streams of 200 MiB each, both
+    /// with a bad checksum, add up past the limit.
+    #[test]
+    fn counts_flate_output_before_a_bad_checksum() {
+        let data = with_bad_checksum(deflate_spaces(200 * 1024 * 1024));
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        for object in [4, 5] {
+            pdf.extend_from_slice(
+                format!(
+                    "{object} 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+                    data.len()
+                )
+                .as_bytes(),
+            );
+            pdf.extend_from_slice(&data);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        }
+        assert_eq!(
+            pdf_too_large_reason(&Bytes::from(pdf)),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// The first stage of a Flate chain keeps its output when its checksum
+    /// fails, as `PDFium` does, so the bomb in the stage after it is budgeted.
+    #[test]
+    fn decodes_a_flate_chain_whose_first_stage_has_a_bad_checksum() {
+        let data = with_bad_checksum(deflate(&flate_bomb()));
+        let pdf = loadable_pdf_with_content_stream(b"[/FlateDecode /FlateDecode]", &data);
         assert_eq!(
             pdf_too_large_reason(&pdf),
             "its compressed streams decompress to more than 256 MiB, the per-document limit"
