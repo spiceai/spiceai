@@ -52,12 +52,12 @@ use reqwest::{
 use runtime_rate_control::{Permit, RateController, RequestOutcome};
 use runtime_request_context::{TRACEPARENT_HEADER, resolve_request_context};
 use snafu::prelude::*;
-use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
+use std::collections::{HashSet, VecDeque};
 use std::{
     borrow::ToOwned,
     fmt,
-    hash::{Hash, Hasher},
-    sync::Arc,
+    hash::{BuildHasher, Hash, RandomState},
+    sync::{Arc, LazyLock},
     time::Instant,
     time::{Duration, SystemTime},
 };
@@ -171,6 +171,43 @@ fn endpoint_label(url: &Url) -> String {
     // carry nothing else — no path, query, fragment or userinfo — so the redaction is a
     // property of the type rather than of remembering to clear each field.
     url.origin().ascii_serialization()
+}
+
+/// The key every request digest in this module is computed with. It is drawn at random
+/// once per process: equal values get equal digests within one process's log, which is
+/// what a reader following a request through it needs, while a digest cannot be checked
+/// against a guessed value — `/users/42`, a short token — anywhere else.
+static REQUEST_DIGEST_KEY: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+
+/// A digest of a request, or of a part of one, that a log line or an error can carry in
+/// place of the request itself. See [`request_value_label`] for why the value cannot go
+/// there.
+fn request_digest(value: &impl Hash) -> u64 {
+    REQUEST_DIGEST_KEY.hash_one(value)
+}
+
+/// How a log line refers to a value a query contributes to a request: the
+/// `request_path`, `request_query`, `request_body` or `request_headers` it filtered on.
+///
+/// **The value itself is never written.** The query chose it, so it can be a token, a
+/// signed parameter, an identifier or a whole payload, and the reader of a diagnostic
+/// log is not the caller who chose it — the boundary [`endpoint_label`] draws for the
+/// configured endpoint. Nor is escaping enough: a body may hold line breaks or terminal
+/// control sequences that, written as they are, start a line a plain-text log reader
+/// takes for one the runtime wrote. What a reader needs to follow a request through the
+/// log is its size and which values repeat, so the label carries the length and a
+/// [`request_digest`] and nothing a query can shape.
+fn request_value_label(value: &str) -> String {
+    format!(
+        "<redacted {} bytes, digest {:016x}>",
+        value.len(),
+        request_digest(&value)
+    )
+}
+
+/// [`request_value_label`] for a request part a partition may leave unset.
+fn optional_request_value_label(value: Option<&str>) -> String {
+    value.map_or_else(|| "<none>".to_string(), request_value_label)
 }
 
 /// The half of an [`Error::ErrorResponse`] message that tells the operator what to do.
@@ -846,9 +883,7 @@ impl CacheKey {
     }
 
     fn redacted_label(&self) -> String {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
-        format!("http-cache-key:{:016x}", hasher.finish())
+        format!("http-cache-key:{:016x}", request_digest(self))
     }
 
     /// Bytes this key keeps alive. Counted alongside the response because the
@@ -907,7 +942,10 @@ pub struct HttpTableProvider {
 impl std::fmt::Debug for HttpTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpTableProvider")
-            .field("base_url", &self.base_url)
+            .field(
+                "base_url",
+                &redact::redact_url_credentials(self.base_url.as_str()),
+            )
             .field("file_format", &self.file_format)
             .field("acceleration_enabled", &self.acceleration_enabled)
             .field("pagination", &self.pagination)
@@ -2420,21 +2458,31 @@ impl TableProvider for HttpTableProvider {
             filters.len(),
             limit
         );
-        for (i, filter) in filters.iter().enumerate() {
-            tracing::trace!("  Filter {}: {:?}", i, filter);
+        // A filter is named by the columns it reads, not printed: its literals are the
+        // request values `request_value_label` keeps out of the log.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            for (i, filter) in filters.iter().enumerate() {
+                let mut columns = filter
+                    .column_refs()
+                    .into_iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>();
+                columns.sort_unstable();
+                tracing::trace!("  Filter {i} reads columns {columns:?}");
+            }
         }
 
         // Extract all (path, query, body) combinations that are allowed for this provider
         let partitions = self.extract_partitions(filters)?;
 
         tracing::trace!("Extracted {} partitions from filters", partitions.len());
-        for (i, partition) in partitions.iter().enumerate() {
+        for (i, (path, query, body, request_headers)) in partitions.iter().enumerate() {
             tracing::trace!(
-                "  Partition {}: path={:?}, query={:?}, body={:?}",
-                i,
-                partition.0,
-                partition.1,
-                partition.2
+                "  Partition {i}: path={}, query={}, body={}, headers={}",
+                optional_request_value_label(path.as_deref()),
+                optional_request_value_label(query.as_deref()),
+                optional_request_value_label(body.as_deref()),
+                optional_request_value_label(request_headers.as_deref()),
             );
         }
 
@@ -2636,12 +2684,11 @@ impl HttpExec {
         let request_headers_val = request_headers.as_deref();
 
         tracing::debug!(
-            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}, request_headers_present={}",
-            partition,
-            path_val,
-            query_val,
-            body_val,
-            request_headers_val.is_some()
+            "HttpExec fetching partition {partition}: request_path={}, request_query={}, request_body={}, request_headers={}",
+            optional_request_value_label(path.as_deref()),
+            optional_request_value_label(query_val),
+            optional_request_value_label(body_val),
+            optional_request_value_label(request_headers_val),
         );
 
         // Fetch content with path, query, and body
@@ -2770,8 +2817,8 @@ impl HttpExec {
         let headers_for_batch = request_headers.unwrap_or("");
 
         tracing::debug!(
-            "Creating batch with request_path={:?}, content_len={}, num_rows={}",
-            path_for_batch,
+            "Creating batch with request_path={}, content_len={}, num_rows={}",
+            optional_request_value_label(path),
             fetch_result.content.len(),
             num_rows
         );
@@ -3117,10 +3164,13 @@ impl std::fmt::Debug for HttpExec {
 
 impl DisplayAs for HttpExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        // Any caller can `EXPLAIN` a query against the dataset, so the configured URL is
+        // shown as `/v1/datasets` shows it: without a key or password it carries.
         write!(
             f,
             "HttpExec: base_url={}, format={}, ",
-            self.provider.base_url, self.provider.file_format
+            redact::redact_url_credentials(self.provider.base_url.as_str()),
+            self.provider.file_format
         )?;
 
         if self.deferred_partitions {
@@ -3600,6 +3650,11 @@ const REQUEST_PATH_DOT_SEGMENT_MESSAGE: &str = "The 'request_path' value contain
 
 const REQUEST_PATH_REWRITTEN_MESSAGE: &str = "The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
 
+const REQUEST_PATH_RELATIVE_MESSAGE: &str =
+    "The 'request_path' value must start with '/', such as '/api/endpoint'.";
+
+const REQUEST_PATH_DOUBLE_DOT_MESSAGE: &str = "The 'request_path' value contains '..', which is not allowed for security reasons. Remove it from the path.";
+
 /// Rejects a `request_path` the HTTP request would not send as written.
 ///
 /// `allowed_request_paths` is matched against the path as written, but the request goes to
@@ -3638,9 +3693,10 @@ fn ensure_request_path_is_sent_as_written(raw: &str, base_url: &Url) -> Result<(
 }
 
 fn pagination_request_label(url: &Url) -> String {
-    let mut hasher = DefaultHasher::new();
-    url.as_str().hash(&mut hasher);
-    format!("http-pagination-request:{:016x}", hasher.finish())
+    format!(
+        "http-pagination-request:{:016x}",
+        request_digest(&url.as_str())
+    )
 }
 
 fn record_pagination_request_url(state: &mut PaginationState, url: &Url) -> Result<()> {
@@ -4013,6 +4069,14 @@ fn merge_base_and_partition_queries_with_override(
 }
 
 impl HttpTableProvider {
+    /// The `allowed_request_paths` patterns, for a log line: the compiled `GlobSet`'s
+    /// `Debug` is its automaton, dozens of lines long.
+    fn allowed_path_patterns(&self) -> Option<&[String]> {
+        self.allowed_paths
+            .as_ref()
+            .map(|(_, patterns)| patterns.as_slice())
+    }
+
     /// Extract request partition values from filters.
     ///
     /// Path, query, body, and header filters are all used to build the partition
@@ -4022,7 +4086,7 @@ impl HttpTableProvider {
         tracing::trace!(
             "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}, allow_header_filters={}",
             filters.len(),
-            self.allowed_paths,
+            self.allowed_path_patterns(),
             self.request_filter_options
                 .is_enabled(RequestFilterKind::Query),
             self.request_filter_options
@@ -4049,10 +4113,10 @@ impl HttpTableProvider {
         let partition_values = accumulator.finalize();
 
         tracing::trace!(
-            "After finalize: paths={:?}, queries={:?}, bodies={:?}, headers_count={}",
-            partition_values.paths,
-            partition_values.queries,
-            partition_values.bodies,
+            "After finalize: {} paths, {} queries, {} bodies, {} header sets",
+            partition_values.paths.len(),
+            partition_values.queries.len(),
+            partition_values.bodies.len(),
             partition_values.headers.len()
         );
 
@@ -4201,38 +4265,41 @@ impl HttpTableProvider {
         value: &str,
         accumulator: &mut PartitionAccumulator,
     ) -> Result<()> {
-        if column_name == "request_headers" {
-            tracing::trace!(
-                "apply_literal_filter: column={}, value=<redacted {} bytes>",
-                column_name,
-                value.len()
-            );
-        } else {
-            tracing::trace!(
-                "apply_literal_filter: column={}, value={}",
-                column_name,
-                value
-            );
-        }
+        tracing::trace!(
+            "apply_literal_filter: column={column_name}, value={}",
+            request_value_label(value)
+        );
         match column_name {
             "request_path" => {
                 let normalized = self.ensure_allowed_path(value)?;
-                tracing::trace!("Path filter validated and normalized: {}", normalized);
+                tracing::trace!(
+                    "Path filter validated and normalized: {}",
+                    request_value_label(&normalized)
+                );
                 accumulator.record_path(normalized);
             }
             "request_query" => {
                 let normalized = self.ensure_allowed_query(value)?;
-                tracing::trace!("Query filter validated and normalized: {}", normalized);
+                tracing::trace!(
+                    "Query filter validated and normalized: {}",
+                    request_value_label(&normalized)
+                );
                 accumulator.record_query(normalized);
             }
             "request_body" => {
                 let normalized = self.ensure_allowed_body(value)?;
-                tracing::trace!("Body filter validated and normalized: {}", normalized);
+                tracing::trace!(
+                    "Body filter validated and normalized: {}",
+                    request_value_label(&normalized)
+                );
                 accumulator.record_body(normalized);
             }
             "request_headers" => {
                 let normalized = self.ensure_allowed_headers(value)?;
-                tracing::trace!("Header filter validated: {} bytes", normalized.len());
+                tracing::trace!(
+                    "Header filter validated: {}",
+                    request_value_label(&normalized)
+                );
                 accumulator.record_headers(normalized);
             }
             _ => {
@@ -4336,11 +4403,15 @@ impl HttpTableProvider {
         }
     }
 
+    /// Validates a `request_path` filter value.
+    ///
+    /// Neither the log line nor the rejections repeat the value, for the reasons
+    /// [`request_value_label`] gives; the caller who wrote the filter still has it.
     fn ensure_allowed_path(&self, raw: &str) -> Result<String> {
         tracing::debug!(
             "ensure_allowed_path called with raw={}, allowed_paths={:?}",
-            raw,
-            self.allowed_paths
+            request_value_label(raw),
+            self.allowed_path_patterns()
         );
 
         if raw.is_empty() {
@@ -4351,23 +4422,19 @@ impl HttpTableProvider {
         if raw.len() > MAX_REQUEST_PATH_LENGTH {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "The 'request_path' value '{raw}' is too long ({} characters). Maximum allowed length is {MAX_REQUEST_PATH_LENGTH} characters.",
+                    "The 'request_path' value is too long ({} characters). Maximum allowed length is {MAX_REQUEST_PATH_LENGTH} characters.",
                     raw.len()
                 ),
             });
         }
         if !raw.starts_with('/') {
             return Err(Error::FilterRejected {
-                message: format!(
-                    "The 'request_path' value '{raw}' must start with '/'. For example: '/api/endpoint' instead of '{raw}'."
-                ),
+                message: REQUEST_PATH_RELATIVE_MESSAGE.to_string(),
             });
         }
         if raw.contains("..") {
             return Err(Error::FilterRejected {
-                message: format!(
-                    "The 'request_path' value '{raw}' contains '..' segments, which are not allowed for security reasons."
-                ),
+                message: REQUEST_PATH_DOUBLE_DOT_MESSAGE.to_string(),
             });
         }
         ensure_request_path_is_sent_as_written(raw, &self.base_url)?;
@@ -4384,7 +4451,7 @@ impl HttpTableProvider {
         if !globset.is_match(raw) {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "The 'request_path' value '{raw}' does not match any allowed path patterns. Allowed patterns are: [{}]. Update the 'allowed_request_paths' parameter in your dataset configuration to include a matching pattern.",
+                    "The 'request_path' value does not match any allowed path patterns. Allowed patterns are: [{}]. Update the 'allowed_request_paths' parameter in your dataset configuration to include a matching pattern.",
                     patterns
                         .iter()
                         .map(|p| format!("'{p}'"))
@@ -4400,7 +4467,7 @@ impl HttpTableProvider {
     fn ensure_allowed_query(&self, raw: &str) -> Result<String> {
         tracing::debug!(
             "ensure_allowed_query called with raw={}, allow_query_filters={}",
-            raw,
+            request_value_label(raw),
             self.request_filter_options
                 .is_enabled(RequestFilterKind::Query)
         );
@@ -4443,7 +4510,7 @@ impl HttpTableProvider {
     fn ensure_allowed_body(&self, raw: &str) -> Result<String> {
         tracing::debug!(
             "ensure_allowed_body called with raw={}, allow_body_filters={}",
-            raw,
+            request_value_label(raw),
             self.request_filter_options
                 .is_enabled(RequestFilterKind::Body)
         );
@@ -7177,6 +7244,73 @@ mod tests {
         }
     }
 
+    /// The rejections a `request_path` can get before the allowlist is consulted, asserted
+    /// in full so a reword cannot bring the path back into a message that reaches logs.
+    #[test]
+    fn test_request_path_rejections_do_not_repeat_the_path() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/hooks/*".to_string()])
+            .expect("allowed paths");
+        let too_long = format!("/hooks/{}", "s".repeat(MAX_REQUEST_PATH_LENGTH));
+        let cases = [
+            (
+                "hooks/PATH-SECRET",
+                "The 'request_path' value must start with '/', such as '/api/endpoint'.".to_string(),
+            ),
+            (
+                "/hooks/..PATH-SECRET",
+                "The 'request_path' value contains '..', which is not allowed for security reasons. Remove it from the path.".to_string(),
+            ),
+            (
+                too_long.as_str(),
+                format!(
+                    "The 'request_path' value is too long ({} characters). Maximum allowed length is {MAX_REQUEST_PATH_LENGTH} characters.",
+                    too_long.len()
+                ),
+            ),
+            (
+                "/admin/PATH-SECRET",
+                "The 'request_path' value does not match any allowed path patterns. Allowed patterns are: ['/hooks/*']. Update the 'allowed_request_paths' parameter in your dataset configuration to include a matching pattern.".to_string(),
+            ),
+        ];
+        for (raw, expected) in cases {
+            match provider.ensure_allowed_path(raw) {
+                Err(Error::FilterRejected { message }) => {
+                    assert_eq!(message, expected, "request_path {raw:?}");
+                }
+                other => panic!("request_path {raw:?} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// What a log line says about a request value: its size and a digest, never the
+    /// value, and nothing a value can shape — a body's line break or escape sequence
+    /// included.
+    #[test]
+    fn test_request_value_label_carries_size_and_digest_only() {
+        let forged =
+            "{\"token\":\"BODY-SECRET\"}\n2026-01-01T00:00:00Z ERROR runtime: forged\u{1b}[2K";
+        let label = request_value_label(forged);
+        let digest = label
+            .strip_prefix(&format!("<redacted {} bytes, digest ", forged.len()))
+            .and_then(|rest| rest.strip_suffix('>'))
+            .unwrap_or_else(|| panic!("unexpected label shape: {label:?}"));
+        assert_eq!(digest.len(), 16, "a 64-bit hex digest: {label:?}");
+        assert!(
+            digest.chars().all(|c| c.is_ascii_hexdigit()),
+            "a hex digest: {label:?}"
+        );
+
+        // Repeats of one value can be followed through a log; different values differ.
+        assert_eq!(request_value_label(forged), label);
+        assert_ne!(
+            request_value_label("/hooks/a"),
+            request_value_label("/hooks/b")
+        );
+        assert_eq!(optional_request_value_label(None), "<none>");
+        assert_eq!(optional_request_value_label(Some(forged)), label);
+    }
+
     #[test]
     fn test_url_construction_without_base_path() {
         let base_url = Url::parse("https://api.example.com/").expect("valid URL");
@@ -8012,7 +8146,11 @@ mod tests {
         match err {
             DataFusionError::Plan(message) => {
                 assert!(message.contains("does not match any allowed path patterns"));
-                assert!(message.contains("/admin/users"));
+                assert!(message.contains("'/api/*'"), "names the allowed patterns");
+                assert!(
+                    !message.contains("/admin/users"),
+                    "repeats the rejected path: {message}"
+                );
             }
             other => panic!("Unexpected error: {other:?}"),
         }
