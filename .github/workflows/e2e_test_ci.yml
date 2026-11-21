@@ -1147,7 +1147,8 @@ jobs:
           - target:
               target_os: 'darwin'
 
-    # The default PostgreSQL line of test/source_versions.json.
+    # PostgreSQL 18, the line this job ran on GitHub's Ubuntu image (18.7) and the
+    # default of test/source_versions.json.
     services:
       postgres:
         image: docker.io/library/postgres:18
@@ -1324,11 +1325,12 @@ jobs:
           - target:
               target_os: 'darwin'
 
-    # The default MySQL line of test/source_versions.json. The image creates `testdb` and
-    # gives `test_user` every privilege on it.
+    # MySQL 8.4, the LTS line this job ran on GitHub's Ubuntu image (8.4.13); the
+    # integration suite covers the others in test/source_versions.json. The image
+    # creates `testdb` and gives `test_user` every privilege on it.
     services:
       mysql:
-        image: docker.io/library/mysql:9.7
+        image: docker.io/library/mysql:8.4
         ports:
           - 3306:3306
         env:
