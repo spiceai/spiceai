@@ -390,9 +390,9 @@ pub async fn create_hf_model(
         configuration: error.is_configuration_error(),
         source: Box::new(error),
     };
-    // Every node of a split model resolves the files itself, and each would choose by its own
-    // memory, so a split model takes only a repository's one quantization: every node must name
-    // the same files.
+    // Every node of a split model resolves the files itself, so a split model never chooses by
+    // one node's memory: with no `files`, every node takes the repository's default quantization,
+    // which depends on the repository alone.
     let budget = if distributed.is_some() {
         hf_files::Budget::Split
     } else {

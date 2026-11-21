@@ -171,11 +171,14 @@ fn resolve_gguf(
         if files.iter().any(|file| !is_gguf_path(file)) {
             tracing::info!(
                 "Model '{name}' loads {} from Hugging Face repo '{repo}'{}.",
-                describe(resolved.quantization.as_deref(), resolved.weights.len()),
-                resolved
-                    .draft
-                    .first()
-                    .map_or_else(String::new, |draft| format!(", drafting with '{draft}'"))
+                describe(
+                    resolved.quantization.as_deref().map(printable).as_deref(),
+                    resolved.weights.len()
+                ),
+                resolved.draft.first().map_or_else(String::new, |draft| format!(
+                    ", drafting with '{}'",
+                    printable(draft)
+                ))
             );
         }
         return Ok(resolved
@@ -210,14 +213,14 @@ fn choose_quantization<'q>(
     let names = || {
         quantizations
             .iter()
-            .map(|q| format!("{} ({})", q.name, gigabytes(q.bytes)))
+            .map(|q| format!("{} ({})", printable(&q.name), gigabytes(q.bytes)))
             .collect::<Vec<_>>()
             .join(", ")
     };
     let pin = |q: &Quantization| {
         gguf_files::pin(listing, q)
             .iter()
-            .map(|entry| format!("{{path: {entry}}}"))
+            .map(|entry| format!("{{path: {}}}", printable(entry)))
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -232,7 +235,7 @@ fn choose_quantization<'q>(
         Budget::Free(_) | Budget::Unmeasured | Budget::Split => {
             tracing::info!(
                 "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the quantization a model with no `files` loads: {}. To load another of its {} complete GGUF quantizations, name it in the model's `files`: {}.",
-                describe(Some(&default.name), default.files.len()),
+                describe(Some(&printable(&default.name)), default.files.len()),
                 gigabytes(default.bytes),
                 default_reason(quantizations, default),
                 quantizations.len(),
@@ -245,11 +248,11 @@ fn choose_quantization<'q>(
         Ok(chosen) => {
             tracing::info!(
                 "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the largest of its {} complete GGUF quantizations whose weights fit the {} of memory free for it with room for the context; {} ({}), which a model with no `files` loads, does not. Pin it with `files: [{}]`.",
-                describe(Some(&chosen.name), chosen.files.len()),
+                describe(Some(&printable(&chosen.name)), chosen.files.len()),
                 gigabytes(chosen.bytes),
                 quantizations.len(),
                 gibibytes(memory),
-                default.name,
+                printable(&default.name),
                 gigabytes(default.bytes),
                 pin(chosen)
             );
@@ -262,7 +265,7 @@ fn choose_quantization<'q>(
                 gibibytes(memory),
                 smallest.map_or_else(String::new, |q| format!(
                     "; the smallest, {}, is {}",
-                    q.name,
+                    printable(&q.name),
                     gigabytes(q.bytes)
                 )),
                 names()
@@ -287,6 +290,20 @@ fn default_reason(quantizations: &[Quantization], default: &Quantization) -> Str
             "its first by path, as llama.cpp loads it when a repository has neither {q4} nor {q8}"
         )
     }
+}
+
+/// `name` with its control characters escaped (`\n`, `\u{1b}`): a quantization's name comes from
+/// the repository's file paths, which its owner chooses, and a message prints it on one line.
+fn printable(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `quantization UD-Q4_K_XL (6 files)`, or `3 files` when the files are no one quantization.
@@ -457,6 +474,15 @@ mod tests {
 
     fn owned(names: &[&str]) -> Vec<String> {
         names.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_name_prints_on_one_line() {
+        assert_eq!(printable("UD-Q4_K_XL"), "UD-Q4_K_XL");
+        assert_eq!(
+            printable("Q4_K_M\nINFO forged line\u{1b}[31m"),
+            "Q4_K_M\\nINFO forged line\\u{1b}[31m"
+        );
     }
 
     /// As mistral.rs does, a repository's `chat_template.jinja` is read before its
