@@ -3,7 +3,7 @@ name: Trunk Health
 
 # Blocks merging into trunk while a post-merge failure goes unaddressed.
 #
-# The comprehensive tests run after merge (nightly_tests.yml). A failure they
+# The comprehensive tests run after merge (trunk_tests.yml). A failure they
 # find is tracked as an open issue labeled `trunk-broken` or an open PR labeled
 # `fixes-trunk`. Once one has carried its label for more than 24 hours, this
 # check fails for every PR that is not labeled `fixes-trunk`, does not close a

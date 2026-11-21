@@ -279,7 +279,7 @@ test('triage is searched past the first page of events, and no further than the 
 test('a post-merge workflow not yet on trunk leaves the backstop inactive', async () => {
   const r = await gate(mergeGroup(), { runs: 'missing' });
   assert.deepEqual(r.failed, []);
-  assert.match(r.notices[0], /nightly_tests\.yml does not exist on trunk yet/);
+  assert.match(r.notices[0], /trunk_tests\.yml does not exist on trunk yet/);
 });
 
 // --- Exemptions ------------------------------------------------------------

@@ -40,7 +40,7 @@ export const GRACE_HOURS = 24;
 // failure nobody filed. A flake or an infrastructure fault rarely fails four
 // runs in a row; a real regression does.
 export const BACKSTOP_RUNS = 4;
-export const POST_MERGE_WORKFLOW = 'nightly_tests.yml';
+export const POST_MERGE_WORKFLOW = 'trunk_tests.yml';
 export const COMMENT_MARKER = '<!-- trunk-health -->';
 
 const COMMENT_AUTHOR = 'github-actions[bot]';

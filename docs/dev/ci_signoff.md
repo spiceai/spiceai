@@ -759,7 +759,7 @@ merge queue is still the real gate.
 
 ## Trunk Health
 
-Some tests run after merge rather than in the merge queue: `nightly_tests.yml`
+Some tests run after merge rather than in the merge queue: `trunk_tests.yml`
 runs the comprehensive set on `trunk` every 12 hours. A failure it finds is
 tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
 `fixes-trunk` that fixes or reverts it. The required **Trunk Health** check
@@ -771,7 +771,7 @@ tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
   label for more than 24 hours. The age counts from the most recent time the
   label was added. The 24 hours are for triage: a flake or an infrastructure
   fault should not stop all merging before anyone has looked at it.
-- **Untriaged:** the last four completed `nightly_tests.yml` runs on `trunk`
+- **Untriaged:** the last four completed `trunk_tests.yml` runs on `trunk`
   failed (cancelled runs are skipped), nothing is labeled, and nobody has
   triaged a trunk failure since the older of those runs started. Triage is
   adding or removing a `trunk-broken` or `fixes-trunk` label, or closing an
@@ -830,7 +830,7 @@ two labels (`gh label create trunk-broken`, `gh label create fixes-trunk`) and
 runs `scripts/signoff install --yes`, which adds `Trunk Health` to the required
 checks (see [Configure the ruleset](#configure-the-ruleset)). Until then the
 check runs but does not block. It is safe to require before
-`nightly_tests.yml` exists: with no such workflow, the untriaged condition
+`trunk_tests.yml` exists: with no such workflow, the untriaged condition
 stays off.
 
 ## For maintainers
