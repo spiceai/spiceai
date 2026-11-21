@@ -36,9 +36,27 @@ pub use response::ResponseBodyFormat;
 /// Maximum number of retry attempts for a single page fetch during pagination.
 pub const PAGE_RETRY_MAX_ATTEMPTS: u32 = 5;
 
+/// The reasons reqwest's display of a redirect error leaves out, such as why a redirect was refused.
+fn redirect_reasons(error: &reqwest::Error) -> String {
+    if !error.is_redirect() {
+        return String::new();
+    }
+    let mut reasons = String::new();
+    let mut reason = std::error::Error::source(error);
+    while let Some(next) = reason {
+        reasons.push_str(": ");
+        reasons.push_str(&next.to_string());
+        reason = next.source();
+    }
+    reasons
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to send GraphQL HTTP request: {source}"))]
+    #[snafu(display(
+        "Failed to send GraphQL HTTP request: {source}{}",
+        redirect_reasons(source)
+    ))]
     ReqwestInternal { source: reqwest::Error },
 
     /// The response body could not be read: refused as a compression bomb, or because the
