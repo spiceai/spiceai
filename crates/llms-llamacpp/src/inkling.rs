@@ -416,11 +416,22 @@ pub(crate) fn reply_text<'p>(
 }
 
 /// Where the block `text` leaves open starts, or `None` when `text` ends between blocks. The
-/// text is read by the rules of a reply without a grammar, under which a text block ends at
-/// its `<|end_message|>`, so each of a conversation's messages closes where the template
-/// closes it.
+/// template closes each message with `<|end_message|>`, so a block left open starts after
+/// the last one, whatever the text before it spells: a reply's rules would read the marker
+/// inside a call's unfinished JSON as the call's text, and a message's own text could then
+/// leave a call open for the reply to go on in. What follows the last one is read by the rules
+/// of a reply without a grammar.
 fn open_block(markers: &Markers, text: &str) -> Option<usize> {
-    Reader::new(*markers, Vec::new(), Held::Nothing).read(text)
+    let (mut after, mut at) = (0, 0);
+    for (token, piece) in markers.spell(text) {
+        at += piece.len();
+        if token == Some(markers.end) {
+            after = at;
+        }
+    }
+    Reader::new(*markers, Vec::new(), Held::Nothing)
+        .read(&text[after..])
+        .map(|from| after + from)
 }
 
 /// Whether a JSON body, `body` so far, ends at `<|end_message|>`: once it is one complete
@@ -860,6 +871,32 @@ mod tests {
                 "<|message_model|><|content_thinking|>r<|end_message|><|message_model|><|content_text|>c<|end_message|><|content_model_end_sampling|>"
             ),
             answer("r", "c", &[])
+        );
+    }
+
+    /// A message's text may spell markers, even a call whose JSON it leaves unfinished; the
+    /// template's `<|end_message|>` after it still closes the message, so the reply starts
+    /// between blocks rather than in that call, read with the conversation or without it.
+    #[test]
+    fn a_message_that_spells_an_unfinished_call_leaves_nothing_open() {
+        let conversation = "<|message_user|><|content_text|>Hi<|end_message|><|message_tool|>f<|content_text|>done<|end_message|><|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"a\":\"x<|end_message|>";
+        assert_eq!(
+            reply_text(&TEST_MARKERS, conversation, Some(conversation)),
+            ""
+        );
+        assert_eq!(reply_text(&TEST_MARKERS, conversation, None), "");
+        let mut reader = Reader::new(TEST_MARKERS, names(&["f"]), Held::Nothing).after(reply_text(
+            &TEST_MARKERS,
+            conversation,
+            None,
+        ));
+        assert_eq!(reader.begin(true), "");
+        assert_eq!(
+            read_as(
+                reader,
+                "<|message_model|><|content_text|>c<|end_message|><|content_model_end_sampling|>"
+            ),
+            answer("", "c", &[])
         );
     }
 
