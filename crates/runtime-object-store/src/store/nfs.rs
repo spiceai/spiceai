@@ -31,11 +31,14 @@ use object_store::{
 };
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
-    process_directory_entries_shallow, resolve_range,
+    DirEntry, build_byte_range, build_object_meta, generic_error, guard_buffered_read,
+    process_directory_entries, process_directory_entries_shallow, resolve_range,
 };
 
 const STORE_NAME: &str = "NFS";
+
+// Every read `get_opts` admits must also fit in one `NfsFile::pread` buffer.
+const _: () = assert!(super::common::MAX_BUFFERED_READ <= libnfs::MAX_READ);
 
 fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     error: T,
@@ -235,6 +238,7 @@ impl ObjectStore for NFSObjectStore {
                 }
 
                 let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
+                guard_buffered_read(STORE_NAME, data_to_read)?;
 
                 let file = nfs
                     .open(StdPath::new(&location_string), OFlag::O_RDONLY)

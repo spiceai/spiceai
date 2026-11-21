@@ -41,8 +41,8 @@ use ssh2::{
 };
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
-    process_directory_entries_shallow, resolve_range,
+    DirEntry, build_byte_range, build_object_meta, generic_error, guard_buffered_read,
+    process_directory_entries, process_directory_entries_shallow, resolve_range,
 };
 
 const STORE_NAME: &str = "SFTP";
@@ -715,6 +715,7 @@ impl ObjectStore for SFTPObjectStore {
             }
 
             let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
+            guard_buffered_read(STORE_NAME, data_to_read)?;
 
             // Seek to start position
             file.seek(SeekFrom::Start(start)).map_err(handle_error)?;

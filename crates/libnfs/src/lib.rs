@@ -98,7 +98,19 @@ pub enum Error {
     /// Unknown or unsupported file type encountered.
     #[snafu(display("Unknown file type: {file_type}"))]
     UnknownFileType { file_type: u32 },
+
+    /// A read asked for more bytes than [`MAX_READ`] in one buffer.
+    #[snafu(display(
+        "NFS read of {count} bytes exceeds {max}-byte cap; read the file in smaller ranges"
+    ))]
+    ReadTooLarge { count: u64, max: u64 },
 }
+
+/// Largest buffer [`NfsFile::pread`] allocates for one read.
+///
+/// Callers usually take the count from a size the server reported, so the
+/// buffer must be bounded before it is allocated.
+pub const MAX_READ: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Result type for NFS operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -760,8 +772,16 @@ impl NfsFile {
     /// Read data from the file at a specific offset.
     ///
     /// # Errors
-    /// Returns an error if the read operation fails or if count exceeds platform limits.
+    /// Returns an error if the read operation fails, if count exceeds platform limits,
+    /// or if count exceeds [`MAX_READ`].
     pub fn pread(&self, count: u64, offset: u64) -> Result<Vec<u8>> {
+        snafu::ensure!(
+            count <= MAX_READ,
+            ReadTooLargeSnafu {
+                count,
+                max: MAX_READ
+            }
+        );
         // SAFETY: We target 64-bit minimum platforms. On 64-bit systems, u64 fits in usize.
         // Check for truncation to handle potential future 128-bit platforms gracefully.
         let capacity = usize::try_from(count).map_err(|_| Error::NfsOperationFailed {
@@ -803,7 +823,7 @@ impl NfsFile {
     /// Read data from the beginning of the file.
     ///
     /// # Errors
-    /// Returns an error if the read operation fails.
+    /// Returns an error if the read operation fails or if count exceeds [`MAX_READ`].
     pub fn read(&self, count: u64) -> Result<Vec<u8>> {
         self.pread(count, 0)
     }
