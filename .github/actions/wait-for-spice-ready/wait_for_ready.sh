@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-URL="${SPICE_READY_URL:-http://localhost:8090/v1/ready}"
+URL="${SPICE_READY_URL:-${SPICE_HTTP_ENDPOINT:-http://localhost:8090}/v1/ready}"
 TIMEOUT="${SPICE_READY_TIMEOUT:-300}"
 INTERVAL="${SPICE_READY_INTERVAL:-2}"
 # How often to say something while waiting. A silent 5-minute step is
