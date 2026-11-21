@@ -133,6 +133,12 @@ pub enum Error {
         query: String,
     },
 
+    /// The server answered with a GraphQL `errors` body that does not point at
+    /// the query: no source location and no validation-style `extensions.code`.
+    /// Timeouts and upstream failures take this shape, so it is retriable.
+    #[snafu(display("Server returned an error: {message}"))]
+    ServerReportedError { message: String },
+
     #[snafu(display(
         "Failed to build a valid regex from pagination parameters due to the resource name {resource_name}. {source}"
     ))]
@@ -162,6 +168,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - Connection/timeout errors from reqwest
 /// - Empty or incomplete HTTP 200 bodies (GitHub GraphQL does this intermittently)
 /// - JSON decode errors on a JSON-classified body (truncated payloads)
+/// - A GraphQL `errors` body that does not point at the query (`ServerReportedError`)
 ///
 /// `Error::RateLimited` is retriable: GitHub's secondary/CPU cap is reported on
 /// the response (`retry-after` + HTTP 403), after `check_rate_limit()` already
@@ -174,7 +181,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[must_use]
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
-        Error::RateLimited { .. } => true,
+        Error::RateLimited { .. } | Error::ServerReportedError { .. } => true,
         Error::InvalidCredentialsOrPermissions { kind, .. } => *kind == RefusalKind::Inferred,
         Error::InvalidReqwestStatus { status, .. } => {
             status.is_server_error()

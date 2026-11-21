@@ -2220,6 +2220,36 @@ fn handle_http_error(
     Ok(())
 }
 
+/// Whether a GraphQL `errors` entry says the query itself is wrong, as opposed
+/// to the server failing to run it.
+///
+/// A validation-style `extensions.code` always means the query is wrong. An
+/// error with a source location points into the query, so it is too, unless
+/// the code names a transient server failure. Anything else (a bare message,
+/// an execution-time failure) is treated as transient.
+fn is_query_error(has_location: bool, code: Option<&str>) -> bool {
+    const QUERY_CODES: &[&str] = &[
+        "GRAPHQL_VALIDATION_FAILED",
+        "GRAPHQL_PARSE_FAILED",
+        "BAD_USER_INPUT",
+        "BAD_REQUEST",
+        "PERSISTED_QUERY_NOT_FOUND",
+        "PERSISTED_QUERY_NOT_SUPPORTED",
+    ];
+    const TRANSIENT_CODES: &[&str] = &[
+        "INTERNAL_SERVER_ERROR",
+        "SERVICE_UNAVAILABLE",
+        "TIMEOUT",
+        "GATEWAY_TIMEOUT",
+        "UPSTREAM_ERROR",
+    ];
+    match code {
+        Some(code) if QUERY_CODES.iter().any(|c| c.eq_ignore_ascii_case(code)) => true,
+        Some(code) if TRANSIENT_CODES.iter().any(|c| c.eq_ignore_ascii_case(code)) => false,
+        _ => has_location,
+    }
+}
+
 fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     // Check if there are any errors in the response
     if let Some(errors) = response.get("errors") {
@@ -2312,6 +2342,16 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                     ),
                 });
             }
+        }
+
+        let error_code = graphql_error
+            .get("extensions")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str());
+
+        if !is_query_error(location.is_some(), error_code) {
+            tracing::debug!("GraphQL error without a query location: {message}");
+            return Err(Error::ServerReportedError { message });
         }
 
         return if let Some((line, column)) = location {
@@ -4934,5 +4974,78 @@ mod tests {
                 self.success.clone()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod graphql_errors_classification_tests {
+    use super::{handle_graphql_query_error, is_query_error};
+    use crate::graphql::{Error, is_retriable_error};
+    use serde_json::json;
+
+    fn classify(body: serde_json::Value) -> Error {
+        handle_graphql_query_error(&body, "{ items { id } }").expect_err("errors[] must fail")
+    }
+
+    #[test]
+    fn errors_without_location_are_retriable() {
+        let err = classify(json!({
+            "data": null,
+            "errors": [{"message": "upstream timeout, please retry"}]
+        }));
+        assert!(matches!(err, Error::ServerReportedError { .. }), "{err:?}");
+        assert!(is_retriable_error(&err));
+        assert!(err.to_string().contains("upstream timeout, please retry"));
+    }
+
+    #[test]
+    fn transient_code_with_location_is_retriable() {
+        let err = classify(json!({
+            "errors": [{
+                "message": "backend unavailable",
+                "locations": [{"line": 1, "column": 3}],
+                "extensions": {"code": "SERVICE_UNAVAILABLE"}
+            }]
+        }));
+        assert!(is_retriable_error(&err), "{err:?}");
+    }
+
+    #[test]
+    fn errors_with_location_fail_clearly() {
+        let err = classify(json!({
+            "errors": [{
+                "message": "Cannot query field \"bogus\" on type \"Query\".",
+                "locations": [{"line": 1, "column": 3}]
+            }]
+        }));
+        assert!(matches!(err, Error::InvalidGraphQLQuery { .. }), "{err:?}");
+        assert!(!is_retriable_error(&err));
+        assert!(err.to_string().contains("Cannot query field"));
+    }
+
+    #[test]
+    fn validation_codes_fail_clearly_even_without_location() {
+        for code in [
+            "GRAPHQL_VALIDATION_FAILED",
+            "GRAPHQL_PARSE_FAILED",
+            "BAD_USER_INPUT",
+        ] {
+            let err = classify(json!({
+                "errors": [{"message": "bad query", "extensions": {"code": code}}]
+            }));
+            assert!(
+                matches!(err, Error::InvalidGraphQLQuery { .. }),
+                "{code}: {err:?}"
+            );
+            assert!(!is_retriable_error(&err));
+        }
+    }
+
+    #[test]
+    fn classification_table() {
+        assert!(!is_query_error(false, None));
+        assert!(is_query_error(true, None));
+        assert!(!is_query_error(true, Some("INTERNAL_SERVER_ERROR")));
+        assert!(is_query_error(false, Some("graphql_validation_failed")));
     }
 }
