@@ -1407,6 +1407,7 @@ tools:
     description: MCP-based tool
     params:
       mcp_args: '["--config", "/path/to/config"]'
+      tool_allowlist: list_issues, get_issue
 
 # =============================================================================
 # WORKERS

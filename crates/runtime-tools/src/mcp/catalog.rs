@@ -56,7 +56,7 @@ use tools::SpiceModelTool;
 
 use super::{
     Error, MAX_TOOL_RESULT_SIZE, MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCP_REQUEST_TIMEOUT,
-    MCPConfig, Result, UnderlyingTransportSnafu,
+    MCPConfig, McpToolFilter, Result, UnderlyingTransportSnafu,
     http_client::BoundedHttpClient,
     server::{McpSchemaSnapshot, apply_listed_catalog_cache},
     tool::McpToolWrapper,
@@ -122,12 +122,14 @@ pub(crate) struct McpToolCatalog {
     /// `ttlMs` is 0 and every `all`/`get` refetches.
     refresh: Arc<ListRefresh>,
     reconnector: Arc<Reconnector>,
+    filter: McpToolFilter,
 }
 
 /// Replaces a dead client and republishes its tool list. Shared by the
 /// heartbeat and by tool calls that fail on a closed transport.
 pub(crate) struct Reconnector {
     cfg: MCPConfig,
+    filter: McpToolFilter,
     name: String,
     client: Arc<RwLock<McpClient>>,
     tool_cache: Arc<StdRwLock<ToolListCache>>,
@@ -150,7 +152,7 @@ impl Reconnector {
         // stalls every concurrent `client.read()` (tool call)
         // for the full upstream RTT. Reserve the generation
         // only while swapping, after those readers drain.
-        let listed = list_tools_from_client(&new_client).await;
+        let listed = list_tools_from_client(&new_client, &self.filter).await;
         let my_gen = self
             .refresh
             .swap_and_reserve(&self.client, new_client)
@@ -376,7 +378,12 @@ impl Drop for McpToolCatalog {
 }
 
 impl McpToolCatalog {
-    pub async fn try_new(cfg: MCPConfig, name: &str, description: Option<String>) -> Result<Self> {
+    pub async fn try_new(
+        cfg: MCPConfig,
+        filter: McpToolFilter,
+        name: &str,
+        description: Option<String>,
+    ) -> Result<Self> {
         let client = Self::create_client(&cfg, name).await?;
         let client = Arc::new(RwLock::new(client));
 
@@ -394,6 +401,7 @@ impl McpToolCatalog {
         let refresh_clone = Arc::clone(&refresh);
         let reconnector = Arc::new(Reconnector {
             cfg,
+            filter: filter.clone(),
             name: name.to_string(),
             client: Arc::clone(&client),
             tool_cache: Arc::clone(&tool_cache),
@@ -401,6 +409,7 @@ impl McpToolCatalog {
             refresh: Arc::clone(&refresh),
         });
         let reconnector_clone = Arc::clone(&reconnector);
+        let filter_clone = filter.clone();
 
         let heartbeat_task = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
@@ -439,6 +448,7 @@ impl McpToolCatalog {
                     // later sees Zone (`validated=Region executed=Zone`).
                     publish_live_list(
                         &client_clone,
+                        &filter_clone,
                         &refresh_clone,
                         &tool_cache_clone,
                         &schemas_clone,
@@ -461,6 +471,7 @@ impl McpToolCatalog {
             schemas,
             refresh,
             reconnector,
+            filter,
         };
         // Fill the sync schema cache before the catalog is registered so
         // Streamable HTTP `get_tool` can validate `Mcp-Param-*` on the first
@@ -468,13 +479,20 @@ impl McpToolCatalog {
         // list leaves the cache empty; fail construction so the existing
         // component-load retry rebuilds the catalog instead of registering
         // one that would make rmcp cache `get_tool == None`.
-        catalog
+        let listed = catalog
             .list_tools()
             .await
             .map_err(|e| Error::CouldNotConstructTool {
                 name: name.to_string(),
                 e: e.to_string(),
             })?;
+        let missing = catalog.filter.missing_from(&listed);
+        if !missing.is_empty() {
+            tracing::warn!(
+                "Tool '{name}': the MCP server does not list these tools from 'tool_allowlist': {}. They are not available until the server lists them.",
+                missing.join(", ")
+            );
+        }
         Ok(catalog)
     }
 
@@ -683,7 +701,7 @@ impl McpToolCatalog {
             return Ok(self.cached_tools());
         }
         let (client, my_gen) = self.refresh.reserve_with_read(&self.client).await;
-        let (tools, complete, ttl_ms) = list_tools_from_client(&client).await?;
+        let (tools, complete, ttl_ms) = list_tools_from_client(&client, &self.filter).await?;
         drop(client);
         self.remember_tools(&tools, complete, ttl_ms, my_gen);
         Ok(tools)
@@ -709,6 +727,16 @@ impl McpToolCatalog {
 
     #[cfg(test)]
     fn for_test(name: &str, cache: ToolListCache, client: McpClient) -> Self {
+        Self::for_test_with_filter(name, cache, client, McpToolFilter::All)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_filter(
+        name: &str,
+        cache: ToolListCache,
+        client: McpClient,
+        filter: McpToolFilter,
+    ) -> Self {
         let client = Arc::new(RwLock::new(client));
         let tool_cache = Arc::new(StdRwLock::new(cache));
         let schemas = Arc::new(StdRwLock::new(None));
@@ -731,12 +759,14 @@ impl McpToolCatalog {
                     args: Vec::new(),
                     env: HashMap::new(),
                 },
+                filter: filter.clone(),
                 name: name.to_string(),
                 client,
                 tool_cache,
                 schemas,
                 refresh,
             }),
+            filter,
         }
     }
 }
@@ -746,10 +776,12 @@ impl McpToolCatalog {
 /// (`replace = false`); the merge must not grow past this.
 const MAX_TOTAL_TOOLS: usize = 10000;
 
-/// Page through `tools/list`. `complete` is true only when the peer
-/// finished (no cursor) before the pagination or total-tool caps.
+/// Page through `tools/list`, keeping only the tools `filter` allows.
+/// `complete` is true only when the peer finished (no cursor) before the
+/// pagination or total-tool caps.
 async fn list_tools_from_client(
     client: &McpClient,
+    filter: &McpToolFilter,
 ) -> std::result::Result<(Vec<rmcp::model::Tool>, bool, u64), ServiceError> {
     // Security: Limit pagination to prevent infinite loops and memory exhaustion
     const MAX_PAGINATION_ITERATIONS: usize = 100;
@@ -769,13 +801,14 @@ async fn list_tools_from_client(
             return Ok((tools, false, ttl_ms));
         }
 
-        let response = client
+        let mut response = client
             .list_tools(Some(
                 PaginatedRequestParams::default().with_cursor(cursor.clone()),
             ))
             .await?;
         ttl_ms = fold_page_ttl(ttl_ms, response.ttl_ms, seen_page);
         seen_page = true;
+        response.tools.retain(|tool| filter.allows(&tool.name));
 
         // Security: Validate total tools count to prevent memory exhaustion
         if tools.len().saturating_add(response.tools.len()) > MAX_TOTAL_TOOLS {
@@ -884,13 +917,14 @@ async fn wait_for_heartbeat_or_ttl(
 
 async fn publish_live_list(
     client: &RwLock<McpClient>,
+    filter: &McpToolFilter,
     refresh: &ListRefresh,
     tool_cache: &StdRwLock<ToolListCache>,
     schemas: &StdRwLock<Option<Arc<McpSchemaSnapshot>>>,
     catalog_name: &str,
 ) {
     let (guard, my_gen) = refresh.reserve_with_read(client).await;
-    let listed = list_tools_from_client(&guard).await;
+    let listed = list_tools_from_client(&guard, filter).await;
     drop(guard);
     if let Ok((listed, complete, ttl_ms)) = listed {
         refresh.publish_listed(
@@ -1235,6 +1269,7 @@ impl SpiceToolCatalog for McpToolCatalog {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+    use std::collections::HashSet;
 
     /// A connection attempt that is given up on closes its connection. `handshake()` gives up at
     /// `MCP_HANDSHAKE_TIMEOUT` by dropping the attempt; this drops it the same way, once its first
@@ -1543,6 +1578,43 @@ mod tests {
             calls >= 1,
             "expired get must call tools/list, list_calls={calls}"
         );
+    }
+
+    /// Tools outside `tool_allowlist` must not be listed, looked up, or callable.
+    #[tokio::test]
+    async fn filtered_catalog_hides_tools_outside_tool_allowlist() {
+        let filter = McpToolFilter::Only(Arc::new(HashSet::from(["allowed".to_string()])));
+        let catalog = McpToolCatalog::for_test_with_filter(
+            "srv",
+            ToolListCache::default(),
+            McpClient::Scripted(ScriptedMcpClient {
+                list_calls: Arc::new(AtomicU64::new(0)),
+                tools: vec![sample_listed_tool("allowed"), sample_listed_tool("hidden")],
+                ttl_ms: 5_000,
+            }),
+            filter,
+        );
+
+        let listed: Vec<String> = catalog
+            .all()
+            .await
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(listed, vec!["allowed"]);
+        let definitions: Vec<String> = catalog
+            .all_definitons()
+            .await
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect();
+        assert_eq!(definitions, vec!["allowed"]);
+
+        assert!(catalog.get("allowed").await.is_some());
+        assert!(catalog.get("hidden").await.is_none());
+        assert!(catalog.try_get("allowed").is_some());
+        assert!(catalog.try_get("hidden").is_none());
+        assert!(catalog.try_all().iter().all(|tool| tool.name() != "hidden"));
     }
 
     #[tokio::test]
