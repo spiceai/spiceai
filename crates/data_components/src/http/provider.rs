@@ -32,7 +32,10 @@ use datafusion::{
     common::{Constraints, TableReference, project_schema, runtime::IoWaitExt},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{SendableRecordBatchStream, TaskContext},
+    execution::{
+        SendableRecordBatchStream, TaskContext,
+        memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
+    },
     logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, expr::InList},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -97,6 +100,12 @@ pub enum Error {
     #[snafu(display("Filter rejected: {message}"))]
     FilterRejected { message: String },
 
+    /// A query whose request filters, or a subquery's values, combine into more
+    /// requests than `max_request_partitions` allows. Typed, so callers classify it
+    /// as a refused request by type (see `crate::refusal`), not by its message.
+    #[snafu(display("{message}"))]
+    TooManyRequests { message: String },
+
     #[snafu(display("HTTP provider configuration error: {message}"))]
     Configuration { message: String },
 
@@ -119,9 +128,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to read the response from {endpoint} for {dataset}: {source}. Ask the \
-        endpoint for an uncompressed response by adding `Accept-Encoding: identity` to \
-        `http_headers`, or request less data per call. \
+        "Failed to read the response from {endpoint} for {dataset}: {source} \
         See: https://spiceai.org/docs/components/data-connectors/https"
     ))]
     CompressionRatio {
@@ -136,9 +143,33 @@ pub enum Error {
         dataset: String,
         source: http_body_limit::Error,
     },
+
+    #[snafu(display(
+        "Failed to read the response from {endpoint} for {dataset}: {source}. Raise \
+        `runtime.query.memory_limit`, or request less data per call with filters or \
+        pagination. See: https://spiceai.org/docs/reference/memory"
+    ))]
+    ResponseMemory {
+        endpoint: String,
+        dataset: String,
+        source: http_body_limit::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// `n` with a comma between each group of three digits, as error messages print counts.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
 
 /// How a message refers to the dataset: by name when there is one, and by a phrase that
 /// still reads as a sentence when there is not.
@@ -354,14 +385,22 @@ impl From<Error> for DataFusionError {
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
-            err @ (Error::HttpRequest { .. } | Error::JsonNesting { .. }) => {
-                DataFusionError::External(Box::new(err))
-            }
+            // Kept typed. `TooManyRequests` and `CompressionRatio` are refusals callers
+            // classify by type (see `crate::refusal`): `/v1/sql` answers them as JSON, and a
+            // refresh does not ask again for a query or a response that would be refused
+            // again.
+            err @ (Error::HttpRequest { .. }
+            | Error::JsonNesting { .. }
+            | Error::TooManyRequests { .. }
+            | Error::CompressionRatio { .. }) => DataFusionError::External(Box::new(err)),
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
-            // `Plan`, so a refresh does not re-ask: the response will expand as far again.
-            err @ Error::CompressionRatio { .. } => DataFusionError::Plan(err.to_string()),
+            // The pool's own error kind, so the query fails as any other that ran out of
+            // query memory does.
+            err @ Error::ResponseMemory { .. } => {
+                DataFusionError::ResourcesExhausted(err.to_string())
+            }
             err @ Error::ResponseDecode { .. } => {
                 DataFusionError::External(Box::new(std::io::Error::other(err.to_string())))
             }
@@ -376,6 +415,9 @@ pub const DEFAULT_MAX_QUERY_LENGTH: usize = 1024;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_MAX_HEADERS_LENGTH: usize = 16 * 1024; // 16 KiB
 pub const DEFAULT_PAGINATION_MAX_PAGES: usize = 100;
+/// The most distinct requests one scan of an HTTP dataset may send by default, one for
+/// each combination of its request filter values (`max_request_partitions`).
+pub const DEFAULT_MAX_REQUEST_PARTITIONS: usize = 1000;
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
 const PAGINATION_REPEAT_DETECTION_WINDOW: usize = 1024;
 pub type PartitionSpec = (
@@ -510,9 +552,10 @@ impl CachedResponse {
     /// The reported window is the entry's own retention rather than anything
     /// re-derived: it is already the effective value the entry was admitted
     /// under.
-    fn into_fetch_result(self) -> HttpFetchResult {
+    fn into_fetch_result(self, reservation: MemoryReservation) -> HttpFetchResult {
         HttpFetchResult {
             content: (*self.content).clone(),
+            _reservation: reservation,
             directives: CacheDirectives {
                 present: true,
                 max_age: Some(self.max_age),
@@ -807,6 +850,10 @@ impl ForwardedTraceParent {
 
 struct HttpFetchResult {
     content: String,
+    /// The share of the query memory pool `content` is charged to. Never read: it is
+    /// held so the charge lasts exactly as long as the result, and returned when the
+    /// result is dropped.
+    _reservation: MemoryReservation,
     /// What the origin's `Cache-Control` said. The retention decision is made by
     /// the caller, which is where a configured fallback is in scope.
     directives: CacheDirectives,
@@ -888,7 +935,7 @@ pub struct HttpTableProvider {
     custom_headers: HeaderMap,
     allowed_paths: Option<(GlobSet, Vec<String>)>,
     request_filter_options: RequestFilterOptions,
-    max_request_partitions: Option<usize>,
+    max_request_partitions: usize,
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
     auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
@@ -950,7 +997,7 @@ impl HttpTableProvider {
             custom_headers: HeaderMap::new(),
             allowed_paths: None,
             request_filter_options: RequestFilterOptions::default(),
-            max_request_partitions: None,
+            max_request_partitions: DEFAULT_MAX_REQUEST_PARTITIONS,
             health_probe: None,
             pagination: None,
             auth: None,
@@ -987,6 +1034,13 @@ impl HttpTableProvider {
     /// that still reads as a sentence when there is not.
     fn dataset_subject(&self) -> String {
         dataset_subject(self.dataset_name.as_deref())
+    }
+
+    /// A reservation on `memory_pool` for one response to this dataset, named so that a
+    /// query that runs out of memory says which dataset's response it was holding.
+    fn response_reservation(&self, memory_pool: &Arc<dyn MemoryPool>) -> MemoryReservation {
+        MemoryConsumer::new(format!("HTTP response for {}", self.dataset_subject()))
+            .register(memory_pool)
     }
 
     /// Set what a response the origin did not mark successful becomes: a failed
@@ -1214,12 +1268,12 @@ impl HttpTableProvider {
     }
 
     #[must_use]
-    pub fn max_request_partitions(&self) -> Option<usize> {
+    pub fn max_request_partitions(&self) -> usize {
         self.max_request_partitions
     }
 
     #[must_use]
-    pub fn with_max_request_partitions(mut self, max_request_partitions: Option<usize>) -> Self {
+    pub fn with_max_request_partitions(mut self, max_request_partitions: usize) -> Self {
         self.max_request_partitions = max_request_partitions;
         self
     }
@@ -1822,9 +1876,11 @@ impl HttpTableProvider {
         request_headers: Option<&HeaderMap>,
         trace_parent: Option<&ForwardedTraceParent>,
         path_label: &str,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> Result<HttpFetchResult> {
         let retry_strategy = self.retry_strategy.clone();
         let this = self.clone();
+        let memory_pool = Arc::clone(memory_pool);
         let url_clone = url.clone();
         let body_owned = body.map(ToOwned::to_owned);
         let request_headers_owned = request_headers.cloned();
@@ -1842,6 +1898,7 @@ impl HttpTableProvider {
             let request_headers = request_headers_owned.clone();
             let trace_parent = trace_parent_owned.clone();
             let path = path_owned.clone();
+            let memory_pool = Arc::clone(&memory_pool);
 
             async move {
                 this.perform_single_request(
@@ -1850,6 +1907,7 @@ impl HttpTableProvider {
                     request_headers.as_ref(),
                     trace_parent.as_ref(),
                     &path,
+                    &memory_pool,
                 )
                 .await
             }
@@ -1884,6 +1942,7 @@ impl HttpTableProvider {
         request_headers: Option<&HeaderMap>,
         trace_parent: Option<&ForwardedTraceParent>,
         path_label: &str,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         // Held until the body below has been read, so a response still streaming counts
         // against the rate controller's concurrency limit.
@@ -1995,6 +2054,7 @@ impl HttpTableProvider {
 
         let fetched = Self::extract_response(
             response,
+            self.response_reservation(memory_pool),
             &self.base_url,
             status_code,
             path_label,
@@ -2019,8 +2079,13 @@ impl HttpTableProvider {
     }
 
     /// Extract content and metadata from an HTTP response.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a distinct property of the one response being read"
+    )]
     async fn extract_response(
         response: reqwest::Response,
+        reservation: MemoryReservation,
         endpoint: &Url,
         status_code: u16,
         path_label: &str,
@@ -2143,37 +2208,69 @@ impl HttpTableProvider {
         // the retriable-error classification in `graphql/mod.rs`, which groups
         // is_timeout/is_connect/is_body/is_decode together as transient.
         //
-        // The client is built with `http_body_limit::decode_manually`, so a compressed body
-        // is decoded here and refused once it expands past a ratio real responses do not
-        // reach. That refusal is permanent: asking again gets the same body.
-        let response = http_body_limit::buffer(response, http_body_limit::Limit::CompressionRatio)
+        // The body is charged to the query memory pool as it is read, so a response larger
+        // than the pool can hold fails the query instead of the process. The client is
+        // built with `http_body_limit::decode_manually`, so a compressed body is decoded
+        // here and refused once it expands past a ratio real responses do not reach. Both
+        // refusals are permanent: asking again gets the same body.
+        let memory_error = |source| Error::ResponseMemory {
+            endpoint: endpoint_label(endpoint),
+            dataset: dataset_subject(dataset_name),
+            source,
+        };
+        let response =
+            http_body_limit::buffer(response, http_body_limit::Limit::Reserve(&reservation))
+                .io_wait()
+                .await
+                .map_err(|e| match e {
+                    http_body_limit::Error::Read { source } => {
+                        RetryError::transient(Error::http_request(endpoint, source))
+                    }
+                    source @ (http_body_limit::Error::Decode { .. }
+                    | http_body_limit::Error::Io { .. }) => {
+                        RetryError::transient(Error::ResponseDecode {
+                            endpoint: endpoint_label(endpoint),
+                            dataset: dataset_subject(dataset_name),
+                            source,
+                        })
+                    }
+                    source @ http_body_limit::Error::MemoryLimit { .. } => {
+                        RetryError::Permanent(memory_error(source))
+                    }
+                    source @ (http_body_limit::Error::CompressionRatio { .. }
+                    | http_body_limit::Error::TooLarge { .. }) => {
+                        RetryError::Permanent(Error::CompressionRatio {
+                            endpoint: endpoint_label(endpoint),
+                            dataset: dataset_subject(dataset_name),
+                            source,
+                        })
+                    }
+                })?;
+        // The text is decoded while the body is still held, and in a legacy charset or
+        // with invalid UTF-8 it is longer than the body, so it is charged at its exact
+        // length before it is made; once the body is released, the charge is what the
+        // text holds.
+        let content = http_body_limit::text(response, &reservation)
             .io_wait()
             .await
             .map_err(|e| match e {
                 http_body_limit::Error::Read { source } => {
                     RetryError::transient(Error::http_request(endpoint, source))
                 }
-                source @ http_body_limit::Error::Decode { .. } => {
-                    RetryError::transient(Error::ResponseDecode {
-                        endpoint: endpoint_label(endpoint),
-                        dataset: dataset_subject(dataset_name),
-                        source,
-                    })
+                source @ http_body_limit::Error::MemoryLimit { .. } => {
+                    RetryError::Permanent(memory_error(source))
                 }
-                source @ (http_body_limit::Error::CompressionRatio { .. }
-                | http_body_limit::Error::TooLarge { .. }) => {
-                    RetryError::Permanent(Error::CompressionRatio {
-                        endpoint: endpoint_label(endpoint),
-                        dataset: dataset_subject(dataset_name),
-                        source,
-                    })
-                }
+                source => RetryError::Permanent(Error::ResponseDecode {
+                    endpoint: endpoint_label(endpoint),
+                    dataset: dataset_subject(dataset_name),
+                    source,
+                }),
             })?;
-        let content = response
-            .text()
-            .io_wait()
-            .await
-            .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
+        reservation
+            .try_resize(content.capacity())
+            .map_err(|source| {
+                RetryError::Permanent(memory_error(http_body_limit::Error::MemoryLimit { source }))
+            })?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -2185,6 +2282,7 @@ impl HttpTableProvider {
 
         Ok(HttpFetchResult {
             content,
+            _reservation: reservation,
             directives,
             // The age on arrival plus the time spent here since — reading the
             // body and getting to admission. Saturating throughout, because
@@ -2207,6 +2305,7 @@ impl HttpTableProvider {
         body: Option<&str>,
         request_headers: Option<&str>,
         trace_parent: Option<&ForwardedTraceParent>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
@@ -2224,6 +2323,7 @@ impl HttpTableProvider {
                 parsed_request_headers.as_ref(),
                 trace_parent,
                 &path_owned,
+                memory_pool,
             )
             .await?;
 
@@ -2233,6 +2333,9 @@ impl HttpTableProvider {
         Ok(fetch_result)
     }
 
+    /// The response to one request, from the response cache or the origin. Its content
+    /// is charged to `memory_pool`, the query memory pool of the query reading it, for as
+    /// long as the result is held.
     async fn get_response(
         &self,
         path: &str,
@@ -2240,11 +2343,19 @@ impl HttpTableProvider {
         body: Option<&str>,
         request_headers: Option<&str>,
         trace_parent: Option<&ForwardedTraceParent>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> Result<HttpFetchResult> {
         // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
             return self
-                .fetch_response(path, query, body, request_headers, trace_parent)
+                .fetch_response(
+                    path,
+                    query,
+                    body,
+                    request_headers,
+                    trace_parent,
+                    memory_pool,
+                )
                 .await;
         }
 
@@ -2262,11 +2373,27 @@ impl HttpTableProvider {
                     cache_key.redacted_label()
                 );
             }
-            return Ok(cached.into_fetch_result());
+            // The copy handed to the query is charged like a body read from the origin.
+            let reservation = self.response_reservation(memory_pool);
+            reservation
+                .try_grow(cached.content.len())
+                .map_err(|source| Error::ResponseMemory {
+                    endpoint: endpoint_label(&self.base_url),
+                    dataset: self.dataset_subject(),
+                    source: http_body_limit::Error::MemoryLimit { source },
+                })?;
+            return Ok(cached.into_fetch_result(reservation));
         }
 
         let fetch_result = self
-            .fetch_response(path, query, body, request_headers, trace_parent)
+            .fetch_response(
+                path,
+                query,
+                body,
+                request_headers,
+                trace_parent,
+                memory_pool,
+            )
             .await?;
 
         // Retention is resolved here because this is the only place both the
@@ -2488,7 +2615,7 @@ impl HttpExec {
 
     /// Returns the maximum number of request partitions allowed, if configured.
     #[must_use]
-    pub fn max_request_partitions(&self) -> Option<usize> {
+    pub fn max_request_partitions(&self) -> usize {
         self.provider.max_request_partitions()
     }
 
@@ -2556,17 +2683,26 @@ impl HttpExec {
         values: &[String],
     ) -> DataFusionResult<Self> {
         let existing = &self.partitions;
-        let new_count = existing.len() * values.len();
-
-        if let Some(max) = self.max_request_partitions()
-            && new_count > max
-        {
-            return Err(DataFusionError::Plan(format!(
-                "HttpExec: expanding params would create {new_count} partitions (existing {} x {} values), which exceeds max_request_partitions={max}. Reduce the number of dynamic values or increase max_request_partitions.",
-                existing.len(),
-                values.len(),
-            )));
-        }
+        let max = self.max_request_partitions();
+        let new_count = existing.len().checked_mul(values.len());
+        let new_count = match new_count {
+            Some(count) if count <= max => count,
+            _ => {
+                let needed = new_count.map_or_else(
+                    || "more requests than can be counted".to_string(),
+                    |count| format!("{} requests", thousands(count)),
+                );
+                return Err(DataFusionError::External(Box::new(
+                    Error::TooManyRequests {
+                        message: format!(
+                            "Failed to run the query on {} (https): the values a subquery supplied for {col_name} combine into {needed}, more than the {} allowed. Filter the subquery, or set `max_request_partitions` on the dataset. See: https://spiceai.org/docs/components/data-connectors/https",
+                            self.provider.dataset_subject(),
+                            thousands(max),
+                        ),
+                    },
+                )));
+            }
+        };
 
         let mut new_partitions = Vec::with_capacity(new_count);
 
@@ -2626,6 +2762,7 @@ impl HttpExec {
         provider: &HttpTableProvider,
         partition: usize,
         trace_parent: Option<&ForwardedTraceParent>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataFusionResult<RecordBatch> {
         let (path, query, body, request_headers) = &self.partitions[partition];
 
@@ -2652,6 +2789,7 @@ impl HttpExec {
                 body_val,
                 request_headers_val,
                 trace_parent,
+                memory_pool,
             )
             .await
             .map_err(DataFusionError::from)?;
@@ -3197,6 +3335,8 @@ impl ExecutionPlan for HttpExec {
         let provider = Arc::clone(&self.provider);
         let schema = Arc::clone(&self.projected_schema);
         let trace_parent = ForwardedTraceParent::from_task_context(&context);
+        // Every response body this partition reads is charged to the query's memory pool.
+        let memory_pool = Arc::clone(context.memory_pool());
         let completion = self
             .completion
             .as_ref()
@@ -3229,6 +3369,7 @@ impl ExecutionPlan for HttpExec {
                 let provider = Arc::clone(&provider);
                 let progress = progress.clone();
                 let trace_parent = trace_parent.clone();
+                let memory_pool = Arc::clone(&memory_pool);
 
                 async move {
                     loop {
@@ -3294,6 +3435,7 @@ impl ExecutionPlan for HttpExec {
                                     body_val,
                                     state.request_headers.as_deref(),
                                     trace_parent.as_ref(),
+                                    &memory_pool,
                                 )
                                 .await
                                 .map_err(DataFusionError::from)?
@@ -3341,6 +3483,7 @@ impl ExecutionPlan for HttpExec {
                                             parsed_request_headers.as_ref(),
                                             trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
+                                            &memory_pool,
                                         )
                                         .await
                                         .map_err(DataFusionError::from)?
@@ -3370,6 +3513,7 @@ impl ExecutionPlan for HttpExec {
                                             parsed_request_headers.as_ref(),
                                             trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
+                                            &memory_pool,
                                         )
                                         .await
                                         .map_err(DataFusionError::from)?
@@ -3400,6 +3544,7 @@ impl ExecutionPlan for HttpExec {
                                             parsed_request_headers.as_ref(),
                                             trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
+                                            &memory_pool,
                                         )
                                         .await
                                         .map_err(DataFusionError::from)?
@@ -3541,7 +3686,12 @@ impl ExecutionPlan for HttpExec {
             let stream = futures::stream::once(async move {
                 tracing::trace!("Fetching partition {}", partition);
                 let batch = exec
-                    .fetch_and_create_batch(&provider, partition, trace_parent.as_ref())
+                    .fetch_and_create_batch(
+                        &provider,
+                        partition,
+                        trace_parent.as_ref(),
+                        &memory_pool,
+                    )
                     .await?;
                 if batch
                     .schema()
@@ -4582,27 +4732,37 @@ impl HttpTableProvider {
         body_count: usize,
         header_count: usize,
     ) -> Result<()> {
+        let max = self.max_request_partitions;
         let partition_count = path_count
             .checked_mul(query_count)
             .and_then(|count| count.checked_mul(body_count))
-            .and_then(|count| count.checked_mul(header_count))
-            .ok_or_else(|| Error::FilterRejected {
-                message: "The HTTP request partition count overflowed while combining request_path, request_query, request_body, and request_headers filters. Reduce the number of filter values.".to_string(),
-            })?;
-
-        if let Some(max_request_partitions) = self.max_request_partitions {
-            ensure!(
-                partition_count <= max_request_partitions,
-                FilterRejectedSnafu {
-                    message: format!(
-                        "The HTTP connector would create {partition_count} request partitions, which exceeds max_request_partitions={max_request_partitions}. Reduce the number of request_path, request_query, request_body, or request_headers filter values, or increase max_request_partitions."
-                    )
-                }
-            );
+            .and_then(|count| count.checked_mul(header_count));
+        let (needed, fix) = match partition_count {
+            Some(count) if count <= max => return Ok(()),
+            Some(count) => (
+                format!("{} requests", thousands(count)),
+                format!("set `max_request_partitions: {count}` on the dataset"),
+            ),
+            None => (
+                "more requests than can be counted".to_string(),
+                "set `max_request_partitions` on the dataset".to_string(),
+            ),
+        };
+        TooManyRequestsSnafu {
+            message: format!(
+                "Failed to plan the query on {} (https): its request filters combine into {needed}, more than the {} allowed. Use fewer request_path, request_query, request_body or request_headers values, or {fix}. See: https://spiceai.org/docs/components/data-connectors/https",
+                self.dataset_subject(),
+                thousands(max),
+            ),
         }
-
-        Ok(())
+        .fail()
     }
+}
+
+/// A pool with no limit, for tests whose responses are not about memory.
+#[cfg(test)]
+pub(crate) fn test_memory_pool() -> Arc<dyn MemoryPool> {
+    Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
 }
 
 #[cfg(test)]
@@ -4737,6 +4897,62 @@ mod response_cache_tests {
         );
     }
 
+    /// Text can need more room than the body it is decoded from: windows-1252 0x80 is
+    /// U+20AC, three bytes of UTF-8 for each byte received. The body and its text are
+    /// held together while it is decoded, so a response needs room for both, and the
+    /// pool is never held past its limit.
+    #[tokio::test]
+    async fn a_response_whose_text_outgrows_its_body_is_held_to_the_pool() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+        const BODY: usize = 1024 * 1024;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/legacy"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json; charset=windows-1252")
+                    .insert_header("cache-control", "no-store")
+                    .set_body_bytes(vec![0x80_u8; BODY]),
+            )
+            .mount(&origin)
+            .await;
+        let provider = provider_for(&origin);
+
+        for limit in [3 * BODY - 1, 4 * BODY - 1] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            match provider
+                .get_response("/legacy", None, None, None, None, &pool)
+                .await
+            {
+                Ok(served) => panic!(
+                    "a {BODY}-byte body decoding to {} bytes of text was held under a \
+                     {limit}-byte limit; the pool holds {} bytes",
+                    served.content.len(),
+                    pool.reserved()
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message
+                            .contains("holding the decoded data would pass the query memory limit"),
+                        "{message}"
+                    );
+                }
+            }
+            assert_eq!(pool.reserved(), 0, "a refused response holds nothing");
+        }
+
+        let limit = 4 * BODY;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let served = provider
+            .get_response("/legacy", None, None, None, None, &pool)
+            .await
+            .expect("a pool with room for the body and its text holds the response");
+        assert_eq!(served.content, "\u{20AC}".repeat(BODY));
+        assert_eq!(pool.reserved(), served.content.len());
+    }
+
     /// The invariant the admission path exists to hold: a response the origin
     /// refused to have stored is served to its caller and kept by nobody.
     ///
@@ -4760,7 +4976,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served to its caller");
         assert_eq!(served.content, r#"{"rows":1}"#);
@@ -4801,7 +5024,14 @@ mod response_cache_tests {
         let provider = provider_for(&origin);
         for id in 0..200 {
             provider
-                .get_response(&format!("/report/{id}"), None, None, None, None)
+                .get_response(
+                    &format!("/report/{id}"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
                 .expect("each response is served");
         }
@@ -4837,7 +5067,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served to its caller");
         assert_eq!(served.content, r#"{"rows":6}"#);
@@ -4869,7 +5106,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -4904,7 +5148,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is served rather than panicking the query");
         assert_eq!(served.content, r#"{"rows":8}"#);
@@ -5030,14 +5281,28 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(4096, None);
         provider
-            .get_response("/small", None, None, None, None)
+            .get_response(
+                "/small",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&provider.cache).await;
         assert_eq!(provider.cache.entry_count(), 1, "the small entry is held");
 
         provider
-            .get_response("/huge", None, None, None, None)
+            .get_response(
+                "/huge",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the oversized response is still served to its caller");
         settle(&provider.cache).await;
@@ -5067,7 +5332,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5096,7 +5368,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5228,7 +5507,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5258,7 +5544,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5302,7 +5595,14 @@ mod response_cache_tests {
         // `Vary` naming anything at all.
         let unauthenticated = provider_for(&origin);
         unauthenticated
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&unauthenticated.cache).await;
@@ -5310,7 +5610,14 @@ mod response_cache_tests {
 
         let authenticated = provider_for(&origin).with_auth(Arc::new(RotatingAuth));
         authenticated
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&authenticated.cache).await;
@@ -5342,7 +5649,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5374,7 +5688,14 @@ mod response_cache_tests {
         let provider = provider_for(&origin);
         for _ in 0..3 {
             let served = provider
-                .get_response("/report", None, None, None, None)
+                .get_response(
+                    "/report",
+                    None,
+                    None,
+                    None,
+                    None,
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
                 .expect("the response is served");
             assert_eq!(served.content, r#"{"rows":2}"#);
@@ -5403,7 +5724,14 @@ mod response_cache_tests {
 
         let without_fallback = provider_for(&origin);
         without_fallback
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&without_fallback.cache).await;
@@ -5416,7 +5744,14 @@ mod response_cache_tests {
         let with_fallback =
             provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::from_mins(5)));
         with_fallback
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&with_fallback.cache).await;
@@ -5440,7 +5775,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::ZERO));
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5463,7 +5805,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(0, None);
         provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5493,7 +5842,14 @@ mod response_cache_tests {
         let provider = provider_for(&origin)
             .with_error_response_action(crate::http::provider::ErrorResponseAction::Store);
         let fetched = provider
-            .get_response("/report", None, None, None, None)
+            .get_response(
+                "/report",
+                None,
+                None,
+                None,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("`store` must answer a 404 with its body, or this asserts nothing");
         assert_eq!(
@@ -5940,7 +6296,14 @@ mod tests {
             let (provider, permits) =
                 retry_test_provider(url.clone(), budget, Duration::from_secs(2));
             let Err(error) = provider
-                .perform_request_with_retry(url.clone(), None, None, None, "/lookup")
+                .perform_request_with_retry(
+                    url.clone(),
+                    None,
+                    None,
+                    None,
+                    "/lookup",
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
             else {
                 panic!("connection refusal should fail");
@@ -5953,7 +6316,14 @@ mod tests {
             retry_test_server(vec![(200, "{}".to_string())], Duration::from_millis(300)).await;
         let (provider, permits) = retry_test_provider(url.clone(), 0, Duration::from_millis(50));
         let Err(error) = provider
-            .perform_request_with_retry(url, None, None, None, "/lookup")
+            .perform_request_with_retry(
+                url,
+                None,
+                None,
+                None,
+                "/lookup",
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
         else {
             panic!("timed out origin should fail");
@@ -5981,7 +6351,14 @@ mod tests {
         let (provider, _) = retry_test_provider(url.clone(), 0, Duration::from_secs(2));
 
         let Err(send_error) = provider
-            .perform_request_with_retry(url, None, None, None, "/path-secret")
+            .perform_request_with_retry(
+                url,
+                None,
+                None,
+                None,
+                "/path-secret",
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
         else {
             panic!("connection refusal should fail");
@@ -6049,7 +6426,14 @@ mod tests {
                         retry_test_provider(url.clone(), budget, Duration::from_secs(3));
                     let provider = provider.with_error_response_action(action);
                     let Err(error) = provider
-                        .perform_request_with_retry(url, None, None, None, "/lookup")
+                        .perform_request_with_retry(
+                            url,
+                            None,
+                            None,
+                            None,
+                            "/lookup",
+                            &crate::http::provider::test_memory_pool(),
+                        )
                         .await
                     else {
                         panic!("{status} under `{action}` must fail the request");
@@ -6129,7 +6513,14 @@ mod tests {
         let second_url = url.clone();
         let request = tokio::spawn(async move {
             provider
-                .perform_request_with_retry(url, None, None, None, "/lookup")
+                .perform_request_with_retry(
+                    url,
+                    None,
+                    None,
+                    None,
+                    "/lookup",
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
         });
         tokio::time::timeout(Duration::from_secs(2), headers_received)
@@ -6138,7 +6529,14 @@ mod tests {
             .expect("headers signal sent");
         let second_request = tokio::spawn(async move {
             second_provider
-                .perform_request_with_retry(second_url, None, None, None, "/lookup")
+                .perform_request_with_retry(
+                    second_url,
+                    None,
+                    None,
+                    None,
+                    "/lookup",
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
         });
         assert!(
@@ -6211,7 +6609,14 @@ mod tests {
             .with_error_response_action(ErrorResponseAction::Store);
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            provider.perform_request_with_retry(url, None, None, None, "/lookup"),
+            provider.perform_request_with_retry(
+                url,
+                None,
+                None,
+                None,
+                "/lookup",
+                &crate::http::provider::test_memory_pool(),
+            ),
         )
         .await
         .expect("the refusal must not wait for the withheld body");
@@ -6257,7 +6662,14 @@ mod tests {
             // `store`, so the 404 body is data and the case can assert what was read.
             let provider = provider.with_error_response_action(ErrorResponseAction::Store);
             let result = provider
-                .perform_request_with_retry(url, None, None, None, "/lookup")
+                .perform_request_with_retry(
+                    url,
+                    None,
+                    None,
+                    None,
+                    "/lookup",
+                    &crate::http::provider::test_memory_pool(),
+                )
                 .await
                 .expect("HTTP response should remain available");
             assert_eq!(result.response_status, expected_status);
@@ -6276,7 +6688,14 @@ mod tests {
         .await;
         let (provider, permits) = retry_test_provider(url.clone(), 2, Duration::from_secs(3));
         let Err(error) = provider
-            .perform_request_with_retry(url, None, None, None, "/lookup")
+            .perform_request_with_retry(
+                url,
+                None,
+                None,
+                None,
+                "/lookup",
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
         else {
             panic!("a 404 under the default `on_error_response` must fail the request");
@@ -7070,7 +7489,7 @@ mod tests {
             .with_allowed_paths(vec!["/api/users".to_string(), "/api/posts".to_string()])
             .expect("allowed paths")
             .enable_query_filters(64)
-            .with_max_request_partitions(Some(3));
+            .with_max_request_partitions(3);
         let filters = vec![
             Expr::InList(InList::new(
                 Box::new(Expr::Column(Column::from_name("request_path"))),
@@ -7093,13 +7512,17 @@ mod tests {
         let err = provider
             .extract_partitions(&filters)
             .expect_err("expected partition cap rejection");
-        match err {
-            DataFusionError::Plan(message) => {
-                assert!(message.contains("4 request partitions"));
-                assert!(message.contains("max_request_partitions=3"));
-            }
-            other => panic!("Unexpected error: {other:?}"),
-        }
+        assert!(
+            crate::refusal::is_request_bound_refusal(&err),
+            "the refusal keeps its type: {err:?}"
+        );
+        let DataFusionError::External(refused) = err else {
+            panic!("Unexpected error: {err:?}");
+        };
+        assert_eq!(
+            refused.to_string(),
+            "Failed to plan the query on this dataset (https): its request filters combine into 4 requests, more than the 3 allowed. Use fewer request_path, request_query, request_body or request_headers values, or set `max_request_partitions: 4` on the dataset. See: https://spiceai.org/docs/components/data-connectors/https"
+        );
     }
 
     #[test]
@@ -7346,6 +7769,8 @@ mod tests {
         let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
+            _reservation: datafusion::execution::memory_pool::MemoryConsumer::new("test")
+                .register(&crate::http::provider::test_memory_pool()),
             directives: CacheDirectives {
                 present: true,
                 max_age: Some(Duration::from_mins(1)),
@@ -7392,7 +7817,12 @@ mod tests {
         );
 
         let batch = exec
-            .fetch_and_create_batch(provider.as_ref(), 0, None)
+            .fetch_and_create_batch(
+                provider.as_ref(),
+                0,
+                None,
+                &crate::http::provider::test_memory_pool(),
+            )
             .await
             .expect("batch should be created from cached response");
 
@@ -10678,6 +11108,8 @@ mod tests {
     fn empty_fetch_result() -> HttpFetchResult {
         HttpFetchResult {
             content: String::new(),
+            _reservation: datafusion::execution::memory_pool::MemoryConsumer::new("test")
+                .register(&crate::http::provider::test_memory_pool()),
             directives: CacheDirectives::default(),
             response_age: None,
             age_measured_at: Instant::now(),
@@ -11224,6 +11656,8 @@ mod tests {
         );
         let fetch_result = HttpFetchResult {
             content: String::new(),
+            _reservation: datafusion::execution::memory_pool::MemoryConsumer::new("test")
+                .register(&crate::http::provider::test_memory_pool()),
             directives: CacheDirectives::default(),
             response_age: None,
             age_measured_at: Instant::now(),
@@ -11299,6 +11733,8 @@ mod tests {
         ];
         let fetch_result = HttpFetchResult {
             content: String::new(),
+            _reservation: datafusion::execution::memory_pool::MemoryConsumer::new("test")
+                .register(&crate::http::provider::test_memory_pool()),
             directives: CacheDirectives::default(),
             response_age: None,
             age_measured_at: Instant::now(),
@@ -11324,10 +11760,7 @@ mod tests {
     ///
     /// Enables all filter types (path, query, body, headers) so that
     /// `with_expanded_params` validation passes for any column.
-    fn make_exec(
-        partitions: Vec<PartitionSpec>,
-        max_request_partitions: Option<usize>,
-    ) -> HttpExec {
+    fn make_exec(partitions: Vec<PartitionSpec>, max_request_partitions: usize) -> HttpExec {
         let provider = base_provider()
             .with_allowed_paths(["/*"])
             .expect("valid path glob")
@@ -11346,7 +11779,10 @@ mod tests {
 
     #[test]
     fn content_builder_preserves_utf8_empty_nul_and_duplicate_values() {
-        let plain = make_exec(vec![(None, None, None, None)], None);
+        let plain = make_exec(
+            vec![(None, None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let (cached, _) = plain.for_cache_fetch();
         let rows: Vec<String> = ["", "雪🌶", "before\0after", "same", "same"]
             .into_iter()
@@ -11395,7 +11831,10 @@ mod tests {
 
     #[test]
     fn cache_fetch_metadata_matches_plain_http() {
-        let plain = make_exec(vec![(None, None, None, None)], None);
+        let plain = make_exec(
+            vec![(None, None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let (cached, completion) = plain.for_cache_fetch();
         let rows = vec!["same".to_string(), "same".to_string()];
         for query in [None, Some("")] {
@@ -11513,7 +11952,10 @@ mod tests {
 
     #[test]
     fn test_with_expanded_params_request_path() {
-        let exec = make_exec(vec![(None, None, None, None)], None);
+        let exec = make_exec(
+            vec![(None, None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let result = exec
             .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
             .expect("expand should succeed");
@@ -11534,7 +11976,7 @@ mod tests {
                 (Some("/a".to_string()), None, None, None),
                 (Some("/b".to_string()), None, None, None),
             ],
-            None,
+            DEFAULT_MAX_REQUEST_PARTITIONS,
         );
         let result = exec
             .with_expanded_params(
@@ -11571,7 +12013,10 @@ mod tests {
     /// counter as its template, not a fresh one, for that fallback to see it.
     #[test]
     fn test_with_expanded_params_shares_metrics_with_template() {
-        let exec = make_exec(vec![(None, None, None, None)], None);
+        let exec = make_exec(
+            vec![(None, None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let expanded = exec
             .with_expanded_params("request_path", &["/a".to_string(), "/b".to_string()])
             .expect("expand should succeed");
@@ -11601,12 +12046,25 @@ mod tests {
                 (Some("/a".to_string()), None, None, None),
                 (Some("/b".to_string()), None, None, None),
             ],
-            Some(3),
+            3,
         );
 
-        _ = exec
+        let error = exec
             .with_expanded_params("request_query", &["q=1".to_string(), "q=2".to_string()])
             .expect_err("should exceed max_request_partitions");
+        assert!(
+            crate::refusal::is_request_bound_refusal(&error),
+            "the refusal keeps its type: {error:?}"
+        );
+        let DataFusionError::External(refused) = error else {
+            panic!("expected a typed refusal, got {error:?}");
+        };
+        assert_eq!(
+            refused.to_string(),
+            "Failed to run the query on this dataset (https): the values a subquery supplied for request_query combine into 4 requests, more than the 3 allowed. Filter the subquery, or set `max_request_partitions` on the dataset. See: https://spiceai.org/docs/components/data-connectors/https"
+        );
+        assert_eq!(thousands(90_000), "90,000");
+        assert_eq!(thousands(1_000), "1,000");
     }
 
     type PartitionAccessor = Box<dyn Fn(&PartitionSpec) -> &Option<String>>;
@@ -11630,7 +12088,10 @@ mod tests {
         ];
 
         for (test_value, col_name, accessor) in &cases {
-            let exec = make_exec(vec![(None, None, None, None)], None);
+            let exec = make_exec(
+                vec![(None, None, None, None)],
+                DEFAULT_MAX_REQUEST_PARTITIONS,
+            );
             let result = exec
                 .with_expanded_params(col_name, &[test_value.to_string()])
                 .unwrap_or_else(|e| panic!("expand for {col_name} should succeed: {e}"));
@@ -11673,7 +12134,10 @@ mod tests {
 
     #[test]
     fn test_with_expanded_params_unknown_column_errors() {
-        let exec = make_exec(vec![(Some("/orig".to_string()), None, None, None)], None);
+        let exec = make_exec(
+            vec![(Some("/orig".to_string()), None, None, None)],
+            DEFAULT_MAX_REQUEST_PARTITIONS,
+        );
         let _ = exec
             .with_expanded_params("nonexistent_column", &["x".to_string()])
             .expect_err("unknown column should error");

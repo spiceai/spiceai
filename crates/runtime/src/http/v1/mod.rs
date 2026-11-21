@@ -715,10 +715,24 @@ enum SqlErrorKind {
     /// The request set `Cache-Control: only-if-cached` and no cached result was
     /// servable, so the query was not run.
     NotCached,
+    /// A connector refused data the query read as a compression bomb
+    /// (`data_components::refusal`): the query is well formed, but the data it reads
+    /// is what the runtime will not process.
+    RefusedData,
+    /// An HTTP dataset refused a query whose request filters combine into more
+    /// requests than `max_request_partitions` allows: the query is the client's to
+    /// change.
+    RefusedRequests,
 }
 
 impl SqlErrorKind {
     fn of_query_error(e: &QueryError) -> Self {
+        if data_components::refusal::is_compression_refusal(e) {
+            return Self::RefusedData;
+        }
+        if data_components::refusal::is_request_bound_refusal(e) {
+            return Self::RefusedRequests;
+        }
         match e {
             QueryError::QueryCancelled { .. } => Self::Cancellation,
             QueryError::QueryTimedOut { .. } => Self::Timeout,
@@ -735,7 +749,11 @@ impl SqlErrorKind {
     }
 
     fn of_datafusion_error(e: &datafusion::error::DataFusionError) -> Self {
-        if is_cancellation_error(e) {
+        if data_components::refusal::is_compression_refusal(e) {
+            Self::RefusedData
+        } else if data_components::refusal::is_request_bound_refusal(e) {
+            Self::RefusedRequests
+        } else if is_cancellation_error(e) {
             Self::Cancellation
         } else if is_timeout_error(e) {
             Self::Timeout
@@ -773,6 +791,22 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
         // `RESOURCE_EXHAUSTED`.
         SqlErrorKind::ResourcesExhausted | SqlErrorKind::Unavailable => {
             StatusCode::SERVICE_UNAVAILABLE
+        }
+        // Data the runtime will not process, answered as JSON a client reads to act on.
+        SqlErrorKind::RefusedData => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
+        // A request the runtime will not send, answered as JSON a client reads to act on.
+        SqlErrorKind::RefusedRequests => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({ "error": message })),
+            )
+                .into_response();
         }
         SqlErrorKind::General => status_for_sql_error(&message),
     };
@@ -1679,6 +1713,83 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&streamed),
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A compression bomb is data the runtime will not process (422), and a query over
+    /// the request bound a request it will not send (400); both carry `{"error": …}`.
+    /// The answer is chosen by the error's type, so a reworded message still maps, and a
+    /// message that only mentions either refusal does not.
+    #[tokio::test]
+    async fn sql_error_response_answers_refusals_as_json() {
+        async fn answer(error: datafusion::error::DataFusionError) -> (StatusCode, Vec<u8>) {
+            let response =
+                sql_error_response(error.to_string(), SqlErrorKind::of_datafusion_error(&error));
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("the error body reads");
+            (status, body.to_vec())
+        }
+
+        let refusal = http_body_limit::Error::CompressionRatio {
+            codec: http_body_limit::Codec::Zstd,
+            input: http_body_limit::Input::Response,
+            decoded: 67_200_000,
+            received: 33_600,
+        };
+        // Any wording, a context and a share wrapping it: the type decides.
+        for message in [
+            "Failed to read the response from http://127.0.0.1:1 for dataset 'api': refused",
+            "a reworded refusal that names no codec, ratio or bomb",
+        ] {
+            let typed = http_body_limit::CompressionRefusal::new(message.to_string(), &refusal)
+                .expect("a compression refusal");
+            let bomb = datafusion::error::DataFusionError::Shared(std::sync::Arc::new(
+                datafusion::error::DataFusionError::Context(
+                    "scan".to_string(),
+                    Box::new(datafusion::error::DataFusionError::External(Box::new(
+                        typed,
+                    ))),
+                ),
+            ));
+            let bomb_text = bomb.to_string();
+            let (status, body) = answer(bomb).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{message}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).expect("a JSON body"),
+                json!({ "error": bomb_text })
+            );
+        }
+
+        // A query over the request bound is a 400 with a JSON body, by its type too.
+        let bound = datafusion::error::DataFusionError::External(Box::new(
+            data_components::http::provider::Error::TooManyRequests {
+                message: "a reworded request-bound refusal".to_string(),
+            },
+        ));
+        let bound_text = bound.to_string();
+        let (status, body) = answer(bound).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("a JSON body"),
+            json!({ "error": bound_text })
+        );
+
+        // Text alone is not a refusal.
+        let text_only = datafusion::error::DataFusionError::Plan(
+            "the response was refused as a compression bomb; set `max_request_partitions`"
+                .to_string(),
+        );
+        let text_only_message = text_only.to_string();
+        let (status, body) = answer(text_only).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, text_only_message.into_bytes());
+
+        let other = datafusion::error::DataFusionError::Plan("table 'x' not found".to_string());
+        let other_text = other.to_string();
+        let (status, body) = answer(other).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, other_text.into_bytes());
     }
 
     /// A memory-pool refusal has to be told apart from the cancellation and

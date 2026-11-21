@@ -40,6 +40,7 @@ use async_trait::async_trait;
 use datafusion::common::parsers::CompressionTypeVariant;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -62,6 +63,7 @@ use datafusion_datasource::decoder::Decoder;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::source::DataSource;
 use futures::TryStreamExt;
+use http_body_limit::Expansion;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore, ObjectStoreExt};
 use snafu::prelude::*;
 use tokio_util::io::{StreamReader, SyncIoBridge};
@@ -81,6 +83,8 @@ pub struct SpiceJsonOptions {
     /// When `true`, include Socrata `meta_data` columns (sid, id, position, etc.)
     /// in the schema for SODA format responses. Disabled by default.
     pub soda_metadata: bool,
+    /// The dataset and connector a refused file names and links, when known.
+    pub source: Option<crate::limits::SourceLabel>,
 }
 
 #[derive(Debug, Snafu)]
@@ -143,6 +147,7 @@ impl Default for SpiceJsonOptions {
             flatten_json: None,
             json_pointer: None,
             soda_metadata: false,
+            source: None,
         }
     }
 }
@@ -218,6 +223,17 @@ impl SpiceJsonFormat {
         self
     }
 
+    /// Name the dataset these files belong to and the connector that reads them, which a
+    /// refused file names and links.
+    #[must_use]
+    pub fn with_source(mut self, dataset: impl Into<String>, connector: impl Into<String>) -> Self {
+        self.options.source = Some(crate::limits::SourceLabel {
+            dataset: dataset.into(),
+            connector: connector.into(),
+        });
+        self
+    }
+
     /// Infer the schema of `objects` and count how many JSON records were
     /// inspected. The count is `0` for an empty array, an empty pointer
     /// target, or blank JSONL. An empty object (`{}` / `[{}]`) is one record
@@ -232,7 +248,7 @@ impl SpiceJsonFormat {
     /// pointer, or inferring a schema from the records.
     pub async fn probe_schema(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> Result<JsonSchemaProbe> {
@@ -242,7 +258,7 @@ impl SpiceJsonFormat {
         for object in objects {
             let budget = max_records - record_count;
             let (schema, records) = self
-                .probe_file(store, &object.location, move |format, body| {
+                .probe_file(state, store, &object.location, move |format, body| {
                     format.schema_from_body(body, budget)
                 })
                 .await?;
@@ -284,7 +300,7 @@ impl SpiceJsonFormat {
     /// an error.
     pub async fn probe_keys(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
         registered: &BTreeSet<String>,
@@ -302,7 +318,7 @@ impl SpiceJsonFormat {
                 until_found.map(|wanted| wanted.difference(&probe.keys).cloned().collect());
             let registered = Arc::clone(&registered);
             let file = self
-                .probe_file(store, &object.location, move |format, body| {
+                .probe_file(state, store, &object.location, move |format, body| {
                     format.keys_from_body(body, budget, &registered, missing.as_ref())
                 })
                 .await?;
@@ -331,9 +347,13 @@ impl SpiceJsonFormat {
     /// reads it. A JSONL or array body therefore never holds the compressed or
     /// the decompressed file in memory, and a probe that stops early stops the
     /// download. Only a body that must be parsed whole is buffered (see
-    /// [`ProbeBody::Document`]).
+    /// [`ProbeBody::Document`]), and it is charged to the query memory pool of
+    /// `state` as it is decompressed, so a document the pool cannot hold, however
+    /// small it was compressed, fails the probe with an error that names the file
+    /// rather than exhausting memory.
     async fn probe_file<T, F>(
         &self,
+        state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         location: &object_store::path::Path,
         probe: F,
@@ -349,19 +369,41 @@ impl SpiceJsonFormat {
             ))),
         };
         let format = self.clone();
+        let reservation = MemoryConsumer::new(format!("JSON schema probe of '{location}'"))
+            .register(&state.runtime_env().memory_pool);
         tokio::task::spawn_blocking(move || {
-            let decoded =
-                FileCompressionType::from(format.options.compression).convert_read(reader)?;
-            let body = format.open_body(decoded)?;
-            probe(&format, body)
+            let (decoded, expansion) = crate::limits::checked_decoder(
+                FileCompressionType::from(format.options.compression),
+                reader,
+            )?;
+            // `reservation` outlives the probe, so a document stays charged while it is read.
+            format
+                .open_body(decoded, &reservation)
+                .and_then(|body| probe(&format, body))
+                .map_err(|error| {
+                    // The record parsers report a failed read as text; the check still knows
+                    // whether the file was refused.
+                    match expansion.as_ref().and_then(Expansion::refused) {
+                        Some(refusal) => DataFusionError::External(Box::new(refusal)),
+                        None => error,
+                    }
+                })
         })
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| {
+            crate::limits::locate_refusal("JSON", location, self.options.source.as_ref(), e)
+        })
     }
 
     /// Classifies a decompressed body as streamable records or a whole
-    /// document. A leading UTF-8 BOM and whitespace are consumed either way.
-    fn open_body(&self, reader: Box<dyn Read + Send>) -> Result<ProbeBody> {
+    /// document. A leading UTF-8 BOM and whitespace are consumed either way. A
+    /// document is read under `reservation`.
+    fn open_body(
+        &self,
+        reader: Box<dyn Read + Send>,
+        reservation: &MemoryReservation,
+    ) -> Result<ProbeBody> {
         let mut reader = BufReader::new(reader);
         let opens_array = body_opens_a_json_array(&mut reader)?;
         if self.options.json_pointer.is_none() {
@@ -377,8 +419,13 @@ impl SpiceJsonFormat {
                 )?)));
             }
         }
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
+        let buf =
+            http_body_limit::read_to_end(reader, http_body_limit::Limit::Reserve(reservation))
+                .map_err(|e| match e {
+                    // A failed read is reported as it always was.
+                    http_body_limit::Error::Io { source } => DataFusionError::IoError(source),
+                    refused => DataFusionError::External(Box::new(refused)),
+                })?;
         Ok(ProbeBody::Document(buf))
     }
 
@@ -681,6 +728,7 @@ impl FileFormat for SpiceJsonFormat {
                 .with_json_pointer(self.options.json_pointer.clone())
                 .with_unnest_struct(self.options.flatten_json.clone())
                 .with_soda_metadata(self.options.soda_metadata)
+                .with_source(self.options.source.clone())
                 .with_table_schema(table_schema),
         )
     }
@@ -1081,6 +1129,12 @@ mod tests {
         })
     }
 
+    fn unbounded() -> MemoryReservation {
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        MemoryConsumer::new("test probe").register(&pool)
+    }
+
     #[test]
     fn streamed_key_probe_never_reads_past_the_record_that_completes_the_wanted_keys() {
         let wanted: BTreeSet<String> = ["a", "b"].map(String::from).into();
@@ -1090,7 +1144,9 @@ mod tests {
             (Format::Auto, "[{\"a\":1,\"b\":2},"),
         ] {
             let json = SpiceJsonFormat::default().with_format(format);
-            let body = json.open_body(fails_after(head)).expect("open body");
+            let body = json
+                .open_body(fails_after(head), &unbounded())
+                .expect("open body");
             let probe = json
                 .keys_from_body(body, usize::MAX, &BTreeSet::new(), Some(&wanted))
                 .expect("the probe stops before the unreadable remainder");
@@ -1103,14 +1159,19 @@ mod tests {
         for format in [Format::Object, Format::Soda, Format::Auto] {
             let json = SpiceJsonFormat::default().with_format(format);
             assert!(
-                json.open_body(fails_after("{\"a\":1}")).is_err(),
+                json.open_body(fails_after("{\"a\":1}"), &unbounded())
+                    .is_err(),
                 "{format:?} parses the document whole, so it reads to the end"
             );
         }
         let pointer = SpiceJsonFormat::default()
             .with_format(Format::Array)
             .with_json_pointer("/data".to_string());
-        assert!(pointer.open_body(fails_after("[{\"a\":1}")).is_err());
+        assert!(
+            pointer
+                .open_body(fails_after("[{\"a\":1}"), &unbounded())
+                .is_err()
+        );
     }
 
     #[test]

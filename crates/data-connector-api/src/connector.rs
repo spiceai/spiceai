@@ -45,25 +45,24 @@ use crate::{AnyErrorResult, DataConnectorResult};
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-/// Request timeout of the client [`default_spice_client`] builds. Connectors
+/// Request timeout of the client [`default_spice_client_builder`] builds. Connectors
 /// that use that client derive rate-control defaults from it, the same way the
 /// HTTPS connector derives them from its `client_timeout` parameter.
 pub const DEFAULT_SPICE_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Redirects the client [`default_spice_client`] builds follows before a request fails.
+/// Redirects the client [`default_spice_client_builder`] builds follows before a request fails.
 const DEFAULT_SPICE_CLIENT_MAX_REDIRECTS: usize = 10;
 
-/// Creates a default reqwest client with standard Spice settings. It follows only the redirects
+/// A reqwest client builder with standard Spice settings: the Spice user agent, a
+/// 10-second connect timeout, a [`DEFAULT_SPICE_CLIENT_TIMEOUT`] request timeout, and
+/// `content_type` as the default `Content-Type`. Its client follows only the redirects
 /// `redirects` allows, and refuses a redirect that leaves the request's host for a private,
-/// loopback, or link-local address.
-///
-/// # Errors
-///
-/// Returns an error if the client cannot be built.
-pub fn default_spice_client(
+/// loopback, or link-local address, so a caller must not set its own redirect policy or DNS
+/// resolver on it.
+pub fn default_spice_client_builder(
     content_type: &'static str,
     redirects: RedirectScope,
-) -> reqwest::Result<reqwest::Client> {
+) -> reqwest::ClientBuilder {
     use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
     let mut headers = HeaderMap::new();
@@ -79,7 +78,6 @@ pub fn default_spice_client(
         DEFAULT_SPICE_CLIENT_MAX_REDIRECTS,
         redirects,
     )
-    .build()
 }
 
 #[derive(Clone, Copy)]
@@ -479,7 +477,7 @@ impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
 
 #[cfg(test)]
 mod tests {
-    use super::{RedirectScope, default_spice_client};
+    use super::{RedirectScope, default_spice_client_builder};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -537,7 +535,8 @@ mod tests {
             move |_| redirect_to(&target)
         })
         .await;
-        let client = default_spice_client("application/json", RedirectScope::PublicHosts)
+        let client = default_spice_client_builder("application/json", RedirectScope::PublicHosts)
+            .build()
             .expect("build the client");
 
         let error = client
@@ -567,7 +566,8 @@ mod tests {
         let (target_port, target_requests) = serve(|_| OK_RESPONSE.to_string()).await;
         let (origin_port, _) =
             serve(move |_| redirect_to(&format!("http://localhost.:{target_port}/graphql"))).await;
-        let client = default_spice_client("application/json", RedirectScope::PublicHosts)
+        let client = default_spice_client_builder("application/json", RedirectScope::PublicHosts)
+            .build()
             .expect("build the client");
 
         let error = client
@@ -600,7 +600,8 @@ mod tests {
             }
         })
         .await;
-        let client = default_spice_client("application/json", RedirectScope::PublicHosts)
+        let client = default_spice_client_builder("application/json", RedirectScope::PublicHosts)
+            .build()
             .expect("build the client");
 
         let response = client
