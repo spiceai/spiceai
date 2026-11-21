@@ -95,8 +95,8 @@ pub struct SubmitQueryRequest {
     /// When `runtime.query.timeout` is set, it is the timeout of a job that sets none, and a longer value is refused with `400`.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
-    /// Optional maximum size of results for async jobs.
-    /// Jobs with results larger than this will be failed with an error for exceeding the maximum size.
+    /// Optional maximum size of results for async jobs, in bytes: at most 107374182400 (100 GiB), which is also the limit when it is omitted.
+    /// Jobs with results larger than this will be failed with an error for exceeding the maximum size, and their results discarded.
     #[serde(default)]
     pub maximum_size: Option<u64>,
 }
@@ -315,8 +315,9 @@ pub struct CancelActiveQueryResponse {
         )
     ),
     responses(
-        (status = 202, description = "Query accepted for async execution", body = SubmitQueryResponse),
-        (status = 400, description = "Invalid request, such as a `timeout_seconds` above `runtime.query.timeout`"),
+        (status = 202, description = "Query accepted for async execution: `RUNNING`, or `PENDING` while the caller already runs 64 async queries", body = SubmitQueryResponse),
+        (status = 400, description = "Invalid request, such as a `timeout_seconds` above `runtime.query.timeout` or a `maximum_size` above 100 GiB"),
+        (status = 429, description = "The caller's queue of waiting queries (1,000) or its stored results (6.25 TiB) on this scheduler is full; retry after `Retry-After` seconds"),
         (status = 503, description = "Queries API requires cluster mode")
     )
 ))]
@@ -946,6 +947,23 @@ fn batches_to_json(
     }
 }
 
+/// The `Retry-After` of a submission refused because the caller's queue is full.
+const QUEUE_FULL_RETRY_AFTER_SECS: u64 = 5;
+
+/// A `429 Too Many Requests` with `Retry-After` and the JSON error body.
+fn too_many_requests(error: &crate::jobs::Error, retry_after_secs: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({"error": error.to_string()})),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(retry_after_secs),
+    );
+    response
+}
+
 fn error_to_response(error: &crate::jobs::Error) -> Response {
     use crate::jobs::Error;
 
@@ -965,11 +983,23 @@ fn error_to_response(error: &crate::jobs::Error) -> Response {
             Json(serde_json::json!({"error": error.to_string()})),
         )
             .into_response(),
-        Error::TimeoutAboveQueryTimeout { .. } => (
+        Error::TimeoutAboveQueryTimeout { .. } | Error::MaximumSizeAboveLimit { .. } => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": error.to_string()})),
         )
             .into_response(),
+        Error::QueueFull { .. } => too_many_requests(error, QUEUE_FULL_RETRY_AFTER_SECS),
+        Error::ResultBudgetFull {
+            oldest_expiry_ms, ..
+        } => too_many_requests(
+            error,
+            oldest_expiry_ms.map_or(crate::jobs::DEFAULT_RESULT_TTL.as_secs(), |expiry_ms| {
+                expiry_ms
+                    .saturating_sub(crate::jobs::now_ms())
+                    .div_ceil(1_000)
+                    .max(1)
+            }),
+        ),
         Error::ClusterModeRequired => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": error.to_string()})),
@@ -1293,5 +1323,174 @@ mod tests {
             .expect("chunk response should build");
 
         assert_eq!(response.row_offset, 2 * DEFAULT_CHUNK_SIZE);
+    }
+}
+
+#[cfg(test)]
+mod budget_response_tests {
+    use super::*;
+    use crate::dataaccelerator::AcceleratorEngineRegistry;
+    use crate::datafusion::builder::DataFusionBuilder;
+    use crate::jobs::{JobLimits, JobStore};
+    use http_body_util::BodyExt;
+    use object_store::{ObjectStore, memory::InMemory};
+    use runtime_status::RuntimeStatus;
+
+    const OWNER: &str = "apikey:0123456789abcdef";
+    const OTHER: &str = "apikey:fedcba9876543210";
+
+    /// An executor over `store`, with no distributed scheduler: a query it starts fails at
+    /// once, so these tests hold their queries in the queue, or fill the budget directly.
+    fn executor(store: Arc<dyn ObjectStore>, limits: JobLimits) -> JobExecutor {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        JobExecutor::with_limits(Arc::new(JobStore::new(store, "jobs", "node-1")), df, limits)
+    }
+
+    fn select_one() -> SubmitQueryRequest {
+        SubmitQueryRequest {
+            sql: "SELECT 1".to_string(),
+            parameters: None,
+            timeout_seconds: None,
+            maximum_size: None,
+        }
+    }
+
+    async fn body(response: Response) -> serde_json::Value {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("JSON body")
+    }
+
+    async fn job_ids(executor: &JobExecutor, owner: &str) -> Vec<String> {
+        let mut ids: Vec<String> = executor
+            .list_jobs(None, owner)
+            .await
+            .expect("jobs listed")
+            .into_iter()
+            .map(|job| job.job_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// With no running slot free, a caller's submissions wait up to its queue limit. The next
+    /// one is a `429` with `Retry-After` that leaves no job behind, while another caller's
+    /// queue is its own, and cancelling a waiting query frees its place.
+    #[tokio::test]
+    async fn a_caller_past_its_queue_limit_gets_429_and_no_job() {
+        let executor = executor(
+            Arc::new(InMemory::new()),
+            JobLimits {
+                running: 0,
+                pending: 2,
+                stored_bytes: u64::MAX,
+            },
+        );
+        let first = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("the first query waits");
+        let second = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("the second query waits");
+        assert_eq!(first.status, JobStatus::Pending);
+        assert_eq!(second.status, JobStatus::Pending);
+
+        let refused = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect_err("the queue is full");
+        let response = error_to_response(&refused);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("5"))
+        );
+        assert_eq!(
+            body(response).await,
+            serde_json::json!({"error": "Failed to submit the async query: you already have 2 async queries waiting to run, the most one caller may queue. Wait for some to start, or cancel one with POST /v1/queries/{query_id}/cancel, then retry. See https://spiceai.org/docs/api/http/queries"})
+        );
+        let mut expected = vec![first.job_id.clone(), second.job_id.clone()];
+        expected.sort();
+        assert_eq!(job_ids(&executor, OWNER).await, expected);
+
+        let other = executor
+            .submit(select_one(), true, OTHER.to_string())
+            .await
+            .expect("another caller has a queue of its own");
+        assert_eq!(other.status, JobStatus::Pending);
+
+        executor
+            .cancel(&first.job_id, OWNER)
+            .await
+            .expect("the first query is cancelled");
+        let third = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect("the cancelled query's place is free");
+        assert_eq!(third.status, JobStatus::Pending);
+    }
+
+    /// Results count against the caller's stored-results budget until the minute they expire in
+    /// ends. At the budget a submission is a `429` whose `Retry-After` is the seconds until then,
+    /// and whose body names that time; it leaves no job behind.
+    #[tokio::test]
+    async fn a_caller_at_its_stored_results_budget_gets_429_until_the_oldest_result_expires() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // The end of a minute about an hour from now.
+        let expires_at_ms = (crate::jobs::now_ms() / 60_000 + 61) * 60_000;
+        let executor = executor(
+            store,
+            JobLimits {
+                running: 64,
+                pending: 1_000,
+                stored_bytes: 1 << 30,
+            },
+        );
+        // 1 GiB of results this scheduler's queries kept, expiring in that minute.
+        executor.keep_stored_for_test(OWNER, 1 << 30, expires_at_ms);
+
+        let refused = executor
+            .submit(select_one(), true, OWNER.to_string())
+            .await
+            .expect_err("the stored-results budget is full");
+        let response = error_to_response(&refused);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("Retry-After seconds");
+        // Whole seconds until then, rounded up, as of the response, a moment before this check.
+        let at_least = expires_at_ms
+            .saturating_sub(crate::jobs::now_ms())
+            .div_ceil(1_000);
+        assert!(
+            (at_least..=at_least + 1).contains(&retry_after),
+            "{retry_after} vs {at_least}"
+        );
+        let expires_at = chrono::DateTime::from_timestamp_millis(
+            i64::try_from(expires_at_ms).expect("a time in range"),
+        )
+        .expect("a valid time")
+        .format("%Y-%m-%dT%H:%M:%SZ");
+        assert_eq!(
+            body(response).await,
+            serde_json::json!({"error": format!("Failed to submit the async query: your stored query results total 1 GiB, the most one caller may keep. Space frees as results expire; the oldest expires at {expires_at}. See https://spiceai.org/docs/api/http/queries")})
+        );
+        assert_eq!(job_ids(&executor, OWNER).await, Vec::<String>::new());
     }
 }

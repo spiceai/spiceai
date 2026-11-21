@@ -422,6 +422,11 @@ pub(crate) fn routes(
 ) -> Router {
     // Routes that need a principal with write access. The check is a route layer so it runs
     // after authentication and before each handler's body extractors.
+    #[expect(
+        deprecated,
+        reason = "`POST /v1/packages/generate` is served until it is removed in v2.6"
+    )]
+    let generate_package = post(v1::packages::generate);
     let write_router = Router::new()
         .route("/v1/sql/active", get(v1::queries::list_active))
         .route(
@@ -444,7 +449,7 @@ pub(crate) fn routes(
             "/v1/datasets/{name}/acceleration/snapshots/current",
             post(v1::snapshots::set_current_snapshot),
         )
-        .route("/v1/packages/generate", post(v1::packages::generate))
+        .route("/v1/packages/generate", generate_package)
         .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel))
         .route_layer(middleware::from_fn(v1::require_write_access));
 
@@ -709,6 +714,10 @@ pub(crate) fn routes(
         .merge(authenticated_router)
         .route_layer(middleware::from_fn(super::mtls::mtls_request_layer))
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
+        // Every `POST /v1/packages/generate` response carries its deprecation headers, including
+        // the shutdown, mTLS, auth, write-access, and body-limit rejections above, so this wraps
+        // them.
+        .route_layer(middleware::from_fn(package_generate_deprecation))
         // The Messages API needs every `/v1/messages` error in its error envelope, including the
         // shutdown, mTLS, auth, and body-limit rejections above, so this wraps them.
         .route_layer(middleware::from_fn(v1::messages::encode_layer_errors))
@@ -737,6 +746,17 @@ pub(crate) fn routes(
     // rewrite then replaces `Access-Control-Allow-Headers` with the closed
     // MCP set plus requested `Mcp-Param-*` names — not every requested header.
     router.layer(middleware::from_fn(allow_mcp_param_cors_headers))
+}
+
+/// Every response to the deprecated `POST /v1/packages/generate`, the refusals of the layers in
+/// front of its handler included, carries its `Deprecation` and `Link` headers.
+async fn package_generate_deprecation(req: Request<Body>, next: Next) -> axum::response::Response {
+    let deprecated = req.uri().path() == "/v1/packages/generate";
+    let mut response = next.run(req).await;
+    if deprecated {
+        v1::packages::add_deprecation_headers(response.headers_mut());
+    }
+    response
 }
 
 async fn track_metrics(

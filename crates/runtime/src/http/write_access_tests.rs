@@ -208,11 +208,20 @@ async fn read_write_caller_gets_the_unauthenticated_answer() {
         }
     }
 
-    for (path, field) in [
-        ("/v1/packages/generate", "from"),
+    let missing = |field: &str| {
+        format!(
+            "Failed to deserialize the JSON body into the target type: missing field `{field}` at line 1 column 2"
+        )
+    };
+    for (path, expected_body) in [
+        // `/v1/packages/generate` answers every error with a JSON `{"error": …}` body.
+        (
+            "/v1/packages/generate",
+            serde_json::json!({ "error": missing("from") }).to_string(),
+        ),
         (
             "/v1/datasets/missing/acceleration/snapshots/current",
-            "snapshot_id",
+            missing("snapshot_id"),
         ),
     ] {
         let answer = send(
@@ -225,12 +234,7 @@ async fn read_write_caller_gets_the_unauthenticated_answer() {
         .await;
         assert_eq!(
             answer,
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "Failed to deserialize the JSON body into the target type: missing field `{field}` at line 1 column 2"
-                )
-            ),
+            (StatusCode::UNPROCESSABLE_ENTITY, expected_body),
             "POST {path} with a read-write key and `{{}}`"
         );
     }
@@ -253,4 +257,107 @@ async fn read_only_caller_still_reads() {
         (StatusCode::OK, "[]"),
         "GET /v1/datasets with a read-only key"
     );
+}
+
+/// Every response to the deprecated `POST /v1/packages/generate` carries its `Deprecation` and
+/// `Link` headers, the refusals of the layers in front of its handler included: authentication
+/// (401), write access (403) and the request body limit (413). Another route carries neither.
+#[tokio::test]
+async fn every_package_generate_response_carries_the_deprecation_headers() {
+    const DEPRECATION: &str = "@1794873600";
+    const LINK: &str = "<https://spiceai.org/docs/api/http/packages#deprecation>; rel=\"deprecation\"; type=\"text/html\"";
+    // One byte over the 128 MiB limit on authenticated request bodies. The limit refuses a
+    // declared length before it reads the body.
+    let over_the_body_limit = (128 * 1024 * 1024 + 1).to_string();
+
+    let routes = routes(true).await;
+    let cases = [
+        (
+            "/v1/packages/generate",
+            None,
+            None,
+            StatusCode::UNAUTHORIZED,
+            Some((DEPRECATION, LINK)),
+        ),
+        (
+            "/v1/packages/generate",
+            Some("wrong-key"),
+            None,
+            StatusCode::UNAUTHORIZED,
+            Some((DEPRECATION, LINK)),
+        ),
+        (
+            "/v1/packages/generate",
+            Some(READ_ONLY_KEY),
+            None,
+            StatusCode::FORBIDDEN,
+            Some((DEPRECATION, LINK)),
+        ),
+        (
+            "/v1/packages/generate",
+            Some(READ_WRITE_KEY),
+            None,
+            StatusCode::BAD_REQUEST,
+            Some((DEPRECATION, LINK)),
+        ),
+        (
+            "/v1/packages/generate",
+            Some(READ_WRITE_KEY),
+            Some(over_the_body_limit.as_str()),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Some((DEPRECATION, LINK)),
+        ),
+        (
+            "/v1/datasets/missing/acceleration/refresh",
+            None,
+            None,
+            StatusCode::UNAUTHORIZED,
+            None,
+        ),
+        (
+            "/v1/datasets/missing/acceleration/refresh",
+            Some(READ_WRITE_KEY),
+            Some(over_the_body_limit.as_str()),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            None,
+        ),
+    ];
+    let mut answers = Vec::new();
+    let mut expected = Vec::new();
+    for (path, api_key, content_length, status, headers) in cases {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(api_key) = api_key {
+            request = request.header("x-api-key", api_key);
+        }
+        if let Some(content_length) = content_length {
+            request = request.header(header::CONTENT_LENGTH, content_length);
+        }
+        let request = request.body(Body::from("{")).expect("request");
+        let response = routes.clone().oneshot(request).await.expect("response");
+        let value_of = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .map(|value| value.to_str().expect("an ASCII header").to_string())
+        };
+        let request =
+            format!("POST {path} with key {api_key:?} and Content-Length {content_length:?}");
+        answers.push((
+            request.clone(),
+            response.status(),
+            value_of("deprecation"),
+            value_of("link"),
+        ));
+        expected.push((
+            request,
+            status,
+            headers.map(|(deprecation, _)| deprecation.to_string()),
+            headers.map(|(_, link)| link.to_string()),
+        ));
+    }
+    // Compared all at once, so a failure lists every request that answered differently.
+    assert_eq!(answers, expected);
 }

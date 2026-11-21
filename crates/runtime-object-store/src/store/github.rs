@@ -335,10 +335,11 @@ impl ObjectStore for GitHubRawObjectStore {
             if git_tree.truncated {
                 yield Err(object_store::Error::Generic {
                     store: "GitHubRawObjectStore",
-                    source: Box::new(std::io::Error::other(format!(
-                        "Failed to list the files of GitHub repository '{}/{}' at '{}': the repository has more files than GitHub lists in one response, so the list would be incomplete. Reference individual files instead of a folder.",
-                        config.org, config.repo, config.rev
-                    ))),
+                    source: Box::new(TruncatedListing {
+                        org: config.org.clone(),
+                        repo: config.repo.clone(),
+                        rev: config.rev.clone(),
+                    }),
                 });
                 return;
             }
@@ -380,6 +381,28 @@ impl ObjectStore for GitHubRawObjectStore {
         Err(not_implemented("copy_opts"))
     }
 }
+
+/// GitHub listed only part of a repository's files: it has more than GitHub returns in one
+/// recursive tree. Listing it fails with this error rather than returning the files GitHub did
+/// list, which callers find in the error chain to refuse the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncatedListing {
+    pub org: String,
+    pub repo: String,
+    pub rev: String,
+}
+
+impl std::fmt::Display for TruncatedListing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GitHub lists only part of the files of repository '{}/{}' at '{}', so the list would be incomplete. Reference individual files instead of a folder.",
+            self.org, self.repo, self.rev
+        )
+    }
+}
+
+impl std::error::Error for TruncatedListing {}
 
 fn not_implemented(operation: &'static str) -> object_store::Error {
     object_store::Error::NotImplemented {
@@ -816,8 +839,7 @@ mod tests {
             other => panic!("a truncated tree must yield exactly one error, got {other:?}"),
         };
         assert!(
-            error.contains("Failed to list the files of GitHub repository 'spiceai/spiceai'")
-                && error.contains("the list would be incomplete"),
+            error.contains("GitHub lists only part of the files of repository 'spiceai/spiceai' at 'refs/heads/trunk', so the list would be incomplete."),
             "the error must say the listing is incomplete: {error}"
         );
     }

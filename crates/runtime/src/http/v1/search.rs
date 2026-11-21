@@ -15,6 +15,7 @@ limitations under the License.
 */
 use axum::{
     Extension, Json,
+    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -38,8 +39,18 @@ struct SearchResponse {
     pub duration_ms: u128,
 }
 
+/// A `400 Bad Request` with the JSON error body every `/v1/search` client error uses.
+fn bad_request(message: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": message.to_string()})),
+    )
+        .into_response()
+}
+
 /// Validates basic `/v1/search` request parameters, returning an error message
-/// for a `400 Bad Request` if the request is invalid.
+/// for a `400 Bad Request` if the request is invalid. The `limit` range is checked
+/// with the other fields in `SearchRequest::try_from`.
 fn validate_request(payload: &SearchRequestHTTPJson) -> Option<&'static str> {
     // For now, force the user to specify which data.
     if payload
@@ -49,10 +60,6 @@ fn validate_request(payload: &SearchRequestHTTPJson) -> Option<&'static str> {
         .is_some_and(std::vec::Vec::is_empty)
     {
         return Some("No data sources provided");
-    }
-
-    if payload.base.limit.is_some_and(|limit| limit == 0) {
-        return Some("Limit must be greater than 0");
     }
 
     // Empty/whitespace `text` is rejected in `SearchRequest::try_from` so HTTP
@@ -140,12 +147,23 @@ fn validate_request(payload: &SearchRequestHTTPJson) -> Option<&'static str> {
 ))]
 pub(crate) async fn post(
     Extension(vs): Extension<Arc<SearchEngine<crate::search::util::RuntimeTableProviderExplorer>>>,
-    Json(payload): Json<SearchRequestHTTPJson>,
+    payload: Result<Json<SearchRequestHTTPJson>, JsonRejection>,
 ) -> Response {
     let start_time = Instant::now();
 
+    let payload = match payload {
+        Ok(Json(payload)) => payload,
+        Err(rejection) => {
+            return (
+                rejection.status(),
+                Json(serde_json::json!({"error": rejection.body_text()})),
+            )
+                .into_response();
+        }
+    };
+
     if let Some(msg) = validate_request(&payload) {
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+        return bad_request(msg);
     }
 
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "search", input = %payload.base.text);
@@ -154,7 +172,7 @@ pub(crate) async fn post(
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "task_history", parent: &span, "{e}");
-            return (StatusCode::BAD_REQUEST, e).into_response();
+            return bad_request(e);
         }
     };
 
@@ -226,6 +244,9 @@ pub(crate) async fn post(
             };
 
             tracing::error!(target: "task_history", parent: &span, "{e}");
+            if error_type == StatusCode::BAD_REQUEST {
+                return bad_request(e);
+            }
             (error_type, e.to_string()).into_response()
         }
     }
@@ -240,11 +261,43 @@ mod validate_tests {
     }
 
     #[test]
-    fn rejects_zero_limit_and_empty_datasets() {
-        let r = req(serde_json::json!({"datasets": ["products"], "text": "boots", "limit": 0}));
-        assert_eq!(validate_request(&r), Some("Limit must be greater than 0"));
+    fn rejects_empty_datasets() {
         let r = req(serde_json::json!({"datasets": [], "text": "boots"}));
         assert_eq!(validate_request(&r), Some("No data sources provided"));
+    }
+
+    /// The `limit` range is checked once, in the conversion `/v1/search` and the `search` tool
+    /// share, with the message both return.
+    #[test]
+    fn limit_must_be_between_1_and_10000() {
+        for (limit, ok) in [
+            (0, false),
+            (1, true),
+            (3, true),
+            (10_000, true),
+            (10_001, false),
+        ] {
+            let r =
+                req(serde_json::json!({"datasets": ["products"], "text": "boots", "limit": limit}));
+            assert_eq!(validate_request(&r), None);
+            match SearchRequest::try_from(r) {
+                Ok(request) => {
+                    assert!(ok, "limit {limit} must be refused");
+                    assert_eq!(request.limit, limit);
+                }
+                Err(e) => {
+                    assert!(!ok, "limit {limit} must be accepted: {e}");
+                    assert_eq!(
+                        e,
+                        format!(
+                            "`limit` must be between 1 and 10000, but was {limit}. Request fewer results, or use /v1/sql to read every row. See https://spiceai.org/docs/api/http/search"
+                        )
+                    );
+                }
+            }
+        }
+        let r = req(serde_json::json!({"datasets": ["products"], "text": "boots"}));
+        assert_eq!(SearchRequest::try_from(r).map(|r| r.limit), Ok(3));
     }
 
     #[test]
