@@ -19,6 +19,9 @@ limitations under the License.
 //! fix's upstream regression query in a session built from the configuration
 //! every Spice session starts from, and fails if the backport is lost when the
 //! fork is re-cut.
+//!
+//! It also guards fork patches whose loss changes no answer, only what a query
+//! costs, and fails if one of those is lost.
 
 use std::path::Path;
 
@@ -1207,4 +1210,57 @@ async fn levenshtein_refuses_a_batch_past_its_size_limit() {
             );
         }
     }
+}
+
+/// spiceai/datafusion#301: `DefaultDialect::identifier_quote_style` compiles its
+/// identifier pattern once. The unparser calls it for every identifier it writes,
+/// so a pattern compiled on each call costs every federated query one regex
+/// compilation per identifier. The guard measures against that cost directly,
+/// so it holds on any machine and in a debug build: quoting a set of
+/// identifiers must take well under the time of compiling the pattern once per
+/// identifier, which is a floor for the unpatched function.
+#[test]
+fn the_unparser_compiles_its_identifier_pattern_once() {
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    use datafusion::sql::unparser::dialect::{DefaultDialect, Dialect};
+
+    const IDENTIFIERS: usize = 200;
+    const ROUNDS: usize = 5;
+
+    fn fastest(round: &dyn Fn()) -> Duration {
+        (0..ROUNDS)
+            .map(|_| {
+                let start = Instant::now();
+                round();
+                start.elapsed()
+            })
+            .min()
+            .expect("at least one round")
+    }
+
+    let dialect = DefaultDialect {};
+    let names: Vec<String> = (0..IDENTIFIERS).map(|i| format!("column_{i}")).collect();
+    assert_eq!(
+        dialect.identifier_quote_style("column_0"),
+        None,
+        "a lowercase identifier is written unquoted"
+    );
+    let quoting = fastest(&|| {
+        for name in &names {
+            black_box(dialect.identifier_quote_style(black_box(name)));
+        }
+    });
+    let compiling = fastest(&|| {
+        for _ in &names {
+            black_box(regex::Regex::new(black_box(r"^[a-zA-Z_][a-zA-Z0-9_]*$")).expect("valid"));
+        }
+    });
+    assert!(
+        quoting * 4 < compiling,
+        "quoting {IDENTIFIERS} identifiers took {quoting:?}, against {compiling:?} to compile \
+         the identifier pattern {IDENTIFIERS} times: identifier_quote_style is compiling its \
+         pattern on every call again (spiceai/datafusion#301)"
+    );
 }

@@ -111,6 +111,7 @@ jobs:
               - 'crates/test-framework/src/source_versions.rs'
               - '.github/workflows/integration.yml'
               - '.github/scripts/docker_pull.sh'
+              - '.github/scripts/mc_cp.sh'
               - 'crates/data-connectors/connector-postgres/**'
               - 'crates/data-connectors/connector-postgres-common/**'
               - 'crates/data-connectors/connector-mysql/**'
@@ -343,7 +344,7 @@ jobs:
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to upload integration test archives}"
-          mc cp ./integration_tests.tar.zst "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}"
+          bash .github/scripts/mc_cp.sh ./integration_tests.tar.zst "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}"
 
       - name: Upload test archive (artifact fallback)
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
@@ -435,7 +436,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
@@ -500,7 +501,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -512,7 +513,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
           role-session-name: gha-dynamodb-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -524,7 +525,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_S3_VECTORS_ROLE_ARN }}
           role-session-name: gha-s3-vectors-${{ github.run_id }}
           role-duration-seconds: 5400
           aws-region: us-east-1
@@ -585,7 +586,7 @@ jobs:
           AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
           AWS_ICEBERG_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
           AWS_ICEBERG_REGION: ${{ vars.AWS_ICEBERG_REGION }}
-          AWS_ICEBERG_ACCOUNT_ID: ${{ vars.AWS_ICEBERG_ACCOUNT_ID }}
+          AWS_ICEBERG_ACCOUNT_ID: ${{ vars.CI_AWS_ICEBERG_ACCOUNT_ID }}
           AWS_GLUE_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
           AWS_GLUE_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
           AWS_GLUE_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
@@ -729,7 +730,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1096,7 +1097,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download GitHub test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download GitHub test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1220,7 +1221,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1300,7 +1301,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK credential bridge test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK credential bridge test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1316,7 +1317,7 @@ jobs:
         env:
           AWS_EC2_METADATA_DISABLED: true
           AWS_REGION: ${{ vars.AWS_REGION }}
-          AWS_ROLE_ARN: ${{ vars.AWS_WEB_IDENTITY_TEST_ROLE_ARN }}
+          AWS_ROLE_ARN: ${{ vars.CI_AWS_WEB_IDENTITY_TEST_ROLE_ARN }}
         # A GitHub OIDC token lives 5 minutes, enough for these tests' STS exchanges.
         run: |
           set -euo pipefail
@@ -1377,7 +1378,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download snapshot refresh test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1394,7 +1395,7 @@ jobs:
         if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
@@ -1456,7 +1457,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download data components test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download data components test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'
@@ -1526,7 +1527,7 @@ jobs:
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download partition table test archive}"
           mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+          bash .github/scripts/mc_cp.sh "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download partition table test archive
         if: env.HAS_RUSTFS_ACCESS != 'true'

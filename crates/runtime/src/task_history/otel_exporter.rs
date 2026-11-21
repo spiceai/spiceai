@@ -176,18 +176,41 @@ impl TaskHistoryExporter {
         }
     }
 
+    /// Whether `task`'s `input` and `captured_output` can carry user or model
+    /// content (a prompt, a search query, tool arguments, retrieved rows), and
+    /// so are shaped by `captured_context`.
+    ///
+    /// This lists the tasks that cannot, and treats every other task as one
+    /// that can. A task added later that records a prompt is then redacted
+    /// under `captured_context: redacted` without anyone having to remember to
+    /// list it here; forgetting to list a task that carries no content costs
+    /// only a `[redacted]` or truncated identifier.
     fn is_context_task(task: &str) -> bool {
-        matches!(
+        !matches!(
             task,
-            "ai_chat"
-                | "ai_decision"
-                | "ai_completion"
-                | "responses"
-                | "text_embed"
-                | "search"
-                | "nsql"
-                | "scheduled_worker"
-        ) || task.starts_with("tool_use::")
+            // SQL text, and the plans and statements derived from it, are
+            // outside `captured_context`.
+            "sql_query"
+                | "plan"
+                | "ballista_stage"
+                | "databricks_execute_statement"
+                | "databricks_poll_statement"
+                | "databricks_get_schema"
+                // Work the runtime starts on a component the Spicepod names,
+                // recorded under that name, a fixed string, or a count.
+                | "health"
+                | "acceleration_refresh"
+                | "accelerated_schema_evolution"
+                | "test_connectivity"
+                | "ai_decide"
+                | "cluster::expand_secret"
+                | "uc_get_catalog"
+                | "uc_get_effective_permissions"
+                | "uc_get_table"
+                | "uc_list_schemas"
+                | "uc_list_tables"
+                | "uc_temporary_table_credentials"
+        )
     }
 
     fn process_context_payload(
@@ -639,18 +662,53 @@ mod tests {
         );
     }
 
+    /// SQL text, plans and runtime-chosen identifiers are outside
+    /// `captured_context`: kept whole under `redacted`, and not cut at 4096
+    /// characters under the default `truncated`, which would break a plan.
     #[test]
     fn process_context_payload_preserves_non_context_tasks() {
-        let payload: Arc<str> = "SELECT COUNT(*) FROM item".into();
+        let long: Arc<str> = "x".repeat(TRUNCATED_TASK_HISTORY_CONTEXT_CHARS + 1).into();
+        for task in [
+            "sql_query",
+            "plan",
+            "ballista_stage",
+            "databricks_execute_statement",
+            "acceleration_refresh",
+            "health",
+        ] {
+            for mode in [
+                TaskHistoryCapturedContext::Redacted,
+                TaskHistoryCapturedContext::Truncated,
+            ] {
+                assert_eq!(
+                    TaskHistoryExporter::process_context_payload(&mode, task, Arc::clone(&long)),
+                    long,
+                    "task '{task}' must keep its payload under {mode:?}"
+                );
+            }
+        }
+    }
 
-        assert_eq!(
-            TaskHistoryExporter::process_context_payload(
-                &TaskHistoryCapturedContext::Redacted,
-                "sql_query",
-                Arc::clone(&payload),
-            ),
-            payload
-        );
+    /// The `ai()` SQL function records its prompt and `rerank()` its search
+    /// query, so both are redacted like every other prompt and search payload,
+    /// and so is a task this exporter has never heard of.
+    #[test]
+    fn process_context_payload_redacts_sql_function_prompts_and_unknown_tasks() {
+        for (task, payload) in [
+            ("ai", "ai('customer-secret', 'model')"),
+            ("rerank", "customer-secret"),
+            ("some_future_task", "customer-secret"),
+        ] {
+            assert_eq!(
+                TaskHistoryExporter::process_context_payload(
+                    &TaskHistoryCapturedContext::Redacted,
+                    task,
+                    payload.into(),
+                ),
+                Arc::<str>::from(REDACTED_TASK_HISTORY_VALUE),
+                "task '{task}' must not reach task history unredacted"
+            );
+        }
     }
 
     #[test]

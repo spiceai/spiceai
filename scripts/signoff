@@ -447,9 +447,11 @@ changed_files_vs_trunk() {
   printf '%s\n' "$files"
 }
 
-# Map changed file paths (stdin, one per line) to workspace package names.
-# Uses `cargo metadata` so package names match what `-p` expects (including
-# nested members under crates/data-connectors/*).
+# Map changed file paths (stdin, one per line) to workspace package specs for
+# `-p`. Uses `cargo metadata` so names match the members (including nested
+# members under crates/data-connectors/*). A member whose name another package in
+# Cargo.lock also uses prints as `name@version`, because a bare `-p name` is then
+# ambiguous and cargo refuses it.
 packages_for_changed_files() {
   command -v cargo >/dev/null 2>&1 || fail "cargo not found — required for sign-off checks"
   # Targeted pre-lint is an optional fail-fast step: without python3, skip it
@@ -472,7 +474,8 @@ packages_for_changed_files() {
   # its own error (missing rustc, bad manifest, …) stays visible.
   cargo metadata --no-deps --format-version 1 \
     | CHANGED_FILES="$files" SIGNOFF_LINT_EXCLUDED="$LINT_EXCLUDED_PACKAGES" python3 -c '
-import json, os, sys
+import json, os, re, sys
+from collections import Counter
 from pathlib import Path
 
 try:
@@ -481,6 +484,11 @@ except ValueError:
     raise SystemExit("cargo metadata failed — is this a Cargo workspace?")
 excluded = set(os.environ.get("SIGNOFF_LINT_EXCLUDED", "").split())
 workspace_root = Path(meta["workspace_root"]).resolve()
+try:
+    lockfile = (workspace_root / "Cargo.lock").read_text()
+except OSError:
+    lockfile = ""
+locked_names = Counter(re.findall(r"^\[\[package\]\]\nname = \"([^\"]+)\"$", lockfile, re.M))
 
 # Longest package root first so nested members (connector-postgres) win over
 # a parent path if both ever appeared (they should not for exclusive members).
@@ -494,7 +502,8 @@ for p in meta["packages"]:
         root.relative_to(workspace_root)
     except ValueError:
         continue
-    packages.append((str(root) + os.sep, name))
+    spec = name + "@" + p["version"] if locked_names[name] > 1 else name
+    packages.append((str(root) + os.sep, spec))
 packages.sort(key=lambda x: len(x[0]), reverse=True)
 
 found = set()
@@ -506,13 +515,13 @@ for raw in os.environ["CHANGED_FILES"].splitlines():
     # avoid matching sibling packages that share a prefix (runtime vs
     # runtime-auth).
     abs_path = str((workspace_root / path).resolve())
-    for root, name in packages:
+    for root, spec in packages:
         if abs_path == root.rstrip(os.sep) or abs_path.startswith(root):
-            found.add(name)
+            found.add(spec)
             break
 
-for name in sorted(found):
-    print(name)
+for spec in sorted(found):
+    print(spec)
 '
 }
 
@@ -580,14 +589,18 @@ except ValueError:
 
 wanted = set(sys.argv[1].split())
 # Match on workspace members only: a dependency can share a name with a member.
+# A spec is `name` or, when the name is ambiguous, `name@version`.
 members = set(meta.get("workspace_members", []))
-names = {p["id"]: p["name"] for p in meta["packages"]}
+packages = {p["id"]: p for p in meta["packages"]}
 
 features = []
 for node in meta.get("resolve", {}).get("nodes", []):
-    if node["id"] not in members or names.get(node["id"]) not in wanted:
+    package = packages.get(node["id"])
+    if node["id"] not in members or package is None:
         continue
-    name = names[node["id"]]
+    name = package["name"]
+    if name not in wanted and name + "@" + package["version"] not in wanted:
+        continue
     # `default` is already on -- nothing here passes --no-default-features.
     features.extend(
         f"{name}/{feat}" for feat in sorted(node["features"]) if feat != "default"
@@ -608,7 +621,11 @@ features_for_packages() {
 
   awk -v feats="$features" -v pkgs="$packages" 'BEGIN {
     n = split(pkgs, selected, /[ \t\n]+/)
-    for (i = 1; i <= n; i++) if (selected[i] != "") keep[selected[i]] = 1
+    for (i = 1; i <= n; i++) {
+      if (selected[i] == "") continue
+      at = index(selected[i], "@")
+      keep[at ? substr(selected[i], 1, at - 1) : selected[i]] = 1
+    }
 
     m = split(feats, entries, /,/)
     out = ""
@@ -654,13 +671,15 @@ candidates = set(sys.argv[1].split())
 # A proc-macro crate lib target is what `--lib` selects for it, so it counts.
 LIB_KINDS = {"lib", "rlib", "proc-macro"}
 
-with_lib = sorted(
-    p["name"]
-    for p in meta["packages"]
-    if p["name"] in candidates
-    and any(LIB_KINDS & set(t["kind"]) for t in p["targets"])
-)
-print(" ".join(with_lib))
+with_lib = []
+for p in meta["packages"]:
+    if not any(LIB_KINDS & set(t["kind"]) for t in p["targets"]):
+        continue
+    # Keep the spec as given: `name@version` stays qualified for `-p`.
+    for spec in (p["name"], p["name"] + "@" + p["version"]):
+        if spec in candidates:
+            with_lib.append(spec)
+print(" ".join(sorted(with_lib)))
 ' "$packages" || return 0
 }
 
@@ -822,7 +841,7 @@ post_pending_status() {
 # sync with `rustAffecting` in .github/workflows/pr.yml and covered by the
 # check-code-changes filter; `scripts/check_rust_gate_paths.py` enforces both,
 # and docs/dev/ci_signoff.md explains why each path is here.
-RUST_AFFECTING_PATH_PATTERN='(^(crates|bin|tools|vendor)/|\.(rs|snap|proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls|cayenne_data_path_fs)\.py$|^scripts/cayenne_data_path_fs_allowlist\.json$|^scripts/(test_)?rust_guard_common\.py$|^scripts/(test_)?nextest_build_targets\.py$|^docs/dev/fork_patches\.md$|^(Makefile|version\.txt)$|^test/tpc-bench/(Makefile|mysql-null-spec\.awk)$|^test/tls/|^test/spicepods/tpch/sf1/accelerated/postgres\[catalog\]\[changes\]\.yaml$|^test/source_versions\.json$)'
+RUST_AFFECTING_PATH_PATTERN='(^(crates|bin|tools|vendor)/|\.(rs|snap|proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls|cayenne_data_path_fs)\.py$|^scripts/cayenne_data_path_fs_allowlist\.json$|^scripts/(test_)?rust_guard_common\.py$|^scripts/(test_)?nextest_build_targets\.py$|^docs/dev/fork_patches\.md$|^(Makefile|version\.txt)$|^test/tpc-bench/(Makefile|mysql-null-spec\.awk)$|^test/tls/|^test/spicepods/tpch/sf1/accelerated/postgres\[catalog\]\[changes\]\.yaml$|^test/source_versions\.json$|^\.schema/spicepod\.schema\.json$)'
 
 # True when the branch delta vs trunk can affect Rust lint/build/tests.
 # Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).

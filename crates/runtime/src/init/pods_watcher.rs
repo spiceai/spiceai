@@ -708,7 +708,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_runtime_reports_nothing() {
-        assert!(changed_sections(|_| {}).is_empty());
+        assert_eq!(changed_sections(|_| {}), [] as [&str; 0]);
     }
 
     /// Settings that apply on a reload: reporting them would tell the operator

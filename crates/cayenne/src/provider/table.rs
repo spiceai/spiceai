@@ -4500,12 +4500,15 @@ pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, 
     );
 }
 
-/// Tier-0 size ceiling for protected-snapshot leveling, in bytes (8 MiB).
+/// Tier-0 size ceiling for protected-snapshot leveling, in bytes (256 KiB).
 ///
 /// Runs at or below this size are tier 0; each subsequent tier is
-/// [`PROTECTED_TIER_GROWTH`]× larger. Function-scoped constant for now —
-/// promote to a `CayenneContext` config knob when the policy stabilizes.
-const PROTECTED_TIER_BASE_BYTES: u64 = 8 * 1024 * 1024;
+/// [`PROTECTED_TIER_GROWTH`]× larger. Tier 0 must sit near the size of one
+/// write's run, which for small CDC and OTLP batches is on the order of
+/// 100 KiB: with a ceiling of several MiB, each new run lands in the same tier
+/// as the growing merge output and is folded into it on every pass, rewriting
+/// that output dozens of times before it levels up.
+const PROTECTED_TIER_BASE_BYTES: u64 = 256 * 1024;
 
 /// Geometric growth factor between protected-snapshot size tiers.
 const PROTECTED_TIER_GROWTH: u64 = 8;
@@ -5133,7 +5136,7 @@ const fn coalesced_task_state_after_signal(state: u8) -> Option<u8> {
 /// running and so owns the task it must now spawn; otherwise the signal was
 /// recorded on the task already running.
 fn coalesced_task_try_claim(state: &AtomicU8) -> bool {
-    state.fetch_update(
+    state.try_update(
         Ordering::AcqRel,
         Ordering::Acquire,
         coalesced_task_state_after_signal,
@@ -8419,7 +8422,7 @@ impl CayenneTableProvider {
         // the table's state alive while it does.
         if self
             .snapshot_cleanup_rearms_left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 (left > 0).then(|| left - 1)
             })
             .is_err()
@@ -16187,7 +16190,7 @@ impl CayenneTableProvider {
         if after == before {
             return;
         }
-        let _ = accounted_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+        let _ = accounted_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
             Some(if after > before {
                 held.saturating_add(after - before)
             } else {
@@ -20062,7 +20065,7 @@ impl CayenneTableProvider {
     fn adjust_cached_inlined_row_count(&self, delta: i64) {
         let _ =
             self.inlined_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(if delta >= 0 {
                         current.saturating_add(delta)
                     } else {
@@ -20490,7 +20493,7 @@ impl CayenneTableProvider {
         // observes the new generation (`Acquire`) also observes the updated
         // count; a reader racing ahead of the bump may still see 0, which is
         // exactly the pre-publish state its watermark capture hides anyway.
-        let _ = self.durable_inlined_row_count.fetch_update(
+        let _ = self.durable_inlined_row_count.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_add(durable_delta)),
@@ -24179,7 +24182,7 @@ impl CayenneTableProvider {
             return;
         }
         let keep = trigger_files.saturating_sub(1);
-        let _ = self.new_files_since_last_compaction.fetch_update(
+        let _ = self.new_files_since_last_compaction.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |credits| {
@@ -39972,7 +39975,7 @@ impl CayenneTableProvider {
         // `saturating_sub`); clamped at `i64::MAX` it only ever over-nets, keeping
         // the maintained count Inexact-and-conservative rather than inflated.
         let superseded_delta = i64::try_from(superseded).unwrap_or(i64::MAX);
-        let _ = self.mem_tier_pending_superseded.fetch_update(
+        let _ = self.mem_tier_pending_superseded.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_add(superseded_delta)),
@@ -41175,19 +41178,24 @@ impl CayenneTableProvider {
             return Ok(0);
         }
 
-        // PK membership of the (cross-shard) visible rows drives the reinserted-vs-
-        // pure tombstone split, same as the checkpoint.
-        let corpus_keys = self.checkpoint_corpus_pk_keys(&union_visible)?;
-
-        // Shadow inserts and both kinds of tombstones commit together. Durable
-        // commit only: NO `publish_inlined_mutation`, generation bump, or watermark
-        // advance, so live scans keep serving the RAM tier. The shadow's seal
-        // sequence exceeds every active tombstone sequence; the target snapshot
-        // is None because the inserts live in the inline BLOB. Drop the returned
-        // update: reads hide deleted rows via RAM tombstones until restart.
-        // A later bake may re-commit the tombstones (the index merges by max
-        // sequence). At N==1 the view is shard 0's delta; at N>1 it is the
-        // disjoint-key union, exactly as in the sharded checkpoint.
+        // Shadow inserts and the tombstones commit together. Durable commit only:
+        // NO `publish_inlined_mutation`, generation bump, or watermark advance, so
+        // live scans keep serving the RAM tier. The shadow's seal sequence exceeds
+        // every active tombstone sequence; the target snapshot is None because the
+        // inserts live in the inline BLOB. Drop the returned update: reads hide
+        // deleted rows via RAM tombstones until restart. A later bake may re-commit
+        // the tombstones (the index merges by max sequence). At N==1 the view is
+        // shard 0's delta; at N>1 it is the disjoint-key union, exactly as in the
+        // sharded checkpoint.
+        //
+        // Every tombstone is delete-only, including those of keys the shadow
+        // re-inserts. Inline visibility compares a row's sequence with the delete
+        // sequence and never consults a re-insert, so the shadow needs no stamp. A
+        // stamp would make the restored index re-expose every stored copy of the
+        // key: with no protected snapshot, the current-snapshot scan honors a
+        // re-insert, so a restart served the superseded row beside the shadow
+        // (#16278). The checkpoint that later moves these rows into a file stamps
+        // its own re-inserts and insert records at that file's sequence.
         let inline_data = if union_visible.is_empty() {
             Vec::new()
         } else {
@@ -41212,7 +41220,7 @@ impl CayenneTableProvider {
                 &union_view,
                 None,
                 seal_sequence,
-                &corpus_keys,
+                &CheckpointCorpusKeys::None,
                 inline_data,
                 false,
             )
@@ -49829,7 +49837,7 @@ mod tests {
             t0 + grace * 2,
             grace,
         );
-        assert!(del.is_empty());
+        assert_eq!(del, [] as [String; 0]);
         assert!(!first_seen.contains_key(&f), "re-referenced entry pruned");
 
         // Re-mark, then it disappears from the store entirely → pruned.
@@ -49843,7 +49851,7 @@ mod tests {
         assert!(first_seen.contains_key(&f));
         let del =
             CayenneTableProvider::plan_cold_gc_deletions(&[], &empty, &mut first_seen, t0, grace);
-        assert!(del.is_empty());
+        assert_eq!(del, [] as [String; 0]);
         assert!(first_seen.is_empty(), "gone-from-store entry pruned");
     }
 
@@ -51952,6 +51960,30 @@ mod tests {
                 oldest_pair_bytes: 8 * gib,
             },
             "the two 1 GiB runs would fit, but the walk is oldest-first by design"
+        );
+    }
+
+    #[test]
+    fn protected_merge_leaves_a_merged_run_alone_when_small_runs_arrive() {
+        // Measured under OTLP ingest: 500-row writes produce runs of about
+        // 100 KiB, and a merged output grows toward the tier-0 ceiling. Eight new
+        // runs merge with each other; the 7 MiB output is not rewritten to absorb
+        // them.
+        let mib = 1024 * 1024;
+        let mut inputs = vec![sized("merged", 7 * mib)];
+        let small: Vec<String> = (1..=8).map(|i| format!("s{i}")).collect();
+        inputs.extend(small.iter().map(|id| sized(id, 100 * 1024)));
+        assert_eq!(
+            select_protected_snapshot_merge_tier(
+                &inputs,
+                8,
+                PROTECTED_MERGE_MAX_WIDTH,
+                PROTECTED_TIER_BASE_BYTES,
+                PROTECTED_TIER_GROWTH,
+                None,
+                None,
+            ),
+            ProtectedMergeSelection::Merge(small.into_iter().map(|id| (id, 0)).collect()),
         );
     }
 
@@ -77059,12 +77091,12 @@ mod tests {
             .durable_inlined_row_count
             .store(0, Ordering::Relaxed);
         provider.bump_inlined_structural_epoch();
-        assert!(
+        assert_eq!(
             provider
                 .read_inlined_batches()
                 .await
-                .expect("fast path applies again once the signal is 0")
-                .is_empty()
+                .expect("fast path applies again once the signal is 0"),
+            [] as [RecordBatch; 0]
         );
 
         // Un-poison and verify the table still scans end-to-end.

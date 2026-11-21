@@ -17,7 +17,13 @@ async-trait.workspace = true
 # for the whole graph. `client` rather than `server` because the proxy calls
 # out to an MCP server rather than serving one.
 rmcp = { workspace = true, optional = true, features = ["client"] }
+# Who may call a tool is decided from the principal on the current request
+# (`access::authorize`), so the trait that runs tools reads it.
+runtime-auth = { path = "../runtime-auth" }
+runtime-request-context = { path = "../runtime-request-context" }
 serde_json.workspace = true
+snafu.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

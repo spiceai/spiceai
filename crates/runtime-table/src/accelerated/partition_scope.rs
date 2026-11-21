@@ -243,7 +243,6 @@ fn with_record(
 /// would let later changes acknowledge its source position, so it would never
 /// apply. The source's own errors pass through unchanged: a source may continue
 /// after them.
-#[must_use]
 pub fn scope_changes(stream: ChangesStream, scope: Arc<PartitionScope>) -> ChangesStream {
     let mut scoped = stream
         .then(move |item| {

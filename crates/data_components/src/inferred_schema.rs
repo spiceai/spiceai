@@ -376,7 +376,7 @@ mod tests {
         );
         let parsed = InferredSchema::from_metadata(&metadata);
         // Bad PK ignored, good indexes preserved.
-        assert!(parsed.primary_key.is_empty());
+        assert_eq!(parsed.primary_key, [] as [String; 0]);
         assert_eq!(parsed.indexes, sample().indexes);
     }
 

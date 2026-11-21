@@ -53,7 +53,7 @@ pub mod replication_tpch;
 pub mod replication_type_change;
 #[cfg(feature = "postgres")]
 pub mod schema_inference;
-#[cfg(all(feature = "postgres", feature = "sqlite"))]
+#[cfg(feature = "postgres")]
 pub mod write_back;
 #[cfg(feature = "postgres")]
 pub mod write_back_delivery;

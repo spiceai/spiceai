@@ -5,14 +5,14 @@ description: "Query: tpcds_q62"
 +-------------------------------------------------------+---------+----------+---------+------------+------------+-------------+-----------+
 | substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type | web_name | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
 +-------------------------------------------------------+---------+----------+---------+------------+------------+-------------+-----------+
-| Conventional childr                                   | EXPRESS | site_0   | 320     | 325        | 309        | 314         | 0         |
-| Conventional childr                                   | EXPRESS | site_1   | 280     | 243        | 274        | 276         | 0         |
-| Conventional childr                                   | EXPRESS | site_2   | 270     | 279        | 260        | 259         | 0         |
-| Conventional childr                                   | EXPRESS | site_3   | 307     | 294        | 314        | 302         | 0         |
-| Conventional childr                                   | EXPRESS | site_4   | 303     | 289        | 316        | 307         | 0         |
-| Conventional childr                                   | LIBRARY | site_0   | 258     | 229        | 272        | 235         | 0         |
-| Conventional childr                                   | LIBRARY | site_1   | 223     | 262        | 248        | 255         | 0         |
-| Conventional childr                                   | LIBRARY | site_2   | 238     | 219        | 202        | 204         | 0         |
-| Conventional childr                                   | LIBRARY | site_3   | 166     | 208        | 170        | 183         | 0         |
-| Conventional childr                                   | LIBRARY | site_4   | 206     | 206        | 200        | 218         | 0         |
+| Bad cards must make.                                  | EXPRESS | site_0   | 289     | 305        | 255        | 265         | 0         |
+| Bad cards must make.                                  | EXPRESS | site_1   | 279     | 252        | 286        | 282         | 0         |
+| Bad cards must make.                                  | EXPRESS | site_2   | 311     | 320        | 302        | 313         | 0         |
+| Bad cards must make.                                  | EXPRESS | site_3   | 297     | 312        | 256        | 284         | 0         |
+| Bad cards must make.                                  | EXPRESS | site_4   | 324     | 349        | 280        | 290         | 0         |
+| Bad cards must make.                                  | LIBRARY | site_0   | 247     | 256        | 233        | 253         | 0         |
+| Bad cards must make.                                  | LIBRARY | site_1   | 205     | 223        | 207        | 220         | 0         |
+| Bad cards must make.                                  | LIBRARY | site_2   | 206     | 198        | 183        | 177         | 0         |
+| Bad cards must make.                                  | LIBRARY | site_3   | 193     | 214        | 231        | 198         | 0         |
+| Bad cards must make.                                  | LIBRARY | site_4   | 215     | 244        | 235        | 232         | 0         |
 +-------------------------------------------------------+---------+----------+---------+------------+------------+-------------+-----------+
