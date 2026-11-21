@@ -158,6 +158,7 @@
   "schema-ddl": 48,
   "search": 11,
   "search-hybrid": 15,
+  "secret-redaction": 23,
   "served-while-source-down": 31,
   "settings-evolution": 76,
   "sidecar-append-stream-keyed": 6,
