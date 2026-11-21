@@ -358,7 +358,7 @@ async fn run_with_signal_forwarding(
 /// Returns `(http_endpoint, flight_endpoint)`. If `--endpoint` is provided, it takes precedence
 /// over the corresponding specific endpoint flag. An error is returned if `--endpoint` has no
 /// recognized scheme or conflicts with an already-specified endpoint.
-fn resolve_endpoint(
+pub(crate) fn resolve_endpoint(
     endpoint: Option<&str>,
     http_endpoint: Option<&str>,
     flight_endpoint: Option<&str>,

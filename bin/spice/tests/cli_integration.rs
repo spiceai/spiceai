@@ -1756,6 +1756,34 @@ mod build {
         assert!(!project.path().join("score.wasm").exists(), "{printed}");
     }
 
+    /// An `--endpoint` the runtime cannot be started on is refused before
+    /// anything is built, and the runtime never starts.
+    #[test]
+    fn test_run_builds_nothing_for_an_endpoint_it_refuses() {
+        let project = two_manifest_project();
+        let bin = TempDir::new().expect("create the runtime directory");
+        let record = bin.path().join("runtime-saw");
+        let spiced = stub_runtime(&bin, &record);
+
+        let output = spice_cmd()
+            .current_dir(project.path())
+            .env("SPICED_PATH", &spiced)
+            .args(["run", "--endpoint", "ftp://127.0.0.1:1"])
+            .timeout(std::time::Duration::from_mins(1))
+            .output()
+            .expect("run spice run");
+
+        let printed = printed(&output);
+        assert!(
+            printed.contains("Unrecognized scheme in --endpoint 'ftp://127.0.0.1:1'. Use http://, https://, grpc://, or grpc+tls://"),
+            "{printed}"
+        );
+        assert_eq!(output.status.code(), Some(1), "{printed}");
+        assert!(!printed.contains("Building function"), "{printed}");
+        assert!(!project.path().join("decoy.wasm").exists(), "{printed}");
+        assert!(!record.exists(), "the runtime must not start: {printed}");
+    }
+
     /// An app directory holding `spicepod.yaml`, whose function `decoy`
     /// builds `decoy.wasm`, and `production.yaml`, whose function `score`
     /// writes `production` to `score.wasm`.

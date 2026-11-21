@@ -19,7 +19,7 @@ limitations under the License.
 use crate::commands::build::FUNCTIONS_DOCS;
 use crate::context::RuntimeContext;
 use crate::error::Result;
-use crate::runtime_launcher::{ConnectionReport, RunConfig, run_runtime};
+use crate::runtime_launcher::{ConnectionReport, RunConfig, resolve_endpoint, run_runtime};
 use clap::Args;
 use spiced_args::RuntimeSpicepod;
 
@@ -77,6 +77,14 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
     // wherever the Spicepod itself is. The modules are built and hashed
     // against the same directory, so the runtime loads what was just built.
     let runtime_dir = ctx.app_dir();
+
+    // An endpoint the runtime cannot be started on is refused before anything
+    // is built.
+    resolve_endpoint(
+        args.endpoint.as_deref(),
+        args.http_endpoint.as_deref(),
+        args.flight_endpoint.as_deref(),
+    )?;
 
     // Build the function modules the runtime is about to load. The runtime
     // itself never builds anything.
