@@ -82,6 +82,7 @@ snafu.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "fs"] }
 
 [dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 # Test-only, and deliberately dev-only: these sit in the `runtime` tier, so a normal
 # dependency would be an upward edge. The cache-refresh tests live here because they
 # need this crate's `create_table_provider`.
@@ -103,6 +104,10 @@ prost.workspace = true
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[bench]]
+name = "cdc_apply"
+harness = false
 
 [lints]
 workspace = true

@@ -31,6 +31,7 @@ dependencies = [
  "cayenne-metastore-actions",
  "chrono",
  "cpu-budget",
+ "criterion 0.7.0",
  "data-accelerator-api",
  "data_components",
  "datafusion",
