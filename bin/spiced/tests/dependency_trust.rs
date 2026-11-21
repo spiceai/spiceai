@@ -27,6 +27,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The longest one readiness check may take.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest a query may take to answer.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn unused_local_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
     listener.local_addr().expect("read ephemeral address")
@@ -89,50 +95,76 @@ impl Spiced {
     }
 
     /// Wait until `done` holds, or fail with the log after two minutes.
-    fn wait_for(&self, what: &str, done: impl Fn() -> bool) {
+    ///
+    /// `done` is given how long one attempt may block, at most
+    /// [`REQUEST_TIMEOUT`] and never past the deadline, so a `spiced` that
+    /// accepts a connection and never answers still fails the wait on time.
+    fn wait_for(&self, what: &str, done: impl Fn(Duration) -> bool) {
         let deadline = Instant::now() + Duration::from_mins(2);
-        while !done() {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
-                Instant::now() < deadline,
+                !remaining.is_zero(),
                 "timed out waiting for {what}: {}",
                 self.printed()
             );
+            if done(remaining.min(REQUEST_TIMEOUT)) {
+                return;
+            }
             std::thread::sleep(Duration::from_millis(200));
         }
     }
 
     /// `POST /v1/sql`, returning the response body.
     fn sql(&self, query: &str) -> String {
-        let mut stream = TcpStream::connect(self.http).expect("connect to spiced");
-        write!(
-            stream,
+        let request = format!(
             "POST /v1/sql HTTP/1.1\r\nHost: {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{query}",
             self.http,
             query.len()
-        )
-        .expect("send the query");
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .expect("read the response");
+        );
+        let response = self.request(&request, QUERY_TIMEOUT).unwrap_or_else(|err| {
+            panic!(
+                "no response to '{query}' within {QUERY_TIMEOUT:?}: {err}: {}",
+                self.printed()
+            )
+        });
         response
             .split_once("\r\n\r\n")
             .map(|(_, body)| body.to_string())
             .unwrap_or_default()
     }
 
-    fn ready(&self) -> bool {
-        let Ok(mut stream) = TcpStream::connect(self.http) else {
-            return false;
-        };
-        let _ = write!(
-            stream,
+    /// Whether `GET /v1/ready` answers 200 within `timeout`.
+    fn ready(&self, timeout: Duration) -> bool {
+        let request = format!(
             "GET /v1/ready HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
             self.http
         );
-        let mut response = String::new();
-        let _ = stream.read_to_string(&mut response);
-        response.starts_with("HTTP/1.1 200")
+        self.request(&request, timeout)
+            .is_ok_and(|response| response.starts_with("HTTP/1.1 200"))
+    }
+
+    /// Send `request` and read the response until `spiced` closes the
+    /// connection, all within `timeout`.
+    fn request(&self, request: &str, timeout: Duration) -> std::io::Result<String> {
+        let deadline = Instant::now() + timeout;
+        let mut stream = TcpStream::connect_timeout(&self.http, timeout)?;
+        stream.set_write_timeout(Some(timeout))?;
+        stream.write_all(request.as_bytes())?;
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            stream.set_read_timeout(Some(remaining))?;
+            match stream.read(&mut buffer)? {
+                0 => break,
+                read => response.extend_from_slice(&buffer[..read]),
+            }
+        }
+        String::from_utf8(response).map_err(std::io::Error::other)
     }
 }
 
@@ -151,8 +183,8 @@ fn a_restricted_dependency_does_not_start_its_stdio_tool() {
     let spiced = Spiced::start(&instance);
 
     let refusal = "ERROR runtime: Failed to load tool 'fetch' from Spicepod dependency 'thirdparty': the tool starts the program '/usr/bin/touch' on this host, and a dependency may do that only when spicepod.yaml trusts it. To trust it, replace `- thirdparty` under `dependencies:` with `- { from: thirdparty, trust: full }`. See: https://spiceai.org/docs/reference/spicepod#dependencies";
-    spiced.wait_for("the refusal", || spiced.printed().contains(refusal));
-    spiced.wait_for("readiness", || spiced.ready());
+    spiced.wait_for("the refusal", |_| spiced.printed().contains(refusal));
+    spiced.wait_for("readiness", |timeout| spiced.ready(timeout));
     let answer = spiced.sql("SELECT answer FROM answer");
     assert!(
         answer.contains("\"answer\":42"),
@@ -173,7 +205,7 @@ fn a_trusted_dependency_starts_its_stdio_tool() {
     let (_root, instance, marker) = app("{ from: thirdparty, trust: full }");
     let spiced = Spiced::start(&instance);
 
-    spiced.wait_for("the program to start", || marker.exists());
+    spiced.wait_for("the program to start", |_| marker.exists());
     assert!(
         !spiced
             .printed()
