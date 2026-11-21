@@ -1,0 +1,22 @@
+{
+  "description": "SHA-256 pins of the files CI downloads through .github/scripts/cached_fetch.sh. A pin is what makes a cached copy safe to use: every copy, from the CI cache or the source, is checked against it. The CI cache warm-up workflow uploads each pinned file to the cache. See .github/ci-cache/README.md.",
+  "rust": {
+    "hosts": ["x86_64-unknown-linux-gnu"],
+    "components": ["rustc", "cargo", "rust-std", "rustfmt", "clippy"],
+    "toolchains": {
+      "1.99.1": {
+        "manifest_sha256": "fb152be80975c194aa5fc684b2aec3a6e14e2b855efe2faa4e5f8ae6e590f463"
+      }
+    }
+  },
+  "cargo-deny": {
+    "version": "0.19.6",
+    "url": "https://github.com/EmbarkStudios/cargo-deny/releases/download/{version}/cargo-deny-{version}-{target}.tar.gz",
+    "sha256": {
+      "x86_64-unknown-linux-musl": "0021d321c781f0159a150ca308859ad93ccce64a887b22ad2e129f096a8a2c07",
+      "aarch64-unknown-linux-musl": "d27bdcc361099068db61652761633e338372d4fa318d38944f09af3b1639d52a",
+      "aarch64-apple-darwin": "1eca0934ec7bf12d8b9a8303335e1fff8bcc0767476947a50d3357858eded222",
+      "x86_64-apple-darwin": "2526753e4f10ce8a0c9c45ba634e59d7c07e4aace9a21304a0fa86fb089b7039"
+    }
+  }
+}
