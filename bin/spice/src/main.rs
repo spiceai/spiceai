@@ -183,31 +183,31 @@ enum Commands {
 
     /// Add or configure catalog entries in `spicepod.yaml`.
     #[command(long_about = component::COMPONENT_LONG_ABOUT)]
-    Catalog(component::ComponentArgs),
+    Catalog(component::ComponentArgsWithoutEnable),
 
     /// Add or configure model entries in `spicepod.yaml`.
     #[command(long_about = component::COMPONENT_LONG_ABOUT)]
-    Model(component::ComponentArgs),
+    Model(component::ComponentArgsWithoutEnable),
 
     /// Add or configure view entries in `spicepod.yaml`.
     #[command(long_about = component::COMPONENT_LONG_ABOUT)]
-    View(component::ComponentArgs),
+    View(component::ComponentArgsWithoutEnable),
 
     /// Add or configure embedding entries in `spicepod.yaml`.
     #[command(long_about = component::COMPONENT_LONG_ABOUT)]
-    Embedding(component::ComponentArgs),
+    Embedding(component::ComponentArgsWithoutEnable),
 
     /// Add or configure reranker entries in `spicepod.yaml`.
     #[command(long_about = component::COMPONENT_LONG_ABOUT)]
-    Reranker(component::ComponentArgs),
+    Reranker(component::ComponentArgsWithoutEnable),
 
     /// Add or configure tool entries in `spicepod.yaml`.
     #[command(long_about = component::COMPONENT_LONG_ABOUT)]
-    Tool(component::ComponentArgs),
+    Tool(component::ComponentArgsWithoutEnable),
 
     /// Add or configure worker entries in `spicepod.yaml`.
     #[command(long_about = component::COMPONENT_LONG_ABOUT)]
-    Worker(component::ComponentArgs),
+    Worker(component::ComponentArgsWithoutEnable),
 
     /// Add or configure function entries in `spicepod.yaml`.
     #[command(long_about = component::COMPONENT_LONG_ABOUT)]
@@ -215,11 +215,11 @@ enum Commands {
 
     /// Add or configure secret entries in `spicepod.yaml`.
     #[command(long_about = component::COMPONENT_LONG_ABOUT)]
-    Secret(component::ComponentArgs),
+    Secret(component::ComponentArgsWithoutEnable),
 
     /// Configure the `runtime:` section of `spicepod.yaml`.
     #[command(long_about = component::SINGLETON_LONG_ABOUT)]
-    Runtime(component::SingletonArgs),
+    Runtime(component::SingletonArgsWithoutEnable),
 
     /// Configure the `management:` section of `spicepod.yaml`.
     #[command(long_about = component::SINGLETON_LONG_ABOUT)]
@@ -1145,7 +1145,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             rt.block_on(catalogs::execute(&ctx, &args))?;
         }
         Commands::Catalog(args) => {
-            component::execute_component(ComponentSection::Catalog, &args)?;
+            component::execute_component(ComponentSection::Catalog, &args.into())?;
         }
         Commands::Models(args) => {
             let rt = tokio::runtime::Runtime::new()
@@ -1153,7 +1153,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             rt.block_on(models::execute(&ctx, &args))?;
         }
         Commands::Model(args) => {
-            component::execute_component(ComponentSection::Model, &args)?;
+            component::execute_component(ComponentSection::Model, &args.into())?;
         }
         Commands::Pods(args) => {
             let rt = tokio::runtime::Runtime::new()
@@ -1176,7 +1176,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             rt.block_on(workers::execute(&ctx, &args))?;
         }
         Commands::Worker(args) => {
-            component::execute_component(ComponentSection::Worker, &args)?;
+            component::execute_component(ComponentSection::Worker, &args.into())?;
         }
         Commands::Acceleration(args) => {
             let rt = tokio::runtime::Runtime::new()
@@ -1187,25 +1187,25 @@ fn run_cli(cli: Cli) -> Result<()> {
             dataset::execute(&args)?;
         }
         Commands::View(args) => {
-            component::execute_component(ComponentSection::View, &args)?;
+            component::execute_component(ComponentSection::View, &args.into())?;
         }
         Commands::Embedding(args) => {
-            component::execute_component(ComponentSection::Embedding, &args)?;
+            component::execute_component(ComponentSection::Embedding, &args.into())?;
         }
         Commands::Reranker(args) => {
-            component::execute_component(ComponentSection::Reranker, &args)?;
+            component::execute_component(ComponentSection::Reranker, &args.into())?;
         }
         Commands::Tool(args) => {
-            component::execute_component(ComponentSection::Tool, &args)?;
+            component::execute_component(ComponentSection::Tool, &args.into())?;
         }
         Commands::Function(args) => {
             component::execute_component(ComponentSection::Function, &args)?;
         }
         Commands::Secret(args) => {
-            component::execute_component(ComponentSection::Secret, &args)?;
+            component::execute_component(ComponentSection::Secret, &args.into())?;
         }
         Commands::Runtime(args) => {
-            component::execute_singleton(SingletonSection::Runtime, &args)?;
+            component::execute_singleton(SingletonSection::Runtime, &args.into())?;
         }
         Commands::Management(args) => {
             component::execute_singleton(SingletonSection::Management, &args)?;
@@ -1327,6 +1327,62 @@ mod tests {
     fn try_parse_normalized(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         let args = normalize_direct_command_args(args.iter().map(OsString::from));
         Cli::try_parse_from(args)
+    }
+
+    fn subcommand_help(parent: &str, name: &str) -> String {
+        let mut command = Cli::command();
+        let parent_cmd = command
+            .find_subcommand_mut(parent)
+            .unwrap_or_else(|| panic!("{parent} should exist"));
+        let subcommand = parent_cmd
+            .find_subcommand_mut(name)
+            .unwrap_or_else(|| panic!("{parent} {name} should exist"));
+        subcommand.render_long_help().to_string()
+    }
+
+    #[test]
+    fn help_hides_enable_where_the_schema_has_no_enabled_field() {
+        let hidden = [
+            ("dataset", "add"),
+            ("dataset", "configure"),
+            ("view", "add"),
+            ("view", "configure"),
+            ("model", "add"),
+            ("model", "configure"),
+            ("catalog", "add"),
+            ("catalog", "configure"),
+            ("embedding", "add"),
+            ("embedding", "configure"),
+            ("reranker", "add"),
+            ("reranker", "configure"),
+            ("tool", "add"),
+            ("tool", "configure"),
+            ("worker", "add"),
+            ("worker", "configure"),
+            ("secret", "add"),
+            ("secret", "configure"),
+            ("runtime", "configure"),
+        ];
+        for (parent, name) in hidden {
+            let help = subcommand_help(parent, name);
+            assert!(!help.contains("--enable"), "{parent} {name}: {help}");
+            assert!(!help.contains("--disable"), "{parent} {name}: {help}");
+            assert!(help.contains("--set"), "{parent} {name}: {help}");
+        }
+
+        let visible = [
+            ("function", "add"),
+            ("function", "configure"),
+            ("management", "configure"),
+            ("snapshots", "configure"),
+            ("extension", "add"),
+            ("extension", "configure"),
+        ];
+        for (parent, name) in visible {
+            let help = subcommand_help(parent, name);
+            assert!(help.contains("--enable"), "{parent} {name}: {help}");
+            assert!(help.contains("--disable"), "{parent} {name}: {help}");
+        }
     }
 
     fn is_json(args: &[&str]) -> bool {

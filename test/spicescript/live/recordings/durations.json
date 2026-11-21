@@ -1,5 +1,5 @@
 {
-  "anthropic-static-token": 10,
-  "databricks-static-token": 20,
-  "openai-static-key": 10
+  "anthropic-static-token": 3,
+  "databricks-static-token": 3,
+  "openai-static-key": 4
 }

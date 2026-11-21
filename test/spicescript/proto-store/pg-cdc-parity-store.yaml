@@ -10,10 +10,23 @@ sources:
   store: { kind: rustfs }
 
 variants:
-  # Same acceleration on S3-compatible storage (RustFS on the rig, per-run prefix).
+  # Same acceleration on S3-compatible storage (RustFS on the rig, per-run
+  # prefix): an S3 data path needs the object-native metastore, with the
+  # bucket as the state location that holds the acceleration.
   local: {}
   rustfs:
-    datasets: { '*': { acceleration: { params: { cayenne_file_path: 's3://${sources.store.bucket}/cayenne', cayenne_s3_endpoint: '${sources.store.endpoint}', cayenne_s3_region: us-east-1, cayenne_s3_auth: key, cayenne_s3_key: '${sources.store.key}', cayenne_s3_secret: '${sources.store.secret}' } } } }
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: 's3://${sources.store.bucket}/state/'
+          params:
+            s3_endpoint: '${sources.store.endpoint}'
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: '${sources.store.key}'
+            s3_secret: '${sources.store.secret}'
+            allow_http: 'true'
 
 spicepod:
   version: v1

@@ -265,6 +265,59 @@ async fn a_request_admitted_mid_reply_reads_its_prompts_end_in_the_running_ones_
     );
 }
 
+/// Requests that start in one pass with nothing running, as a request's choices do, or two
+/// conversations' next turns whose replies ended together, read their prompts' ends in the one
+/// step they share: the first does not read its own in a pass of its own before the next joins
+/// it. Greedy, each choice is the reply alone.
+#[tokio::test]
+async fn requests_starting_together_read_their_prompts_ends_in_one_step() {
+    let gguf = qwen35_gguf().await;
+    let name = "qwen3.5";
+    let prompt = PROMPTS[0];
+    let alone = {
+        let model = load(&gguf, name, 1, 4096).await;
+        reply(&model, body(name, prompt, 96)).await
+    };
+    let engine = Arc::new(
+        LlamaCpp::from(
+            std::slice::from_ref(&gguf),
+            LocalModelOptions {
+                reasoning: ReasoningDefault {
+                    model_name: name,
+                    effort: None,
+                },
+                context_length: Some(4096),
+                concurrent_requests: NonZeroU32::new(2),
+                ..LocalModelOptions::default()
+            },
+        )
+        .await
+        .expect("the model loads"),
+    );
+    let model: Arc<dyn Chat> = Arc::clone(&engine) as Arc<dyn Chat>;
+    let mut two_choices = body(name, prompt, 96);
+    two_choices["n"] = json!(2);
+    let reply = tokio::time::timeout(SERVED_WITHIN, model.chat_request(request(two_choices)))
+        .await
+        .expect("both choices reply")
+        .expect("a reply");
+    let texts: Vec<String> = reply
+        .choices
+        .iter()
+        .map(|choice| choice.message.content.clone().expect("content"))
+        .collect();
+    assert_eq!(
+        texts,
+        vec![alone.clone(), alone],
+        "two choices started together, against the reply alone"
+    );
+    assert_eq!(
+        engine.prompt_ends_in_steps(),
+        2,
+        "both choices read their prompt's end in the step they share"
+    );
+}
+
 /// Requests whose output limits together pass the shared cache still all reply, as each does
 /// alone. With a 1024-token context, each of the four requests may write 320 reply tokens, more
 /// than a third of the context; each is admitted while its prompt fits beside the running
@@ -718,4 +771,183 @@ async fn a_client_leaving_mid_batch_leaves_the_other_reply_unchanged() {
         staying_text, alone.text,
         "the reply beside a client that left"
     );
+}
+
+/// Set in the environment of the process `a_reply_under_a_gpu_fault` runs in, to the reply the
+/// model gives when nothing fails.
+const FAULT_PROBE: &str = "SPICE_LLAMACPP_TEST_FAULT_PROBE";
+
+/// Set beside [`FAULT_PROBE`] to the model the probe serves: `qwen3.5`, which drafts with its MTP
+/// head, or else `qwen3-0.6b`, which has none.
+const FAULT_MODEL: &str = "SPICE_LLAMACPP_TEST_FAULT_MODEL";
+
+/// The line `a_reply_under_a_gpu_fault` prints with how many bytes of the reply it streamed.
+const FAULT_STREAMED: &str = "fault probe streamed ";
+
+fn fault_body(name: &str) -> Value {
+    body(name, PROMPTS[0], 48)
+}
+
+async fn fault_gguf(name: &str) -> std::path::PathBuf {
+    if name == "qwen3.5" {
+        qwen35_gguf().await
+    } else {
+        qwen3_gguf().await
+    }
+}
+
+/// A reply whose decode the GPU fails ends in an error, and streams nothing the decode did not
+/// compute. llama.cpp's `GGML_BACKEND_FAULT_TEST=N` skips the N-th graph of the process and
+/// fails its backend from then on, as a GPU fault does: the outputs the skipped graph would
+/// have written keep what they held, which llama.cpp used to hand back as the decode's own. Each
+/// fault position runs in a process of its own, and at least one must land after the reply
+/// began streaming.
+#[tokio::test]
+async fn a_reply_the_gpu_fails_to_compute_ends_in_an_error() {
+    gpu_fault_ends_the_reply("qwen3-0.6b").await;
+}
+
+/// [`a_reply_the_gpu_fails_to_compute_ends_in_an_error`] on a model whose MTP head drafts, so
+/// that the failure also lands in the head's reads of the target and of its own decodes.
+#[tokio::test]
+async fn a_drafted_reply_the_gpu_fails_to_compute_ends_in_an_error() {
+    gpu_fault_ends_the_reply("qwen3.5").await;
+}
+
+async fn gpu_fault_ends_the_reply(name: &'static str) {
+    let gguf = fault_gguf(name).await;
+    let expected = streamed(&load(&gguf, name, 1, 2048).await, fault_body(name))
+        .await
+        .text;
+    let mut mid_reply = Vec::new();
+    for at in [1, 3, 10, 30, 60] {
+        let out =
+            std::process::Command::new(std::env::current_exe().expect("the test binary's path"))
+                .args([
+                    "--exact",
+                    "batching::a_reply_under_a_gpu_fault",
+                    "--nocapture",
+                ])
+                .env(FAULT_PROBE, &expected)
+                .env(FAULT_MODEL, name)
+                .env("GGML_BACKEND_FAULT_TEST", at.to_string())
+                .output()
+                .expect("the probe runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "graph {at} failed: the probe's checks failed ({}):\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let streamed: usize = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(FAULT_STREAMED))
+            .and_then(|n| n.trim().parse().ok())
+            .expect("the probe says how much of the reply it streamed");
+        eprintln!(
+            "graph {at} failed: the reply streamed {streamed} of {} bytes, then failed",
+            expected.len()
+        );
+        if streamed > 0 && streamed < expected.len() {
+            mid_reply.push(at);
+        }
+    }
+    assert!(
+        !mid_reply.is_empty(),
+        "no fault landed after the reply began streaming"
+    );
+}
+
+/// The request of [`a_reply_the_gpu_fails_to_compute_ends_in_an_error`], in a process whose
+/// `GGML_BACKEND_FAULT_TEST` fails one graph: whatever streams before the failure is the start
+/// of the reply the model gives without it, and the reply then ends in an error that says a
+/// backend failed. Without [`FAULT_PROBE`] it does nothing.
+#[tokio::test]
+async fn a_reply_under_a_gpu_fault() {
+    let Some(expected) = std::env::var_os(FAULT_PROBE) else {
+        return;
+    };
+    let expected = expected.into_string().expect("a UTF-8 reply");
+    let name = if std::env::var(FAULT_MODEL).as_deref() == Ok("qwen3.5") {
+        "qwen3.5"
+    } else {
+        "qwen3-0.6b"
+    };
+    let gguf = fault_gguf(name).await;
+    let path = gguf.to_str().expect("a UTF-8 path").to_string();
+    let failed_with = |message: &str| {
+        assert!(
+            message.contains("failed computing"),
+            "the error does not say a backend failed: {message}"
+        );
+        // llama.cpp logs the cause only in the call that first finds the failure, whichever
+        // one that is, and later calls fail without it. Here the failure is the one
+        // `GGML_BACKEND_FAULT_TEST` makes, which llama.cpp finds where it waits for the graph
+        // (`check_backends`) or where it queues the next one (`graph_compute`), and either way
+        // logs the line that fails the context, ending as below
+        let cause = message
+            .split_once(". llama.cpp reported: ")
+            .map(|(_, cause)| cause);
+        assert!(
+            cause.is_some_and(|cause| cause.contains(
+                " outputs and state are not the computation's and every later decode fails; \
+                 free the context and create another"
+            )),
+            "the error does not carry the cause llama.cpp logged: {message}"
+        );
+    };
+    // the failed graph may be one the model's load computes
+    let model = match llms::chat::create_local_model(
+        &[path],
+        None,
+        None,
+        None,
+        None,
+        None,
+        LocalModelOptions {
+            reasoning: ReasoningDefault {
+                model_name: name,
+                effort: None,
+            },
+            context_length: Some(2048),
+            concurrent_requests: NonZeroU32::new(1),
+            ..LocalModelOptions::default()
+        },
+    )
+    .await
+    {
+        Ok(model) => model,
+        Err(e) => {
+            failed_with(&e.to_string());
+            println!("{FAULT_STREAMED}0");
+            return;
+        }
+    };
+    let mut text = String::new();
+    let mut error = None;
+    match model.chat_stream(request(fault_body(name))).await {
+        Ok(mut stream) => {
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        for choice in chunk.choices {
+                            text.extend(choice.delta.content);
+                        }
+                    }
+                    Err(e) => {
+                        error = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        Err(e) => error = Some(e.to_string()),
+    }
+    assert!(
+        expected.starts_with(&text),
+        "streamed {text:?}, which is not how the reply without a failure starts: {expected:?}"
+    );
+    failed_with(&error.expect("the reply ends in an error"));
+    println!("{FAULT_STREAMED}{}", text.len());
 }
