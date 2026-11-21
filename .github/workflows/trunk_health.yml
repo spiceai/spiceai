@@ -16,14 +16,23 @@ name: Trunk Health
 # passes, and posts or updates one PR comment on each of the PR's events, so a
 # PR is not left with a stale red check after trunk recovers.
 
+# The same branches as the other required checks, so a ruleset that requires
+# this check on a release branch gets a report; the gate passes at once for any
+# branch but trunk.
 on:
   pull_request:
     branches:
       - trunk
+      - release-*
+      - release/*
+      - feature-*
     types: [opened, synchronize, reopened, labeled, unlabeled, edited, ready_for_review]
   merge_group:
     branches:
       - trunk
+      - release-*
+      - release/*
+      - feature-*
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref }}

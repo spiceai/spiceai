@@ -771,7 +771,7 @@ tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
   label for more than 24 hours. The age counts from the most recent time the
   label was added. The 24 hours are for triage: a flake or an infrastructure
   fault should not stop all merging before anyone has looked at it.
-- **Untriaged:** the last four completed `trunk_tests.yml` runs on `trunk`
+- **Untriaged:** the last four completed scheduled `trunk_tests.yml` runs on `trunk`
   failed (cancelled runs are skipped), nothing is labeled, and nobody has
   triaged a trunk failure since the older of those runs started. Triage is
   adding or removing a `trunk-broken` or `fixes-trunk` label, or closing an
@@ -805,7 +805,7 @@ history and needs no admin bypass. It also counts as triage, so the failed runs
 before it do not trip the untriaged condition; a failure that keeps happening
 trips it again after four more failed runs.
 
-**Where it runs.** The merge-queue run is the one that blocks. The run on a
+**Where it runs.** It reports on the same branches as the other required checks, and guards only `trunk`: for a PR into a release or feature branch it passes at once, so a broken trunk never blocks a release fix. The merge-queue run is the one that blocks. The run on a
 pull request is advisory: it always passes, and when merging is blocked it
 posts one comment listing the blocking items and how to unblock. The run
 repeats only on the PR's own events (a push, a label, an edit), so the comment

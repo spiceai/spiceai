@@ -276,6 +276,23 @@ test('triage is searched past the first page of events, and no further than the 
   assert.equal(tooOld.failed.length, 1, 'triage before the failing runs started does not count');
 });
 
+test('only scheduled runs count: another event\'s green run cannot clear the backstop', async () => {
+  const r = await gate(mergeGroup(), {
+    runs: [{ conclusion: 'success', event: 'pull_request' }, { conclusion: 'success', event: 'pull_request' }, ...fails(4)],
+  });
+  assert.equal(r.failed.length, 1);
+  assert.match(r.failed[0], /last 4 post-merge runs on trunk failed/);
+});
+
+test('a release branch passes at once, whatever trunk\'s state', async () => {
+  const context = mergeGroup();
+  context.payload.merge_group.base_ref = 'refs/heads/release/2.4';
+  const r = await gate(context, { ...brokenIssue(7, 48), runs: fails(4) });
+  assert.deepEqual(r.failed, []);
+  assert.deepEqual(r.infos, ['Trunk Health guards trunk only; nothing to check for release/2.4.']);
+  assert.deepEqual(r.calls, [], 'nothing is read for another branch');
+});
+
 test('a post-merge workflow not yet on trunk leaves the backstop inactive', async () => {
   const r = await gate(mergeGroup(), { runs: 'missing' });
   assert.deepEqual(r.failed, []);

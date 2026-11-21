@@ -41,6 +41,9 @@ export const GRACE_HOURS = 24;
 // runs in a row; a real regression does.
 export const BACKSTOP_RUNS = 4;
 export const POST_MERGE_WORKFLOW = 'trunk_tests.yml';
+// The branch the gate guards. Other branches' required checks pass at once: a
+// broken trunk must not block a release branch's fixes.
+export const GUARDED_BRANCH = 'trunk';
 export const COMMENT_MARKER = '<!-- trunk-health -->';
 
 const COMMENT_AUTHOR = 'github-actions[bot]';
@@ -130,6 +133,10 @@ export async function postMergeRuns({ github, owner, repo, branch }) {
         repo,
         workflow_id: POST_MERGE_WORKFLOW,
         branch,
+        // Only the scheduled runs are the post-merge verdict. A run of another
+        // event, such as one a pull request from a branch also named `trunk`
+        // set off, must not displace them.
+        event: 'schedule',
         status: 'completed',
         per_page: RUNS_PER_PAGE,
         page,
@@ -419,6 +426,11 @@ export async function run({ github, context, core, now = new Date() }) {
     prNumber = pr.number;
     baseSha = pr.base.sha;
     branch = pr.base.ref;
+  }
+
+  if (branch !== GUARDED_BRANCH) {
+    core.info(`Trunk Health guards ${GUARDED_BRANCH} only; nothing to check for ${branch}.`);
+    return;
   }
 
   let result;

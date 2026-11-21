@@ -129,15 +129,16 @@ export function fakeGithub(state = {}) {
       },
       actions: {
         // Honours page and per_page, as the API does.
-        listWorkflowRuns: async ({ workflow_id, status, page = 1, per_page = 30 }) => {
+        listWorkflowRuns: async ({ workflow_id, status, event, page = 1, per_page = 30 }) => {
           maybeFail('actions.listWorkflowRuns');
           calls.push(`actions.listWorkflowRuns page ${page}`);
           if (state.runs === 'missing') throw httpError(404, `Not Found: ${workflow_id}`);
           if (status !== 'completed') throw new Error('only completed runs are modelled');
           const start = (page - 1) * per_page;
+          const matching = (state.runs ?? []).filter((run) => !event || (run.event ?? 'schedule') === event);
           return {
             data: {
-              workflow_runs: (state.runs ?? []).slice(start, start + per_page).map((run, i) => ({
+              workflow_runs: matching.slice(start, start + per_page).map((run, i) => ({
                 html_url: `https://github.com/o/r/actions/runs/${start + i}`,
                 head_sha: run.head_sha ?? `${start + i}`.padStart(40, '0'),
                 conclusion: run.conclusion,
