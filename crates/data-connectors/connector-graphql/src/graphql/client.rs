@@ -2250,6 +2250,15 @@ fn is_query_error(has_location: bool, code: Option<&str>) -> bool {
     }
 }
 
+/// An explicit credential or permission refusal named by the API.
+fn is_refusal_code(code: Option<&str>) -> bool {
+    code.is_some_and(|c| {
+        ["UNAUTHENTICATED", "FORBIDDEN", "UNAUTHORIZED"]
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(c))
+    })
+}
+
 fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     // Check if there are any errors in the response
     if let Some(errors) = response.get("errors") {
@@ -2287,10 +2296,27 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     }
 
     // Safely access the first error with bounds checking
+    // Prefer the first entry that is definitely permanent (a query problem or an
+    // explicit credential refusal) over an earlier bare message, so one
+    // transient-looking entry cannot hide a validation failure.
     let graphql_error = response
         .get("errors")
         .and_then(|e| e.as_array())
-        .and_then(|arr| arr.first())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|entry| {
+                    let has_location = entry
+                        .get("locations")
+                        .and_then(|l| l.as_array())
+                        .is_some_and(|l| !l.is_empty());
+                    let code = entry
+                        .get("extensions")
+                        .and_then(|e| e.get("code"))
+                        .and_then(|c| c.as_str());
+                    is_query_error(has_location, code) || is_refusal_code(code)
+                })
+                .or_else(|| arr.first())
+        })
         .unwrap_or(&Value::Null);
 
     if !graphql_error.is_null() {
@@ -2326,6 +2352,21 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             .unwrap_or_default()
             .to_string();
 
+        let error_code = graphql_error
+            .get("extensions")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str());
+
+        if is_refusal_code(error_code) || is_refusal_code(error_type) {
+            return Err(Error::InvalidCredentialsOrPermissions {
+                message: format!(
+                    "The API refused the request ({}). Verify the credentials have the necessary permissions. {message}",
+                    error_code.or(error_type).unwrap_or_default()
+                ),
+                kind: RefusalKind::Explicit,
+            });
+        }
+
         if let Some(error_type) = error_type {
             if error_type.to_lowercase() == "forbidden" {
                 return Err(Error::InvalidCredentialsOrPermissions {
@@ -2343,11 +2384,6 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                 });
             }
         }
-
-        let error_code = graphql_error
-            .get("extensions")
-            .and_then(|e| e.get("code"))
-            .and_then(|c| c.as_str());
 
         if !is_query_error(location.is_some(), error_code) {
             tracing::debug!("GraphQL error without a query location: {message}");
@@ -5039,6 +5075,32 @@ mod graphql_errors_classification_tests {
             );
             assert!(!is_retriable_error(&err));
         }
+    }
+
+    #[test]
+    fn refusal_codes_are_permanent_without_location() {
+        for code in ["UNAUTHENTICATED", "FORBIDDEN"] {
+            let err = classify(json!({
+                "errors": [{"message": "nope", "extensions": {"code": code}}]
+            }));
+            assert!(
+                matches!(err, Error::InvalidCredentialsOrPermissions { .. }),
+                "{code}: {err:?}"
+            );
+            assert!(!is_retriable_error(&err));
+        }
+    }
+
+    #[test]
+    fn later_validation_error_is_not_hidden_by_a_bare_first_entry() {
+        let err = classify(json!({
+            "errors": [
+                {"message": "upstream timeout"},
+                {"message": "bad field", "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}
+            ]
+        }));
+        assert!(matches!(err, Error::InvalidGraphQLQuery { .. }), "{err:?}");
+        assert!(err.to_string().contains("bad field"));
     }
 
     #[test]
