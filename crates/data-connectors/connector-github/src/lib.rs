@@ -1982,6 +1982,19 @@ pub(crate) fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operato
     }
 }
 
+/// Whether GitHub search reads `value` as one plain term. A value with whitespace, a
+/// qualifier, a quote, a parenthesis, a leading `-` or a boolean operator would add
+/// terms to the query that sits beside its `repo:` qualifier.
+fn is_single_search_term(value: &str) -> bool {
+    !value.starts_with('-')
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, ':' | '"' | '(' | ')'))
+        && !["AND", "OR", "NOT"]
+            .iter()
+            .any(|operator| value.eq_ignore_ascii_case(operator))
+}
+
 pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     let column_matches = expr_to_match(expr);
 
@@ -2022,6 +2035,19 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             ScalarValue::Utf8(Some(v))
             | ScalarValue::LargeUtf8(Some(v))
             | ScalarValue::Utf8View(Some(v)) => {
+                if !is_single_search_term(v) {
+                    tracing::debug!(
+                        "Value for column {} is not a single GitHub search term",
+                        column.name
+                    );
+
+                    return FilterPushdownResult {
+                        filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                        expr: expr.clone(),
+                        context: None,
+                    };
+                }
+
                 if column.name == "state" {
                     v.to_lowercase()
                 } else {

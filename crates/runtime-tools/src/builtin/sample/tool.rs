@@ -22,7 +22,7 @@ use runtime_query_engine::query_engine::QueryEngine;
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, ToolAccess};
 use tracing::Span;
 use tracing_futures::Instrument;
 
@@ -99,7 +99,12 @@ impl SpiceModelTool for SampleDataTool {
         Some(result_schema())
     }
 
-    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    /// Reads a sample of a dataset the caller can query.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let params = self.method.parse_args(arg).boxed()?;
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name().to_string(), input = format!("{params}"), sample_method = self.method.name());
 

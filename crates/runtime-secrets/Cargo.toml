@@ -52,6 +52,9 @@ azure_security_keyvault_secrets = { version = "1.0.1", optional = true }
 # `aws_secrets_manager` `endpoint_url` param. Pulled in only under those
 # features via the feature block below.
 url = { workspace = true, optional = true }
+# `util::net::is_loopback_host` decides which HashiCorp Vault addresses may use plaintext
+# `http://`.
+util = { workspace = true, default-features = false, optional = true }
 keyring = { version = "3.6.3", features = [
     "apple-native",
     "windows-native",
@@ -80,7 +83,7 @@ azure-keyvault = [
 ]
 # HashiCorp Vault: pure-reqwest implementation, no SDK. `url` is shared
 # with the `azure-keyvault` feature for address validation.
-hashicorp_vault = ["dep:url"]
+hashicorp_vault = ["dep:url", "dep:util"]
 # `azure-keyvault` is deliberately *not* in `default`: it pulls the Azure SDK
 # (azure_core / azure_identity / azure_security_keyvault_secrets) into every
 # crate that depends on `runtime-secrets` without `default-features = false`,

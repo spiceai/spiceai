@@ -400,24 +400,23 @@ jobs:
           if [ "$PGHOST" != "127.0.0.1" ]; then
             echo "::error::$DB_NAME is missing or empty on the hosted $PGHOST cluster. Scale factor $SCALE_FACTOR is too large to safely generate and load inline from a CI runner. Pre-provision it first, e.g.:"
             echo "  cd test/tpc-bench && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME DBGEN_SCALE=$SCALE_FACTOR make tpch-clone tpch-fleet-gen pg-init && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCH_DATA_DIR=./tmp/fleet make pg-load && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index"
-            echo "(for a tpcds run: make tpcds-clone tpcds-fleet-gen pg-tpcds-init, then TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load, then make pg-tpcds-create-index)"
+            echo "(for a tpcds run: make tpcds-init tpcds-gen pg-tpcds-init pg-tpcds-load pg-tpcds-create-index)"
             exit 1
           fi
 
           echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
           sudo apt-get install -y git
-          # Both query sets seed from the pinned DuckDB CLI (tpch-fleet-gen /
-          # tpcds-fleet-gen), so nothing is compiled here - the kits are only
-          # cloned for their DDL (dss.ddl / tpcds.sql, tpcds_ri.sql). Seeding
-          # from any other generator produces data the recorded expected
-          # answers don't match (see the fleet-gen comments in the Makefile).
-          sudo apt-get install -y unzip
+          # Both query sets seed the data the rest of the benchmark fleet holds:
+          # TPC-DS from tpcds-kit's dsdgen, built here, and TPC-H from the pinned
+          # DuckDB CLI (tpch-fleet-gen), whose tpch extension writes dbgen's
+          # data, so tpch-kit is only cloned for its DDL (dss.ddl).
 
           if [ "$QUERY_SET" = "tpcds" ]; then
-            make tpcds-clone
-            DBGEN_SCALE=$SCALE_FACTOR make tpcds-fleet-gen
+            sudo apt-get install -y make gcc flex bison byacc
+            make tpcds-init
+            DBGEN_SCALE=$SCALE_FACTOR make tpcds-gen
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-init
-            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-load
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
           else
             make tpch-clone
@@ -650,7 +649,7 @@ jobs:
         id: aws-s3-athena
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_S3_ATHENA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_S3_ATHENA_ROLE_ARN }}
           role-session-name: gha-s3-athena-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: us-east-1
@@ -661,7 +660,7 @@ jobs:
         id: aws-dynamodb
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
           role-session-name: gha-dynamodb-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: us-east-1
