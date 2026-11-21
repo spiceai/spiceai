@@ -215,7 +215,7 @@ impl DatasetInitialization {
             .map_err(|error| InitializeFailure { error, retry })
     }
 
-    async fn run(self, retry: &mut Option<DatasetInitialization>) -> Result<DatasetReady> {
+    async fn run(self, retry: &mut Option<Box<DatasetInitialization>>) -> Result<DatasetReady> {
         let Self {
             dataset,
             runtime,
@@ -260,7 +260,7 @@ impl DatasetInitialization {
                                 }
                             };
                             if !is_permanent_dataset_failure(&err) {
-                                *retry = Some(Self {
+                                *retry = Some(Box::new(Self {
                                     dataset: Arc::clone(&dataset),
                                     runtime: Arc::clone(&runtime),
                                     connector_source: ConnectorSource::Lazy(builder),
@@ -268,7 +268,7 @@ impl DatasetInitialization {
                                     bootstrap_status,
                                     load_semaphore,
                                     preloaded_accelerated_table,
-                                });
+                                }));
                             }
                             return Err(report_deferred_failure(&runtime, &dataset, err));
                         }
@@ -320,7 +320,7 @@ impl DatasetInitialization {
                             source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
                         };
                         if !is_permanent_dataset_failure(&err) {
-                            *retry = Some(Self {
+                            *retry = Some(Box::new(Self {
                                 dataset: Arc::clone(&dataset),
                                 runtime: Arc::clone(&runtime),
                                 connector_source: ConnectorSource::Lazy(builder),
@@ -328,7 +328,7 @@ impl DatasetInitialization {
                                 bootstrap_status,
                                 load_semaphore,
                                 preloaded_accelerated_table,
-                            });
+                            }));
                         }
                         return Err(report_deferred_failure(&runtime, &dataset, err));
                     }
@@ -356,6 +356,14 @@ impl DatasetInitialization {
                     ));
                 }
 
+                // A failed earlier attempt left the dataset in `Error`
+                // (`report_deferred_failure`); this one serves it, so it is `Ready`
+                // again. The accelerated branch above reports through
+                // `register_loaded_dataset` instead.
+                runtime
+                    .status
+                    .update_dataset(&dataset.name, runtime_status::ComponentStatus::Ready);
+
                 Ok(DatasetReady {
                     table_provider: Some(federated_provider),
                     accelerated_table: None,
@@ -380,8 +388,9 @@ impl DatasetInitialization {
 pub struct InitializeFailure {
     pub error: RuntimeError,
     /// The plan, to run again: set when the failure is the source being unavailable;
-    /// `None` for a configuration error no retry clears.
-    pub retry: Option<DatasetInitialization>,
+    /// `None` for a configuration error no retry clears. Boxed: the plan is large, and
+    /// it rides in the `Err` variant of every bring-up.
+    pub retry: Option<Box<DatasetInitialization>>,
 }
 
 /// Report a deferred dataset's first-reference bring-up failure, and return the

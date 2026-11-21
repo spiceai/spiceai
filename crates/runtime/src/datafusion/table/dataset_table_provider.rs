@@ -195,7 +195,7 @@ impl DatasetTableProvider {
                 if let Some(init) = failure.retry {
                     let failures = failures.saturating_add(1);
                     *slot = Slot::Pending {
-                        init: Box::new(init),
+                        init,
                         failures,
                         not_before: Instant::now() + retry_backoff(failures),
                         last_error: Some(Arc::clone(&error)),
