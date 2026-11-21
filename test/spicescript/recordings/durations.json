@@ -81,6 +81,7 @@
   "http-caching-keys": 15,
   "http-connector": 4,
   "http-errors": 13,
+  "huggingface-gguf-default": 1,
   "iceberg-coverage": 97,
   "iceberg-generated": 54,
   "iceberg-refresh": 60,
