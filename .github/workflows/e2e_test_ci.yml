@@ -232,7 +232,7 @@ jobs:
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          # This run's test jobs use the binaries, and so does nightly_tests.yml,
+          # This run's test jobs use the binaries, and so does trunk_tests.yml,
           # which runs every 12 hours and tests the merge queue's build of trunk
           # HEAD rather than building it again. Three days covers a missed or
           # late run; at the repository's 30-day default each run kept its two
@@ -2969,7 +2969,7 @@ jobs:
   # Runs the scenario scripts not tagged `long` against this run's spiced and
   # spice CLI, plus every script this run adds or changes. Every script, the
   # known-failing ledger, the older DuckDB releases and the live providers run
-  # after merge, on trunk, in nightly_tests.yml.
+  # after merge, on trunk, in trunk_tests.yml.
   test_spicescript:
     name: ${{ matrix.name }}
     needs: [build, build_spicescript]
@@ -2991,7 +2991,7 @@ jobs:
           # The scripts this run adds or changes, whatever their tags: a new
           # regression script runs before it merges, and a fix whose
           # known-failing script now passes learns it here rather than from the
-          # next nightly run.
+          # next trunk tests run.
           - { name: 'spicescript: changed scripts', changed: true }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -3000,7 +3000,7 @@ jobs:
       # commit on a push. Scripts are the *.yaml files directly in
       # test/spicescript and in test/spicescript/known-failing/<group>/; the
       # other directories under it are not run by CI (see its README), and the
-      # live scripts need the provider tokens only nightly_tests.yml mints. A
+      # live scripts need the provider tokens only trunk_tests.yml mints. A
       # changed known-failing ledger (a re-record) runs its whole group against
       # the new ledger.
       - name: Find changed scripts

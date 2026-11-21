@@ -93,7 +93,7 @@ this run's other combinations have reserved does not count toward that.
 | `--only-tag TAG` | Select only scripts with any of these tags (see [`tags:`](#scripts)); repeat for several. Applies to explicit files too, before `--partition`. |
 | `--exclude-tag TAG` | Exclude scripts with any of these tags; repeat for several. Exclusion wins over `--only-tag`. Tag flags print the selected and total counts; selecting zero scripts is an error, but an empty partition share is allowed. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
-| `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. CI shards by these times, so refresh them from CI's own runs with `python3 test/spicescript/update_durations.py`, which writes each script's median over the newest merge-queue and nightly runs. |
+| `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. CI shards by these times, so refresh them from CI's own runs with `python3 test/spicescript/update_durations.py`, which writes each script's median over the newest merge-queue and `trunk_tests.yml` runs. |
 | `--max-wait DURATION` | Cap every wait (`eventually`, readiness, refreshes) at this length. For known-failing scripts, which otherwise wait out every limit. |
 | `--matrix KEY=VALUE` | Choose which **runs** happen: only the matrix combinations with this value of a key under `matrix:` (as `${matrix.KEY}` prints it), such as `src=clickhouse`; repeat a key for several values. Scripts without the key or any of the values are skipped. Expected failures of the combinations left out are neither required to fail nor dropped by `--record-failures`. |
 | `--variant NAME` | Choose which **instances** start in each run: only this name under `variants:`, such as `cayenne`; repeat it for several. Scripts with none of them are skipped. Expected failures of the variants left out, and of comparisons between variants (the run compares a different set), are neither required to fail nor dropped by `--record-failures`. Neither option combines with `--record-durations`. |
@@ -168,7 +168,7 @@ steps:
 `tags:` is optional. The one tag is `long`: the script is too slow for the
 run before every merge, for what it catches there, so the merge queue skips it
 (`--exclude-tag long`) and it runs after merge, on trunk, in
-`nightly_tests.yml`. A script without it runs before every merge. Leave a new
+`trunk_tests.yml`. A script without it runs before every merge. Leave a new
 script untagged unless it is slow; tag it `long` when its CI time is high and
 its failure history low. Unknown and duplicate tags are rejected.
 
@@ -771,8 +771,8 @@ runner loads them in bulk (`COPY` on PostgreSQL, multi-row `INSERT` elsewhere).
   `test/spicescript/known-failing/<group>/`. It moves to `test/spicescript/`
   once the bug is fixed. The merge queue runs a known-failing script only in
   the PR that adds or changes it; the rest of `known-failing/` runs after
-  merge in `nightly_tests.yml`. A PR that fixes a bug without touching its
-  script learns from the next nightly run, so run the script yourself in that
+  merge in `trunk_tests.yml`. A PR that fixes a bug without touching its
+  script learns from the next trunk tests run, so run the script yourself in that
   PR.
 
 ## Expected failures
@@ -789,7 +789,7 @@ A run fails on:
   answer, a row count moved);
 - a listed check that passes: if it is fixed, re-record and move the script
   out of `known-failing/` (for a script in `known-failing/`, this shows up in
-  the post-merge run of `nightly_tests.yml`, unless the PR changes the
+  the post-merge run of `trunk_tests.yml`, unless the PR changes the
   script);
 - an entry with no group.
 

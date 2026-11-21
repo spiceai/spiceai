@@ -1,11 +1,11 @@
 ---
-name: Nightly tests
+name: Trunk tests
 
 # The post-merge test run: everything that does not run in the merge queue,
 # against trunk HEAD every 12 hours. The merge queue runs a quick set; this
 # runs the rest, and the Trunk Health check (trunk_health.yml) blocks merging
 # when its failures go unaddressed. Add a job here, and to `needs` of the
-# `Nightly tests` job at the end, to move a test out of the merge queue.
+# `Trunk tests` job at the end, to move a test out of the merge queue.
 #
 # Today it runs spicescript (tools/spicescript):
 # - every script in test/spicescript, including those tagged `long`, which the
@@ -24,7 +24,7 @@ name: Nightly tests
 #
 # On demand it runs against the Linux build of an E2E Test CI push or
 # merge_group run of trunk or a release branch, with the scripts of the commit
-# that run built (`gh workflow run nightly_tests.yml -f run_id=<run>`). A pull
+# that run built (`gh workflow run trunk_tests.yml -f run_id=<run>`). A pull
 # request's run is refused: its author built that spiced and wrote those
 # scripts, and these jobs have id-token: write on the self-hosted runners.
 
@@ -131,7 +131,7 @@ jobs:
           set -euo pipefail
           # Scheduled runs test the commit they ran at, so the newest green
           # scheduled run's commit is the last one known good.
-          green=$(gh run list -R "$GITHUB_REPOSITORY" -w nightly_tests.yml -b trunk -e schedule \
+          green=$(gh run list -R "$GITHUB_REPOSITORY" -w trunk_tests.yml -b trunk -e schedule \
             --status success -L 1 --json headSha -q '.[0].headSha // ""')
           {
             echo "### Testing ${SHA}"
@@ -146,13 +146,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           mkdir -p "$RUNNER_TEMP/range"
           jq -n --arg sha "$SHA" --arg last_green "$green" '{sha: $sha, last_green: $last_green}' \
-            > "$RUNNER_TEMP/range/nightly-range.json"
+            > "$RUNNER_TEMP/range/trunk-tests-range.json"
 
       - name: Upload the commit range
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: nightly-range
-          path: ${{ runner.temp }}/range/nightly-range.json
+          name: trunk-tests-range
+          path: ${{ runner.temp }}/range/trunk-tests-range.json
           retention-days: 30
 
   # Only when no E2E Test CI run still holds the commit's build, such as a
@@ -388,7 +388,7 @@ jobs:
   # job above succeeded or was skipped, and names the jobs that did not.
   summary:
     environment: secret-free
-    name: Nightly tests
+    name: Trunk tests
     if: ${{ !cancelled() }}
     needs: [resolve, build, spicescript]
     runs-on: spiceai-dev-runners
@@ -410,7 +410,7 @@ jobs:
             exit 1
           fi
           if [ -n "$failed" ]; then
-            echo "::error::Nightly test jobs did not succeed: ${failed}"
+            echo "::error::Trunk test jobs did not succeed: ${failed}"
             exit 1
           fi
-          echo "Every nightly test job succeeded."
+          echo "Every trunk test job succeeded."
