@@ -117,7 +117,7 @@ impl ListingTableConnector for SFTP {
         let mut sftp_url = Url::parse(url).boxed().map_err(|source| {
             data_connector_api::DataConnectorError::InvalidConfiguration {
                 dataconnector: format!("{self}"),
-                message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/sftp"),
+                message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/ftp#from"),
                 connector_component: ConnectorComponent::from(dataset),
                 source,
             }

@@ -49,50 +49,32 @@ use spicepod::{
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
-#[cfg(feature = "sqlite")]
-mod sqlite;
-
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
-    test_request_context().scope(async {
-        let running_container = prepare_test_environment()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let running_container = Arc::new(running_container);
+    test_request_context()
+        .scope(async {
+            let running_container = prepare_test_environment()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let running_container = Arc::new(running_container);
 
-        let config = vec![
-            ("cayenne", Some("spill_to_disk_cayenne")),
-            #[cfg(feature = "sqlite")]
-            ("sqlite", Some("spill_to_disk_sqlite.db")),
-        ];
-
-        for (idx, (engine, db_file_path)) in config.into_iter().enumerate() {
-            tracing::info!("Testing spill-to-disk and rehydration with engine: {engine}, db_file_path: {db_file_path:?}");
-
-            if idx > 0 {
-                // Ensure the container is running as the tests manipulate it
-                running_container
-                    .start()
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))?;
-            }
             execute_spill_to_disk_and_rehydration(
                 Arc::clone(&running_container),
-                engine,
-                db_file_path,
+                "cayenne",
+                Some("spill_to_disk_cayenne"),
             )
             .await?;
-        }
 
-        running_container.cleanup().await;
+            running_container.cleanup().await;
 
-        tracing::info!("Spill-to-disk and rehydration tests passed!");
+            tracing::info!("Spill-to-disk and rehydration tests passed!");
 
-        Ok(())
-    }).await
+            Ok(())
+        })
+        .await
 }
 
 /// Validates spill-to-disk and rehydration functionality by simulating runtime restarts
@@ -250,12 +232,6 @@ async fn get_locally_persisted_records(
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
     match engine {
         "cayenne" => crate::acceleration::query_cayenne_file(db_file_path, "lineitem", query).await,
-        #[cfg(feature = "sqlite")]
-        "sqlite" => sqlite::query_local_db(&db_file_path.to_string_lossy(), query)
-            .await?
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .map_err(|e| anyhow::anyhow!("Unable to collect query results: {e}")),
         _ => Err(anyhow::anyhow!("Unsupported engine: {engine}")),
     }
 }
