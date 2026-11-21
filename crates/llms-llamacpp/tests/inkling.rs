@@ -172,6 +172,74 @@ async fn an_inkling_grammar_goes_on_from_a_text_block_the_prompt_opened() {
     }
 }
 
+/// A required call is made even when the prompt opens a text block: the grammar holds the
+/// reply to thinking blocks and then the call, so the text block is refused, the grammar is
+/// built again at its root, and the model has to call the tool rather than answer in text
+/// until its budget runs out. The tool is named `assistant` because that is what Qwen writes
+/// after the token respelled as the block header, so the respelled model makes the call where
+/// the grammar lets it rather than open a thinking block it never closes.
+#[tokio::test]
+async fn a_required_inkling_call_is_made_when_the_prompt_opened_a_text_block() {
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let gguf = gguf(scratch.path()).await;
+    let model = load(&gguf, &template("<|message_model|><|content_text|>")).await;
+    let response = model
+        .chat_request(request(json!({
+            "model": "inkling",
+            "messages": [{ "role": "user", "content": "What is the weather in Paris?" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "assistant",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string", "maxLength": 12 } },
+                        "required": ["city"],
+                        "additionalProperties": false,
+                    },
+                },
+            }],
+            "tool_choice": "required",
+            "temperature": 0,
+            "max_tokens": 64,
+        })))
+        .await
+        .expect("the request succeeds");
+    let choice = response.choices.first().expect("one choice");
+    let calls: Vec<(String, Value)> = choice
+        .message
+        .tool_calls
+        .iter()
+        .flatten()
+        .map(|call| match call {
+            ChatCompletionMessageToolCalls::Function(call) => (
+                call.function.name.clone(),
+                serde_json::from_str(&call.function.arguments).expect("the arguments are JSON"),
+            ),
+            ChatCompletionMessageToolCalls::Custom(_) => panic!("a function call: {call:?}"),
+        })
+        .collect();
+    assert_eq!(
+        choice.finish_reason,
+        Some(FinishReason::ToolCalls),
+        "{calls:?} {:?}",
+        choice.message.content
+    );
+    let [(name, arguments)] = calls.as_slice() else {
+        panic!("one call: {calls:?}");
+    };
+    assert_eq!(
+        (
+            name.as_str(),
+            arguments
+                .as_object()
+                .map(|a| a.keys().cloned().collect::<Vec<_>>())
+        ),
+        ("assistant", Some(vec!["city".to_string()])),
+        "{arguments}"
+    );
+}
+
 /// A required call's grammar is advanced over the call block the prompt opened, so the reply
 /// goes on in its arguments, holds them to the tool's schema and closes the block, and the
 /// call is made when the end-of-generation token ends the reply. With `parallel_tool_calls`

@@ -3055,20 +3055,22 @@ fn harmony_rules(markers: &harmony::Markers) -> String {
     rules
 }
 
-/// The grammar of a whole Inkling reply that must call one of `tools`: any thinking and text
-/// blocks, then a call block, or several when `parallel`, each naming its tool in its header
-/// and holding `{"name":NAME,"args":ARGS}` with the arguments held to the tool's schema, as
-/// llama.cpp's server forces one. Each marker is its token, never text spelling it. After a
-/// call's `<|end_message|>` the grammar may be complete, which is when the end-of-generation
-/// token that ends the reply is allowed.
+/// The grammar of a whole Inkling reply that must call one of `tools`: any thinking blocks,
+/// then a call block, or several when `parallel`, each naming its tool in its header and
+/// holding `{"name":NAME,"args":ARGS}` with the arguments held to the tool's schema. Each
+/// marker is its token, never text spelling it. After a call's `<|end_message|>` the grammar
+/// may be complete, which is when the end-of-generation token that ends the reply is allowed.
+///
+/// No text block comes before the call, as no final message comes before a Harmony one
+/// (`harmony_call`). llama.cpp's server allows text blocks there, and a model that answers in
+/// text can then write block after block until its budget runs out without ever calling.
 fn inkling_call(
     markers: &inkling::Markers,
     tools: &[&Tool],
     parallel: bool,
 ) -> std::result::Result<String, OpenAIError> {
-    let [header, _, text, call, end] = markers.terminals();
+    let [header, _, _, call, end] = markers.terminals();
     let mut grammar = inkling_rules(markers);
-    let _ = writeln!(grammar, "text ::= {header} {text} body {end}");
     let mut calls = Vec::with_capacity(tools.len());
     for (i, tool) in tools.iter().enumerate() {
         let prefix = format!("tool{i}-");
@@ -3081,7 +3083,7 @@ fn inkling_call(
     }
     let _ = writeln!(grammar, "call ::= {header} ({})", calls.join(" | "));
     let more = if parallel { " call*" } else { "" };
-    let _ = writeln!(grammar, "root ::= (thinking | text)* call{more}");
+    let _ = writeln!(grammar, "root ::= thinking* call{more}");
     Ok(grammar)
 }
 
@@ -5148,18 +5150,17 @@ mod tests {
         let grammar =
             inkling_call(&INKLING_MARKERS, &[&tool], true).expect("the tool's schema converts");
         // the test vocabulary's markers are tokens 11 to 18, matched as tokens
+        // thinking blocks, then the calls: no text block, in which a model could answer
+        // instead of calling
         assert!(
-            grammar.ends_with("root ::= (thinking | text)* call call*\n"),
+            grammar.ends_with("root ::= thinking* call call*\n"),
             "{grammar}"
         );
         assert!(
             grammar.starts_with("thinking ::= <[11]> <[12]> body <[17]>\n"),
             "{grammar}"
         );
-        assert!(
-            grammar.contains("\ntext ::= <[11]> <[13]> body <[17]>\n"),
-            "{grammar}"
-        );
+        assert!(!grammar.contains("<[13]>"), "{grammar}");
         assert!(
             grammar.contains(
                 "\ncall ::= <[11]> (\"get_weather\" <[14]> \"{\\\"name\\\":\\\"get_weather\\\",\\\"args\\\":\" tool0-root \"}\" <[17]>)\n"
@@ -5177,10 +5178,7 @@ mod tests {
         );
         // one call only, when the request asks for no parallel calls
         let single = inkling_call(&INKLING_MARKERS, &[&tool], false).expect("one call");
-        assert!(
-            single.ends_with("root ::= (thinking | text)* call\n"),
-            "{single}"
-        );
+        assert!(single.ends_with("root ::= thinking* call\n"), "{single}");
     }
 
     #[test]
@@ -5320,13 +5318,13 @@ mod tests {
                 (
                     called(),
                     FinishReason::ToolCalls,
-                    Some("(thinking | text)* call call*".to_string()),
+                    Some("thinking* call call*".to_string()),
                     false
                 ),
                 (
                     called(),
                     FinishReason::ToolCalls,
-                    Some("(thinking | text)* call".to_string()),
+                    Some("thinking* call".to_string()),
                     false
                 ),
                 (
