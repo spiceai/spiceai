@@ -32,6 +32,23 @@ use regex::Regex;
 use snafu::Snafu;
 use spicepod::component::model::ModelFile;
 
+/// `text` as a message prints a name that comes from a repository's file paths: printable ASCII
+/// as it is, and every other character, a backslash included, escaped as Rust escapes it (`\n`,
+/// `\\`, `\u{202e}`), so a repository's owner cannot break the message's line or disguise
+/// what it says.
+#[must_use]
+pub fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c != '\\' && (c.is_ascii_graphic() || c == ' ') {
+            out.push(c);
+        } else {
+            out.extend(c.escape_default());
+        }
+    }
+    out
+}
+
 /// A file of the repository: its path in the repository and its size in bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedFile {
@@ -82,20 +99,22 @@ impl Resolved {
 #[derive(Debug, Clone, PartialEq, Eq, Snafu)]
 pub enum ResolveError {
     /// A named `.gguf` file is not in the repository.
-    #[snafu(display("the repository has no file '{path}'"))]
+    #[snafu(display("the repository has no file '{}'", printable(path)))]
     MissingFile { path: String },
     /// A shard series some of whose shards the repository lacks.
     #[snafu(display(
-        "'{path}' is a shard of a series the repository lacks part of: {}",
-        missing.join(", ")
+        "'{}' is a shard of a series the repository lacks part of: {}",
+        printable(path),
+        printable(&missing.join(", "))
     ))]
     IncompleteShards { path: String, missing: Vec<String> },
     /// A name several quantizations answer to: a folder that holds several, or a tag one has
     /// and another's folder bears.
     #[snafu(display(
-        "'{name}' matches {} quantizations of the repository, {}; name one of them",
+        "'{}' matches {} quantizations of the repository, {}; name one of them",
+        printable(name),
         quantizations.len(),
-        quantizations.join(", ")
+        printable(&quantizations.join(", "))
     ))]
     AmbiguousQuantization {
         name: String,
@@ -103,8 +122,9 @@ pub enum ResolveError {
     },
     /// A name that is neither a file nor a quantization of the repository.
     #[snafu(display(
-        "the repository has no file or quantization '{name}'; its quantizations are {}",
-        available.join(", ")
+        "the repository has no file or quantization '{}'; its quantizations are {}",
+        printable(name),
+        printable(&available.join(", "))
     ))]
     UnknownQuantization {
         name: String,
@@ -861,6 +881,31 @@ mod tests {
         assert_eq!(names(&quantizations(&with_sidecars)), vec!["Q2_K"]);
         // So a drafter's Q8_0 is not taken for the model's.
         assert_eq!(default_name(&with_sidecars).as_deref(), Some("Q2_K"));
+    }
+
+    #[test]
+    fn a_name_prints_as_printable_ascii() {
+        for (text, printed) in [
+            (
+                "UD-Q4_K_XL/GLM-4.7-Flash-UD-Q4_K_XL.gguf",
+                "UD-Q4_K_XL/GLM-4.7-Flash-UD-Q4_K_XL.gguf",
+            ),
+            ("Q4_K_M\nINFO forged line", "Q4_K_M\\nINFO forged line"),
+            ("Q4_K_M\u{1b}[31m", "Q4_K_M\\u{1b}[31m"),
+            (
+                "Q4_K_M\u{2028}INFO forged line",
+                "Q4_K_M\\u{2028}INFO forged line",
+            ),
+            ("\u{202e}M_K_4Q", "\\u{202e}M_K_4Q"),
+            ("Q4_K_M\\n", "Q4_K_M\\\\n"),
+            ("Modèle Q8_0", "Mod\\u{e8}le Q8_0"),
+        ] {
+            assert_eq!(printable(text), printed, "{text:?}");
+        }
+        // A repository's names in a resolution error print the same way.
+        let listing = listing(&[("Q4_K_M\nINFO forged.gguf", GB)]);
+        let error = resolve(&listing, &["Q9_K"]).expect_err("no such quantization");
+        assert!(!error.to_string().contains('\n'), "{error}");
     }
 
     #[test]
