@@ -632,13 +632,15 @@ jobs:
   check_changes:
     environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
-    # The pool of the three required builds below, which all wait on this job.
-    # On the `spiceai-macos` minis it queued 13.7 min at the median and 64.7 min
-    # at p90 for a runner, then ran for 0.4 min (merge_group, 2026-09-29..10-06).
-    runs-on: spiceai-macos-large
-    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
-    # cold runner having to clone from scratch, not the ~1 min a warm
-    # self-hosted workspace takes.
+    # The three required builds below cannot even queue until this job finishes, so it
+    # runs on the pool that hands out a runner fastest, not on the macOS pool those builds
+    # use. A path diff runs anywhere. On `spiceai-macos-large` it waited 57 min at p90 for
+    # a runner, then ran for 0.2 min; the same checkout and diff in the E2E, integration
+    # and ADBC workflows waited at most 4.6 min at p90 on `spiceai-dev-runners`
+    # (merge_group, 2026-11-11..18).
+    runs-on: spiceai-dev-runners
+    # A full-history checkout (`fetch-depth: 0`) and a path diff, on a runner that always
+    # clones from scratch.
     timeout-minutes: 45
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
