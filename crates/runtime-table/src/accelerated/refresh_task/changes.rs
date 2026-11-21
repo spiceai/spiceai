@@ -6929,12 +6929,88 @@ mod tests {
         );
     }
 
+    /// Stops before each write until the test has read the table, so a test can
+    /// query the accelerator between the writes of one apply.
+    #[derive(Debug)]
+    struct PausingWrites {
+        inner: Arc<dyn TableProvider>,
+        paused: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    #[async_trait]
+    impl TableProvider for PausingWrites {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            self.paused.send(resume).map_err(|_| {
+                DataFusionError::Execution("the test stopped reading the writes".to_string())
+            })?;
+            resumed.await.map_err(|_| {
+                DataFusionError::Execution("the test did not resume the write".to_string())
+            })?;
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
+    /// The `(id, name)` rows of `table`, sorted.
+    async fn id_name_rows(table: Arc<dyn TableProvider>) -> Vec<(i32, String)> {
+        let batches = SessionContext::new()
+            .read_table(table)
+            .expect("read table")
+            .collect()
+            .await
+            .expect("collect table");
+        let mut rows: Vec<(i32, String)> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32")
+                    .clone();
+                let names = batch
+                    .column_by_name("name")
+                    .expect("name")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("name is Utf8")
+                    .clone();
+                (0..ids.len()).map(move |i| (ids.value(i), names.value(i).to_string()))
+            })
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
     /// A reload of a ready dataset arrives as one replacement envelope (the
     /// `spice.ai` append stream stages it until its snapshot ends). A query
-    /// that runs while it is applied sees the old rows or the new ones, never
-    /// anything in between; applying the same reload as a truncate and then its
-    /// rows would expose the empty table.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// that runs before, between or after the writes that apply it sees the old
+    /// rows or the new ones, never anything in between. Applying the same
+    /// reload as a truncate and then its rows would show the empty table
+    /// between those two writes, so each write is held until the table has
+    /// been read.
+    #[tokio::test]
     async fn a_staged_reload_is_seen_whole_or_not_at_all() {
         let dataset = "staged_reload_swaps_atomically";
         let schema = Arc::new(create_test_data_schema());
@@ -6945,17 +7021,21 @@ mod tests {
         let federated = Arc::new(
             MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
         );
-        let accelerator = Arc::new(
+        let accelerator: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(
                 Arc::clone(&schema),
                 vec![vec![id_name_batch(&old_ids, &old_names)]],
             )
             .expect("accelerator mem table"),
         );
+        let (paused, mut paused_writes) = tokio::sync::mpsc::unbounded_channel();
         let task = make_refresh_task_with_source(
             dataset,
             Arc::clone(&federated) as Arc<dyn TableProvider>,
-            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+            Arc::new(PausingWrites {
+                inner: Arc::clone(&accelerator),
+                paused,
+            }) as Arc<dyn TableProvider>,
         );
         let dataset_name = TableReference::bare(dataset);
         let metric_labels = DatasetMetricLabels::new(&dataset_name);
@@ -6983,47 +7063,19 @@ mod tests {
             pending_commit: &mut pending_commit,
             deferred_commits: None,
         };
-
-        let done = Arc::new(AtomicBool::new(false));
-        let reader = tokio::spawn({
-            let accelerator = Arc::clone(&accelerator);
-            let done = Arc::clone(&done);
-            async move {
-                let ctx = SessionContext::new();
-                let mut reads = std::collections::BTreeSet::new();
-                while !done.load(Ordering::SeqCst) {
-                    let batches = ctx
-                        .read_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>)
-                        .expect("read accelerator")
-                        .collect()
-                        .await
-                        .expect("collect accelerator");
-                    let mut rows: Vec<(i32, String)> = batches
-                        .iter()
-                        .flat_map(|batch| {
-                            let ids = batch
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<Int32Array>()
-                                .expect("id is Int32")
-                                .clone();
-                            let names = batch
-                                .column(1)
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                                .expect("name is Utf8")
-                                .clone();
-                            (0..ids.len()).map(move |i| (ids.value(i), names.value(i).to_string()))
-                        })
-                        .collect();
-                    rows.sort_unstable();
-                    reads.insert(rows);
-                    tokio::task::yield_now().await;
-                }
-                reads
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let rows_of = |ids: &[i32], names: &[&str]| -> Vec<(i32, String)> {
+            ids.iter()
+                .zip(names)
+                .map(|(id, name)| (*id, (*name).to_string()))
+                .collect()
+        };
+        let old_rows = rows_of(&old_ids, &old_names);
+        let new_rows = rows_of(&new_ids, &new_names);
+        assert_eq!(
+            id_name_rows(Arc::clone(&accelerator)).await,
+            old_rows,
+            "the old snapshot before the reload"
+        );
 
         let reload = cdc::ChangeEnvelope::from_parts(
             Box::new(cdc::NoOpCommitter),
@@ -7033,28 +7085,37 @@ mod tests {
             true,
             true,
         );
-        assert!(task.apply_envelope_run(&mut context, vec![reload]).await);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        done.store(true, Ordering::SeqCst);
-        let reads = reader.await.expect("reader");
-        let rows_of = |ids: &[i32], names: &[&str]| -> Vec<(i32, String)> {
-            ids.iter()
-                .zip(names)
-                .map(|(id, name)| (*id, (*name).to_string()))
-                .collect()
-        };
-        let old_rows = rows_of(&old_ids, &old_names);
-        let new_rows = rows_of(&new_ids, &new_names);
+        let apply = task.apply_envelope_run(&mut context, vec![reload]);
+        tokio::pin!(apply);
+        let mut reads_before_writes = Vec::new();
+        let applied = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    applied = &mut apply => break applied,
+                    Some(resume) = paused_writes.recv() => {
+                        reads_before_writes.push(id_name_rows(Arc::clone(&accelerator)).await);
+                        resume.send(()).expect("the write waits for the read");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the reload is applied");
+        assert!(applied, "the reload is applied");
         assert!(
-            reads
+            !reads_before_writes.is_empty(),
+            "the reload is written to the accelerator"
+        );
+        assert!(
+            reads_before_writes
                 .iter()
                 .all(|rows| *rows == old_rows || *rows == new_rows),
-            "a query saw a partly reloaded table: {reads:?}"
+            "a query between two writes of the reload saw a partly reloaded table: {reads_before_writes:?}"
         );
-        assert!(reads.contains(&new_rows), "{reads:?}");
         assert_eq!(
-            names_in_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>).await,
-            vec!["new".to_string(); new_ids.len()]
+            id_name_rows(Arc::clone(&accelerator)).await,
+            new_rows,
+            "the new snapshot after the reload"
         );
     }
 

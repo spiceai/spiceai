@@ -900,6 +900,63 @@ mod tests {
             })
     }
 
+    /// The ids an envelope carries, sorted.
+    fn ids(envelope: &ChangeEnvelope) -> Vec<i32> {
+        let rows = envelope.change_batch().expect("built").data_batch();
+        let mut ids = rows
+            .column_by_name("id")
+            .expect("an id column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id is Int32")
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The ids of the next envelope, once the snapshot is read, and whether it
+    /// is marked ready.
+    async fn next_ids(
+        stream: &mut BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>,
+    ) -> Option<(Vec<i32>, bool)> {
+        tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .ok()
+            .flatten()
+            .map(|envelope| {
+                let envelope = envelope.expect("not an error");
+                (ids(&envelope), envelope.is_dataset_ready())
+            })
+    }
+
+    /// The producer's message for an update of `ids`, published now on its
+    /// subscription's `published` stream, then tagged as the commit at
+    /// `sequence` of `epoch` instead of the sequence it was published at.
+    async fn published_update(
+        broadcaster: &DataUpdateBroadcaster,
+        published: &mut Messages,
+        epoch: &str,
+        sequence: u64,
+        ids: Vec<i32>,
+    ) -> FlightData {
+        broadcaster
+            .publish(&TableReference::bare(DATASET), update(ids))
+            .await;
+        let mut message = tokio::time::timeout(Duration::from_secs(5), published.next())
+            .await
+            .expect("the producer sends the update")
+            .expect("a message")
+            .expect("not an error");
+        assert!(
+            StreamMetadata::parse(&message.app_metadata)
+                .is_some_and(|metadata| metadata.marker == StreamMarker::Update),
+            "the producer's next message is the update"
+        );
+        message.app_metadata = StreamMetadata::update(epoch, sequence).to_bytes();
+        message
+    }
+
     /// The next envelope as a staged reload's replacement: its row count.
     async fn replacement(
         stream: &mut BoxStream<'static, Result<ChangeEnvelope, cdc::StreamError>>,
@@ -1839,39 +1896,42 @@ mod tests {
         // Two commits before the reload's snapshot: it holds them.
         broadcaster.publish(&path, update(vec![10])).await;
         broadcaster.publish(&path, update(vec![11])).await;
-        let (mut reload, _) =
+        let (mut reload, mut published) =
             through_end(producer(&datafusion, &broadcaster, table(vec![1, 2])).await).await;
         let snapshot_sequence = snapshot_sequence(&reload);
         assert_eq!(snapshot_sequence, 2);
         let epoch = broadcaster.epoch().to_string();
-        let row = row_message(&reload);
-        let with = |sequence| {
-            let mut message = row.clone();
-            message.app_metadata = StreamMetadata::update(&epoch, sequence).to_bytes();
-            message
+        let mut commit = async |sequence, ids| {
+            published_update(&broadcaster, &mut published, &epoch, sequence, ids).await
         };
+        // Each commit carries rows of its own, so keeping the wrong one shows in
+        // the rows, not only in their count.
+        let held = commit(snapshot_sequence, vec![20]).await;
+        let later = commit(snapshot_sequence + 1, vec![21]).await;
+        let replayed = commit(snapshot_sequence, vec![30]).await;
+        let new = commit(snapshot_sequence + 2, vec![31]).await;
         let end = reload.pop().expect("end marker");
         // During the reload: a commit the snapshot holds, and a later one.
-        reload.push(with(snapshot_sequence));
-        reload.push(with(snapshot_sequence + 1));
+        reload.push(held);
+        reload.push(later);
         reload.push(end);
         // After the swap: a replay of a held commit, and a new one.
-        reload.push(with(snapshot_sequence));
-        reload.push(with(snapshot_sequence + 2));
+        reload.push(replayed);
+        reload.push(new);
 
         let mut stream = consumer(vec![failed_after_ready, held_open(reload)]);
         assert_eq!(snapshots(&mut stream, 1).await, vec![snapshot_of(1)]);
         assert_eq!(
-            replacement(&mut stream).await,
-            4,
-            "the snapshot's 2 rows and the 2 rows of the staged update past it"
+            ids(&replacement_envelope(&mut stream).await),
+            vec![1, 2, 21],
+            "the snapshot's rows and the staged commit past it"
         );
         assert_eq!(
-            next_rows(&mut stream).await,
-            Some((2, true)),
+            next_ids(&mut stream).await,
+            Some((vec![31], true)),
             "the new commit"
         );
-        assert_eq!(next_rows(&mut stream).await, None, "the replay is skipped");
+        assert_eq!(next_ids(&mut stream).await, None, "the replay is skipped");
     }
 
     #[derive(Clone, Default)]
