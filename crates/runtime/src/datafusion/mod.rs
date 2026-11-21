@@ -399,6 +399,13 @@ pub enum Error {
     #[snafu(display("Table {table_name} is not accelerated"))]
     NotAcceleratedTable { table_name: String },
 
+    /// A deferred dataset whose source has not been reached yet: it is initialized by the
+    /// first query that references it, and a refresh has nothing to refresh before then.
+    #[snafu(display(
+        "Dataset {table_name} is not initialized yet: it initializes when a query first references it, and its source was unavailable at the last attempt. Query it to retry, then refresh."
+    ))]
+    DatasetNotInitialized { table_name: String },
+
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
 
@@ -2986,6 +2993,17 @@ impl DataFusion {
             .update_dataset(&dataset.name, status::ComponentStatus::Ready);
 
         Ok(())
+    }
+
+    /// Whether `dataset_name` is a deferred dataset still waiting for the first query that
+    /// references it to initialize it (including one whose attempts have failed).
+    pub async fn awaits_initialization(&self, dataset_name: &TableReference) -> bool {
+        self.has_pending_initializations()
+            && self
+                .pending_initializations
+                .read()
+                .await
+                .contains_key(dataset_name)
     }
 
     /// Whether `dataset_name` is registered with its loaded provider: registered,
@@ -6257,6 +6275,13 @@ impl DataFusion {
             return self
                 .forward_refresh_to_executors(partition_service, dataset_name, overrides.as_ref())
                 .await;
+        }
+
+        if self.awaits_initialization(dataset_name).await {
+            return DatasetNotInitializedSnafu {
+                table_name: dataset_name.to_string(),
+            }
+            .fail();
         }
 
         let table = self

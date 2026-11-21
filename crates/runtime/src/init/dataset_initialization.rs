@@ -53,6 +53,7 @@ use crate::Error as RuntimeError;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{DataConnector, NewDataConnectorResult};
 use crate::datafusion::AcceleratorBootstrap;
+use crate::init::dataset::is_permanent_dataset_failure;
 use crate::{Result, Runtime, accelerated::AcceleratedTable};
 
 /// Where the `DataConnector` for this dataset comes from.
@@ -70,8 +71,10 @@ pub enum ConnectorSource {
     Lazy(LazyConnectorBuilder),
 }
 
+/// Builds the connector of a deferred dataset. `Fn`, not `FnOnce`: a first reference that
+/// fails because the source is unavailable is retried on a later one, which builds again.
 pub type LazyConnectorBuilder =
-    Box<dyn FnOnce() -> BoxFuture<'static, NewDataConnectorResult> + Send + Sync>;
+    Box<dyn Fn() -> BoxFuture<'static, NewDataConnectorResult> + Send + Sync>;
 
 /// How the dataset's schema is resolved.
 pub enum SchemaSource {
@@ -197,6 +200,22 @@ impl DatasetInitialization {
 
     /// Consume the plan and run the dataset bring-up to completion.
     pub async fn initialize(self) -> Result<DatasetReady> {
+        self.initialize_retriable().await.map_err(|f| f.error)
+    }
+
+    /// Like [`Self::initialize`], and when the bring-up fails for a reason a later attempt
+    /// can clear (the source is unavailable), hands the plan back to try again.
+    /// Configuration errors, which no retry clears, return no plan.
+    pub async fn initialize_retriable(
+        self,
+    ) -> std::result::Result<DatasetReady, Box<InitializeFailure>> {
+        let mut retry = None;
+        self.run(&mut retry)
+            .await
+            .map_err(|error| Box::new(InitializeFailure { error, retry }))
+    }
+
+    async fn run(self, retry: &mut Option<Box<DatasetInitialization>>) -> Result<DatasetReady> {
         let Self {
             dataset,
             runtime,
@@ -230,11 +249,28 @@ impl DatasetInitialization {
                     match builder().await {
                         Ok(connector) => connector,
                         Err(source) => {
-                            return Err(report_deferred_failure(
-                                &runtime,
-                                &dataset,
-                                RuntimeError::UnableToInitializeDataConnector { source },
-                            ));
+                            // The production builder already returns a boxed `RuntimeError`
+                            // (`UnableToInitializeDataConnector` for a factory failure); keep
+                            // it as is, so the classifier sees the factory's own error and a
+                            // configuration failure stays permanent.
+                            let err = match source.downcast::<RuntimeError>() {
+                                Ok(err) => *err,
+                                Err(source) => {
+                                    RuntimeError::UnableToInitializeDataConnector { source }
+                                }
+                            };
+                            if !is_permanent_dataset_failure(&err) {
+                                *retry = Some(Box::new(Self {
+                                    dataset: Arc::clone(&dataset),
+                                    runtime: Arc::clone(&runtime),
+                                    connector_source: ConnectorSource::Lazy(builder),
+                                    schema_source: SchemaSource::Known { schema },
+                                    bootstrap_status,
+                                    load_semaphore,
+                                    preloaded_accelerated_table,
+                                }));
+                            }
+                            return Err(report_deferred_failure(&runtime, &dataset, err));
                         }
                     }
                 };
@@ -280,13 +316,21 @@ impl DatasetInitialization {
                 let federated_provider = match connector.read_provider(&context, &dataset).await {
                     Ok(provider) => provider,
                     Err(e) => {
-                        return Err(report_deferred_failure(
-                            &runtime,
-                            &dataset,
-                            RuntimeError::UnableToInitializeDataConnector {
-                                source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                            },
-                        ));
+                        let err = RuntimeError::UnableToInitializeDataConnector {
+                            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                        };
+                        if !is_permanent_dataset_failure(&err) {
+                            *retry = Some(Box::new(Self {
+                                dataset: Arc::clone(&dataset),
+                                runtime: Arc::clone(&runtime),
+                                connector_source: ConnectorSource::Lazy(builder),
+                                schema_source: SchemaSource::Known { schema },
+                                bootstrap_status,
+                                load_semaphore,
+                                preloaded_accelerated_table,
+                            }));
+                        }
+                        return Err(report_deferred_failure(&runtime, &dataset, err));
                     }
                 };
 
@@ -312,6 +356,14 @@ impl DatasetInitialization {
                     ));
                 }
 
+                // A failed earlier attempt left the dataset in `Error`
+                // (`report_deferred_failure`); this one serves it, so it is `Ready`
+                // again. The accelerated branch above reports through
+                // `register_loaded_dataset` instead.
+                runtime
+                    .status
+                    .update_dataset(&dataset.name, runtime_status::ComponentStatus::Ready);
+
                 Ok(DatasetReady {
                     table_provider: Some(federated_provider),
                     accelerated_table: None,
@@ -332,6 +384,15 @@ impl DatasetInitialization {
     }
 }
 
+/// A failed bring-up, with the plan to try again when a later attempt can succeed.
+pub struct InitializeFailure {
+    pub error: RuntimeError,
+    /// The plan, to run again: set when the failure is the source being unavailable;
+    /// `None` for a configuration error no retry clears. Boxed: the plan is large, and
+    /// it rides in the `Err` variant of every bring-up.
+    pub retry: Option<Box<DatasetInitialization>>,
+}
+
 /// Report a deferred dataset's first-reference bring-up failure, and return the
 /// error unchanged so the caller can propagate it.
 ///
@@ -348,9 +409,9 @@ impl DatasetInitialization {
 /// — the accelerated deferred branch — are therefore already reported by it and
 /// must not pass through here, or they are counted twice (#12365).
 ///
-/// `error!` rather than `warn!`, and no `spaced_tracer`: `ensure_ready` memoizes
-/// the failure in a `OnceCell`, so this runs at most once per registration and
-/// nothing retries afterwards.
+/// `error!` rather than `warn!`, and no `spaced_tracer`: `ensure_ready` retries a
+/// source-unavailable failure no sooner than its backoff allows, so this logs once
+/// per attempt, and a configuration failure runs it once per registration.
 fn report_deferred_failure(
     runtime: &Runtime,
     dataset: &Dataset,
@@ -595,5 +656,191 @@ mod tests {
             Some(ComponentStatus::Ready),
             "a deferred dataset that came up must still report Ready"
         );
+    }
+
+    /// A builder that fails with `error()` for its first `failures` calls, then serves.
+    fn failing_then_serving(
+        failures: usize,
+        error: impl Fn() -> Box<dyn std::error::Error + Send + Sync> + Send + Sync + 'static,
+    ) -> (LazyConnectorBuilder, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let builder: LazyConnectorBuilder = Box::new(move || {
+            let call = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result = if call < failures {
+                Err(error())
+            } else {
+                Ok(stub(false))
+            };
+            Box::pin(async move { result })
+        });
+        (builder, calls)
+    }
+
+    fn plan(
+        runtime: &Arc<crate::Runtime>,
+        dataset: &Arc<Dataset>,
+        builder: LazyConnectorBuilder,
+    ) -> DatasetInitialization {
+        DatasetInitialization::plan_deferred(
+            Arc::clone(dataset),
+            Arc::clone(runtime),
+            builder,
+            other_schema(),
+            BootstrapStatus::None,
+            None,
+        )
+    }
+
+    /// An unavailable source is not the end of the dataset: the failed bring-up hands its
+    /// plan back, and running it again once the source is there brings the dataset up.
+    #[tokio::test]
+    async fn an_unavailable_source_hands_the_plan_back_to_retry() {
+        let (runtime, dataset) = ready_deferred_dataset().await;
+        let (builder, calls) = failing_then_serving(1, || "no data files yet".into());
+
+        let failure = match plan(&runtime, &dataset, builder)
+            .initialize_retriable()
+            .await
+        {
+            Ok(_) => panic!("the first attempt must fail"),
+            Err(failure) => failure,
+        };
+        let retry = failure.retry.expect("an unavailable source can be retried");
+        assert!(
+            runtime
+                .status
+                .get_dataset_status(&dataset.name)
+                .is_some_and(|s| s.is_error())
+        );
+
+        retry
+            .initialize()
+            .await
+            .expect("the retry brings the dataset up");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            runtime.status.get_dataset_status(&dataset.name),
+            Some(ComponentStatus::Ready)
+        );
+    }
+
+    /// A configuration error is a pure function of the spicepod: no plan to retry.
+    #[tokio::test]
+    async fn a_configuration_error_is_not_retried() {
+        let (runtime, dataset) = ready_deferred_dataset().await;
+        let component = ConnectorComponent::from(dataset.as_ref());
+        let (builder, _) = failing_then_serving(usize::MAX, move || {
+            Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "test".to_string(),
+                connector_component: component.clone(),
+                message: "endpoint is required".to_string(),
+            })
+        });
+
+        let failure = match plan(&runtime, &dataset, builder)
+            .initialize_retriable()
+            .await
+        {
+            Ok(_) => panic!("the attempt must fail"),
+            Err(failure) => failure,
+        };
+        assert!(
+            failure.retry.is_none(),
+            "a configuration error has no retry"
+        );
+    }
+
+    /// The production builder boxes a `RuntimeError`; a configuration error inside it stays
+    /// permanent rather than being wrapped and read as an unavailable source.
+    #[tokio::test]
+    async fn a_boxed_runtime_error_from_the_builder_keeps_its_classification() {
+        let (runtime, dataset) = ready_deferred_dataset().await;
+        let component = ConnectorComponent::from(dataset.as_ref());
+        let (builder, _) = failing_then_serving(usize::MAX, move || {
+            Box::new(crate::Error::UnableToInitializeDataConnector {
+                source: Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "test".to_string(),
+                    connector_component: component.clone(),
+                    message: "endpoint is required".to_string(),
+                }),
+            })
+        });
+
+        let failure = match plan(&runtime, &dataset, builder)
+            .initialize_retriable()
+            .await
+        {
+            Ok(_) => panic!("the attempt must fail"),
+            Err(failure) => failure,
+        };
+        assert!(
+            failure.retry.is_none(),
+            "a configuration error has no retry"
+        );
+    }
+
+    /// `ensure_ready` does not keep an unavailable-source failure: a call inside the backoff
+    /// gets the last error without touching the source, and the first call after it builds
+    /// the connector again and initializes the dataset.
+    #[tokio::test]
+    async fn ensure_ready_retries_an_unavailable_source_after_a_backoff() {
+        use crate::datafusion::table::dataset_table_provider::DatasetTableProvider;
+
+        let (runtime, dataset) = ready_deferred_dataset().await;
+        let (builder, calls) = failing_then_serving(1, || "no data files yet".into());
+        let provider = DatasetTableProvider::new(
+            dataset.name.clone(),
+            declared_schema(),
+            plan(&runtime, &dataset, builder),
+        );
+
+        provider
+            .ensure_ready()
+            .await
+            .expect_err("the source is unavailable");
+        assert!(!provider.is_initialized());
+        provider
+            .ensure_ready()
+            .await
+            .expect_err("still inside the backoff");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        provider.ensure_ready().await.expect("the retry succeeds");
+        assert!(provider.is_initialized());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        provider.ensure_ready().await.expect("the result is kept");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A configuration error is kept: later calls get it without another attempt.
+    #[tokio::test]
+    async fn ensure_ready_keeps_a_configuration_error() {
+        use crate::datafusion::table::dataset_table_provider::DatasetTableProvider;
+
+        let (runtime, dataset) = ready_deferred_dataset().await;
+        let component = ConnectorComponent::from(dataset.as_ref());
+        let (builder, calls) = failing_then_serving(usize::MAX, move || {
+            Box::new(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "test".to_string(),
+                connector_component: component.clone(),
+                message: "endpoint is required".to_string(),
+            })
+        });
+        let provider = DatasetTableProvider::new(
+            dataset.name.clone(),
+            declared_schema(),
+            plan(&runtime, &dataset, builder),
+        );
+
+        provider
+            .ensure_ready()
+            .await
+            .expect_err("a configuration error");
+        assert!(provider.is_initialized());
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        provider.ensure_ready().await.expect_err("kept");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -419,6 +419,12 @@ pub struct AccelerationRequest {
                 "message": "Dataset taxi_trips not found"
             })
         ))),
+        (status = 409, description = "The dataset is deferred and has not initialized yet: its source was unavailable when a query first referenced it. Query the dataset to retry initialization, then refresh", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset eth_recent_blocks is not initialized yet: it initializes when a query first references it, and its source was unavailable at the last attempt. Query it to retry, then refresh."
+            })
+        ))),
         (status = 400, description = "Dataset is not accelerated, or the overrides are invalid: a `refresh_mode` other than `full` or `append`, or a `refresh_sql` that does not parse or omits the dataset's `time_column`", content((
             MessageResponse = "application/json",
             example = json!({
@@ -524,6 +530,13 @@ pub(crate) async fn refresh(
             },
         ) => (
             status::StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("{err}"),
+            }),
+        )
+            .into_response(),
+        Err(err @ crate::datafusion::Error::DatasetNotInitialized { .. }) => (
+            status::StatusCode::CONFLICT,
             Json(MessageResponse {
                 message: format!("{err}"),
             }),
