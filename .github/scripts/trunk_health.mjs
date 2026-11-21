@@ -18,8 +18,9 @@
 // tracked as an open issue labeled `trunk-broken` or an open PR labeled
 // `fixes-trunk`. This gate keeps those from being ignored: once one has carried
 // its label for more than GRACE_HOURS, every merge that does not fix it is
-// blocked. As a backstop, when the last BACKSTOP_RUNS post-merge runs failed and
-// nothing is labeled at all, merging is blocked until someone files the failure.
+// blocked. As a backstop, when the last BACKSTOP_RUNS post-merge runs failed,
+// nothing is labeled, and nobody has triaged a trunk failure since those runs
+// started, merging is blocked until someone files the failure.
 //
 // A PR is exempt when it is labeled `fixes-trunk`, closes (by a closing link) an
 // issue labeled `trunk-broken`, or is a pure revert from a branch of this
@@ -42,6 +43,9 @@ export const COMMENT_MARKER = '<!-- trunk-health -->';
 const COMMENT_AUTHOR = 'github-actions[bot]';
 const HOUR_MS = 60 * 60 * 1000;
 const RUNS_PER_PAGE = 20;
+// How far back the backstop looks for a triage action: about a day of this
+// repository's issue events at 100 a page.
+const MAX_EVENT_PAGES = 30;
 // Conclusions that say nothing about whether trunk is healthy.
 const IGNORED_CONCLUSIONS = new Set(['cancelled', 'skipped', 'neutral']);
 
@@ -134,12 +138,41 @@ export async function postMergeRuns({ github, owner, repo, branch }) {
     const pageRuns = data.workflow_runs ?? [];
     for (const run of pageRuns) {
       if (IGNORED_CONCLUSIONS.has(run.conclusion) || runs.length === BACKSTOP_RUNS) continue;
-      runs.push({ url: run.html_url, conclusion: run.conclusion, sha: run.head_sha });
+      runs.push({
+        url: run.html_url,
+        conclusion: run.conclusion,
+        sha: run.head_sha,
+        createdAt: new Date(run.created_at),
+      });
     }
     if (pageRuns.length < RUNS_PER_PAGE) break;
   }
   const failing = runs.length === BACKSTOP_RUNS && runs.every((run) => run.conclusion !== 'success');
   return { missing: false, failing, runs };
+}
+
+/**
+ * Whether anyone triaged a trunk failure since `since`: added or removed a
+ * BROKEN_LABEL or FIX_LABEL, or closed an item that carries one (a fix merged,
+ * or a failure dismissed). Reads the repository's issue events, newest first,
+ * until they are older than `since`; an unread remainder counts as no triage.
+ */
+export async function triagedSince({ github, owner, repo, since }) {
+  const labels = new Set([BROKEN_LABEL, FIX_LABEL]);
+  for (let page = 1; page <= MAX_EVENT_PAGES; page += 1) {
+    const { data } = await github.rest.issues.listEventsForRepo({ owner, repo, per_page: 100, page });
+    for (const event of data) {
+      if (new Date(event.created_at) < since) return false;
+      if ((event.event === 'labeled' || event.event === 'unlabeled') && labels.has(event.label?.name)) {
+        return true;
+      }
+      if (event.event === 'closed' && (event.issue?.labels ?? []).some((l) => labels.has(l.name))) {
+        return true;
+      }
+    }
+    if (data.length < 100) return false;
+  }
+  return false;
 }
 
 /** Why PR `pr` may merge while trunk is broken, or null when it may not. */
@@ -223,7 +256,19 @@ export async function evaluate({ github, owner, repo, prNumbers, baseSha, branch
   const items = await blockingItems({ github, owner, repo, now });
   const backstop = await postMergeRuns({ github, owner, repo, branch });
   const overdue = items.filter((item) => item.overdue);
-  const backstopFires = backstop.failing && items.length === 0;
+  // Untriaged: the failures came after anyone last acted on a trunk failure.
+  // Removing a label or closing an item is such an action, so dismissing a
+  // flake or merging a fix does not leave the backstop blocking on the runs
+  // that preceded it; two new failed runs trip it again.
+  const backstopFires =
+    backstop.failing &&
+    items.length === 0 &&
+    !(await triagedSince({
+      github,
+      owner,
+      repo,
+      since: new Date(Math.min(...backstop.runs.map((run) => run.createdAt.getTime()))),
+    }));
 
   // Every PR that would merge must be exempt, not only the one this run is for.
   const exemptions = [];

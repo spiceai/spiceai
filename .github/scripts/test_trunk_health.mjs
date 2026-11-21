@@ -202,6 +202,67 @@ test('the backstop yields once the failure is filed, starting its grace period',
   assert.deepEqual(r.failed, []);
 });
 
+// A label removed (a dismissed failure) or a labeled item closed (a merged
+// fix) after the failing runs started is triage: those runs no longer trip it.
+const failedRuns = (h1, h2) => [
+  { conclusion: 'failure', created_at: hoursAgo(h1) },
+  { conclusion: 'failure', created_at: hoursAgo(h2) },
+];
+
+test('removing the label after the failures is an override, not a backstop trigger', async () => {
+  const r = await gate(mergeGroup(), {
+    runs: failedRuns(6, 18),
+    repoEvents: [
+      { event: 'deployed', created_at: hoursAgo(1) },
+      { event: 'unlabeled', label: 'trunk-broken', created_at: hoursAgo(2) },
+    ],
+  });
+  assert.deepEqual(r.failed, []);
+});
+
+test('closing a labeled item after the failures (a merged fix) is triage', async () => {
+  const r = await gate(mergeGroup(), {
+    runs: failedRuns(6, 18),
+    repoEvents: [{ event: 'closed', issueLabels: ['fixes-trunk', 'kind/ci'], created_at: hoursAgo(3) }],
+  });
+  assert.deepEqual(r.failed, []);
+});
+
+test('two failures after the last triage trip the backstop again', async () => {
+  const r = await gate(mergeGroup(), {
+    runs: failedRuns(6, 18),
+    repoEvents: [
+      { event: 'labeled', label: 'other', created_at: hoursAgo(5) },
+      { event: 'closed', issueLabels: ['kind/bug'], created_at: hoursAgo(7) },
+      { event: 'unlabeled', label: 'trunk-broken', created_at: hoursAgo(30) },
+    ],
+  });
+  assert.equal(r.failed.length, 1);
+  assert.match(r.failed[0], /last 2 post-merge runs on trunk failed/);
+});
+
+test('triage is searched past the first page of events, and no further than the runs', async () => {
+  const noise = Array.from({ length: 150 }, () => ({ event: 'deployed', created_at: hoursAgo(1) }));
+  const found = await gate(mergeGroup(), {
+    runs: failedRuns(6, 18),
+    repoEvents: [...noise, { event: 'unlabeled', label: 'fixes-trunk', created_at: hoursAgo(10) }],
+  });
+  assert.deepEqual(found.failed, []);
+  assert.deepEqual(found.calls.filter((c) => c.startsWith('issues.listEventsForRepo page')), [
+    'issues.listEventsForRepo page 1',
+    'issues.listEventsForRepo page 2',
+  ]);
+
+  const tooOld = await gate(mergeGroup(), {
+    runs: failedRuns(6, 18),
+    repoEvents: [
+      { event: 'deployed', created_at: hoursAgo(1) },
+      { event: 'unlabeled', label: 'trunk-broken', created_at: hoursAgo(19) },
+    ],
+  });
+  assert.equal(tooOld.failed.length, 1, 'triage before the failing runs started does not count');
+});
+
 test('a post-merge workflow not yet on trunk leaves the backstop inactive', async () => {
   const r = await gate(mergeGroup(), { runs: 'missing' });
   assert.deepEqual(r.failed, []);

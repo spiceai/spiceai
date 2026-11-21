@@ -772,9 +772,12 @@ tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
   label was added. The 24 hours are for triage: a flake or an infrastructure
   fault should not stop all merging before anyone has looked at it.
 - **Untriaged:** the last two completed `nightly_tests.yml` runs on `trunk`
-  failed (cancelled runs are skipped), and nothing is labeled. Filing the
-  failure as a `trunk-broken` issue clears this and starts that issue's
-  24 hours.
+  failed (cancelled runs are skipped), nothing is labeled, and nobody has
+  triaged a trunk failure since the older of those runs started. Triage is
+  adding or removing a `trunk-broken` or `fixes-trunk` label, or closing an
+  item that carries one. Filing the failure as a `trunk-broken` issue clears
+  this and starts that issue's 24 hours; dismissing an item or merging its fix
+  clears it until two more runs fail.
 
 **A PR may merge anyway when any holds:**
 
@@ -797,7 +800,9 @@ past the block by being queued behind it.
 **Removing the label is the only override.** If an item should not block
 merging (a flake, an infrastructure fault, a failure in a test that is being
 retired), a maintainer removes its label. That is visible in the issue's
-history and needs no admin bypass.
+history and needs no admin bypass. It also counts as triage, so the failed runs
+before it do not trip the untriaged condition; a failure that keeps happening
+trips it again after two more failed runs.
 
 **Where it runs.** The merge-queue run is the one that blocks. The run on a
 pull request is advisory: it always passes, and when merging is blocked it

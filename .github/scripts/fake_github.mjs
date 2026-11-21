@@ -28,6 +28,7 @@ const httpError = (status, message) => Object.assign(new Error(message), { statu
  * - commits: { [number]: [{ sha, message }] }
  * - onBase: Set of SHAs that are ancestors of the base
  * - comments: { [number]: [{ id, body, login }] }
+ * - repoEvents: [{ event, created_at, label?, issueLabels? }] newest first
  * - queue: [{ sha?, message }] — a merge group's commits not yet on its branch
  * - fail: { [method]: Error } — that call throws
  */
@@ -90,6 +91,20 @@ export function fakeGithub(state = {}) {
             })),
           };
         },
+        // Repository-wide issue events, newest first (state.repoEvents).
+        listEventsForRepo: async ({ page = 1, per_page = 30 }) => {
+          maybeFail('issues.listEventsForRepo');
+          calls.push(`issues.listEventsForRepo page ${page}`);
+          const start = (page - 1) * per_page;
+          return {
+            data: (state.repoEvents ?? []).slice(start, start + per_page).map((e) => ({
+              event: e.event,
+              created_at: e.created_at,
+              label: e.label ? { name: e.label } : undefined,
+              issue: { labels: (e.issueLabels ?? []).map((name) => ({ name })) },
+            })),
+          };
+        },
         listComments: async ({ issue_number }) => {
           maybeFail('issues.listComments');
           return {
@@ -126,6 +141,7 @@ export function fakeGithub(state = {}) {
                 html_url: `https://github.com/o/r/actions/runs/${start + i}`,
                 head_sha: run.head_sha ?? `${start + i}`.padStart(40, '0'),
                 conclusion: run.conclusion,
+                created_at: run.created_at ?? '2026-11-19T00:00:00Z',
               })),
             },
           };
