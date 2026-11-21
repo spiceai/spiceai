@@ -149,7 +149,11 @@ async fn with_nothing_named_the_model_loads_on_this_machine() {
     let chosen = resolve(&[], Budget::Free(memory))
         .await
         .expect("a quantization fits");
-    assert_eq!(chosen.gguf, vec!["Qwen3-0.6B-Q4_K_M.gguf"], "{memory} bytes free");
+    assert_eq!(
+        chosen.gguf,
+        vec!["Qwen3-0.6B-Q4_K_M.gguf"],
+        "{memory} bytes free"
+    );
     let model = load(&[]).await;
     assert_eq!(twelve_times_twelve(model.as_ref()).await, vec![144]);
 }

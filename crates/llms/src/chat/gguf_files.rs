@@ -149,7 +149,7 @@ fn is_projector(path: &str) -> bool {
 }
 
 /// A file that is not the model's weights though it is a GGUF file: an importance matrix, or a
-/// DFlash, EAGLE-3 or DSpark drafter, as llama.cpp's `-hf` tells them apart by name.
+/// `dflash-`, `eagle3-` or `dspark-` drafter, as llama.cpp's `-hf` tells them apart by name.
 fn is_sidecar(path: &str) -> bool {
     let name = file_name(path).to_ascii_lowercase();
     ["imatrix", "dflash-", "eagle3-", "dspark-"]
@@ -784,8 +784,14 @@ mod tests {
     /// `BF16` in a folder of two shards, which sorts first by path.
     fn glm47() -> Vec<ListedFile> {
         listing(&[
-            ("BF16/GLM-4.7-Flash-BF16-00001-of-00002.gguf", 49_910_000_000),
-            ("BF16/GLM-4.7-Flash-BF16-00002-of-00002.gguf", 10_000_000_000),
+            (
+                "BF16/GLM-4.7-Flash-BF16-00001-of-00002.gguf",
+                49_910_000_000,
+            ),
+            (
+                "BF16/GLM-4.7-Flash-BF16-00002-of-00002.gguf",
+                10_000_000_000,
+            ),
             ("GLM-4.7-Flash-Q3_K_M.gguf", 14_610_000_000),
             ("GLM-4.7-Flash-Q4_K_M.gguf", 18_310_000_000),
             ("GLM-4.7-Flash-Q8_0.gguf", 31_840_000_000),
