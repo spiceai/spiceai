@@ -89,6 +89,11 @@ pub fn build(
         name: decl.name.clone(),
         description: decl.description.clone(),
         args: decl.signature.args.clone(),
+        access: if decl.executes_code() {
+            ToolAccess::ReadWrite
+        } else {
+            ToolAccess::ReadOnly
+        },
         df,
     })
 }
@@ -125,6 +130,9 @@ pub struct FunctionAsTool {
     name: String,
     description: Option<String>,
     args: Vec<FunctionArg>,
+    /// What a call can change: read-write for a function that calls out
+    /// ([`Function::executes_code`]), read-only otherwise.
+    access: ToolAccess,
     df: Weak<dyn QueryEngine>,
 }
 
@@ -152,11 +160,12 @@ impl SpiceModelTool for FunctionAsTool {
         Some(build_parameters_schema(&self.args))
     }
 
-    /// Runs the function in a `SELECT`, read-only unless the caller may write, so a caller
-    /// without write access is refused the functions that run code or call out, as in its own
-    /// SQL.
+    /// A function that calls out ([`Function::executes_code`]) needs write access, as it does
+    /// in SQL, so only a caller with write access is offered it or may call it. Any other
+    /// function runs in a `SELECT` that is read-only unless the caller may write, so any caller
+    /// may call it.
     fn access(&self) -> ToolAccess {
-        ToolAccess::ReadOnly
+        self.access
     }
 
     async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {

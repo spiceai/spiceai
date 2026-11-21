@@ -245,7 +245,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                 }
                 ctx.register_udf(udf.as_ref().clone());
                 registered_function_names.push(decl.name.clone());
-                if function_executes_code(&decl) {
+                if decl.executes_code() {
                     add_code_executing_function(&decl.name);
                 }
                 upsert_user_function_info(info_from_decl(&decl));
@@ -267,7 +267,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                 }
                 ctx.register_udtf(&decl.name, udtf);
                 registered_function_names.push(decl.name.clone());
-                if function_executes_code(&decl) {
+                if decl.executes_code() {
                     add_code_executing_function(&decl.name);
                 }
                 upsert_user_function_info(info_from_decl(&decl));
@@ -367,24 +367,12 @@ pub fn registered_table_udf_name(ctx: &SessionContext, name: &str) -> Option<Str
         .cloned()
 }
 
-/// The `from` scheme of a function declaration, lowercased: `sql`, `http`, `wasm`, ...
-fn function_scheme(decl: &Function) -> String {
-    decl.from
-        .split_once(':')
-        .map_or(decl.from.as_str(), |(scheme, _)| scheme)
-        .to_ascii_lowercase()
-}
-
-fn function_executes_code(decl: &Function) -> bool {
-    matches!(function_scheme(decl).as_str(), "http" | "https")
-}
-
 /// Whether a sidecar refuses this declaration. HTTP and WebAssembly functions
 /// run code or make requests from inside the sidecar, which guards its
 /// application's access to the cluster. SQL functions are queries over the
 /// sidecar's own catalog and are kept.
 fn sidecar_refuses_function(decl: &Function) -> bool {
-    matches!(function_scheme(decl).as_str(), "http" | "https" | "wasm")
+    matches!(decl.scheme().as_str(), "http" | "https" | "wasm")
 }
 
 /// The error logged for each function a sidecar refuses to register.
@@ -449,7 +437,7 @@ async fn resolve_function_params(
 
 pub(crate) fn effective_user_function_volatility(decl: &Function) -> &'static str {
     match decl.volatility {
-        Volatility::Immutable if function_executes_code(decl) => "stable",
+        Volatility::Immutable if decl.executes_code() => "stable",
         Volatility::Immutable => "immutable",
         Volatility::Stable => "stable",
         Volatility::Volatile => "volatile",
@@ -595,7 +583,7 @@ async fn apply_function_diff_inner(
                 }
                 ctx.register_udf(udf.as_ref().clone());
                 registered_function_names.push(next.name.clone());
-                if function_executes_code(&next) {
+                if next.executes_code() {
                     add_code_executing_function(&next.name);
                 }
                 upsert_user_function_info(info_from_decl(&next));
@@ -614,7 +602,7 @@ async fn apply_function_diff_inner(
                 }
                 ctx.register_udtf(&next.name, udtf);
                 registered_function_names.push(next.name.clone());
-                if function_executes_code(&next) {
+                if next.executes_code() {
                     add_code_executing_function(&next.name);
                 }
                 upsert_user_function_info(info_from_decl(&next));
