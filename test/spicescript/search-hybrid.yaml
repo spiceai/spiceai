@@ -84,8 +84,9 @@ steps:
     expect: { status: 200, body-contains: '"results"' }
   # A search asks for 1 to 10,000 results per dataset, wherever it takes a `limit`: outside the
   # range it is refused before anything is searched, with the range, the value and the fix.
+  # At the bound nothing is cut short: vector search returns each of the 76 documents with a body.
   - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs"], "text": "fox", "limit": 10000}' }
-    expect: { status: 200, json: [ { pointer: /results, length: '>=1' } ] }
+    expect: { status: 200, json: [ { pointer: /results, length: 76 } ] }
   - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs"], "text": "fox", "limit": 10001}' }
     expect:
       status: 400
@@ -153,12 +154,13 @@ steps:
     expect:
       status: 200
       body-contains: '`limit` must be between 1 and 10000, but was 0.'
-  - query: SELECT count(*) > 0 AS found FROM text_search(docs, 'fox', limit => 10000)
-    expect: { rows: [['true']] }
+  # At the bound each search function returns every row it matches, compared with the source.
+  - query: SELECT id FROM text_search(docs, 'fox', limit => 10000)
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL
   - query: SELECT id FROM text_search(docs, 'fox', limit => 10001)
     expect-error: '`limit` must be between 1 and 10000, but was 10001. Request fewer results, or query the table without a search function to read every row. See https://spiceai.org/docs/reference/sql/search'
-  - query: SELECT count(*) > 0 AS found FROM vector_search(docs, 'fox', limit => 10000)
-    expect: { rows: [['true']] }
+  - query: SELECT id FROM vector_search(docs, 'fox', limit => 10000)
+    oracle-sql: SELECT id FROM docs WHERE body IS NOT NULL
   - query: SELECT id FROM vector_search(docs, 'fox', limit => 10001)
     expect-error: '`limit` must be between 1 and 10000, but was 10001.'
   - query: SELECT id FROM vector_search(docs, 'fox', limit => 0)

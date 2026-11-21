@@ -304,6 +304,26 @@ steps:
         - { pointer: /total_count, equals: 69 }
     eventually: 60s
     only: authenticated
+  # They failed with the request to resubmit, not for any other reason: the newest, which was
+  # waiting, says so through the API, and the log names each running query (this caller's 64
+  # and the other caller's 1) and each of the 4 waiting.
+  - http: { method: GET, path: /v1/queries, query: { status: failed } }
+    expect: { status: 200, json: [ { pointer: /queries/0/sql_preview, matches: '> 70$' } ] }
+    capture: { newest_failed: /queries/0/query_id }
+    only: authenticated
+  - http: { method: GET, path: '/v1/queries/${captured.newest_failed}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /status, equals: FAILED }
+        - { pointer: /error/error_code, equals: SCHEDULER_UNAVAILABLE }
+        - { pointer: /error/message, equals: 'The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.' }
+    only: authenticated
+  - assert-log:
+      count:
+        'was running on a scheduler that stopped, and it cannot be resumed under the identity that submitted it, so it is marked failed; resubmit the query': 65
+        'was waiting on a scheduler that stopped, and it cannot be run under the identity that submitted it, so it is marked failed; resubmit the query': 4
+    only: authenticated
   - http: { method: GET, path: /v1/queries, query: { status: cancelled } }
     expect: { status: 200, json: [ { pointer: /total_count, equals: 1 } ] }
 
