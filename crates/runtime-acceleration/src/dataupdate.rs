@@ -28,21 +28,68 @@ use datafusion::physical_plan::{
 };
 use futures::TryStreamExt;
 pub use runtime_query_engine::query_engine::{DataUpdate, UpdateType};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, broadcast};
 
 use datafusion::common::TableReference;
 
 const DATA_UPDATE_BROADCAST_CAPACITY: usize = 100;
 
-#[derive(Clone, Debug, Default)]
+/// A published update and the commit sequence number it was published under.
+///
+/// Sequence numbers count the commits published for one table by one
+/// broadcaster, which lives as long as the runtime process. Together with the
+/// broadcaster's [`epoch`](DataUpdateBroadcaster::epoch) they let an append-stream
+/// subscriber tell which updates its snapshot already holds.
+#[derive(Clone, Debug)]
+pub struct SequencedDataUpdate {
+    pub sequence: u64,
+    pub update: DataUpdate,
+}
+
+type CommitFence = Arc<RwLock<u64>>;
+
+#[derive(Clone, Debug)]
 pub struct DataUpdateBroadcaster {
-    channels: Arc<RwLock<HashMap<TableReference, Arc<broadcast::Sender<DataUpdate>>>>>,
+    channels: Arc<RwLock<HashMap<TableReference, Arc<broadcast::Sender<SequencedDataUpdate>>>>>,
+    /// Per table, the sequence number of the last published commit, behind a
+    /// lock that orders commits against subscriber snapshots: a fenced commit
+    /// holds it for writing from before its write until after its publish, and
+    /// a subscriber holds it for reading while it subscribes and opens its
+    /// snapshot. So a subscriber's snapshot holds exactly the fenced commits up
+    /// to the sequence number it read, and it receives every later one.
+    fences: Arc<parking_lot::Mutex<HashMap<TableReference, CommitFence>>>,
+    epoch: Arc<str>,
+}
+
+impl Default for DataUpdateBroadcaster {
+    fn default() -> Self {
+        Self {
+            channels: Arc::default(),
+            fences: Arc::default(),
+            epoch: Arc::from(uuid::Uuid::now_v7().simple().to_string()),
+        }
+    }
+}
+
+/// Held by a writer from before a commit until it has published it; see
+/// [`DataUpdateBroadcaster::begin_commit`].
+pub struct CommitGuard {
+    sequence: OwnedRwLockWriteGuard<u64>,
+}
+
+/// A subscription opened with [`DataUpdateBroadcaster::subscribe_at_snapshot`].
+/// Fenced commits wait until it is dropped, so open the snapshot before
+/// dropping it.
+pub struct SnapshotFence {
+    _sequence: OwnedRwLockReadGuard<u64>,
+    /// The last commit published before the snapshot.
+    pub sequence: u64,
 }
 
 pub struct DataUpdateReceiver {
     broadcaster: DataUpdateBroadcaster,
     table_reference: TableReference,
-    receiver: Option<broadcast::Receiver<DataUpdate>>,
+    receiver: Option<broadcast::Receiver<SequencedDataUpdate>>,
 }
 
 impl DataUpdateReceiver {
@@ -57,6 +104,19 @@ impl DataUpdateReceiver {
     /// [`RecvError::Closed`]: broadcast::error::RecvError::Closed
     /// [`RecvError::Lagged`]: broadcast::error::RecvError::Lagged
     pub async fn recv(&mut self) -> Result<DataUpdate, broadcast::error::RecvError> {
+        self.recv_sequenced()
+            .await
+            .map(|sequenced| sequenced.update)
+    }
+
+    /// [`Self::recv`], with the commit sequence number of the update.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::recv`].
+    pub async fn recv_sequenced(
+        &mut self,
+    ) -> Result<SequencedDataUpdate, broadcast::error::RecvError> {
         let Some(receiver) = self.receiver.as_mut() else {
             return Err(broadcast::error::RecvError::Closed);
         };
@@ -83,6 +143,46 @@ impl DataUpdateBroadcaster {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Identifies this broadcaster, so this runtime process: sequence numbers
+    /// from different epochs are not comparable.
+    #[must_use]
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
+    fn fence(&self, table_reference: &TableReference) -> CommitFence {
+        Arc::clone(
+            self.fences
+                .lock()
+                .entry(table_reference.clone())
+                .or_default(),
+        )
+    }
+
+    /// Starts a fenced commit to `table_reference`: hold the guard while the
+    /// write runs and pass it to [`Self::publish_committed`]. A subscriber that
+    /// arrives meanwhile waits, then reads a snapshot that holds the commit.
+    pub async fn begin_commit(&self, table_reference: &TableReference) -> CommitGuard {
+        CommitGuard {
+            sequence: self.fence(table_reference).write_owned().await,
+        }
+    }
+
+    /// Subscribes to `table_reference` and reads the sequence number of its
+    /// last published commit, both while no fenced commit is running.
+    pub async fn subscribe_at_snapshot(
+        &self,
+        table_reference: &TableReference,
+    ) -> (DataUpdateReceiver, SnapshotFence) {
+        let sequence = self.fence(table_reference).read_owned().await;
+        let receiver = self.subscribe(table_reference).await;
+        let fence = SnapshotFence {
+            sequence: *sequence,
+            _sequence: sequence,
+        };
+        (receiver, fence)
     }
 
     pub async fn subscribe(&self, table_reference: &TableReference) -> DataUpdateReceiver {
@@ -119,7 +219,21 @@ impl DataUpdateBroadcaster {
         false
     }
 
+    /// Publishes an update whose write was not fenced; it takes the next
+    /// sequence number once the write is done.
     pub async fn publish(&self, table_reference: &TableReference, update: DataUpdate) {
+        let guard = self.begin_commit(table_reference).await;
+        self.publish_committed(table_reference, guard, update).await;
+    }
+
+    /// Publishes the update a fenced commit wrote, under the commit's next
+    /// sequence number, and ends the commit.
+    pub async fn publish_committed(
+        &self,
+        table_reference: &TableReference,
+        mut guard: CommitGuard,
+        update: DataUpdate,
+    ) {
         let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
             return;
         };
@@ -129,6 +243,11 @@ impl DataUpdateBroadcaster {
             return;
         }
 
+        *guard.sequence += 1;
+        let update = SequencedDataUpdate {
+            sequence: *guard.sequence,
+            update,
+        };
         if let Err(err) = channel.send(update) {
             tracing::debug!(
                 dataset = %table_reference,
@@ -162,7 +281,7 @@ impl DataUpdateBroadcaster {
     async fn remove_if_unused(
         &self,
         table_reference: &TableReference,
-        channel: &Arc<broadcast::Sender<DataUpdate>>,
+        channel: &Arc<broadcast::Sender<SequencedDataUpdate>>,
     ) {
         if channel.receiver_count() > 0 {
             return;
@@ -212,10 +331,22 @@ impl DataUpdatePublisher {
             .await
     }
 
-    /// Sends appended rows to every current subscriber. Call it only once the
-    /// rows are committed, so a subscriber never receives rows a reader of the
-    /// dataset cannot see.
-    pub async fn publish_append(&self, schema: SchemaRef, data: Vec<RecordBatch>) {
+    /// Starts a fenced commit to the dataset; see
+    /// [`DataUpdateBroadcaster::begin_commit`].
+    pub async fn begin_commit(&self) -> CommitGuard {
+        self.broadcaster.begin_commit(&self.table_reference).await
+    }
+
+    /// Sends appended rows to every current subscriber under the commit's
+    /// sequence number, and ends the commit. Call it only once the rows are
+    /// committed, so a subscriber never receives rows a reader of the dataset
+    /// cannot see.
+    pub async fn publish_append(
+        &self,
+        guard: CommitGuard,
+        schema: SchemaRef,
+        data: Vec<RecordBatch>,
+    ) {
         let data: Vec<RecordBatch> = data
             .into_iter()
             .filter(|batch| batch.num_rows() > 0)
@@ -224,8 +355,9 @@ impl DataUpdatePublisher {
             return;
         }
         self.broadcaster
-            .publish(
+            .publish_committed(
                 &self.table_reference,
+                guard,
                 DataUpdate {
                     schema,
                     data,
@@ -561,6 +693,43 @@ mod tests {
             .expect("published update should be received");
         assert_eq!(update.schema, schema);
         assert!(matches!(update.update_type, UpdateType::Append));
+    }
+
+    /// A subscription opened while a fenced commit runs waits for its publish,
+    /// and reads that commit's sequence number as its snapshot's.
+    #[tokio::test]
+    async fn a_snapshot_subscription_waits_for_a_running_commit() {
+        let broadcaster = DataUpdateBroadcaster::new();
+        let table_reference = TableReference::bare("cdc_table");
+        let mut earlier = broadcaster.subscribe(&table_reference).await;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let update = DataUpdate {
+            schema: Arc::clone(&schema),
+            data: vec![one_column_batch(&schema, vec![1])],
+            update_type: UpdateType::Append,
+        };
+
+        let guard = broadcaster.begin_commit(&table_reference).await;
+        let subscribing = tokio::spawn({
+            let broadcaster = broadcaster.clone();
+            let table_reference = table_reference.clone();
+            async move { broadcaster.subscribe_at_snapshot(&table_reference).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !subscribing.is_finished(),
+            "the subscription waits for the commit"
+        );
+        broadcaster
+            .publish_committed(&table_reference, guard, update.clone())
+            .await;
+        let (_later, fence) = subscribing.await.expect("subscribes");
+        assert_eq!(fence.sequence, 1);
+        assert_eq!(earlier.recv_sequenced().await.expect("update").sequence, 1);
+        drop(fence);
+
+        broadcaster.publish(&table_reference, update).await;
+        assert_eq!(earlier.recv_sequenced().await.expect("update").sequence, 2);
     }
 
     #[tokio::test]

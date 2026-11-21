@@ -161,6 +161,7 @@
   "secret-redaction": 23,
   "served-while-source-down": 31,
   "settings-evolution": 76,
+  "sidecar-append-stream": 35,
   "sidecar-append-stream-keyed": 6,
   "sidecar-cluster": 119,
   "sidecar-substrait-field-metadata": 6,
