@@ -61,8 +61,10 @@ steps:
   # of 5,000 rows): one sets no timeout, the other sets the runtime's.
   - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 0"}' }
     expect: { status: 202 }
+    capture: { no_timeout_set: /query_id }
   - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 1", "timeout_seconds": 5}' }
     expect: { status: 202 }
+    capture: { runtime_timeout_set: /query_id }
   # Both start running...
   - http: { method: GET, path: /v1/queries }
     expect:
@@ -78,6 +80,19 @@ steps:
         - { pointer: /queries/*/sql_preview, equals: 'SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 0', count: 1 }
         - { pointer: /queries/*/sql_preview, equals: 'SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 1', count: 1 }
     eventually: 60s
+  # Each failed because it timed out, not for any other reason.
+  - http: { method: GET, path: '/v1/queries/${captured.no_timeout_set}/status' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /status, equals: FAILED }
+        - { pointer: /error/error_code, equals: TIMEOUT }
+  - http: { method: GET, path: '/v1/queries/${captured.runtime_timeout_set}/status' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /status, equals: FAILED }
+        - { pointer: /error/error_code, equals: TIMEOUT }
   - http: { method: GET, path: /v1/queries, query: { status: running } }
     expect:
       status: 200
