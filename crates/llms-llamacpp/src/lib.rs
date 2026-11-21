@@ -3055,15 +3055,16 @@ fn harmony_rules(markers: &harmony::Markers) -> String {
     rules
 }
 
-/// The grammar of a whole Inkling reply that must call one of `tools`: any thinking blocks,
-/// then a call block, or several when `parallel`, each naming its tool in its header and
+/// The grammar of a whole Inkling reply that must call one of `tools`: a thinking block or
+/// none, then a call block, or several when `parallel`, each naming its tool in its header and
 /// holding `{"name":NAME,"args":ARGS}` with the arguments held to the tool's schema. Each
 /// marker is its token, never text spelling it. After a call's `<|end_message|>` the grammar
 /// may be complete, which is when the end-of-generation token that ends the reply is allowed.
 ///
-/// No text block comes before the call, as no final message comes before a Harmony one
-/// (`harmony_call`). llama.cpp's server allows text blocks there, and a model that answers in
-/// text can then write block after block until its budget runs out without ever calling.
+/// Only the call follows the thinking, as only the call follows a Harmony reply's analysis
+/// (`harmony_call`). llama.cpp's server allows any thinking and text blocks before it, and a
+/// model that would rather answer than call then writes its answer in block after block until
+/// its budget runs out without ever calling, in text blocks or, without them, in thinking.
 fn inkling_call(
     markers: &inkling::Markers,
     tools: &[&Tool],
@@ -3083,7 +3084,7 @@ fn inkling_call(
     }
     let _ = writeln!(grammar, "call ::= {header} ({})", calls.join(" | "));
     let more = if parallel { " call*" } else { "" };
-    let _ = writeln!(grammar, "root ::= thinking* call{more}");
+    let _ = writeln!(grammar, "root ::= thinking? call{more}");
     Ok(grammar)
 }
 
@@ -5150,10 +5151,10 @@ mod tests {
         let grammar =
             inkling_call(&INKLING_MARKERS, &[&tool], true).expect("the tool's schema converts");
         // the test vocabulary's markers are tokens 11 to 18, matched as tokens
-        // thinking blocks, then the calls: no text block, in which a model could answer
-        // instead of calling
+        // a thinking block or none, then the calls: no text block or second thinking block, in
+        // which a model could answer instead of calling
         assert!(
-            grammar.ends_with("root ::= thinking* call call*\n"),
+            grammar.ends_with("root ::= thinking? call call*\n"),
             "{grammar}"
         );
         assert!(
@@ -5178,7 +5179,7 @@ mod tests {
         );
         // one call only, when the request asks for no parallel calls
         let single = inkling_call(&INKLING_MARKERS, &[&tool], false).expect("one call");
-        assert!(single.ends_with("root ::= thinking* call\n"), "{single}");
+        assert!(single.ends_with("root ::= thinking? call\n"), "{single}");
     }
 
     #[test]
@@ -5318,13 +5319,13 @@ mod tests {
                 (
                     called(),
                     FinishReason::ToolCalls,
-                    Some("thinking* call call*".to_string()),
+                    Some("thinking? call call*".to_string()),
                     false
                 ),
                 (
                     called(),
                     FinishReason::ToolCalls,
-                    Some("thinking* call".to_string()),
+                    Some("thinking? call".to_string()),
                     false
                 ),
                 (

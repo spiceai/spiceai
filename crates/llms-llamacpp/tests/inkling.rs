@@ -173,9 +173,9 @@ async fn an_inkling_grammar_goes_on_from_a_text_block_the_prompt_opened() {
 }
 
 /// A required call is made even when the prompt opens a text block: the grammar holds the
-/// reply to thinking blocks and then the call, so the text block is refused, the grammar is
-/// built again at its root, and the model has to call the tool rather than answer in text
-/// until its budget runs out. The tool is named `assistant` because that is what Qwen writes
+/// reply to a thinking block or none and then the call, so the text block is refused, the
+/// grammar is built again at its root, and the model has to call the tool rather than answer
+/// in text until its budget runs out. The tool is named `assistant` because that is what Qwen writes
 /// after the token respelled as the block header, so the respelled model makes the call where
 /// the grammar lets it rather than open a thinking block it never closes.
 #[tokio::test]
