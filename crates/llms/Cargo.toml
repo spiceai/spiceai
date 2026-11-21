@@ -70,6 +70,7 @@ cudarc = { version = "0.19", optional = true, features = [
     "cuda-version-from-build-system",
 ] }
 either = "1.15.0"
+llm-resilience = "0.2.1"
 indexmap.workspace = true
 linkme.workspace = true
 tempfile.workspace = true
