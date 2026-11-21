@@ -7,7 +7,7 @@ name: Trunk Health
 # find is tracked as an open issue labeled `trunk-broken` or an open PR labeled
 # `fixes-trunk`. Once one has carried its label for more than 24 hours, this
 # check fails for every PR that is not labeled `fixes-trunk`, does not close a
-# `trunk-broken` issue, and is not a pure revert. When the last two post-merge
+# `trunk-broken` issue, and is not a pure revert. When the last four post-merge
 # runs failed and nothing is labeled, it fails too, until someone files the
 # failure. Removing the label is the only override. The rules are in
 # .github/scripts/trunk_health.mjs; docs/dev/ci_signoff.md explains them.

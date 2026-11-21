@@ -36,16 +36,19 @@ import { checkPureRevert } from './pure_revert.mjs';
 export const BROKEN_LABEL = 'trunk-broken';
 export const FIX_LABEL = 'fixes-trunk';
 export const GRACE_HOURS = 24;
-export const BACKSTOP_RUNS = 2;
+// High on purpose: the labeled items are the gate, and this only catches a
+// failure nobody filed. A flake or an infrastructure fault rarely fails four
+// runs in a row; a real regression does.
+export const BACKSTOP_RUNS = 4;
 export const POST_MERGE_WORKFLOW = 'nightly_tests.yml';
 export const COMMENT_MARKER = '<!-- trunk-health -->';
 
 const COMMENT_AUTHOR = 'github-actions[bot]';
 const HOUR_MS = 60 * 60 * 1000;
 const RUNS_PER_PAGE = 20;
-// How far back the backstop looks for a triage action: about a day of this
-// repository's issue events at 100 a page.
-const MAX_EVENT_PAGES = 30;
+// How far back the backstop looks for a triage action: about two days of this
+// repository's issue events at 100 a page, the span of BACKSTOP_RUNS runs.
+const MAX_EVENT_PAGES = 60;
 // Conclusions that say nothing about whether trunk is healthy.
 const IGNORED_CONCLUSIONS = new Set(['cancelled', 'skipped', 'neutral']);
 
@@ -259,7 +262,7 @@ export async function evaluate({ github, owner, repo, prNumbers, baseSha, branch
   // Untriaged: the failures came after anyone last acted on a trunk failure.
   // Removing a label or closing an item is such an action, so dismissing a
   // flake or merging a fix does not leave the backstop blocking on the runs
-  // that preceded it; two new failed runs trip it again.
+  // that preceded it; BACKSTOP_RUNS new failed runs trip it again.
   const backstopFires =
     backstop.failing &&
     items.length === 0 &&

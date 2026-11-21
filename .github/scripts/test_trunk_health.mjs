@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { COMMENT_MARKER, parseQueueRef, run } from './trunk_health.mjs';
+import { BACKSTOP_RUNS, COMMENT_MARKER, parseQueueRef, run } from './trunk_health.mjs';
 import { fakeCore, fakeGithub, testRunner } from './fake_github.mjs';
 
 const NOW = new Date('2026-11-20T12:00:00Z');
@@ -148,35 +148,49 @@ test('merge-queue refs parse to the PR they were built for', () => {
 
 // --- The backstop ----------------------------------------------------------
 
-test('two failed post-merge runs with nothing labeled block', async () => {
-  const r = await gate(mergeGroup(), { runs: [{ conclusion: 'failure' }, { conclusion: 'failure' }, { conclusion: 'success' }] });
+/** `n` failed runs, newest first. */
+const fails = (n) => Array.from({ length: n }, () => ({ conclusion: 'failure' }));
+
+test('the backstop needs four failed runs in a row', () => {
+  assert.equal(BACKSTOP_RUNS, 4);
+});
+
+test('four failed post-merge runs with nothing labeled block', async () => {
+  const r = await gate(mergeGroup(), { runs: [...fails(4), { conclusion: 'success' }] });
   assert.equal(r.failed.length, 1);
-  assert.match(r.failed[0], /last 2 post-merge runs on trunk failed/);
+  assert.match(r.failed[0], /last 4 post-merge runs on trunk failed/);
   assert.match(r.failed[0], /open an issue labeled `trunk-broken`/);
 });
 
-test('one failure after a success does not trip the backstop', async () => {
-  const r = await gate(mergeGroup(), { runs: [{ conclusion: 'failure' }, { conclusion: 'success' }] });
+test('three failures after a success do not trip the backstop', async () => {
+  const r = await gate(mergeGroup(), { runs: [...fails(3), { conclusion: 'success' }, ...fails(4)] });
   assert.deepEqual(r.failed, []);
 });
 
 test('cancelled and skipped runs are not verdicts and are passed over', async () => {
   const tripped = await gate(mergeGroup(), {
-    runs: [{ conclusion: 'cancelled' }, { conclusion: 'failure' }, { conclusion: 'skipped' }, { conclusion: 'timed_out' }],
+    runs: [
+      { conclusion: 'cancelled' },
+      { conclusion: 'failure' },
+      { conclusion: 'skipped' },
+      { conclusion: 'timed_out' },
+      { conclusion: 'neutral' },
+      ...fails(2),
+    ],
   });
   assert.equal(tripped.failed.length, 1);
 
   const notTripped = await gate(mergeGroup(), {
-    runs: [{ conclusion: 'failure' }, { conclusion: 'cancelled' }, { conclusion: 'success' }],
+    runs: [...fails(3), { conclusion: 'cancelled' }, { conclusion: 'success' }],
   });
   assert.deepEqual(notTripped.failed, []);
 });
 
 test('the backstop pages past a full page of cancelled runs to find its verdicts', async () => {
-  const runs = [...Array(25).fill({ conclusion: 'cancelled' }), { conclusion: 'failure' }, { conclusion: 'failure' }];
+  const runs = [...Array(25).fill({ conclusion: 'cancelled' }), ...fails(4)];
   const r = await gate(mergeGroup(), { runs });
   assert.equal(r.failed.length, 1);
-  assert.match(r.failed[0], /last 2 post-merge runs on trunk failed/);
+  assert.match(r.failed[0], /last 4 post-merge runs on trunk failed/);
   assert.deepEqual(r.calls.filter((c) => c.startsWith('actions.listWorkflowRuns page')), [
     'actions.listWorkflowRuns page 1',
     'actions.listWorkflowRuns page 2',
@@ -184,7 +198,7 @@ test('the backstop pages past a full page of cancelled runs to find its verdicts
 });
 
 test('the backstop stops paging once it has its verdicts', async () => {
-  const runs = [{ conclusion: 'success' }, { conclusion: 'failure' }, ...Array(40).fill({ conclusion: 'failure' })];
+  const runs = [{ conclusion: 'success' }, ...fails(41)];
   const r = await gate(mergeGroup(), { runs });
   assert.deepEqual(r.failed, []);
   assert.deepEqual(r.calls.filter((c) => c.startsWith('actions.listWorkflowRuns page')), [
@@ -193,21 +207,20 @@ test('the backstop stops paging once it has its verdicts', async () => {
 });
 
 test('fewer completed runs than the backstop needs do not trip it', async () => {
-  const r = await gate(mergeGroup(), { runs: [{ conclusion: 'failure' }] });
+  const r = await gate(mergeGroup(), { runs: fails(3) });
   assert.deepEqual(r.failed, []);
 });
 
 test('the backstop yields once the failure is filed, starting its grace period', async () => {
-  const r = await gate(mergeGroup(), { runs: [{ conclusion: 'failure' }, { conclusion: 'failure' }], ...brokenIssue(7, 1) });
+  const r = await gate(mergeGroup(), { runs: fails(4), ...brokenIssue(7, 1) });
   assert.deepEqual(r.failed, []);
 });
 
 // A label removed (a dismissed failure) or a labeled item closed (a merged
 // fix) after the failing runs started is triage: those runs no longer trip it.
-const failedRuns = (h1, h2) => [
-  { conclusion: 'failure', created_at: hoursAgo(h1) },
-  { conclusion: 'failure', created_at: hoursAgo(h2) },
-];
+/** Four failed runs, newest `h1` hours ago and oldest `h2` hours ago. */
+const failedRuns = (h1, h2) =>
+  [0, 1, 2, 3].map((i) => ({ conclusion: 'failure', created_at: hoursAgo(h1 + ((h2 - h1) * i) / 3) }));
 
 test('removing the label after the failures is an override, not a backstop trigger', async () => {
   const r = await gate(mergeGroup(), {
@@ -228,7 +241,7 @@ test('closing a labeled item after the failures (a merged fix) is triage', async
   assert.deepEqual(r.failed, []);
 });
 
-test('two failures after the last triage trip the backstop again', async () => {
+test('four failures after the last triage trip the backstop again', async () => {
   const r = await gate(mergeGroup(), {
     runs: failedRuns(6, 18),
     repoEvents: [
@@ -238,7 +251,7 @@ test('two failures after the last triage trip the backstop again', async () => {
     ],
   });
   assert.equal(r.failed.length, 1);
-  assert.match(r.failed[0], /last 2 post-merge runs on trunk failed/);
+  assert.match(r.failed[0], /last 4 post-merge runs on trunk failed/);
 });
 
 test('triage is searched past the first page of events, and no further than the runs', async () => {
