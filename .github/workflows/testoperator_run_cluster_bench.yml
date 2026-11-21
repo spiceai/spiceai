@@ -341,11 +341,11 @@ jobs:
 
       # Credentials must outlast every image's run and its teardown, so they
       # match the job timeout rather than the 1-hour default.
-      - name: Authorize with the sandbox benchmark role
+      - name: Authorize with the benchmark role
         if: env.CB_COMPUTE == 'ec2'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
+          role-to-assume: ${{ secrets.CI_AWS_EC2_BENCH_ROLE_ARN }}
           role-session-name: gha-ballista-bench-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: ${{ env.CB_EC2_REGION }}
@@ -353,7 +353,7 @@ jobs:
       - name: Resolve the EC2 cluster inputs
         if: env.CB_COMPUTE == 'ec2'
         env:
-          SUBNET_ID: ${{ vars.BALLISTA_BENCH_SUBNET_ID }}
+          SUBNET_ID: ${{ vars.CI_BALLISTA_BENCH_SUBNET_ID }}
         run: |
           set -euo pipefail
           if [ -z "${CB_EC2_IMAGES}" ]; then
@@ -361,7 +361,7 @@ jobs:
             exit 1
           fi
           if [ -z "${SUBNET_ID}" ]; then
-            echo "::error::Repository variable BALLISTA_BENCH_SUBNET_ID is not set"
+            echo "::error::Variable CI_BALLISTA_BENCH_SUBNET_ID is not set in the ci environment"
             exit 1
           fi
           ami_id="$(aws ssm get-parameters --region "${CB_EC2_REGION}" \
@@ -382,7 +382,7 @@ jobs:
         if: env.CB_COMPUTE != 'ec2'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_ICEBERG_ROLE_ARN }}
           role-session-name: gha-iceberg-${{ github.run_id }}
           role-duration-seconds: 36000
           aws-region: us-east-1
@@ -406,7 +406,7 @@ jobs:
           # Defaults to the dedicated spicehq nodegroup; without it the app lands on
           # the shared default nodegroup.
           SPIDAPTER_ORGANIZATION_TAG: ${{ env.CB_ORGANIZATION_TAG }}
-          SCHEDULER_STATE_LOCATION: 's3://spiceai-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
+          SCHEDULER_STATE_LOCATION: 's3://spiceai-ci-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
           CHANNEL: ${{ env.CB_CHANNEL }}
@@ -544,7 +544,7 @@ jobs:
         if: always() && env.CB_COMPUTE == 'ec2'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
+          role-to-assume: ${{ secrets.CI_AWS_EC2_BENCH_ROLE_ARN }}
           role-session-name: gha-ballista-bench-cleanup-${{ github.run_id }}
           aws-region: ${{ env.CB_EC2_REGION }}
 
