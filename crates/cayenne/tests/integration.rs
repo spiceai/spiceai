@@ -150,6 +150,7 @@ mod scalar_function_pushdown_test;
 mod scan_view_retention_test;
 mod selective_join_pk_probe_test;
 mod shared_metastore_concurrency_test;
+mod similar_to_semantics_test;
 mod small_file_compaction_position_mode_test;
 mod small_files_compaction_test;
 mod snapshot_cleanup_convergence_test;
