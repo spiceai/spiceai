@@ -264,17 +264,38 @@ pub fn redact_url_credentials(url: &str) -> String {
 /// [`redact_message_credentials`] cannot do for a URL in free text: use this for a
 /// source, including where a message quotes one. Only the URL at the start of
 /// `from`, or right after its connector prefix, is redacted; a `://` later in a
-/// path is left alone. A source without credentials is returned unchanged.
+/// path is left alone. Whitespace and control characters before the URL, at the start
+/// of `from` or after its connector prefix (`' https://...'`, `custom: https://...`),
+/// are skipped, as a URL parser skips them. A source without credentials is returned
+/// unchanged.
 #[must_use]
 pub fn redact_source_credentials(from: &str) -> String {
-    let redacted = redact_url_credentials(from);
-    if redacted != from {
-        return redacted;
+    let (lead, source) = split_leading_filler(from);
+    // A URL right after the connector prefix is the source's URL, even when the whole source
+    // also reads as one: taken whole, `iceberg:// https://u:p@h/x?sig=S` is an `iceberg` URL,
+    // and only its query would be redacted.
+    if let Some(len) = connector_prefix_len(source) {
+        let (prefix, rest) = source.split_at(len);
+        let (gap, url) = split_leading_filler(rest);
+        if starts_with_scheme(url) {
+            return format!("{lead}{prefix}{gap}{}", redact_url_credentials(url));
+        }
     }
-    match connector_prefix_len(from) {
-        Some(len) => format!("{}{}", &from[..len], redact_url_credentials(&from[len..])),
-        None => redacted,
-    }
+    format!("{lead}{}", redact_url_credentials(source))
+}
+
+/// `text` split after its leading whitespace and control characters, the characters a
+/// URL parser strips from the start of its input.
+fn split_leading_filler(text: &str) -> (&str, &str) {
+    let rest = text.trim_start_matches(|c: char| c.is_whitespace() || c.is_control());
+    text.split_at(text.len() - rest.len())
+}
+
+/// Whether `text` starts with a URL scheme and `://`.
+fn starts_with_scheme(text: &str) -> bool {
+    text.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic()) && scheme.chars().all(is_scheme_char)
+    })
 }
 
 /// How many bytes of `from` its connector prefix and delimiter take: up to the first
@@ -628,6 +649,38 @@ mod tests {
             ("iceberg://https://u:pa ss@h/x", "iceberg://https://h/x"),
         ] {
             assert_eq!(redact_source_credentials(from), want, "{from}");
+        }
+    }
+
+    /// Whitespace or control characters before the URL, at the start of the source or
+    /// after its connector prefix, do not hide the URL; they are kept as written.
+    #[test]
+    fn redact_source_credentials_skips_whitespace_before_the_url() {
+        for (from, want) in [
+            (
+                " https://alice:PASSWORD@models.example.invalid/v1?api_key=KEY",
+                " https://models.example.invalid/v1?api_key=***",
+            ),
+            ("\t\n https://alice:MY PASSWORD@h/v1", "\t\n https://h/v1"),
+            ("\u{1}https://alice:PASSWORD@h/v1", "\u{1}https://h/v1"),
+            (
+                "custom: https://alice:PASSWORD@models.example.invalid/v1?api_key=KEY",
+                "custom: https://models.example.invalid/v1?api_key=***",
+            ),
+            (
+                " openai:\thttps://alice:PASSWORD@h/v1?token=T",
+                " openai:\thttps://h/v1?token=***",
+            ),
+            (
+                "iceberg:// https://u:pa ss@h/x?sig=S",
+                "iceberg:// https://h/x?sig=***",
+            ),
+            // Without credentials, whitespace and all, the source is unchanged.
+            (" https://h/v1?region=us", " https://h/v1?region=us"),
+            ("custom: openai", "custom: openai"),
+            ("   ", "   "),
+        ] {
+            assert_eq!(redact_source_credentials(from), want, "{from:?}");
         }
     }
 }
