@@ -782,9 +782,11 @@ tracked as an open issue labeled `trunk-broken`, or as an open PR labeled
 - it closes, by a closing keyword such as `Fixes #N`, an issue labeled
   `trunk-broken` (a plain mention does not count, nor does closing an
   unlabeled issue);
-- it is a pure revert, by the same rule as [Reverts are
-  fast-tracked](#reverts-are-fast-tracked)
-  (`.github/scripts/pure_revert.mjs`), except that a fork's revert also counts.
+- it is a pure revert from a branch of this repository, by the same rule as
+  [Reverts are fast-tracked](#reverts-are-fast-tracked)
+  (`.github/scripts/pure_revert.mjs`). The rule reads the revert footers and
+  does not prove the changes undo the commits, so a fork's revert needs the
+  `fixes-trunk` label instead.
 
 The merge queue merges up to three entries together once the last one's checks
 pass, so the entries queued ahead of a PR merge on its run as well. In the

@@ -58,7 +58,11 @@ jobs:
       # .github/ change (CODEOWNERS). On the PR that adds this workflow
       # the base has no script yet and the check fails; it is not required
       # until it is on trunk.
+      # On a pull request the check is advisory, so a failure to load the gate
+      # must not leave a red required check behind; the merge-queue run, where
+      # a failure blocks, stays fail-closed.
       - name: Check out the base commit's scripts
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
@@ -67,6 +71,7 @@ jobs:
           persist-credentials: false
 
       - name: Check trunk health
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |

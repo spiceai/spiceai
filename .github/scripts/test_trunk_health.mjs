@@ -254,6 +254,18 @@ test('a pure revert may merge', async () => {
   assert.match(r.summary, /it is a pure revert/);
 });
 
+test('a fork\'s revert is not exempt: its footer is an unverified claim', async () => {
+  const reverted = 'a'.repeat(40);
+  const r = await gate(mergeGroup(), {
+    ...brokenIssue(7, 48),
+    pulls: { [PR]: { labels: [], fork: true } },
+    commits: { [PR]: [{ sha: 'c'.repeat(40), message: `Revert "x"\n\nThis reverts commit ${reverted}.` }] },
+    onBase: new Set([reverted]),
+  });
+  assert.equal(r.failed.length, 1);
+  assert.ok(!r.calls.includes('pulls.listCommits'), 'a fork PR is not checked for revert purity');
+});
+
 test('a revert of a commit not on trunk is not exempt', async () => {
   const r = await gate(mergeGroup(), {
     ...brokenIssue(7, 48),
@@ -386,6 +398,12 @@ test('the workflow runs the base commit\'s gate, never the PR\'s', () => {
   assert.match(workflow, /\/trusted\/\.github\/scripts\/trunk_health\.mjs/);
   assert.match(workflow, /persist-credentials: false/);
   assert.match(workflow, /name: Trunk Health\n/);
+  // Loading the gate is best-effort on a pull request only.
+  assert.equal(
+    (workflow.match(/continue-on-error: \$\{\{ github\.event_name == 'pull_request' \}\}/g) ?? []).length,
+    2
+  );
+  assert.doesNotMatch(workflow, /continue-on-error: true/);
 });
 
 await runAll();

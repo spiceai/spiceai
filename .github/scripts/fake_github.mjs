@@ -23,7 +23,7 @@ const httpError = (status, message) => Object.assign(new Error(message), { statu
  * - issues: [{ number, title, labels: [name], pr: bool }] — open issues and PRs
  * - events: { [number]: [{ event, label, created_at }] }
  * - runs: [{ conclusion, head_sha }] newest first, or 'missing' for a 404
- * - pulls: { [number]: { labels: [name] } }
+ * - pulls: { [number]: { labels: [name], fork? } }
  * - closing: { [number]: [{ number, labels: [name], repo? }] } (repo defaults to 'o/r')
  * - commits: { [number]: [{ sha, message }] }
  * - onBase: Set of SHAs that are ancestors of the base
@@ -135,7 +135,14 @@ export function fakeGithub(state = {}) {
         get: async ({ pull_number }) => {
           maybeFail('pulls.get');
           const pr = state.pulls?.[pull_number] ?? { labels: [] };
-          return { data: { number: pull_number, labels: pr.labels.map((name) => ({ name })) } };
+          return {
+            data: {
+              number: pull_number,
+              labels: pr.labels.map((name) => ({ name })),
+              head: { repo: { full_name: pr.fork ? 'someone/r' : 'o/r' } },
+              base: { repo: { full_name: 'o/r' } },
+            },
+          };
         },
         listCommits: async ({ pull_number }) => {
           maybeFail('pulls.listCommits');

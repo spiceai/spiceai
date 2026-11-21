@@ -22,7 +22,8 @@
 // nothing is labeled at all, merging is blocked until someone files the failure.
 //
 // A PR is exempt when it is labeled `fixes-trunk`, closes (by a closing link) an
-// issue labeled `trunk-broken`, or is a pure revert. Removing the label from a
+// issue labeled `trunk-broken`, or is a pure revert from a branch of this
+// repository. Removing the label from a
 // blocking item is the only override. See docs/dev/ci_signoff.md.
 //
 // The merge-queue run enforces. The pull_request run is advisory: it never
@@ -178,6 +179,13 @@ export async function exemption({ github, owner, repo, pr, baseSha }) {
     cursor = references.pageInfo.hasNextPage ? references.pageInfo.endCursor : null;
   } while (cursor !== null);
 
+  // A revert footer is the author's claim, and the check does not prove the
+  // changes undo the commit. From a branch of this repository that claim comes
+  // from someone with write access, who could label the PR `fixes-trunk`
+  // anyway; from a fork it costs nothing, so a fork's revert needs the label.
+  const sameRepo =
+    pr.head?.repo?.full_name !== undefined && pr.head.repo.full_name === pr.base?.repo?.full_name;
+  if (!sameRepo) return null;
   const revert = await checkPureRevert({ github, owner, repo, pullNumber: pr.number, baseSha });
   if (revert.pure) return 'it is a pure revert';
   return null;
