@@ -317,3 +317,47 @@ async fn a_required_inkling_call_goes_on_from_the_call_block_the_prompt_opened()
         "the call goes on from the arguments the prompt began: {city:?}"
     );
 }
+
+/// The reasoning a streamed reply sends, piece by piece.
+async fn reasoned(model: &Arc<dyn Chat>, body: Value) -> Vec<String> {
+    let mut stream = model.chat_stream(request(body)).await.expect("a stream");
+    let mut pieces = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        for choice in chunk.expect("a chunk").choices {
+            pieces.extend(choice.delta.reasoning_content.filter(|c| !c.is_empty()));
+        }
+    }
+    pieces
+}
+
+/// Text a grammar holds spells no `<|`, which the next turn's prompt would read as the start
+/// of a marker. The grammar is advanced over thinking the prompt began: `Note <` is allowed,
+/// so the reply goes on from it and sends it first, and `Note <<|` is refused, so it is not
+/// sent and the reply starts between blocks.
+#[tokio::test]
+async fn held_inkling_text_spells_no_marker_opening() {
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let gguf = gguf(scratch.path()).await;
+    let model = load(
+        &gguf,
+        &template("<|message_model|><|content_thinking|>Note <"),
+    )
+    .await;
+    let pieces = reasoned(&model, structured()).await;
+    drop(model);
+    assert_eq!(
+        pieces.first().map(String::as_str),
+        Some("Note <"),
+        "the thinking the prompt began is sent first: {pieces:?}"
+    );
+    let model = load(
+        &gguf,
+        &template("<|message_model|><|content_thinking|>Note <<|"),
+    )
+    .await;
+    let pieces = reasoned(&model, structured()).await;
+    assert!(
+        !pieces.concat().starts_with("Note <<|"),
+        "the refused thinking is not sent: {pieces:?}"
+    );
+}

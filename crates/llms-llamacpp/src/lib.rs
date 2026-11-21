@@ -3050,7 +3050,7 @@ fn harmony_rules(markers: &harmony::Markers) -> String {
         "analysis ::= {channel} \"analysis\" {message} reasoning {end} {start} \"assistant\""
     );
     // The text between markers holds no `<|`, so it cannot spell one either.
-    rules.push_str("reasoning ::= ([^<] | \"<\" [^|])*\n");
+    rules.push_str("reasoning ::= ([^<] | \"<\"+ [^|<])* \"<\"*\n");
     let _ = writeln!(rules, "constrain ::= \" \" {constrain}? [A-Za-z0-9_-]+");
     rules
 }
@@ -3110,7 +3110,7 @@ fn inkling_rules(markers: &inkling::Markers) -> String {
     let mut rules = String::new();
     let _ = writeln!(rules, "thinking ::= {header} {thinking} body {end}");
     // The text between markers holds no `<|`, so it cannot spell one either.
-    rules.push_str("body ::= ([^<] | \"<\" [^|])*\n");
+    rules.push_str("body ::= ([^<] | \"<\"+ [^|<])* \"<\"*\n");
     rules
 }
 
@@ -4528,6 +4528,11 @@ mod tests {
             grammar.contains("constrain ::= \" \" <[7]>? [A-Za-z0-9_-]+\n"),
             "{grammar}"
         );
+        // reasoning text spells no `<|`, not even after another `<`
+        assert!(
+            grammar.contains("\nreasoning ::= ([^<] | \"<\"+ [^|<])* \"<\"*\n"),
+            "{grammar}"
+        );
         assert!(
             !grammar.contains("<|"),
             "no marker is written as text: {grammar}"
@@ -5162,6 +5167,11 @@ mod tests {
             "{grammar}"
         );
         assert!(!grammar.contains("<[13]>"), "{grammar}");
+        // text spells no `<|`, not even after another `<`
+        assert!(
+            grammar.contains("\nbody ::= ([^<] | \"<\"+ [^|<])* \"<\"*\n"),
+            "{grammar}"
+        );
         assert!(
             grammar.contains(
                 "\ncall ::= <[11]> (\"get_weather\" <[14]> \"{\\\"name\\\":\\\"get_weather\\\",\\\"args\\\":\" tool0-root \"}\" <[17]>)\n"
