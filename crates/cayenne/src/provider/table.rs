@@ -76143,8 +76143,12 @@ mod tests {
             )
             .await;
         }
+        // Wait for every maintenance task, not only the queued post-write state: a
+        // manifest rebuild that found `compaction_lock` held reschedules itself as a
+        // detached retry that `flush_pending_maintenance` does not await, and while
+        // it holds the lock the bake below declines (#16515).
         provider
-            .flush_pending_maintenance()
+            .drain_in_flight_maintenance()
             .await
             .expect("drain maintenance");
         let expected = vec![(1, 10), (2, 20), (3, 30), (7, 40)];
