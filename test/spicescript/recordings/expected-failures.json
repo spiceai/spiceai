@@ -1519,6 +1519,24 @@
     },
     {
       "run": "postgres-cdc-parity",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-parity",
       "who": "object-native-s3-latency",
       "key": "query: SELECT * FROM orders #11",
       "kind": "wrong-answer",
