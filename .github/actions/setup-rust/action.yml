@@ -152,6 +152,50 @@ runs:
             ;;
         esac
 
+        # With a CI cache (CI_CACHE_URL, set by the workflow), install the toolchain from a
+        # local mirror of its pinned release before anything below asks rustup for it:
+        # `rustup show` installs the toolchain rust-toolchain.toml names from
+        # static.rust-lang.org when it is missing, which every fresh runner pod pays. The
+        # mirror is built by .github/scripts/rust_dist_mirror.py from the CI cache, or from
+        # static.rust-lang.org for any file the cache lacks, and every file is checked
+        # against the manifest pinned in .github/ci-cache/pins.json; rustup checks the
+        # component hashes again. RUSTUP_DIST_SERVER points at the mirror for this install
+        # only, so a later `rustup target add` still reaches static.rust-lang.org. If any
+        # of it fails, the install below runs from static.rust-lang.org as before.
+        if [ -n "${CI_CACHE_URL:-}" ]; then
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) cache_host=x86_64-unknown-linux-gnu ;;
+            Linux-aarch64) cache_host=aarch64-unknown-linux-gnu ;;
+            Darwin-arm64) cache_host=aarch64-apple-darwin ;;
+            Darwin-x86_64) cache_host=x86_64-apple-darwin ;;
+            *) cache_host='' ;;
+          esac
+          cache_tool_dir="$rustup_home/toolchains/${toolchain}-${cache_host}"
+          if [ -n "$cache_host" ] && ! { [ -x "$cache_tool_dir/bin/rustc" ] && [ -x "$cache_tool_dir/bin/cargo" ] &&
+            [ -x "$cache_tool_dir/bin/rustfmt" ] && [ -x "$cache_tool_dir/bin/cargo-clippy" ]; }; then
+            mirror="${RUNNER_TEMP:-/tmp}/rust-dist-${toolchain}"
+            rm -rf "$mirror"
+            status=0
+            python3 "$GITHUB_ACTION_PATH/../../scripts/rust_dist_mirror.py" \
+              --toolchain "$toolchain" --host "$cache_host" --out "$mirror" || status=$?
+            if [ "$status" -eq 0 ]; then
+              rm -rf "$cache_tool_dir"
+              rm -f "$rustup_home/update-hashes/${toolchain}-${cache_host}"
+              if RUSTUP_DIST_SERVER="file://$mirror" rustup toolchain install "$toolchain" \
+                --profile minimal --component rustfmt --component clippy --no-self-update; then
+                echo "Installed Rust $toolchain from the CI cache's pinned release."
+              else
+                echo "::warning::Installing Rust $toolchain from the local mirror of its pinned release failed; installing it from static.rust-lang.org instead."
+                rm -rf "$cache_tool_dir"
+                rm -f "$rustup_home/update-hashes/${toolchain}-${cache_host}"
+              fi
+            elif [ "$status" -ne 3 ]; then
+              echo "::warning::Could not assemble Rust $toolchain from its pinned release (exit $status); installing it from static.rust-lang.org instead."
+            fi
+            rm -rf "$mirror"
+          fi
+        fi
+
         host="$(rustup show | awk '/^Default host:/ { print $3; exit }')"
         if [ -z "$host" ]; then
           echo "rustup did not report a default host" >&2
