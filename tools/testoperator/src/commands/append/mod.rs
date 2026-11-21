@@ -134,7 +134,7 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         test_metrics.emit(TestStatus::Failed).await?;
         return Err(e);
     }
-    let health_monitor = HealthMonitor::spawn()?;
+    let health_monitor = HealthMonitor::spawn(spiced_instance.http_base_url())?;
 
     let append_test = append_test
         .with_spiced_instance(spiced_instance)

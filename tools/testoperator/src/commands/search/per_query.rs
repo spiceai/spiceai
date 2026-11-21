@@ -15,8 +15,11 @@ limitations under the License.
 */
 
 //! Per-query retrieval metrics of a `testoperator run search` run, recorded as OTEL gauges at
-//! the primary rank cutoff. Two runs over the same query set pair up by query id, which is the
-//! input a paired significance test between two runs needs.
+//! the primary rank cutoff, or with `--per-query-all-k` at every cutoff up to it. Two runs over
+//! the same query set pair up by query id, which is the input a paired significance test between
+//! two runs needs.
+
+use std::ops::RangeInclusive;
 
 use test_framework::{anyhow, opentelemetry::KeyValue, spicetest::search::RetrievalEvaluation};
 
@@ -32,29 +35,45 @@ pub(crate) fn primary_k(evaluation: &RetrievalEvaluation) -> Option<usize> {
     }
 }
 
-/// Records each judged query's metrics at cutoff `k`, with `query_id` and `k` attributes. The
-/// dataset and spicepod attributes come from the telemetry resource, as for the run-level metrics.
+/// The cutoffs to record per-query metrics at: `primary_k` only, or with `all_k` every cutoff
+/// from 1 to `primary_k`.
+pub(crate) fn cutoffs(primary_k: usize, all_k: bool) -> RangeInclusive<usize> {
+    if all_k {
+        1..=primary_k
+    } else {
+        primary_k..=primary_k
+    }
+}
+
+/// Records each judged query's metrics at each of `cutoffs`, with `query_id` and `k` attributes.
+/// The dataset and spicepod attributes come from the telemetry resource, as for the run-level
+/// metrics.
 ///
-/// Only one cutoff is recorded, so a run adds 4 points per judged query. All cutoffs would
-/// multiply that by `max_k`.
-pub(crate) fn record_metrics(evaluation: &RetrievalEvaluation, k: usize) -> anyhow::Result<()> {
-    let k_attr = KeyValue::new("k", i64::try_from(k)?);
-    for (query_id, metrics) in evaluation.at_k(k) {
-        let attributes = [
-            KeyValue::new("query_id", query_id.to_string()),
-            k_attr.clone(),
-        ];
-        crate::metrics::SEARCH_QUERY_NDCG.record(metrics.ndcg, &attributes);
-        crate::metrics::SEARCH_QUERY_RECALL.record(metrics.recall, &attributes);
-        crate::metrics::SEARCH_QUERY_RECIPROCAL_RANK.record(metrics.mrr, &attributes);
-        crate::metrics::SEARCH_QUERY_PRECISION.record(metrics.precision, &attributes);
+/// A run adds 4 points per judged query per cutoff, so the default of one cutoff keeps the
+/// volume low.
+pub(crate) fn record_metrics(
+    evaluation: &RetrievalEvaluation,
+    cutoffs: RangeInclusive<usize>,
+) -> anyhow::Result<()> {
+    for k in cutoffs {
+        let k_attr = KeyValue::new("k", i64::try_from(k)?);
+        for (query_id, metrics) in evaluation.at_k(k) {
+            let attributes = [
+                KeyValue::new("query_id", query_id.to_string()),
+                k_attr.clone(),
+            ];
+            crate::metrics::SEARCH_QUERY_NDCG.record(metrics.ndcg, &attributes);
+            crate::metrics::SEARCH_QUERY_RECALL.record(metrics.recall, &attributes);
+            crate::metrics::SEARCH_QUERY_RECIPROCAL_RANK.record(metrics.mrr, &attributes);
+            crate::metrics::SEARCH_QUERY_PRECISION.record(metrics.precision, &attributes);
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::primary_k;
+    use super::{cutoffs, primary_k};
     use std::collections::HashMap;
     use test_framework::spicetest::search::RetrievalEvaluation;
 
@@ -77,5 +96,15 @@ mod tests {
         assert_eq!(primary_k(&evaluation(10)), Some(10));
         assert_eq!(primary_k(&evaluation(3)), Some(3));
         assert_eq!(primary_k(&evaluation(0)), None);
+    }
+
+    #[test]
+    fn cutoffs_are_the_primary_k_or_every_cutoff_up_to_it() {
+        assert_eq!(cutoffs(10, false).collect::<Vec<_>>(), vec![10]);
+        assert_eq!(
+            cutoffs(10, true).collect::<Vec<_>>(),
+            (1..=10).collect::<Vec<_>>()
+        );
+        assert_eq!(cutoffs(3, true).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 }

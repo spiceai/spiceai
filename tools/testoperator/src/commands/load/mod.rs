@@ -125,7 +125,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // Create telemetry with resource upfront, before any metrics calls
     let telemetry = super::create_telemetry_with_resource(&args.test_args.common, load_resource);
 
-    let health_monitor = HealthMonitor::spawn()?;
+    let health_monitor = HealthMonitor::spawn(spiced_instance.http_base_url())?;
 
     // Start metrics scraper if enabled
     let metrics_scraper = if args.test_args.common.scrape_spiced_metrics {

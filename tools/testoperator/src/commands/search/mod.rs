@@ -18,7 +18,7 @@ mod harness;
 mod per_query;
 mod spicepod;
 use self::spicepod::BenchmarkDataset;
-use super::{duration_millis_between, get_app_and_start_request};
+use super::{create_telemetry_with_resource, duration_millis_between, get_app_and_start_request};
 use crate::{
     args::{SearchTestArgs, SqlPipelineArg},
     health::HealthMonitor,
@@ -35,7 +35,6 @@ use test_framework::{
         SpiceTest,
         search::{NotStarted, RetrievalMetrics, SearchMethod, SearchRunMetric, SqlPipeline},
     },
-    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
 };
@@ -88,9 +87,9 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         .build();
 
     // Create telemetry with resource upfront, before any metrics calls
-    let telemetry = Telemetry::new_with_resource(&search_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+    let telemetry = create_telemetry_with_resource(&args.common, search_resource);
 
-    let health_monitor = HealthMonitor::spawn()?;
+    let health_monitor = HealthMonitor::spawn(spiced_instance.http_base_url())?;
 
     let index_finished_at = Instant::now();
 
@@ -186,7 +185,10 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         crate::metrics::SEARCH_MRR.record(metrics_at_k.mrr, &k_attr);
         crate::metrics::SEARCH_PRECISION.record(metrics_at_k.precision, &k_attr);
     }
-    per_query::record_metrics(&evaluation, primary_k)?;
+    per_query::record_metrics(
+        &evaluation,
+        per_query::cutoffs(primary_k, args.per_query_all_k),
+    )?;
     if let Some((max_memory, median_memory)) = memory_usage {
         crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
         crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);

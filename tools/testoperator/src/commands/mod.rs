@@ -524,7 +524,8 @@ async fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<S
     spicepod.version = Spicepod::load_exact(args.spicepod_path.clone())
         .await?
         .version;
-    let mut start_request = StartRequest::new(args.spiced_path_buf(), spicepod)?;
+    let mut start_request =
+        StartRequest::new(args.spiced_path_buf(), spicepod)?.with_ports(args.spiced_ports());
 
     if let Some(ref data_dir) = args.data_dir {
         start_request = start_request.with_data_dir(data_dir.clone());

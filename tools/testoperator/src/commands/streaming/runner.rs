@@ -170,6 +170,7 @@ pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
     // Phase 6: Start Spice with metrics enabled
     println!("\nPhase 6: Starting Spice");
     let mut start_request = StartRequest::new(args.common.spiced_path_buf(), transformed)?
+        .with_ports(args.common.spiced_ports())
         .with_additional_args(vec!["--metrics".to_string(), "0.0.0.0:9090".to_string()]);
 
     if let Some(ref data_dir) = args.common.data_dir {
@@ -214,7 +215,7 @@ pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
     // Phase 8: Start liveness monitors if enabled
     let health_monitor = if args.enable_liveness {
         println!("Starting health liveness monitor");
-        Some(HealthMonitor::spawn()?)
+        Some(HealthMonitor::spawn(spiced_instance.http_base_url())?)
     } else {
         None
     };

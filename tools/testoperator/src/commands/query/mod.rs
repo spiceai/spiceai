@@ -37,7 +37,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         .wait_for_ready(Duration::from_secs(10))
         .await?;
 
-    let health_monitor = HealthMonitor::spawn()?;
+    let health_monitor = HealthMonitor::spawn(spiced_instance.http_base_url())?;
 
     // Create the appropriate query executor based on args
     let executor = super::create_query_executor(args, &spiced_instance).await?;

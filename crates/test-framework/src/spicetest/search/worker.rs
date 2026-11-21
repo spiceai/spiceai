@@ -25,7 +25,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
-use crate::constants::{HTTP_BASE_URL, SEARCH_ENDPOINT, SQL_ENDPOINT};
+use crate::constants::{SEARCH_ENDPOINT, SQL_ENDPOINT};
 
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct SearchRequest {
@@ -216,6 +216,8 @@ pub struct SearchResult {
 pub(crate) struct VectorSearchWorker {
     worker_id: usize,
     http_client: Client,
+    /// HTTP base URL of the spiced instance under test.
+    http_base_url: Arc<str>,
     config: SearchConfig,
 }
 
@@ -299,10 +301,16 @@ pub struct SearchResponseResult {
 }
 
 impl VectorSearchWorker {
-    pub fn new(worker_id: usize, http_client: Client, config: SearchConfig) -> Self {
+    pub fn new(
+        worker_id: usize,
+        http_client: Client,
+        http_base_url: Arc<str>,
+        config: SearchConfig,
+    ) -> Self {
         Self {
             worker_id,
             http_client,
+            http_base_url,
             config,
         }
     }
@@ -312,6 +320,7 @@ impl VectorSearchWorker {
             let Self {
                 worker_id,
                 http_client,
+                http_base_url,
                 config: SearchConfig { requests, method },
             } = self;
             let mut results: BTreeMap<String, SearchResult> = BTreeMap::new();
@@ -322,7 +331,8 @@ impl VectorSearchWorker {
 
             for (index, request) in requests.into_iter().enumerate() {
                 let start = Instant::now();
-                let response = send_request(&http_client, &method, &request).await?;
+                let response =
+                    send_request(&http_client, &http_base_url, &method, &request).await?;
                 let duration = start.elapsed();
                 results.insert(
                     request.id,
@@ -358,15 +368,16 @@ impl VectorSearchWorker {
 /// includes the response body.
 async fn send_request(
     http_client: &Client,
+    http_base_url: &str,
     method: &SearchMethod,
     request: &SearchRequest,
 ) -> Result<SearchResponse> {
     let builder = match method {
         SearchMethod::SearchApi => http_client
-            .post(format!("{HTTP_BASE_URL}{SEARCH_ENDPOINT}"))
+            .post(format!("{http_base_url}{SEARCH_ENDPOINT}"))
             .json(request),
         SearchMethod::Sql(pipeline) => http_client
-            .post(format!("{HTTP_BASE_URL}{SQL_ENDPOINT}"))
+            .post(format!("{http_base_url}{SQL_ENDPOINT}"))
             .json(&pipeline.body(request)),
     };
     let res = builder.send().await?;
