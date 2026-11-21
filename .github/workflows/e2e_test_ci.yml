@@ -518,7 +518,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -621,7 +621,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -801,7 +801,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -884,7 +884,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -958,7 +958,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -1056,7 +1056,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Get RustFS credentials
         id: rustfs
@@ -1167,7 +1167,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -1355,7 +1355,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -1547,7 +1547,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -1643,7 +1643,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init Spice app
         run: |
@@ -1722,7 +1722,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -1850,7 +1850,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -2049,7 +2049,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -2237,7 +2237,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Test GitHub against a local API fixture
         run: |
@@ -2317,7 +2317,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       # Anonymous Hub requests share a per-IP quota across the runner pool; the token,
       # when the secret is available, gives this job its own.
@@ -2397,7 +2397,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -2489,7 +2489,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Init spice app
         run: |
@@ -2635,7 +2635,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: check installation
         run: |
@@ -2876,7 +2876,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: check installation
         run: |
@@ -3092,7 +3092,7 @@ jobs:
         uses: $/.github/actions/install-spice
         with:
           build-path: ./build
-          install-dir: ${{ runner.temp }}/spice/bin
+          install-scope: job
 
       - name: Get RustFS credentials
         id: rustfs

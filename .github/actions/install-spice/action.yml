@@ -4,30 +4,42 @@ inputs:
   build-path:
     description: 'Directory containing Spice binaries'
     required: true
-  install-dir:
+  install-scope:
     description: |
-      Directory to install `spice` and `spiced` into (not used on Windows). Empty
-      installs into `$HOME/.spice/bin`, the directory `spice install` and
-      `spice upgrade` manage. On a self-hosted runner whose instances share a host
-      and a user, pass a directory of the job's own, such as `spice/bin` under the
-      runner's temporary directory (the `runner.temp` context): two jobs installing into one shared
-      `$HOME/.spice/bin` replace each other's binaries, so a job can start the
-      other job's `spiced`. `spice run` starts the `spiced` beside the `spice`
-      it runs, so the two stay paired in either directory.
+      Where to install `spice` and `spiced` (not used on Windows, which always
+      installs into `$HOME\.spice\bin`). `user` (the default) installs into
+      `$HOME/.spice/bin`, the directory `spice install` and `spice upgrade` manage.
+      `job` installs into `spice/bin` under the runner's temporary directory
+      (`RUNNER_TEMP`), which belongs to this job alone. Pass `job` on a self-hosted
+      runner whose instances share a host and a user: two jobs installing into one
+      shared `$HOME/.spice/bin` replace each other's binaries, so a job can start
+      the other job's `spiced`. `spice run` starts the `spiced` beside the `spice`
+      it runs, so the two stay paired in either directory. The action picks the
+      directory itself rather than taking a path, so no caller-supplied string is
+      added to `PATH`.
     required: false
-    default: ''
+    default: 'user'
 
 runs:
   using: 'composite'
   steps:
     - name: Install Spice binaries
+      id: install
       shell: bash
       if: runner.os != 'Windows'
       env:
         INPUT_BUILD_PATH: ${{ inputs.build-path }}
-        INPUT_INSTALL_DIR: ${{ inputs.install-dir }}
+        INPUT_INSTALL_SCOPE: ${{ inputs.install-scope }}
       run: |
-        install_dir="${INPUT_INSTALL_DIR:-$HOME/.spice/bin}"
+        case "$INPUT_INSTALL_SCOPE" in
+          user | '') install_dir="$HOME/.spice/bin" ;;
+          job) install_dir="${RUNNER_TEMP:?RUNNER_TEMP is not set}/spice/bin" ;;
+          *)
+            echo "::error::install-spice: install-scope must be 'user' or 'job'"
+            exit 1
+            ;;
+        esac
+        echo "dir=$install_dir" >> "$GITHUB_OUTPUT"
         echo "Installing Spice from local folder: ${INPUT_BUILD_PATH}"
 
         chmod +x "${INPUT_BUILD_PATH}/spice"
@@ -76,9 +88,9 @@ runs:
       shell: bash
       if: runner.os != 'Windows'
       env:
-        INPUT_INSTALL_DIR: ${{ inputs.install-dir }}
+        INSTALL_DIR: ${{ steps.install.outputs.dir }}
       run: |
-        install_dir="${INPUT_INSTALL_DIR:-$HOME/.spice/bin}"
+        install_dir="${INSTALL_DIR:?the install step reported no directory}"
         # Verify binaries exist and are executable
         if [ ! -x "$install_dir/spice" ]; then
           echo "ERROR: spice binary not found or not executable"
