@@ -9,8 +9,8 @@ inputs:
       Directory to install `spice` and `spiced` into (not used on Windows). Empty
       installs into `$HOME/.spice/bin`, the directory `spice install` and
       `spice upgrade` manage. On a self-hosted runner whose instances share a host
-      and a user, pass a directory of the job's own, such as
-      `${{ runner.temp }}/spice/bin`: two jobs installing into one shared
+      and a user, pass a directory of the job's own, such as `spice/bin` under the
+      runner's temporary directory (the `runner.temp` context): two jobs installing into one shared
       `$HOME/.spice/bin` replace each other's binaries, so a job can start the
       other job's `spiced`. `spice run` starts the `spiced` beside the `spice`
       it runs, so the two stay paired in either directory.
