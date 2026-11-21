@@ -20,8 +20,9 @@ limitations under the License.
 //! series of shards (`Model-Q4_K_M-00001-of-00003.gguf` …), often one folder each
 //! (`UD-Q2_K_XL/…`), and sometimes MTP draft heads (`MTP/mtp-Model-Q8_0.gguf`) and vision
 //! projectors (`mmproj-F16.gguf`). A model's `files` may name exact files, a quantization by
-//! name or folder, or nothing; [`resolve`] turns each into the files to download, and
-//! [`choose`] picks a quantization when none is named.
+//! name or folder, or nothing; [`resolve`] turns each into the files to download, and with
+//! none named [`default_quantization`] picks llama.cpp's default, which [`choose`] replaces with
+//! the largest that fits when it does not.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -147,6 +148,15 @@ fn is_projector(path: &str) -> bool {
     file_name(path).to_ascii_lowercase().starts_with("mmproj")
 }
 
+/// A file that is not the model's weights though it is a GGUF file: an importance matrix, or a
+/// DFlash, EAGLE-3 or DSpark drafter, as llama.cpp's `-hf` tells them apart by name.
+fn is_sidecar(path: &str) -> bool {
+    let name = file_name(path).to_ascii_lowercase();
+    ["imatrix", "dflash-", "eagle3-", "dspark-"]
+        .iter()
+        .any(|keyword| name.contains(keyword))
+}
+
 /// The shard series a file belongs to, `(series key, index, count)`, or `None` for a lone file.
 fn shard(path: &str) -> Option<(String, u32, u32)> {
     let caps = SHARD.as_ref()?.captures(path)?;
@@ -213,9 +223,9 @@ fn tag(path: &str) -> Option<String> {
     Some(caps.name("tag")?.as_str().to_string())
 }
 
-/// The model's complete quantizations in the listing, largest first. Draft heads and
-/// projectors are not quantizations of the model; a shard series with a shard missing is not
-/// complete and is left out.
+/// The model's complete quantizations in the listing, largest first. Draft heads, drafters,
+/// importance matrices and projectors are not quantizations of the model; a shard series with
+/// a shard missing is not complete and is left out.
 #[must_use]
 pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
     let size: BTreeMap<&str, u64> = listing.iter().map(|f| (f.path.as_str(), f.size)).collect();
@@ -224,7 +234,7 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
     let mut groups: BTreeMap<(String, String, Option<u32>), Vec<&str>> = BTreeMap::new();
     for file in listing {
         let path = file.path.as_str();
-        if !is_gguf(path) || is_draft_head(path) || is_projector(path) {
+        if !is_gguf(path) || is_draft_head(path) || is_projector(path) || is_sidecar(path) {
             continue;
         }
         let (stem, count) =
@@ -471,6 +481,44 @@ pub fn resolve(
 pub fn weights_budget(memory: u64) -> u64 {
     const RESERVE: u64 = 4 << 30;
     (memory - memory / 10).saturating_sub(RESERVE)
+}
+
+/// The quantization tags a model with no `files` loads by default, in order: those of
+/// llama.cpp's `-hf`, so a repository loads the file `llama-server -hf <repo>` loads.
+pub const DEFAULT_TAGS: [&str; 2] = ["Q4_K_M", "Q8_0"];
+
+/// The quantization a model with no `files` loads by default, as llama.cpp's `-hf` picks it:
+/// the first by path whose first file's path carries [`DEFAULT_TAGS`]' `Q4_K_M`, else `Q8_0`,
+/// else the first by path. A path carries a tag where the tag follows the path's start, `-`,
+/// `.` or `/` and comes before `.` or `-`, in any case, so `UD-Q4_K_M` and a `Q4_K_M/` folder
+/// carry `Q4_K_M` and `BF16` does not carry `F16`. `None` when there is none.
+#[must_use]
+pub fn default_quantization(quantizations: &[Quantization]) -> Option<&Quantization> {
+    let mut by_path: Vec<&Quantization> = quantizations.iter().collect();
+    by_path.sort_by(|a, b| a.files.first().cmp(&b.files.first()));
+    DEFAULT_TAGS
+        .iter()
+        .find_map(|tag| by_path.iter().copied().find(|q| carries(q, tag)))
+        .or_else(|| by_path.first().copied())
+}
+
+/// Whether `quantization`'s first file's path carries the quantization tag `tag` as a whole
+/// token, as llama.cpp matches it: after the path's start, `-`, `.` or `/`, and before `.` or
+/// `-`, in any case.
+#[must_use]
+pub fn carries(quantization: &Quantization, tag: &str) -> bool {
+    let path = quantization
+        .files
+        .first()
+        .map_or_else(String::new, |path| path.to_ascii_lowercase());
+    let tag = tag.to_ascii_lowercase();
+    path.match_indices(&tag).any(|(at, _)| {
+        let before = path.get(..at).and_then(|head| head.chars().next_back());
+        let after = path
+            .get(at + tag.len()..)
+            .and_then(|tail| tail.chars().next());
+        matches!(before, None | Some('-' | '.' | '/')) && matches!(after, Some('.' | '-'))
+    })
 }
 
 /// The largest complete quantization whose weights fit `budget` bytes, or the smallest one,
@@ -730,6 +778,83 @@ mod tests {
             choose(&[], GB).map_err(|smallest| smallest.is_none()),
             Err(true)
         );
+    }
+
+    /// A cut of unsloth/GLM-4.7-Flash-GGUF's listing (2026-11-21): single files at the top, and
+    /// `BF16` in a folder of two shards, which sorts first by path.
+    fn glm47() -> Vec<ListedFile> {
+        listing(&[
+            ("BF16/GLM-4.7-Flash-BF16-00001-of-00002.gguf", 49_910_000_000),
+            ("BF16/GLM-4.7-Flash-BF16-00002-of-00002.gguf", 10_000_000_000),
+            ("GLM-4.7-Flash-Q3_K_M.gguf", 14_610_000_000),
+            ("GLM-4.7-Flash-Q4_K_M.gguf", 18_310_000_000),
+            ("GLM-4.7-Flash-Q8_0.gguf", 31_840_000_000),
+            ("GLM-4.7-Flash-UD-Q4_K_XL.gguf", 17_520_000_000),
+            ("GLM-4.7-Flash-UD-TQ1_0.gguf", 8_330_000_000),
+            ("README.md", 10_000),
+        ])
+    }
+
+    fn default_name(listing: &[ListedFile]) -> Option<String> {
+        default_quantization(&quantizations(listing)).map(|q| q.name.clone())
+    }
+
+    #[test]
+    fn the_default_is_the_quantization_llama_cpp_loads() {
+        // Q4_K_M where the repository offers it, whatever larger ones fit.
+        assert_eq!(default_name(&glm47()).as_deref(), Some("Q4_K_M"));
+        assert_eq!(default_name(&qwen3()).as_deref(), Some("Q4_K_M"));
+        // Else Q8_0: GLM-5.3's folders are UD-Q2_K_XL and Q8_0.
+        assert_eq!(default_name(&glm()).as_deref(), Some("Q8_0"));
+        // Else the first by path: Qwen3.8's UD-Q2_K_XL/ before UD-Q3_K_XL/. Its MTP heads carry
+        // Q4_K_M and Q8_0 but are not quantizations of the model.
+        assert_eq!(default_name(&qwen38()).as_deref(), Some("UD-Q2_K_XL"));
+        assert_eq!(default_quantization(&[]), None);
+    }
+
+    #[test]
+    fn a_tag_is_carried_as_a_whole_token_of_the_path() {
+        let q = |path: &str| Quantization {
+            name: String::new(),
+            files: vec![path.to_string()],
+            bytes: 0,
+        };
+        for (path, tag, carried) in [
+            ("Model-Q4_K_M.gguf", "Q4_K_M", true),
+            ("model-q4_k_m.gguf", "Q4_K_M", true),
+            ("Model-UD-Q4_K_M.gguf", "Q4_K_M", true),
+            ("Q4_K_M/Model-Q4_K_M-00001-of-00002.gguf", "Q4_K_M", true),
+            ("Q4_K_M.gguf", "Q4_K_M", true),
+            ("Model.Q8_0.gguf", "Q8_0", true),
+            ("Model-BF16.gguf", "F16", false),
+            ("Model-F16.gguf", "F16", true),
+            ("Model-IQ4_K_M.gguf", "Q4_K_M", false),
+            ("Model-Q4_K_M_L.gguf", "Q4_K_M", false),
+            ("Model-Q8_0_XL.gguf", "Q8_0", false),
+        ] {
+            assert_eq!(carries(&q(path), tag), carried, "{path} carries {tag}");
+        }
+        // A repository whose only Q4_K_M is unsloth's UD- one loads it, as llama.cpp does.
+        let ud = listing(&[
+            ("Model-Q8_0.gguf", 8 * GB),
+            ("Model-UD-Q4_K_M.gguf", 4 * GB),
+        ]);
+        assert_eq!(default_name(&ud).as_deref(), Some("UD-Q4_K_M"));
+    }
+
+    #[test]
+    fn importance_matrices_and_drafters_are_not_quantizations() {
+        let with_sidecars = listing(&[
+            ("DeepSeek-V4.1-Flash-Q2_K.gguf", 90 * GB),
+            ("dspark-DeepSeek-V4.1-Flash-Q8_0.gguf", 2 * GB),
+            ("DFlash/dflash-DeepSeek-V4.1-Flash-Q8_0.gguf", 2 * GB),
+            ("eagle3-DeepSeek-V4.1-Flash-Q8_0.gguf", GB),
+            ("imatrix_unsloth.gguf", 10_000_000),
+            ("mmproj-F16.gguf", GB),
+        ]);
+        assert_eq!(names(&quantizations(&with_sidecars)), vec!["Q2_K"]);
+        // So a drafter's Q8_0 is not taken for the model's.
+        assert_eq!(default_name(&with_sidecars).as_deref(), Some("Q2_K"));
     }
 
     #[test]

@@ -27,8 +27,10 @@ limitations under the License.
 //!
 //! A GGUF model loads the files its `files` resolve to ([`gguf_files::resolve`]): exact
 //! files with their sibling shards, or a quantization by name with the repository's draft
-//! head. A GGUF repository named with no `files` loads the largest complete quantization that
-//! fits the memory the engine reports.
+//! head. A GGUF repository named with no `files` loads the quantization llama.cpp's `-hf`
+//! loads ([`gguf_files::default_quantization`]: `Q4_K_M`, else `Q8_0`, else its first), or, when
+//! the engine reports less memory than its weights need, the largest complete quantization that
+//! fits.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -55,12 +57,13 @@ pub struct Downloaded {
 /// What a model that names no GGUF files chooses its quantization by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Budget {
-    /// The memory free for the model, in bytes: the largest quantization whose weights fit it.
+    /// The memory free for the model, in bytes: the default quantization when its weights fit
+    /// it with room for the context, or else the largest that does.
     Free(u64),
-    /// No engine measures the memory, so only a repository's one quantization is chosen.
+    /// No engine measures the memory: the default quantization.
     Unmeasured,
-    /// The model is split across machines, each of which would choose by its own memory, so
-    /// only a repository's one quantization is chosen: every machine must load the same files.
+    /// The model is split across machines, which must all load the same files: the default
+    /// quantization, which depends on the repository alone, never on one machine's memory.
     Split,
 }
 
@@ -146,7 +149,7 @@ async fn open(model_id: &str, hub: HubParams<'_>, name: &str) -> Result<Snapshot
 }
 
 /// The GGUF files a model loads from `snapshot`: those `files` resolve to, or with none named,
-/// the largest complete quantization whose weights fit `memory`, and its draft head. Empty for
+/// the quantization `budget` chooses ([`choose_quantization`]), and its draft head. Empty for
 /// a repository that offers no GGUF quantization or that mistral.rs loads from safetensors.
 fn resolve_gguf(
     snapshot: &Snapshot,
@@ -192,8 +195,10 @@ fn resolve_gguf(
     Ok(gguf)
 }
 
-/// The quantization a model with no `files` loads: the only one, or the largest whose weights
-/// fit `memory` with room for the context.
+/// The quantization a model with no `files` loads: its default, the one llama.cpp's `-hf` loads
+/// ([`gguf_files::default_quantization`]), or, when the engine measures the memory and the
+/// default's weights do not fit it with room for the context, the largest that does. A split
+/// model and a build that cannot measure the memory take the default as it is.
 fn choose_quantization<'q>(
     snapshot: &Snapshot,
     listing: &[ListedFile],
@@ -209,48 +214,44 @@ fn choose_quantization<'q>(
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let pin = |q: &Quantization| {
+        gguf_files::pin(listing, q)
+            .iter()
+            .map(|entry| format!("{{path: {entry}}}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let Some(default) = gguf_files::default_quantization(quantizations) else {
+        return Err(DownloadError::unusable(
+            snapshot,
+            "it offers no complete GGUF quantization".to_string(),
+        ));
+    };
     let memory = match budget {
-        Budget::Free(memory) => memory,
-        Budget::Unmeasured | Budget::Split => {
-            if let [only] = quantizations {
-                return Ok(only);
-            }
-            let why = if budget == Budget::Split {
-                "a model split across machines names its quantization, so that every machine loads the same weights"
-            } else {
-                "this build cannot measure the memory to choose one"
-            };
-            return Err(DownloadError::unusable(
-                snapshot,
-                format!(
-                    "it offers {} GGUF quantizations ({}) and {why}. Name one in the model's `files`, as `files: [{{path: {}}}]`",
-                    quantizations.len(),
-                    names(),
-                    quantizations.last().map_or("", |q| q.name.as_str())
-                ),
-            ));
+        Budget::Free(memory) if default.bytes > gguf_files::weights_budget(memory) => memory,
+        Budget::Free(_) | Budget::Unmeasured | Budget::Split => {
+            tracing::info!(
+                "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the quantization a model with no `files` loads: {}. To load another of its {} complete GGUF quantizations, name it in the model's `files`: {}.",
+                describe(Some(&default.name), default.files.len()),
+                gigabytes(default.bytes),
+                default_reason(quantizations, default),
+                quantizations.len(),
+                names()
+            );
+            return Ok(default);
         }
     };
     match gguf_files::choose(quantizations, gguf_files::weights_budget(memory)) {
         Ok(chosen) => {
-            let larger = quantizations
-                .iter()
-                .rev()
-                .find(|q| q.bytes > chosen.bytes)
-                .map_or_else(String::new, |q| {
-                    format!("; {} ({}) does not", q.name, gigabytes(q.bytes))
-                });
             tracing::info!(
-                "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the largest of its {} complete GGUF quantizations whose weights fit the {} of memory free for it with room for the context{larger}. Pin it with `files: [{}]`.",
+                "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the largest of its {} complete GGUF quantizations whose weights fit the {} of memory free for it with room for the context; {} ({}), which a model with no `files` loads, does not. Pin it with `files: [{}]`.",
                 describe(Some(&chosen.name), chosen.files.len()),
                 gigabytes(chosen.bytes),
                 quantizations.len(),
                 gibibytes(memory),
-                gguf_files::pin(listing, chosen)
-                    .iter()
-                    .map(|entry| format!("{{path: {entry}}}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                default.name,
+                gigabytes(default.bytes),
+                pin(chosen)
             );
             Ok(chosen)
         }
@@ -267,6 +268,24 @@ fn choose_quantization<'q>(
                 names()
             ),
         )),
+    }
+}
+
+/// Why `default` is the quantization a model with no `files` loads, for the log line that
+/// says so: it carries `Q4_K_M`, or `Q8_0` and no quantization carries `Q4_K_M`, or neither
+/// is offered and it is the first by path.
+fn default_reason(quantizations: &[Quantization], default: &Quantization) -> String {
+    let [q4, q8] = gguf_files::DEFAULT_TAGS;
+    if gguf_files::carries(default, q4) {
+        format!("its {q4}, as llama.cpp loads it")
+    } else if gguf_files::carries(default, q8)
+        && !quantizations.iter().any(|q| gguf_files::carries(q, q4))
+    {
+        format!("its {q8}, as llama.cpp loads it when a repository has no {q4}")
+    } else {
+        format!(
+            "its first by path, as llama.cpp loads it when a repository has neither {q4} nor {q8}"
+        )
     }
 }
 

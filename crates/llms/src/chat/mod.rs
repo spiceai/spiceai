@@ -369,8 +369,9 @@ use crate::hf::HubParams;
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `files` are the model's `files`, as the Spicepod lists them: GGUF files within the repo,
 ///    or a quantization by name (`UD-Q4_K_XL`), resolved against the repo
-///    ([`gguf_files::resolve`]); with none, a GGUF repo's largest quantization that fits the
-///    memory the engine reports. A registered engine that serves the GGUF files gets them all,
+///    ([`gguf_files::resolve`]); with none, the quantization llama.cpp's `-hf` loads (`Q4_K_M`,
+///    else `Q8_0`, else the first), or the largest that fits when the memory the engine reports
+///    cannot hold it. A registered engine that serves the GGUF files gets them all,
 ///    every shard and any draft head; mistral.rs loads the first.
 /// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
