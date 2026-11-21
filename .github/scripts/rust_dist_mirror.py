@@ -10,9 +10,6 @@ static.rust-lang.org lays them out. Point rustup at the result with
 
 Usage:
   rust_dist_mirror.py --toolchain 1.99.1 --host x86_64-unknown-linux-gnu --out DIR
-  rust_dist_mirror.py --toolchain 1.99.1 --host HOST --list
-      prints "<sha256> <url>" for the manifest and each component, without downloading
-      the components (the manifest itself is fetched).
 
 Exit status 3 means the toolchain has no pin, so the caller should install from the
 source as before.
@@ -25,7 +22,6 @@ import json
 import re
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 DIST_ROOT = "https://static.rust-lang.org/"
@@ -87,9 +83,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--toolchain", required=True)
     parser.add_argument("--host", required=True)
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--out", type=Path)
-    target.add_argument("--list", action="store_true")
+    parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
     pins = json.loads(PINS.read_text())["rust"]
@@ -104,22 +98,13 @@ def main() -> int:
 
     manifest_name = f"channel-rust-{args.toolchain}.toml"
     manifest_url = f"{DIST_ROOT}dist/{manifest_name}"
-    with tempfile.TemporaryDirectory() as scratch:
-        root = args.out if args.out else Path(scratch)
-        manifest = root / "dist" / manifest_name
-        fetch(pin["manifest_sha256"], manifest, manifest_url)
-        wanted = components(manifest, args.host, pins["components"])
-
-        if args.list:
-            print(pin["manifest_sha256"], manifest_url)
-            for sha256, url in wanted:
-                print(sha256, url)
-            return 0
-
-        # rustup reads the manifest's checksum file before the manifest.
-        (root / "dist" / f"{manifest_name}.sha256").write_text(f"{pin['manifest_sha256']}  {manifest_name}\n")
-        for sha256, url in wanted:
-            fetch(sha256, root / url[len(DIST_ROOT) :], url)
+    root = args.out
+    manifest = root / "dist" / manifest_name
+    fetch(pin["manifest_sha256"], manifest, manifest_url)
+    # rustup reads the manifest's checksum file before the manifest.
+    (root / "dist" / f"{manifest_name}.sha256").write_text(f"{pin['manifest_sha256']}  {manifest_name}\n")
+    for sha256, url in components(manifest, args.host, pins["components"]):
+        fetch(sha256, root / url[len(DIST_ROOT) :], url)
     print(f"file://{args.out.resolve()}")
     return 0
 

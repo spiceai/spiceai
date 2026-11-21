@@ -24,8 +24,8 @@ def main() -> int:
     for toolchain, pin in rust["toolchains"].items():
         if not SHA256.fullmatch(pin.get("manifest_sha256", "")):
             errors.append(f"rust.toolchains.{toolchain}.manifest_sha256 is not a lowercase hex SHA-256.")
-    if not rust["hosts"] or not rust["components"]:
-        errors.append("rust.hosts and rust.components must each name at least one entry.")
+    if not rust["components"]:
+        errors.append("rust.components must name at least one component.")
 
     channel = re.search(r'^\s*channel\s*=\s*"([^"]+)"', (ROOT / "rust-toolchain.toml").read_text(), re.M)
     if channel is None:

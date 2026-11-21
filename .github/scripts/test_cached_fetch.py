@@ -24,17 +24,34 @@ DROP = "drop"
 
 
 class Server:
-    """Serves `script[path]`, a list of responses consumed in order; the last repeats."""
+    """Serves `script[path]`, a list of responses consumed in order; the last repeats.
+
+    A PUT stores its body (answering `put_status`), and a GET of a path with no script
+    serves what was stored there, as the bucket would.
+    """
 
     def __init__(self):
         self.script = {}
         self.requests = []
+        self.stored = {}
+        self.puts = []
+        self.put_status = 200
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):  # noqa: N802 (http.server's naming)
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                server.puts.append(self.path)
+                if server.put_status == 200:
+                    server.stored[self.path] = body
+                self.send_response(server.put_status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
             def do_GET(self):  # noqa: N802 (http.server's naming)
                 server.requests.append(self.path)
-                responses = server.script.get(self.path, [404])
+                default = [server.stored[self.path]] if self.path in server.stored else [404]
+                responses = server.script.get(self.path, default)
                 response = responses.pop(0) if len(responses) > 1 else responses[0]
                 if response == DROP:
                     # Close without a reply: curl reports exit 52, an empty reply.
@@ -181,6 +198,60 @@ class CachedFetchTest(unittest.TestCase):
         self.assertIn("curl exit 7", proc.stdout)
         self.assertIn("attempt 2 of 2", proc.stdout)
         self.assertEqual(self.source.count(SOURCE_PATH), 1)
+
+    # --- writing back ----------------------------------------------------------------
+
+    def test_a_miss_is_written_back_and_the_next_job_hits(self):
+        self.source.script[SOURCE_PATH] = [CONTENT]
+        first = self.run_fetch()
+        self.assert_fetched(first)
+        self.assertEqual(self.cache.puts, [CACHE_PATH])
+        self.assertEqual(self.cache.stored[CACHE_PATH], CONTENT)
+        self.assertIn("written to the CI cache", first.stdout)
+
+        self.dest.unlink()
+        second = self.run_fetch()
+        self.assert_fetched(second)
+        self.assertIn("verified from the CI cache", second.stdout)
+        self.assertEqual(self.source.count(SOURCE_PATH), 1)
+        self.assertEqual(self.cache.puts, [CACHE_PATH])
+
+    def test_wrong_bytes_are_replaced_with_the_verified_download(self):
+        self.cache.script[CACHE_PATH] = [WRONG]
+        self.source.script[SOURCE_PATH] = [CONTENT]
+        self.assert_fetched(self.run_fetch())
+        self.assertEqual(self.cache.puts, [CACHE_PATH])
+        self.assertEqual(self.cache.stored[CACHE_PATH], CONTENT)
+
+    def test_a_hit_writes_nothing(self):
+        self.cache.script[CACHE_PATH] = [CONTENT]
+        self.assert_fetched(self.run_fetch())
+        self.assertEqual(self.cache.puts, [])
+
+    def test_nothing_is_written_when_the_cache_refused_the_read(self):
+        self.cache.script[CACHE_PATH] = [403]
+        self.source.script[SOURCE_PATH] = [CONTENT]
+        self.assert_fetched(self.run_fetch())
+        self.assertEqual(self.cache.puts, [])
+
+    def test_nothing_is_written_when_the_cache_kept_failing(self):
+        self.cache.script[CACHE_PATH] = [503, 503]
+        self.source.script[SOURCE_PATH] = [CONTENT]
+        self.assert_fetched(self.run_fetch())
+        self.assertEqual(self.cache.puts, [])
+
+    def test_a_failed_write_does_not_fail_the_job(self):
+        self.cache.put_status = 500
+        self.source.script[SOURCE_PATH] = [CONTENT]
+        proc = self.run_fetch()
+        self.assert_fetched(proc)
+        self.assertEqual(self.cache.puts, [CACHE_PATH])
+        self.assertIn("Could not write", proc.stdout)
+
+    def test_a_download_that_fails_its_pin_is_not_written(self):
+        self.source.script[SOURCE_PATH] = [WRONG]
+        self.assert_failed(self.run_fetch())
+        self.assertEqual(self.cache.puts, [])
 
     # --- the source --------------------------------------------------------------------
 

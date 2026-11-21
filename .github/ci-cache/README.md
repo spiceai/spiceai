@@ -10,7 +10,8 @@ order:
    self-hosted Macs, which keep their disks between jobs.
 2. `CI_CACHE_URL`, the `ci-cache` bucket of the CI object store, read anonymously over
    HTTP at `<CI_CACHE_URL>/sha256/<sha256>`. Two attempts (one retry); a 404 is a miss
-   and is not retried. Only runners inside the cluster reach it.
+   and is not retried. Only runners inside the cluster reach it, and no credentials are
+   needed.
 3. The file's source, such as a GitHub release or static.rust-lang.org. Four attempts
    (three retries), retrying only network errors and 408, 429 and 5xx answers.
 
@@ -29,24 +30,29 @@ and the source disagree.
   `components` for a host and lays them out as a local mirror. `setup-rust` installs from
   that mirror with `RUSTUP_DIST_SERVER=file://…`, and rustup checks each component's hash
   again. If the mirror cannot be built, `setup-rust` installs from static.rust-lang.org as
-  before. `hosts` lists the hosts whose components the warm-up uploads.
+  before.
 - **`cargo-deny`**: the release archive for each target, installed by the
   `install-cargo-deny` action.
 
 ## How the cache is filled
 
-Jobs only read the bucket, and need no credentials to do so. The `CI cache warm-up`
-workflow (`.github/workflows/ci_cache_warm.yml`) reads every pinned file from the cache,
-uploads any that are missing or wrong, and reads the upload back anonymously. It runs
-when the pins change on trunk and once a day. Until it runs after a new pin merges, jobs
-download that file from its source.
+By the jobs that use it. When the bucket answers that it lacks a file (404) or holds the
+wrong bytes, the job downloads the file from its source, checks it against the pin, and
+writes it back with an anonymous `PUT`, so the next job reads it from the bucket. The write
+is best-effort: one try, and a failure is a warning. Nothing is written when the bucket
+could not be reached or refused the read. Objects expire 30 days after they are written,
+which drops files no pin names any more; a file still in use is written again by the next
+job that misses it.
+
+Anyone who can reach the bucket can write to it. That is safe because no reader uses bytes
+that do not match its pin, and a reader that finds wrong bytes replaces them with the
+verified download.
 
 ## Adding a file
 
 1. Add its pin to `pins.json`. Take the SHA-256 from the publisher's checksum file and
    check it against a download.
 2. Fetch it with `bash .github/scripts/cached_fetch.sh <sha256> <dest> <source url>`.
-3. List it in `pinned_files()` in `.github/scripts/ci_cache_warm.py`.
 
 A workflow opts in by setting `CI_CACHE_URL` in its top-level `env`, as the workflows that
 run `setup-rust` on `spiceai-dev-runners` do:

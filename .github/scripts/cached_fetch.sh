@@ -18,8 +18,14 @@
 # does not match is a miss, so a wrong or tampered entry costs a download from the source
 # and nothing else; a source copy that does not match fails, because the pin and the
 # source disagree. Only a verified file reaches DEST, and it is written to CI_CACHE_DIR
-# for the next job. Nothing here writes to the bucket: the `CI cache warm-up` workflow
-# fills it, so jobs need no credentials to read it.
+# for the next job.
+#
+# The bucket fills itself. When it answered that it lacks the file (404), or held the wrong
+# bytes, the verified download from the source is written back to it, anonymously, so the
+# next job reads it there. A write that fails is a warning, never a failed job. Nothing is
+# written when the bucket could not be reached or refused the read: it would refuse or
+# stall the write too. Anyone who can reach the bucket may write it, which is safe only
+# because no reader uses bytes that do not match its pin.
 #
 # Usage: bash .github/scripts/cached_fetch.sh SHA256 DEST URL [URL...]
 # CI_SOURCE_DELAY_SECONDS (default 5, doubled after each failed attempt) and
@@ -124,7 +130,10 @@ fetch() {
     --write-out '%{http_code}' --output "$tmp" "$1")" || status=$?
 }
 
-# 2. The CI object store.
+# 2. The CI object store. cache_state records why the read ended without a verified copy:
+# `missing` (404) or `wrong` (the bytes did not match) mean the verified download from the
+# source should be written back.
+cache_state=''
 if [ -n "${CI_CACHE_URL:-}" ]; then
   url="${CI_CACHE_URL%/}/sha256/$sha256"
   for ((attempt = 1; ; attempt++)); do
@@ -135,10 +144,12 @@ if [ -n "${CI_CACHE_URL:-}" ]; then
         exit 0
       fi
       echo "::warning::The CI cache's copy of $name does not match its pinned SHA-256; downloading it from the source instead."
+      cache_state=wrong
       break
     fi
     if [ "$status" -eq 22 ] && [ "$code" = 404 ]; then
       echo "$name is not in the CI cache yet; downloading it from the source."
+      cache_state=missing
       break
     fi
     if ! transient "$status" "$code" || [ "$attempt" -ge "$cache_attempts" ]; then
@@ -150,6 +161,24 @@ if [ -n "${CI_CACHE_URL:-}" ]; then
   done
 fi
 
+# Writes the verified download to the bucket for the next job, when the bucket said it
+# lacked the file or held the wrong bytes. One try: the job already has its file.
+write_back() {
+  case "$cache_state" in
+    missing | wrong) ;;
+    *) return 0 ;;
+  esac
+  local put_status=0 put_code
+  put_code="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 600 \
+    --write-out '%{http_code}' --output /dev/null --upload-file "$tmp" \
+    "${CI_CACHE_URL%/}/sha256/$sha256")" || put_status=$?
+  if [ "$put_status" -eq 0 ]; then
+    echo "$name: written to the CI cache for the next job."
+  else
+    echo "::warning::Could not write $name to the CI cache (curl exit $put_status, HTTP $put_code); the next job downloads it from the source again."
+  fi
+}
+
 # 3. The source.
 delay="$source_delay"
 for ((attempt = 1; ; attempt++)); do
@@ -159,6 +188,7 @@ for ((attempt = 1; ; attempt++)); do
     if [ "$status" -eq 0 ]; then
       got="$(file_sha256 "$tmp")"
       if [ "$got" = "$sha256" ]; then
+        write_back
         finish "$url"
         exit 0
       fi
