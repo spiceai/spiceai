@@ -17,13 +17,9 @@ limitations under the License.
 //! Spice **accelerators** vs **out-of-Spice** standalone engines — exact SQL
 //! result equality (not performance).
 //!
-//! | Spice side | Standalone oracle |
-//! |------------|-------------------|
-//! | `SQLite` accelerator (`DataAccelerator`) | `rusqlite` crate |
-//!
-//! The micro tests here reach the accelerator `TableProvider` directly; `surfaces` runs the
-//! same SQL through a Spicepod-built runtime, in-process and over HTTP and Flight SQL, and
-//! compares it with both `rusqlite` and the installed `DuckDB` library (`duckdb-oracle`).
+//! `surfaces` runs the micro queries through a Spicepod-built runtime, in-process and
+//! over HTTP and Flight SQL, and compares each answer with both standalone `SQLite`
+//! (the `rusqlite` crate) and the installed `DuckDB` library (`duckdb-oracle`).
 //!
 //! Cayenne vs standalone oracles live under `crates/cayenne/tests/result_correctness_*`.
 //! Standalone DuckDB↔SQLite agreement (no Spice) lives under
@@ -44,18 +40,10 @@ limitations under the License.
 // itself rather than relying on another module to.
 use accelerator_cayenne as _;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::TableReference;
-use datafusion::common::{Constraints, ToDFSchema};
-use datafusion::datasource::TableProvider;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::physical_plan::collect;
-use datafusion_table_providers::util::test::MockExec;
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
     QueryValidationResult, RowOrder, compare_query_result_batches_with_sort_check,
@@ -170,74 +158,6 @@ fn write_parquet(path: &std::path::Path, batch: &RecordBatch) {
     writer.close().expect("close");
 }
 
-fn create_cmd(name: &str, schema: SchemaRef) -> datafusion::logical_expr::CreateExternalTable {
-    let df_schema = ToDFSchema::to_dfschema_ref(schema).expect("df schema");
-    datafusion::logical_expr::CreateExternalTable {
-        schema: df_schema,
-        name: TableReference::bare(name),
-        locations: vec![],
-        file_type: String::new(),
-        table_partition_cols: vec![],
-        if_not_exists: true,
-        or_replace: false,
-        definition: None,
-        order_exprs: vec![],
-        unbounded: false,
-        options: HashMap::new(),
-        constraints: Constraints::new_unverified(vec![]),
-        column_defaults: HashMap::default(),
-        temporary: false,
-    }
-}
-
-async fn insert_batch(table: &Arc<dyn TableProvider>, batch: RecordBatch) {
-    let schema = batch.schema();
-    let exec = MockExec::new(vec![Ok(batch)], schema);
-    let ctx = SessionContext::new();
-    let plan = table
-        .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
-        .await
-        .expect("insert plan");
-    collect(plan, ctx.task_ctx()).await.expect("insert collect");
-}
-
-/// Run SQL against Spice-accelerated tables via `DataFusion`.
-///
-/// Bare `SessionContext` + accelerator `TableProvider` hits a `DataFusion`
-/// physical/logical schema mismatch on some aggregate shapes (`COUNT(*)`).
-/// We therefore materialize each accelerator table through its **scan** path
-/// into an in-memory table (still the accelerator's storage + scan plan), then
-/// run the SQL against those scans. That exercises accelerator write+scan and
-/// compares the resulting SQL answers to the standalone engine.
-async fn spice_query(
-    tables: &[(String, Arc<dyn TableProvider>)],
-    sql: &str,
-) -> Result<Vec<RecordBatch>, String> {
-    use datafusion::datasource::MemTable;
-
-    let ctx = SessionContext::new();
-    for (name, table) in tables {
-        let plan = table
-            .scan(&ctx.state(), None, &[], None)
-            .await
-            .map_err(|e| format!("scan {name}: {e}"))?;
-        let batches = collect(plan, ctx.task_ctx())
-            .await
-            .map_err(|e| format!("collect scan {name}: {e}"))?;
-        // Prefer the physical schema from the scan (accelerators may rewrite
-        // types vs the create-time logical schema).
-        let schema = batches
-            .first()
-            .map_or_else(|| table.schema(), RecordBatch::schema);
-        let mem = MemTable::try_new(schema, vec![batches])
-            .map_err(|e| format!("memtable {name}: {e}"))?;
-        ctx.register_table(name.as_str(), Arc::new(mem))
-            .map_err(|e| format!("register {name}: {e}"))?;
-    }
-    let df = ctx.sql(sql).await.map_err(|e| format!("sql: {e}"))?;
-    df.collect().await.map_err(|e| format!("collect: {e}"))
-}
-
 fn compare(query: &Query, spice: &[RecordBatch], standalone: &[RecordBatch]) -> String {
     // Multiset unless the row set itself depends on order, so tied rows under a
     // non-unique `ORDER BY` do not fail; the sort check below is tie-tolerant and
@@ -270,20 +190,12 @@ fn compare(query: &Query, spice: &[RecordBatch], standalone: &[RecordBatch]) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Spice SQLite accelerator ↔ standalone rusqlite
+// Standalone SQLite oracle, through the rusqlite crate
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "sqlite")]
-mod sqlite_accel {
-    use super::{
-        compare, create_cmd, insert_batch, make_dim, make_fact, micro_queries, spice_query,
-    };
-    use accelerator_sqlite::SqliteAccelerator;
+mod standalone_sqlite {
     use arrow::array::RecordBatch;
-    use data_accelerator_api::DataAccelerator;
-    use datafusion::datasource::TableProvider;
     use rusqlite::Connection;
-    use std::sync::Arc;
 
     pub(super) fn load_standalone_sqlite(
         tables: &[(&str, RecordBatch)],
@@ -472,51 +384,6 @@ mod sqlite_accel {
         Ok(vec![
             RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())?,
         ])
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn spice_sqlite_accel_vs_standalone_sqlite_micro() {
-        let fact = make_fact(2_048, 64);
-        let dim = make_dim(256);
-
-        // Spice SQLite accelerator
-        let accel = SqliteAccelerator::new();
-        let t_table = accel
-            .create_external_table(create_cmd("t", fact.schema()), None, vec![], None)
-            .await
-            .expect("create t");
-        let d_table = accel
-            .create_external_table(create_cmd("d", dim.schema()), None, vec![], None)
-            .await
-            .expect("create d");
-        insert_batch(&t_table, fact.clone()).await;
-        insert_batch(&d_table, dim.clone()).await;
-        let spice_tables: Vec<(String, Arc<dyn TableProvider>)> =
-            vec![("t".into(), t_table), ("d".into(), d_table)];
-
-        // Standalone rusqlite (out of Spice)
-        let (_tmp, conn) = load_standalone_sqlite(&[("t", fact), ("d", dim)]);
-
-        let mut fails = Vec::new();
-        for q in micro_queries() {
-            let spice = spice_query(&spice_tables, &q.sql)
-                .await
-                .unwrap_or_else(|e| panic!("spice sql {}: {e}", q.name));
-            let standalone = standalone_query(&conn, &q.sql)
-                .unwrap_or_else(|e| panic!("sqlite sql {}: {e}", q.name));
-            let status = compare(&q, &spice, &standalone);
-            eprintln!(
-                "spice-sqlite-accel vs standalone-sqlite / {} -> {status}",
-                q.name
-            );
-            if !status.starts_with("PASS") {
-                fails.push(format!("{}: {status}", q.name));
-            }
-        }
-        assert!(
-            fails.is_empty(),
-            "Spice SQLite accelerator vs standalone SQLite failures: {fails:#?}"
-        );
     }
 }
 

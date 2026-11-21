@@ -224,7 +224,7 @@ jobs:
       AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
       AZURE_OPENAI_TENANT_ID: ${{ secrets.AZURE_OPENAI_TENANT_ID }}
       AZURE_OPENAI_CLIENT_ID: ${{ secrets.AZURE_OPENAI_CLIENT_ID }}
-      HAS_BEDROCK_ROLE: ${{ secrets.AWS_BEDROCK_ROLE_ARN != '' }}
+      HAS_BEDROCK_ROLE: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN != '' }}
     strategy:
       # The two arms cover disjoint model sets — self-hosted local models and the hosted
       # providers — so one arm's result says nothing about the other's, and cancelling the
@@ -256,7 +256,7 @@ jobs:
         id: bedrock-role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN }}
           role-session-name: gha-llms-bedrock-${{ github.run_id }}
           aws-region: us-east-1
           output-env-credentials: false
@@ -313,13 +313,13 @@ jobs:
           # honours it for every service, so leaving it set sends this suite's Bedrock
           # calls to the local build cache instead of AWS.
           unset AWS_ENDPOINT_URL
-          # Bedrock runs as the CI role (`AWS_BEDROCK_ROLE_ARN`): until the `ci` environment has
+          # Bedrock runs as the CI role (`CI_AWS_BEDROCK_ROLE_ARN`): until the `ci` environment has
           # one, the other providers still run, and the run says Bedrock did not.
           if [[ ",${MODEL_ALLOWLIST}," == *",bedrock,"* && "${HAS_BEDROCK_ROLE}" != "true" ]]; then
-            echo "::warning::AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
+            echo "::warning::CI_AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
             MODEL_ALLOWLIST=$(printf '%s' "$MODEL_ALLOWLIST" | tr ',' '\n' | grep -vx bedrock | paste -sd, - || true)
             if [ -z "$MODEL_ALLOWLIST" ]; then
-              echo "::error::This run tests only Bedrock, which needs AWS_BEDROCK_ROLE_ARN."
+              echo "::error::This run tests only Bedrock, which needs CI_AWS_BEDROCK_ROLE_ARN."
               exit 1
             fi
             export MODEL_ALLOWLIST
@@ -400,5 +400,9 @@ jobs:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
+        # One test at a time. Each test loads a model of its own, and several models computing
+        # on one Apple GPU at once can hang it ("Caused GPU Hang Error"): the GPU's recovery then
+        # discards every model's queued work, failing tests that did nothing wrong. Four at a
+        # time still hangs the M3 Pro runners' GPU.
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- model:: batching:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: sequences:: hf_resolution:: unsupported::
+          cargo test -p llms-llamacpp --features metal --test integration -- --test-threads=1 model:: batching:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: sequences:: system_messages:: hf_resolution:: unsupported::

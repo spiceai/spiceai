@@ -221,6 +221,11 @@ required-features = ["bench", "kafka"]
 
 [[bench]]
 harness = false
+name = "debezium_decode"
+required-features = ["debezium"]
+
+[[bench]]
+harness = false
 name = "pgoutput_decode"
 required-features = ["postgres"]
 

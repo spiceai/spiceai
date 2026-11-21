@@ -41178,19 +41178,24 @@ impl CayenneTableProvider {
             return Ok(0);
         }
 
-        // PK membership of the (cross-shard) visible rows drives the reinserted-vs-
-        // pure tombstone split, same as the checkpoint.
-        let corpus_keys = self.checkpoint_corpus_pk_keys(&union_visible)?;
-
-        // Shadow inserts and both kinds of tombstones commit together. Durable
-        // commit only: NO `publish_inlined_mutation`, generation bump, or watermark
-        // advance, so live scans keep serving the RAM tier. The shadow's seal
-        // sequence exceeds every active tombstone sequence; the target snapshot
-        // is None because the inserts live in the inline BLOB. Drop the returned
-        // update: reads hide deleted rows via RAM tombstones until restart.
-        // A later bake may re-commit the tombstones (the index merges by max
-        // sequence). At N==1 the view is shard 0's delta; at N>1 it is the
-        // disjoint-key union, exactly as in the sharded checkpoint.
+        // Shadow inserts and the tombstones commit together. Durable commit only:
+        // NO `publish_inlined_mutation`, generation bump, or watermark advance, so
+        // live scans keep serving the RAM tier. The shadow's seal sequence exceeds
+        // every active tombstone sequence; the target snapshot is None because the
+        // inserts live in the inline BLOB. Drop the returned update: reads hide
+        // deleted rows via RAM tombstones until restart. A later bake may re-commit
+        // the tombstones (the index merges by max sequence). At N==1 the view is
+        // shard 0's delta; at N>1 it is the disjoint-key union, exactly as in the
+        // sharded checkpoint.
+        //
+        // Every tombstone is delete-only, including those of keys the shadow
+        // re-inserts. Inline visibility compares a row's sequence with the delete
+        // sequence and never consults a re-insert, so the shadow needs no stamp. A
+        // stamp would make the restored index re-expose every stored copy of the
+        // key: with no protected snapshot, the current-snapshot scan honors a
+        // re-insert, so a restart served the superseded row beside the shadow
+        // (#16278). The checkpoint that later moves these rows into a file stamps
+        // its own re-inserts and insert records at that file's sequence.
         let inline_data = if union_visible.is_empty() {
             Vec::new()
         } else {
@@ -41215,7 +41220,7 @@ impl CayenneTableProvider {
                 &union_view,
                 None,
                 seal_sequence,
-                &corpus_keys,
+                &CheckpointCorpusKeys::None,
                 inline_data,
                 false,
             )
@@ -67583,6 +67588,18 @@ mod tests {
         store_int64_tombstones(provider, index);
     }
 
+    /// Wait out the post-write maintenance the test's writes scheduled. After its
+    /// debounce that pass rebuilds the snapshot manifests under `compaction_lock`,
+    /// and a whole-table reclaim that finds the lock held declines as
+    /// `DeclinedLockBusy`. A test slowed by a loaded runner reaches its reclaim
+    /// inside that window (#16128), so drain the pass first.
+    async fn drain_post_write_maintenance(provider: &CayenneTableProvider) {
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain the writes' post-write maintenance");
+    }
+
     /// The deletion-index reclaim trigger is scoped to the one table shape with no
     /// other reclaimer: a primary-key table on an explicit `deletion_mode:
     /// position`. A key-delete table must stay on the seq-prefix bake, which
@@ -67761,6 +67778,7 @@ mod tests {
             .await
             .expect("position capture should not error");
         insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[11, 21, 31])).await;
+        drain_post_write_maintenance(&provider).await;
         assert!(
             provider.deletion_index_reclaim_trigger().is_some(),
             "precondition: the upserts' tombstones are over the trigger of two"
@@ -67803,6 +67821,7 @@ mod tests {
         .await;
         let schema = Arc::clone(&provider.table_metadata.schema);
         insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+        drain_post_write_maintenance(&provider).await;
         install_int64_deletes(&provider, &[(1, i64::MAX - 1), (1_000, i64::MAX - 1)]);
         assert!(
             provider
@@ -67896,6 +67915,7 @@ mod tests {
                     roaring::RoaringBitmap::from_iter([0u32]),
                 )),
             )])));
+        drain_post_write_maintenance(&provider).await;
         install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
         assert!(
             provider
@@ -67931,6 +67951,7 @@ mod tests {
         let schema = Arc::clone(&provider.table_metadata.schema);
         insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
 
+        drain_post_write_maintenance(&provider).await;
         install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
         assert!(
             provider.deletion_index_reclaim_trigger().is_some(),

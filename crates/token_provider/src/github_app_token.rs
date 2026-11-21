@@ -383,7 +383,7 @@ async fn generate_token(installation: &Installation) -> Result<GitHubToken, GitH
     let claims = claims(&installation.app_client_id)?;
     let jwt_token = app_jwt(&claims, &installation.key).await?;
 
-    let client = reqwest::Client::builder()
+    let client = http_retry::client_builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))

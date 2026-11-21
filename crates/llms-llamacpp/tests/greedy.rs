@@ -53,15 +53,23 @@ async fn a_greedy_chain_picks_what_llama_cpp_greedy_sampling_picks() {
     let mut through_llama_cpp =
         Sampler::chain([Sampler::logit_bias(&vocab, &[]), Sampler::greedy()]);
     let mut check = |context: &llama_cpp::Context<'_>, row: i32, at: &str| -> Token {
-        let picked = greedy.sample(context, row);
-        assert_eq!(picked, through_llama_cpp.sample(context, row), "{at}");
+        let picked = greedy.sample(context, row).expect("a decoded row samples");
+        assert_eq!(
+            picked,
+            through_llama_cpp
+                .sample(context, row)
+                .expect("a decoded row samples"),
+            "{at}"
+        );
         let mut ruled_out = Sampler::chain([
             Sampler::logit_bias(&vocab, &[(picked, f32::NEG_INFINITY)]),
             Sampler::greedy(),
         ]);
         assert_ne!(
             picked,
-            ruled_out.sample(context, row),
+            ruled_out
+                .sample(context, row)
+                .expect("a decoded row samples"),
             "{at}: the ruled-out token"
         );
         picked

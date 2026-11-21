@@ -1977,7 +1977,7 @@ async fn test_cayenne_dml_comprehensive() -> Result<(), String> {
 /// S3 bucket for the datalake e2e test — shared with the snapshot-refresh
 /// integration tests. Per-run unique prefixes keep concurrent runs disjoint,
 /// and the tiny `nation` dataset keeps transfer to a few KB per run.
-const DATALAKE_TEST_BUCKET: &str = "spiceai-snapshot-integration-tests";
+const DATALAKE_TEST_BUCKET: &str = "spiceai-ci-snapshot-integration-tests";
 const DATALAKE_TEST_REGION: &str = "us-west-2";
 
 /// Build the `nation` dataset (25 rows, public demo bucket) accelerated by

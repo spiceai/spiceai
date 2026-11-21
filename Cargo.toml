@@ -37,6 +37,7 @@ members = [
     "crates/duckdb-oracle",
     "crates/duration-parse",
     "crates/http-body-limit",
+    "crates/http-retry",
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
@@ -519,7 +520,7 @@ uuid = "1"
 # verifier and `vstd` ship together, so this moves with `VERUS_VSTD_VERSION` in
 # `.github/workflows/verus_verify.yml`.
 vstd = "=0.0.0-2026-11-01-0251"
-wasmtime = { version = "48.0.8", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "48.0.9", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"
 
 flatbuffers = "25.2.10"
@@ -650,8 +651,9 @@ tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 # apache/datafusion-sqlparser-rs#2436 backported: the right operand of
 # `IS [NOT] DISTINCT FROM` swallowed a following `AND`/`OR`, so
 # `a IS DISTINCT FROM b OR c` parsed as `a IS DISTINCT FROM (b OR c)` and
-# returned wrong rows. Drop this when DataFusion moves to sqlparser >= 0.63.
-# See vendor/sqlparser/README.md.
+# returned wrong rows. It also writes every quote character in a quoted
+# identifier twice, which upstream does not. See vendor/sqlparser/README.md
+# before dropping it.
 sqlparser = { path = "vendor/sqlparser" }
 
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.
