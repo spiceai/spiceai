@@ -80,6 +80,21 @@ pub enum Error {
     LocalRerankerNotEnabled { name: String, from: String },
 }
 
+impl Error {
+    /// Returns `true` when the error is a mistake in the reranker's Spicepod configuration, which
+    /// no retry can clear. A refusal or failure of the provider is not one.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownSource { .. }
+                | Self::MissingParam { .. }
+                | Self::InvalidParam { .. }
+                | Self::LocalRerankerNotEnabled { .. }
+        )
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Wraps a typed-params deserialization failure with the reranker name, same

@@ -999,7 +999,6 @@ impl SharedSource {
 /// Entry point: subscribe one dataset to its shared dump source. Mirrors the
 /// per-dataset lazy contract — setup runs on first poll, errors surface through
 /// the stream.
-#[must_use]
 pub fn subscribe(input: ReplicationStreamInput) -> ChangesStream {
     Box::pin(
         stream::once(async move { subscribe_inner(input).await }).flat_map(|result| match result {

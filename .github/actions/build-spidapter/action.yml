@@ -69,18 +69,22 @@ runs:
       id: commit-sha
       shell: bash
       run: |
-        echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+        echo "sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
 
     - name: Download spidapter from MinIO
       if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
       id: minio-download
       shell: bash
+      env:
+        DETECT_OS_OS: ${{ steps.detect-os.outputs.os }}
+        COMMIT_SHA_SHA: ${{ steps.commit-sha.outputs.sha }}
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
       run: |
-        if mc stat spice-minio/artifacts/spidapter/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spidapter${{ steps.detect-os.outputs.ext }}; then
+        if mc stat "spice-minio/artifacts/spidapter/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/spidapter${DETECT_OS_EXT}"; then
           echo "Found spidapter in MinIO"
           mkdir -p target/release
-          mc cp spice-minio/artifacts/spidapter/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spidapter${{ steps.detect-os.outputs.ext }} target/release/spidapter${{ steps.detect-os.outputs.ext }}
-          chmod +x target/release/spidapter${{ steps.detect-os.outputs.ext }}
+          mc cp "spice-minio/artifacts/spidapter/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/spidapter${DETECT_OS_EXT}" "target/release/spidapter${DETECT_OS_EXT}"
+          chmod +x "target/release/spidapter${DETECT_OS_EXT}"
           echo "found=true" >> $GITHUB_OUTPUT
         else
           echo "Spidapter not found in MinIO"
@@ -99,11 +103,11 @@ runs:
 
     - name: Setup Rust
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')
-      uses: ./.github/actions/setup-rust
+      uses: $/.github/actions/setup-rust
 
     - name: Setup cc
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')) && steps.detect-os.outputs.os == 'linux'
-      uses: ./.github/actions/setup-cc
+      uses: $/.github/actions/setup-cc
 
     # Reports only whether an sccache endpoint was configured, which decides
     # whether `setup-sccache` runs. It deliberately does not export a
@@ -117,8 +121,10 @@ runs:
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')
       id: check-sccache
       shell: bash
+      env:
+        INPUT_MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
       run: |
-        if [ -z "${{ inputs.minio_endpoint }}" ]; then
+        if [ -z "${INPUT_MINIO_ENDPOINT}" ]; then
           echo "SCCACHE_SETUP=false" >> $GITHUB_OUTPUT
         else
           echo "SCCACHE_SETUP=true" >> $GITHUB_OUTPUT
@@ -126,7 +132,7 @@ runs:
 
     - name: Set up sccache
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-spidapter.outputs.cache-hit != 'true')) && steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
-      uses: ./.github/actions/setup-sccache
+      uses: $/.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
         minio_access_key: ${{ inputs.minio_access_key }}
@@ -156,15 +162,21 @@ runs:
     - name: Upload spidapter to MinIO
       if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-spidapter.outputs.cache-hit != 'true')
       shell: bash
+      env:
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
+        DETECT_OS_OS: ${{ steps.detect-os.outputs.os }}
+        COMMIT_SHA_SHA: ${{ steps.commit-sha.outputs.sha }}
       run: |
-        mc cp target/release/spidapter${{ steps.detect-os.outputs.ext }} spice-minio/artifacts/spidapter/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spidapter${{ steps.detect-os.outputs.ext }}
+        mc cp "target/release/spidapter${DETECT_OS_EXT}" "spice-minio/artifacts/spidapter/${DETECT_OS_OS}-x86_64/${COMMIT_SHA_SHA}/spidapter${DETECT_OS_EXT}"
 
     - name: Install spidapter to system path (Linux/macOS)
       if: inputs.install_to_system_path == 'true' && steps.detect-os.outputs.os != 'windows'
       shell: bash
+      env:
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
       run: |
         sudo mkdir -p /usr/local/bin
-        sudo cp target/release/spidapter${{ steps.detect-os.outputs.ext }} /usr/local/bin/spidapter
+        sudo cp "target/release/spidapter${DETECT_OS_EXT}" /usr/local/bin/spidapter
         sudo chmod +x /usr/local/bin/spidapter
 
     - name: Install spidapter to system path (Windows)
@@ -178,20 +190,24 @@ runs:
     - name: Set output path
       id: set-path
       shell: bash
+      env:
+        INPUT_INSTALL_TO_SYSTEM_PATH: ${{ inputs.install_to_system_path }}
+        DETECT_OS_OS: ${{ steps.detect-os.outputs.os }}
+        DETECT_OS_EXT: ${{ steps.detect-os.outputs.ext }}
       run: |
-        if [ "${{ inputs.install_to_system_path }}" = "true" ]; then
-          if [ "${{ steps.detect-os.outputs.os }}" = "windows" ]; then
+        if [ "${INPUT_INSTALL_TO_SYSTEM_PATH}" = "true" ]; then
+          if [ "${DETECT_OS_OS}" = "windows" ]; then
             echo "path=/c/usr/local/bin/spidapter.exe" >> $GITHUB_OUTPUT
           else
             echo "path=/usr/local/bin/spidapter" >> $GITHUB_OUTPUT
           fi
         else
-          echo "path=${{ github.workspace }}/target/release/spidapter${{ steps.detect-os.outputs.ext }}" >> $GITHUB_OUTPUT
+          echo "path=${{ github.workspace }}/target/release/spidapter${DETECT_OS_EXT}" >> $GITHUB_OUTPUT
         fi
 
     - name: Upload spidapter artifact
       if: inputs.upload_artifact == 'true'
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: spidapter-${{ steps.detect-os.outputs.os }}
         path: target/release/spidapter${{ steps.detect-os.outputs.ext }}

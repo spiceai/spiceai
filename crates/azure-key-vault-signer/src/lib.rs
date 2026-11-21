@@ -325,7 +325,7 @@ impl KeyVaultSigner {
     }
 
     fn new(key: KeyVaultKey, identity: Identity) -> Result<Self, KeyVaultError> {
-        let http = reqwest::Client::builder()
+        let http = http_retry::client_builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))

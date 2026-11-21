@@ -19,7 +19,7 @@ runs:
         fi
 
     - name: Authorize with AWS
-      uses: ./.github/actions/aws-authorize
+      uses: $/.github/actions/aws-authorize
       with:
         environment: sandbox
         region: us-east-1
@@ -27,6 +27,8 @@ runs:
 
     - name: Fetch and export secrets from SSM
       shell: bash
+      env:
+        INPUT_SSM_PATH: ${{ inputs.ssm_path }}
       run: |
         NEXT_TOKEN=""
         PARAM_COUNT=0
@@ -34,13 +36,13 @@ runs:
         while true; do
           if [ -z "$NEXT_TOKEN" ]; then
             RESPONSE=$(aws ssm get-parameters-by-path \
-              --path "${{ inputs.ssm_path }}" \
+              --path "${INPUT_SSM_PATH}" \
               --with-decryption \
               --recursive \
               --output json)
           else
             RESPONSE=$(aws ssm get-parameters-by-path \
-              --path "${{ inputs.ssm_path }}" \
+              --path "${INPUT_SSM_PATH}" \
               --with-decryption \
               --recursive \
               --starting-token "$NEXT_TOKEN" \
@@ -78,7 +80,7 @@ runs:
         done
 
         if [ "$PARAM_COUNT" -eq 0 ]; then
-          echo "::warning::No parameters found under ${{ inputs.ssm_path }}"
+          echo "::warning::No parameters found under ${INPUT_SSM_PATH}"
         else
           echo "Loaded $PARAM_COUNT secrets from SSM"
         fi

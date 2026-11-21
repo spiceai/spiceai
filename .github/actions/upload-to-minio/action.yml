@@ -39,6 +39,13 @@ runs:
           sudo chmod +x /usr/local/bin/mc
         fi
         if [[ -n "$MINIO_SESSION_TOKEN" ]]; then
+          # Appended to $GITHUB_ENV as NAME=value: a newline would inject more entries.
+          for value in "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" "${MINIO_SESSION_TOKEN}"; do
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "::error::upload-to-minio: MinIO inputs must not contain a newline"
+              exit 1
+            fi
+          done
           echo "MC_HOST_spice-minio=${MINIO_ENDPOINT%%://*}://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}:${MINIO_SESSION_TOKEN}@${MINIO_ENDPOINT#*://}" >> "$GITHUB_ENV"
         else
           mc alias set spice-minio "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
@@ -46,11 +53,14 @@ runs:
 
     - name: Upload to MinIO
       shell: bash
+      env:
+        INPUT_SOURCE_PATH: ${{ inputs.source_path }}
+        INPUT_DESTINATION_PATH: ${{ inputs.destination_path }}
       run: |
-        if [ -f "${{ inputs.source_path }}" ]; then
-          if ! mc cp ${{ inputs.source_path }} ${{ inputs.destination_path }}; then
-            echo "::warning::Failed to upload ${{ inputs.source_path }} to MinIO."
+        if [ -f "${INPUT_SOURCE_PATH}" ]; then
+          if ! mc cp "${INPUT_SOURCE_PATH}" "${INPUT_DESTINATION_PATH}"; then
+            echo "::warning::Failed to upload ${INPUT_SOURCE_PATH} to MinIO."
           fi
         else
-          echo "File ${{ inputs.source_path }} not found, skipping upload"
+          echo "File ${INPUT_SOURCE_PATH} not found, skipping upload"
         fi

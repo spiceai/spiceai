@@ -1425,7 +1425,6 @@ impl Kafka {
         self
     }
 
-    #[must_use]
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let flatten_json = self.flatten_json.clone();

@@ -1,0 +1,59 @@
+---
+name: Changelog Script Test
+
+# `Generate Changelog` takes two free-text inputs from whoever dispatches it and
+# hands them to `scripts/generate_changelog.py`. This runs that workflow's step,
+# read from its own file, with hostile and real inputs in a scratch repository
+# with an offline `gh`: no input may run a command or reach Git as an option,
+# and real inputs must still produce the exact changelog.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - 'scripts/generate_changelog.py'
+      - 'scripts/test_generate_changelog.py'
+      - '.github/workflows/generate_changelog.yml'
+      # Self-referencing so an edit to this file is exercised by the gate it
+      # defines, rather than only when one of the paths above also changes.
+      - '.github/workflows/changelog_script_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'scripts/generate_changelog.py'
+      - 'scripts/test_generate_changelog.py'
+      - '.github/workflows/generate_changelog.yml'
+      - '.github/workflows/changelog_script_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
+jobs:
+  test-generate-changelog:
+    environment: secret-free
+    name: Changelog inputs run no command
+    runs-on: spiceai-dev-runners
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # Reads the checkout and nothing else; the tests stub `gh` and never touch the network.
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: python3 scripts/test_generate_changelog.py -v

@@ -21,11 +21,6 @@ limitations under the License.
 //! driven through the registry's table creation and the accelerator's
 //! `reload_from_snapshot`, as the runtime opens and reloads a dataset.
 
-#![expect(
-    clippy::expect_used,
-    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
-)]
-
 use std::{
     path::{Path, PathBuf},
     sync::Arc,

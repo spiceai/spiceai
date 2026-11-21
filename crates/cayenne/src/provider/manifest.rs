@@ -53,7 +53,7 @@ pub(crate) struct SeqPrefixPlan {
     pub(crate) reference: Vec<SnapshotFile>,
 }
 
-/// How `upsert_snapshot_manifest_from_listing` tags each listed file's
+/// How `upsert_snapshot_manifest_from_files` tags each listed file's
 /// `[min_sequence, max_sequence]` — the TRUE per-file commit-seq range the
 /// seq-prefix bake needs, in place of the prior single per-snapshot watermark
 /// (which degenerated `partition_manifest_by_sequence` to all-bake/all-reference

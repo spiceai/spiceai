@@ -615,7 +615,7 @@ async fn test_distributed_query_captures_plan_from_executed_graph() -> Result<()
                      AND input = '{plan_input}'"
                 ))
                 .await?;
-            assert!(!plan_rows.is_empty());
+            assert_ne!(plan_rows, [] as [RecordBatch; 0]);
             assert_eq!(
                 plan_rows[0].num_rows(),
                 1,

@@ -79,6 +79,9 @@ on:
         type: string
         default: '1'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-throughput:
     # The Databricks service principal's federation policy trusts this environment's subject.
@@ -126,7 +129,7 @@ jobs:
       # outages otherwise fail `apt-get install git` with exit 100, and gives
       # the Ubuntu archives mirror failover, as testoperator_run_bench.yml does.
       - name: Configure apt mirrors
-        uses: ./.github/actions/configure-apt
+        uses: $/.github/actions/configure-apt
 
       - name: Set spicepod path
         id: set_spicepod_path
@@ -146,14 +149,14 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        uses: ./.github/actions/rustfs-credentials
+        uses: $/.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           duration-seconds: '21600'
           export-env: 'false'
 
       - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+        uses: $/.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -161,7 +164,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
+        uses: $/.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -173,12 +176,12 @@ jobs:
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
@@ -186,7 +189,7 @@ jobs:
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
+        uses: $/.github/actions/setup-testoperator-data
         with:
           query_set: ${{ github.event.inputs.query_set }}
 
@@ -262,24 +265,23 @@ jobs:
           if [ "$PGHOST" != "127.0.0.1" ]; then
             echo "::error::$DB_NAME is missing or empty on the hosted $PGHOST cluster. Scale factor $SCALE_FACTOR is too large to safely generate and load inline from a CI runner. Pre-provision it first, e.g.:"
             echo "  cd test/tpc-bench && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME DBGEN_SCALE=$SCALE_FACTOR make tpch-clone tpch-fleet-gen pg-init && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCH_DATA_DIR=./tmp/fleet make pg-load && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index"
-            echo "(for a tpcds run: make tpcds-clone tpcds-fleet-gen pg-tpcds-init, then TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load, then make pg-tpcds-create-index)"
+            echo "(for a tpcds run: make tpcds-init tpcds-gen pg-tpcds-init pg-tpcds-load pg-tpcds-create-index)"
             exit 1
           fi
 
           echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
           sudo apt-get install -y git
-          # Both query sets seed from the pinned DuckDB CLI (tpch-fleet-gen /
-          # tpcds-fleet-gen), so nothing is compiled here - the kits are only
-          # cloned for their DDL (dss.ddl / tpcds.sql, tpcds_ri.sql). Seeding
-          # from any other generator produces data the recorded expected
-          # answers don't match (see the fleet-gen comments in the Makefile).
-          sudo apt-get install -y unzip
+          # Both query sets seed the data the rest of the benchmark fleet holds:
+          # TPC-DS from tpcds-kit's dsdgen, built here, and TPC-H from the pinned
+          # DuckDB CLI (tpch-fleet-gen), whose tpch extension writes dbgen's
+          # data, so tpch-kit is only cloned for its DDL (dss.ddl).
 
           if [ "$QUERY_SET" = "tpcds" ]; then
-            make tpcds-clone
-            DBGEN_SCALE=$SCALE_FACTOR make tpcds-fleet-gen
+            sudo apt-get install -y make gcc flex bison byacc
+            make tpcds-init
+            DBGEN_SCALE=$SCALE_FACTOR make tpcds-gen
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-init
-            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-load
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
           else
             make tpch-clone
@@ -292,11 +294,11 @@ jobs:
 
       - name: Install ADBC BigQuery Driver
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/setup-adbc-bigquery
+        uses: $/.github/actions/setup-adbc-bigquery
 
       - name: Set up BigQuery credentials (workload identity federation)
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/bigquery-credentials
+        uses: $/.github/actions/bigquery-credentials
         with:
           workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
           service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
@@ -309,7 +311,7 @@ jobs:
 
       - name: Setup ScyllaDB
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
-        uses: ./.github/actions/setup-scylladb
+        uses: $/.github/actions/setup-scylladb
         with:
           keyspace: tpch_sf1
 
@@ -329,7 +331,7 @@ jobs:
         id: aws-s3-athena
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_S3_ATHENA_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_S3_ATHENA_ROLE_ARN }}
           role-session-name: gha-s3-athena-${{ github.run_id }}
           role-duration-seconds: 21600
           aws-region: us-east-1
@@ -340,7 +342,7 @@ jobs:
         id: aws-dynamodb
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-to-assume: ${{ secrets.CI_AWS_DYNAMODB_ROLE_ARN }}
           role-session-name: gha-dynamodb-${{ github.run_id }}
           role-duration-seconds: 21600
           aws-region: us-east-1

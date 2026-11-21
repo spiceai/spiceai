@@ -152,7 +152,7 @@ mod tests {
             };
 
             let leaves = checkpoint.leaf_shards();
-            assert!(leaves.is_empty());
+            assert_eq!(leaves, [] as [(&String, &ShardCheckpoint); 0]);
         }
 
         #[test]

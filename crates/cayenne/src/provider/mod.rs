@@ -74,6 +74,7 @@ limitations under the License.
 pub(crate) mod append_commit;
 pub(crate) mod append_stage;
 pub(crate) mod clustering;
+mod cold_file_stats;
 pub(crate) mod cold_partition;
 pub(crate) mod cold_pk_prune;
 pub(crate) mod column_stats;
@@ -103,6 +104,7 @@ pub(crate) mod mem_tier_index;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod on_conflict;
+pub mod orphan_sweep;
 pub(crate) mod overwrite;
 pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
@@ -129,6 +131,7 @@ pub(crate) mod transaction;
 pub(crate) mod tuning;
 #[cfg(test)]
 mod tuning_sim;
+pub(crate) mod uncommitted_files;
 pub(crate) mod update_exec;
 pub(crate) mod update_keys;
 pub(crate) mod utils;
