@@ -320,6 +320,10 @@ pub fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
 /// Returns an error if `scalar` is not a non-negative integer value (or a
 /// string that parses to one).
 pub fn parse_limit_scalar(scalar: &ScalarValue) -> DataFusionResult<u64> {
+    crate::request::check_sql_search_limit(parse_non_negative_limit(scalar)?)
+}
+
+fn parse_non_negative_limit(scalar: &ScalarValue) -> DataFusionResult<u64> {
     match scalar {
         ScalarValue::Int64(Some(limit)) => u64::try_from(*limit).map_err(|_| {
             DataFusionError::Plan(format!(

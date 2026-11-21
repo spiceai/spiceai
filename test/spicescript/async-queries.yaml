@@ -1,0 +1,106 @@
+name: async-queries
+description: >
+  On a cluster, an async query (`POST /v1/queries`) is held to
+  `runtime.query.timeout` like every other query the runtime's APIs run: a
+  query that sets no `timeout_seconds` fails once the runtime's timeout has
+  passed, one that sets the runtime's timeout fails at it too, and one that
+  asks for a longer timeout is refused with `400` before it runs. A query that
+  finishes within the timeout succeeds.
+
+sources:
+  lake: { kind: files }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: async-queries
+  runtime:
+    query:
+      timeout: 5s
+  datasets:
+    - from: 'file://${sources.lake.path}/nums/'
+      name: nums
+      params: { file_format: parquet }
+
+defaults:
+  cluster: { executors: 1 }
+
+steps:
+  - generate:
+      lake:
+        table: nums
+        rows: 5000
+        seed: 21
+        primary-key: id
+        format: parquet
+        columns:
+          - { name: id, sequence: 1 }
+  - start: {}
+
+  # A query that finishes within the timeout succeeds.
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums"}' }
+    expect: { status: 202 }
+  - http: { method: GET, path: /v1/queries, query: { status: succeeded } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /queries/*/sql_preview, equals: 'SELECT count(*) AS n FROM nums', count: 1 }
+    eventually: 60s
+
+  # A timeout longer than the runtime's is refused before the query runs, with the limit and
+  # the fix; nothing is queued for it.
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 2", "timeout_seconds": 3600}' }
+    expect:
+      status: 400
+      json:
+        - { pointer: /error, equals: "`timeout_seconds` is 3600, above 5 seconds, this runtime's `runtime.query.timeout` and the longest an async query may run. Omit it to use 5 seconds, or set a smaller value. See https://spiceai.org/docs/api/http/queries" }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 2", "timeout_seconds": 6}' }
+    expect: { status: 400 }
+
+  # Two queries that would run for far longer than the timeout (a filtered three-way cross join
+  # of 5,000 rows): one sets no timeout, the other sets the runtime's.
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 0"}' }
+    expect: { status: 202 }
+    capture: { no_timeout_set: /query_id }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 1", "timeout_seconds": 5}' }
+    expect: { status: 202 }
+    capture: { runtime_timeout_set: /query_id }
+  # Both start running...
+  - http: { method: GET, path: /v1/queries }
+    expect:
+      status: 200
+      json:
+        - { pointer: /queries/*/status, equals: RUNNING, count: '>=2' }
+    eventually: 30s
+  # ...and both fail once the runtime's 5s timeout has passed.
+  - http: { method: GET, path: /v1/queries, query: { status: failed } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /queries/*/sql_preview, equals: 'SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 0', count: 1 }
+        - { pointer: /queries/*/sql_preview, equals: 'SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 1', count: 1 }
+    eventually: 60s
+  # Each failed because it timed out, not for any other reason.
+  - http: { method: GET, path: '/v1/queries/${captured.no_timeout_set}/status' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /status, equals: FAILED }
+        - { pointer: /error/error_code, equals: TIMEOUT }
+  - http: { method: GET, path: '/v1/queries/${captured.runtime_timeout_set}/status' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /status, equals: FAILED }
+        - { pointer: /error/error_code, equals: TIMEOUT }
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 0 }
+  # The refused query was never created.
+  - http: { method: GET, path: /v1/queries }
+    expect:
+      status: 200
+      json:
+        - { pointer: /queries/*/sql_preview, equals: 'SELECT count(*) AS n FROM nums a, nums b, nums c WHERE a.id + b.id + c.id > 2', count: 0 }

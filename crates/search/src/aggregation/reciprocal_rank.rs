@@ -16,25 +16,30 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use crate::aggregation::from_single_input;
-use crate::{
-    SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult,
-    collect_batches,
-};
+use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult};
 
 use super::{AggregationResult, CandidateAggregation, DatafusionSnafu};
 use super::{Error, Result};
 
+use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::Column;
 use datafusion::common::TableReference;
+use datafusion::common::utils::memory::RecordBatchMemoryCounter;
 use datafusion::datasource::MemTable;
+use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
     Expr as LogicalExpr, ExprFunctionExt, LogicalPlan, LogicalPlanBuilder,
 };
 use datafusion::logical_expr::{JoinType, Operator, binary_expr, col, lit};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{SessionContext, coalesce};
+use futures::StreamExt;
 use snafu::ResultExt;
 
 /// Reciprocal Rank Fusion (RRF) is a method for combining multiple ranked sets of search results.
@@ -123,6 +128,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
         mut data: Vec<VectorSearchGenerationResult>,
         primary_key: Vec<Column>,
         limit: usize,
+        runtime: Arc<RuntimeEnv>,
     ) -> Result<AggregationResult> {
         let num_inputs = data.len();
         // Handle 0, or 1 candidates.
@@ -140,7 +146,16 @@ impl CandidateAggregation for ReciprocalRankFusion {
         let schemas = data.iter().map(|d| d.data.schema()).collect::<Vec<_>>();
         let () = verify_schema_compatibility(schemas.as_slice())?;
 
-        let ctx = util::session_state::session_context();
+        // The fusion runs in the query engine's memory pool, and the candidates it collects are
+        // reserved from that pool until its result is consumed, so a search is held to
+        // `runtime.query.memory_limit` as a query is.
+        let mut reservation =
+            MemoryConsumer::new("SearchCandidates").register(&runtime.memory_pool);
+        let mut counter = RecordBatchMemoryCounter::new();
+        let ctx = SessionContext::new_with_config_rt(
+            util::session_state::session_config(),
+            Arc::clone(&runtime),
+        );
         let mut table_names: Vec<TableReference> = Vec::with_capacity(num_inputs);
 
         // Find all additional columns in the schema that are not part of the primary key or the expected
@@ -161,8 +176,9 @@ impl CandidateAggregation for ReciprocalRankFusion {
                 primary_key.as_slice(),
             ));
 
-            let mut data = collect_batches(stream).await.context(DatafusionSnafu)?;
-            data.retain(|batch| batch.num_rows() > 0);
+            let data = collect_reserved_batches(stream, &mut reservation, &mut counter)
+                .await
+                .context(DatafusionSnafu)?;
 
             // If data is empty, don't use.
             if data.is_empty() {
@@ -198,13 +214,15 @@ impl CandidateAggregation for ReciprocalRankFusion {
             let tbl = table_names.pop().ok_or(Error::NoCandidatesGenerated)?;
             let match_keys: Vec<_> = matches.keys().cloned().collect();
 
-            return result_from_table(
+            let mut result = result_from_table(
                 &ctx,
                 &tbl,
                 match_keys.first().ok_or(Error::NoCandidatesGenerated)?,
                 primary_key_str.as_slice(),
             )
-            .await;
+            .await?;
+            result.data = holding_reservation(result.data, reservation);
+            return Ok(result);
         }
 
         let additional_columns = additional_columns.into_iter().collect::<Vec<_>>();
@@ -230,7 +248,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
             .context(DatafusionSnafu)?;
 
         Ok(AggregationResult {
-            data,
+            data: holding_reservation(data, reservation),
             primary_key: primary_key_str,
             data_columns: additional_columns
                 .iter()
@@ -239,6 +257,43 @@ impl CandidateAggregation for ReciprocalRankFusion {
             matches,
         })
     }
+}
+
+/// Collects the non-empty batches of `stream`, growing `reservation` by the memory of each
+/// batch's buffers that `counter` has not counted yet (batches sliced from one another share
+/// buffers, which are held once). Fails with the memory pool's error, and stops reading, once
+/// the pool cannot hold another batch.
+async fn collect_reserved_batches(
+    mut stream: SendableRecordBatchStream,
+    reservation: &mut MemoryReservation,
+    counter: &mut RecordBatchMemoryCounter,
+) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        reservation.try_grow(counter.count_batch(&batch))?;
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+/// `stream`, keeping `reservation` until the stream is dropped: its batches are read from the
+/// candidates the reservation accounts for.
+fn holding_reservation(
+    stream: SendableRecordBatchStream,
+    reservation: MemoryReservation,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream.map(move |batch| {
+            let _ = &reservation;
+            batch
+        }),
+    ))
 }
 
 // Construct a [`AggregationResult`] from a single table in a [`SessionContext`].
@@ -505,10 +560,12 @@ mod tests {
     use arrow::array::RecordBatch;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
 
     use super::*;
+    use crate::collect_batches;
 
     // Note: The old SQL snapshot tests have been removed as we now use LogicalPlanBuilder.
     // The logical plan is tested through integration tests and runtime behavior verification.
@@ -712,6 +769,7 @@ mod tests {
                 vec![stream_0, stream_1, stream_2],
                 vec![Column::from_name("id")],
                 10,
+                Arc::new(RuntimeEnv::default()),
             )
             .await
             .expect("rrf aggregation should succeed");
@@ -781,7 +839,12 @@ mod tests {
         };
 
         let result = ReciprocalRankFusion
-            .aggregate(vec![stream_0, stream_1], vec![Column::from_name("id")], 10)
+            .aggregate(
+                vec![stream_0, stream_1],
+                vec![Column::from_name("id")],
+                10,
+                Arc::new(RuntimeEnv::default()),
+            )
             .await
             .expect("rrf aggregation should succeed");
 
@@ -854,5 +917,67 @@ mod tests {
             result.is_ok(),
             "Utf8 and LargeUtf8 should be considered semantically equivalent"
         );
+    }
+
+    /// The candidates fusion collects count against the query engine's memory pool: a pool too
+    /// small for them fails the search with the pool's error instead of holding them anyway.
+    #[tokio::test]
+    async fn reciprocal_rank_fusion_candidates_count_against_the_memory_pool() {
+        let candidates = |label: &str| {
+            let ids: Vec<String> = (0..10_000).map(|i| format!("{label}-{i}")).collect();
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    SEARCH_SCORE_COLUMN_NAME,
+                    Arc::new(arrow::array::Float64Array::from(vec![1.0; 10_000])) as _,
+                ),
+                (
+                    SEARCH_VALUE_COLUMN_NAME,
+                    Arc::new(arrow::array::StringArray::from(ids.clone())) as _,
+                ),
+                ("id", Arc::new(arrow::array::StringArray::from(ids)) as _),
+            ])
+            .expect("valid record batch");
+            VectorSearchGenerationResult {
+                data: stream_from_batch(batch),
+                derived_from: "body".to_string(),
+            }
+        };
+
+        let small_pool = RuntimeEnvBuilder::new()
+            .with_memory_limit(64 * 1024, 1.0)
+            .build_arc()
+            .expect("runtime with a memory limit");
+        let Err(e) = ReciprocalRankFusion
+            .aggregate(
+                vec![candidates("a"), candidates("b")],
+                vec![Column::from_name("id")],
+                10,
+                small_pool,
+            )
+            .await
+        else {
+            panic!("fusion must not hold more candidates than the memory pool allows");
+        };
+        assert!(
+            e.to_string().contains("SearchCandidates"),
+            "expected the memory pool's error for the search candidates, got: {e}"
+        );
+
+        let result = ReciprocalRankFusion
+            .aggregate(
+                vec![candidates("a"), candidates("b")],
+                vec![Column::from_name("id")],
+                10,
+                Arc::new(RuntimeEnv::default()),
+            )
+            .await
+            .expect("fusion fits an unbounded pool");
+        let rows: usize = collect_batches(result.data)
+            .await
+            .expect("fused batches")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 10);
     }
 }
