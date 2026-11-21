@@ -51,10 +51,9 @@ spicepod:
     - { from: 'snowflake:DB.PUBLIC.T', name: sf_keypair_bad_account, params: { snowflake_account: no-such-account, snowflake_username: spice, snowflake_warehouse: wh, snowflake_role: r, snowflake_private_key_path: '${script.dir}/../tls/spiced_key.pem' } }
     - { from: 'kafka:no_such_host_topic', name: kf_bad_host, params: { kafka_bootstrap_servers: 'no-such-host.invalid:9092', kafka_security_protocol: PLAINTEXT }, acceleration: { enabled: true, engine: cayenne, refresh_mode: append } }
     # A Debezium topic whose messages carry no Kafka key cannot have its updates
-    # and deletes applied, so it fails to load on every engine. `schema_evolution`
-    # works around #15495, which otherwise fails a fresh topic before this check.
-    - { from: 'debezium:dbz_keyless_${sources.kafka.namespace}', name: dbz_keyless_cayenne, params: { kafka_bootstrap_servers: '127.0.0.1:${sources.kafka.port.19092}', kafka_security_protocol: plaintext, schema_evolution: 'true' }, acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: changes } }
-    - { from: 'debezium:dbz_keyless_${sources.kafka.namespace}', name: dbz_keyless_arrow, params: { kafka_bootstrap_servers: '127.0.0.1:${sources.kafka.port.19092}', kafka_security_protocol: plaintext, schema_evolution: 'true' }, acceleration: { enabled: true, engine: arrow, mode: memory, refresh_mode: changes } }
+    # and deletes applied, so it fails to load on every engine.
+    - { from: 'debezium:dbz_keyless_${sources.kafka.namespace}', name: dbz_keyless_cayenne, params: { kafka_bootstrap_servers: '127.0.0.1:${sources.kafka.port.19092}', kafka_security_protocol: plaintext }, acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: changes } }
+    - { from: 'debezium:dbz_keyless_${sources.kafka.namespace}', name: dbz_keyless_arrow, params: { kafka_bootstrap_servers: '127.0.0.1:${sources.kafka.port.19092}', kafka_security_protocol: plaintext }, acceleration: { enabled: true, engine: arrow, mode: memory, refresh_mode: changes } }
 
 steps:
   - source-exec: { my: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }

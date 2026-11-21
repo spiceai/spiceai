@@ -6,9 +6,7 @@ description: >
   Cayenne acceleration answers as PostgreSQL does, before and after spiced
   restarts. A dataset that declares its columns `timestamptz`, `timestamp` and
   `Timestamp(Microsecond)` loads Debezium's string and integer timestamps into
-  those types, converting each integer from the unit of its Debezium type. (An Arrow
-  acceleration of the topic fails to start:
-  known-failing/debezium/debezium-kafka-arrow.yaml.)
+  those types, converting each integer from the unit of its Debezium type.
 
 sources:
   src: { kind: postgres }
