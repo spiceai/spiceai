@@ -65,12 +65,12 @@ use crate::{
     acceleration::has_vortex_file,
     configure_test_datafusion,
     federation_differential::{
-        PlanCheck, Row, agreement, check_cayenne_sources, check_sources, operators, physical_plan,
-        render,
+        Case, Row, agreement, check_cayenne_sources, check_federated, check_sources, empty,
+        operators, ordered, physical_plan, rows, spice_rows,
     },
     init_tracing,
     postgres::common::{self, get_pg_params},
-    utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 /// The rows of the fixture table, so a load that dropped some fails up front.
@@ -105,76 +105,8 @@ const SEED: &[&str] = &[
        (NULL, 'nowhere'), (7, 'unused')",
 ];
 
-/// One query, with `{items}` and `{regions}` standing for the tables.
-struct Case {
-    sql: &'static str,
-    /// Whether the rows' order is part of the answer: the query's top-level
-    /// `ORDER BY` covers a unique key, so the order is fixed.
-    ordered: bool,
-    /// Whether no row is the right answer. Every other case must return rows,
-    /// so two empty answers cannot pass for agreement.
-    empty: bool,
-}
-
-const fn rows(sql: &'static str) -> Case {
-    Case {
-        sql,
-        ordered: false,
-        empty: false,
-    }
-}
-
-const fn ordered(sql: &'static str) -> Case {
-    Case {
-        sql,
-        ordered: true,
-        empty: false,
-    }
-}
-
-const fn empty(sql: &'static str) -> Case {
-    Case {
-        sql,
-        ordered: false,
-        empty: true,
-    }
-}
-
-/// The operators a federated plan may run in Spice: wrappers that pass rows
-/// through, and the scan that sends SQL to `PostgreSQL`. Both tables come from
-/// one `PostgreSQL` database, so federation sends the whole query there. Any
-/// other operator means Spice evaluated part of the query itself, over a wider
-/// scan: a filter, an aggregate, a join, a sort, a window, or a computed
-/// column. The answer can still match, but then it compares `DataFusion` with
-/// `PostgreSQL`, which the accelerated side already does, and not the
-/// translation this test exists to check.
-const PASS_THROUGH: [&str; 3] = [
-    "SchemaCastScanExec",
-    "CooperativeExec",
-    "BytesProcessedExec",
-];
+/// The scans that send SQL to `PostgreSQL`, or to a `SQLite` acceleration.
 const REMOTE_SCANS: [&str; 2] = ["VirtualExecutionPlan", "SqlExec"];
-
-/// Checks that the physical plan in `plan`, an `EXPLAIN` answer, runs nothing
-/// in Spice but [`PASS_THROUGH`] operators over one of [`REMOTE_SCANS`].
-fn check_nothing_local(plan: &[Row]) -> Result<(), String> {
-    let physical = physical_plan(plan)?;
-    let operators: Vec<&str> = operators(&physical).iter().map(|op| op.name).collect();
-    let local: Vec<&str> = operators
-        .iter()
-        .copied()
-        .filter(|op| !PASS_THROUGH.contains(op) && !REMOTE_SCANS.contains(op))
-        .collect();
-    if !local.is_empty() {
-        return Err(format!(
-            "Spice evaluates {local:?} itself instead of sending it to PostgreSQL:\n{physical}"
-        ));
-    }
-    if !operators.iter().any(|op| REMOTE_SCANS.contains(op)) {
-        return Err(format!("the plan sends no SQL to PostgreSQL:\n{physical}"));
-    }
-    Ok(())
-}
 
 fn cases() -> Vec<Case> {
     vec![
@@ -307,7 +239,6 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// A row as its cells, each rendered, or `None` for NULL.
 /// How a dataset reads `PostgreSQL`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -417,11 +348,6 @@ fn dataset(port: usize, table: &str, name: &str, kind: Kind, dir: &Path) -> Data
     ds
 }
 
-async fn spice_rows(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<Row>, String> {
-    let batches = run_query(rt, sql).await.map_err(|e| e.to_string())?;
-    render(&batches)
-}
-
 /// The oracle: `sql` sent to `PostgreSQL` over the simple query protocol, which
 /// returns every cell in `PostgreSQL`'s own text form.
 async fn postgres_rows(client: &tokio_postgres::Client, sql: &str) -> Result<Vec<Row>, String> {
@@ -518,10 +444,7 @@ async fn compare_case(
     case: &Case,
     failures: &mut Vec<String>,
 ) -> Result<bool, anyhow::Error> {
-    let oracle_sql = case
-        .sql
-        .replace("{items}", "diff_items")
-        .replace("{regions}", "diff_regions");
+    let oracle_sql = case.oracle_sql("diff_items", "diff_regions");
     let oracle = postgres_rows(client, &oracle_sql)
         .await
         .map_err(|e| anyhow::anyhow!("PostgreSQL rejected `{oracle_sql}`: {e}"))?;
@@ -536,10 +459,7 @@ async fn compare_case(
     let mut all_remote = true;
     for subject in SUBJECTS {
         let name = subject.name;
-        let sql = case
-            .sql
-            .replace("{items}", subject.items)
-            .replace("{regions}", subject.regions);
+        let sql = Case::bind(case.sql, subject.items, subject.regions);
         match spice_rows(rt, &sql).await {
             Ok(spice) => {
                 if let Err(reason) = agreement(&spice, &oracle, case.ordered) {
@@ -554,14 +474,16 @@ async fn compare_case(
         // DataFusion over a wider scan and compares nothing the accelerated side
         // does not. A Cayenne side must read only Cayenne, or its agreement says
         // nothing about what Cayenne stored.
-        let check: Option<PlanCheck> = match subject.kind {
-            Kind::Federated => Some(check_nothing_local),
+        let check: Option<&dyn Fn(&[Row]) -> Result<(), String>> = match subject.kind {
+            Kind::Federated => {
+                Some(&|plan| check_federated(plan, &REMOTE_SCANS, "PostgreSQL", case.kept_local))
+            }
             Kind::CayenneMemory | Kind::CayenneFile | Kind::CayenneVortex => {
-                Some(check_cayenne_sources)
+                Some(&check_cayenne_sources)
             }
             Kind::Accelerated | Kind::PartitionedArrow => None,
             #[cfg(feature = "sqlite")]
-            Kind::SqliteMemory | Kind::SqliteFile => Some(check_sqlite_sources),
+            Kind::SqliteMemory | Kind::SqliteFile => Some(&check_sqlite_sources),
         };
         if let Some(check) = check {
             let plan = spice_rows(rt, &format!("EXPLAIN {sql}"))

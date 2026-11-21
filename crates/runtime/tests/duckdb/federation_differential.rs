@@ -61,10 +61,11 @@ use crate::{
     acceleration::has_vortex_file,
     configure_test_datafusion,
     federation_differential::{
-        PlanCheck, Row, agreement, check_cayenne_sources, operators, physical_plan, render,
+        Case, Row, agreement, check_cayenne_sources, check_federated, empty, ordered, render,
+        rewritten, rows, spice_rows,
     },
     init_tracing,
-    utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 /// The rows of the fixture table, so a load that dropped some fails up front.
@@ -97,61 +98,12 @@ INSERT INTO diff_regions VALUES
   (NULL, 'nowhere'), (7, 'unused');
 ";
 
-/// One query, with `{items}` and `{regions}` standing for the tables.
-struct Case {
-    sql: &'static str,
-    /// The `DuckDB` spelling of `sql`, where `DuckDB` defines an operator in
-    /// `sql` differently from Spice. `None` sends `sql` to `DuckDB` unchanged.
-    duckdb: Option<&'static str>,
-    /// Whether the rows' order is part of the answer: the query's top-level
-    /// `ORDER BY` covers a unique key, so the order is fixed.
-    ordered: bool,
-    /// Whether no row is the right answer. Every other case must return rows,
-    /// so two empty answers cannot pass for agreement.
-    empty: bool,
-    /// Whether Spice must evaluate the query's `LIKE` itself rather than send
-    /// it to `DuckDB`: a pattern with a backslash, which `DuckDB` without
-    /// `ESCAPE` reads literally and Spice reads as an escape.
-    like_kept_local: bool,
-}
-
-const fn rows(sql: &'static str) -> Case {
-    Case {
-        sql,
-        duckdb: None,
-        ordered: false,
-        empty: false,
-        like_kept_local: false,
-    }
-}
-
-const fn ordered(sql: &'static str) -> Case {
-    Case {
-        ordered: true,
-        ..rows(sql)
-    }
-}
-
-const fn empty(sql: &'static str) -> Case {
-    Case {
-        empty: true,
-        ..rows(sql)
-    }
-}
-
-/// A case `DuckDB` spells `duckdb` for the same semantics.
-const fn rewritten(sql: &'static str, duckdb: &'static str) -> Case {
-    Case {
-        duckdb: Some(duckdb),
-        ..rows(sql)
-    }
-}
-
 /// A case whose `LIKE` pattern holds a backslash, which `DuckDB` spells
-/// `duckdb`, and which Spice must evaluate itself.
+/// `duckdb`, and which Spice must evaluate itself: `DuckDB` without `ESCAPE`
+/// reads the backslash literally, and Spice reads it as an escape.
 const fn backslash_like(sql: &'static str, duckdb: &'static str) -> Case {
     Case {
-        like_kept_local: true,
+        kept_local: Some(" LIKE "),
         ..rewritten(sql, duckdb)
     }
 }
@@ -318,60 +270,8 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// The operators a federated plan may run in Spice: wrappers that pass rows
-/// through, and the scan that sends SQL to `DuckDB`. Both tables come from one
-/// `DuckDB` database, so federation sends the whole query there. Any other
-/// operator means Spice evaluated part of the query itself, over a wider scan,
-/// and the case then compares `DataFusion` with `DuckDB`, which the accelerated
-/// sides already do, and not the translation this test exists to check.
-const PASS_THROUGH: [&str; 3] = [
-    "SchemaCastScanExec",
-    "CooperativeExec",
-    "BytesProcessedExec",
-];
+/// The scans that send SQL to `DuckDB`.
 const REMOTE_SCANS: [&str; 3] = ["VirtualExecutionPlan", "SqlExec", "DuckSqlExec"];
-
-/// Checks that the physical plan in `plan`, an `EXPLAIN` answer, runs nothing
-/// in Spice but [`PASS_THROUGH`] operators over one of [`REMOTE_SCANS`].
-fn check_nothing_local(plan: &[Row]) -> Result<(), String> {
-    let physical = physical_plan(plan)?;
-    let operators: Vec<&str> = operators(&physical).iter().map(|op| op.name).collect();
-    let local: Vec<&str> = operators
-        .iter()
-        .copied()
-        .filter(|op| !PASS_THROUGH.contains(op) && !REMOTE_SCANS.contains(op))
-        .collect();
-    if !local.is_empty() {
-        return Err(format!(
-            "Spice evaluates {local:?} itself instead of sending it to DuckDB:\n{physical}"
-        ));
-    }
-    if !operators.iter().any(|op| REMOTE_SCANS.contains(op)) {
-        return Err(format!("the plan sends no SQL to DuckDB:\n{physical}"));
-    }
-    Ok(())
-}
-
-/// Checks that the physical plan in `plan` evaluates a `LIKE` in Spice, over
-/// SQL sent to `DuckDB` that carries none: `DuckDB` would read the pattern's
-/// backslash literally, so sending it would change the answer.
-fn check_like_kept_local(plan: &[Row]) -> Result<(), String> {
-    let physical = physical_plan(plan)?;
-    let operators = operators(&physical);
-    let local_like = operators
-        .iter()
-        .any(|op| op.name == "FilterExec" && op.line.contains(" LIKE "));
-    let sent_like = operators
-        .iter()
-        .any(|op| REMOTE_SCANS.contains(&op.name) && op.line.to_uppercase().contains(" LIKE "));
-    if local_like && !sent_like {
-        Ok(())
-    } else {
-        Err(format!(
-            "a LIKE pattern with a backslash must be evaluated in Spice, not sent to DuckDB:\n{physical}"
-        ))
-    }
-}
 
 /// How a dataset reads `DuckDB`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -475,11 +375,6 @@ fn dataset(db: &Path, table: &str, name: &str, kind: Kind, dir: &Path) -> Datase
     ds
 }
 
-async fn spice_rows(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<Row>, String> {
-    let batches = run_query(rt, sql).await.map_err(|e| e.to_string())?;
-    render(&batches)
-}
-
 /// The oracle: `sql` sent to the standalone `DuckDB` database.
 fn duckdb_rows(oracle: &duckdb_oracle::Connection, sql: &str) -> Result<Vec<Row>, String> {
     let batches = oracle.query(sql).map_err(|e| e.to_string())?;
@@ -492,11 +387,7 @@ async fn compare_case(
     case: &Case,
     failures: &mut Vec<String>,
 ) -> Result<bool, anyhow::Error> {
-    let oracle_sql = case
-        .duckdb
-        .unwrap_or(case.sql)
-        .replace("{items}", "diff_items")
-        .replace("{regions}", "diff_regions");
+    let oracle_sql = case.oracle_sql("diff_items", "diff_regions");
     let expected = duckdb_rows(oracle, &oracle_sql)
         .map_err(|e| anyhow::anyhow!("DuckDB rejected `{oracle_sql}`: {e}"))?;
     if expected.is_empty() != case.empty {
@@ -507,13 +398,10 @@ async fn compare_case(
         ));
     }
 
-    let mut all_remote = !case.like_kept_local;
+    let mut all_remote = case.kept_local.is_none();
     for subject in SUBJECTS {
         let name = subject.name;
-        let sql = case
-            .sql
-            .replace("{items}", subject.items)
-            .replace("{regions}", subject.regions);
+        let sql = Case::bind(case.sql, subject.items, subject.regions);
         match spice_rows(rt, &sql).await {
             Ok(spice) => {
                 if let Err(reason) = agreement(&spice, &expected, case.ordered) {
@@ -524,15 +412,15 @@ async fn compare_case(
             }
             Err(e) => failures.push(format!("{name}: {sql}\n    failed: {e}")),
         }
-        // The federated side must send the whole query to DuckDB, or it is
-        // DataFusion over a wider scan and checks no translation, except a
-        // backslash `LIKE`, which it must keep. A Cayenne side
-        // must read only Cayenne, or its agreement says nothing about what
-        // Cayenne stored.
-        let check: Option<PlanCheck> = match subject.kind {
-            Kind::Federated if case.like_kept_local => Some(check_like_kept_local),
-            Kind::Federated => Some(check_nothing_local),
-            Kind::CayenneMemory | Kind::CayenneVortex => Some(check_cayenne_sources),
+        // The federated side must send the whole query to DuckDB, but for an
+        // expression the case keeps local, or it is DataFusion over a wider scan
+        // and checks no translation. A Cayenne side must read only Cayenne, or
+        // its agreement says nothing about what Cayenne stored.
+        let check: Option<&dyn Fn(&[Row]) -> Result<(), String>> = match subject.kind {
+            Kind::Federated => {
+                Some(&|plan| check_federated(plan, &REMOTE_SCANS, "DuckDB", case.kept_local))
+            }
+            Kind::CayenneMemory | Kind::CayenneVortex => Some(&check_cayenne_sources),
             Kind::Arrow => None,
         };
         if let Some(check) = check {
