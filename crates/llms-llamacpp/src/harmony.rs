@@ -36,7 +36,9 @@ limitations under the License.
 //! The markers are read as tokens, never as text, so text that spells one is only text.
 
 use llama_cpp::{Token, Vocab};
-use mistralrs_core::{CalledFunction, ToolCallResponse, ToolCallType};
+use mistralrs_core::ToolCallResponse;
+
+use crate::reply::{self, Held, Text, call};
 
 const START: &str = "<|start|>";
 const CHANNEL: &str = "<|channel|>";
@@ -94,38 +96,20 @@ impl Markers {
     }
 
     /// `text` as the markers it spells, each as its token with its text, and the text between
-    /// them, as a prompt tokenized with its markers as tokens holds it. Every marker starts
-    /// with `<|`, so the text is scanned once, for those two bytes.
+    /// them, as a prompt tokenized with its markers as tokens holds it.
     fn spell<'t>(&self, text: &'t str) -> Vec<(Option<Token>, &'t str)> {
-        let spelled = [
-            (START, self.start),
-            (CHANNEL, self.channel),
-            ("<|message|>", self.message),
-            ("<|end|>", self.end),
-            ("<|return|>", self.done),
-            ("<|call|>", self.call),
-            (CONSTRAIN, self.constrain),
-        ];
-        let mut out = Vec::new();
-        // The text before `from` is spelled; a marker may start at `at` or after it.
-        let (mut from, mut at) = (0, 0);
-        while let Some(found) = text[at..].find("<|") {
-            let i = at + found;
-            if let Some((s, token)) = spelled.iter().find(|(s, _)| text[i..].starts_with(s)) {
-                if from < i {
-                    out.push((None, &text[from..i]));
-                }
-                out.push((Some(*token), &text[i..i + s.len()]));
-                from = i + s.len();
-                at = from;
-            } else {
-                at = i + "<|".len();
-            }
-        }
-        if from < text.len() {
-            out.push((None, &text[from..]));
-        }
-        out
+        reply::spell(
+            text,
+            &[
+                (START, self.start),
+                (CHANNEL, self.channel),
+                ("<|message|>", self.message),
+                ("<|end|>", self.end),
+                ("<|return|>", self.done),
+                ("<|call|>", self.call),
+                (CONSTRAIN, self.constrain),
+            ],
+        )
     }
 }
 
@@ -144,15 +128,6 @@ enum Route {
     Dropped,
 }
 
-/// Where a piece of a reply's text goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Text {
-    Reasoning,
-    Content,
-    /// Read into the message's header, or a call's arguments, or dropped: nothing to send.
-    Held,
-}
-
 /// What a marker does to the reply.
 #[derive(Debug)]
 pub(crate) enum Mark {
@@ -162,17 +137,6 @@ pub(crate) enum Mark {
     Call(ToolCallResponse),
     /// The reply ends.
     Done,
-}
-
-/// What a grammar holds a reply to, as llama.cpp's server holds it: the whole reply, or none
-/// of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Held {
-    Nothing,
-    /// Analysis messages, then a final message whose body is a `response_format`'s JSON.
-    Reply,
-    /// Any analysis, then a call to one of the tools a required call may name.
-    Call,
 }
 
 /// Where a prompt leaves a reply that a grammar holds, as the grammar goes on from it.
@@ -558,18 +522,6 @@ fn recipient(text: &str) -> &str {
         .find(|c: char| c.is_whitespace() || c == '<')
         .unwrap_or(text.len());
     &text[..end]
-}
-
-fn call(name: String, arguments: &str) -> ToolCallResponse {
-    ToolCallResponse {
-        index: 0,
-        id: format!("call-{}", uuid::Uuid::new_v4()),
-        tp: ToolCallType::Function,
-        function: CalledFunction {
-            name,
-            arguments: arguments.to_string(),
-        },
-    }
 }
 
 /// Markers for tests, as a vocabulary with them as tokens 1 to 7 would hold them.
