@@ -30,6 +30,7 @@ pub mod model2vec;
 mod model_http;
 mod model_info;
 pub mod openai;
+pub mod openrouter;
 pub mod progress;
 pub mod provider;
 pub mod rerank;

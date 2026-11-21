@@ -366,10 +366,13 @@ fn create_catalog_specific_schema(
 ///
 /// Most providers match `name:…`. `TypeSafe` also accepts bare `typesafe` and a
 /// colon or slash form with a non-empty model id (not `typesafe:` / `typesafe/`,
-/// and not typos like `typesafely:…`).
+/// and not typos like `typesafely:…`). `OpenRouter` takes a colon or slash form
+/// with a non-empty model id, which itself holds a slash (`openrouter:baseten/elephant-1`).
 fn model_source_from_pattern(name: &str) -> String {
     if name == "typesafe" {
         format!("^{}($|:.+|/.+)", regex::escape(name))
+    } else if name == "openrouter" {
+        format!("^{}[:/].+", regex::escape(name))
     } else {
         format!("^{}:", regex::escape(name))
     }
@@ -378,6 +381,8 @@ fn model_source_from_pattern(name: &str) -> String {
 fn model_source_from_description(name: &str) -> String {
     if name == "typesafe" {
         "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/decisions or the SQL decision functions.".to_string()
+    } else if name == "openrouter" {
+        "Model source for OpenRouter decision models. Format: openrouter:<provider>/<model>, such as openrouter:baseten/elephant-1. Only decision models are supported; use POST /v1/decisions or the SQL decision functions.".to_string()
     } else {
         format!("Model source for {name} provider. Format: {name}:<model_id>")
     }
@@ -1420,6 +1425,14 @@ mod tests {
         assert!(re.is_match("typesafe/jev"));
         assert!(!re.is_match("typesafely:jev"));
         assert!(!re.is_match("other:jev"));
+
+        let openrouter = model_source_from_pattern("openrouter");
+        assert_eq!(openrouter, "^openrouter[:/].+");
+        let re = regex::Regex::new(&openrouter).expect("pattern compiles");
+        assert!(re.is_match("openrouter:baseten/elephant-1"));
+        assert!(re.is_match("openrouter/baseten/elephant-1"));
+        assert!(!re.is_match("openrouter"));
+        assert!(!re.is_match("openrouter:"));
 
         let openai = model_source_from_pattern("openai");
         assert_eq!(openai, "^openai:");

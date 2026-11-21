@@ -246,7 +246,7 @@ pub async fn construct_model(
     })?;
 
     let model = match source {
-        ModelSource::TypeSafe => Err(LlmError::EvaluateOnlyModel {
+        ModelSource::TypeSafe | ModelSource::OpenRouter => Err(LlmError::EvaluateOnlyModel {
             model: component.name.clone(),
         }),
         #[cfg(feature = "models")]
