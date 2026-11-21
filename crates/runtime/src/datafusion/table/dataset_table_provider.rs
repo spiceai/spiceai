@@ -53,7 +53,7 @@ use snafu::Snafu;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
-use crate::init::dataset_initialization::{DatasetInitialization, DatasetReady};
+use crate::init::dataset_initialization::{DatasetInitialization, DatasetReady, InitializeFailure};
 
 /// The wait before the first retry of a failed initialization; it doubles with each
 /// further failure, up to [`MAX_RETRY_BACKOFF`].
@@ -188,11 +188,12 @@ impl DatasetTableProvider {
                 result
             }
             Err(failure) => {
+                let InitializeFailure { error, retry } = *failure;
                 let error = Arc::new(InitError::InitializationFailed {
                     name: self.name.clone(),
-                    source: Box::new(failure.error),
+                    source: Box::new(error),
                 });
-                if let Some(init) = failure.retry {
+                if let Some(init) = retry {
                     let failures = failures.saturating_add(1);
                     *slot = Slot::Pending {
                         init,

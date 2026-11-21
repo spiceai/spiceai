@@ -208,11 +208,11 @@ impl DatasetInitialization {
     /// Configuration errors, which no retry clears, return no plan.
     pub async fn initialize_retriable(
         self,
-    ) -> std::result::Result<DatasetReady, InitializeFailure> {
+    ) -> std::result::Result<DatasetReady, Box<InitializeFailure>> {
         let mut retry = None;
         self.run(&mut retry)
             .await
-            .map_err(|error| InitializeFailure { error, retry })
+            .map_err(|error| Box::new(InitializeFailure { error, retry }))
     }
 
     async fn run(self, retry: &mut Option<Box<DatasetInitialization>>) -> Result<DatasetReady> {
