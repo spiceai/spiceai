@@ -156,23 +156,45 @@ impl ConnectStatus {
     /// directory makes no request at all, and the clock is measured only where
     /// a wrong one is the explanation.
     pub(crate) async fn collect(instance_dir: &Path, config_dir: &Path, endpoint: &str) -> Self {
+        Self::collect_inspecting(
+            instance_dir,
+            config_dir,
+            endpoint,
+            |instance_dir, config_dir| {
+                service::status(service::backend(), instance_dir, config_dir)
+            },
+        )
+        .await
+    }
+
+    /// [`Self::collect`], with `inspect_service` answering for the service.
+    async fn collect_inspecting(
+        instance_dir: &Path,
+        config_dir: &Path,
+        endpoint: &str,
+        inspect_service: impl FnOnce(&Path, &Path) -> ServiceStatus + Send + 'static,
+    ) -> Self {
         // First, so the service manifest is read from where it now lives.
         let prepared = prepare_state_dir(config_dir).await;
-        let service_instance_dir = instance_dir.to_path_buf();
-        let service_config_dir = config_dir.to_path_buf();
-        let service_status = tokio::task::spawn_blocking(move || {
-            service::status(
-                service::backend(),
-                &service_instance_dir,
-                &service_config_dir,
-            )
-        })
-        .await
-        .unwrap_or_else(|source| {
-            ServiceStatus::inspection_unavailable(format!(
-                "service status inspection task failed: {source}"
-            ))
-        });
+        // The service manifest is in the state directory, so it is read only
+        // from one that passed the state-directory rule. Otherwise the service
+        // is reported as not inspected, for the same reason.
+        let service_status = match &prepared {
+            Ok(()) => {
+                let service_instance_dir = instance_dir.to_path_buf();
+                let service_config_dir = config_dir.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    inspect_service(&service_instance_dir, &service_config_dir)
+                })
+                .await
+                .unwrap_or_else(|source| {
+                    ServiceStatus::inspection_unavailable(format!(
+                        "service status inspection task failed: {source}"
+                    ))
+                })
+            }
+            Err(diagnostic) => ServiceStatus::inspection_unavailable(diagnostic.clone()),
+        };
         Self::collect_prepared(prepared, service_status, instance_dir, config_dir, endpoint).await
     }
 
@@ -751,6 +773,47 @@ mod tests {
             "https://api.example",
         )
         .await
+    }
+
+    /// The service manifest lives in the state directory, so a state directory
+    /// that cannot be used is not read for the service either: the service is
+    /// reported as not inspected, for the same reason, and nothing in the
+    /// directory is parsed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_state_directory_that_cannot_be_used_is_not_read_for_the_service() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::create_dir_all(&elsewhere).expect("create link target");
+        std::fs::write(
+            super::super::service::ServiceManifest::path_in(&elsewhere),
+            "UNTRUSTED_SERVICE_MANIFEST",
+        )
+        .expect("plant a service manifest");
+        std::os::unix::fs::symlink(&elsewhere, state_dir(&config_dir)).expect("link");
+
+        let root = dir.path().to_path_buf();
+        let status = ConnectStatus::collect_inspecting(
+            &instance_dir,
+            &config_dir,
+            "https://api.example",
+            move |instance_dir, config_dir| {
+                service::status(&FakeBackend::new(&root), instance_dir, config_dir)
+            },
+        )
+        .await;
+
+        let refused = format!(
+            "Could not use the Spice Cloud Connect state directory '{}': it is a symbolic link, and Spice keeps this state only in a real directory",
+            state_dir(&config_dir).display()
+        );
+        assert_eq!(
+            status.service,
+            ServiceStatus::inspection_unavailable(refused)
+        );
     }
 
     /// A state directory that is not a real directory is reported, with

@@ -717,9 +717,10 @@ fn read_bounded_lock_diagnostics(file: &mut File) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Lets a test act on the filesystem just before a lock acquisition opens the
-/// directory it locks, the way another account sharing the config directory
-/// could.
+/// Lets a test act on the filesystem just before a lock acquisition (this one
+/// or the enrollment transaction's) opens the directory it locks, the way
+/// another account sharing the config directory could, and inspect what the
+/// acquisition then locked.
 #[cfg(test)]
 pub(crate) mod acquire_hooks {
     use std::collections::HashMap;
@@ -741,34 +742,34 @@ pub(crate) mod acquire_hooks {
             .insert(dir.to_path_buf(), Box::new(hook));
     }
 
-    pub(super) fn run(dir: &Path) {
+    /// Run the hook registered for `dir`, if any. Called by each lock
+    /// acquisition just before it opens the directory it locks.
+    pub(crate) fn run(dir: &Path) {
         let hook = HOOKS.lock().expect("acquire hooks lock").remove(dir);
         if let Some(hook) = hook {
             hook();
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     /// What a lock acquisition locked, after the state directory's name was
     /// changed just before the lock opened it.
     #[cfg(unix)]
     #[derive(Debug, PartialEq, Eq)]
-    struct Acquisition {
-        acquired: bool,
+    pub(crate) struct Acquisition {
+        pub(crate) acquired: bool,
         /// Which directory the lock's retained descriptor is.
-        locked: Option<&'static str>,
+        pub(crate) locked: Option<&'static str>,
         /// That directory's permission bits, in octal.
-        locked_mode: Option<String>,
+        pub(crate) locked_mode: Option<String>,
         /// Whether a lock file was created in the directory a link points to.
-        lock_created_through_link: bool,
+        pub(crate) lock_created_through_link: bool,
     }
 
     #[cfg(unix)]
-    fn identify(file: &File, candidates: &[(&'static str, &Path)]) -> &'static str {
+    pub(crate) fn identify(
+        file: &std::fs::File,
+        candidates: &[(&'static str, &Path)],
+    ) -> &'static str {
         use std::os::unix::fs::MetadataExt as _;
 
         let held = file.metadata().expect("stat the retained directory");
@@ -782,7 +783,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn mode_of(file: &File) -> String {
+    pub(crate) fn mode_of(file: &std::fs::File) -> String {
         use std::os::unix::fs::PermissionsExt as _;
         format!(
             "{:04o}",
@@ -792,7 +793,7 @@ mod tests {
 
     /// An existing owner-only state directory, as enrollment leaves it.
     #[cfg(unix)]
-    fn existing_state_directory(root: &Path) -> PathBuf {
+    pub(crate) fn existing_state_directory(root: &Path) -> PathBuf {
         use std::os::unix::fs::DirBuilderExt as _;
         let config_dir = root.join(".spice");
         std::fs::create_dir(&config_dir).expect("create the config directory");
@@ -807,7 +808,7 @@ mod tests {
     /// A writable-by-anyone directory the state directory's name is pointed
     /// at, as another account sharing the config directory could.
     #[cfg(unix)]
-    fn shared_directory(root: &Path) -> PathBuf {
+    pub(crate) fn shared_directory(root: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let shared = root.join("shared");
         std::fs::create_dir(&shared).expect("create the shared directory");
@@ -815,6 +816,15 @@ mod tests {
             .expect("make the shared directory writable by anyone");
         shared
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use acquire_hooks::{
+        Acquisition, existing_state_directory, identify, mode_of, shared_directory,
+    };
 
     /// The state directory's name is replaced by a link after it was checked
     /// and before the lock opens it. The lock must not end up in the link's
