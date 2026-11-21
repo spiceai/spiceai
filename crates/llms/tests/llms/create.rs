@@ -81,7 +81,7 @@ fn xai(model_id: &str) -> Result<Xai, anyhow::Error> {
     let Ok(api_key) = std::env::var("SPICE_XAI_API_KEY") else {
         return Err(anyhow::anyhow!("SPICE_XAI_API_KEY not set"));
     };
-    Ok(Xai::new(Some(model_id), api_key.as_str()))
+    Ok(Xai::new(Some(model_id), api_key.as_str())?)
 }
 
 pub(crate) fn create_xai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
@@ -225,7 +225,7 @@ pub(crate) async fn create_azure() -> Result<Arc<dyn Chat>, anyhow::Error> {
         Some(&deployment),
         None,
         Some(&api_key),
-    )))
+    )?))
 }
 
 pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {

@@ -19,6 +19,7 @@ pub mod http_auth;
 pub mod registry;
 pub mod ssrf;
 pub mod store;
+pub mod url_table;
 
 pub use builder::{build_azure_object_store, build_gcs_object_store};
 

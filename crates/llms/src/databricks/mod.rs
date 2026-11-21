@@ -168,13 +168,18 @@ impl Databricks {
     }
 }
 
-#[must_use]
+/// A Databricks model served at `endpoint` that authenticates with a personal access token.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built (see
+/// [`crate::provider::client_without_retry`]).
 pub fn from_access_token(
     endpoint: &str,
     model: &str,
     access_token: &str,
     user_agent: Option<&'static str>,
-) -> Databricks {
+) -> Result<Databricks, async_openai::error::OpenAIError> {
     let mut cfg = HostedModelConfig::from_url(
         format!("https://token:{access_token}@{endpoint}/serving-endpoints/{model}").as_str(),
     );
@@ -183,21 +188,28 @@ pub fn from_access_token(
         cfg = cfg.with_header("user-agent", user_agent);
     }
 
-    Databricks {
+    Ok(Databricks {
         model: model.to_string(),
-        client: crate::provider::client_without_retry(cfg),
+        client: crate::provider::client_without_retry(cfg)?,
         health_check: HealthCheck::Required,
         cache: None,
-    }
+    })
 }
 
+/// A Databricks model served at `endpoint` that authenticates with the current token of
+/// `token_provider`.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built (see
+/// [`crate::provider::client_without_retry`]).
 pub fn from_token_provider(
     endpoint: &str,
     model: &str,
     token_provider: Arc<dyn TokenProvider>,
     user_agent: Option<&'static str>,
     health_check: HealthCheck,
-) -> Databricks {
+) -> Result<Databricks, async_openai::error::OpenAIError> {
     let mut cfg = HostedModelConfig::from_url(
         format!("https://{endpoint}/serving-endpoints/{model}").as_str(),
     )
@@ -209,12 +221,12 @@ pub fn from_token_provider(
         cfg = cfg.with_header("user-agent", user_agent);
     }
 
-    Databricks {
+    Ok(Databricks {
         model: model.to_string(),
-        client: crate::provider::client_without_retry(cfg),
+        client: crate::provider::client_without_retry(cfg)?,
         health_check,
         cache: None,
-    }
+    })
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Serialize)]
@@ -483,7 +495,7 @@ mod tests {
                 .with_bearer_token(Some("token"));
         Databricks {
             model: "model".to_string(),
-            client: crate::provider::client_without_retry(config),
+            client: crate::provider::client_without_retry(config).expect("the client builds"),
             health_check: HealthCheck::Required,
             cache: None,
         }

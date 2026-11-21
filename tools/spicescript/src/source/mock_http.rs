@@ -217,6 +217,11 @@ impl Source for MockHttp {
                 Self::prefix(namespace)
             )),
         );
+        // For a URL that must name the server another way than `url` does (another host
+        // name for this machine, such as `localhost` or `0.0.0.0`): its port and this
+        // instance's path prefix.
+        extra.insert("port".into(), json!(self.port));
+        extra.insert("prefix".into(), json!(Self::prefix(namespace)));
         Ok(super::Namespace {
             params: json!({}),
             extra,

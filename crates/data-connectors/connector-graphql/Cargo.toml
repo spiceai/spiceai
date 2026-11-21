@@ -33,12 +33,14 @@ datafusion.workspace = true
 futures.workspace = true
 graphql-parser.workspace = true
 http.workspace = true
+http-egress = { path = "../../http-egress" }
 linkme.workspace = true
 paste.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 runtime-component = { path = "../../runtime-component" }
 runtime-metrics = { path = "../../runtime-metrics" }
+runtime-object-store = { path = "../../runtime-object-store" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-rate-control = { path = "../../runtime-rate-control" }
 secrecy.workspace = true

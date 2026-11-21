@@ -323,11 +323,20 @@ fn spiceai(
     }
     Ok(Arc::new(
         OpenaiEmbed::new(
-            llms::spiceai::new_spiceai_client(model_id, Some(endpoint), api_key),
+            llms::spiceai::new_spiceai_client(model_id, Some(endpoint), api_key)
+                .map_err(client_error)?,
             None,
         )
         .set_cache(embeddings_cache),
     ))
+}
+
+/// The load error for an embedding model whose HTTP client could not be built, which happens
+/// only when its TLS backend cannot be initialized.
+fn client_error(source: async_openai::error::OpenAIError) -> EmbedError {
+    EmbedError::FailedToInstantiateEmbeddingModel {
+        source: Box::new(source),
+    }
 }
 
 #[cfg(feature = "models")]
@@ -634,6 +643,7 @@ async fn databricks(
                 user_agent,
                 HealthCheck::Required,
             )
+            .map_err(client_error)?
             .set_cache(embeddings_cache),
         ) as Arc<dyn Embed>);
     }
@@ -661,12 +671,11 @@ async fn databricks(
                 source: "If `databricks_client_secret` is provided, `databricks_client_id` must also be provided.".into(),
             })
         }
-        (Some(token), None, None) => Ok(Arc::new(llms::databricks::from_access_token(
-            endpoint,
-            model_id.as_str(),
-            token,
-            user_agent,
-        ).set_cache(embeddings_cache)) as Arc<dyn Embed>),
+        (Some(token), None, None) => Ok(Arc::new(
+            llms::databricks::from_access_token(endpoint, model_id.as_str(), token, user_agent)
+                .map_err(client_error)?
+                .set_cache(embeddings_cache),
+        ) as Arc<dyn Embed>),
 
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = token_provider_registry
@@ -691,7 +700,9 @@ async fn databricks(
                     token_provider,
                     user_agent,
                     HealthCheck::Required,
-                ).set_cache(embeddings_cache),
+                )
+                .map_err(client_error)?
+                .set_cache(embeddings_cache),
             ) as Arc<dyn Embed>)
         }
         (None, Some(client_id), None) => {
@@ -715,7 +726,9 @@ async fn databricks(
                     token_provider,
                     user_agent,
                     HealthCheck::Skip,
-                ).set_cache(embeddings_cache),
+                )
+                .map_err(client_error)?
+                .set_cache(embeddings_cache),
             ) as Arc<dyn Embed>)
         }
     }
@@ -815,7 +828,8 @@ async fn azure(
                 params.deployment_name.as_deref(),
                 entra_token,
                 api_key,
-            ),
+            )
+            .map_err(client_error)?,
             None,
         )
         .set_cache(embeddings_cache),
@@ -865,7 +879,8 @@ async fn openai(
             params.org_id.as_deref(),
             params.project_id.as_deref(),
             Some(usage_tier),
-        ),
+        )
+        .map_err(client_error)?,
         Some(usage_tier.into()),
     )
     .set_cache(embeddings_cache);

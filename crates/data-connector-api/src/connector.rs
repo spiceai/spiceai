@@ -35,7 +35,7 @@ use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::ParameterSpec;
 
-pub use runtime_object_store::ssrf::RedirectScope;
+pub use http_egress::OnOriginChange;
 
 use crate::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use crate::federated::FederatedTableProvider;
@@ -53,33 +53,55 @@ pub const DEFAULT_SPICE_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Redirects the client [`default_spice_client`] builds follows before a request fails.
 const DEFAULT_SPICE_CLIENT_MAX_REDIRECTS: usize = 10;
 
-/// Creates a default reqwest client with standard Spice settings. It follows only the redirects
-/// `redirects` allows, and refuses a redirect that leaves the request's host for a private,
-/// loopback, or link-local address.
+/// Why the client [`default_spice_client`] builds refuses a redirect.
+const OFF_HOST_REDIRECT_REFUSED: &str = "a redirect off the request's host to a private, loopback, or link-local address is not followed";
+
+/// Creates a default reqwest client with standard Spice settings. Its redirects follow the
+/// `http-egress` policy: a redirect within the request's origin is followed. One that changes
+/// the origin is refused when it downgrades HTTPS to HTTP or leads to a private, loopback, or
+/// link-local address (an IP literal, a well-known internal name, or a host that resolves to
+/// one), and every one is refused when `on_origin_change` is [`OnOriginChange::Refuse`]. The
+/// request's own host keeps the class of its first DNS answer.
+///
+/// With [`OnOriginChange::Follow`], `reqwest` follows the redirects and drops only
+/// `Authorization`, `Cookie` and `Proxy-Authorization` when one changes the origin. A request
+/// that carries a credential in a custom header or its body must refuse an origin change, or be
+/// sent through [`http_egress::send`].
 ///
 /// # Errors
 ///
 /// Returns an error if the client cannot be built.
 pub fn default_spice_client(
     content_type: &'static str,
-    redirects: RedirectScope,
+    on_origin_change: OnOriginChange,
 ) -> reqwest::Result<reqwest::Client> {
     use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
     let mut headers = HeaderMap::new();
     headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
 
-    let builder = reqwest::Client::builder()
+    let egress = http_egress::Egress::new(
+        Some(
+            http_egress::DestinationGuard::new(
+                http_egress::is_internal_ip,
+                http_egress::redirect_target_is_internal,
+                OFF_HOST_REDIRECT_REFUSED,
+            )
+            .redirects_only(),
+        ),
+        DEFAULT_SPICE_CLIENT_MAX_REDIRECTS,
+    );
+    reqwest::Client::builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(DEFAULT_SPICE_CLIENT_TIMEOUT)
-        .default_headers(headers);
-    runtime_object_store::ssrf::guard_redirects(
-        builder,
-        DEFAULT_SPICE_CLIENT_MAX_REDIRECTS,
-        redirects,
-    )
-    .build()
+        .default_headers(headers)
+        .redirect(http_egress::redirect_policy(
+            egress.clone(),
+            on_origin_change,
+        ))
+        .dns_resolver(Arc::new(http_egress::Resolver::new(egress)))
+        .build()
 }
 
 #[derive(Clone, Copy)]
@@ -243,6 +265,19 @@ pub trait DataConnectorFactory: Send + Sync {
     ) -> Option<SchemaRef> {
         None
     }
+}
+
+/// The objects a dataset reads from an object store, as its connector resolves them from the
+/// dataset's configuration.
+#[derive(Clone, Debug)]
+pub struct ObjectStoreScope {
+    /// The dataset's object-store URL, with the store settings and credentials in its fragment,
+    /// as the object-store registry builds a store from it.
+    pub store_url: url::Url,
+    /// The suffix the dataset lists objects by (for example `.parquet`, `.csv.gz`), or a
+    /// `*`-prefixed suffix (`*`, `*.parquet`) for a dataset that lists every object and selects
+    /// by content.
+    pub listing_suffix: String,
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
@@ -415,6 +450,20 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         Ok(())
     }
 
+    /// The objects this connector reads for `dataset` from an object store: the store URL with
+    /// its credentials, and the suffix it lists objects by. `None` for a connector that does not
+    /// read files from an object store.
+    ///
+    /// URL tables lend a dataset's credentials only for the objects this scope admits, so a
+    /// wrapper must forward it: the default `None` would make a wrapped dataset lend nothing,
+    /// and the URL table fall back to an unsigned read.
+    async fn object_store_scope(
+        &self,
+        _dataset: &DatasetSpec,
+    ) -> DataConnectorResult<Option<ObjectStoreScope>> {
+        Ok(None)
+    }
+
     /// A hook called **before** the accelerated table is built, giving the
     /// connector a chance to wrap or replace the accelerator's provider.
     ///
@@ -479,7 +528,7 @@ impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
 
 #[cfg(test)]
 mod tests {
-    use super::{RedirectScope, default_spice_client};
+    use super::{OnOriginChange, default_spice_client};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -537,7 +586,7 @@ mod tests {
             move |_| redirect_to(&target)
         })
         .await;
-        let client = default_spice_client("application/json", RedirectScope::PublicHosts)
+        let client = default_spice_client("application/json", OnOriginChange::Follow)
             .expect("build the client");
 
         let error = client
@@ -567,7 +616,7 @@ mod tests {
         let (target_port, target_requests) = serve(|_| OK_RESPONSE.to_string()).await;
         let (origin_port, _) =
             serve(move |_| redirect_to(&format!("http://localhost.:{target_port}/graphql"))).await;
-        let client = default_spice_client("application/json", RedirectScope::PublicHosts)
+        let client = default_spice_client("application/json", OnOriginChange::Follow)
             .expect("build the client");
 
         let error = client
@@ -579,6 +628,48 @@ mod tests {
         let message = error_chain(&error);
         assert!(
             message.contains("Refused to connect to localhost.: a redirect off the request's host to a private, loopback, or link-local address is not followed"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            target_requests.load(Ordering::SeqCst),
+            0,
+            "the redirect target is never reached"
+        );
+    }
+
+    /// A client that refuses an origin change follows a redirect within the request's origin,
+    /// and refuses one to another origin before that origin's host is resolved or reached.
+    #[tokio::test]
+    async fn a_client_that_refuses_an_origin_change_follows_only_the_request_origin() {
+        let (target_port, target_requests) = serve(|_| OK_RESPONSE.to_string()).await;
+        let (origin_port, _) = serve(move |path| match path {
+            "/graphql" => redirect_to("/graphql/"),
+            "/graphql/" => OK_RESPONSE.to_string(),
+            _ => redirect_to(&format!("http://localhost.:{target_port}/graphql")),
+        })
+        .await;
+        let client = default_spice_client("application/json", OnOriginChange::Refuse)
+            .expect("build the client");
+
+        let response = client
+            .post(format!("http://127.0.0.1:{origin_port}/graphql"))
+            .send()
+            .await
+            .expect("the redirect within the origin is followed");
+        assert_eq!(response.url().path(), "/graphql/");
+
+        let error = client
+            .post(format!("http://127.0.0.1:{origin_port}/away"))
+            .send()
+            .await
+            .expect_err("the redirect off the origin is refused");
+        let message = error_chain(&error);
+        assert!(
+            message.contains(&format!(
+                "the server redirected to another origin, http://localhost.:{target_port}, and \
+                 this request carries a credential that is sent only to \
+                 http://127.0.0.1:{origin_port}"
+            )),
             "unexpected error: {message}"
         );
         assert_eq!(
@@ -600,7 +691,7 @@ mod tests {
             }
         })
         .await;
-        let client = default_spice_client("application/json", RedirectScope::PublicHosts)
+        let client = default_spice_client("application/json", OnOriginChange::Follow)
             .expect("build the client");
 
         let response = client

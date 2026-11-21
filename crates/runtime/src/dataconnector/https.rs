@@ -94,36 +94,8 @@ fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     }
 }
 
-/// Resolves the hosts a redirect introduced through [`ssrf::redirect_destination_guard`], so a
-/// redirect cannot reach an internal address by name. The dataset's own host and a proxy's
-/// resolve unchecked.
-#[derive(Default)]
-struct RedirectHostResolver {
-    redirect_hosts: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
-}
-
-/// `host` as [`RedirectHostResolver`] keys it: `example.com.` and `example.com` name the same host.
-fn redirect_host_key(host: &str) -> String {
-    host.trim_end_matches('.').to_ascii_lowercase()
-}
-
-impl reqwest::dns::Resolve for RedirectHostResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        let guarded = self
-            .redirect_hosts
-            .lock()
-            .contains(&redirect_host_key(&host));
-        Box::pin(async move {
-            let addresses: Vec<std::net::SocketAddr> = if guarded {
-                ssrf::redirect_destination_guard().resolve(&host).await?
-            } else {
-                tokio::net::lookup_host((host.as_str(), 0)).await?.collect()
-            };
-            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
+/// Redirects the JSON API client follows before a request fails.
+const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug)]
 pub struct Https {
@@ -979,7 +951,18 @@ impl Https {
         )
     }
 
-    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
+    /// The client a JSON API dataset fetches with, and the egress state the provider follows its
+    /// redirects under.
+    ///
+    /// The dataset's own host is trusted as its first DNS answer leaves it, and every host a
+    /// redirect introduces is checked, with the classifier URL tables use. `reqwest` follows no
+    /// redirect itself: the provider follows them through [`http_egress::send`], which keeps the
+    /// dataset's headers and credentials on its origin. An `https` dataset never makes a
+    /// plaintext request.
+    async fn build_http_client(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<(Client, http_egress::Egress)> {
         let client_timeout = self.configured_client_timeout();
         let connect_timeout = self.configured_connect_timeout();
 
@@ -999,39 +982,22 @@ impl Https {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(90);
 
-        let origin_host = Url::parse(dataset.from.as_str())
-            .ok()
-            .and_then(|url| url.host_str().map(redirect_host_key));
-        let resolver = RedirectHostResolver::default();
-        let redirect_hosts = Arc::clone(&resolver.redirect_hosts);
+        let egress = http_egress::Egress::new(
+            Some(ssrf::redirect_destination_guard().redirects_only()),
+            MAX_REDIRECTS,
+        );
+        let https_only = Url::parse(dataset.from.as_str()).is_ok_and(|url| url.scheme() == "https");
 
-        let mut builder = Client::builder()
-            .user_agent(util::spiceai_user_agent())
-            .connect_timeout(connect_timeout)
-            .timeout(client_timeout)
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                const MAX_REDIRECTS: usize = 5;
-                if attempt.previous().len() >= MAX_REDIRECTS {
-                    return attempt.error("too many redirects");
-                }
-                // SSRF defense-in-depth: refuse to follow a redirect to an
-                // internal target, with the same classifier URL tables use.
-                if ssrf::redirect_target_is_internal(attempt.url()) {
-                    return attempt.error("redirect to a private address is not allowed");
-                }
-                // This closure cannot resolve DNS, so the resolver checks the
-                // addresses of each new host a redirect names.
-                if let Some(url::Host::Domain(host)) = attempt.url().host() {
-                    let host = redirect_host_key(host);
-                    if origin_host.as_deref() != Some(host.as_str()) {
-                        redirect_hosts.lock().insert(host);
-                    }
-                }
-                attempt.follow()
-            }))
-            .dns_resolver(Arc::new(resolver))
-            .pool_max_idle_per_host(pool_max_idle_per_host)
-            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
+        let mut builder = http_egress::configure(
+            Client::builder()
+                .user_agent(util::spiceai_user_agent())
+                .connect_timeout(connect_timeout)
+                .timeout(client_timeout)
+                .pool_max_idle_per_host(pool_max_idle_per_host)
+                .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
+                .https_only(https_only),
+            &egress,
+        );
 
         if let Some(identity) = self.resolve_client_identity(dataset).await? {
             // `Identity::from_pem` yields a rustls identity, but the workspace transitively
@@ -1044,14 +1010,15 @@ impl Https {
 
         // The provider decodes compressed bodies itself, so it can refuse one that
         // expands like a compression bomb before it is held in memory.
-        http_body_limit::decode_manually(builder)
+        let client = http_body_limit::decode_manually(builder)
             .build()
             .boxed()
             .map_err(|e| DataConnectorError::InternalWithSource {
                 dataconnector: "https".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: e,
-            })
+            })?;
+        Ok((client, egress))
     }
 
     /// Parse `OAuth2` parameters into a config and grant.
@@ -1213,6 +1180,12 @@ impl Https {
                 scopes,
                 client_auth,
                 header,
+                // The token endpoint is the operator's: its host is pinned to its first
+                // DNS answer, and a redirect never takes the token request to another origin.
+                egress: http_egress::Egress::new(
+                    Some(ssrf::redirect_destination_guard().redirects_only()),
+                    MAX_REDIRECTS,
+                ),
             },
             grant,
         )))
@@ -1262,6 +1235,7 @@ impl Https {
         match err {
             AuthErr::InvalidTokenUrl { .. }
             | AuthErr::InsecureTokenUrl { .. }
+            | AuthErr::TokenRedirectRefused { .. }
             | AuthErr::UnsupportedTokenType { .. }
             | AuthErr::TokenEndpointStatus {
                 status: 400 | 401 | 403,
@@ -1294,7 +1268,7 @@ impl Https {
             }
         })?;
 
-        let client = self.build_http_client(dataset).await?;
+        let (client, egress) = self.build_http_client(dataset).await?;
 
         let HttpProviderParams {
             file_format,
@@ -1331,6 +1305,7 @@ impl Https {
             file_format,
             acceleration_enabled,
         )
+        .with_egress(egress)
         .with_table_reference(dataset.name.clone())
         .with_max_retries(max_retries)
         .with_backoff_method(backoff_method)
@@ -4851,16 +4826,20 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let origin = format!("http://127.0.0.1:{origin_port}/data");
         let connector = test_connector(Some("json")).await;
         let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
-        let client = connector
+        let (client, egress) = connector
             .build_http_client(&dataset)
             .await
             .expect("build the HTTP client");
 
-        let error = client
-            .get(&origin)
-            .send()
-            .await
-            .expect_err("the redirect is refused");
+        let request = client.get(&origin).build().expect("the request builds");
+        let error = http_egress::send(
+            &client,
+            request,
+            &egress,
+            http_egress::OnOriginChange::Follow,
+        )
+        .await
+        .expect_err("the redirect is refused");
 
         let message =
             std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
@@ -4887,7 +4866,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let origin = format!("http://localhost.:{port}/data");
         let connector = test_connector(Some("json")).await;
         let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
-        let client = connector
+        let (client, _) = connector
             .build_http_client(&dataset)
             .await
             .expect("build the HTTP client");

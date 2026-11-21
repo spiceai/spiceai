@@ -19,13 +19,12 @@ limitations under the License.
 //!
 //! One classifier decides which addresses and host names are internal. URL tables apply it to
 //! the URL a query names, to every address that URL's host resolves to, and to every redirect;
-//! the HTTPS data connector applies it to every redirect and to every address a redirect's new
-//! host resolves to.
+//! the HTTPS data connector applies it to every redirect that changes the origin and to every
+//! address a redirect's new host resolves to, and once the dataset's own host first resolves to
+//! a public address, to every later answer for that host. The policy itself is the
+//! `http-egress` crate's, shared by every client that applies these guards.
 
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex, PoisonError};
-
+pub use http_egress::{is_blocked_internal_hostname, is_internal_ip, redirect_target_is_internal};
 use object_store_spawn::DestinationGuard;
 use url::Url;
 
@@ -48,77 +47,6 @@ pub fn allow_private_hosts() -> bool {
             "1" | "true" | "yes" | "on"
         )
     })
-}
-
-/// Returns `true` if `ip` is in a range that must not be reachable through a
-/// user-supplied URL: loopback, private/RFC1918, link-local (incl. the
-/// `169.254.169.254` cloud-metadata endpoint), unique-local, CGNAT,
-/// unspecified, multicast, and other reserved ranges.
-#[must_use]
-pub fn is_internal_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_internal_ipv4(v4),
-        // Unwrap IPv4-mapped/-compatible addresses (e.g. `::ffff:169.254.169.254`)
-        // and re-check them as IPv4 so they can't bypass the v4 rules.
-        IpAddr::V6(v6) => match v6.to_ipv4() {
-            Some(v4) => is_internal_ipv4(v4),
-            None => is_internal_ipv6(v6),
-        },
-    }
-}
-
-fn is_internal_ipv4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    // Only the four oldest, universally-stable classifiers are used as methods;
-    // the rest are explicit prefix checks so behavior is obvious and portable.
-    ip.is_loopback()            // 127.0.0.0/8
-        || ip.is_private()      // 10/8, 172.16/12, 192.168/16
-        || ip.is_link_local()   // 169.254.0.0/16 (incl. 169.254.169.254 metadata)
-        || ip.is_unspecified()  // 0.0.0.0
-        || o[0] == 0                                 // 0.0.0.0/8 "this network"
-        || (o[0] == 100 && (o[1] & 0xc0) == 64)      // 100.64.0.0/10 CGNAT
-        || (o[0] == 198 && (o[1] & 0xfe) == 18)      // 198.18.0.0/15 benchmarking
-        || (o[0] == 192 && o[1] == 0 && o[2] == 2)   // 192.0.2.0/24 TEST-NET-1
-        || (o[0] == 198 && o[1] == 51 && o[2] == 100) // 198.51.100.0/24 TEST-NET-2
-        || (o[0] == 203 && o[1] == 0 && o[2] == 113) // 203.0.113.0/24 TEST-NET-3
-        || o[0] >= 224 // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved, 255.255.255.255 broadcast
-}
-
-fn is_internal_ipv6(ip: Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
-    ip.is_loopback()                  // ::1
-        || ip.is_unspecified()        // ::
-        || (first & 0xfe00) == 0xfc00 // fc00::/7 unique local
-        || (first & 0xffc0) == 0xfe80 // fe80::/10 link local
-        || (first & 0xff00) == 0xff00 // ff00::/8 multicast
-}
-
-/// Returns `true` for hostnames that never legitimately point at a remote
-/// endpoint and must be blocked without needing DNS resolution: `localhost`
-/// (and `*.localhost`, RFC 6761) and the well-known cloud-metadata names.
-#[must_use]
-pub fn is_blocked_internal_hostname(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    lower == "localhost"
-        || lower.ends_with(".localhost")
-        || lower == "metadata.google.internal"
-        || lower == "metadata.goog"
-}
-
-/// Whether a redirect to `url` must be refused because its host is an internal IP literal or
-/// a well-known internal name.
-///
-/// This check needs no DNS, so it can run inside a synchronous redirect policy. A host name it
-/// lets through can still resolve to an internal address; URL tables also check every resolved
-/// address (see [`url_table_destination_guard`]).
-#[must_use]
-pub fn redirect_target_is_internal(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Ipv4(ip)) => is_internal_ip(IpAddr::V4(ip)),
-        Some(url::Host::Ipv6(ip)) => is_internal_ip(IpAddr::V6(ip)),
-        Some(url::Host::Domain(domain)) => is_blocked_internal_hostname(domain),
-        None => false,
-    }
 }
 
 /// Scheme prefix under which `http`/`https` URL tables register their object stores.
@@ -155,177 +83,30 @@ pub fn url_table_destination_guard() -> DestinationGuard {
     )
 }
 
-/// What the HTTPS data connector refuses for a host it reaches only through a redirect: any
-/// internal address that host resolves to.
+/// What the HTTPS data connector refuses for a destination a redirect introduced: an internal
+/// address, including another port or scheme on a dataset host that resolves to one.
 #[must_use]
 pub fn redirect_destination_guard() -> DestinationGuard {
+    connector_redirect_guard("HTTPS")
+}
+
+/// What the data connector named `connector` refuses for a destination a redirect introduced,
+/// as [`redirect_destination_guard`] does for the HTTPS data connector.
+#[must_use]
+pub fn connector_redirect_guard(connector: &str) -> DestinationGuard {
     DestinationGuard::new(
         is_internal_ip,
         redirect_target_is_internal,
-        "the HTTPS data connector does not follow a redirect to a private, loopback, or link-local address",
+        format!(
+            "the {connector} data connector does not follow a redirect to a private, loopback, or link-local address"
+        ),
     )
-}
-
-/// `host` as [`RedirectHostResolver`] keys it: `example.com.` and `example.com` name the same host.
-#[must_use]
-pub fn redirect_host_key(host: &str) -> String {
-    host.trim_end_matches('.').to_ascii_lowercase()
-}
-
-/// Resolves the hosts a redirect introduced through a [`DestinationGuard`], so a redirect cannot
-/// reach an internal address by name. Every other host, such as the request's own or a proxy's,
-/// resolves unchecked.
-#[derive(Clone, Debug)]
-pub struct RedirectHostResolver {
-    guard: DestinationGuard,
-    redirect_hosts: Arc<Mutex<HashSet<String>>>,
-}
-
-impl RedirectHostResolver {
-    #[must_use]
-    pub fn new(guard: DestinationGuard) -> Self {
-        Self {
-            guard,
-            redirect_hosts: Arc::default(),
-        }
-    }
-
-    /// Checks every later lookup of `host` with the guard.
-    pub fn check_host(&self, host: &str) {
-        self.redirect_hosts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(redirect_host_key(host));
-    }
-}
-
-impl reqwest::dns::Resolve for RedirectHostResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        let checked = self
-            .redirect_hosts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&redirect_host_key(&host));
-        let guard = self.guard.clone();
-        Box::pin(async move {
-            let addresses: Vec<SocketAddr> = if checked {
-                guard.resolve(&host).await?
-            } else {
-                tokio::net::lookup_host((host.as_str(), 0)).await?.collect()
-            };
-            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
-
-/// Why [`guard_redirects`] refuses a redirect.
-const OFF_HOST_REDIRECT_REFUSED: &str = "a redirect off the request's host to a private, loopback, or link-local address is not followed";
-
-/// Why [`guard_redirects`] refuses a redirect under [`RedirectScope::RequestOrigin`].
-const OFF_ORIGIN_REDIRECT_REFUSED: &str = "a request that carries a custom credential header follows a redirect only to its own scheme, host, and port. Configure the endpoint URL as the redirect target directly.";
-
-/// Which redirects [`guard_redirects`] follows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RedirectScope {
-    /// A redirect within the request's own host, or to another host that is not private,
-    /// loopback, or link-local.
-    PublicHosts,
-    /// Only a redirect to the request's own scheme, host, and port, for a request that carries a
-    /// credential in a header reqwest does not remove when a redirect leaves that origin.
-    RequestOrigin,
-}
-
-/// What [`guard_redirects`] does with one redirect.
-#[derive(Debug, PartialEq, Eq)]
-enum RedirectCheck {
-    /// The redirect stays on the request's own host, which is not checked.
-    OwnHost,
-    /// The redirect leaves the request's scheme, host, or port under
-    /// [`RedirectScope::RequestOrigin`].
-    OffOrigin,
-    /// The redirect leaves for an internal IP literal or a well-known internal name.
-    Internal,
-    /// The redirect leaves for another host, whose addresses are checked when it resolves.
-    OtherHost,
-}
-
-/// Classifies a redirect to `target` from a request whose URLs so far are `previous`, the
-/// request's own URL first.
-fn check_redirect(scope: RedirectScope, previous: &[Url], target: &Url) -> RedirectCheck {
-    if scope == RedirectScope::RequestOrigin
-        && previous
-            .first()
-            .is_none_or(|own| own.origin() != target.origin())
-    {
-        return RedirectCheck::OffOrigin;
-    }
-    let own_host = previous
-        .first()
-        .and_then(Url::host_str)
-        .map(redirect_host_key);
-    if own_host.is_some() && own_host == target.host_str().map(redirect_host_key) {
-        RedirectCheck::OwnHost
-    } else if redirect_target_is_internal(target) {
-        RedirectCheck::Internal
-    } else {
-        RedirectCheck::OtherHost
-    }
-}
-
-/// Makes `builder` follow at most `max_redirects` redirects within `scope`, and refuse one that
-/// leaves the request's own host for a private, loopback, or link-local destination: an internal
-/// IP literal, a well-known internal name, or a host that resolves to an internal address. A
-/// redirect within the request's own host is followed, whatever that host resolves to.
-pub fn guard_redirects(
-    builder: reqwest::ClientBuilder,
-    max_redirects: usize,
-    scope: RedirectScope,
-) -> reqwest::ClientBuilder {
-    let resolver = RedirectHostResolver::new(DestinationGuard::new(
-        is_internal_ip,
-        redirect_target_is_internal,
-        OFF_HOST_REDIRECT_REFUSED,
-    ));
-    let redirect_hosts = resolver.clone();
-    builder
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= max_redirects {
-                return attempt.error("too many redirects");
-            }
-            match check_redirect(scope, attempt.previous(), attempt.url()) {
-                RedirectCheck::OwnHost => attempt.follow(),
-                RedirectCheck::OffOrigin => {
-                    let refused = format!(
-                        "Refused to follow the redirect to {}: {OFF_ORIGIN_REDIRECT_REFUSED}",
-                        attempt.url()
-                    );
-                    attempt.error(refused)
-                }
-                RedirectCheck::Internal => {
-                    let refused = format!(
-                        "Refused to connect to {}: {OFF_HOST_REDIRECT_REFUSED}",
-                        attempt.url()
-                    );
-                    attempt.error(refused)
-                }
-                RedirectCheck::OtherHost => {
-                    // The policy cannot resolve DNS, so the resolver checks the addresses of
-                    // each new host a redirect names.
-                    if let Some(url::Host::Domain(host)) = attempt.url().host() {
-                        redirect_hosts.check_host(host);
-                    }
-                    attempt.follow()
-                }
-            }
-        }))
-        .dns_resolver(Arc::new(resolver))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
+    use std::{net::IpAddr, str::FromStr};
 
     #[test]
     fn test_is_internal_ip_blocks_dangerous_ranges() {
@@ -448,83 +229,5 @@ mod tests {
                 "{url} is not a URL table store"
             );
         }
-    }
-
-    #[test]
-    fn check_redirect_refuses_only_an_internal_target_off_the_request_host() {
-        let previous = [Url::parse("http://graphql.example.com/graphql").expect("valid URL")];
-        for target in [
-            "http://127.0.0.1:18791/graphql",
-            "http://10.0.0.1/graphql",
-            "http://169.254.169.254/latest/meta-data/",
-            "http://[::1]/graphql",
-            "http://localhost/graphql",
-            "http://metadata.google.internal/computeMetadata/v1/",
-        ] {
-            let target = Url::parse(target).expect("valid URL");
-            assert_eq!(
-                check_redirect(RedirectScope::PublicHosts, &previous, &target),
-                RedirectCheck::Internal,
-                "{target} must be refused"
-            );
-        }
-        for target in [
-            "https://93.184.216.34/graphql",
-            "https://api.example.org/graphql",
-        ] {
-            let target = Url::parse(target).expect("valid URL");
-            assert_eq!(
-                check_redirect(RedirectScope::PublicHosts, &previous, &target),
-                RedirectCheck::OtherHost,
-                "{target} must be followed"
-            );
-        }
-
-        let previous = [Url::parse("http://127.0.0.1:4000/graphql").expect("valid URL")];
-        let target = Url::parse("http://127.0.0.1:4000/graphql/").expect("valid URL");
-        assert_eq!(
-            check_redirect(RedirectScope::PublicHosts, &previous, &target),
-            RedirectCheck::OwnHost,
-            "a redirect within the request's own host is followed"
-        );
-    }
-
-    #[test]
-    fn check_redirect_in_the_request_origin_scope_refuses_every_target_off_the_origin() {
-        let previous = [Url::parse("http://api.example.com/graphql").expect("valid URL")];
-        for target in [
-            "https://93.184.216.34/graphql",
-            "https://api.example.org/graphql",
-        ] {
-            let target = Url::parse(target).expect("valid URL");
-            assert_eq!(
-                check_redirect(RedirectScope::PublicHosts, &previous, &target),
-                RedirectCheck::OtherHost,
-                "{target} must be followed in the public-hosts scope"
-            );
-            assert_eq!(
-                check_redirect(RedirectScope::RequestOrigin, &previous, &target),
-                RedirectCheck::OffOrigin,
-                "{target} must be refused in the request-origin scope"
-            );
-        }
-        for target in [
-            "https://api.example.com/graphql",
-            "http://api.example.com:8080/graphql",
-        ] {
-            let target = Url::parse(target).expect("valid URL");
-            assert_eq!(
-                check_redirect(RedirectScope::RequestOrigin, &previous, &target),
-                RedirectCheck::OffOrigin,
-                "{target} changes the scheme or port, so it must be refused"
-            );
-        }
-
-        let target = Url::parse("http://api.example.com:80/graphql/").expect("valid URL");
-        assert_eq!(
-            check_redirect(RedirectScope::RequestOrigin, &previous, &target),
-            RedirectCheck::OwnHost,
-            "a redirect within the request's origin is followed"
-        );
     }
 }

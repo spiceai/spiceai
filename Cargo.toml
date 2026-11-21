@@ -37,6 +37,7 @@ members = [
     "crates/duckdb-oracle",
     "crates/duration-parse",
     "crates/http-body-limit",
+    "crates/http-egress",
     "crates/http-retry",
     "crates/dynamodb-streams",
     "crates/event_stream",

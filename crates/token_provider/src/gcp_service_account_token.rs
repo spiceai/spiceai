@@ -67,6 +67,14 @@ pub enum GcpAuthError {
         source: reqwest::Error,
     },
 
+    #[snafu(display(
+        "Failed to exchange the GCP service account JWT for an access token at {token_uri}: {source}. A token request is sent only to its token endpoint's origin, so it does not follow this redirect. Set `token_uri` in the service account key to the URL the token endpoint redirects to."
+    ))]
+    TokenEndpointRedirected {
+        token_uri: String,
+        source: http_egress::RedirectRefused,
+    },
+
     #[snafu(display("GCP token endpoint {token_uri} returned an error response: {source}"))]
     TokenEndpointStatus {
         token_uri: String,
@@ -296,14 +304,19 @@ async fn exchange_token(
     let jwt = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
         .context(UnableToGenerateJWTSnafu)?;
 
-    let client = http_retry::client_builder()
-        .user_agent(util::spiceai_user_agent())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context(UnableToExchangeTokenSnafu {
-            token_uri: token_uri.to_string(),
-        })?;
+    // The request carries a signed assertion that grants a token to whoever presents it, so it
+    // never follows the token endpoint to another origin.
+    let client = http_egress::origin_bound(
+        http_retry::client_builder(),
+        "a service account token request follows a redirect only within its token endpoint's origin",
+    )
+    .user_agent(util::spiceai_user_agent())
+    .connect_timeout(Duration::from_secs(10))
+    .timeout(Duration::from_secs(30))
+    .build()
+    .context(UnableToExchangeTokenSnafu {
+        token_uri: token_uri.to_string(),
+    })?;
 
     let response = client
         .post(token_uri.as_ref())
@@ -313,8 +326,15 @@ async fn exchange_token(
         ])
         .send()
         .await
-        .context(UnableToExchangeTokenSnafu {
-            token_uri: token_uri.to_string(),
+        .map_err(|source| match http_egress::refused_redirect(&source) {
+            Some(refused) => GcpAuthError::TokenEndpointRedirected {
+                token_uri: token_uri.to_string(),
+                source: refused.clone(),
+            },
+            None => GcpAuthError::UnableToExchangeToken {
+                token_uri: token_uri.to_string(),
+                source,
+            },
         })?
         .error_for_status()
         .context(TokenEndpointStatusSnafu {

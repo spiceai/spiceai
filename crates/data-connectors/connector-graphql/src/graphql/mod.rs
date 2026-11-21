@@ -59,6 +59,14 @@ pub enum Error {
     ))]
     ReqwestInternal { source: reqwest::Error },
 
+    #[snafu(display(
+        "Failed to send the GraphQL request to {endpoint}: {source}. Point the dataset at the URL the server redirects to. See: https://spiceai.org/docs/components/data-connectors/graphql"
+    ))]
+    RedirectRefused {
+        endpoint: String,
+        source: http_egress::RedirectRefused,
+    },
+
     #[snafu(display("HTTP {status}: {message}"))]
     InvalidReqwestStatus {
         status: reqwest::StatusCode,

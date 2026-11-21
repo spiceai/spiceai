@@ -2236,6 +2236,13 @@ impl Runtime {
     pub async fn load_components(self: Arc<Self>) {
         self.secrets_preflight().await;
 
+        // Object-store URL tables borrow credentials only from the Spicepod's datasets.
+        self.df.set_url_table_datasets(Arc::new(
+            crate::datafusion::url_table_datasets::RuntimeUrlTableDatasets::new(Arc::downgrade(
+                &self,
+            )),
+        ));
+
         let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
         if hold_ready_for_warmup {
             tracing::info!(

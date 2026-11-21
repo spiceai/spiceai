@@ -50,6 +50,31 @@ pub enum Error {
     InvalidMcpArgs { source: shell_words::ParseError },
 
     #[snafu(display(
+        "Failed to load tool '{tool}': MCP server URL '{url}' uses plaintext HTTP to a host that is not loopback, which would send the tool's credentials and results unencrypted. Use https://, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: {MCP_DOCS}"
+    ))]
+    PlaintextToRemoteHost { tool: String, url: String },
+
+    #[snafu(display(
+        "Failed to load tool '{tool}': MCP server URL '{url}' uses plaintext HTTP to a host that is not loopback ({wildcard} is not a loopback address), which would send the tool's credentials and results unencrypted. Use {local_url} for a local server, https:// for a remote one, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: {MCP_DOCS}"
+    ))]
+    PlaintextToWildcard {
+        tool: String,
+        url: String,
+        wildcard: String,
+        local_url: String,
+    },
+
+    #[snafu(display(
+        "Failed to load tool '{tool}': `mcp_transport_security` applies only to an MCP server reached over HTTP (`mcp:http://` or `mcp:https://`), and tool '{tool}' runs a local program. Remove `mcp_transport_security` from tool '{tool}'. See: {MCP_DOCS}"
+    ))]
+    TransportSecurityOnStdio { tool: String },
+
+    #[snafu(display(
+        "Failed to load tool '{tool}': `mcp_transport_security` is '{value}', and it takes `require_tls` or `allow_plaintext`. See: {MCP_DOCS}"
+    ))]
+    InvalidTransportSecurity { tool: String, value: String },
+
+    #[snafu(display(
         "Error occurred in underlying communication to MCP tool. Error: {}",
         source
     ))]
@@ -70,7 +95,12 @@ impl Error {
     pub fn is_configuration_error(&self) -> bool {
         matches!(
             self,
-            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. }
+            Error::InvalidMCPDirective { .. }
+                | Error::InvalidMcpArgs { .. }
+                | Error::PlaintextToRemoteHost { .. }
+                | Error::PlaintextToWildcard { .. }
+                | Error::TransportSecurityOnStdio { .. }
+                | Error::InvalidTransportSecurity { .. }
         )
     }
 }
@@ -126,7 +156,70 @@ pub const MCP_CALL_TOOL_TIMEOUT: Duration = Duration::from_mins(10);
 /// into peak memory.
 const MAX_TOOL_RESULT_SIZE: usize = crate::utils::MAX_TOOL_RESULT_BYTES;
 
+/// Documentation for MCP tools, named in their errors.
+const MCP_DOCS: &str = "https://spiceai.org/docs/components/tools/mcp";
+
 const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
+
+/// Whether a Streamable HTTP MCP tool may use plaintext HTTP to a host that is not loopback.
+const MCP_TRANSPORT_SECURITY_PARAM: &str = "mcp_transport_security";
+
+/// The values of [`MCP_TRANSPORT_SECURITY_PARAM`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TransportSecurity {
+    /// `http://` only to a loopback host; any other host needs `https://`.
+    #[default]
+    RequireTls,
+    /// `http://` to any host: the network below HTTP already protects the connection.
+    AllowPlaintext,
+}
+
+impl TransportSecurity {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "require_tls" => Some(Self::RequireTls),
+            "allow_plaintext" => Some(Self::AllowPlaintext),
+            _ => None,
+        }
+    }
+}
+
+/// Refuses an `http://` MCP server URL to a host that is not loopback, unless `security`
+/// permits plaintext. Loopback is decided from the host as written, never from DNS.
+fn check_transport_security(tool: &str, url: &url::Url, security: TransportSecurity) -> Result<()> {
+    if url.scheme() != "http" || security == TransportSecurity::AllowPlaintext {
+        return Ok(());
+    }
+    let host = url.host_str().unwrap_or_default();
+    if util::net::is_loopback_host(host) {
+        return Ok(());
+    }
+    // The URL is shown in the error, which is logged: never with credentials written into it.
+    let mut url = url.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let wildcard = match url.host() {
+        Some(url::Host::Ipv4(ip)) if ip.is_unspecified() => Some(("0.0.0.0", "127.0.0.1")),
+        Some(url::Host::Ipv6(ip)) if ip.is_unspecified() => Some(("::", "[::1]")),
+        _ => None,
+    };
+    if let Some((wildcard, loopback)) = wildcard {
+        let mut local_url = url.clone();
+        if local_url.set_host(Some(loopback)).is_ok() {
+            return Err(Error::PlaintextToWildcard {
+                tool: tool.to_string(),
+                url: url.to_string(),
+                wildcard: wildcard.to_string(),
+                local_url: local_url.to_string(),
+            });
+        }
+    }
+    Err(Error::PlaintextToRemoteHost {
+        tool: tool.to_string(),
+        url: url.to_string(),
+    })
+}
+
 /// Custom HTTP headers, formatted `Name: Value` and delimited like the HTTP
 /// connector's `http_headers`. If the value contains `;`, only `;` separates
 /// headers (so values may contain `,`); otherwise `,` separates them.
@@ -135,7 +228,8 @@ const MCP_HEADERS_PARAM: &str = "mcp_headers";
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MCPType {
-    /// Connect to an MCP server over Streamable HTTP (HTTPS in production; HTTP is permitted for localhost).
+    /// Connect to an MCP server over Streamable HTTP: HTTPS, or HTTP to a loopback host, or HTTP
+    /// to any host with `mcp_transport_security: allow_plaintext`.
     StreamableHttp(url::Url),
 
     /// Uses stdio to communicate with an MCP server. The string is the command to run.
@@ -168,11 +262,18 @@ pub(crate) enum MCPConfig {
 }
 impl MCPConfig {
     fn from_type(
+        tool: &str,
         mcp_type: &MCPType,
         params: &HashMap<String, SecretString>,
         env: &HashMap<String, SecretString>,
     ) -> Result<Self> {
+        let transport_security = params.get(MCP_TRANSPORT_SECURITY_PARAM);
         Ok(match mcp_type.clone() {
+            MCPType::Stdio(_) if transport_security.is_some() => {
+                return Err(Error::TransportSecurityOnStdio {
+                    tool: tool.to_string(),
+                });
+            }
             MCPType::Stdio(command) => {
                 // Shell-word rules: quotes and backslash escapes group arguments.
                 let args = shell_words::split(
@@ -191,6 +292,18 @@ impl MCPConfig {
                 Self::Stdio { command, args, env }
             }
             MCPType::StreamableHttp(url) => {
+                let security = match transport_security {
+                    None => TransportSecurity::default(),
+                    Some(value) => {
+                        TransportSecurity::parse(value.expose_secret()).ok_or_else(|| {
+                            Error::InvalidTransportSecurity {
+                                tool: tool.to_string(),
+                                value: value.expose_secret().to_string(),
+                            }
+                        })?
+                    }
+                };
+                check_transport_security(tool, &url, security)?;
                 let auth_token = params.get(MCP_AUTH_TOKEN_PARAM).cloned();
                 let mut headers = parse_custom_headers(params);
                 if auth_token.is_some() && headers.remove(&AUTHORIZATION).is_some() {
@@ -301,7 +414,8 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("FOO".to_string(), SecretString::from("bar"));
 
-        let cfg = MCPConfig::from_type(&mcp_type, &params, &env).expect("valid MCP config");
+        let cfg =
+            MCPConfig::from_type("test_tool", &mcp_type, &params, &env).expect("valid MCP config");
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 assert_eq!(command, "docker");
@@ -312,11 +426,123 @@ mod tests {
         }
     }
 
+    fn http_config(url: &str, params: &[(&str, &str)]) -> Result<MCPConfig> {
+        let mcp_type = MCPType::StreamableHttp(url::Url::parse(url).expect("valid url"));
+        let params = params
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), SecretString::from(*value)))
+            .collect();
+        MCPConfig::from_type("remote_tools", &mcp_type, &params, &HashMap::new())
+    }
+
+    /// The signed-off rule (spiceai/spiceai#16479): `http://` only to a loopback host, decided
+    /// from the host as written, unless the tool permits plaintext.
+    #[test]
+    fn plaintext_mcp_is_allowed_only_to_loopback_or_with_permission() {
+        for url in [
+            "http://localhost:8090/v1/mcp",
+            "http://tools.localhost:8090/v1/mcp",
+            "http://127.0.0.1:8090/v1/mcp",
+            "http://127.1.2.3/v1/mcp",
+            "http://[::1]:8090/v1/mcp",
+            "https://tools.example.com/mcp",
+        ] {
+            http_config(url, &[]).unwrap_or_else(|e| panic!("{url} is allowed: {e}"));
+        }
+        http_config(
+            "https://tools.example.com/mcp",
+            &[("mcp_transport_security", "allow_plaintext")],
+        )
+        .expect("a permission an https tool never uses is accepted");
+        http_config(
+            "http://tools.default.svc:8080/mcp",
+            &[("mcp_transport_security", "allow_plaintext")],
+        )
+        .expect("plaintext is allowed when the tool permits it");
+
+        let message = http_config("http://user:s3cr3t@tools.example.com/mcp", &[])
+            .err()
+            .expect("credentials in the URL do not make it loopback")
+            .to_string();
+        assert!(
+            message.contains("MCP server URL 'http://tools.example.com/mcp'")
+                && !message.contains("s3cr3t")
+                && !message.contains("user@"),
+            "{message}"
+        );
+
+        for url in [
+            "http://tools.example.com/mcp",
+            "http://127.0.0.1.nip.io/mcp",
+        ] {
+            let message = http_config(url, &[("mcp_transport_security", "require_tls")])
+                .err()
+                .unwrap_or_else(|| panic!("{url} is refused"))
+                .to_string();
+            assert_eq!(
+                message,
+                format!(
+                    "Failed to load tool 'remote_tools': MCP server URL '{url}' uses plaintext HTTP to a host that is not loopback, which would send the tool's credentials and results unencrypted. Use https://, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: https://spiceai.org/docs/components/tools/mcp"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_mcp_to_a_wildcard_address_names_the_loopback_one() {
+        let message = http_config("http://0.0.0.0:8090/v1/mcp", &[])
+            .err()
+            .expect("the wildcard address is not loopback")
+            .to_string();
+        assert_eq!(
+            message,
+            "Failed to load tool 'remote_tools': MCP server URL 'http://0.0.0.0:8090/v1/mcp' uses plaintext HTTP to a host that is not loopback (0.0.0.0 is not a loopback address), which would send the tool's credentials and results unencrypted. Use http://127.0.0.1:8090/v1/mcp for a local server, https:// for a remote one, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection. See: https://spiceai.org/docs/components/tools/mcp"
+        );
+        let message = http_config("http://[::]:8090/v1/mcp", &[])
+            .err()
+            .expect("the IPv6 wildcard address is not loopback")
+            .to_string();
+        assert!(
+            message.contains("(:: is not a loopback address)")
+                && message.contains("Use http://[::1]:8090/v1/mcp for a local server"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn transport_security_is_refused_on_a_stdio_tool_and_checked_for_its_values() {
+        let mcp_type = MCPType::Stdio("npx".to_string());
+        let params = HashMap::from([(
+            "mcp_transport_security".to_string(),
+            SecretString::from("allow_plaintext"),
+        )]);
+        let message = MCPConfig::from_type("maps", &mcp_type, &params, &HashMap::new())
+            .err()
+            .expect("a stdio tool takes no transport security")
+            .to_string();
+        assert_eq!(
+            message,
+            "Failed to load tool 'maps': `mcp_transport_security` applies only to an MCP server reached over HTTP (`mcp:http://` or `mcp:https://`), and tool 'maps' runs a local program. Remove `mcp_transport_security` from tool 'maps'. See: https://spiceai.org/docs/components/tools/mcp"
+        );
+
+        let error = http_config(
+            "https://tools.example.com/mcp",
+            &[("mcp_transport_security", "plaintext")],
+        )
+        .err()
+        .expect("an unknown value is refused");
+        assert!(error.is_configuration_error());
+        assert_eq!(
+            error.to_string(),
+            "Failed to load tool 'remote_tools': `mcp_transport_security` is 'plaintext', and it takes `require_tls` or `allow_plaintext`. See: https://spiceai.org/docs/components/tools/mcp"
+        );
+    }
+
     #[test]
     fn mcp_config_from_https_preserves_url() {
         let url = url::Url::parse("https://example.com/v1/mcp").expect("valid url");
         let mcp_type = MCPType::StreamableHttp(url.clone());
-        let cfg = MCPConfig::from_type(&mcp_type, &HashMap::new(), &HashMap::new())
+        let cfg = MCPConfig::from_type("test_tool", &mcp_type, &HashMap::new(), &HashMap::new())
             .expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp {
@@ -342,8 +568,8 @@ mod tests {
             SecretString::from("test-api-key"),
         );
 
-        let cfg =
-            MCPConfig::from_type(&mcp_type, &params, &HashMap::new()).expect("valid MCP config");
+        let cfg = MCPConfig::from_type("test_tool", &mcp_type, &params, &HashMap::new())
+            .expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp {
                 auth_token,
@@ -370,8 +596,8 @@ mod tests {
             SecretString::from("X-API-Key: test-api-key, X-Tenant: acme"),
         );
 
-        let cfg =
-            MCPConfig::from_type(&mcp_type, &params, &HashMap::new()).expect("valid MCP config");
+        let cfg = MCPConfig::from_type("test_tool", &mcp_type, &params, &HashMap::new())
+            .expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp { headers, .. } => {
                 assert_eq!(
@@ -405,8 +631,8 @@ mod tests {
             SecretString::from("Authorization: Basic abc, X-Tenant: acme"),
         );
 
-        let cfg =
-            MCPConfig::from_type(&mcp_type, &params, &HashMap::new()).expect("valid MCP config");
+        let cfg = MCPConfig::from_type("test_tool", &mcp_type, &params, &HashMap::new())
+            .expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp { headers, .. } => {
                 assert!(!headers.contains_key(&AUTHORIZATION));
