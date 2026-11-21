@@ -31,6 +31,8 @@ use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use tempfile::NamedTempFile;
 
+mod federation_differential;
+
 fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
     let mut dataset = Dataset::new(
         format!("duckdb:read_{fn_name}({path_str})"),
