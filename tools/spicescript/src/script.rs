@@ -25,14 +25,28 @@ limitations under the License.
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use clap::ValueEnum as _;
 use indexmap::IndexMap;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
+
+/// A script's tags, which `--only-tag` and `--exclude-tag` select on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tag {
+    /// Too slow for the run before every merge, for what it catches there: the
+    /// merge queue runs `--exclude-tag long`, and the post-merge run on trunk
+    /// runs every script. As with Go's `-short`, a script runs before merge
+    /// unless it opts out.
+    Long,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Script {
     pub name: String,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -1114,6 +1128,14 @@ impl Script {
             .context("A script needs `steps`")?;
         expand_shared_variants(&mut root, shared)?;
         let mut script: Script = serde_json::from_value(root)?;
+        for (i, tag) in script.tags.iter().enumerate() {
+            ensure!(
+                !script.tags[..i].contains(tag),
+                "Duplicate tag `{}`; list each tag only once",
+                tag.to_possible_value()
+                    .map_or_else(String::new, |value| value.get_name().to_string())
+            );
+        }
         let Value::Array(steps) = steps else {
             bail!("`steps` must be a list");
         };
@@ -2915,6 +2937,30 @@ fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tags_parse() {
+        let script =
+            Script::parse("name: s\ntags: [long]\nspicepod: {}\nsteps: []").expect("tags parse");
+        assert_eq!(script.tags, vec![Tag::Long]);
+    }
+
+    #[test]
+    fn tags_reject_unknown_tag() {
+        let error = Script::parse("name: s\ntags: [slow]\nspicepod: {}\nsteps: []")
+            .expect_err("unknown tag");
+        assert_eq!(error.to_string(), "unknown variant `slow`, expected `long`");
+    }
+
+    #[test]
+    fn tags_reject_duplicate_tag() {
+        let error = Script::parse("name: s\ntags: [long, long]\nspicepod: {}\nsteps: []")
+            .expect_err("duplicate tag");
+        assert_eq!(
+            error.to_string(),
+            "Duplicate tag `long`; list each tag only once"
+        );
+    }
 
     #[test]
     fn sample_objects_takes_its_bounds_and_needs_six_samples() {

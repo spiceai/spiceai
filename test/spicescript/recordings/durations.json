@@ -49,6 +49,7 @@
   "ducklake-refresh": 37,
   "duplicate-keys": 12,
   "dynamodb": 90,
+  "dynamodb-iterator-expiry": 461,
   "dynamodb-types": 16,
   "dynamodb-writes": 25,
   "edge-values": 22,

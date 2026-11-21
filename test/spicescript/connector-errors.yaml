@@ -1,4 +1,5 @@
 name: connector-errors
+tags: [long]
 description: >
   Beyond PostgreSQL (config-errors.yaml), a dataset whose source cannot be
   reached, rejects its credentials, or lacks the table is reported in Error

@@ -1,4 +1,5 @@
 name: mysql-connection-pool
+tags: [long]
 description: >
   A MySQL dataset's connection pool takes its size and connection lifetime from
   the Spicepod whether the server is given as individual parameters or as a
