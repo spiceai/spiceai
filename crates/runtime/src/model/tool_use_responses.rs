@@ -46,8 +46,8 @@ use tracing::{Instrument, Span};
 
 use crate::model::responses_tool_history::{ToolOutcome, mcp_call, replayed_call};
 use crate::model::tool_use::{
-    MAX_SPICE_TOOL_CALLS_PER_RESPONSE, encode_tool_name, tool_call_not_run_message,
-    warn_if_over_tool_call_limit,
+    MAX_SPICE_TOOL_CALLS_PER_RESPONSE, encode_tool_name, take_withheld, tool_call_not_run_message,
+    warn_if_over_tool_call_limit, withheld_tool_choice_error, withheld_tool_names,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -479,7 +479,7 @@ impl ToolUsingResponses {
         }
 
         // Append spiced runtime tools to the request.
-        let mut req = self.add_runtime_tools(&req).await;
+        let mut req = self.add_runtime_tools(&req).await?;
         // The rounds that may still run Spice tools; `None` for no limit.
         let mut tool_rounds_left = recursion_limit;
         // The output of the rounds that ran Spice tools, as the client receives it, and their usage.
@@ -546,7 +546,7 @@ impl ToolUsingResponses {
         }
 
         // Append spiced runtime tools to the request.
-        let req = self.add_runtime_tools(&req).await;
+        let req = self.add_runtime_tools(&req).await?;
 
         let s = self.inner_responses.responses_stream(req.clone()).await?;
 
@@ -598,13 +598,16 @@ impl ToolUsingResponses {
     }
 
     /// `req` with the Spice tools its caller may call (see [`Self::runtime_tools`]) beside the
-    /// model's hosted tools. A request left with no tool at all sends none, and so no tool
-    /// settings either.
-    async fn add_runtime_tools(&self, req: &CreateResponse) -> CreateResponse {
-        let mut runtime_tools = self.runtime_tools(::tools::caller_can_write().await);
-        if runtime_tools.is_empty() {
+    /// model's hosted tools. Its `tool_choice` keeps only the tools offered (see
+    /// [`tool_choice_without_withheld`]), and one that requires a Spice tool the caller may not
+    /// call is refused. A request left with no tool at all sends none, and so no tool settings
+    /// either.
+    async fn add_runtime_tools(&self, req: &CreateResponse) -> Result<CreateResponse, OpenAIError> {
+        let can_write = ::tools::caller_can_write().await;
+        let mut runtime_tools = self.runtime_tools(can_write);
+        let mut req = if runtime_tools.is_empty() {
             tracing::debug!("No runtime tools available, returning original request");
-            without_orphan_tool_settings(req.clone())
+            req.clone()
         } else {
             runtime_tools.extend(req.tools.clone().unwrap_or_default());
             // Ensure function names are unique. Tool-use recursion sometimes creates duplicates.
@@ -613,7 +616,18 @@ impl ToolUsingResponses {
             let mut req = req.clone();
             req.tools = Some(runtime_tools);
             req
-        }
+        };
+        let withheld = withheld_tool_names(&self.tools, can_write, |name| {
+            req.tools
+                .iter()
+                .flatten()
+                .any(|tool| matches!(tool, ToolDefinition::Function(f) if f.name == name))
+        });
+        req.tool_choice = match tool_choice_without_withheld(req.tool_choice.take(), &withheld) {
+            Ok(choice) => choice,
+            Err(required) => return Err(withheld_tool_choice_error(&required).await),
+        };
+        Ok(without_orphan_tool_settings(req))
     }
 }
 
@@ -1148,6 +1162,44 @@ fn next_round_tool_choice(choice: Option<ToolChoiceParam>) -> Option<ToolChoiceP
     }
 }
 
+/// `choice`, the `tool_choice` of a request whose caller is not offered the Spice tools named in
+/// `withheld`, naming only tools the provider is offered; the Responses counterpart of
+/// `tool_use::tool_choice_without_withheld`. An `allowed_tools` list loses the withheld tools and
+/// keeps the rest, hosted tools included, in its mode, and one that allowed only withheld tools
+/// lets the model call none in `auto` mode. A choice that requires a call to a withheld tool, a
+/// named function or such a list in `required` mode, is `Err` with the tools it requires, for the
+/// request to be refused.
+fn tool_choice_without_withheld(
+    choice: Option<ToolChoiceParam>,
+    withheld: &HashSet<String>,
+) -> Result<Option<ToolChoiceParam>, Vec<String>> {
+    match choice {
+        Some(ToolChoiceParam::Function(function)) if withheld.contains(&function.name) => {
+            Err(vec![function.name])
+        }
+        Some(ToolChoiceParam::AllowedTools(mut allowed)) => {
+            let removed = take_withheld(&mut allowed.tools, withheld, allowed_function_name);
+            if removed.is_empty() || !allowed.tools.is_empty() {
+                Ok(Some(ToolChoiceParam::AllowedTools(allowed)))
+            } else if allowed.mode == ToolChoiceAllowedMode::Required {
+                Err(removed)
+            } else {
+                Ok(Some(ToolChoiceParam::Mode(ToolChoiceOptions::None)))
+            }
+        }
+        choice => Ok(choice),
+    }
+}
+
+/// The function an entry of a Responses `allowed_tools` list names:
+/// `{"type": "function", "name": ...}`.
+fn allowed_function_name(tool: &Value) -> Option<&str> {
+    if tool.get("type")?.as_str()? != "function" {
+        return None;
+    }
+    tool.get("name")?.as_str()
+}
+
 /// `req` without `tools`, `tool_choice` and `parallel_tool_calls` when it offers no tool: a
 /// request whose caller may call none of the Spice tools, on a model with no hosted tools, would
 /// otherwise carry an empty `tools` list and tool settings with no tool to apply to, which a
@@ -1250,6 +1302,7 @@ pub fn combine_usage(
 mod tests {
     use super::*;
     use crate::model::ModelContextExtension;
+    use crate::model::tool_use::withheld_tool_choice_message;
     use crate::model::wrapper::responses::ResponsesWrapper;
     use async_openai::types::responses::{
         CreateResponseArgs, ToolChoiceAllowed, ToolChoiceCustom, ToolChoiceFunction,
@@ -2357,6 +2410,256 @@ mod tests {
                     "stream: {stream}, can write: {can_write}, tool_choice: {choice:?}"
                 );
             }
+        }
+    }
+
+    /// A request context whose caller has no credentials, which a runtime without
+    /// `runtime.auth` serves read-only beyond loopback.
+    fn anonymous_caller() -> Arc<RequestContext> {
+        Arc::new(RequestContext::builder(Protocol::Http).build())
+    }
+
+    fn named_choice(name: &str) -> ToolChoiceParam {
+        ToolChoiceParam::Function(ToolChoiceFunction {
+            name: name.to_string(),
+        })
+    }
+
+    /// An `allowed_tools` choice in `mode` over `tools`, each a tool by name: a Spice function,
+    /// or `code_interpreter`, the hosted tool.
+    fn allowed_choice(mode: ToolChoiceAllowedMode, tools: &[&str]) -> ToolChoiceParam {
+        ToolChoiceParam::AllowedTools(ToolChoiceAllowed {
+            mode,
+            tools: tools
+                .iter()
+                .map(|name| match *name {
+                    "code_interpreter" => json!({ "type": "code_interpreter" }),
+                    name => json!({ "type": "function", "name": name }),
+                })
+                .collect(),
+        })
+    }
+
+    /// A model offering the hosted `code_interpreter` tool, `list_datasets`, which any caller
+    /// may call, and `store_note`, which only a caller with write access may call. Without
+    /// `with_read_only_tool`, `store_note` is its only Spice tool, and without `hosted`, it has
+    /// no hosted tool.
+    fn read_write_model(
+        provider: &Arc<ScriptedResponses>,
+        hosted: bool,
+        with_read_only_tool: bool,
+    ) -> ToolUsingResponses {
+        let mut tools = vec![Arc::new(StoreNote) as Arc<dyn SpiceModelTool>];
+        if with_read_only_tool {
+            tools.push(Arc::new(ListDatasets(AtomicUsize::new(0))));
+        }
+        let hosted = if hosted {
+            vec![OpenAIResponsesTools::CodeInterpreter]
+        } else {
+            vec![]
+        };
+        ToolUsingResponses::new(
+            Arc::clone(provider) as Arc<dyn Responses>,
+            hosted,
+            tools,
+            None,
+        )
+    }
+
+    /// The Responses counterpart of the chat completions test: a `tool_choice` that requires a
+    /// call to a Spice tool its caller may not call is refused before the provider is sent
+    /// anything, streamed or not, with an error that names the tool: a choice naming the tool or
+    /// allowing only it in `required` mode, whether the caller is offered other tools or none,
+    /// and whether its credentials only read or it has none.
+    #[tokio::test]
+    async fn test_a_tool_choice_requiring_a_tool_the_caller_may_not_call_is_refused() {
+        for stream in [false, true] {
+            for (has_credentials, hosted, with_read_only_tool, choice) in [
+                (true, false, true, named_choice("store_note")),
+                (false, false, true, named_choice("store_note")),
+                (false, false, false, named_choice("store_note")),
+                (true, true, false, named_choice("store_note")),
+                (
+                    true,
+                    true,
+                    true,
+                    allowed_choice(ToolChoiceAllowedMode::Required, &["store_note"]),
+                ),
+            ] {
+                let provider = ScriptedResponses::new(vec![]);
+                let model = read_write_model(&provider, hosted, with_read_only_tool);
+                let mut request = request(stream);
+                request.tool_choice = Some(choice.clone());
+
+                let caller = if has_credentials {
+                    api_key_caller(false)
+                } else {
+                    anonymous_caller()
+                };
+                let result = caller
+                    .scope(async {
+                        if stream {
+                            model.responses_stream(request).await.map(|_| ())
+                        } else {
+                            model.responses_request(request).await.map(|_| ())
+                        }
+                    })
+                    .await;
+
+                let case = format!(
+                    "stream: {stream}, credentials: {has_credentials}, hosted: {hosted}, read-only tool: {with_read_only_tool}, {choice:?}"
+                );
+                match result {
+                    Err(OpenAIError::InvalidArgument(message)) => assert_eq!(
+                        message,
+                        withheld_tool_choice_message(&["store_note".to_string()], has_credentials),
+                        "{case}"
+                    ),
+                    other => panic!("{case}: expected the request to be refused, got {other:?}"),
+                }
+                assert_eq!(
+                    provider.requests.lock().len(),
+                    0,
+                    "{case}: the provider is sent nothing"
+                );
+            }
+        }
+    }
+
+    /// An `allowed_tools` choice loses the Spice tools its caller may not call and keeps the
+    /// rest, hosted tools included, in its mode; one that allowed only those, in `auto` mode,
+    /// lets the model call none. A choice naming a tool the caller is offered reaches the
+    /// provider as the client sent it: a Spice tool it may call, a hosted tool, and any Spice
+    /// tool for a caller with write access.
+    #[tokio::test]
+    async fn test_a_tool_choice_keeps_only_the_tools_the_caller_is_offered() {
+        let as_sent =
+            |choice: &ToolChoiceParam| serde_json::to_value(choice).expect("a serializable choice");
+        let code_interpreter = ToolChoiceParam::Hosted(ToolChoiceTypes::CodeInterpreter);
+        for stream in [false, true] {
+            for (can_write, choice, expected) in [
+                (
+                    false,
+                    allowed_choice(
+                        ToolChoiceAllowedMode::Required,
+                        &["list_datasets", "store_note", "code_interpreter"],
+                    ),
+                    as_sent(&allowed_choice(
+                        ToolChoiceAllowedMode::Required,
+                        &["list_datasets", "code_interpreter"],
+                    )),
+                ),
+                (
+                    false,
+                    allowed_choice(ToolChoiceAllowedMode::Auto, &["store_note"]),
+                    json!("none"),
+                ),
+                (
+                    false,
+                    allowed_choice(
+                        ToolChoiceAllowedMode::Auto,
+                        &["store_note", "code_interpreter"],
+                    ),
+                    as_sent(&allowed_choice(
+                        ToolChoiceAllowedMode::Auto,
+                        &["code_interpreter"],
+                    )),
+                ),
+                (
+                    false,
+                    named_choice("list_datasets"),
+                    as_sent(&named_choice("list_datasets")),
+                ),
+                (false, code_interpreter.clone(), as_sent(&code_interpreter)),
+                (
+                    true,
+                    named_choice("store_note"),
+                    as_sent(&named_choice("store_note")),
+                ),
+                (
+                    true,
+                    allowed_choice(
+                        ToolChoiceAllowedMode::Required,
+                        &["list_datasets", "store_note"],
+                    ),
+                    as_sent(&allowed_choice(
+                        ToolChoiceAllowedMode::Required,
+                        &["list_datasets", "store_note"],
+                    )),
+                ),
+            ] {
+                let provider = ScriptedResponses::new(vec![]);
+                let model = read_write_model(&provider, true, true);
+                let mut request = request(stream);
+                request.tool_choice = Some(choice.clone());
+
+                api_key_caller(can_write)
+                    .scope(output_through_spice(&model, request))
+                    .await;
+
+                assert_eq!(
+                    sent_tool_fields(&provider)["tool_choice"],
+                    expected,
+                    "stream: {stream}, can write: {can_write}, {choice:?}"
+                );
+            }
+        }
+    }
+
+    /// `/v1/responses` answers a request whose `tool_choice` requires a Spice tool its caller may
+    /// not call with a 400 in the `OpenAI` error envelope, streamed or not, rather than a 500 or a
+    /// response from a provider asked for a tool it was not offered.
+    #[tokio::test]
+    async fn test_responses_answer_a_withheld_tool_choice_with_a_400() {
+        use axum::extract::{Extension, Json};
+        use http_body_util::BodyExt;
+
+        for stream in [false, true] {
+            let provider = ScriptedResponses::new(vec![]);
+            let rt = Arc::new(crate::Runtime::builder().build().await);
+            rt.responses_llms().write().await.insert(
+                "m".to_string(),
+                Arc::new(read_write_model(&provider, false, true)) as Arc<dyn Responses>,
+            );
+            let req: CreateResponse = serde_json::from_value(json!({
+                "model": "m",
+                "input": "Remember this.",
+                "stream": stream,
+                "tool_choice": { "type": "function", "name": "store_note" },
+            }))
+            .expect("a valid request");
+
+            let response = api_key_caller(false)
+                .scope(crate::http::v1::responses::post(Extension(rt), Json(req)))
+                .await;
+
+            let status = response.status();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes();
+            let body = serde_json::from_slice::<Value>(&body)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
+            assert_eq!(
+                (status, body),
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    json!({ "error": {
+                        "message": withheld_tool_choice_message(&["store_note".to_string()], true),
+                        "type": "invalid_request_error",
+                        "param": null,
+                        "code": null,
+                    } })
+                ),
+                "stream: {stream}"
+            );
+            assert_eq!(
+                provider.requests.lock().len(),
+                0,
+                "stream: {stream}: the provider is sent nothing"
+            );
         }
     }
 

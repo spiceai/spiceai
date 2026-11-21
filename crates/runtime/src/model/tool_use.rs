@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use std::pin::Pin;
@@ -43,6 +43,8 @@ use futures::{Stream, StreamExt};
 use pin_project::pin_project;
 use serde_json::Value;
 
+use runtime_auth::AuthRequestContext;
+use runtime_auth::anonymous::{HOW_TO_WRITE, READ_ONLY_BECAUSE};
 use runtime_tools::builtin::list_datasets::catalog_prompt_from_tool;
 use runtime_tools::result::{ResultBudget, tool_result_text, with_budget};
 use tokio::sync::mpsc;
@@ -91,6 +93,95 @@ pub(crate) fn warn_if_over_tool_call_limit(model: &str, requested: usize) {
     if requested > MAX_SPICE_TOOL_CALLS_PER_RESPONSE {
         tracing::warn!("{}", tool_calls_over_limit_warning(model, requested));
     }
+}
+
+/// The error for a request whose `tool_choice` requires a call to one of `tools`, Spice tools
+/// that can write, none of which its caller may call, so none was offered to the model.
+/// `has_credentials` is whether the request carried credentials, which then do not allow write
+/// access; a request without any is served read-only.
+pub(crate) fn withheld_tool_choice_message(tools: &[String], has_credentials: bool) -> String {
+    let (required, which, what) = match tools {
+        [tool] => (
+            format!("tool '{tool}'"),
+            "which this request may not call",
+            "the tool",
+        ),
+        [first @ .., last] => (
+            format!(
+                "one of the tools {} or '{last}'",
+                first.iter().map(|tool| format!("'{tool}'")).join(", ")
+            ),
+            "none of which this request may call",
+            "each",
+        ),
+        [] => (
+            "a tool".to_string(),
+            "which this request may not call",
+            "the tool",
+        ),
+    };
+    let (why, fix) = if has_credentials {
+        (
+            "the credentials on this request do not allow write access".to_string(),
+            "retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth".to_string(),
+        )
+    } else {
+        (
+            format!(
+                "the request has no credentials, which this runtime serves read-only {READ_ONLY_BECAUSE}"
+            ),
+            format!("retry with write access. {HOW_TO_WRITE}"),
+        )
+    };
+    format!(
+        "`tool_choice` requires a call to {required}, {which}: {what} can change data or act outside Spice, and {why}. Name a tool this request may call in `tool_choice`, or {fix}"
+    )
+}
+
+/// The refusal of a request whose `tool_choice` requires a call to one of `tools`, which the
+/// caller of the current request may not call (see [`withheld_tool_choice_message`]).
+pub(crate) async fn withheld_tool_choice_error(tools: &[String]) -> OpenAIError {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let has_credentials = AuthRequestContext::auth_principal(context.as_ref()).is_some();
+    OpenAIError::InvalidArgument(withheld_tool_choice_message(tools, has_credentials))
+}
+
+/// The names, as the model knows them, of the Spice `tools` a caller that `can_write` is not
+/// offered: those that can write, to a caller without write access (see
+/// [`ToolUsingChat::runtime_tools`]). A name the request offers anyway, which `offered` says,
+/// such as the client's own function of that name, is not withheld.
+pub(crate) fn withheld_tool_names(
+    tools: &[Arc<dyn SpiceModelTool>],
+    can_write: bool,
+    offered: impl Fn(&str) -> bool,
+) -> HashSet<String> {
+    if can_write {
+        return HashSet::new();
+    }
+    tools
+        .iter()
+        .filter(|t| t.access() != ::tools::ToolAccess::ReadOnly)
+        .map(|t| encode_tool_name(t.name().as_ref()))
+        .filter(|name| !offered(name))
+        .collect()
+}
+
+/// Takes the entries of `allowed`, an `allowed_tools` list, that name one of the `withheld`
+/// tools, by the name `name_of` reads from an entry, out of the list, and returns their names.
+pub(crate) fn take_withheld(
+    allowed: &mut Vec<Value>,
+    withheld: &HashSet<String>,
+    name_of: impl Fn(&Value) -> Option<&str>,
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    allowed.retain(|tool| match name_of(tool) {
+        Some(name) if withheld.contains(name) => {
+            removed.push(name.to_string());
+            false
+        }
+        _ => true,
+    });
+    removed
 }
 
 pub struct ToolUsingChat {
@@ -371,7 +462,7 @@ impl ToolUsingChat {
             }
 
             // Append spiced runtime tools to the request.
-            let inner_req = self.add_runtime_tools(&req).await;
+            let inner_req = self.add_runtime_tools(&req).await?;
 
             let resp = self.inner_chat.chat_request(inner_req.clone()).await?;
             let usage = resp.usage.clone();
@@ -432,13 +523,16 @@ impl ToolUsingChat {
     }
 
     /// Add the spice runtime tools the caller of the current request may call to a list of tools
-    /// (may contain external tools too), and ensure no duplicates. A request left with no tools
-    /// sends none, and so no tool choice either.
+    /// (may contain external tools too), and ensure no duplicates. The request's `tool_choice`
+    /// keeps only the tools offered (see [`tool_choice_without_withheld`]), and one that requires
+    /// a Spice tool the caller may not call is refused. A request left with no tools sends none,
+    /// and so no tool choice either.
     async fn add_runtime_tools(
         &self,
         req: &CreateChatCompletionRequest,
-    ) -> CreateChatCompletionRequest {
-        let mut runtime_tools = self.runtime_tools(::tools::caller_can_write().await);
+    ) -> Result<CreateChatCompletionRequest, OpenAIError> {
+        let can_write = ::tools::caller_can_write().await;
+        let mut runtime_tools = self.runtime_tools(can_write);
         if let Some(ref request_tools) = req.tools {
             runtime_tools.extend(request_tools.iter().filter_map(|t| match t {
                 ChatCompletionTools::Function(f) => Some(f.clone()),
@@ -449,9 +543,16 @@ impl ToolUsingChat {
         runtime_tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         runtime_tools.dedup_by(|a, b| a.function.name == b.function.name);
         let mut req = req.clone();
+        let withheld = withheld_tool_names(&self.tools, can_write, |name| {
+            runtime_tools.iter().any(|t| t.function.name == name)
+        });
+        req.tool_choice = match tool_choice_without_withheld(req.tool_choice.take(), &withheld) {
+            Ok(choice) => choice,
+            Err(required) => return Err(withheld_tool_choice_error(&required).await),
+        };
         if runtime_tools.is_empty() {
             req.tools = None;
-            return without_orphan_tool_choice(req);
+            return Ok(without_orphan_tool_choice(req));
         }
         req.tools = Some(
             runtime_tools
@@ -459,7 +560,7 @@ impl ToolUsingChat {
                 .map(ChatCompletionTools::Function)
                 .collect(),
         );
-        req
+        Ok(req)
     }
 
     /// Streams the completion of `req`, running Spice tools as the model calls them. Every round
@@ -489,7 +590,7 @@ impl ToolUsingChat {
         }
 
         // Append spiced runtime tools to the request. Avoid clone if no runtime tools.
-        let updated_req = self.add_runtime_tools(&req).await;
+        let updated_req = self.add_runtime_tools(&req).await?;
         let s = self.inner_chat.chat_stream(updated_req.clone()).await?;
 
         Ok(make_a_stream(
@@ -689,6 +790,49 @@ fn next_round_tool_choice(
             ToolChoiceOptions::Auto | ToolChoiceOptions::None,
         ))) => unforced,
     }
+}
+
+/// `choice`, the `tool_choice` of a request whose caller is not offered the Spice tools named in
+/// `withheld`, naming only tools the provider is offered: an `allowed_tools` list loses the
+/// withheld tools and keeps the rest in its mode, and one that allowed only withheld tools lets
+/// the model call none in `auto` mode. A choice that requires a call to a withheld tool, a named
+/// function or such a list in `required` mode, is `Err` with the tools it requires, for the
+/// request to be refused: the provider would reject a choice naming a tool it was not offered,
+/// and dropping it would answer without the call the client required.
+fn tool_choice_without_withheld(
+    choice: Option<ChatCompletionToolChoiceOption>,
+    withheld: &HashSet<String>,
+) -> Result<Option<ChatCompletionToolChoiceOption>, Vec<String>> {
+    match choice {
+        Some(ChatCompletionToolChoiceOption::Function(named))
+            if withheld.contains(&named.function.name) =>
+        {
+            Err(vec![named.function.name])
+        }
+        Some(ChatCompletionToolChoiceOption::AllowedTools(mut choice)) => {
+            let allowed = &mut choice.allowed_tools;
+            let removed = take_withheld(&mut allowed.tools, withheld, allowed_function_name);
+            if removed.is_empty() || !allowed.tools.is_empty() {
+                Ok(Some(ChatCompletionToolChoiceOption::AllowedTools(choice)))
+            } else if allowed.mode == ToolChoiceAllowedMode::Required {
+                Err(removed)
+            } else {
+                Ok(Some(ChatCompletionToolChoiceOption::Mode(
+                    ToolChoiceOptions::None,
+                )))
+            }
+        }
+        choice => Ok(choice),
+    }
+}
+
+/// The function an entry of a Chat Completions `allowed_tools` list names:
+/// `{"type": "function", "function": {"name": ...}}`.
+fn allowed_function_name(tool: &Value) -> Option<&str> {
+    if tool.get("type")?.as_str()? != "function" {
+        return None;
+    }
+    tool.get("function")?.get("name")?.as_str()
 }
 
 /// `req` without its `tool_choice` and `parallel_tool_calls` when it offers no tools: a request
@@ -1357,6 +1501,26 @@ mod tests {
         assert_eq!(
             tool_calls_over_limit_warning("chatm", 20_000),
             "Model 'chatm' made 20000 tool calls in one response, more than the 64 Spice runs from one response, so Spice ran the first 64 and told the model the other 19936 did not run. If the model needs more, prompt it to make fewer tool calls at once. See: https://spiceai.org/docs/features/large-language-models/tools"
+        );
+    }
+
+    /// The refusal of a `tool_choice` that requires a Spice tool its caller may not call names
+    /// the tools, says why the caller may not call them, and says what to do instead, for a
+    /// caller whose credentials only read and for one with none.
+    #[test]
+    fn the_withheld_tool_choice_error_names_the_tools_why_and_the_fix() {
+        let tools = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            withheld_tool_choice_message(&tools(&["store_note"]), true),
+            "`tool_choice` requires a call to tool 'store_note', which this request may not call: the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Name a tool this request may call in `tool_choice`, or retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
+        );
+        assert_eq!(
+            withheld_tool_choice_message(&tools(&["store_note"]), false),
+            "`tool_choice` requires a call to tool 'store_note', which this request may not call: the tool can change data or act outside Spice, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Name a tool this request may call in `tool_choice`, or retry with write access. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth"
+        );
+        assert_eq!(
+            withheld_tool_choice_message(&tools(&["store_note", "send_alert", "run_job"]), true),
+            "`tool_choice` requires a call to one of the tools 'store_note', 'send_alert' or 'run_job', none of which this request may call: each can change data or act outside Spice, and the credentials on this request do not allow write access. Name a tool this request may call in `tool_choice`, or retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
         );
     }
 
@@ -3026,6 +3190,287 @@ mod tests {
                     "stream: {stream}, can write: {can_write}, tools: {client_tools}, {choice:?}"
                 );
             }
+        }
+    }
+
+    /// Who sends a request: a caller whose API key may write, one whose API key may only read,
+    /// or one with no credentials, which a runtime without `runtime.auth` serves read-only
+    /// beyond loopback.
+    #[derive(Clone, Copy, Debug)]
+    enum Caller {
+        Writer,
+        Reader,
+        Anonymous,
+    }
+
+    impl Caller {
+        fn context(self) -> Arc<RequestContext> {
+            let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+            let key = "key-1".to_string();
+            let principal = match self {
+                Self::Writer => ApiKey::ReadWrite { key },
+                Self::Reader => ApiKey::ReadOnly { key },
+                Self::Anonymous => return context,
+            };
+            context
+                .set_auth_principal(Arc::new(principal) as AuthPrincipalRef)
+                .expect("auth principal should be set");
+            context
+        }
+
+        /// Whether the caller's request carries credentials.
+        fn has_credentials(self) -> bool {
+            !matches!(self, Self::Anonymous)
+        }
+    }
+
+    /// Sends `req` through `model` as `caller`, streamed or not, to the end of the stream, and
+    /// returns the error the client gets before the provider answers, if any.
+    async fn send_as(
+        caller: Caller,
+        model: &ToolUsingChat,
+        req: CreateChatCompletionRequest,
+        stream: bool,
+    ) -> Result<(), OpenAIError> {
+        caller
+            .context()
+            .scope(async {
+                if stream {
+                    let chunks: Vec<_> = model.chat_stream(req).await?.collect().await;
+                    assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+                } else {
+                    model.chat_request(req).await?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    fn named_choice(name: &str) -> ChatCompletionToolChoiceOption {
+        ChatCompletionToolChoiceOption::Function(name.into())
+    }
+
+    fn allowed_choice(
+        mode: ToolChoiceAllowedMode,
+        names: &[&str],
+    ) -> ChatCompletionToolChoiceOption {
+        ChatCompletionToolChoiceOption::AllowedTools(ChatCompletionAllowedToolsChoice {
+            allowed_tools: ChatCompletionAllowedTools {
+                mode,
+                tools: names
+                    .iter()
+                    .map(|name| json!({ "type": "function", "function": { "name": name } }))
+                    .collect(),
+            },
+        })
+    }
+
+    /// A `tool_choice` that requires a call to a Spice tool its caller may not call is refused
+    /// before the provider is sent anything, streamed or not, with an error that names the tool:
+    /// a choice naming the tool or allowing only it in `required` mode, whether the caller is
+    /// offered other tools or none, and whether its credentials only read or it has none.
+    #[tokio::test]
+    async fn test_a_tool_choice_requiring_a_tool_the_caller_may_not_call_is_refused() {
+        for stream in [false, true] {
+            for (caller, offers_sql, choice) in [
+                (Caller::Reader, true, named_choice("store_note")),
+                (Caller::Anonymous, true, named_choice("store_note")),
+                (Caller::Reader, false, named_choice("store_note")),
+                (Caller::Anonymous, false, named_choice("store_note")),
+                (
+                    Caller::Reader,
+                    true,
+                    allowed_choice(ToolChoiceAllowedMode::Required, &["store_note"]),
+                ),
+            ] {
+                let provider = ScriptedChat::new(vec![Reply::Answer("D")]);
+                let mut tools = vec![Arc::new(StoreNote) as Arc<dyn SpiceModelTool>];
+                if offers_sql {
+                    tools.push(Arc::new(Sql));
+                }
+                let model = model(&provider, tools);
+                let mut req = request(vec![user("A")]);
+                req.tool_choice = Some(choice.clone());
+
+                let case =
+                    format!("stream: {stream}, {caller:?}, offers sql: {offers_sql}, {choice:?}");
+                match send_as(caller, &model, req, stream).await {
+                    Err(OpenAIError::InvalidArgument(message)) => assert_eq!(
+                        message,
+                        withheld_tool_choice_message(
+                            &["store_note".to_string()],
+                            caller.has_credentials()
+                        ),
+                        "{case}"
+                    ),
+                    other => panic!("{case}: expected the request to be refused, got {other:?}"),
+                }
+                assert_eq!(
+                    provider.requests.lock().len(),
+                    0,
+                    "{case}: the provider is sent nothing"
+                );
+            }
+        }
+    }
+
+    /// An `allowed_tools` choice loses the Spice tools its caller may not call and keeps the
+    /// rest in its mode; one that allowed only those, in `auto` mode, lets the model call none.
+    /// A choice naming a tool the caller is offered reaches the provider as the client sent it:
+    /// a Spice tool it may call, the client's own function, even one named like a Spice tool it
+    /// may not call, and any Spice tool for a caller with write access.
+    #[tokio::test]
+    async fn test_a_tool_choice_keeps_only_the_tools_the_caller_is_offered() {
+        let lookup = json!([{ "type": "function", "function": { "name": "lookup_order" } }]);
+        let own_store_note = json!([{ "type": "function", "function": { "name": "store_note" } }]);
+        let as_sent = |choice: &ChatCompletionToolChoiceOption| {
+            serde_json::to_value(choice).expect("a serializable tool choice")
+        };
+        let required = ToolChoiceAllowedMode::Required;
+        let auto = ToolChoiceAllowedMode::Auto;
+        for stream in [false, true] {
+            for (caller, client_tools, choice, expected) in [
+                (
+                    Caller::Reader,
+                    json!(null),
+                    allowed_choice(required.clone(), &["sql", "store_note"]),
+                    as_sent(&allowed_choice(required.clone(), &["sql"])),
+                ),
+                (
+                    Caller::Anonymous,
+                    json!(null),
+                    allowed_choice(auto.clone(), &["store_note"]),
+                    json!("none"),
+                ),
+                (
+                    Caller::Reader,
+                    lookup.clone(),
+                    allowed_choice(auto.clone(), &["store_note", "lookup_order"]),
+                    as_sent(&allowed_choice(auto.clone(), &["lookup_order"])),
+                ),
+                (
+                    Caller::Reader,
+                    json!(null),
+                    named_choice("sql"),
+                    as_sent(&named_choice("sql")),
+                ),
+                (
+                    Caller::Reader,
+                    lookup.clone(),
+                    named_choice("lookup_order"),
+                    as_sent(&named_choice("lookup_order")),
+                ),
+                (
+                    Caller::Reader,
+                    own_store_note.clone(),
+                    named_choice("store_note"),
+                    as_sent(&named_choice("store_note")),
+                ),
+                (
+                    Caller::Writer,
+                    json!(null),
+                    named_choice("store_note"),
+                    as_sent(&named_choice("store_note")),
+                ),
+                (
+                    Caller::Writer,
+                    json!(null),
+                    allowed_choice(required.clone(), &["sql", "store_note"]),
+                    as_sent(&allowed_choice(required.clone(), &["sql", "store_note"])),
+                ),
+            ] {
+                let provider = ScriptedChat::new(vec![Reply::Answer("D")]);
+                let model = model(
+                    &provider,
+                    vec![
+                        Arc::new(Sql) as Arc<dyn SpiceModelTool>,
+                        Arc::new(StoreNote) as Arc<dyn SpiceModelTool>,
+                    ],
+                );
+                let mut req = request(vec![user("A")]);
+                req.tools = serde_json::from_value(client_tools.clone()).expect("valid tools");
+                req.tool_choice = Some(choice.clone());
+
+                let case =
+                    format!("stream: {stream}, {caller:?}, tools: {client_tools}, {choice:?}");
+                send_as(caller, &model, req, stream)
+                    .await
+                    .unwrap_or_else(|e| panic!("{case}: {e}"));
+                assert_eq!(
+                    sent_tool_fields(&provider)["tool_choice"],
+                    expected,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// `/v1/chat/completions` answers a request whose `tool_choice` requires a Spice tool its
+    /// caller may not call with a 400 that says why, streamed or not, rather than a 500 or a
+    /// completion from a provider asked for a tool it was not offered.
+    #[tokio::test]
+    async fn test_chat_completions_answer_a_withheld_tool_choice_with_a_400() {
+        use crate::{http::v1::chat::post, model::LLMChatCompletionsModelStore};
+        use axum::extract::{Extension, Json};
+        use http_body_util::BodyExt;
+
+        for stream in [false, true] {
+            let provider = ScriptedChat::new(vec![Reply::Answer("D")]);
+            let mut store = LLMChatCompletionsModelStore::new();
+            store.insert(
+                "m".to_string(),
+                Arc::new(model(
+                    &provider,
+                    vec![
+                        Arc::new(Sql) as Arc<dyn SpiceModelTool>,
+                        Arc::new(StoreNote) as Arc<dyn SpiceModelTool>,
+                    ],
+                )) as Arc<dyn Chat>,
+            );
+            let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "stream": stream,
+                "messages": [{ "role": "user", "content": "Remember this." }],
+                "tool_choice": { "type": "function", "function": { "name": "store_note" } },
+            }))
+            .expect("a valid request");
+
+            let response = Caller::Reader
+                .context()
+                .scope(post(
+                    Extension(Arc::new(tokio::sync::RwLock::new(store))),
+                    Extension(Arc::new(tokio::sync::RwLock::new(
+                        std::collections::HashMap::new(),
+                    ))),
+                    Extension(crate::status::RuntimeStatus::new()),
+                    axum::http::HeaderMap::new(),
+                    Json(req),
+                ))
+                .await;
+
+            let status = response.status();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes();
+            assert_eq!(
+                (status, String::from_utf8_lossy(&body).into_owned()),
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!(
+                        "invalid args: {}",
+                        withheld_tool_choice_message(&["store_note".to_string()], true)
+                    )
+                ),
+                "stream: {stream}"
+            );
+            assert_eq!(
+                provider.requests.lock().len(),
+                0,
+                "stream: {stream}: the provider is sent nothing"
+            );
         }
     }
 }
