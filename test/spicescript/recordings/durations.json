@@ -1,6 +1,7 @@
 {
   "acceleration-dml-arithmetic": 8,
   "adbc-duckdb-catalog": 3,
+  "anonymous-access": 9,
   "append-embeddings": 11,
   "append-iso-offset": 9,
   "append-kill": 74,
@@ -179,7 +180,8 @@
   "timezone-rules": 1,
   "tlp": 488,
   "tls": 6,
-  "tool-authorization": 24,
+  "tool-access-config": 1,
+  "tool-authorization": 57,
   "tool-metadata": 1,
   "tool-results": 11,
   "tpch-coverage": 158,

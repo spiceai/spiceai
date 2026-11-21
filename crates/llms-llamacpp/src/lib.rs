@@ -3256,7 +3256,7 @@ fn now() -> u32 {
 /// The cache namespace of the caller this request runs for: its authenticated principal's, or
 /// the shared one of an unauthenticated or internal request, as the runtime scopes each request.
 async fn caller() -> CacheNamespace {
-    RequestContext::current(AsyncMarker::new().await).cache_namespace()
+    RequestContext::current(AsyncMarker::new().await).caller_namespace()
 }
 
 fn api_error(message: &str) -> OpenAIError {

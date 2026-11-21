@@ -74,8 +74,15 @@ const WRONG_CONTENT_TYPE: (&str, &str) = ("text/plain", "not json");
 /// naming it.
 const EMPTY_OBJECT: (&str, &str) = ("application/json", "{}");
 
-/// The runtime's HTTP routes, with API key authentication when `auth` is set.
+/// The runtime's HTTP routes, with API key authentication when `auth` is set, on a listener
+/// bound only to loopback.
 async fn routes(auth: bool) -> Router {
+    routes_on(auth, "127.0.0.1:8090").await
+}
+
+/// The runtime's HTTP routes, with API key authentication when `auth` is set, on a listener
+/// bound to `bind_address`.
+async fn routes_on(auth: bool, bind_address: &str) -> Router {
     let rt = Arc::new(
         Runtime::builder()
             .with_app(app::AppBuilder::new("write_access").build())
@@ -97,7 +104,9 @@ async fn routes(auth: bool) -> Router {
     });
     super::routes::routes(
         &rt,
-        Arc::new(Config::new()),
+        Arc::new(
+            Config::new().with_http_bind_address(bind_address.parse().expect("a socket address")),
+        ),
         search,
         auth_layer,
         &CorsConfig::default(),
@@ -112,6 +121,17 @@ async fn send(
     method: &Method,
     path: &str,
     api_key: Option<&str>,
+    body: (&str, &'static str),
+) -> (StatusCode, String) {
+    send_with_headers(routes, method, path, api_key, &[], body).await
+}
+
+async fn send_with_headers(
+    routes: &Router,
+    method: &Method,
+    path: &str,
+    api_key: Option<&str>,
+    headers: &[(&str, &str)],
     (content_type, body): (&str, &'static str),
 ) -> (StatusCode, String) {
     let mut request = Request::builder()
@@ -120,6 +140,9 @@ async fn send(
         .header(header::CONTENT_TYPE, content_type);
     if let Some(api_key) = api_key {
         request = request.header("x-api-key", api_key);
+    }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
     }
     let request = request.body(Body::from(body)).expect("request");
     let response = routes.clone().oneshot(request).await.expect("response");
@@ -170,8 +193,49 @@ async fn anonymous_caller_is_refused_before_the_body_is_parsed() {
     }
 }
 
+/// The refusal of a write route for a request without credentials on a runtime without
+/// `runtime.auth` that the listener serves read-only.
+const ANONYMOUS_WRITE_REFUSAL: &str = "This route changes data, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth";
+
+/// Without `runtime.auth`, a listener beyond loopback serves a request without credentials
+/// read-only, and so does a loopback-only listener when the request came through a proxy:
+/// every write route refuses it with `403` before reading the body.
+#[tokio::test]
+async fn anonymous_caller_beyond_loopback_is_read_only() {
+    let beyond_loopback = [
+        routes_on(false, "0.0.0.0:8090").await,
+        routes_on(false, "[::]:8090").await,
+    ];
+    let loopback = routes(false).await;
+    for (method, path, _) in write_routes() {
+        let mut answers = Vec::new();
+        for routes in &beyond_loopback {
+            answers.push(send(routes, &method, path, None, EMPTY_OBJECT).await);
+        }
+        for forwarded in [
+            ("x-forwarded-for", "192.0.2.60"),
+            ("forwarded", "for=192.0.2.60"),
+        ] {
+            answers.push(
+                send_with_headers(&loopback, &method, path, None, &[forwarded], EMPTY_OBJECT).await,
+            );
+        }
+        for (status, text) in answers {
+            let message = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|value| value["message"].as_str().map(ToString::to_string));
+            assert_eq!(
+                (status, message.as_deref()),
+                (StatusCode::FORBIDDEN, Some(ANONYMOUS_WRITE_REFUSAL)),
+                "{method} {path} without credentials answered {status}: {text}",
+            );
+        }
+    }
+}
+
 /// A read-write caller gets exactly the answer the same request gets when the runtime has no
-/// authentication, including the JSON extractor's 400, 415 and 422.
+/// authentication and listens only on loopback (the local operator), including the JSON
+/// extractor's 400, 415 and 422.
 #[tokio::test]
 async fn read_write_caller_gets_the_unauthenticated_answer() {
     let authenticated = routes(true).await;

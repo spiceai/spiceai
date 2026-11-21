@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub(crate) mod anonymous;
+pub use anonymous::AnonymousAccessLayer;
 pub(crate) mod rate_limit;
 pub use rate_limit::WriteRateLimitLayer;
 pub(crate) mod request_context;

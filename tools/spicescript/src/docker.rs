@@ -1087,11 +1087,28 @@ pub fn free_port() -> Result<u16> {
     free_port_on(std::net::Ipv4Addr::LOCALHOST.into())
 }
 
-/// Whether a listener could bind `ip:port` now. Probing the wildcard address
-/// also finds a listener on any single address, such as `127.0.0.2`, that a
-/// loopback probe misses.
+/// Whether a listener could bind `ip:port` now, and this runner, which reaches
+/// every listener at loopback, would reach that listener there. A loopback
+/// probe misses what a probe of the wildcard address finds: on Linux a
+/// listener on another single address, such as `127.0.0.2`; on macOS, which
+/// lets a single address share a port with the wildcard, a listener on the
+/// wildcard address itself. For the same reason a wildcard probe on macOS
+/// misses a listener on `127.0.0.1`, which would then answer the runner, so a
+/// port for any other address is probed at loopback too.
 fn port_is_free(ip: std::net::IpAddr, port: u16) -> bool {
-    std::net::TcpListener::bind((ip, port)).is_ok()
+    let bindable = |ip: std::net::IpAddr| std::net::TcpListener::bind((ip, port)).is_ok();
+    bindable(ip) && (ip.is_loopback() || bindable(std::net::Ipv4Addr::LOCALHOST.into()))
+}
+
+/// `port`, if a listener on `ip` could still bind it (see [`port_is_free`]),
+/// or else another port this run has not given out that it could: for a port
+/// chosen for one address and then served on another.
+pub fn port_still_free_on(ip: std::net::IpAddr, port: u16) -> Result<u16> {
+    if port_is_free(ip, port) {
+        Ok(port)
+    } else {
+        free_port_on(ip)
+    }
 }
 
 /// A port this run has not given out and that a listener could bind on `ip`.
@@ -1381,6 +1398,40 @@ mod port_tests {
             std::net::Ipv4Addr::LOCALHOST.into(),
             port
         ));
+        assert!(!super::port_is_free(
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+            port
+        ));
+    }
+
+    /// A listener on the wildcard address refuses another bind of the wildcard on its port.
+    /// macOS lets a single address share a port with the wildcard, so there a loopback probe
+    /// finds that port free; only a probe on the wildcard address sees the listener.
+    #[test]
+    fn a_wildcard_probe_sees_a_listener_on_the_wildcard_address() {
+        let every: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
+        let held = std::net::TcpListener::bind((every, 0)).expect("listen on 0.0.0.0");
+        let port = held.local_addr().expect("local addr").port();
+        assert!(
+            std::net::TcpListener::bind((every, port)).is_err(),
+            "a second listener on 0.0.0.0:{port} is refused"
+        );
+        assert_eq!(
+            super::port_is_free(std::net::Ipv4Addr::LOCALHOST.into(), port),
+            cfg!(target_os = "macos"),
+            "a loopback probe of {port}"
+        );
+        assert!(!super::port_is_free(every, port));
+    }
+
+    /// The runner reaches every listener at loopback, so a port for a listener on every
+    /// interface must be free at loopback too. macOS lets the wildcard share a port with a
+    /// listener on `127.0.0.1`, which would then answer the runner in place of `spiced`.
+    #[test]
+    fn a_wildcard_probe_sees_a_listener_on_loopback() {
+        let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("listen on 127.0.0.1");
+        let port = held.local_addr().expect("local addr").port();
         assert!(!super::port_is_free(
             std::net::Ipv4Addr::UNSPECIFIED.into(),
             port

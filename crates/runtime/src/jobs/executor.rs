@@ -24,17 +24,19 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use runtime_request_context::RequestContext;
+use runtime_auth::anonymous::LOCAL_OPERATOR_ID;
+use runtime_auth::{AuthRequestContext, LocalPrincipal};
+use runtime_request_context::{Protocol, RequestContext};
 
 use crate::datafusion::DataFusion;
 use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
 use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::state::JobErrorCode;
 
-use super::Result;
 use super::error::Error;
 use super::state::{JobState, JobStatus};
 use super::store::JobStore;
+use super::{JobCaller, Result};
 
 /// How a job comes to be driven by this scheduler.
 enum Start {
@@ -87,6 +89,21 @@ impl std::fmt::Debug for JobExecutor {
             .field("job_store", &self.job_store)
             .finish_non_exhaustive()
     }
+}
+
+/// The request context a job taken over from a lost scheduler runs in: its submitter's, rebuilt
+/// from the job's owner. A job of a caller without credentials (`public`) runs as a client
+/// request without a principal, and a job of the local operator as the local operator, so a
+/// resumed job may do no more than its submitter could: a remote function or a read-write tool
+/// refuses a request without credentials, as it refuses the runtime's own work only when that
+/// work is not a client's. [`JobExecutor::resume`] resumes only those owners' jobs.
+fn resumed_job_context(job: &JobState) -> Arc<RequestContext> {
+    let context = RequestContext::builder(Protocol::Http).build();
+    if job.is_owned_by(LOCAL_OPERATOR_ID) {
+        // A context just built has no principal yet, so this cannot fail.
+        let _ = AuthRequestContext::set_auth_principal(&context, Arc::new(LocalPrincipal));
+    }
+    Arc::new(context)
 }
 
 impl JobExecutor {
@@ -174,10 +191,13 @@ impl JobExecutor {
     /// principal's table access and masking apply. The job records only its
     /// submitter's opaque storage id, not an identity a plan can be authorized
     /// against, so a job submitted by an authenticated principal is failed with a
-    /// request to resubmit rather than re-planned without that principal.
+    /// request to resubmit rather than re-planned without that principal. A job of
+    /// a caller without credentials, or of the local operator (which reads every
+    /// dataset without restriction, so its plan does not depend on an identity), is
+    /// re-planned.
     pub async fn resume(&self, job: &JobState) {
         let job_id = job.job_id.as_str();
-        if !job.is_owned_by(super::PUBLIC_JOB_OWNER) {
+        if !(job.is_owned_by(super::PUBLIC_JOB_OWNER) || job.is_owned_by(LOCAL_OPERATOR_ID)) {
             tracing::warn!(
                 job_id,
                 "Async query job '{job_id}' was running on a scheduler that stopped, and it cannot be resumed under the identity that submitted it, so it is marked failed; resubmit the query."
@@ -243,31 +263,35 @@ impl JobExecutor {
         let active_jobs = Arc::clone(&self.active_jobs);
         let job_id_owned = job_id.to_string();
 
+        // The job runs as its owner, rebuilt, as it ran on the scheduler it was taken from: not
+        // as the runtime's own work, which may do what a caller cannot.
         tokio::spawn(
-            async move {
-                let result = Self::execute_job(
-                    &job_store,
-                    df,
-                    &job_id_owned,
-                    &active_jobs,
-                    cancel_token,
-                    Start::TakenOver(Box::new(taken)),
-                )
-                .await;
+            resumed_job_context(job).scope(
+                async move {
+                    let result = Self::execute_job(
+                        &job_store,
+                        df,
+                        &job_id_owned,
+                        &active_jobs,
+                        cancel_token,
+                        Start::TakenOver(Box::new(taken)),
+                    )
+                    .await;
 
-                {
-                    let mut active = active_jobs.write().await;
-                    active.remove(&job_id_owned);
+                    {
+                        let mut active = active_jobs.write().await;
+                        active.remove(&job_id_owned);
+                    }
+
+                    report_job_end(&job_id_owned, result, "Job recovery failed");
                 }
-
-                report_job_end(&job_id_owned, result, "Job recovery failed");
-            }
-            .instrument(tracing::info_span!("job_recovery", job_id = %job_id)),
+                .instrument(tracing::info_span!("job_recovery", job_id = %job_id)),
+            ),
         );
     }
 
-    /// Requests cancellation of a running job submitted by `caller`.
-    pub async fn cancel(&self, job_id: &str, caller: &str) -> Result<JobState> {
+    /// Requests cancellation of a running job `caller` may reach (see [`JobCaller`]).
+    pub async fn cancel(&self, job_id: &str, caller: &JobCaller) -> Result<JobState> {
         // Resolve ownership before signalling: a caller that did not submit
         // the job must not be able to stop it.
         self.owned_job(job_id, caller).await?;
@@ -284,8 +308,8 @@ impl JobExecutor {
         self.job_store.cancel_job(job_id).await
     }
 
-    /// Gets the current state of a job submitted by `caller`.
-    pub async fn get_status(&self, job_id: &str, caller: &str) -> Result<JobState> {
+    /// Gets the current state of a job `caller` may reach.
+    pub async fn get_status(&self, job_id: &str, caller: &JobCaller) -> Result<JobState> {
         self.owned_job(job_id, caller).await
     }
 
@@ -293,7 +317,7 @@ impl JobExecutor {
     ///
     /// Ownership is resolved before expiry so every job `caller` does not own
     /// answers identically, whether it is live, expired, or absent.
-    async fn owned_job(&self, job_id: &str, caller: &str) -> Result<JobState> {
+    async fn owned_job(&self, job_id: &str, caller: &JobCaller) -> Result<JobState> {
         let state = self.job_store.get_job_ignoring_expiry(job_id).await?;
         Self::require_owner(&state, caller)?;
         if state.is_expired() {
@@ -304,12 +328,12 @@ impl JobExecutor {
         Ok(state)
     }
 
-    /// Rejects access to a job `caller` did not submit.
+    /// Rejects access to a job `caller` may not reach.
     ///
     /// Reports the job as missing rather than forbidden so the API does not
     /// confirm that a job id exists to a principal that cannot read it.
-    fn require_owner(state: &JobState, caller: &str) -> Result<()> {
-        if state.is_owned_by(caller) {
+    fn require_owner(state: &JobState, caller: &JobCaller) -> Result<()> {
+        if caller.may_access(state) {
             return Ok(());
         }
         tracing::debug!(
@@ -321,12 +345,12 @@ impl JobExecutor {
         })
     }
 
-    /// Reads a result chunk for a completed job submitted by `caller`.
+    /// Reads a result chunk for a completed job `caller` may reach.
     pub async fn get_chunk(
         &self,
         job_id: &str,
         chunk_index: usize,
-        caller: &str,
+        caller: &JobCaller,
     ) -> Result<Vec<RecordBatch>> {
         let state = self.owned_job(job_id, caller).await?;
 
@@ -360,14 +384,14 @@ impl JobExecutor {
         self.job_store.read_chunk(job_id, chunk_index).await
     }
 
-    /// Lists the jobs `caller` submitted, optionally filtered by status.
+    /// Lists the jobs `caller` may reach, optionally filtered by status.
     pub async fn list_jobs(
         &self,
         status_filter: Option<JobStatus>,
-        caller: &str,
+        caller: &JobCaller,
     ) -> Result<Vec<JobState>> {
         let mut jobs = self.job_store.list_jobs(status_filter).await?;
-        jobs.retain(|job| job.is_owned_by(caller));
+        jobs.retain(|job| caller.may_access(job));
         Ok(jobs)
     }
 
@@ -756,11 +780,11 @@ mod tests {
 
         let executor = executor(successor);
         executor
-            .get_chunk(&job_id, 0, PUBLIC_JOB_OWNER)
+            .get_chunk(&job_id, 0, &JobCaller::owning(PUBLIC_JOB_OWNER))
             .await
             .expect("the listed chunk");
         let err = executor
-            .get_chunk(&job_id, 1, PUBLIC_JOB_OWNER)
+            .get_chunk(&job_id, 1, &JobCaller::owning(PUBLIC_JOB_OWNER))
             .await
             .expect_err("chunk 1 is not in the result");
         assert!(
@@ -982,6 +1006,134 @@ mod tests {
         }
     }
 
+    /// Object store that records the request context of every write, as
+    /// `<protocol>/<principal>` (`none` when there is no principal), so a test can see whom the
+    /// work that wrote ran as.
+    #[derive(Debug)]
+    struct RecordWriters {
+        inner: Arc<dyn object_store::ObjectStore>,
+        writers: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl std::fmt::Display for RecordWriters {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordWriters")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for RecordWriters {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let context =
+                RequestContext::current(runtime_request_context::AsyncMarker::new().await);
+            let principal = AuthRequestContext::auth_principal(context.as_ref())
+                .map_or_else(|| "none".to_string(), |p| p.username().to_string());
+            self.writers
+                .lock()
+                .push(format!("{}/{principal}", context.protocol().as_str()));
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A job taken over from a lost scheduler runs as its owner did: a caller without
+    /// credentials as a client request with no principal, the local operator as itself, and
+    /// neither as the runtime's own work, which may do what a caller cannot. The takeover is
+    /// written by the recovery sweep itself; everything after it runs as the job (here it
+    /// fails, as this test has no scheduler to run it on, and records that it failed).
+    #[tokio::test]
+    async fn a_resumed_job_runs_as_its_owner() {
+        for (owner, expected) in [
+            (PUBLIC_JOB_OWNER, "http/none"),
+            (LOCAL_OPERATOR_ID, "http/local"),
+        ] {
+            let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let lost = JobStore::new(Arc::clone(&inner), "test", "node-lost");
+            let job_id = seed_job(&lost, owner).await;
+            let running = lost
+                .set_job_running(&job_id)
+                .await
+                .expect("the lost scheduler had started the job");
+            let store = Arc::new(RecordWriters {
+                inner,
+                writers: parking_lot::Mutex::new(Vec::new()),
+            });
+            let recoverer = Arc::new(JobStore::new(
+                Arc::clone(&store) as Arc<dyn object_store::ObjectStore>,
+                "test",
+                "node-b",
+            ));
+            let executor = executor(Arc::clone(&recoverer));
+
+            executor.resume(&running).await;
+            let state = wait_until_finished(&recoverer, &job_id).await;
+            assert_eq!(state.status, JobStatus::Failed, "{owner}: {state:?}");
+            let writers = store.writers.lock().clone();
+            assert_eq!(
+                writers.first().map(String::as_str),
+                Some("internal/none"),
+                "{owner}: the takeover is the recovery sweep's own write: {writers:?}"
+            );
+            assert!(
+                writers.len() >= 2,
+                "{owner}: the job wrote after its takeover: {writers:?}"
+            );
+            assert!(
+                writers[1..].iter().all(|writer| writer == expected),
+                "{owner}: every write after the takeover runs as {expected}: {writers:?}"
+            );
+        }
+    }
+
     /// A takeover write that lands but reports an error: the recoverer reads
     /// the job back, finds it holds the job, and drives it.
     #[tokio::test]
@@ -1021,12 +1173,12 @@ mod tests {
         let job_id = seed_job(&job_store, OWNER).await;
 
         executor
-            .get_status(&job_id, OWNER)
+            .get_status(&job_id, &JobCaller::owning(OWNER))
             .await
             .expect("the submitting principal should read its own job");
 
         let err = executor
-            .get_status(&job_id, OTHER)
+            .get_status(&job_id, &JobCaller::owning(OTHER))
             .await
             .expect_err("another principal must not read the job");
         assert!(
@@ -1056,7 +1208,7 @@ mod tests {
             .expect("the job should be marked expired");
 
         let owner_err = executor
-            .get_status(&job_id, OWNER)
+            .get_status(&job_id, &JobCaller::owning(OWNER))
             .await
             .expect_err("the owner should be told its results expired");
         assert!(
@@ -1068,7 +1220,7 @@ mod tests {
         );
 
         let other_err = executor
-            .get_status(&job_id, OTHER)
+            .get_status(&job_id, &JobCaller::owning(OTHER))
             .await
             .expect_err("another principal must not read the job");
         assert!(
@@ -1084,7 +1236,7 @@ mod tests {
         let job_id = seed_job(&job_store, OWNER).await;
 
         let err = executor
-            .get_chunk(&job_id, 0, OTHER)
+            .get_chunk(&job_id, 0, &JobCaller::owning(OTHER))
             .await
             .expect_err("another principal must not read result chunks");
         assert!(
@@ -1100,7 +1252,7 @@ mod tests {
         let job_id = seed_job(&job_store, OWNER).await;
 
         let err = executor
-            .cancel(&job_id, OTHER)
+            .cancel(&job_id, &JobCaller::owning(OTHER))
             .await
             .expect_err("another principal must not cancel the job");
         assert!(
@@ -1109,13 +1261,94 @@ mod tests {
         );
 
         let state = executor
-            .get_status(&job_id, OWNER)
+            .get_status(&job_id, &JobCaller::owning(OWNER))
             .await
             .expect("the job should still be readable by its owner");
         assert_eq!(
             state.status,
             JobStatus::Pending,
             "a refused cancellation must leave the job running"
+        );
+    }
+
+    /// The local operator reaches the jobs of callers without credentials, among them every job
+    /// submitted before it had a scope of its own, and its own jobs. A caller without
+    /// credentials still reaches only `public` jobs, so not the operator's, and an API key only
+    /// its own.
+    #[tokio::test]
+    async fn the_local_operator_reaches_public_jobs_and_keeps_its_own() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let executor = executor(Arc::clone(&job_store));
+        let public_job = seed_job(&job_store, PUBLIC_JOB_OWNER).await;
+        let operator_job = seed_job(&job_store, LOCAL_OPERATOR_ID).await;
+        let key_job = seed_job(&job_store, OWNER).await;
+        let operator = JobCaller::local_operator();
+        let anonymous = JobCaller::owning(PUBLIC_JOB_OWNER);
+        let ids = |jobs: Vec<JobState>| {
+            let mut ids: Vec<String> = jobs.into_iter().map(|job| job.job_id).collect();
+            ids.sort();
+            ids
+        };
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(
+            ids(executor
+                .list_jobs(None, &operator)
+                .await
+                .expect("listing should succeed")),
+            sorted(vec![public_job.clone(), operator_job.clone()])
+        );
+        assert_eq!(
+            ids(executor
+                .list_jobs(None, &anonymous)
+                .await
+                .expect("listing should succeed")),
+            vec![public_job.clone()]
+        );
+
+        for (job, caller) in [
+            (&operator_job, &anonymous),
+            (&public_job, &JobCaller::owning(OWNER)),
+            (&key_job, &operator),
+        ] {
+            let err = executor
+                .get_status(job, caller)
+                .await
+                .expect_err("the job is out of the caller's reach");
+            assert!(
+                matches!(err, super::super::error::Error::JobNotFound { .. }),
+                "{caller:?} reading {job}: {err:?}"
+            );
+            let err = executor
+                .cancel(job, caller)
+                .await
+                .expect_err("the job is out of the caller's reach");
+            assert!(
+                matches!(err, super::super::error::Error::JobNotFound { .. }),
+                "{caller:?} cancelling {job}: {err:?}"
+            );
+        }
+
+        let read = executor
+            .get_status(&public_job, &operator)
+            .await
+            .expect("the local operator reads a public job");
+        assert_eq!(read.status, JobStatus::Pending);
+        let cancelled = executor
+            .cancel(&public_job, &operator)
+            .await
+            .expect("the local operator cancels a public job");
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+        assert_eq!(
+            executor
+                .get_status(&operator_job, &operator)
+                .await
+                .expect("the local operator reads its own job")
+                .status,
+            JobStatus::Pending
         );
     }
 
@@ -1127,14 +1360,14 @@ mod tests {
         let theirs = seed_job(&job_store, OTHER).await;
 
         let listed = executor
-            .list_jobs(None, OWNER)
+            .list_jobs(None, &JobCaller::owning(OWNER))
             .await
             .expect("listing should succeed");
         let ids: Vec<&str> = listed.iter().map(|j| j.job_id.as_str()).collect();
         assert_eq!(ids, vec![mine.as_str()]);
 
         let unauthenticated = executor
-            .list_jobs(None, PUBLIC_JOB_OWNER)
+            .list_jobs(None, &JobCaller::owning(PUBLIC_JOB_OWNER))
             .await
             .expect("listing should succeed");
         assert!(

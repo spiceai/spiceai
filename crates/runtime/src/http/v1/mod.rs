@@ -130,21 +130,33 @@ pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
         .any(|group| *group == "write" || *group == "read_write")
 }
 
+/// Whether the request may only read: its principal lacks write access, or it has none. A
+/// request without credentials has none unless it is the local operator, on a loopback-only
+/// listener of a runtime without `runtime.auth` (see `runtime_auth::anonymous`).
 pub(crate) async fn current_principal_requires_read_only() -> bool {
     let context = RequestContext::current(AsyncMarker::new().await);
-    runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
-        .is_some_and(|principal| !principal_has_write_access(principal))
+    !runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
+        .is_some_and(principal_has_write_access)
 }
 
-/// Denies an OTLP gRPC export from a read-only API key. The OTLP gRPC services run on the
-/// Flight server, outside the [`require_write_access`] route layer, so each export handler
-/// calls this before it reads the request. With authentication disabled there is no
-/// principal, and the export is allowed.
+/// Why the current request may not write, for a route that changes data: a read-only API key,
+/// or a request without credentials that is not the local operator's (it reached Spice over the
+/// network or through a proxy). `None` when it may write.
+pub(crate) async fn write_access_refusal() -> Option<String> {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    match runtime_auth::AuthRequestContext::auth_principal(context.as_ref()) {
+        Some(principal) if principal_has_write_access(principal) => None,
+        Some(_) => Some("API key does not allow write access".to_string()),
+        None => Some(runtime_auth::anonymous::write_route_refusal()),
+    }
+}
+
+/// Denies an OTLP gRPC export from a caller without write access. The OTLP gRPC services run on
+/// the Flight server, outside the [`require_write_access`] route layer, so each export handler
+/// calls this before it reads the request.
 pub(crate) async fn ensure_otlp_grpc_write_access() -> Result<(), tonic::Status> {
-    if current_principal_requires_read_only().await {
-        return Err(tonic::Status::permission_denied(
-            "API key does not allow write access",
-        ));
+    if let Some(refusal) = write_access_refusal().await {
+        return Err(tonic::Status::permission_denied(refusal));
     }
     Ok(())
 }
@@ -156,18 +168,23 @@ pub(crate) async fn ensure_otlp_grpc_write_access() -> Result<(), tonic::Status>
 /// (415, 422) before the handler body runs, which would tell a read-only caller the
 /// route's request schema instead of answering 403.
 pub(crate) async fn require_write_access(req: Request<Body>, next: Next) -> Response {
-    if current_principal_requires_read_only().await {
+    if let Some(refusal) = write_access_refusal().await {
         return (
             StatusCode::FORBIDDEN,
-            axum::Json(json!({ "message": "API key does not allow write access" })),
+            axum::Json(json!({ "message": refusal })),
         )
             .into_response();
     }
     next.run(req).await
 }
 
+/// `403` for a query refused because its caller may only read: a read-only key, or a request
+/// without credentials, whose every refusal (a write, a remote function) gives the reason
+/// [`runtime_auth::anonymous::READ_ONLY_BECAUSE`]. `400` for any other error.
 fn status_for_sql_error(message: &str) -> StatusCode {
-    if message.contains("read-only SQL context") {
+    if message.contains("read-only SQL context")
+        || message.contains(runtime_auth::anonymous::READ_ONLY_BECAUSE)
+    {
         StatusCode::FORBIDDEN
     } else {
         StatusCode::BAD_REQUEST
@@ -1389,6 +1406,27 @@ mod tests {
         dataaccelerator::AcceleratorEngineRegistry, datafusion::builder::DataFusionBuilder,
         status::RuntimeStatus,
     };
+
+    /// A query refused because its caller may only read answers `403`, whichever check refused
+    /// it; any other failed query answers `400`.
+    #[test]
+    fn read_only_refusals_answer_forbidden() {
+        for message in [
+            "Error during planning: Insert Into operations are not allowed in read-only SQL context.",
+            "Error during planning: INSERT operations are not allowed for a request without credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth",
+            "Execution error: remote function 'remote_rows' needs write access, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth",
+        ] {
+            assert_eq!(
+                status_for_sql_error(message),
+                StatusCode::FORBIDDEN,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            status_for_sql_error("Error during planning: table 'nope' not found"),
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[test]
     fn redact_source_credentials_removes_userinfo() {

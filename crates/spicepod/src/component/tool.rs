@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
+use crate::component::access::AccessMode;
 use crate::component::function::Signature;
 use crate::metric::Metrics;
 
@@ -61,6 +62,17 @@ pub struct Tool {
     /// Ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
+
+    /// On a `from: mcp:` tool, what the server's tools may change: `read` (every tool only
+    /// reads, so callers without write access may call them) or `read_write` (the default).
+    /// Spice does not verify it. A built-in tool's access is fixed, so it does not take one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<AccessMode>,
+
+    /// On a `from: mcp:` tool with `access: read_write`, the server's tools that only read
+    /// anyway, by the names the server reports; `*` matches any run of characters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only_tools: Vec<String>,
 }
 
 impl Nameable for Tool {
@@ -81,6 +93,8 @@ impl WithDependsOn<Tool> for Tool {
             metrics: self.metrics.clone(),
             as_sql: self.as_sql,
             signature: self.signature.clone(),
+            access: self.access.clone(),
+            read_only_tools: self.read_only_tools.clone(),
         }
     }
 }
