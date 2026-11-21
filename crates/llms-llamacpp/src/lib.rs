@@ -93,6 +93,10 @@ use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 mod batching;
 mod distributed;
 mod harmony;
+mod inkling;
+mod reply;
+
+use reply::Reply;
 
 llms::register_local_chat_engine!(
     LLAMA_CPP,
@@ -240,8 +244,9 @@ pub struct LlamaCpp {
     model_name: String,
     template: Template,
     special: SpecialTokens,
-    /// The markers of the Harmony replies the template asks for, when it asks for them.
-    harmony: Option<harmony::Markers>,
+    /// The markers of the reply formats the templates write (Harmony, Inkling), which a reply
+    /// in one of them is read by.
+    formats: reply::Formats,
     reasoning_support: ReasoningSupport,
     /// Which shapes of a message's content each of the model's chat templates reads.
     content_support: ContentSupport,
@@ -273,8 +278,8 @@ struct Loaded {
     /// `general.architecture`, as the GGUF names it.
     architecture: Option<String>,
     special: SpecialTokens,
-    /// The Harmony markers, when the vocabulary holds them.
-    harmony: Option<harmony::Markers>,
+    /// The markers of each reply format the vocabulary holds.
+    formats: reply::Formats,
     /// The context llama.cpp created, in tokens: what one request can hold.
     context_window: u32,
     /// How many prompt tokens each request reads from the KV cache, as the thread sets it.
@@ -311,9 +316,9 @@ struct Job {
     reasoning: Option<TagReasoningContext>,
     /// Reads tool calls out of the content, when the request offers tools.
     tools: Option<ToolCallingMatcher>,
-    /// Reads a Harmony reply, which carries its reasoning, content and tool calls in its own
-    /// messages, in place of `reasoning` and `tools`.
-    harmony: Option<harmony::Reader>,
+    /// Reads a reply in a format read by its markers (Harmony, Inkling), which carries its
+    /// reasoning, content and tool calls in its own blocks, in place of `reasoning` and `tools`.
+    reply: Option<Reply>,
     /// Whether `tool_choice` requires a tool call, so a reply without one fails.
     require_tool_call: bool,
     /// Set when the decode thread is stopping, which ends the request.
@@ -382,7 +387,8 @@ impl LlamaCpp {
     /// # Errors
     ///
     /// When a weight file is missing, llama.cpp cannot load the model or its MTP head, the
-    /// model has no chat template or writes Harmony replies, or `reasoning_effort` is one
+    /// model has no chat template, or its template writes a reply format (Harmony, Inkling)
+    /// whose markers its vocabulary does not hold as single tokens, or `reasoning_effort` is one
     /// its chat template refuses, or `options` makes this node a rank other than 0 of a
     /// distributed model: such a rank serves no model of its own, and the engine's `load`
     /// returns the share it holds for the head instead.
@@ -482,7 +488,7 @@ impl LlamaCpp {
                     "the GGUF file carries no chat template, and the model sets no `chat_template`"
                         .into(),
             })?;
-        let harmony = check_reply_format(&template, loaded.architecture, loaded.harmony, file)?;
+        let formats = check_reply_format(&template, loaded.architecture, loaded.formats, file)?;
 
         let model_name = options.reasoning.model_name.to_string();
         let reasoning_support = {
@@ -546,7 +552,7 @@ impl LlamaCpp {
             model_name,
             template,
             special: loaded.special,
-            harmony,
+            formats,
             reasoning_support,
             content_support,
             counter: AtomicUsize::new(0),
@@ -652,13 +658,14 @@ impl LlamaCpp {
                 &obliged,
             )
         };
-        // Harmony is read only when the template this request renders with writes it: named
-        // templates may mix a Harmony one with one that is not.
-        let markers = request_markers(self.harmony, template);
-        // A required Harmony call has a grammar of its own (below); otherwise the content's
-        // grammar holds the reply.
-        let harmony_call_held = markers.is_some() && !obliged.is_empty();
-        let content = if harmony_call_held { None } else { content()? };
+        // A reply is read by a format's markers only when the template this request renders
+        // with writes that format: named templates may mix one that does with one that does
+        // not.
+        let format = self.formats.of(template);
+        // A required call in such a format has a grammar of its own (below); otherwise the
+        // content's grammar holds the reply.
+        let call_held = format.is_some() && !obliged.is_empty();
+        let content = if call_held { None } else { content()? };
         // Each choice reads its own reply, so each has its own reader.
         let matchers = (0..choices)
             .map(|_| {
@@ -678,37 +685,41 @@ impl LlamaCpp {
             .first()
             .and_then(Option::as_ref)
             .is_some_and(ToolCallingMatcher::requires_tool_call);
-        let ban_eog = require_tool_call && !harmony_call_held && content.is_none();
+        let ban_eog = require_tool_call && !call_held && content.is_none();
         let nameable = nameable_tools(&callable, &obliged);
         let held = if !obliged.is_empty() {
-            harmony::Held::Call
+            reply::Held::Call
         } else if content.is_some() {
-            harmony::Held::Reply
+            reply::Held::Reply
         } else {
-            harmony::Held::Nothing
+            reply::Held::Nothing
         };
         let prompt = self.prompt(&req.messages, reasoning, tools.clone(), true)?;
         // Every choice's reply starts where the prompt leaves it, so the prompt is read once,
         // from what the generation prompt adds after the conversation the template renders
-        // without it (`harmony::reply_text`).
-        let reader = markers.map(|markers| {
+        // without it (`harmony::reply_text`, `inkling::reply_text`).
+        let reader = format.map(|format| {
             let conversation = self
                 .prompt(&req.messages, reasoning, tools.clone(), false)
                 .ok();
-            harmony::Reader::new(markers, nameable, held).after(harmony::reply_text(
-                &markers,
-                &prompt,
-                conversation.as_deref(),
-            ))
+            format.reader(nameable, held, &prompt, conversation.as_deref())
         });
-        // A Harmony grammar holds the reply by the vocabulary's markers, from where the prompt
-        // leaves it.
+        // A grammar over a format's markers holds the whole reply by the vocabulary's markers,
+        // from where the prompt leaves it.
         let grammar = match &reader {
-            Some(reader) if harmony_call_held => {
+            Some(Reply::Harmony(reader)) if call_held => {
                 Some(harmony_call(reader.markers(), &obliged, reader.opened())?)
             }
-            Some(reader) => {
+            Some(Reply::Harmony(reader)) => {
                 content.map(|reply| harmony_reply(reader.markers(), &reply, reader.opened()))
+            }
+            Some(Reply::Inkling(reader)) if call_held => Some(inkling_call(
+                reader.markers(),
+                &obliged,
+                req.parallel_tool_calls.unwrap_or(true),
+            )?),
+            Some(Reply::Inkling(reader)) => {
+                content.map(|reply| inkling_reply(reader.markers(), &reply))
             }
             None => content,
         };
@@ -722,9 +733,10 @@ impl LlamaCpp {
         let mut receivers = Vec::with_capacity(choices);
         for tools in matchers {
             let (events, rx) = mpsc::channel(STREAM_BUFFER);
-            let harmony = reader.clone();
+            let reply = reader.clone();
             let job = Job {
-                reasoning: reasoning_parser(template, &prompt),
+                // A reply read by a format's markers carries its own reasoning and calls.
+                reasoning: reasoning_parser(template, &prompt).filter(|_| reply.is_none()),
                 prompt: prompt.clone(),
                 namespace: namespace.clone(),
                 limit: completion_limit(req),
@@ -739,8 +751,8 @@ impl LlamaCpp {
                     ban_eog,
                 },
                 stop: stop.clone(),
-                tools: tools.filter(|_| harmony.is_none()),
-                harmony,
+                tools: tools.filter(|_| reply.is_none()),
+                reply,
                 require_tool_call,
                 stopping: Arc::clone(&self.decoder.stopping),
                 events,
@@ -1153,7 +1165,7 @@ fn serve(
         template: model.chat_template(),
         architecture: model.architecture(),
         special,
-        harmony: harmony::Markers::find(vocab),
+        formats: reply::Formats::find(vocab),
         context_window,
         reused_prompt_tokens: Arc::clone(&cache.reused),
         prompt_ends_in_steps: Arc::clone(&cache.ends_in_steps),
@@ -1344,31 +1356,38 @@ fn load_error(path: &Path, error: llama_cpp::Error) -> ChatError {
     }
 }
 
-/// A Harmony reply (gpt-oss) is read token by token, by its markers, so a model whose chat
-/// template writes one is served only when its vocabulary holds every marker as one token, and
-/// refused otherwise rather than served with its channel markup in the content. Returns the
-/// markers a Harmony template's replies are read by.
+/// A Harmony reply (gpt-oss) or an Inkling reply is read token by token, by its format's
+/// markers, so a model whose chat template writes one is served only when its vocabulary
+/// holds every one of that format's markers as one token, and refused otherwise rather than
+/// served with the format's markup in the content. Returns the markers of the formats the
+/// templates write, which their replies are read by.
 fn check_reply_format(
     template: &Template,
     architecture: Option<String>,
-    markers: Option<harmony::Markers>,
+    found: reply::Formats,
     file: String,
-) -> Result<Option<harmony::Markers>> {
-    if !templates(template).any(is_harmony_template) {
-        return Ok(None);
-    }
-    markers
-        .map(Some)
-        .ok_or_else(|| ChatError::UnsupportedArchitecture {
-            architecture: architecture.unwrap_or_else(|| "gpt-oss".to_string()),
+) -> Result<reply::Formats> {
+    let writes = |format: fn(&str) -> bool| templates(template).any(format);
+    // Each format a template writes, with its markers if the vocabulary holds them.
+    let harmony = writes(is_harmony_template).then_some(found.harmony);
+    let inkling = writes(inkling::is_inkling_template).then_some(found.inkling);
+    // The architecture of the models that write a format whose markers the vocabulary lacks,
+    // which the error names when the GGUF names none.
+    let lacking = match (harmony, inkling) {
+        (Some(None), _) => Some("gpt-oss"),
+        (_, Some(None)) => Some("inkling2_loop"),
+        _ => None,
+    };
+    if let Some(writer) = lacking {
+        return Err(ChatError::UnsupportedArchitecture {
+            architecture: architecture.unwrap_or_else(|| writer.to_string()),
             file,
-        })
-}
-
-/// The markers a request's reply is read by: the model's, when the template the request renders
-/// with writes Harmony, and none for a template that does not.
-fn request_markers(markers: Option<harmony::Markers>, template: &str) -> Option<harmony::Markers> {
-    markers.filter(|_| is_harmony_template(template))
+        });
+    }
+    Ok(reply::Formats {
+        harmony: harmony.flatten(),
+        inkling: inkling.flatten(),
+    })
 }
 
 /// The file an error names: its name, or the whole path when it has none.
@@ -2164,7 +2183,7 @@ struct Output {
     produced: u32,
     reasoning: Option<TagReasoningContext>,
     tools: Option<ToolSplit>,
-    harmony: Option<harmony::Reader>,
+    reply: Option<Reply>,
     require_tool_call: bool,
     /// Whether tool calls were sent; nothing is sent after them.
     called: bool,
@@ -2185,7 +2204,7 @@ impl Output {
             produced: 0,
             reasoning: job.reasoning,
             tools: job.tools.map(ToolSplit::new),
-            harmony: job.harmony,
+            reply: job.reply,
             require_tool_call: job.require_tool_call,
             called: false,
             failure: None,
@@ -2198,23 +2217,23 @@ impl Output {
     /// The reply's text the prompt wrote, for the grammar to be advanced over before the reply
     /// goes on from where the prompt left it.
     fn pending(&self) -> &str {
-        self.harmony.as_ref().map_or("", harmony::Reader::pending)
+        self.reply.as_ref().map_or("", Reply::pending)
     }
 
     /// Starts the reply where the prompt left it when it `goes_on` from there, sending the
-    /// text the prompt began the opened message with first; otherwise from a header.
+    /// text the prompt began the opened block with first; otherwise afresh.
     fn begin(&mut self, goes_on: bool) {
-        if let Some(reader) = self.harmony.as_mut() {
+        if let Some(reader) = self.reply.as_mut() {
             let begun = reader.begin(goes_on);
             // A client that is gone is found at the next send, as it is for any other.
             self.route(&begun);
         }
     }
 
-    /// Whether generation has left any reasoning block, so `response_format` applies: in a
-    /// Harmony reply, whether it is in its final message.
+    /// Whether generation has left any reasoning block, so `response_format` applies. A reply
+    /// read by a format's markers is held to its grammar whole, reasoning included.
     fn in_content(&self) -> bool {
-        match &self.harmony {
+        match &self.reply {
             Some(reader) => reader.in_grammar(),
             None => !self
                 .reasoning
@@ -2226,7 +2245,7 @@ impl Output {
     /// The end-of-generation tokens a required tool call rules out: all of `eog` but the one
     /// that ends a Harmony reply with a call.
     fn ruled_out(&self, eog: &[Token]) -> Vec<Token> {
-        let call = self.harmony.as_ref().map(|reader| reader.markers().call());
+        let call = self.reply.as_ref().and_then(Reply::ends_with_call);
         eog.iter().copied().filter(|&t| Some(t) != call).collect()
     }
 
@@ -2250,10 +2269,10 @@ impl Output {
             self.failure = Some(DECODE_STOPPED.to_string());
             return Some(FinishReason::Stop);
         }
-        // A Harmony marker is read before anything else, because two of them end generation
-        // and one of those completes a tool call.
+        // A format's marker is read before anything else, because some of them end generation
+        // and may make tool calls.
         if self
-            .harmony
+            .reply
             .as_ref()
             .is_some_and(|r| r.marks(token, self.stops.held()))
         {
@@ -2264,34 +2283,35 @@ impl Output {
         }
         self.produced += 1;
         let piece = piece();
-        if let Some(reader) = self.harmony.as_mut()
+        if let Some(reader) = self.reply.as_mut()
             && reader.in_header()
         {
-            // A header names a channel and a recipient, which no stop sequence applies to.
+            // A header names a channel and a recipient, or a block, which no stop sequence
+            // applies to.
             reader.text(&String::from_utf8_lossy(&piece));
             return self.spent();
         }
         self.bytes(&piece)
     }
 
-    /// Reads a Harmony marker, which ends generation when `eog`.
+    /// Reads a format's marker, which ends generation when `eog`.
     fn mark(&mut self, token: Token, eog: bool) -> Option<FinishReason> {
-        // What the stop matcher and the character assembly still hold belongs to the message
-        // the marker closes.
+        // What the stop matcher and the character assembly still hold belongs to the block the
+        // marker closes.
         let mut held = self.stops.finish();
         held.push_str(&String::from_utf8_lossy(&std::mem::take(&mut self.pending)));
         if let Some(finish) = self.route(&held) {
             return Some(finish);
         }
-        let reader = self.harmony.as_mut()?;
+        let reader = self.reply.as_mut()?;
         // A marker that does not end generation is a completion token, whatever it does.
         if !eog {
             self.produced += 1;
         }
         match reader.mark(token) {
-            harmony::Mark::Next => self.spent(),
-            harmony::Mark::Call(call) => Some(self.calls(None, vec![call])),
-            harmony::Mark::Done => Some(FinishReason::Stop),
+            reply::Mark::Next => self.spent(),
+            reply::Mark::Calls(calls) => Some(self.calls(None, calls)),
+            reply::Mark::Done => Some(FinishReason::Stop),
         }
     }
 
@@ -2332,13 +2352,13 @@ impl Output {
         if self.called || text.is_empty() {
             return None;
         }
-        if let Some(reader) = self.harmony.as_mut() {
+        if let Some(reader) = self.reply.as_mut() {
             return match reader.text(text) {
-                harmony::Text::Reasoning => {
+                reply::Text::Reasoning => {
                     (!self.send(Event::Reasoning(text.to_string()))).then_some(FinishReason::Stop)
                 }
-                harmony::Text::Content => self.content(text.to_string()),
-                harmony::Text::Held => None,
+                reply::Text::Content => self.content(text.to_string()),
+                reply::Text::Held => None,
             };
         }
         let (reasoning, content) = match self.reasoning.as_mut() {
@@ -2410,9 +2430,13 @@ impl Output {
         }
         if !self.called
             && self.failure.is_none()
-            && let Some(call) = self.harmony.as_mut().and_then(harmony::Reader::finish)
+            && let Some(calls) = self
+                .reply
+                .as_mut()
+                .map(Reply::finish)
+                .filter(|calls| !calls.is_empty())
         {
-            finish = self.calls(None, vec![call]);
+            finish = self.calls(None, calls);
         }
         if !self.called
             && let Some(parser) = self.reasoning.as_mut()
@@ -2873,8 +2897,8 @@ fn callable_tools<'t>(choice: Option<&ToolChoice>, tools: &'t [Tool]) -> Vec<&'t
     }
 }
 
-/// The names a Harmony reply's call may take: the tools `tool_choice` obliges a call to, when
-/// it obliges one, as a named choice does; otherwise the callable ones.
+/// The names a call in a reply read by a format's markers may take: the tools `tool_choice`
+/// obliges a call to, when it obliges one, as a named choice does; otherwise the callable ones.
 fn nameable_tools(callable: &[&Tool], obliged: &[&Tool]) -> Vec<String> {
     let tools = if obliged.is_empty() {
         callable
@@ -3028,6 +3052,62 @@ fn harmony_rules(markers: &harmony::Markers) -> String {
     // The text between markers holds no `<|`, so it cannot spell one either.
     rules.push_str("reasoning ::= ([^<] | \"<\" [^|])*\n");
     let _ = writeln!(rules, "constrain ::= \" \" {constrain}? [A-Za-z0-9_-]+");
+    rules
+}
+
+/// The grammar of a whole Inkling reply that must call one of `tools`: any thinking and text
+/// blocks, then a call block, or several when `parallel`, each naming its tool in its header
+/// and holding `{"name":NAME,"args":ARGS}` with the arguments held to the tool's schema, as
+/// llama.cpp's server forces one. Each marker is its token, never text spelling it. After a
+/// call's `<|end_message|>` the grammar may be complete, which is when the end-of-generation
+/// token that ends the reply is allowed.
+fn inkling_call(
+    markers: &inkling::Markers,
+    tools: &[&Tool],
+    parallel: bool,
+) -> std::result::Result<String, OpenAIError> {
+    let [header, _, text, call, end] = markers.terminals();
+    let mut grammar = inkling_rules(markers);
+    let _ = writeln!(grammar, "text ::= {header} {text} body {end}");
+    let mut calls = Vec::with_capacity(tools.len());
+    for (i, tool) in tools.iter().enumerate() {
+        let prefix = format!("tool{i}-");
+        let arguments = json_grammar(&arguments_schema(tool), "tools")?;
+        grammar.push_str(&prefix_rules(&arguments, &prefix));
+        // The name, and the wrapper's opening `{"name":NAME,"args":`, as GBNF literals.
+        let name = serde_json::Value::String(tool.function.name.clone());
+        let open = serde_json::Value::String(format!("{{\"name\":{name},\"args\":"));
+        calls.push(format!("{name} {call} {open} {prefix}root \"}}\" {end}"));
+    }
+    let _ = writeln!(grammar, "call ::= {header} ({})", calls.join(" | "));
+    let more = if parallel { " call*" } else { "" };
+    let _ = writeln!(grammar, "root ::= (thinking | text)* call{more}");
+    Ok(grammar)
+}
+
+/// The grammar of a whole Inkling reply held to a `response_format`: thinking blocks, then one
+/// text block whose body is `reply`'s JSON, as llama.cpp's server holds one. Any other text
+/// would be content outside the schema. After the text block's `<|end_message|>` the grammar
+/// is complete, so only the end-of-generation token that ends the reply is left.
+fn inkling_reply(markers: &inkling::Markers, reply: &str) -> String {
+    let [header, _, text, _, end] = markers.terminals();
+    let mut grammar = inkling_rules(markers);
+    grammar.push_str(&prefix_rules(reply, "reply-"));
+    let _ = writeln!(
+        grammar,
+        "root ::= thinking* {header} {text} reply-root {end}"
+    );
+    grammar
+}
+
+/// The rules both Inkling grammars share: a thinking block after its header, and the body of a
+/// block that holds text.
+fn inkling_rules(markers: &inkling::Markers) -> String {
+    let [header, thinking, _, _, end] = markers.terminals();
+    let mut rules = String::new();
+    let _ = writeln!(rules, "thinking ::= {header} {thinking} body {end}");
+    // The text between markers holds no `<|`, so it cannot spell one either.
+    rules.push_str("body ::= ([^<] | \"<\" [^|])*\n");
     rules
 }
 
@@ -3387,7 +3467,7 @@ mod tests {
             reasoning,
             require_tool_call: matcher.requires_tool_call(),
             tools: Some(matcher),
-            harmony: None,
+            reply: None,
             stopping: Arc::default(),
             events,
         };
@@ -3718,7 +3798,7 @@ mod tests {
             stop: Vec::new(),
             reasoning: reasoning_parser(template, prompt),
             tools: None,
-            harmony: None,
+            reply: None,
             require_tool_call: false,
             stopping: Arc::default(),
             events,
@@ -3799,18 +3879,23 @@ mod tests {
 
     const HARMONY: &str = "{{ '<|start|>assistant<|channel|>final<|message|>' }}{{ '<|end|>' }}";
     const HARMONY_MARKERS: harmony::Markers = harmony::TEST_MARKERS;
+    /// The formats of a vocabulary that holds Harmony's markers alone.
+    const HARMONY_FORMATS: reply::Formats = reply::Formats {
+        harmony: Some(HARMONY_MARKERS),
+        inkling: None,
+    };
 
     /// Named templates may mix a Harmony template with one that is not: a request rendered
     /// with the other reads its reply as text, which a Harmony reader would hold as a header.
     #[test]
     fn only_a_request_whose_template_writes_harmony_reads_harmony() {
         assert_eq!(
-            request_markers(Some(HARMONY_MARKERS), HARMONY),
-            Some(HARMONY_MARKERS)
+            HARMONY_FORMATS.of(HARMONY),
+            Some(reply::Format::Harmony(HARMONY_MARKERS))
         );
         let chatml = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{% endfor %}";
-        assert_eq!(request_markers(Some(HARMONY_MARKERS), chatml), None);
-        assert_eq!(request_markers(None, HARMONY), None);
+        assert_eq!(HARMONY_FORMATS.of(chatml), None);
+        assert_eq!(reply::Formats::default().of(HARMONY), None);
     }
 
     /// An `Output` reading a Harmony reply that may call `tools`, with `stop` sequences and a
@@ -3830,11 +3915,11 @@ mod tests {
             stop: stop.iter().map(ToString::to_string).collect(),
             reasoning: None,
             tools: None,
-            harmony: Some(harmony::Reader::new(
+            reply: Some(Reply::Harmony(harmony::Reader::new(
                 HARMONY_MARKERS,
                 tools,
-                harmony::Held::Nothing,
-            )),
+                reply::Held::Nothing,
+            ))),
             require_tool_call: false,
             stopping: Arc::default(),
             events,
@@ -3919,7 +4004,7 @@ mod tests {
             model_name: "gpt-oss".to_string(),
             template: Either::Left(template),
             special: SpecialTokens::default(),
-            harmony: Some(HARMONY_MARKERS),
+            formats: HARMONY_FORMATS,
             reasoning_support: ReasoningSupport::default(),
             content_support: ContentSupport::default(),
             counter: AtomicUsize::new(0),
@@ -4396,11 +4481,11 @@ mod tests {
             stop: Vec::new(),
             reasoning: None,
             tools: None,
-            harmony: Some(harmony::Reader::new(
+            reply: Some(Reply::Harmony(harmony::Reader::new(
                 HARMONY_MARKERS,
                 nameable_tools(&[&f, &g], &[&f]),
-                harmony::Held::Nothing,
-            )),
+                reply::Held::Nothing,
+            ))),
             require_tool_call: true,
             stopping: Arc::default(),
             events,
@@ -4503,7 +4588,7 @@ mod tests {
         let refused = check_reply_format(
             &Either::Left(HARMONY.to_string()),
             Some("gpt-oss".to_string()),
-            None,
+            reply::Formats::default(),
             "gpt-oss-20b-mxfp4.gguf".to_string(),
         )
         .expect_err("a Harmony template without its markers is refused");
@@ -4516,27 +4601,27 @@ mod tests {
             check_reply_format(
                 &Either::Left(HARMONY.to_string()),
                 Some("gpt-oss".to_string()),
-                Some(HARMONY_MARKERS),
+                HARMONY_FORMATS,
                 "gpt-oss-20b-mxfp4.gguf".to_string(),
             )
             .expect("a Harmony template with its markers"),
-            Some(HARMONY_MARKERS)
+            HARMONY_FORMATS
         );
         assert_eq!(
             check_reply_format(
                 &Either::Left(THINKS.to_string()),
                 None,
-                Some(HARMONY_MARKERS),
+                HARMONY_FORMATS,
                 "qwen.gguf".to_string(),
             )
             .expect("a think-tag template"),
-            None,
+            reply::Formats::default(),
             "only a Harmony template's replies are read by the markers"
         );
         check_reply_format(
             &Either::Left(GEMMA4.to_string()),
             None,
-            None,
+            reply::Formats::default(),
             "gemma.gguf".to_string(),
         )
         .expect("a Gemma 4 template");
@@ -4576,7 +4661,12 @@ mod tests {
             entry(&[("name", "tool_use"), ("template", HARMONY)]),
         ]);
         assert!(matches!(
-            check_reply_format(&harmony, None, None, "gpt-oss.gguf".to_string()),
+            check_reply_format(
+                &harmony,
+                None,
+                reply::Formats::default(),
+                "gpt-oss.gguf".to_string()
+            ),
             Err(ChatError::UnsupportedArchitecture { .. })
         ));
     }
@@ -4662,7 +4752,7 @@ mod tests {
             stop: vec!["STOP".to_string()],
             reasoning: None,
             tools: None,
-            harmony: None,
+            reply: None,
             require_tool_call: false,
             stopping: Arc::default(),
             events,
@@ -4768,5 +4858,531 @@ mod tests {
         assert_eq!(count(Some(128)), Ok(128));
         assert_eq!(count(Some(0)), refused);
         assert_eq!(count(Some(129)), refused);
+    }
+
+    /// An Inkling chat template: the model's blocks, each closed by `<|end_message|>`, an
+    /// assistant's calls as call blocks whose arguments the template requires to be an object
+    /// (it raises on a string, as Inkling's own does), and no generation prompt, so the prompt
+    /// ends after the last message.
+    const INKLING: &str = r#"{%- set role_token = {"user": "<|message_user|>", "assistant": "<|message_model|>", "system": "<|message_system|>", "tool": "<|message_tool|>"} -%}
+{%- if tools -%}<|message_system|>tool_declare<|content_xml|>{{ tools | tojson }}<|end_message|>{%- endif -%}
+{%- for message in messages -%}
+{%- if message.content is string and message.content -%}{{ role_token[message.role] }}<|content_text|>{{ message.content }}<|end_message|>{%- endif -%}
+{%- if message.content is not string -%}{{ role_token[message.role] }}<|content_image|><|end_message|>{%- endif -%}
+{%- if message.role == "assistant" -%}
+{%- for tc in message.tool_calls or [] -%}
+{%- set args = tc.function.arguments -%}
+{%- if args is string -%}{{ raise_exception("tool call arguments must be a parsed object, not a JSON string; canonicalize upstream") }}{%- endif -%}
+<|message_model|>{{ tc.function.name }}<|content_invoke_tool_json|>{"name":{{ tc.function.name | tojson }},"args":{
+{%- for key, value in args | dictsort -%}{{ key | tojson }}:{{ value | tojson }}{%- if not loop.last -%},{%- endif -%}{%- endfor -%}
+}}<|end_message|>
+{%- endfor -%}
+<|content_model_end_sampling|>
+{%- endif -%}
+{%- endfor -%}"#;
+    const INKLING_MARKERS: inkling::Markers = inkling::TEST_MARKERS;
+    /// The formats of a vocabulary that holds Inkling's markers alone.
+    const INKLING_FORMATS: reply::Formats = reply::Formats {
+        harmony: None,
+        inkling: Some(INKLING_MARKERS),
+    };
+
+    /// Named templates may mix an Inkling template with one that is not: a request rendered
+    /// with the other reads its reply as text.
+    #[test]
+    fn only_a_request_whose_template_writes_inkling_reads_inkling() {
+        assert_eq!(
+            INKLING_FORMATS.of(INKLING),
+            Some(reply::Format::Inkling(INKLING_MARKERS))
+        );
+        assert_eq!(INKLING_FORMATS.of(THINKS), None);
+        assert_eq!(INKLING_FORMATS.of(HARMONY), None);
+        assert_eq!(HARMONY_FORMATS.of(INKLING), None);
+    }
+
+    #[test]
+    fn an_inkling_model_is_refused_only_when_its_vocabulary_lacks_the_markers() {
+        let check = |template: &str, found: reply::Formats| {
+            check_reply_format(
+                &Either::Left(template.to_string()),
+                Some("inkling2_loop".to_string()),
+                found,
+                "inkling-2-mini.gguf".to_string(),
+            )
+        };
+        for found in [reply::Formats::default(), HARMONY_FORMATS] {
+            assert_eq!(
+                check(INKLING, found)
+                    .expect_err("an Inkling template without its markers is refused")
+                    .to_string(),
+                "Architecture 'inkling2_loop' in inkling-2-mini.gguf is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+            );
+        }
+        assert_eq!(
+            check(INKLING, INKLING_FORMATS).expect("an Inkling template with its markers"),
+            INKLING_FORMATS
+        );
+        assert_eq!(
+            check(THINKS, INKLING_FORMATS).expect("a think-tag template"),
+            reply::Formats::default(),
+            "only an Inkling template's replies are read by the markers"
+        );
+    }
+
+    /// An `Output` reading an Inkling reply that may call `tools`, with `stop` sequences and a
+    /// token `limit`, and what it sends.
+    fn inkling_output(
+        tools: &[&str],
+        stop: &[&str],
+        limit: Option<usize>,
+    ) -> (Output, mpsc::Receiver<Event>) {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let tools = tools.iter().map(ToString::to_string).collect();
+        let job = Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit,
+            sampling: Sampling::default(),
+            stop: stop.iter().map(ToString::to_string).collect(),
+            reasoning: None,
+            tools: None,
+            reply: Some(Reply::Inkling(inkling::Reader::new(
+                INKLING_MARKERS,
+                tools,
+                reply::Held::Nothing,
+            ))),
+            require_tool_call: false,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, out) = Output::new(job);
+        (out, rx)
+    }
+
+    /// Generates `reply`: each marker as its token, which ends generation if it is
+    /// `<|content_model_end_sampling|>`, and other text a character per token. Returns why
+    /// generation ended, and after how many tokens.
+    fn generate_inkling(out: &mut Output, reply: &str) -> (Option<FinishReason>, usize) {
+        let ending = Token(18);
+        let mut tokens = Vec::new();
+        for (marker, text) in inkling::spell(reply) {
+            match marker {
+                Some(token) => tokens.push((token, text)),
+                None => tokens.extend(text.chars().map(|c| (Token(100), c.to_string()))),
+            }
+        }
+        for (n, (token, text)) in tokens.into_iter().enumerate() {
+            if let Some(finish) = out.read(token, token == ending, || text.into_bytes()) {
+                return (Some(finish), n + 1);
+            }
+        }
+        (None, 0)
+    }
+
+    /// What the output sent, an event at a time: `r:` reasoning, `c:` content, and the calls
+    /// of one `t:` event.
+    fn events(mut rx: mpsc::Receiver<Event>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(match event {
+                Event::Reasoning(text) => format!("r:{text}"),
+                Event::Content(text) => format!("c:{text}"),
+                Event::ToolCalls(calls) => format!(
+                    "t:{}",
+                    calls
+                        .iter()
+                        .map(|c| format!("{}({})", c.function.name, c.function.arguments))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+                Event::Done(_) | Event::Failed(_) => continue,
+            });
+        }
+        joined(out)
+    }
+
+    #[test]
+    fn an_inkling_reply_sends_its_reasoning_then_its_answer() {
+        let (mut out, rx) = inkling_output(&[], &[], None);
+        let reply = "<|message_model|><|content_thinking|>Add them.<|end_message|><|message_model|><|content_text|>2 + 2 = 4<|end_message|><|content_model_end_sampling|>";
+        let (finish, n) = generate_inkling(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        let outcome = out
+            .finish(FinishReason::Stop, 9)
+            .expect("the request succeeds");
+        // every token but the `<|content_model_end_sampling|>` that ends the reply
+        assert_eq!(outcome.completion_tokens as usize, n - 1);
+        assert_eq!(
+            events(rx),
+            ["r:Add them.".to_string(), "c:2 + 2 = 4".to_string()]
+        );
+    }
+
+    /// A call block does not end an Inkling reply: the reply's calls go out together, in one
+    /// event, when it ends.
+    #[test]
+    fn inkling_calls_go_out_together_when_the_reply_ends() {
+        let (mut out, rx) = inkling_output(&["get_weather", "get_time"], &[], None);
+        let reply = "<|message_model|><|content_thinking|>Look both up.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{}}<|end_message|><|content_model_end_sampling|>";
+        let (finish, n) = generate_inkling(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 9)
+            .expect("the request succeeds");
+        assert_eq!(
+            (outcome.finish, outcome.completion_tokens as usize),
+            (FinishReason::ToolCalls, n - 1)
+        );
+        assert_eq!(
+            events(rx),
+            [
+                "r:Look both up.".to_string(),
+                "t:get_weather({\"city\":\"Paris\"}) get_time({})".to_string()
+            ]
+        );
+    }
+
+    /// A reply cut off by the token budget makes the calls it made, and the one whose JSON is
+    /// complete though its `<|end_message|>` never came.
+    #[test]
+    fn an_inkling_call_cut_off_after_complete_json_is_still_made() {
+        // `<|message_model|>`, `f`, `<|content_invoke_tool_json|>` and the 22 characters of
+        // `{"name":"f","args":{}}`
+        let (mut out, rx) = inkling_output(&["f"], &[], Some(25));
+        let reply = "<|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{}}<|end_message|><|content_model_end_sampling|>";
+        assert_eq!(
+            generate_inkling(&mut out, reply),
+            (Some(FinishReason::Length), 25)
+        );
+        let outcome = out
+            .finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(events(rx), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn an_inkling_reply_counts_its_markers_against_the_budget() {
+        // `<|message_model|>` and `<|content_text|>` leave two of four
+        let (mut out, rx) = inkling_output(&[], &[], Some(4));
+        let reply =
+            "<|message_model|><|content_text|>abcdef<|end_message|><|content_model_end_sampling|>";
+        assert_eq!(
+            generate_inkling(&mut out, reply),
+            (Some(FinishReason::Length), 4)
+        );
+        out.finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(events(rx), ["c:ab".to_string()]);
+    }
+
+    #[test]
+    fn a_stop_sequence_applies_to_an_inkling_body_but_not_its_header() {
+        let (mut out, rx) = inkling_output(&[], &["final"], None);
+        let reply = "<|message_model|><|content_thinking|>r<|end_message|><|message_model|>final<|content_text|>the final word<|end_message|><|content_model_end_sampling|>";
+        let (finish, _) = generate_inkling(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(events(rx), ["r:r".to_string(), "c:the ".to_string()]);
+    }
+
+    #[test]
+    fn text_a_stop_sequence_holds_back_goes_out_before_the_next_inkling_block() {
+        // `x` may start the stop sequence, so it is held until the marker closes its block
+        let (mut out, rx) = inkling_output(&[], &["xyz"], None);
+        let reply = "<|message_model|><|content_thinking|>abx<|end_message|><|message_model|><|content_text|>c<|end_message|><|content_model_end_sampling|>";
+        generate_inkling(&mut out, reply);
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(events(rx), ["r:abx".to_string(), "c:c".to_string()]);
+    }
+
+    /// A call to a tool other than the one `tool_choice` names is dropped, so a required call
+    /// is not made.
+    #[test]
+    fn a_required_inkling_call_to_another_tool_fails_the_request() {
+        let (events, _rx) = mpsc::channel(STREAM_BUFFER);
+        let (_, _, mut output) = Output::new(Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit: None,
+            sampling: Sampling::default(),
+            stop: Vec::new(),
+            reasoning: None,
+            tools: None,
+            reply: Some(Reply::Inkling(inkling::Reader::new(
+                INKLING_MARKERS,
+                vec!["f".to_string()],
+                reply::Held::Nothing,
+            ))),
+            require_tool_call: true,
+            stopping: Arc::default(),
+            events,
+        });
+        let reply = "<|message_model|>g<|content_invoke_tool_json|>{\"name\":\"g\",\"args\":{}}<|end_message|><|content_model_end_sampling|>";
+        assert_eq!(
+            generate_inkling(&mut output, reply).0,
+            Some(FinishReason::Stop)
+        );
+        assert_eq!(
+            output.finish(FinishReason::Stop, 1).map(|o| o.finish),
+            Err("Tool choice was required but no tools were called.".to_string())
+        );
+    }
+
+    /// An Inkling reply makes its calls at the end-of-generation token that ends any reply, so
+    /// none is left possible beside the others; a required call's grammar holds it instead.
+    #[test]
+    fn an_inkling_reply_leaves_no_end_of_generation_token_for_its_calls() {
+        let (out, _rx) = inkling_output(&["f"], &[], None);
+        assert_eq!(
+            out.ruled_out(&[Token(18), Token(99)]),
+            [Token(18), Token(99)]
+        );
+    }
+
+    #[test]
+    fn a_required_inkling_call_is_forced_by_a_grammar_over_the_whole_reply() {
+        let tool = weather_tool();
+        let grammar =
+            inkling_call(&INKLING_MARKERS, &[&tool], true).expect("the tool's schema converts");
+        // the test vocabulary's markers are tokens 11 to 18, matched as tokens
+        assert!(
+            grammar.ends_with("root ::= (thinking | text)* call call*\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.starts_with("thinking ::= <[11]> <[12]> body <[17]>\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("\ntext ::= <[11]> <[13]> body <[17]>\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains(
+                "\ncall ::= <[11]> (\"get_weather\" <[14]> \"{\\\"name\\\":\\\"get_weather\\\",\\\"args\\\":\" tool0-root \"}\" <[17]>)\n"
+            ),
+            "{grammar}"
+        );
+        assert!(
+            !grammar.contains("<|"),
+            "no marker is written as text: {grammar}"
+        );
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+        // one call only, when the request asks for no parallel calls
+        let single = inkling_call(&INKLING_MARKERS, &[&tool], false).expect("one call");
+        assert!(
+            single.ends_with("root ::= (thinking | text)* call\n"),
+            "{single}"
+        );
+    }
+
+    #[test]
+    fn a_structured_inkling_reply_is_held_to_one_text_block() {
+        let reply = content_grammar("m", INKLING, Some(&answer_schema()), &[], &[])
+            .expect("the schema converts")
+            .expect("a json_schema format has a grammar");
+        let grammar = inkling_reply(&INKLING_MARKERS, &reply);
+        // thinking blocks, then one text block: no other text, which would be content outside
+        // the schema
+        assert!(
+            grammar.ends_with("root ::= thinking* <[11]> <[13]> reply-root <[17]>\n"),
+            "{grammar}"
+        );
+        assert!(!grammar.contains("\ntext ::="), "{grammar}");
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+    }
+
+    /// The engine serving an Inkling `template`, and the job it queues for a request with the
+    /// fields `request` sets (a question about France's capital, by default), and what that
+    /// job sends; or why the request is refused.
+    fn inkling_job(
+        template: &str,
+        request: serde_json::Value,
+    ) -> std::result::Result<(LlamaCpp, String, Sampling, Output, mpsc::Receiver<Event>), OpenAIError>
+    {
+        let (jobs, queued) = std_mpsc::channel();
+        let llama = LlamaCpp {
+            decoder: DecodeThread {
+                model: "inkling".to_string(),
+                jobs: Some(jobs),
+                stopping: Arc::default(),
+                freed: None,
+            },
+            model_name: "inkling".to_string(),
+            template: Either::Left(template.to_string()),
+            special: SpecialTokens::default(),
+            formats: INKLING_FORMATS,
+            reasoning_support: ReasoningSupport::default(),
+            content_support: ContentSupport::default(),
+            counter: AtomicUsize::new(0),
+            context_window: 0,
+            reused_prompt_tokens: Arc::default(),
+            prompt_ends_in_steps: Arc::default(),
+        };
+        let mut req = serde_json::json!({
+            "model": "inkling",
+            "messages": [{ "role": "user", "content": "What is the capital of France?" }],
+        });
+        if let (Some(req), serde_json::Value::Object(fields)) = (req.as_object_mut(), request) {
+            req.extend(fields);
+        }
+        let req: CreateChatCompletionRequest = serde_json::from_value(req).expect("a request");
+        let receivers = llama.submit(&req, &CacheNamespace::Public)?;
+        let rx = receivers.into_iter().next().expect("one choice");
+        let (prompt, sampling, out) = Output::new(queued.try_recv().expect("its job"));
+        Ok((llama, prompt, sampling, out, rx))
+    }
+
+    fn weather_tools(tool_choice: &str) -> serde_json::Value {
+        serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"],
+                    },
+                },
+            }],
+            "tool_choice": tool_choice,
+        })
+    }
+
+    /// Inkling's template has no generation prompt, so the reply starts between blocks, with
+    /// nothing for a grammar to be advanced over: a plain reply, a call, a required call and
+    /// a structured reply are each read from there, and held by their grammars from the root.
+    #[test]
+    fn an_inkling_reply_is_read_from_the_end_of_a_prompt_with_no_generation_prompt() {
+        let call = "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|content_model_end_sampling|>";
+        let mut not_parallel = weather_tools("required");
+        not_parallel["parallel_tool_calls"] = serde_json::json!(false);
+        let cases = [
+            (
+                serde_json::json!({}),
+                "<|message_model|><|content_thinking|>Recall it.<|end_message|><|message_model|><|content_text|>Paris<|end_message|><|content_model_end_sampling|>".to_string(),
+            ),
+            (weather_tools("auto"), call.to_string()),
+            (weather_tools("required"), call.to_string()),
+            (not_parallel, call.to_string()),
+            (
+                serde_json::json!({ "response_format": { "type": "json_object" } }),
+                "<|message_model|><|content_text|>{\"capital\":\"Paris\"}<|end_message|><|content_model_end_sampling|>".to_string(),
+            ),
+        ];
+        let read: Vec<_> = cases
+            .into_iter()
+            .map(|(request, reply)| {
+                let (_llama, prompt, sampling, mut out, rx) =
+                    inkling_job(INKLING, request).expect("the request is queued");
+                assert!(
+                    prompt.ends_with("<|message_user|><|content_text|>What is the capital of France?<|end_message|>"),
+                    "the prompt ends after the last message: {prompt:?}"
+                );
+                assert_eq!(out.pending(), "");
+                out.begin(true);
+                let root = sampling.grammar.as_deref().and_then(|grammar| {
+                    grammar
+                        .lines()
+                        .find_map(|line| line.strip_prefix("root ::= "))
+                        .map(ToString::to_string)
+                });
+                let finish = generate_inkling(&mut out, &reply)
+                    .0
+                    .expect("the reply ends at `<|content_model_end_sampling|>`");
+                let outcome = out.finish(finish, 1).expect("the request succeeds");
+                (events(rx), outcome.finish, root, sampling.ban_eog)
+            })
+            .collect();
+        let called = || vec!["t:get_weather({\"city\":\"Paris\"})".to_string()];
+        assert_eq!(
+            read,
+            [
+                (
+                    vec!["r:Recall it.".to_string(), "c:Paris".to_string()],
+                    FinishReason::Stop,
+                    None,
+                    false
+                ),
+                (called(), FinishReason::ToolCalls, None, false),
+                (
+                    called(),
+                    FinishReason::ToolCalls,
+                    Some("(thinking | text)* call call*".to_string()),
+                    false
+                ),
+                (
+                    called(),
+                    FinishReason::ToolCalls,
+                    Some("(thinking | text)* call".to_string()),
+                    false
+                ),
+                (
+                    vec!["c:{\"capital\":\"Paris\"}".to_string()],
+                    FinishReason::Stop,
+                    Some("thinking* <[11]> <[13]> reply-root <[17]>".to_string()),
+                    false
+                ),
+            ]
+        );
+    }
+
+    /// A structured reply beside tools needs a grammar that allows either, which no tool-call
+    /// format but tagged calls has here, so it is refused rather than left unenforced.
+    #[test]
+    fn an_inkling_request_for_a_structured_reply_beside_tools_is_refused() {
+        let mut request = weather_tools("auto");
+        request["response_format"] = serde_json::json!({ "type": "json_object" });
+        let refused = inkling_job(INKLING, request).map(|_| ());
+        assert!(
+            matches!(
+                &refused,
+                Err(OpenAIError::InvalidArgument(message))
+                    if message == "Model 'inkling' can't combine a `json_schema` or `json_object` `response_format` with `tools`: its chat template's tool-call format can't be enforced alongside a schema. Send one or the other."
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// An assistant's earlier call reaches an Inkling template with its arguments as an object,
+    /// which the template requires: the request carries them as `OpenAI`'s JSON string.
+    #[test]
+    fn an_inkling_prompt_renders_an_earlier_calls_arguments_as_an_object() {
+        let request = |arguments: &str| {
+            let mut request = weather_tools("auto");
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "Weather in Paris?" },
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": arguments },
+                    }],
+                },
+                { "role": "tool", "tool_call_id": "call-1", "content": "21C" },
+            ]);
+            request
+        };
+        let (_llama, prompt, ..) =
+            inkling_job(INKLING, request("{\"unit\":\"c\",\"city\":\"Paris\"}"))
+                .expect("the request is queued");
+        assert!(
+            prompt.contains("<|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"unit\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|><|content_text|>21C<|end_message|>"),
+            "{prompt:?}"
+        );
     }
 }
