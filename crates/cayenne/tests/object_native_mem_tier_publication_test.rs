@@ -690,10 +690,10 @@ async fn seal_over_current_snapshot_then_restart(native: bool) -> Vec<(i64, i64)
         "before the rewrite"
     );
     // Fold the write's protected snapshot into a new current snapshot.
-    table
-        .sort_and_rewrite_data(64 << 20)
-        .await
-        .expect("rewrite");
+    assert!(
+        table.force_full_compaction().await.expect("rewrite"),
+        "the full compaction must commit"
+    );
     let protected = table
         .catalog()
         .get_all_snapshot_sequences(table.table_id())

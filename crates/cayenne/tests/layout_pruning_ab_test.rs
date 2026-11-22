@@ -68,14 +68,12 @@ use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionContext, col, lit};
 
+/// Rows loaded per arm. With the smallest configurable target file size (1 MB,
+/// set in [`build_table`]) this spans several files: pruning is a per-file
+/// zone-map property, so a table that fits in one file has no pruning to
+/// measure at all. Production uses 256 MB with tables far larger than one file;
+/// a small target with fewer rows is the scale-invariant proxy for that ratio.
 const ROWS: usize = 250_000;
-/// Target Vortex file size for the rewrite. Deliberately small so the table
-/// spans MANY files: pruning is a per-file zone-map property, so a table that
-/// fits in one file has no pruning to measure at all (the first run of this test
-/// reported `files_scanned=1` in both arms for exactly that reason). Production
-/// uses 256 MB with tables far larger than one file; a small target with fewer
-/// rows is the scale-invariant proxy for that ratio.
-const TARGET_FILE_BYTES: usize = 128 * 1024;
 /// ~7 years of ship dates, as days-since-epoch offsets — the TPC-H window.
 const DATE_SPAN_DAYS: i32 = 2557;
 /// Selective probe window, ~1.2% of the span — the TPC-H q14 shape (one month).
@@ -353,14 +351,17 @@ async fn run_arm(origin: SortColumnsOrigin, table_name: &str) -> ArmResult {
 
     let chosen = provider.effective_sort_columns_for_rewrite();
 
-    // Force the sorted rewrite directly. Under sustained query load the background
+    // Run the full compaction now. Under sustained query load the background
     // compactor never reaches the full-rewrite path (protected snapshots keep the
-    // protected-subset path winning), so calling it here is what makes the layout
+    // protected-subset path winning), so forcing it here is what makes the layout
     // observable at all — see the bench recipe.
-    provider
-        .sort_and_rewrite_data(TARGET_FILE_BYTES)
-        .await
-        .expect("sort_and_rewrite");
+    assert!(
+        provider
+            .force_full_compaction()
+            .await
+            .expect("full compaction"),
+        "the full compaction must commit"
+    );
 
     let file_ranges = file_shipdate_ranges(&fixture, &provider).await;
     let (files_scanned, matching_rows) = probe(&provider, table_name).await;
@@ -436,7 +437,7 @@ async fn pruning_ab_inferred_vs_authoritative_sort() {
     assert!(
         before.total_files > 1 && after.total_files > 1,
         "fixture must span multiple files for the pruning measurement to mean \
-         anything (before={} after={}); lower TARGET_FILE_BYTES or raise ROWS",
+         anything (before={} after={}); raise ROWS",
         before.total_files,
         after.total_files
     );

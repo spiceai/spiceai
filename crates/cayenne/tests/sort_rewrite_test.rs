@@ -16,7 +16,8 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-//! Integration tests for `CayenneTableProvider::sort_and_rewrite_data`.
+//! Integration tests for the full compaction's sorted rewrite, driven through
+//! `CayenneTableProvider::force_full_compaction`.
 //!
 //! These tests exercise the full sort-and-rewrite pipeline:
 //! 1. Read all data from the current listing table
@@ -222,10 +223,13 @@ async fn test_sort_rewrite_basic_impl(
     .await;
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort_and_rewrite_data should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("full compaction should succeed"),
+        "the full compaction must commit"
+    );
 
     // Verify data is sorted (query without ORDER BY to check physical sort order)
     let results = query_all(&ctx, &table, "sort_basic").await;
@@ -270,10 +274,13 @@ async fn test_sort_rewrite_multiple_inserts_impl(
     sql_insert(&table, "sort_multi", "(10, 'batch3_a'), (80, 'batch3_b')").await;
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort_and_rewrite_data should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("full compaction should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_multi").await;
     assert_eq!(total_rows(&results), 6, "should have 6 rows");
@@ -332,10 +339,13 @@ async fn test_sort_rewrite_with_nulls_impl(
     )
     .await;
 
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort_and_rewrite_data should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("full compaction should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_nulls").await;
     assert_eq!(total_rows(&results), 5, "should have 5 rows");
@@ -382,20 +392,26 @@ async fn test_sort_rewrite_idempotent_impl(
     .await;
 
     // First sort
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("first sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("first sort should succeed"),
+        "the full compaction must commit"
+    );
 
     let after_first = query_all(&ctx, &table, "sort_idem").await;
     let ids_first = collect_i64_column(&after_first, "id");
     let data_first = collect_string_column(&after_first, "data");
 
     // Second sort (already sorted)
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("second sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("second sort should succeed"),
+        "the full compaction must commit"
+    );
 
     let after_second = query_all(&ctx, &table, "sort_idem").await;
     let ids_second = collect_i64_column(&after_second, "id");
@@ -432,10 +448,13 @@ async fn test_sort_rewrite_empty_table_impl(
     )
     .await;
 
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort on empty table should succeed");
+    assert!(
+        !table
+            .force_full_compaction()
+            .await
+            .expect("full compaction of an empty table should succeed"),
+        "an empty table has nothing to compact"
+    );
 
     let results = query_all(&ctx, &table, "sort_empty").await;
     assert_eq!(total_rows(&results), 0, "empty table should stay empty");
@@ -467,10 +486,13 @@ async fn test_sort_rewrite_snapshot_changes_impl(
     let metadata_before = table.metadata().clone();
     let snapshot_before = metadata_before.current_snapshot_id.clone();
 
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort should succeed"),
+        "the full compaction must commit"
+    );
 
     // The snapshot should have changed (new UUID)
     let catalog = table.catalog();
@@ -516,10 +538,13 @@ async fn test_sort_rewrite_then_insert_impl(
     sql_insert(&table, "sort_then_ins", "(30, 'c'), (10, 'a'), (20, 'b')").await;
 
     // Sort
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort should succeed"),
+        "the full compaction must commit"
+    );
 
     // Insert more data after sort
     sql_insert(&table, "sort_then_ins", "(5, 'pre'), (25, 'mid')").await;
@@ -548,10 +573,11 @@ async fn test_sort_rewrite_then_insert_impl(
 
 test_with_backends!(test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl);
 
-/// Sort-rewrite sorts each scan partition on its own and merges them. With a
-/// nullable, heavily duplicated key spread over several input files and a small
-/// target size (so the output spans many files), the written order must still
-/// be one ascending, NULLs-last sequence holding every input row exactly once.
+/// The full compaction sorts each scan partition on its own and merges them.
+/// With a nullable, heavily duplicated key spread over several input files, the
+/// written order must still be one ascending, NULLs-last sequence holding every
+/// input row exactly once. (Order across several output files is checked by
+/// `layout_pruning_ab_test`.)
 async fn test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -588,8 +614,8 @@ async fn test_sort_rewrite_orders_nulls_and_duplicates_across_files_impl(
 
     // The second pass reads the snapshot the first attested as sorted; it must
     // write the same single order again.
-    table.sort_and_rewrite_data(64 * 1024).await?;
-    table.sort_and_rewrite_data(64 * 1024).await?;
+    assert!(table.force_full_compaction().await?, "first pass commits");
+    assert!(table.force_full_compaction().await?, "second pass commits");
 
     // One partition reads the snapshot's files in order as a single stream, so
     // this is the physical order the rewrite wrote.
@@ -671,10 +697,13 @@ async fn test_sort_rewrite_large_dataset_impl(
     }
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_large").await;
     assert_eq!(total_rows(&results), 500, "should have 500 rows");
@@ -734,10 +763,13 @@ async fn test_sort_rewrite_multi_column_sort_impl(
     .await;
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("multi-column sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("multi-column sort should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_multi_col").await;
     assert_eq!(total_rows(&results), 6, "should have 6 rows");
@@ -814,10 +846,13 @@ async fn test_sort_rewrite_reopen_table_impl(
     sql_insert(&table, "sort_reopen", "(30, 'c'), (10, 'a'), (20, 'b')").await;
 
     // Sort and rewrite
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort should succeed"),
+        "the full compaction must commit"
+    );
 
     // Drop the provider and re-open from catalog
     drop(table);
@@ -883,10 +918,13 @@ async fn test_sort_rewrite_duplicate_values_impl(
     )
     .await;
 
-    table
-        .sort_and_rewrite_data(128 * 1024 * 1024)
-        .await
-        .expect("sort with duplicates should succeed");
+    assert!(
+        table
+            .force_full_compaction()
+            .await
+            .expect("sort with duplicates should succeed"),
+        "the full compaction must commit"
+    );
 
     let results = query_all(&ctx, &table, "sort_dups").await;
     assert_eq!(total_rows(&results), 6, "all 6 rows should be preserved");
@@ -924,10 +962,10 @@ async fn test_sort_rewrite_duplicate_values_impl(
 
 test_with_backends!(test_sort_rewrite_waits_for_a_running_compaction_impl);
 
-/// The rewrite waits for a compaction already holding the table, rather than
-/// running beside it. A compaction that committed while the rewrite sorted would
-/// replace the snapshot the rewrite read from, and the rewrite would then defer
-/// and discard its sorted output, leaving the compaction's layout in place.
+/// A forced full compaction waits for a compaction pass already holding the
+/// table rather than running beside it. Two passes over the same snapshot would
+/// race: the one that committed second would find its snapshot replaced and
+/// discard its output, so the table would keep whichever layout landed first.
 async fn test_sort_rewrite_waits_for_a_running_compaction_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -950,7 +988,7 @@ async fn test_sort_rewrite_waits_for_a_running_compaction_impl(
     let rewriting = Arc::clone(&table);
     let mut rewrite = tokio::spawn(async move {
         rewriting
-            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .force_full_compaction()
             .await
             .map_err(|e| e.to_string())
     });
@@ -971,11 +1009,12 @@ async fn test_sort_rewrite_waits_for_a_running_compaction_impl(
     );
 
     drop(compaction);
-    tokio::time::timeout(std::time::Duration::from_secs(60), rewrite)
+    let committed = tokio::time::timeout(std::time::Duration::from_secs(60), rewrite)
         .await
         .expect("the rewrite finishes once the compaction releases the table")
         .expect("rewrite task")
-        .expect("sort_and_rewrite_data");
+        .expect("force_full_compaction");
+    assert!(committed, "the full compaction must commit");
 
     assert_ne!(
         table.current_snapshot_id(),
