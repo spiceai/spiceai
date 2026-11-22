@@ -172,9 +172,9 @@ impl Model for Protocol {
             Action::Issue(w) => format!("writer {w} sends its publication request"),
             Action::Deliver(i, 0) => format!("request {i} arrives"),
             Action::Deliver(i, _) => format!("a delayed identical copy of request {i} arrives"),
-            Action::Check(w) => format!("writer {w} reads the head to resolve its request"),
-            Action::RetryIdentical(w) => format!("writer {w} resends the identical request"),
-            Action::Unknown(w) => format!("writer {w}'s response is lost (outcome unknown)"),
+            Action::Check(i) => format!("the writer of request {i} reads the head to resolve it"),
+            Action::RetryIdentical(i) => format!("request {i} is resent identically"),
+            Action::Unknown(i) => format!("request {i}'s response is lost (outcome unknown)"),
         }
     }
     fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
@@ -287,5 +287,30 @@ impl Model for Protocol {
                 })
             }),
         ]
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Action, Protocol};
+    use stateright::Model;
+
+    /// `Check`, `RetryIdentical` and `Unknown` take a request index, not a
+    /// writer, so their labels name the request.
+    #[test]
+    fn request_actions_name_the_request() {
+        let model = Protocol::new("read-delivery", 1);
+        assert_eq!(
+            model.format_action(&Action::Check(3)),
+            "the writer of request 3 reads the head to resolve it"
+        );
+        assert_eq!(
+            model.format_action(&Action::RetryIdentical(3)),
+            "request 3 is resent identically"
+        );
+        assert_eq!(
+            model.format_action(&Action::Unknown(3)),
+            "request 3's response is lost (outcome unknown)"
+        );
     }
 }
