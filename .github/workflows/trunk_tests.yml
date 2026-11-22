@@ -38,10 +38,17 @@ on:
         description: 'An E2E Test CI run whose Linux build to test (default: the build of trunk HEAD)'
         required: false
         type: string
+      branch:
+        description: 'A versioned release branch (release/X.Y) whose head to test, with that commit''s own build (default: trunk)'
+        required: false
+        type: string
 
-# One run at a time, never cancelled: each run is a verdict Trunk Health reads.
+run-name: ${{ inputs.branch && format('Trunk tests on {0}', inputs.branch) || 'Trunk tests' }}
+
+# One run per branch at a time, never cancelled: each run is a verdict that
+# Trunk Health (trunk) or a release build (release branches) reads.
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ inputs.branch || 'trunk' }}
   cancel-in-progress: false
 
 permissions:
@@ -79,9 +86,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ inputs.run_id }}
+          BRANCH: ${{ inputs.branch }}
           GIVEN_WORKFLOW: ${{ steps.given.outputs.workflow }}
         run: |
           set -euo pipefail
+          if [ -n "$BRANCH" ]; then
+            [ -z "$RUN_ID" ] || { echo "::error::Give run_id or branch, not both"; exit 1; }
+            # The versioned release branches only, the same pattern
+            # check-trusted-run accepts builds from: these jobs hold credentials,
+            # and an arbitrary release/* branch may not be protected.
+            [[ "$BRANCH" =~ ^release/[0-9]+\.[0-9]+(\.[0-9]+)?(-rc\.?[0-9]+)?$ ]] || { echo "::error::branch must be a versioned release branch (release/X.Y), not '$BRANCH'"; exit 1; }
+          fi
           holds_build() {
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1/artifacts" \
               -q '.artifacts[] | select(.expired | not) | .name' | grep -qx build_linux_x86_64
@@ -92,14 +107,19 @@ jobs:
             run="$RUN_ID"
             sha=$(gh run view "$RUN_ID" -R "$GITHUB_REPOSITORY" --json headSha -q .headSha)
           else
-            # Trunk, whatever ref a dispatch named: these jobs hold credentials,
-            # and a branch's code gets them only through a trusted run_id. A
+            # Trunk, or a release branch named by `branch`, whatever ref a
+            # dispatch ran from: these jobs hold credentials, and other code
+            # gets them only through a trusted run_id. A
             # scheduled run tests the commit it started at, its own head_sha,
             # so that the next run's commit range starts at the commit this run
             # actually tested; a dispatch tests trunk HEAD. The merge-queue run
             # of a trunk commit built exactly that commit (the queue
             # fast-forwards trunk to it), and so did its push run.
-            if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            if [ -n "$BRANCH" ]; then
+              # A protected release branch's head, read from the API: the
+              # code tested is that branch's, never the dispatching ref's.
+              sha=$(gh api "repos/$GITHUB_REPOSITORY/branches/$BRANCH" -q .commit.sha)
+            elif [ "$GITHUB_EVENT_NAME" = schedule ]; then
               sha="$GITHUB_SHA"
             else
               sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/trunk" -q .sha)
@@ -134,8 +154,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.build.outputs.sha }}
+          BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
+          if [ -n "$BRANCH" ]; then
+            echo "### Testing $BRANCH at ${SHA}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # Scheduled runs test the commit they ran at, so the newest green
           # scheduled run's commit is the last one known good.
           green=$(gh run list -R "$GITHUB_REPOSITORY" -w trunk_tests.yml -b trunk -e schedule \
@@ -156,6 +181,7 @@ jobs:
             > "$RUNNER_TEMP/range/trunk-tests-range.json"
 
       - name: Upload the commit range
+        if: inputs.branch == ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: trunk-tests-range
@@ -421,8 +447,11 @@ jobs:
     needs: [resolve, build, spicescript, models]
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
+    permissions:
+      statuses: write  # the verdict, as a commit status on the tested commit
     steps:
       - name: Verify every job succeeded
+        id: verify
         shell: bash
         env:
           RESULTS: ${{ toJSON(needs) }}
@@ -442,3 +471,75 @@ jobs:
             exit 1
           fi
           echo "Every trunk test job succeeded."
+
+      # The verdict on the exact commit tested, as the `trunk-tests` commit
+      # status. A release build requires it to be `success` on the commit it
+      # builds, and the scheduled fan-out below skips a release branch head
+      # that already has one.
+      - name: Record the verdict on the commit
+        if: ${{ !cancelled() && needs.resolve.outputs.sha != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          set -euo pipefail
+          state=$([ "$OUTCOME" = success ] && echo success || echo failure)
+          description=$([ "$state" = success ] && echo "Every trunk test passed" || echo "Trunk tests failed")
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state="$state" -f context=trunk-tests -f description="$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --silent
+          echo "Recorded trunk-tests=$state on $SHA"
+
+  # Release branches get a verdict too, so a release can be built only from a
+  # commit that passed. On each scheduled run, every release branch with a
+  # commit in the last 30 days whose head has no trunk-tests status yet is
+  # tested in a run of its own: one dispatch per branch, so its result stays
+  # out of trunk's scheduled verdict, which Trunk Health reads. A head without
+  # trunk_tests.yml predates the post-merge split: its own merge queue ran the
+  # full suite, so it needs no verdict.
+  release-branches:
+    environment: secret-free
+    name: Test changed release branches
+    if: github.event_name == 'schedule'
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 15
+    # A failure here (the API refused a lookup) shows as a failed job but
+    # leaves the run's conclusion to the test jobs: Trunk Health reads that
+    # conclusion as trunk's verdict.
+    continue-on-error: true
+    permissions:
+      actions: write   # dispatch this workflow for each branch
+      contents: read
+      statuses: read
+    steps:
+      - name: Dispatch a run for each changed release branch head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d '30 days ago' +%s)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/branches?per_page=100" \
+              -q '.[] | select(.name | test("^release/[0-9]+\\.[0-9]+(\\.[0-9]+)?(-rc\\.?[0-9]+)?$")) | "\(.name) \(.commit.sha)"' |
+          while read -r branch sha; do
+            when=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" -q .commit.committer.date)
+            [ "$(date -u -d "$when" +%s)" -ge "$cutoff" ] || continue
+            # Absence counts only from a listing that succeeded; a lookup that
+            # fails stops the job rather than skipping the branch.
+            if ! workflows=$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$sha" -q '.[].name'); then
+              echo "::error::Could not list the workflows of $branch at $sha, so cannot tell whether it needs testing"
+              exit 1
+            fi
+            if ! grep -qx trunk_tests.yml <<<"$workflows"; then
+              echo "$branch at ${sha:0:12}: predates the post-merge split; its merge queue ran the full suite"
+              continue
+            fi
+            verdict=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/statuses?per_page=100" \
+              -q '[.[] | select(.context == "trunk-tests" and .creator.login == "github-actions[bot]")] | sort_by(.created_at, .id) | last | .state // ""')
+            if [ -n "$verdict" ]; then
+              echo "$branch at ${sha:0:12}: already tested ($verdict)"
+              continue
+            fi
+            echo "$branch at ${sha:0:12}: dispatching"
+            gh workflow run trunk_tests.yml -R "$GITHUB_REPOSITORY" --ref trunk -f branch="$branch"
+          done
