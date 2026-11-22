@@ -524,9 +524,12 @@ impl Model for Protocol {
             if let Some((at, v)) = last.confirmed {
                 lines.push(format!("confirmed v{v} at {at}"));
             }
-            if let Some((start, v)) = last.query {
+            // A query keeps its start tick and the live set of the head it
+            // confirmed, not that head's version.
+            if let Some((start, set)) = last.query {
                 lines.push(format!(
-                    "query on v{v} started {start}: {}",
+                    "query started {start} reads objects {}: {}",
+                    set_label(set, n),
                     match last.result {
                         None => "running",
                         Some(true) => "rows",
@@ -665,5 +668,25 @@ impl Model for Protocol {
             }),
         ]);
         properties
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Protocol, set_label};
+    use stateright::Model;
+
+    /// A query holds its start tick and the set of objects it reads, not a
+    /// head version; the reader box names the set.
+    #[test]
+    fn query_names_its_object_set() {
+        let model = Protocol::new("replicas-readers");
+        let path =
+            crate::explorer::path_to(&model, |s| s.query.is_some()).expect("a started query");
+        let (start, set) = path.last_state().query.expect("query");
+        let svg = model.as_svg(path).expect("replicas draws");
+        let line = format!("query started {start} reads objects {}", set_label(set, 1));
+        assert!(svg.contains(&line), "{line} missing");
+        assert!(!svg.contains("query on v"), "{svg}");
     }
 }
