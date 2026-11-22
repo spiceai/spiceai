@@ -1927,7 +1927,7 @@ mod tests {
         format!("http://{address}/v1")
     }
 
-    /// A model that fails the request puts its error on the `nsql` task_history span.
+    /// A model that fails the request puts its error on the `nsql` `task_history` span.
     #[tokio::test]
     async fn model_error_is_recorded_on_the_nsql_span() {
         let capture = SpanErrorCapture::default();
@@ -2009,7 +2009,7 @@ mod tests {
         format!("http://{address}/v1")
     }
 
-    /// A reply the NSQL parser rejects puts its error on the `nsql` task_history span.
+    /// A reply the NSQL parser rejects puts its error on the `nsql` `task_history` span.
     #[tokio::test]
     async fn malformed_model_response_is_recorded_on_the_nsql_span() {
         let capture = SpanErrorCapture::default();
