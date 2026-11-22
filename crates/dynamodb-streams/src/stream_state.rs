@@ -384,15 +384,19 @@ impl StreamState {
 /// Drops the records a shard has already read: those at or before its
 /// checkpoint's sequence number (`After`), or before it (`At`).
 ///
-/// `DynamoDB` Streams returns each record once, and sequence numbers increase
-/// within a shard, so this removes nothing there. An endpoint that returns a
-/// record again (`LocalStack` can return the same record on every `GetRecords`)
-/// would otherwise re-apply it forever and pin the shard's watermark to that
-/// record's time, so the dataset's lag only grows and it never becomes ready.
+/// `DynamoDB` Streams stores each record once, and sequence numbers increase
+/// within a shard. The checkpoint only advances past records this process has
+/// already handed on, so a record read again after a failed request, an expired
+/// iterator, or a restart (which resumes from the persisted checkpoint) is
+/// newer than it and kept. Only an endpoint that returns a record again
+/// (`LocalStack` can return the same record on every `GetRecords`) has one
+/// removed here; re-applying it would undo later changes to its item and pin
+/// the shard's watermark to its time, so the dataset never became ready.
 /// A record whose sequence number is missing or not numeric is kept.
 fn drop_already_read(records: &mut Vec<Record>, checkpoint: &ShardCheckpoint, shard_id: &str) {
-    let before = records.len();
-    records.retain(|record| {
+    // `Some(true)` when the record has not been read, `None` when it cannot be
+    // ordered against the checkpoint.
+    let unread = |record: &Record| {
         record
             .dynamodb
             .as_ref()
@@ -400,11 +404,22 @@ fn drop_already_read(records: &mut Vec<Record>, checkpoint: &ShardCheckpoint, sh
             .and_then(|sequence_number| {
                 compare_sequence_numbers(sequence_number, &checkpoint.sequence_number)
             })
-            .is_none_or(|ordering| match checkpoint.position {
+            .map(|ordering| match checkpoint.position {
                 CheckpointPosition::At => ordering.is_ge(),
                 CheckpointPosition::After => ordering.is_gt(),
             })
-    });
+    };
+    // Records come in sequence order, so a record returned again can only lead
+    // a batch: when the first is unread, so is every other, and an ordinary
+    // batch costs one comparison.
+    if records
+        .first()
+        .is_none_or(|first| unread(first) == Some(true))
+    {
+        return;
+    }
+    let before = records.len();
+    records.retain(|record| unread(record) != Some(false));
     let dropped = before - records.len();
     if dropped > 0 {
         tracing::debug!(
@@ -3213,12 +3228,44 @@ mod tests {
                 "shard-1",
                 Some("next".to_string()),
                 vec![
-                    create_record("100"),
-                    create_record("0099"),
                     create_record("98"),
+                    create_record("0099"),
+                    create_record("100"),
                 ],
             );
             assert_eq!(delivered(kept), vec!["100"]);
+        }
+
+        /// A batch whose first record is unread is kept whole: records arrive in
+        /// sequence order, so only its first record is compared. A record read
+        /// again after a failed request or a restart is newer than the
+        /// checkpoint, so it is kept too.
+        #[test]
+        fn a_batch_that_starts_unread_is_kept_whole() {
+            let mut state = shard_at("200", CheckpointPosition::After);
+            let kept = state.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![
+                    create_record("201"),
+                    create_record("202"),
+                    create_record("203"),
+                ],
+            );
+            assert_eq!(delivered(kept), vec!["201", "202", "203"]);
+
+            // The same batch again: the checkpoint is now 203, so all of it was
+            // already handed on, and it is dropped.
+            let again = state.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![
+                    create_record("201"),
+                    create_record("202"),
+                    create_record("203"),
+                ],
+            );
+            assert_eq!(delivered(again), Vec::<String>::new());
         }
 
         /// A record that cannot be ordered against the checkpoint is never
