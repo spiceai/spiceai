@@ -33,7 +33,7 @@ use crate::{
 use arrow_schema::SchemaRef;
 use cayenne_metastore_actions::{Action, DatasetState, Kind, ObjRef, Record, proto};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
-use object_store_occ::headlog::{Group, HeadLog, Opened, Reader, Writer};
+use object_store_occ::headlog::{Collector, Group, HeadLog, Opened, Reader, Writer};
 use parking_lot::Mutex;
 use prost::Message;
 use std::sync::Arc;
@@ -293,7 +293,30 @@ impl Inner {
             .await
             .map_err(invalid)?;
         self.staged_checkpoint = at;
+        self.collect();
         Ok(())
+    }
+
+    /// Delete the objects below the floor that no reader can still need, on a
+    /// background task, unless a collection of this log is already running.
+    /// A failed collection leaves them for the next one.
+    fn collect(&self) {
+        let Ok(mut collector) = Arc::clone(&self.collector).try_lock_owned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            match collector.collect().await {
+                Ok(Some(collected)) => tracing::trace!(
+                    "Cayenne object-native metastore deleted {} log objects below commit {}",
+                    collected.deleted,
+                    collected.floor
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    "Cayenne object-native metastore left log objects below the floor for the next collection: {error}"
+                ),
+            }
+        });
     }
 
     pub(super) fn table(&self, id: &str) -> CatalogResult<&cayenne_metastore_actions::TableState> {
@@ -846,6 +869,11 @@ impl Inner {
         };
         Ok((
             Self {
+                collector: Arc::new(tokio::sync::Mutex::new(Collector::new(
+                    Arc::clone(&store),
+                    prefix.clone(),
+                    config.retain_below_floor,
+                ))),
                 reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
                 writer,
                 stop: None,
