@@ -142,6 +142,55 @@ pub enum ResolveError {
         name: String,
         available: Vec<String>,
     },
+    /// A name only importance matrices or drafters answer to, which are not the model's weights
+    /// though their names carry its quantization's tag.
+    #[snafu(display(
+        "'{}' names only {}, which Spice, like llama.cpp, takes by name for an importance matrix or a drafter, not the model's weights; to load one as the weights, name its path in `files`",
+        printable(name),
+        listed(files)
+    ))]
+    NamedSidecar { name: String, files: Vec<String> },
+}
+
+/// What a listing holds: the repository's files, as the Hub lists them, or only those the
+/// Hugging Face cache holds, with the Hub not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListedFrom {
+    Repository,
+    Cache,
+}
+
+impl ResolveError {
+    /// The clause that says why, for a listing `from` holds: of the cache, it reads after
+    /// "where", with the cache named, and says what is not there, never that the repository,
+    /// which was not read, lacks it.
+    #[must_use]
+    pub fn clause(&self, from: ListedFrom) -> String {
+        match (self, from) {
+            (Self::MissingFile { path }, ListedFrom::Cache) => {
+                format!("there is no file '{}'", printable(path))
+            }
+            (Self::IncompleteShards { path, missing }, ListedFrom::Cache) => format!(
+                "'{}' is a shard of a series whose shards {} are not there",
+                printable(path),
+                listed(missing)
+            ),
+            (Self::UnknownQuantization { name, available }, ListedFrom::Cache) => format!(
+                "there is no file or quantization '{}'; the quantizations there are {}",
+                printable(name),
+                listed(available)
+            ),
+            _ => self.to_string(),
+        }
+    }
+
+    /// Whether no file the listing gains can resolve it: a name several quantizations answer
+    /// to answers to them in any listing that holds them, and the repository holds every file
+    /// its cache does.
+    #[must_use]
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::AmbiguousQuantization { .. })
+    }
 }
 
 /// `…-NNNNN-of-NNNNN.gguf`: one shard of a series.
@@ -261,13 +310,23 @@ fn tag(path: &str) -> Option<String> {
 /// a shard missing is not complete and is left out.
 #[must_use]
 pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
+    quantizations_of(listing, false)
+}
+
+/// The complete series in the listing, named as [`quantizations`] names them: of the model's
+/// weights, or, with `sidecars`, of the importance matrices and drafters alone.
+fn quantizations_of(listing: &[ListedFile], sidecars: bool) -> Vec<Quantization> {
     let size: BTreeMap<&str, u64> = listing.iter().map(|f| (f.path.as_str(), f.size)).collect();
     // Files grouped by (folder, stem without the shard suffix, shard count): a series is one
     // shard count, so a partial layout of another count beside it neither hides it nor joins it.
     let mut groups: BTreeMap<(String, String, Option<u32>), Vec<&str>> = BTreeMap::new();
     for file in listing {
         let path = file.path.as_str();
-        if !is_gguf(path) || is_draft_head(path) || is_projector(path) || is_sidecar(path) {
+        if !is_gguf(path)
+            || is_draft_head(path)
+            || is_projector(path)
+            || is_sidecar(path) != sidecars
+        {
             continue;
         }
         let (stem, count) =
@@ -469,6 +528,19 @@ fn yaml_scalar(text: &str) -> String {
     quoted
 }
 
+/// Whether the `files` entry `entry` names `quantization`: the folder that holds it, or, unless
+/// a trailing `/` makes the entry a folder, its name, its tag or its path stem.
+fn answers_to(quantization: &Quantization, entry: &str) -> bool {
+    let name = entry.trim_end_matches('/');
+    quantization
+        .files
+        .iter()
+        .all(|f| folder(f).eq_ignore_ascii_case(name))
+        || (!entry.ends_with('/')
+            && (quantization.name.eq_ignore_ascii_case(name)
+                || aliases(quantization).any(|alias| alias.eq_ignore_ascii_case(name))))
+}
+
 /// Resolves a model's `files` against the repository listing. An exact `.gguf` path is
 /// honoured, with the sibling shards of a shard, a draft head's included; any other entry names
 /// a quantization, by its name, the folder that holds only it, or its tag or path stem, which
@@ -479,7 +551,8 @@ fn yaml_scalar(text: &str) -> String {
 /// # Errors
 ///
 /// Returns an error when a named file is missing, a shard series is incomplete, a name matches
-/// several quantizations, or a name is neither a file nor a quantization of the repository.
+/// several quantizations, a name only importance matrices or drafters answer to, or a name is
+/// neither a file nor a quantization of the repository.
 pub fn resolve(
     listing: &[ListedFile],
     files: &[&str],
@@ -508,19 +581,28 @@ pub fn resolve(
             }
         } else {
             let name = entry.trim_end_matches('/');
-            // Every quantization the entry could name: the folder that holds it, or, unless
-            // `name/` makes it a folder, its name, its tag or its path stem. A listing of fewer
-            // files, as the cache's with the Hub out of reach, names by its folder what the
-            // whole listing named by its tag, so a name more than one answers to names none.
+            // A listing of fewer files, as the cache's with the Hub out of reach, names by its
+            // folder what the whole listing named by its tag, so a name more than one answers to
+            // names none.
             let matched: Vec<&Quantization> = quantizations
                 .iter()
-                .filter(|q| {
-                    q.files.iter().all(|f| folder(f).eq_ignore_ascii_case(name))
-                        || (!entry.ends_with('/')
-                            && (q.name.eq_ignore_ascii_case(name)
-                                || aliases(q).any(|alias| alias.eq_ignore_ascii_case(name))))
-                })
+                .filter(|q| answers_to(q, entry))
                 .collect();
+            if matched.is_empty() && !present.contains(entry) {
+                // Passed over, such a name would leave a repository that also offers safetensors
+                // to load those.
+                let sidecars: Vec<String> = quantizations_of(listing, true)
+                    .iter()
+                    .filter(|q| answers_to(q, entry))
+                    .flat_map(|q| q.files.iter().cloned())
+                    .collect();
+                if !sidecars.is_empty() {
+                    return Err(ResolveError::NamedSidecar {
+                        name: name.to_string(),
+                        files: sidecars,
+                    });
+                }
+            }
             let q = match matched.as_slice() {
                 [q] => *q,
                 [] if present.contains(entry) || quantizations.is_empty() => continue,
@@ -955,6 +1037,42 @@ mod tests {
         assert_eq!(names(&quantizations(&with_sidecars)), vec!["Q2_K"]);
         // So a drafter's Q8_0 is not taken for the model's.
         assert_eq!(default_name(&with_sidecars).as_deref(), Some("Q2_K"));
+    }
+
+    /// A name that answers only to an importance matrix or a drafter, which the resolver, as
+    /// llama.cpp does, does not take for the model's weights, is refused with the way to load the
+    /// file anyway. Passed over, it would leave a repository that also offers safetensors to load
+    /// those instead of the weights `files` names.
+    #[test]
+    fn a_name_only_an_importance_matrix_or_a_drafter_answers_to_is_refused() {
+        let imatrix_named = listing(&[
+            ("Acme-imatrix-7B-Q4_K_M.gguf", GB),
+            ("model.safetensors", GB),
+        ]);
+        assert_eq!(
+            resolve(&imatrix_named, &["Q4_K_M"]).map_err(|e| e.to_string()),
+            Err("'Q4_K_M' names only Acme-imatrix-7B-Q4_K_M.gguf, which Spice, like llama.cpp, takes by name for an importance matrix or a drafter, not the model's weights; to load one as the weights, name its path in `files`".to_string())
+        );
+        // its path loads it as the weights
+        let by_path = resolve(&imatrix_named, &["Acme-imatrix-7B-Q4_K_M.gguf"])
+            .expect("the path resolves")
+            .expect("the path names weights");
+        assert_eq!(by_path.weights, ["Acme-imatrix-7B-Q4_K_M.gguf"]);
+        // beside a quantization of the model that the name does not answer to, a drafter's tag
+        let drafter = listing(&[
+            ("Model-Q4_K_M.gguf", GB),
+            ("dspark-Model-Q8_0.gguf", GB / 5),
+        ]);
+        assert_eq!(
+            resolve(&drafter, &["Q8_0"]).map_err(|e| e.to_string()),
+            Err("'Q8_0' names only dspark-Model-Q8_0.gguf, which Spice, like llama.cpp, takes by name for an importance matrix or a drafter, not the model's weights; to load one as the weights, name its path in `files`".to_string())
+        );
+        // a name a quantization of the model answers to loads it, though a drafter carries it too
+        let both = listing(&[("Model-Q8_0.gguf", GB), ("dspark-Model-Q8_0.gguf", GB / 5)]);
+        let q8 = resolve(&both, &["Q8_0"])
+            .expect("Q8_0 resolves")
+            .expect("Q8_0 names weights");
+        assert_eq!(q8.weights, ["Model-Q8_0.gguf"]);
     }
 
     #[test]

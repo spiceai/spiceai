@@ -38,7 +38,7 @@ use std::sync::LazyLock;
 use huggingface_hub::{DownloadError, Requester, Snapshot};
 use regex::Regex;
 
-use crate::chat::gguf_files::{self, ListedFile, Quantization};
+use crate::chat::gguf_files::{self, ListedFile, ListedFrom, Quantization};
 use crate::hf::HubParams;
 
 use crate::hf::SAFETENSORS_INDEX as SAFETENSOR_INDEX;
@@ -226,9 +226,18 @@ fn resolve_gguf(
             size: file.size,
         })
         .collect();
-    if let Some(resolved) = gguf_files::resolve(&listing, files)
-        .map_err(|error| DownloadError::unusable(snapshot, error.to_string()))?
-    {
+    let from = if snapshot.cache_only_reason().is_some() {
+        ListedFrom::Cache
+    } else {
+        ListedFrom::Repository
+    };
+    if let Some(resolved) = gguf_files::resolve(&listing, files).map_err(|error| {
+        if error.is_ambiguous() {
+            DownloadError::invalid_selection(snapshot, error.to_string())
+        } else {
+            DownloadError::unusable(snapshot, error.clause(from))
+        }
+    })? {
         if files.iter().any(|file| !is_gguf_path(file)) {
             let line = format!(
                 "Model '{name}' loads {} from Hugging Face repo '{repo}'{}.",

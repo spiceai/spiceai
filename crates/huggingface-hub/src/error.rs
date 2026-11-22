@@ -104,6 +104,11 @@ pub(crate) enum Cause {
         message: String,
         source: Source,
     },
+    /// What the component names among the repository's files cannot be loaded, whatever else
+    /// the repository or the cache holds: `message` says why.
+    InvalidSelection {
+        message: String,
+    },
     /// The repository id is not one the Hub allows.
     InvalidRepo,
     /// The Hub listed a path that would leave the snapshot directory.
@@ -176,7 +181,8 @@ impl DownloadError {
 
     /// The repository's files, as the snapshot lists them, cannot be used; `message` says why,
     /// as the clause after a colon. When the snapshot lists only the cache, the error says so
-    /// and how to fill it.
+    /// and how to fill it, and `message` reads after "where": it says what the cache's listing
+    /// lacks, since the repository, which was not read, may hold it.
     #[must_use]
     pub fn unusable(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
         snapshot.error(
@@ -184,6 +190,25 @@ impl DownloadError {
             Cause::Unusable {
                 message: message.into(),
                 source: snapshot.source().clone(),
+            },
+        )
+    }
+
+    /// What the component names among the repository's files, as the snapshot lists them,
+    /// cannot be loaded, and no file the repository or the cache adds can change that: a name
+    /// several quantizations answer to, say, which is just as ambiguous among the repository's
+    /// files as among the cache's, since the cache holds only files of the repository. `message`
+    /// says why, as the clause after a colon. Unlike [`Self::unusable`], it is a configuration
+    /// error wherever the snapshot's files were listed from.
+    #[must_use]
+    pub fn invalid_selection(
+        snapshot: &crate::snapshot::Snapshot,
+        message: impl Into<String>,
+    ) -> Self {
+        snapshot.error(
+            None,
+            Cause::InvalidSelection {
+                message: message.into(),
             },
         )
     }
@@ -197,7 +222,10 @@ impl DownloadError {
     #[must_use]
     pub fn is_configuration_error(&self) -> bool {
         match self.cause.as_ref() {
-            Cause::Settings(_) | Cause::InvalidPath | Cause::InvalidRepo => true,
+            Cause::Settings(_)
+            | Cause::InvalidPath
+            | Cause::InvalidRepo
+            | Cause::InvalidSelection { .. } => true,
             Cause::Missing { source, .. } | Cause::Unusable { source, .. } => {
                 matches!(source, Source::Hub)
             }
@@ -309,7 +337,8 @@ impl DownloadError {
             Cause::Unusable {
                 message,
                 source: Source::Hub,
-            } => (message.clone(), None),
+            }
+            | Cause::InvalidSelection { message } => (message.clone(), None),
             Cause::Unusable {
                 message,
                 source: Source::OfflineCache,

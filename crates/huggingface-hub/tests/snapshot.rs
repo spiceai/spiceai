@@ -1150,7 +1150,7 @@ async fn offline_mode_names_a_needed_file_the_cache_lacks() {
 /// and a retry may succeed.
 #[tokio::test]
 async fn an_unusable_listing_read_from_the_cache_says_so_and_is_retried() {
-    const WHY: &str = "the repository has no file 'model.gguf'";
+    const WHY: &str = "there is no file 'model.gguf'";
     let fixture = Fixture::new().await;
     fixture.mock.commit(MODEL, C1, model_files());
     fixture.mock.branch(MODEL, "main", C1);
@@ -1163,7 +1163,7 @@ async fn an_unusable_listing_read_from_the_cache_says_so_and_is_retried() {
     let error = huggingface_hub::DownloadError::unusable(&online, WHY);
     assert_eq!(
         error.to_string(),
-        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the repository has no file 'model.gguf'. See: https://spiceai.org/docs/components/models/huggingface"
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): there is no file 'model.gguf'. See: https://spiceai.org/docs/components/models/huggingface"
     );
     assert!(error.is_configuration_error());
 
@@ -1176,7 +1176,7 @@ async fn an_unusable_listing_read_from_the_cache_says_so_and_is_retried() {
     assert_eq!(
         error.to_string(),
         format!(
-            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where the repository has no file 'model.gguf'. Run `hf download o/m --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where there is no file 'model.gguf'. Run `hf download o/m --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
             fixture.cache().display()
         )
     );
@@ -1191,7 +1191,7 @@ async fn an_unusable_listing_read_from_the_cache_says_so_and_is_retried() {
     let error = huggingface_hub::DownloadError::unusable(&outage, WHY);
     assert_eq!(
         error.to_string(),
-        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hugging Face Hub could not be reached (HTTP 503), so Spice read only the Hugging Face cache, where the repository has no file 'model.gguf'. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface"
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hugging Face Hub could not be reached (HTTP 503), so Spice read only the Hugging Face cache, where there is no file 'model.gguf'. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface"
     );
     assert!(!error.is_configuration_error());
 }

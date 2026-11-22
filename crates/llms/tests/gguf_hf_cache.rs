@@ -202,11 +202,31 @@ async fn what_the_cache_lacks_is_retried_and_says_how_to_fill_it() {
         cache.path().display()
     );
 
+    write_file(&snapshot, "Model-Q2_K-00001-of-00002.gguf");
+    write_file(&snapshot, "dspark-Model-Q8_0.gguf");
+
+    // each says what is not in the cache, and nothing of the repository it did not read
     for (files, budget, why) in [
         (
             &["Model-Q8_0.gguf"][..],
             Budget::Unmeasured,
-            "the repository has no file 'Model-Q8_0.gguf'",
+            "there is no file 'Model-Q8_0.gguf'",
+        ),
+        (
+            &["Model-Q2_K-00001-of-00002.gguf"][..],
+            Budget::Unmeasured,
+            "'Model-Q2_K-00001-of-00002.gguf' is a shard of a series whose shards Model-Q2_K-00002-of-00002.gguf are not there",
+        ),
+        (
+            &["Q3_K_M"][..],
+            Budget::Unmeasured,
+            "there is no file or quantization 'Q3_K_M'; the quantizations there are Q4_K_M",
+        ),
+        // the repository may hold a Q8_0 of the model beside its drafter's
+        (
+            &["Q8_0"][..],
+            Budget::Unmeasured,
+            "'Q8_0' names only dspark-Model-Q8_0.gguf, which Spice, like llama.cpp, takes by name for an importance matrix or a drafter, not the model's weights; to load one as the weights, name its path in `files`",
         ),
         (
             &[],
@@ -224,6 +244,36 @@ async fn what_the_cache_lacks_is_retried_and_says_how_to_fill_it() {
         );
         assert!(!error.is_configuration_error(), "{files:?}");
     }
+}
+
+/// A name several quantizations in the cache answer to is a mistake in the Spicepod, not a gap
+/// in the cache: the repository holds every quantization its cache holds, so no file the cache
+/// gains can make the name answer to one. It is not retried, and the error says only how to
+/// correct `files`.
+#[tokio::test]
+async fn a_name_several_quantizations_in_the_cache_answer_to_is_not_retried() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_file(&snapshot, "gguf/Model-Q8_0.gguf");
+    write_file(&snapshot, "gguf/Model-Q4_K_M.gguf");
+
+    let error = download_model(
+        REPO_ID,
+        &["gguf"],
+        Budget::Unmeasured,
+        HubParams::default(),
+        "test",
+    )
+    .await
+    .expect_err("two quantizations answer to the folder");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): 'gguf' matches 2 quantizations of the repository, Q4_K_M, Q8_0; name one of them. See: https://spiceai.org/docs/components/models/huggingface"
+        )
+    );
+    assert!(error.is_configuration_error());
 }
 
 /// A split model with no `files` loads, with the Hub out of reach, the default of what the
