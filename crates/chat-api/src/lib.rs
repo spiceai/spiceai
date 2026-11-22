@@ -205,6 +205,23 @@ pub enum Error {
         "Model '{model}' is split across nodes over connections that are neither authenticated nor encrypted, so it loads only when spiced runs with `--allow-insecure-connections`. Start spiced with `--allow-insecure-connections` on every node in `nodes`, and only on a trusted private network: any host that reaches a node's GPU server can use that GPU."
     ))]
     InsecureConnectionsNotAllowed { model: String },
+
+    /// A model split across nodes that each load its weights named no quantization in `files`,
+    /// and the Hub's listing was not read, so this node chose among what its own cache holds.
+    /// `reason` says why only the cache was read, as a clause, and `pinned` is the `files`
+    /// entries that load `quantization`.
+    #[snafu(display(
+        "Model '{model}' is split across nodes by mistral.rs, which has each node load the weights itself, and {reason}, so this node chose quantization {quantization} among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same weights: `files: [{pinned}]`. See: https://spiceai.org/docs/components/models/huggingface"
+    ))]
+    SplitModelChoseFromCache {
+        model: String,
+        quantization: String,
+        pinned: String,
+        reason: String,
+        /// Whether only a restart clears it: `HF_HUB_OFFLINE` is set. With the Hub out of reach
+        /// instead, a later load can read its listing.
+        configuration: bool,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -233,7 +250,8 @@ impl Error {
             | Self::ResponsesNotSupported { .. }
             // Only restarting spiced with `--allow-insecure-connections` clears it.
             | Self::InsecureConnectionsNotAllowed { .. } => true,
-            Self::FailedToDownloadModel { configuration, .. } => *configuration,
+            Self::FailedToDownloadModel { configuration, .. }
+            | Self::SplitModelChoseFromCache { configuration, .. } => *configuration,
             // A loader can wrap a configuration error, such as rejected pickle weights.
             Self::FailedToLoadModel { source } => source
                 .downcast_ref::<Self>()

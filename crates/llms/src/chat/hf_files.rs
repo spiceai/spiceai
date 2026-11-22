@@ -52,6 +52,25 @@ pub struct Downloaded {
     /// The GGUF files the model loads, as repository paths in load order: the weights, shard 1
     /// first, then a draft head. Empty for a model mistral.rs loads from safetensors.
     pub gguf: Vec<String>,
+    /// The quantization chosen among what the Hugging Face cache holds, when `files` named none
+    /// and the Hub's listing was not read. `None` when the Hub listed the repository or `files`
+    /// named what the model loads.
+    pub chosen_from_cache: Option<ChosenFromCache>,
+}
+
+/// A quantization a model with no `files` chose among what the Hugging Face cache holds, the
+/// Hub's listing not read. The Hub, or another machine's cache, can give another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenFromCache {
+    /// The quantization's name, as printable ASCII.
+    pub quantization: String,
+    /// The `files` entries that load it, `{path: …}` each, comma-separated.
+    pub pinned: String,
+    /// Why only the cache was read, as a clause ([`Snapshot::cache_only_reason`]).
+    pub reason: String,
+    /// Whether `HF_HUB_OFFLINE` is set ([`Snapshot::is_offline`]), which only a restart without
+    /// it clears; with the Hub out of reach instead, a later load can read the Hub's listing.
+    pub offline: bool,
 }
 
 /// What a model that names no GGUF files chooses its quantization by.
@@ -84,7 +103,7 @@ pub async fn download_model(
     name: &str,
 ) -> Result<Downloaded, DownloadError> {
     let snapshot = open(model_id, hub, name).await?;
-    let gguf = resolve_gguf(
+    let (gguf, chosen_from_cache) = resolve_gguf(
         &snapshot,
         files,
         budget,
@@ -94,7 +113,11 @@ pub async fn download_model(
     )?;
     let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
     let dir = download(&snapshot, &paths).await?;
-    Ok(Downloaded { dir, gguf })
+    Ok(Downloaded {
+        dir,
+        gguf,
+        chosen_from_cache,
+    })
 }
 
 /// What a model loads, resolved from the Hub without downloading the weights.
@@ -127,7 +150,7 @@ pub async fn model_architecture(
     name: &str,
 ) -> Result<Resolved, DownloadError> {
     let snapshot = open(model_id, hub, name).await?;
-    let gguf = resolve_gguf(
+    let (gguf, _) = resolve_gguf(
         &snapshot,
         files,
         budget,
@@ -186,6 +209,8 @@ fn log_resolved(purpose: Purpose, line: &str) {
 /// The GGUF files a model loads from `snapshot`: those `files` resolve to, or with none named,
 /// the quantization `budget` chooses ([`choose_quantization`]), and its draft head. Empty for
 /// a repository that offers no GGUF quantization or that mistral.rs loads from safetensors.
+/// With the quantization chosen from a listing of the cache alone, also what was chosen
+/// ([`ChosenFromCache`]).
 fn resolve_gguf(
     snapshot: &Snapshot,
     files: &[&str],
@@ -193,7 +218,7 @@ fn resolve_gguf(
     name: &str,
     repo: &str,
     purpose: Purpose,
-) -> Result<Vec<String>, DownloadError> {
+) -> Result<(Vec<String>, Option<ChosenFromCache>), DownloadError> {
     let listing: Vec<ListedFile> = snapshot
         .files()
         .map(|file| ListedFile {
@@ -225,16 +250,17 @@ fn resolve_gguf(
             );
             log_resolved(purpose, &line);
         }
-        return Ok(resolved
+        let gguf = resolved
             .files()
             .into_iter()
             .map(ToString::to_string)
-            .collect());
+            .collect();
+        return Ok((gguf, None));
     }
     let names: Vec<&str> = listing.iter().map(|file| file.path.as_str()).collect();
     let quantizations = gguf_files::quantizations(&listing);
     if quantizations.is_empty() || weights(&names).is_some() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let chosen = choose_quantization(
         snapshot,
@@ -247,7 +273,23 @@ fn resolve_gguf(
     )?;
     let mut gguf = chosen.files.clone();
     gguf.extend(gguf_files::draft_head(&listing, chosen));
-    Ok(gguf)
+    let chosen_from_cache = snapshot.cache_only_reason().map(|reason| ChosenFromCache {
+        quantization: gguf_files::printable(&chosen.name),
+        pinned: pinned(&listing, chosen),
+        reason,
+        offline: snapshot.is_offline(),
+    });
+    Ok((gguf, chosen_from_cache))
+}
+
+/// The `files` entries that load `quantization` ([`gguf_files::pin`]), `{path: …}` each,
+/// comma-separated, as printable ASCII.
+fn pinned(listing: &[ListedFile], quantization: &Quantization) -> String {
+    gguf_files::pin(listing, quantization)
+        .iter()
+        .map(|entry| format!("{{path: {}}}", gguf_files::printable(entry)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The quantization a model with no `files` loads: its default, the one llama.cpp's `-hf` loads
@@ -264,13 +306,6 @@ fn choose_quantization<'q>(
     repo: &str,
     purpose: Purpose,
 ) -> Result<&'q Quantization, DownloadError> {
-    let pin = |q: &Quantization| {
-        gguf_files::pin(listing, q)
-            .iter()
-            .map(|entry| format!("{{path: {}}}", gguf_files::printable(entry)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let Some(default) = gguf_files::default_quantization(quantizations) else {
         return Err(DownloadError::unusable(
             snapshot,
@@ -294,7 +329,13 @@ fn choose_quantization<'q>(
         Ok(chosen) => {
             log_resolved(
                 purpose,
-                &line.step_down(chosen, default, quantizations.len(), memory, &pin(chosen)),
+                &line.step_down(
+                    chosen,
+                    default,
+                    quantizations.len(),
+                    memory,
+                    &pinned(listing, chosen),
+                ),
             );
             Ok(chosen)
         }

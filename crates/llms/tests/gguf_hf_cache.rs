@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use llms::chat::gguf_files::{self, ListedFile};
 use llms::chat::hf_files::{Budget, download_model, model_architecture};
+use llms::chat::{DistributedBackend, DistributedConfig, ReasoningDefault, create_hf_model};
 use llms::hf::HubParams;
 
 const REPO_ID: &str = "spiceai-test/gguf-not-on-the-hub";
@@ -282,6 +283,103 @@ async fn only_the_node_that_loads_the_weights_says_what_the_model_loads() {
         ["Model-Q8_0.gguf"]
     );
     assert_eq!(resolution_lines(&log), [format!("DEBUG {line}")], "{log}");
+}
+
+/// A model split across nodes that each load its weights, as mistral.rs splits one, does not
+/// choose its quantization among what one node's cache holds: another node's cache need not
+/// hold the same, and the nodes would then each load different weights. Named in `files`, the
+/// quantization gets past the refusal, to the engine. No engine that splits a model by sending
+/// each node its share is linked here, so the model goes to mistral.rs.
+#[tokio::test]
+async fn a_split_model_whose_nodes_each_load_the_weights_does_not_choose_from_a_cache() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_file(&snapshot, "Model-Q8_0.gguf");
+
+    let error = load_split(&[], HubParams::default())
+        .await
+        .err()
+        .expect("a quantization chosen from the cache is refused");
+    assert_eq!(
+        error.to_string(),
+        "Model 'test' is split across nodes by mistral.rs, which has each node load the weights itself, and `HF_HUB_OFFLINE` is set, so this node chose quantization Q8_0 among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same weights: `files: [{path: Q8_0}]`. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+    assert!(
+        error.is_configuration_error(),
+        "with `HF_HUB_OFFLINE` set, no retry reads the Hub"
+    );
+
+    let named = load_split(&["Q8_0"], HubParams::default())
+        .await
+        .err()
+        .expect("the placeholder file is not a model mistral.rs loads");
+    assert!(
+        !matches!(named, llms::chat::Error::SplitModelChoseFromCache { .. }),
+        "a quantization named in `files` is loaded as named: {named}"
+    );
+}
+
+/// With the Hub out of reach, the same refusal is retried: a later load can read the Hub's
+/// listing, which every node reads alike.
+#[tokio::test]
+async fn a_split_model_that_chose_from_the_cache_in_an_outage_is_retried() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_file(&snapshot, "Model-Q8_0.gguf");
+    // SAFETY: `require_process_per_test` established that no other thread reads or writes the
+    // environment.
+    unsafe { std::env::remove_var("HF_HUB_OFFLINE") };
+    // Nothing listens on the discard port of the loopback address.
+    let hub = HubParams {
+        endpoint: Some("http://127.0.0.1:9"),
+        ..HubParams::default()
+    };
+
+    let error = load_split(&[], hub)
+        .await
+        .err()
+        .expect("a quantization chosen from the cache is refused");
+    let message = error.to_string();
+    assert!(
+        message.starts_with("Model 'test' is split across nodes by mistral.rs, which has each node load the weights itself, and the Hugging Face Hub could not be reached ("),
+        "{message}"
+    );
+    assert!(
+        message.ends_with("), so this node chose quantization Q8_0 among what its Hugging Face cache holds, and another node's cache need not hold the same. Name the quantization in the model's `files`, so that every node loads the same weights: `files: [{path: Q8_0}]`. See: https://spiceai.org/docs/components/models/huggingface"),
+        "{message}"
+    );
+    assert!(
+        !error.is_configuration_error(),
+        "a later load can reach the Hub"
+    );
+}
+
+/// Loads [`REPO_ID`] with `files`, split across two nodes as the head, the model named `test`.
+async fn load_split(
+    files: &[&str],
+    hub: HubParams<'_>,
+) -> llms::chat::Result<Arc<dyn llms::chat::Chat>> {
+    create_hf_model(
+        REPO_ID,
+        None,
+        files,
+        hub,
+        None,
+        Some(DistributedConfig {
+            backend: DistributedBackend::Ring,
+            node_rank: 0,
+            nodes: vec!["127.0.0.1".to_string(), "127.0.0.2".to_string()],
+            allow_insecure_connections: true,
+            head_url: None,
+        }),
+        ReasoningDefault {
+            model_name: "test",
+            effort: None,
+        },
+    )
+    .await
 }
 
 /// `future`'s output, and what it logged at debug and above, without times or colours.

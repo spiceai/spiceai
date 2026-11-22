@@ -423,10 +423,13 @@ pub async fn create_hf_model(
             return (engine.load)(&gguf_files, options).await;
         }
     }
-    let hf_files::Downloaded { dir, gguf } =
-        hf_files::download_model(model_id, files, budget, hub, reasoning.model_name)
-            .await
-            .map_err(download_error)?;
+    let hf_files::Downloaded {
+        dir,
+        gguf,
+        chosen_from_cache,
+    } = hf_files::download_model(model_id, files, budget, hub, reasoning.model_name)
+        .await
+        .map_err(download_error)?;
     let gguf_files: Vec<PathBuf> = gguf.iter().map(PathBuf::from).collect();
     let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
     if let Some(engine) = engine::engine_for(&gguf_files)
@@ -444,6 +447,19 @@ pub async fn create_hf_model(
             ..LocalModelOptions::default()
         };
         return (engine.load)(&weights, options).await;
+    }
+    // mistral.rs splits a model by having every node load the weights itself, so a quantization
+    // this node chose among what its own cache holds need not be the one another node loads.
+    if distributed.is_some()
+        && let Some(chosen) = chosen_from_cache
+    {
+        return Err(Error::SplitModelChoseFromCache {
+            model: reasoning.model_name.to_string(),
+            quantization: chosen.quantization,
+            pinned: chosen.pinned,
+            reason: chosen.reason,
+            configuration: chosen.offline,
+        });
     }
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the

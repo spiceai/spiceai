@@ -385,6 +385,14 @@ impl Snapshot {
         self.source.cache_only_reason()
     }
 
+    /// Whether the snapshot lists only the files the cache holds because `HF_HUB_OFFLINE` is
+    /// set, which lasts until the process restarts without it. With the Hub out of reach
+    /// instead, a later snapshot can list the repository's files again.
+    #[must_use]
+    pub fn is_offline(&self) -> bool {
+        matches!(self.source, Source::OfflineCache)
+    }
+
     /// The component the snapshot is for.
     #[must_use]
     pub fn requester(&self) -> &Requester {
