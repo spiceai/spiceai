@@ -1532,3 +1532,151 @@ pub(super) async fn drop_replication_slot_when_inactive(
         last_error.unwrap_or_else(|| "none".to_string())
     ))
 }
+
+/// Compare complete rows, including NULLs and duplicates, against PostgreSQL.
+/// The internal threshold injection keeps these fixtures small; a Spicepod
+/// cannot request it, which is why this coverage lives in the integration binary.
+async fn assert_snapshot_rows(
+    client: &tokio_postgres::Client,
+    port: u16,
+    table: &str,
+    pages_per_reader: u32,
+) -> Result<usize, anyhow::Error> {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use data_components::postgres_replication::bootstrap::{
+        SnapshotInput, snapshot_stream_for_test,
+    };
+
+    let oracle = client
+        .query(&format!("SELECT id, name FROM public.{table}"), &[])
+        .await?;
+    let mut expected: Vec<(i32, Option<String>)> =
+        oracle.iter().map(|row| (row.get(0), row.get(1))).collect();
+    assert!(
+        !expected.is_empty(),
+        "snapshot comparison must exercise rows"
+    );
+    expected.sort();
+    let readers = Arc::new(AtomicUsize::new(0));
+    let mut params = params_for(port, "unused_snapshot_slot", "unused_snapshot_publication");
+    params.bootstrap_batch_size = 127;
+    let stream = snapshot_stream_for_test(
+        SnapshotInput {
+            params,
+            schema_name: "public".into(),
+            table_name: table.into(),
+            dataset_schema: dataset_schema(),
+            primary_keys: vec!["id".into()],
+            dataset_name: format!("snapshot_{table}"),
+            metrics: ReplicationMetricsCollector::new(),
+        },
+        NonZeroU32::new(pages_per_reader).expect("positive test threshold"),
+        Arc::clone(&readers),
+    )?;
+    let mut stream = Box::pin(stream);
+    let mut actual = Vec::new();
+    let mut mutated = false;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some(envelope) = stream.next().await {
+            let envelope = envelope.map_err(|e| anyhow::anyhow!("snapshot failed: {e}"))?;
+            assert!(!envelope.is_dataset_ready(), "bootstrap remains lag-based");
+            let batch = envelope.change_batch()?.data_batch();
+            let ids = batch.column(0).as_any().downcast_ref::<arrow::array::Int32Array>()
+                .expect("id int4");
+            let names = batch.column(1).as_any().downcast_ref::<arrow::array::StringArray>()
+                .expect("name text");
+            for row in 0..batch.num_rows() {
+                actual.push((ids.value(row), if names.is_null(row) {
+                    None
+                } else {
+                    Some(names.value(row).to_string())
+                }));
+            }
+            if !mutated && batch.num_rows() > 0 {
+                // These committed writes must remain invisible to every reader,
+                // including a reader that imports the exported snapshot later.
+                client.batch_execute(&format!(
+                    "INSERT INTO public.{table} VALUES (-1, 'late'); DELETE FROM public.{table} WHERE id = 7; UPDATE public.{table} SET name = 'changed' WHERE id = 8"
+                )).await?;
+                mutated = true;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }).await??;
+    assert!(mutated, "writes must overlap the snapshot stream");
+    assert_eq!(actual.len(), expected.len(), "snapshot row count");
+    actual.sort();
+    assert_eq!(
+        actual, expected,
+        "snapshot must match the full source row multiset"
+    );
+    Ok(readers.load(Ordering::Acquire))
+}
+
+#[test]
+fn test_parallel_snapshot_matches_postgres() -> Result<(), anyhow::Error> {
+    // Install a deterministic multi-core entitlement in a child process, never
+    // a process-global override that races other tests in this binary.
+    if cpu_budget::testing::isolated_budget(
+        "postgres::replication::test_parallel_snapshot_matches_postgres",
+    )
+    .map_err(anyhow::Error::msg)?
+        == cpu_budget::testing::Isolation::Parent
+    {
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+        let container = common::start_postgres_docker_container().await?;
+        let port = container.host_port(5432)?;
+        let client = common::connect(port).await?;
+        client.batch_execute(
+            "CREATE TABLE public.snapshot_parallel (id int PRIMARY KEY, name text); INSERT INTO public.snapshot_parallel SELECT i, CASE WHEN i % 11 = 0 THEN NULL ELSE repeat(md5(i::text), 8) END FROM generate_series(1, 20000) i; ANALYZE public.snapshot_parallel"
+        ).await?;
+        let readers = assert_snapshot_rows(&client, port, "snapshot_parallel", 8).await?;
+        assert!(readers > 1, "test must run parallel range readers, got {readers}");
+        Ok(())
+    })
+}
+
+#[tokio::test]
+async fn test_small_snapshot_matches_postgres() -> Result<(), anyhow::Error> {
+    let container = common::start_postgres_docker_container().await?;
+    let port = container.host_port(5432)?;
+    let client = common::connect(port).await?;
+    client.batch_execute(
+        "CREATE TABLE public.snapshot_small (id int PRIMARY KEY, name text); INSERT INTO public.snapshot_small SELECT i, CASE WHEN i % 3 = 0 THEN NULL ELSE 'same' END FROM generate_series(1, 17) i; ANALYZE public.snapshot_small"
+    ).await?;
+    assert_eq!(
+        assert_snapshot_rows(&client, port, "snapshot_small", 131_072).await?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn test_inherited_snapshot_matches_postgres() -> Result<(), anyhow::Error> {
+    if cpu_budget::testing::isolated_budget(
+        "postgres::replication::test_inherited_snapshot_matches_postgres",
+    )
+    .map_err(anyhow::Error::msg)?
+        == cpu_budget::testing::Isolation::Parent
+    {
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+    let container = common::start_postgres_docker_container().await?;
+    let port = container.host_port(5432)?;
+    let client = common::connect(port).await?;
+    client.batch_execute(
+        "CREATE TABLE public.snapshot_parent (id int, name text); CREATE TABLE public.snapshot_child () INHERITS (public.snapshot_parent); INSERT INTO public.snapshot_parent SELECT i, CASE WHEN i % 11 = 0 THEN NULL ELSE repeat(md5(i::text), 8) END FROM generate_series(1, 20000) i; INSERT INTO public.snapshot_child SELECT * FROM ONLY public.snapshot_parent WHERE id <= 100; ANALYZE public.snapshot_parent"
+    ).await?;
+    // Child duplicates must be retained: fallback SELECT does not add ONLY.
+    assert_eq!(
+        assert_snapshot_rows(&client, port, "snapshot_parent", 8).await?,
+        1
+    );
+    Ok(())
+    })
+}

@@ -121,6 +121,12 @@ pub enum Error {
     #[snafu(display("Bootstrap stream error: {}", pg_error_detail(source)))]
     Bootstrap { source: tokio_postgres::Error },
 
+    #[snafu(display("PostgreSQL snapshot reader task failed: {source}"))]
+    BootstrapReaderJoin { source: tokio::task::JoinError },
+
+    #[snafu(display("PostgreSQL snapshot reader ended without completing its scan"))]
+    BootstrapReaderMissing,
+
     #[snafu(display("Invalid Postgres LSN string `{lsn}`: expected `XXXXXXXX/YYYYYYYY`"))]
     InvalidLsn { lsn: String },
 

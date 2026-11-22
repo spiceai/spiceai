@@ -38,7 +38,7 @@ use arrow::{
 };
 use async_stream::try_stream;
 use futures::Stream;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
 
@@ -61,68 +61,127 @@ pub struct SnapshotInput {
     pub metrics: Arc<ReplicationMetricsCollector>,
 }
 
+/// Roughly 1 GiB per reader at PostgreSQL's usual 8 KiB page size amortizes
+/// connection/snapshot setup and avoids fanning out small-table bootstraps.
+const PAGES_PER_READER: u32 = 131_072;
+/// At most two queued batches per reader; producers await downstream capacity.
+const BATCHES_PER_READER: usize = 2;
+
 /// Build a `ChangesStream`-compatible stream that emits all rows of the source
 /// table as op="c" change envelopes.
 pub fn snapshot_stream(
     input: SnapshotInput,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
-    let SnapshotInput {
-        params,
-        schema_name,
-        table_name,
-        dataset_schema,
-        primary_keys,
-        dataset_name,
-        metrics,
-    } = input;
-    let dataset_name_clone = dataset_name.clone();
-    let bootstrap_batch_size = params.bootstrap_batch_size;
+    snapshot_stream_inner(input, PAGES_PER_READER, None)
+}
 
+/// Internal integration-test entry point: exercise heap splitting without a
+/// multi-GiB fixture and observe the actual fan-out without adding a metric.
+#[doc(hidden)]
+pub fn snapshot_stream_for_test(
+    input: SnapshotInput,
+    pages_per_reader: std::num::NonZeroU32,
+    readers: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
+    snapshot_stream_inner(input, pages_per_reader.get(), Some(readers))
+}
+
+/// Own the connection driver as well as the client: aborting a reader or
+/// dropping the output stream closes its socket and rolls back its transaction.
+struct BootstrapConnection {
+    client: tokio_postgres::Client,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BootstrapConnection {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
+async fn connect(input: &SnapshotInput) -> Result<BootstrapConnection> {
+    let tls = input
+        .params
+        .native_tls_connector()
+        .await
+        .context(TlsConfigSnafu)?;
+    let cfg = input.params.pg_config(&format!(
+        "spice-replication-bootstrap/{}",
+        input.dataset_name
+    ));
+    let (client, driver) = if let Some(connector) = tls {
+        let (client, connection) = cfg.connect(connector).await.context(SetupConnectSnafu)?;
+        (
+            client,
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!("postgres bootstrap connection terminated: {e}");
+                }
+            }),
+        )
+    } else {
+        let (client, connection) = cfg.connect(NoTls).await.context(SetupConnectSnafu)?;
+        (
+            client,
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!("postgres bootstrap connection terminated: {e}");
+                }
+            }),
+        )
+    };
+    Ok(BootstrapConnection { client, driver })
+}
+
+fn snapshot_stream_inner(
+    input: SnapshotInput,
+    pages_per_reader: u32,
+    readers_observer: Option<Arc<std::sync::atomic::AtomicUsize>>,
+) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
+    // Keep the existing try_stream envelope/error contract at the WAL boundary.
     Ok(try_stream! {
-        // Build the TLS connector inside the stream because it's an async
-        // operation (reads sslrootcert via tokio::fs).
-        let tls_connector = params
-            .native_tls_connector()
-            .await
-            .context(TlsConfigSnafu)
-            .map_err(super::err_to_stream)?;
-        let cfg = params.pg_config(
-            &format!("spice-replication-bootstrap/{dataset_name_clone}")
-        );
-
-        let (client, conn_task) = if let Some(connector) = tls_connector {
-            let (c, connection) = cfg
-                .connect(connector)
-                .await
-                .context(SetupConnectSnafu)
-                .map_err(super::err_to_stream)?;
-            let t = tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    tracing::warn!("postgres bootstrap connection terminated: {e}");
-                }
-            });
-            (c, t)
-        } else {
-            let (c, connection) = cfg
-                .connect(NoTls)
-                .await
-                .context(SetupConnectSnafu)
-                .map_err(super::err_to_stream)?;
-            let t = tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    tracing::warn!("postgres bootstrap connection terminated: {e}");
-                }
-            });
-            (c, t)
+        let input = Arc::new(input);
+        let holder = connect(&input).await.map_err(super::err_to_stream)?;
+        let relation = format!("{}.{}", quote_ident(&input.schema_name), quote_ident(&input.table_name));
+        // Probe in autocommit so catalog access cannot establish the scan's snapshot.
+        let probe = async {
+            let metadata = holder.client.query_one(
+                "SELECT c.relpages, c.relkind = 'r' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid), current_setting('server_version_num')::int >= 140000 FROM pg_catalog.pg_class c WHERE c.oid = $1::text::regclass",
+                &[&relation],
+            ).await?;
+            let pages: i32 = metadata.try_get(0)?;
+            let ordinary_heap: bool = metadata.try_get(1)?;
+            let supports_tid_ranges: bool = metadata.try_get(2)?;
+            Ok::<_, tokio_postgres::Error>((pages, ordinary_heap, supports_tid_ranges))
+        }.await;
+        let (pages, readers) = match probe {
+            Ok((pages, ordinary_heap, supports_tid_ranges)) => {
+                let pages = u32::try_from(pages).unwrap_or_default();
+                let readers = if ordinary_heap && supports_tid_ranges {
+                    cpu_budget::cpu_budget().postgres_snapshot_readers(pages, pages_per_reader)
+                } else { 1 };
+                (pages, readers)
+            }
+            Err(error) => {
+                tracing::debug!(dataset = %input.dataset_name, table = %relation, error = %super::pg_error_detail(&error), "initial snapshot bootstrap probe failed; using one reader");
+                (0, 1)
+            }
         };
-
-        // REPEATABLE READ to lock in a consistent view.
-        client
-            .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
-            .await
-            .context(BootstrapSnafu)
-            .map_err(super::err_to_stream)?;
-
+        if let Some(observer) = readers_observer {
+            observer.store(readers, std::sync::atomic::Ordering::Release);
+        }
+        tracing::debug!(dataset = %input.dataset_name, readers, pages, "initial snapshot bootstrap readers");
+        holder.client.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .await.context(BootstrapSnafu).map_err(super::err_to_stream)?;
+        let snapshot: Option<String> = if readers > 1 {
+            // TRUNCATE and rewriting ALTER are not MVCC-safe without a table lock
+            // held before the snapshot: https://www.postgresql.org/docs/current/mvcc-caveats.html.
+            holder.client.simple_query(&format!("LOCK TABLE ONLY {relation} IN ACCESS SHARE MODE"))
+                .await.context(BootstrapSnafu).map_err(super::err_to_stream)?;
+            Some(holder.client.query_one("SELECT pg_export_snapshot()", &[])
+                .await.context(BootstrapSnafu).map_err(super::err_to_stream)?
+                .try_get(0).context(BootstrapSnafu).map_err(super::err_to_stream)?)
+        } else { None };
         // Stream rows out of the snapshot transaction. Select exactly the
         // dataset's columns (not `*`): columns outside the dataset schema —
         // whatever their types — are never fetched. Columns whose Arrow type
@@ -137,7 +196,7 @@ pub fn snapshot_stream(
         //     parser (NUMERIC has no native String deserialization).
         //   - List/Dictionary: Postgres array literal / enum label, parsed by
         //     the same builder the WAL path uses.
-        let select_list = dataset_schema
+        let select_list = input.dataset_schema
             .fields()
             .iter()
             .map(|f| {
@@ -157,43 +216,158 @@ pub fn snapshot_stream(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let select_sql = format!(
-            "SELECT {select_list} FROM {schema}.{table}",
-            schema = quote_ident(&schema_name),
-            table = quote_ident(&table_name),
+        let mut tasks = tokio::task::JoinSet::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(readers * BATCHES_PER_READER);
+        let mut holder = Some(holder);
+        for reader in 0..readers {
+            let sql = if readers == 1 {
+                // Preserve the single-reader SELECT, including inheritance semantics.
+                format!("SELECT {select_list} FROM {relation}")
+            } else {
+                let lo = u64::from(pages) * reader as u64 / readers as u64;
+                // ONLY keeps concurrent INHERIT from changing the scanned relation set.
+                let mut sql = format!("SELECT {select_list} FROM ONLY {relation} WHERE ctid >= '({lo},0)'::tid");
+                if reader + 1 < readers {
+                    let hi = u64::from(pages) * (reader + 1) as u64 / readers as u64;
+                    sql.push_str(&format!(" AND ctid < '({hi},0)'::tid"));
+                }
+                sql
+            };
+            let holder_connection = if reader == 0 { holder.take() } else { None };
+            let input = Arc::clone(&input);
+            let sender = sender.clone();
+            let snapshot = snapshot.clone();
+            tasks.spawn(async move {
+                let is_holder = holder_connection.is_some();
+                let connection = if let Some(connection) = holder_connection {
+                    connection
+                } else {
+                    let connection = connect(&input).await?;
+                    connection.client.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                        .await.context(BootstrapSnafu)?;
+                    // Import is the first statement after BEGIN, before any query.
+                    let snapshot = snapshot.as_ref().context(super::BootstrapReaderMissingSnafu)?;
+                    let import = format!("SET TRANSACTION SNAPSHOT '{}'", snapshot.replace('\'', "''"));
+                    connection.client.simple_query(&import).await.context(BootstrapSnafu)?;
+                    connection
+                };
+                let result = scan_reader(&connection.client, &input, &sql, &sender).await?;
+                if !is_holder {
+                    connection.client.simple_query("COMMIT").await.context(BootstrapSnafu)?;
+                }
+                Ok::<_, super::Error>((result, if is_holder { Some(connection) } else { None }))
+            });
+        }
+        drop(sender);
+        let confirmed_flush = Arc::new(AtomicU64::new(0));
+        let mut total_rows = 0;
+        let mut holder_result = None;
+        // `select!` arms run in their own async blocks, where `try_stream!` cannot
+        // rewrite `?` or `yield`, so each arm only reports what happened.
+        enum ReaderEvent<J> {
+            Joined(Option<J>),
+            Batch(ChangeBatch),
+        }
+        while !tasks.is_empty() {
+            let event = tokio::select! {
+                biased;
+                joined = tasks.join_next() => ReaderEvent::Joined(joined),
+                Some(batch) = receiver.recv() => ReaderEvent::Batch(batch),
+            };
+            match event {
+                ReaderEvent::Joined(joined) => {
+                    let result = joined.context(super::BootstrapReaderMissingSnafu)
+                        .and_then(|joined| joined.context(super::BootstrapReaderJoinSnafu))
+                        .and_then(std::convert::identity);
+                    if result.is_err() {
+                        // Tear down every transaction before yielding the error, even
+                        // if the caller leaves the stream suspended at that error.
+                        tasks.shutdown().await;
+                        drop(holder_result.take());
+                    }
+                    let ((final_batch, rows), connection) = result.map_err(super::err_to_stream)?;
+                    total_rows += rows;
+                    if let Some(connection) = connection {
+                        holder_result = Some((connection, final_batch));
+                    } else {
+                        yield envelope_with_lsn(final_batch, Arc::clone(&confirmed_flush), 0, false, input.dataset_name.clone());
+                    }
+                }
+                ReaderEvent::Batch(batch) => {
+                    yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false, input.dataset_name.clone());
+                }
+            }
+        }
+        // All producers finished; drain the bounded queue before the final boundary.
+        while let Some(batch) = receiver.recv().await {
+            yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false, input.dataset_name.clone());
+        }
+        let (holder, final_batch) = holder_result.context(super::BootstrapReaderMissingSnafu)
+            .map_err(super::err_to_stream)?;
+        let commit = holder.client.simple_query("COMMIT").await.context(BootstrapSnafu);
+        drop(holder);
+        commit.map_err(super::err_to_stream)?;
+        input.metrics.mark_bootstrap_complete();
+        tracing::info!(
+            dataset = %input.dataset_name,
+            rows = total_rows,
+            expected = ?input.metrics.bootstrap_rows_expected(),
+            "initial snapshot bootstrap complete"
         );
-        let portal_stream = client
-            .query_raw(&select_sql, std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>())
-            .await
-            .context(BootstrapSnafu)
-            .map_err(super::err_to_stream)?;
-        tokio::pin!(portal_stream);
+        // Readiness remains lag-based; shared.rs appends the watermark only on success.
+        yield envelope_with_lsn(final_batch, confirmed_flush, 0, false, input.dataset_name.clone());
+    })
+}
 
-        // Prepare accumulators.
-        let mut builders = dataset_schema
-            .fields()
-            .iter()
-            .map(|f| BootstrapBuilder::new(f.data_type()))
-            .collect::<Result<Vec<_>>>()
-            .map_err(super::err_to_stream)?;
-        let mut rows_in_batch: usize = 0;
-        let mut total_rows: u64 = 0;
-        let confirmed_flush = Arc::new(AtomicU64::new(0)); // unused for bootstrap, but needed by envelope helper
+/// Scan one transaction using exactly the bootstrap's existing Arrow conversion
+/// and batch boundaries. The final batch is returned for commit-before-boundary.
+async fn scan_reader(
+    client: &tokio_postgres::Client,
+    input: &SnapshotInput,
+    select_sql: &str,
+    sender: &tokio::sync::mpsc::Sender<ChangeBatch>,
+) -> Result<(ChangeBatch, u64)> {
+    let SnapshotInput {
+        params,
+        dataset_schema,
+        primary_keys,
+        dataset_name,
+        metrics,
+        ..
+    } = input;
+    let bootstrap_batch_size = params.bootstrap_batch_size;
+    let portal_stream = client
+        .query_raw(
+            select_sql,
+            std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>(),
+        )
+        .await
+        .context(BootstrapSnafu)?;
+    tokio::pin!(portal_stream);
 
-        // Cache dataset_field_idx → pg_column_idx once (computed from the first
-        // row's column metadata) so the hot per-row loop is O(fields) instead of
-        // O(fields²). All subsequent rows in a `SELECT *` stream share the same
-        // column layout.
-        let mut column_map: Option<Vec<usize>> = None;
+    // Prepare accumulators.
+    let mut builders = dataset_schema
+        .fields()
+        .iter()
+        .map(|f| BootstrapBuilder::new(f.data_type()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut rows_in_batch: usize = 0;
+    let mut total_rows: u64 = 0;
 
-        use futures::StreamExt;
-        while let Some(row_result) = portal_stream.next().await {
-            let row = row_result
-                .context(BootstrapSnafu)
-                .map_err(super::err_to_stream)?;
+    // Cache dataset_field_idx → pg_column_idx once (computed from the first
+    // row's column metadata) so the hot per-row loop is O(fields) instead of
+    // O(fields²). All subsequent rows in a SELECT stream share the same
+    // column layout.
+    let mut column_map: Option<Vec<usize>> = None;
 
-            if column_map.is_none() {
-                let map = dataset_schema
+    use futures::StreamExt;
+    while let Some(row_result) = portal_stream.next().await {
+        // Buffered rows can otherwise keep conversion running without yielding.
+        tokio::task::consume_budget().await;
+        let row = row_result.context(BootstrapSnafu)?;
+
+        if column_map.is_none() {
+            let map = dataset_schema
                     .fields()
                     .iter()
                     .map(|field| {
@@ -203,100 +377,60 @@ pub fn snapshot_stream(
                             .ok_or_else(|| super::Error::SchemaMismatch {
                                 message: format!(
                                     "dataset column `{}` not in source table `{schema_name}.{table_name}`",
-                                    field.name()
+                                    field.name(),
+                                    schema_name = input.schema_name,
+                                    table_name = input.table_name,
                                 ),
                             })
                     })
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(super::err_to_stream)?;
-                column_map = Some(map);
-            }
-            let Some(column_map_ref) = column_map.as_ref() else {
-                unreachable!("column_map is initialized above on first iteration")
-            };
-            for (col_idx, &pg_idx) in column_map_ref.iter().enumerate() {
-                builders[col_idx]
-                    .append_from_row(&row, pg_idx)
-                    .map_err(super::err_to_stream)?;
-            }
-            rows_in_batch += 1;
-            total_rows += 1;
-            metrics.add_bootstrap_rows(1);
+                    .collect::<Result<Vec<_>>>()?;
+            column_map = Some(map);
+        }
+        let Some(column_map_ref) = column_map.as_ref() else {
+            unreachable!("column_map is initialized above on first iteration")
+        };
+        for (col_idx, &pg_idx) in column_map_ref.iter().enumerate() {
+            builders[col_idx].append_from_row(&row, pg_idx)?;
+        }
+        rows_in_batch += 1;
+        total_rows += 1;
+        metrics.add_bootstrap_rows(1);
 
-            if rows_in_batch >= bootstrap_batch_size {
-                let batch = finish_batch(
-                    &dataset_schema,
-                    &mut builders,
-                    rows_in_batch,
-                    &primary_keys,
-                )
-                .map_err(super::err_to_stream)?;
-                rows_in_batch = 0;
-                builders = dataset_schema
-                    .fields()
-                    .iter()
-                    .map(|f| BootstrapBuilder::new(f.data_type()))
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(super::err_to_stream)?;
-                yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false, dataset_name.clone());
-                if let Some(percent) = metrics.bootstrap_progress_percent() {
-                    tracing::debug!(
-                        dataset = %dataset_name,
-                        rows = total_rows,
-                        expected = ?metrics.bootstrap_rows_expected(),
-                        progress_percent = percent,
-                        "initial snapshot bootstrap progress"
-                    );
-                }
+        if rows_in_batch >= bootstrap_batch_size {
+            let batch = finish_batch(dataset_schema, &mut builders, rows_in_batch, primary_keys)?;
+            rows_in_batch = 0;
+            builders = dataset_schema
+                .fields()
+                .iter()
+                .map(|f| BootstrapBuilder::new(f.data_type()))
+                .collect::<Result<Vec<_>>>()?;
+            snafu::ensure!(
+                sender.send(batch).await.is_ok(),
+                super::BootstrapReaderMissingSnafu
+            );
+            if let Some(percent) = metrics.bootstrap_progress_percent() {
+                tracing::debug!(
+                    dataset = %dataset_name,
+                    rows = total_rows,
+                    expected = ?metrics.bootstrap_rows_expected(),
+                    progress_percent = percent,
+                    "initial snapshot bootstrap progress"
+                );
             }
         }
+    }
 
-        // Build the final batch but do NOT yield it yet. We first commit the
-        // REPEATABLE READ transaction; only if that succeeds do we emit the
-        // snapshot-boundary envelope. If COMMIT fails we error out and the
-        // runtime never sees the snapshot, matching the durable state of the
-        // bootstrap. Readiness itself is lag-based and comes from the WAL
-        // stream that follows, not from this envelope.
-        let final_batch = if rows_in_batch > 0 {
-            finish_batch(
-                &dataset_schema,
-                &mut builders,
-                rows_in_batch,
-                &primary_keys,
-            )
-            .map_err(super::err_to_stream)?
-        } else {
-            // Empty table: still emit a zero-row snapshot-boundary envelope so
-            // the WAL stream has a clean schema baseline to chain from. The
-            // batch has zero rows.
-            finish_batch(&dataset_schema, &mut builders, 0, &primary_keys)
-                .map_err(super::err_to_stream)?
-        };
+    // The coordinator withholds the holder's final batch until every commit succeeds.
+    let final_batch = if rows_in_batch > 0 {
+        finish_batch(dataset_schema, &mut builders, rows_in_batch, primary_keys)?
+    } else {
+        // Empty table: still emit a zero-row snapshot-boundary envelope so
+        // the WAL stream has a clean schema baseline to chain from. The
+        // batch has zero rows.
+        finish_batch(dataset_schema, &mut builders, 0, primary_keys)?
+    };
 
-        client
-            .simple_query("COMMIT")
-            .await
-            .context(BootstrapSnafu)
-            .map_err(super::err_to_stream)?;
-        drop(client);
-        let _ = conn_task.await;
-
-        metrics.mark_bootstrap_complete();
-
-        tracing::info!(
-            dataset = %dataset_name,
-            rows = total_rows,
-            expected = ?metrics.bootstrap_rows_expected(),
-            "initial snapshot bootstrap complete"
-        );
-
-        // Yield AFTER the commit has succeeded. The `false` flag keeps
-        // readiness lag-based: the WAL stream that follows marks the dataset
-        // Ready only once it has caught up to the source head (see
-        // `client::wal_stream` and `pg_replication_ready_lag`), so this
-        // snapshot-boundary envelope does not itself flip the ready flag.
-        yield envelope_with_lsn(final_batch, Arc::clone(&confirmed_flush), 0, false, dataset_name.clone());
-    })
+    Ok((final_batch, total_rows))
 }
 
 fn finish_batch(
