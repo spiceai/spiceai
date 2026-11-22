@@ -1500,6 +1500,7 @@ impl Model for Protocol {
                 .iter()
                 .map(|((k, _), r)| format!("retired {} at v{}", key_label(*k), r.version)),
         );
+        let prepared_at = lines.len();
         if let Some(tx) = &state.prepared {
             lines.push(format!(
                 "prepared tx {}: add {} remove {}",
@@ -1512,10 +1513,15 @@ impl Model for Protocol {
         let col = head.right() + 90;
         let mut store_y = 22;
         let mut all: Vec<File> = state.store.clone();
+        let prepared_files: Vec<File> = state
+            .prepared
+            .as_ref()
+            .map_or_else(Vec::new, |tx| tx.files.clone());
         for f in state
             .head
             .iter()
             .chain(state.retired.iter().map(|(f, _)| f))
+            .chain(prepared_files.iter())
         {
             if !all.contains(f) {
                 all.push(*f);
@@ -1528,11 +1534,18 @@ impl Model for Protocol {
             let live = state.head.contains(f);
             let retired = state.retired.iter().any(|(r, _)| r == f);
             let deleting = state.deletes.iter().any(|(d, _, _)| d == f);
+            let prepared = prepared_files.contains(f);
             let (tone, note) = match (stored, live, retired) {
                 (false, true, _) => (Tone::Bad, "MISSING (head names it)"),
                 (false, _, true) => (Tone::Gone, "deleted, retirement not yet forgotten"),
+                (false, false, false) if prepared => {
+                    (Tone::Bad, "MISSING (prepared transaction names it)")
+                }
                 (true, true, _) => (Tone::Live, "live"),
                 (true, false, true) => (Tone::Gone, "retired, awaiting retention"),
+                (true, false, false) if prepared => {
+                    (Tone::Staged, "named by the prepared transaction")
+                }
                 _ => (Tone::Staged, "orphan: no committed head names it"),
             };
             let mut text = vec![format!("{note}; uploaded by writer {}", f.1)];
@@ -1553,6 +1566,21 @@ impl Model for Protocol {
                 svg.arrow(
                     (head.right(), head.line_y(live_at + i)),
                     (node.x, node.mid_y()),
+                    tone,
+                    None,
+                );
+            }
+        }
+        for f in &prepared_files {
+            if let Some((_, node)) = placed.iter().find(|(p, _)| p == f) {
+                let tone = if state.store.contains(f) {
+                    Tone::Staged
+                } else {
+                    Tone::Bad
+                };
+                svg.arrow(
+                    (head.right(), head.line_y(prepared_at)),
+                    (node.x, node.mid_y() + 2),
                     tone,
                     None,
                 );
@@ -2322,4 +2350,41 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
         state = next;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::Protocol;
+    use stateright::Model;
+
+    /// Files a prepared transaction names are not orphans: the drawing says so,
+    /// and shows one the store lacks as missing.
+    #[test]
+    fn prepared_files_are_named_and_missing_ones_shown() {
+        let model = Protocol::new("data-files-intent-retire-prepared", 2);
+        let path = crate::explorer::path_to(&model, |s| {
+            s.prepared
+                .as_ref()
+                .is_some_and(|t| t.files.iter().any(|f| s.store.contains(f)))
+        })
+        .expect("a stored prepared file");
+        let svg = model.as_svg(path).expect("data-files draws");
+        assert!(svg.contains("named by the prepared transaction"), "{svg}");
+
+        let model = Protocol::new(
+            "data-files-intent-retire-prepared-orphan-ignores-reservation",
+            2,
+        );
+        let path = crate::explorer::path_to(&model, |s| {
+            s.prepared
+                .as_ref()
+                .is_some_and(|t| t.files.iter().any(|f| !s.store.contains(f)))
+        })
+        .expect("a missing prepared file");
+        let svg = model.as_svg(path).expect("data-files draws");
+        assert!(
+            svg.contains("MISSING (prepared transaction names it)"),
+            "{svg}"
+        );
+    }
 }
