@@ -297,17 +297,17 @@ fn snapshot_stream_inner(
                     if let Some(connection) = connection {
                         holder_result = Some((connection, final_batch));
                     } else {
-                        yield envelope_with_lsn(final_batch, Arc::clone(&confirmed_flush), 0, false, input.dataset_name.clone());
+                        yield envelope_with_lsn(final_batch, Arc::clone(&confirmed_flush), 0, false, input.dataset_name.clone()).with_snapshot_rows();
                     }
                 }
                 ReaderEvent::Batch(batch) => {
-                    yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false, input.dataset_name.clone());
+                    yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false, input.dataset_name.clone()).with_snapshot_rows();
                 }
             }
         }
         // All producers finished; drain the bounded queue before the final boundary.
         while let Some(batch) = receiver.recv().await {
-            yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false, input.dataset_name.clone());
+            yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false, input.dataset_name.clone()).with_snapshot_rows();
         }
         let (holder, final_batch) = holder_result.context(super::BootstrapReaderMissingSnafu)
             .map_err(super::err_to_stream)?;
@@ -322,7 +322,7 @@ fn snapshot_stream_inner(
             "initial snapshot bootstrap complete"
         );
         // Readiness remains lag-based; shared.rs appends the watermark only on success.
-        yield envelope_with_lsn(final_batch, confirmed_flush, 0, false, input.dataset_name.clone());
+        yield envelope_with_lsn(final_batch, confirmed_flush, 0, false, input.dataset_name.clone()).with_snapshot_rows();
     }
 }
 

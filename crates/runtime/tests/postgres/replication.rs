@@ -229,7 +229,8 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
 
     // --- 1. Bootstrap envelope: two rows, op="c" ---
     let envelope = next_envelope(&mut stream, "bootstrap envelope").await?;
-    let (committer, change_batch, is_ready, _) = envelope.into_parts().expect("build change batch");
+    let (committer, change_batch, is_ready, _, _) =
+        envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -339,7 +340,8 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     };
     let mut stream = start_replication_stream(input);
     let envelope = next_envelope(&mut stream, "forced resume snapshot").await?;
-    let (committer, change_batch, is_ready, _) = envelope.into_parts().expect("build change batch");
+    let (committer, change_batch, is_ready, _, _) =
+        envelope.into_parts().expect("build change batch");
     assert_eq!(
         change_batch.record.num_rows(),
         2,
@@ -406,7 +408,8 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
     // Bootstrap: the seed row arrives as a not-ready boundary; readiness is
     // lag-based and follows from the live/heartbeat path once caught up.
     let envelope = next_envelope(&mut stream, "bootstrap envelope").await?;
-    let (committer, change_batch, is_ready, _) = envelope.into_parts().expect("build change batch");
+    let (committer, change_batch, is_ready, _, _) =
+        envelope.into_parts().expect("build change batch");
     assert_eq!(change_batch.record.num_rows(), 1);
     assert!(
         !is_ready,
@@ -479,7 +482,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
                     seen.len()
                 )
             })??;
-        let (committer, change_batch, _, _) = envelope.into_parts().expect("build change batch");
+        let (committer, change_batch, _, _, _) = envelope.into_parts().expect("build change batch");
         let data_struct = change_batch
             .record
             .column_by_name("data")
@@ -897,7 +900,7 @@ async fn run_wide_types_scenario(
         ))
         .await?;
     let env = next_change_envelope(&mut stream, &format!("insert envelope ({tag})")).await?;
-    let (committer, batch, _, _) = env.into_parts().expect("build change batch");
+    let (committer, batch, _, _, _) = env.into_parts().expect("build change batch");
     assert_eq!(
         batch
             .record
@@ -1008,7 +1011,7 @@ async fn run_wide_types_scenario(
         ))
         .await?;
     let env = next_change_envelope(&mut stream, &format!("update envelope ({tag})")).await?;
-    let (committer, batch, _, _) = env.into_parts().expect("build change batch");
+    let (committer, batch, _, _, _) = env.into_parts().expect("build change batch");
     assert_eq!(
         batch
             .record
@@ -1060,7 +1063,7 @@ async fn run_wide_types_scenario(
         .simple_query(&format!("DELETE FROM public.{table} WHERE id = 1"))
         .await?;
     let env = next_change_envelope(&mut stream, &format!("delete envelope ({tag})")).await?;
-    let (committer, batch, _, _) = env.into_parts().expect("build change batch");
+    let (committer, batch, _, _, _) = env.into_parts().expect("build change batch");
     assert_eq!(
         batch
             .record
