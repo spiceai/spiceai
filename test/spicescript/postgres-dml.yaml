@@ -97,13 +97,14 @@ steps:
     eventually: 30s
 
   # A timestamp bound reaches PostgreSQL with every microsecond, a bound
-  # between two microseconds compares exactly, and a SET value between two
+  # between two microseconds compares exactly (truncated to T+1us, the
+  # DELETE would also remove row 1), and a SET value between two
   # microseconds is truncated as PostgreSQL stores it. The rows sit at T,
   # T+1us and T+2us.
   - spice-exec: UPDATE ev SET note = 'eq' WHERE ts = TIMESTAMP '2024-01-01 00:00:00.000001'
   - source-query: { src: "SELECT id, note FROM ev ORDER BY id" }
     expect: { rows: [['0', ''], ['1', eq], ['2', '']] }
-  - spice-exec: DELETE FROM ev WHERE ts > TIMESTAMP '2024-01-01 00:00:00.000001500'
+  - spice-exec: DELETE FROM ev WHERE ts >= TIMESTAMP '2024-01-01 00:00:00.000001500'
   - source-query: { src: "SELECT id FROM ev ORDER BY id" }
     expect: { rows: [['0'], ['1']] }
   - spice-exec: UPDATE ev SET ts = TIMESTAMP '2024-01-01 00:00:00.000001500' WHERE id = 0
