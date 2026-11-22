@@ -448,7 +448,7 @@ impl Model for Protocol {
                 "table high seq: t0 {}, t1 {}",
                 s.table_high[0], s.table_high[1]
             ));
-            for (t, k, v, seq) in &s.rows {
+            for (t, k, seq, v) in &s.rows {
                 lines.push(format!("  row t{t}.k{k} = v{v} seq {seq}"));
             }
             for (t, k, d) in &s.deletes {
@@ -620,5 +620,23 @@ impl Model for Protocol {
                 }),
             ]
         }
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Action, Protocol};
+    use stateright::Model;
+
+    /// Rows are `(table, key, sequence, value)`; the step text names each
+    /// field as the oracle does.
+    #[test]
+    fn table_row_shows_its_value_and_sequence() {
+        let model = Protocol::new("tables-design", 3);
+        let init = model.init_states().remove(0);
+        let text = model
+            .format_step(&init, Action::TableRecord(1, 0, true))
+            .expect("enabled step");
+        assert!(text.contains("  row t1.k0 = v1 seq 2\n"), "{text}");
     }
 }
