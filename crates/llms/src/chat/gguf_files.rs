@@ -537,8 +537,9 @@ pub const DEFAULT_TAGS: [&str; 2] = ["Q4_K_M", "Q8_0"];
 /// The quantization a model with no `files` loads by default, as llama.cpp's `-hf` picks it:
 /// the first by path whose first file's path carries [`DEFAULT_TAGS`]' `Q4_K_M`, else `Q8_0`,
 /// else the first by path. A path carries a tag where the tag follows the path's start, `-`,
-/// `.` or `/` and comes before `.` or `-`, in any case, so `UD-Q4_K_M` and a `Q4_K_M/` folder
-/// carry `Q4_K_M` and `BF16` does not carry `F16`. `None` when there is none.
+/// `.` or `/` and comes before `.` or `-`, in any case, so `Model-UD-Q4_K_M.gguf` carries
+/// `Q4_K_M`, `Q4_K_M/model.gguf` does not (only its folder bears the tag), and `BF16` does not
+/// carry `F16`. `None` when there is none.
 #[must_use]
 pub fn default_quantization(quantizations: &[Quantization]) -> Option<&Quantization> {
     let mut by_path: Vec<&Quantization> = quantizations.iter().collect();
