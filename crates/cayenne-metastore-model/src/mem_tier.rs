@@ -878,14 +878,29 @@ impl Model for Protocol {
         match action {
             Action::Upsert(k, v) => format!("CDC upsert k{k} = v{v} (or its redelivery)"),
             Action::Delete(k) => format!("CDC delete k{k} (or its redelivery)"),
+            Action::SealCapture if self.has("no-capture-reservation") => {
+                "seal: capture the memory tier (its sequence is reserved later)".into()
+            }
             Action::SealCapture => "seal: capture the memory tier".into(),
             Action::SealReserve => "seal: reserve its sequence number".into(),
-            Action::SealStage => "seal: stage inline shadow rows (and tombstones)".into(),
+            Action::SealStage if self.has("no-one-call") => {
+                "seal: stage inline shadow rows (tombstones follow in a separate call)".into()
+            }
+            Action::SealStage => "seal: stage inline shadow rows and tombstones in one call".into(),
             Action::SealStageRest => "seal: stage the tombstones separately".into(),
             Action::SealEnd => "seal: publish, then acknowledge the source".into(),
             Action::CkCapture => "checkpoint: capture the memory tier".into(),
+            Action::CkPrecompute if self.has("no-insert-records") => {
+                "checkpoint: choose the keys that need insert records (none: this control writes no insert records)".into()
+            }
             Action::CkPrecompute => "checkpoint: choose the keys that need insert records".into(),
-            Action::CkStage => "checkpoint: stage its snapshot, deletes and insert records".into(),
+            Action::CkStage if self.has("no-one-call") => {
+                "checkpoint: stage snapshot and deletes (insert records follow in a separate call)".into()
+            }
+            Action::CkStage if self.has("no-early-stamp") => {
+                "checkpoint: stage snapshot, deletes and insert records in one call, stamping them at a newly reserved sequence".into()
+            }
+            Action::CkStage => "checkpoint: stage snapshot, deletes and insert records in one call".into(),
             Action::CkStageRest => "checkpoint: stage insert records separately".into(),
             Action::CkPublish => "checkpoint: apply to the in-memory index".into(),
             Action::CkEnd => "checkpoint: publish, then acknowledge the source".into(),
@@ -964,14 +979,20 @@ impl Model for Protocol {
                 Tone::Actor,
             ),
             (
+                // Like "live reads match the source", live rows are compared only
+                // outside a crash and outside redelivery after recovery.
                 if s.crashed {
                     "LIVE (process CRASHED)".into()
+                } else if s.replay.is_some() {
+                    "LIVE (redelivering the source)".into()
                 } else {
                     "LIVE (what a query sees)".into()
                 },
                 vec![rows_text(&live)],
                 if s.crashed {
                     Tone::Gone
+                } else if s.replay.is_some() {
+                    Tone::Staged
                 } else if live == expected {
                     Tone::Live
                 } else {
@@ -1469,8 +1490,60 @@ pub(crate) fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<
 
 #[cfg(test)]
 mod explorer_tests {
-    use super::{Action, Protocol};
+    use super::{Action, Protocol, reference, visible};
     use stateright::{Model, Path};
+
+    /// Staging labels describe the run's own protocol, including what its
+    /// control removes.
+    #[test]
+    fn staging_labels_follow_the_mode() {
+        let one_call = Protocol::new("mem-tier-seal-delete-only", 3);
+        let split = Protocol::new("mem-tier-seal-delete-only-no-one-call", 3);
+        let late = Protocol::new("mem-tier-seal-delete-only-no-early-stamp", 3);
+        let unreserved = Protocol::new("mem-tier-seal-delete-only-no-capture-reservation", 3);
+        let no_records = Protocol::new("mem-tier-seal-delete-only-no-insert-records", 3);
+        assert_eq!(
+            one_call.format_action(&Action::SealStage),
+            "seal: stage inline shadow rows and tombstones in one call"
+        );
+        assert_eq!(
+            split.format_action(&Action::SealStage),
+            "seal: stage inline shadow rows (tombstones follow in a separate call)"
+        );
+        assert_eq!(
+            one_call.format_action(&Action::CkStage),
+            "checkpoint: stage snapshot, deletes and insert records in one call"
+        );
+        assert_eq!(
+            split.format_action(&Action::CkStage),
+            "checkpoint: stage snapshot and deletes (insert records follow in a separate call)"
+        );
+        assert_eq!(
+            late.format_action(&Action::CkStage),
+            "checkpoint: stage snapshot, deletes and insert records in one call, stamping them at a newly reserved sequence"
+        );
+        assert_eq!(
+            unreserved.format_action(&Action::SealCapture),
+            "seal: capture the memory tier (its sequence is reserved later)"
+        );
+        assert_eq!(
+            no_records.format_action(&Action::CkPrecompute),
+            "checkpoint: choose the keys that need insert records (none: this control writes no insert records)"
+        );
+    }
+
+    /// While the process redelivers the source after recovery, live rows may
+    /// lag the source by design; the drawing does not call that a failure.
+    #[test]
+    fn redelivery_is_not_drawn_as_a_failure() {
+        let model = Protocol::new("mem-tier-seal-delete-only", 3);
+        let path = crate::explorer::path_to(&model, |s| {
+            s.replay.is_some() && visible(s) != reference(&s.source)
+        })
+        .expect("a state partway through redelivery");
+        let svg = model.as_svg(path).expect("mem-tier draws");
+        assert!(svg.contains("LIVE (redelivering the source)"), "{svg}");
+    }
 
     /// After a full rewrite and a seal, the delete vector's insert stamp keeps
     /// the current-file row visible, so the drawing states the delete and the

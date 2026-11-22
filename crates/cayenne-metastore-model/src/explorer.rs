@@ -190,7 +190,7 @@ impl Svg {
             (Tone::Live, "committed"),
             (Tone::Staged, "written, not referenced / in flight"),
             (Tone::Gone, "collected / superseded"),
-            (Tone::Bad, "missing / violated"),
+            (Tone::Bad, "missing / violated / crash"),
             (Tone::Actor, "actor"),
         ] {
             let _ = write!(

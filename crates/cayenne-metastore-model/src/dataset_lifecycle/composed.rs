@@ -763,8 +763,11 @@ impl Model for Protocol {
                     format!("#{} t{}.k{} ({mark})", f.id, f.table, f.key)
                 })
                 .collect();
+            // "snapshot rows or error" allows an error (a missing delayed object
+            // erroring is a witness), so an error is drawn as an outcome, not a
+            // violation; wrong rows show in the summary against the source.
             let tone = if s.result == Some(Err(())) {
-                Tone::Bad
+                Tone::Gone
             } else {
                 Tone::Actor
             };
