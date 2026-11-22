@@ -204,6 +204,14 @@ fn candidates<P: AsRef<Path>>(weights: &[P]) -> Vec<&P> {
         .filter(|w| name(w).is_some_and(gguf_files::is_model_weights))
         .collect();
     let weights: Vec<&P> = if model.is_empty() { trunk } else { model };
+    // Only a series' first shard holds the architecture, as gguf-split writes it, so the other
+    // shards are not read.
+    let opening: Vec<&P> = weights
+        .iter()
+        .copied()
+        .filter(|w| name(w).is_some_and(gguf_files::opens_a_set))
+        .collect();
+    let weights = if opening.is_empty() { weights } else { opening };
     // The engine opens a model from its first `-00001-of-` shard, else from its first file, and
     // sets aside a drafter it tells by its header: read in that order, so that when the first
     // file is a drafter's, passed over for its header, the weights' is read next.
@@ -362,6 +370,14 @@ mod tests {
         assert_eq!(
             local_architecture(&[lone_weights, drafter_first, drafter_second]).await,
             Some("qwen3".to_string())
+        );
+        // a series' other shards are never read: only its first holds the architecture
+        let silent_first = dir.path().join("silent-Q8_0-00001-of-00002.gguf");
+        std::fs::write(&silent_first, b"no header").expect("the first shard is written");
+        let speaking_second = write("silent-Q8_0-00002-of-00002.gguf", "qwen3");
+        assert_eq!(
+            local_architecture(&[silent_first, speaking_second]).await,
+            None
         );
         // an MTP head is set aside before the weights are looked for, sharded or not
         let imatrix_named = write("model-Q4_K_M-imatrix.gguf", "qwen3");

@@ -89,7 +89,8 @@ pub struct Quantization {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     pub weights: Vec<String>,
-    /// The draft head's files, shard 1 first, which the engine opens; empty without a head.
+    /// The drafter's files, shard 1 first, which the engine opens: an MTP draft head, or a
+    /// `DFlash` drafter its header tells; empty without one.
     pub draft: Vec<String>,
     /// The quantization the weights are, when they are one.
     pub quantization: Option<String>,
@@ -258,6 +259,13 @@ fn is_projector(path: &str) -> bool {
 #[must_use]
 pub fn is_model_weights(path: &str) -> bool {
     !is_projector(path) && !is_sidecar(path)
+}
+
+/// Whether the GGUF file at `path` is the one its set of weights opens from: a lone file, or the
+/// first shard of a series.
+#[must_use]
+pub fn opens_a_set(path: &str) -> bool {
+    shard(path).is_none_or(|(_, index, _)| index == 1)
 }
 
 /// The file of `files` that an engine taking one file opens the model from. An MTP draft head
@@ -649,7 +657,7 @@ pub fn resolve(
 
 /// [`resolve`], with the sets of weights that open from a file in `drafters` taken for drafters,
 /// as the engine tells a `DFlash` drafter by its header: they are not counted as a second set of
-/// weights, and they go after the weights, which a model opens from.
+/// weights, and they are the model's draft, after its weights, in place of an MTP head.
 ///
 /// # Errors
 ///
@@ -765,12 +773,12 @@ pub fn resolve_with_drafters(
         let (weights, opening) = sets.into_values().unzip();
         return Err(ResolveError::SeveralWeights { weights, opening });
     }
-    // A drafter goes after the weights, so that an engine that opens the first file opens them.
-    let (mut weights, drafted): (Vec<String>, Vec<String>) = weights
+    // A drafter the headers tell drafts beside the weights, as the engine drafts with it, in
+    // place of the MTP head a named quantization would bring.
+    let (weights, drafted): (Vec<String>, Vec<String>) = weights
         .into_iter()
         .partition(|w| !drafters.contains(&opening(w)));
-    let model_weights = weights.clone();
-    weights.extend(drafted);
+    draft.extend(drafted);
     if weights.is_empty() && draft.is_empty() {
         return Ok(None);
     }
@@ -779,7 +787,7 @@ pub fn resolve_with_drafters(
             draft = draft_head(listing, q);
         }
         quantization = Some(q.name.clone());
-    } else if let Some(q) = quantizations.iter().find(|q| q.files == model_weights) {
+    } else if let Some(q) = quantizations.iter().find(|q| q.files == weights) {
         quantization = Some(q.name.clone());
     }
     Ok(Some(Resolved {
@@ -1395,14 +1403,12 @@ mod tests {
             let resolved = resolve_with_drafters(&repo, files, &drafters)
                 .expect("Q4_K_M resolves beside its drafter")
                 .expect("Q4_K_M names weights");
+            // the drafter drafts, in place of the MTP head the quantization would bring
             assert_eq!(
                 (resolved.weights, resolved.draft, resolved.quantization),
                 (
-                    vec![
-                        "Model-Q4_K_M.gguf".to_string(),
-                        "Model-Q8_0.gguf".to_string()
-                    ],
-                    vec!["mtp-Model-Q4_K_M.gguf".to_string()],
+                    vec!["Model-Q4_K_M.gguf".to_string()],
+                    vec!["Model-Q8_0.gguf".to_string()],
                     Some("Q4_K_M".to_string())
                 ),
                 "files {files:?}"
