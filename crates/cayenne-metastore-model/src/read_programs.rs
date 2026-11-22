@@ -80,14 +80,17 @@ fn program_text(p: &Program) -> String {
             predicate,
             column,
             limit,
-        } => format!("UPDATE {} SET c{column} LIMIT {limit}", predicate.text()),
+        } => format!(
+            "UPDATE {} SET c{column} = c{column} + 1 (fails if any c{column} would exceed {limit})",
+            predicate.text()
+        ),
         Program::Delete(predicate) => format!("DELETE FROM {}", predicate.text()),
         Program::InsertSelect {
             predicate,
             target,
             key_offset,
         } => format!(
-            "INSERT INTO t{target} SELECT FROM {} (key + {key_offset})",
+            "INSERT INTO t{target} SELECT * FROM {} AT KEY (key + {key_offset}) MOD 3 (fails if a destination row exists)",
             predicate.text()
         ),
         Program::Aggregate { table, target, cap } => format!(
@@ -96,7 +99,7 @@ fn program_text(p: &Program) -> String {
             k = target.1
         ),
         Program::Absent { lookup, target } => format!(
-            "IF NOT EXISTS t{}.k{} INSERT t{}.k{}",
+            "IF t{}.k{} IS ABSENT SET t{}.k{} = [1, 1]",
             lookup.0, lookup.1, target.0, target.1
         ),
         Program::Blind(writes) => format!(
@@ -111,10 +114,13 @@ fn program_text(p: &Program) -> String {
                 .join(", ")
         ),
         Program::Insert { target, value } => {
-            format!("INSERT t{}.k{} = {value:?}", target.0, target.1)
+            format!(
+                "INSERT t{}.k{} = {value:?} (fails if the row exists)",
+                target.0, target.1
+            )
         }
         Program::Append(rows) => format!(
-            "append {}",
+            "append {} (fails if any row exists)",
             rows.iter()
                 .map(|((t, k), v)| format!("t{t}.k{k}={v:?}"))
                 .collect::<Vec<_>>()
@@ -1447,6 +1453,76 @@ impl Model for PredicateProgress {
 #[cfg(test)]
 mod explorer_tests {
     use super::{Program, program_text};
+
+    /// Every program's label names what `execute` does, including when the
+    /// statement fails.
+    #[test]
+    fn every_label_matches_execute() {
+        let p = super::Predicate {
+            table: 0,
+            column: 1,
+            equals: 2,
+        };
+        let cases = [
+            (Program::Delete(p.clone()), "DELETE FROM t0 WHERE c1 = 2"),
+            (
+                Program::InsertSelect {
+                    predicate: p.clone(),
+                    target: 1,
+                    key_offset: 1,
+                },
+                "INSERT INTO t1 SELECT * FROM t0 WHERE c1 = 2 AT KEY (key + 1) MOD 3 (fails if a destination row exists)",
+            ),
+            (
+                Program::Absent {
+                    lookup: (0, 1),
+                    target: (1, 2),
+                },
+                "IF t0.k1 IS ABSENT SET t1.k2 = [1, 1]",
+            ),
+            (
+                Program::Blind(vec![((0, 1), Some([1, 2])), ((1, 0), None)]),
+                "blind write t0.k1=[1, 2], t1.k0=delete",
+            ),
+            (
+                Program::Insert {
+                    target: (0, 1),
+                    value: [1, 2],
+                },
+                "INSERT t0.k1 = [1, 2] (fails if the row exists)",
+            ),
+            (
+                Program::Append(vec![((0, 1), [1, 2])]),
+                "append t0.k1=[1, 2] (fails if any row exists)",
+            ),
+            (
+                Program::Transaction(vec![Program::Delete(p)]),
+                "BEGIN; DELETE FROM t0 WHERE c1 = 2; COMMIT",
+            ),
+        ];
+        for (program, label) in cases {
+            assert_eq!(program_text(&program), label);
+        }
+    }
+
+    /// The label describes what the model executes: each matching row's column
+    /// incremented, the whole statement failing if any result exceeds the limit.
+    #[test]
+    fn update_label_names_the_increment_and_the_ceiling() {
+        let text = program_text(&Program::Update {
+            predicate: super::Predicate {
+                table: 0,
+                column: 1,
+                equals: 2,
+            },
+            column: 0,
+            limit: 2,
+        });
+        assert_eq!(
+            text,
+            "UPDATE t0 WHERE c1 = 2 SET c0 = c0 + 1 (fails if any c0 would exceed 2)"
+        );
+    }
 
     /// The label describes what the model executes: a fixed insert gated on
     /// the target being absent and `SUM(c0) + 1` staying within the cap.
