@@ -737,7 +737,7 @@ where
 /// How a reader's fetch of object `o` is drawn: red only for a violation the
 /// fetch itself raised, and named by which one. `unavailable` is a failure
 /// within the protection window; `wrong_rows` is a missing object read as
-/// empty. Otherwise a miss is an allowed error once the window has passed.
+/// empty. Any other miss is drawn as a plain miss.
 pub(crate) fn fetch_event(
     o: usize,
     found: bool,
@@ -756,10 +756,10 @@ pub(crate) fn fetch_event(
             Tone::Bad,
         ),
         (true, false, false) => (label, Tone::Actor),
-        (false, false, false) => (
-            format!("object {o} is gone after the window (allowed)"),
-            Tone::Gone,
-        ),
+        // Whether this miss is allowed depends on the window; a repeat of a
+        // violation raises no new flag, so the drawing does not claim either way
+        // (`BREAKS` marks a step that breaks a property).
+        (false, false, false) => (format!("object {o} is missing"), Tone::Gone),
     }
 }
 
