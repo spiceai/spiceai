@@ -216,7 +216,15 @@ impl Model for Protocol {
     fn format_action(&self, action: &Action) -> String {
         match action {
             Action::Receive => "the writer receives the next source change".into(),
-            Action::Issue => "the writer sends a commit of its buffer and source position".into(),
+            Action::Issue if self.has("position-before-data") => {
+                "the writer sends its source position, then its buffer, as two commits".into()
+            }
+            Action::Issue if self.has("position-after-data") => {
+                "the writer sends its buffer, then its source position, as two commits".into()
+            }
+            Action::Issue => {
+                "the writer sends one commit of its buffer and its source position".into()
+            }
             Action::Deliver(i, 0) => format!("attempt {i} arrives"),
             Action::Deliver(i, _) => format!("the resent attempt {i} arrives"),
             Action::Resolve => "the writer reads the head to resolve its attempt".into(),
@@ -374,5 +382,29 @@ impl Model for Protocol {
                 s.accepted.iter().any(|&i| s.attempts[i].rows.len() == 2)
             }),
         ]
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::{Action, Protocol};
+    use stateright::Model;
+
+    /// The commit label says what each mode publishes: data and position in
+    /// one commit, or (in the split controls) one of them per commit.
+    #[test]
+    fn commit_label_follows_the_mode() {
+        assert_eq!(
+            Protocol::new("source-positions", 2).format_action(&Action::Issue),
+            "the writer sends one commit of its buffer and its source position"
+        );
+        assert_eq!(
+            Protocol::new("source-position-before-data", 2).format_action(&Action::Issue),
+            "the writer sends its source position, then its buffer, as two commits"
+        );
+        assert_eq!(
+            Protocol::new("source-position-after-data", 2).format_action(&Action::Issue),
+            "the writer sends its buffer, then its source position, as two commits"
+        );
     }
 }
