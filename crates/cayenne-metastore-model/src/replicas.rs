@@ -589,16 +589,22 @@ impl Model for Protocol {
                 Action::Start => Event::on(reader, label).tone(Tone::Actor),
                 Action::Get(o) => {
                     let ok = before.replica & bit(o) != 0;
-                    Event::on(
-                        reader,
-                        if ok {
-                            label
-                        } else {
-                            format!("object {o} MISSING at the replica")
-                        },
-                    )
-                    .to(replica)
-                    .tone(if ok { Tone::Actor } else { Tone::Bad })
+                    // A miss is a violation only when this read raises a property's
+                    // flag; past the retention an error is an allowed outcome.
+                    let violated = (after.bad_availability && !before.bad_availability)
+                        || (after.bad_rows && !before.bad_rows);
+                    let (text, tone) = match (ok, violated) {
+                        (true, false) => (label, Tone::Actor),
+                        (_, true) => (
+                            format!("object {o} is MISSING within the retention"),
+                            Tone::Bad,
+                        ),
+                        (false, false) => (
+                            format!("object {o} is gone after the retention (allowed)"),
+                            Tone::Gone,
+                        ),
+                    };
+                    Event::on(reader, text).to(replica).tone(tone)
                 }
                 Action::ReplicaRead | Action::ReplicaExpire(_) | Action::ReplicaSweep(_) => {
                     Event::on(gc, label).to(replica)

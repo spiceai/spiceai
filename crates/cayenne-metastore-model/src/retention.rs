@@ -757,16 +757,22 @@ impl Model for Protocol {
                 Action::Start => Event::on(reader, label).tone(Tone::Actor),
                 Action::Get(o) => {
                     let ok = before.present[o];
-                    Event::on(
-                        reader,
-                        if ok {
-                            label
-                        } else {
-                            format!("object {o} is MISSING")
-                        },
-                    )
-                    .to(store)
-                    .tone(if ok { Tone::Actor } else { Tone::Bad })
+                    // A miss is a violation only when this read raises a property's
+                    // flag; past the retention an error is an allowed outcome.
+                    let violated = (after.bad_availability && !before.bad_availability)
+                        || (after.bad_rows && !before.bad_rows);
+                    let (text, tone) = match (ok, violated) {
+                        (true, false) => (label, Tone::Actor),
+                        (_, true) => (
+                            format!("object {o} is MISSING within the retention"),
+                            Tone::Bad,
+                        ),
+                        (false, false) => (
+                            format!("object {o} is gone after the retention (allowed)"),
+                            Tone::Gone,
+                        ),
+                    };
+                    Event::on(reader, text).to(store).tone(tone)
                 }
             });
         }
@@ -844,6 +850,39 @@ impl Model for Protocol {
 mod explorer_tests {
     use super::query_outcome;
     use crate::explorer::Tone;
+
+    /// A read that finds its object deleted after the retention has passed is
+    /// an allowed error, so the timeline draws it grey, as the query box does.
+    #[test]
+    fn allowed_late_miss_is_grey_in_the_timeline() {
+        use super::{Action, Protocol};
+        use stateright::{Model, Path};
+        let model = Protocol::new("retention-readers");
+        let init = model.init_states().remove(0);
+        let actions = [
+            Action::Upload(0, 0),
+            Action::Dispatch(0),
+            Action::Land,
+            Action::Confirm,
+            Action::Respond,
+            Action::Start,
+            Action::Remove(0),
+            Action::Tick,
+            Action::Tick,
+            Action::Tick,
+            Action::Expire(0),
+            Action::Collect(0),
+            Action::Get(0),
+        ];
+        let path = Path::from_actions(&model, init, &actions).expect("enabled trace");
+        assert!(!path.last_state().bad_availability);
+        let svg = model.as_svg(path).expect("retention draws");
+        assert!(
+            svg.contains("object 0 is gone after the retention (allowed)"),
+            "{svg}"
+        );
+        assert!(!svg.contains("is MISSING"), "{svg}");
+    }
 
     /// Only an outcome the properties forbid is drawn as a violation.
     #[test]
