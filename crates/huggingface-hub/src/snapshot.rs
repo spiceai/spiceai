@@ -40,7 +40,7 @@ use crate::client::{self, EntryKind, Hub, HubConfig, TreeEntry};
 use crate::download::{self, Checksum, FetchError, Progress};
 use crate::error::{Cause, DownloadContext, DownloadError};
 use crate::location::RepoId;
-use crate::settings::Settings;
+use crate::settings::{Offline, Settings};
 
 /// Files of one repository downloaded at once, as `hf download` does.
 const MAX_CONCURRENT_FILES: usize = 8;
@@ -108,8 +108,8 @@ impl From<TreeEntry> for RepoFile {
 pub(crate) enum Source {
     /// The Hub's listing of the commit.
     Hub,
-    /// The cache, read alone because `HF_HUB_OFFLINE` is set.
-    OfflineCache,
+    /// The cache, read alone because `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` is set (`by`).
+    OfflineCache { by: Offline },
     /// The cache, read alone because the Hub's listing failed with `error`: the Hub could not
     /// be reached, or it refused the request.
     CacheInOutage { error: Arc<client::Error> },
@@ -122,7 +122,7 @@ impl Source {
     pub(crate) fn cache_only_reason(&self) -> Option<String> {
         match self {
             Source::Hub => None,
-            Source::OfflineCache => Some("`HF_HUB_OFFLINE` is set".to_string()),
+            Source::OfflineCache { by } => Some(by.is_set()),
             Source::CacheInOutage { error } => Some(crate::error::fallback_clause(error)),
         }
     }
@@ -212,11 +212,11 @@ impl Snapshot {
         let hub = Arc::new(hub);
         let cache = HubCache::new(settings.cache_dir.clone());
 
-        let (commit, files, source) = if settings.offline {
+        let (commit, files, source) = if let Some(by) = settings.offline {
             let (commit, files) = from_cache(&cache, &repo, &revision)
                 .await
-                .ok_or_else(|| context.error(None, Cause::OfflineNoSnapshot))?;
-            (commit, files, Source::OfflineCache)
+                .ok_or_else(|| context.error(None, Cause::OfflineNoSnapshot { by }))?;
+            (commit, files, Source::OfflineCache { by })
         } else {
             let listed = match paths {
                 None => from_hub(&hub, &cache, &repo, &revision).await,
@@ -395,12 +395,12 @@ impl Snapshot {
         self.source.cache_only_reason()
     }
 
-    /// Whether the snapshot lists only the files the cache holds because `HF_HUB_OFFLINE` is
-    /// set, which lasts until the process restarts without it. With the Hub out of reach
+    /// Whether the snapshot lists only the files the cache holds because `HF_HUB_OFFLINE` or
+    /// `TRANSFORMERS_OFFLINE` is set, which lasts until the process restarts without it. With the Hub out of reach
     /// instead, a later snapshot can list the repository's files again.
     #[must_use]
     pub fn is_offline(&self) -> bool {
-        matches!(self.source, Source::OfflineCache)
+        matches!(self.source, Source::OfflineCache { .. })
     }
 
     /// The component the snapshot is for.

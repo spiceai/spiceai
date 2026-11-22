@@ -674,6 +674,58 @@ async fn offline_mode_with_a_cold_cache_says_how_to_fill_it() {
     assert!(fixture.mock.seen().is_empty());
 }
 
+/// `TRANSFORMERS_OFFLINE` keeps Spice off the Hub as `HF_HUB_OFFLINE` does, and a message
+/// names the variable that is set, so that its fix unsets what keeps the cache read alone.
+#[tokio::test]
+async fn transformers_offline_is_named_as_what_keeps_the_hub_unread() {
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+
+    let error = fixture
+        .try_open(None, &[("TRANSFORMERS_OFFLINE", "1")])
+        .await
+        .expect_err("nothing is cached");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `TRANSFORMERS_OFFLINE` is set and revision 'main' of the repo is not in the Hugging Face cache at '{}'. Run `hf download o/m --revision main` while online, or unset `TRANSFORMERS_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            fixture.cache().display()
+        )
+    );
+    assert!(fixture.mock.seen().is_empty());
+
+    fixture
+        .open(None, &[])
+        .await
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+    fixture.mock.clear_seen();
+    let snapshot = fixture
+        .open(
+            None,
+            &[("TRANSFORMERS_OFFLINE", "1"), ("HF_HUB_OFFLINE", "1")],
+        )
+        .await;
+    assert_eq!(
+        snapshot.cache_only_reason().as_deref(),
+        Some("`HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are set")
+    );
+    let error = snapshot
+        .download(&["tokenizer.json"])
+        .await
+        .expect_err("the tokenizer was never downloaded");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` are set and the Hugging Face cache at '{}' does not hold 'tokenizer.json'. Run `hf download o/m --revision main` while online, or unset `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            fixture.cache().display()
+        )
+    );
+    assert!(fixture.mock.seen().is_empty(), "{:?}", fixture.mock.seen());
+}
+
 #[tokio::test]
 async fn a_hub_outage_loads_the_cached_snapshot() {
     let fixture = Fixture::new().await;

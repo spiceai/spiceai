@@ -31,7 +31,7 @@ use snafu::prelude::*;
 use crate::client;
 use crate::download::FetchError;
 use crate::location::{RepoId, RepoType};
-use crate::settings::{self, Settings, TokenScope, TokenSource, display_path};
+use crate::settings::{self, Offline, Settings, TokenScope, TokenSource, display_path};
 use crate::snapshot::{Requester, Source};
 
 /// What a download was for: every message names it.
@@ -92,8 +92,11 @@ pub(crate) enum Cause {
     Hub(client::Error),
     Fetch(FetchError),
     Settings(settings::Error),
-    /// `HF_HUB_OFFLINE` is set and the cache holds no snapshot of the revision.
-    OfflineNoSnapshot,
+    /// `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` is set (`by`) and the cache holds no
+    /// snapshot of the revision.
+    OfflineNoSnapshot {
+        by: Offline,
+    },
     /// Files the component needs (`what`) are not where the snapshot's files came from.
     Missing {
         what: String,
@@ -206,7 +209,7 @@ impl DownloadError {
                 error,
                 client::Error::InvalidEndpoint { .. } | client::Error::InvalidToken { .. }
             ),
-            Cause::Fetch(_) | Cause::OfflineNoSnapshot => false,
+            Cause::Fetch(_) | Cause::OfflineNoSnapshot { .. } => false,
         }
     }
 
@@ -276,13 +279,14 @@ impl DownloadError {
             Cause::Fetch(error @ FetchError::InvalidEntry { .. }) => (error.to_string(), None),
             // Worded as a cause already, with its own fix.
             Cause::Settings(error) => (error.to_string(), None),
-            Cause::OfflineNoSnapshot => (
+            Cause::OfflineNoSnapshot { by } => (
                 format!(
-                    "`HF_HUB_OFFLINE` is set and revision '{}' of the repo is not in the Hugging Face cache at '{}'",
+                    "{} and revision '{}' of the repo is not in the Hugging Face cache at '{}'",
+                    by.is_set(),
                     context.revision,
                     display_path(&context.cache_dir)
                 ),
-                Some(offline_fix(context)),
+                Some(offline_fix(context, *by)),
             ),
             Cause::Missing {
                 what,
@@ -290,13 +294,14 @@ impl DownloadError {
             } => (format!("the repo has no {what}"), None),
             Cause::Missing {
                 what,
-                source: Source::OfflineCache,
+                source: Source::OfflineCache { by },
             } => (
                 format!(
-                    "`HF_HUB_OFFLINE` is set and the Hugging Face cache at '{}' does not hold {what}",
+                    "{} and the Hugging Face cache at '{}' does not hold {what}",
+                    by.is_set(),
                     display_path(&context.cache_dir)
                 ),
-                Some(offline_fix(context)),
+                Some(offline_fix(context, *by)),
             ),
             Cause::Missing {
                 what,
@@ -327,13 +332,14 @@ impl DownloadError {
             } => (message.clone(), None),
             Cause::Unusable {
                 message,
-                source: Source::OfflineCache,
+                source: Source::OfflineCache { by },
             } => (
                 format!(
-                    "`HF_HUB_OFFLINE` is set, so Spice read only the Hugging Face cache at '{}', where {message}",
+                    "{}, so Spice read only the Hugging Face cache at '{}', where {message}",
+                    by.is_set(),
                     display_path(&context.cache_dir)
                 ),
-                Some(offline_fix(context)),
+                Some(offline_fix(context, *by)),
             ),
             Cause::Unusable {
                 message,
@@ -370,11 +376,14 @@ impl DownloadError {
     }
 }
 
-/// How to fill the cache `HF_HUB_OFFLINE` reads.
-fn offline_fix(context: &DownloadContext) -> String {
+/// How to fill the cache `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` (`by`) reads, or stop
+/// reading the cache alone.
+fn offline_fix(context: &DownloadContext, by: Offline) -> String {
     format!(
-        "Run `hf download {} --revision {}` while online, or unset `HF_HUB_OFFLINE`",
-        context.repo, context.revision
+        "Run `hf download {} --revision {}` while online, or unset {}",
+        context.repo,
+        context.revision,
+        by.variables()
     )
 }
 
