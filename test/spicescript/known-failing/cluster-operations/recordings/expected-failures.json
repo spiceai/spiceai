@@ -49,7 +49,7 @@
       "who": "cayenne",
       "key": "query: SELECT count(*) AS n FROM t #2",
       "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -57,7 +57,7 @@
       "who": "cayenne",
       "key": "query: SELECT count(*) AS n FROM t #3",
       "kind": "error",
-      "signature": "stopped matching after <duration> (<n> attempts): Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "stopped matching after <duration> (<n> attempts): Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -65,7 +65,7 @@
       "who": "cayenne",
       "key": "query: SELECT id, i, d, s, dt FROM t #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -73,7 +73,7 @@
       "who": "cayenne",
       "key": "query: SELECT count(*) AS n, sum(i) AS si, sum(d) AS sd, min(dt) AS lo, max(dt) AS hi FROM t #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -81,7 +81,7 @@
       "who": "cayenne",
       "key": "query: SELECT s, count(*) AS n, avg(d) AS ad FROM t GROUP BY s #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -89,7 +89,7 @@
       "who": "cayenne",
       "key": "query: SELECT id FROM t WHERE i > 40 AND s = 'apple' #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -97,7 +97,7 @@
       "who": "cayenne",
       "key": "query: SELECT t.id, u.label FROM t JOIN u ON t.id = u.t_id WHERE u.label = 'red' #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -105,7 +105,7 @@
       "who": "cayenne",
       "key": "query: SELECT u.label, count(*) AS n, sum(t.d) AS sd FROM t JOIN u ON t.id = u.t_id GROUP BY u.label #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -113,7 +113,7 @@
       "who": "cayenne",
       "key": "query: SELECT id, d FROM t ORDER BY d DESC NULLS LAST, id LIMIT 10 #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -121,7 +121,7 @@
       "who": "cayenne",
       "key": "query: SELECT dt, count(*) AS n FROM t GROUP BY dt ORDER BY n DESC, dt LIMIT 5 #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -129,7 +129,7 @@
       "who": "cayenne",
       "key": "query: SELECT count(DISTINCT s) AS ns, count(DISTINCT dt) AS nd FROM t #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     },
     {
@@ -137,7 +137,7 @@
       "who": "cayenne",
       "key": "query: SELECT id FROM t WHERE id IN (SELECT t_id FROM u WHERE label = 'blue') #2",
       "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Cannot query u: no ready executor serves <n> of its <m> partitions; retry the query: Cannot query u: no ready executor serves <n> of its <m> partitions; retry the query",
+      "signature": "Spice rejected the query: Query execution failed. Cannot query u: no ready executor serves <n> of its <n> partitions; retry the query: Cannot query u: no ready executor serves <n> of its <n> partitions; retry the query",
       "group": "cluster-operations"
     }
   ],

@@ -491,8 +491,10 @@ fn normalized(message: &str) -> String {
             (r"PageType \d+", "PageType <n>"),
             (r"([A-Za-z])\[\d+\]", "$1[<n>]"),
             (r"\d+ of \d+ iterations", "<n> of <m> iterations"),
-            // How many partitions a lost executor held is placement.
-            (r"\b\d+ of its \d+ partitions", "<n> of its <m> partitions"),
+            // How many partitions a lost executor held is placement. Both
+            // counts become `<n>`, the form hand-written ledger patterns
+            // accept (`(\d+|<n>) of its (\d+|<n>) partitions`).
+            (r"\b\d+ of its \d+ partitions", "<n> of its <n> partitions"),
             (r"part-\d+", "part-<n>"),
             (r"\b\d+(\.\d+)?\s?(ns|µs|us|ms|s|m|h)\b", "<duration>"),
         ]
@@ -621,6 +623,12 @@ mod tests {
             signature(
                 "Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query"
             ),
+        );
+        assert_eq!(
+            signature(
+                "Cannot query t: no ready executor serves 2 of its 5 partitions; retry the query"
+            ),
+            "Cannot query t: no ready executor serves <n> of its <n> partitions; retry the query"
         );
         assert_eq!(
             signature(
@@ -808,6 +816,19 @@ mod tests {
             1,
             "an unseen symptom is still a change"
         );
+    }
+
+    #[test]
+    fn a_pattern_written_for_raw_partition_counts_accepts_the_normalized_ones() {
+        let script = script_in("t/known-failing/g");
+        let mut lost = entry("a", false);
+        lost.pattern = Some(
+            r"Cannot query t: (its partitions have not been discovered yet|no ready executor serves (\d+|<n>) of its (\d+|<n>) partitions)".into(),
+        );
+        let ledger = ledger(&script, vec![lost]);
+        let mut run = failure("a");
+        run.message = "Spice rejected the query: Query execution failed. Cannot query t: no ready executor serves 3 of its 5 partitions; retry the query".into();
+        assert_eq!(ledger.judge(&script, &[run]).expected, 1);
     }
 
     #[test]
