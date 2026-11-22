@@ -664,12 +664,16 @@ async fn handle_nsql_query(
             );
         }
 
-        let Ok(mut req) = sql_gen.create_request_for_query(&model, &query, &sql_gen_ctx) else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                headers,
-                "Error preparing data for NQL model".to_string(),
-            );
+        let mut req = match sql_gen.create_request_for_query(&model, &query, &sql_gen_ctx) {
+            Ok(req) => req,
+            Err(e) => {
+                record_nsql_error(&span, &format!("Error preparing data for NSQL model: {e}"));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    "Error preparing data for NQL model".to_string(),
+                );
+            }
         };
 
         req.messages.push(nsql_context.message.clone());
@@ -784,6 +788,7 @@ async fn handle_nsql_query(
                 }
             }
             Ok(None) => {
+                record_nsql_error(&span, "No query produced from NSQL model");
                 tracing::trace!("No query produced from NSQL model");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1967,6 +1972,62 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
             errors[0].starts_with("Error executing query: "),
+            "{errors:?}"
+        );
+    }
+
+    /// A model endpoint whose reply is not the JSON the NSQL prompt asks for.
+    async fn serve_malformed_chat_completions() -> String {
+        let router = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                Json(json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "this is not json"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test model endpoint");
+        let address = listener
+            .local_addr()
+            .expect("the test model endpoint has an address");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("the test model endpoint serves");
+        });
+        format!("http://{address}/v1")
+    }
+
+    /// A reply the NSQL parser rejects puts its error on the `nsql` task_history span.
+    #[tokio::test]
+    async fn malformed_model_response_is_recorded_on_the_nsql_span() {
+        let capture = SpanErrorCapture::default();
+        let _guard = capture.install();
+        let endpoint = serve_malformed_chat_completions().await;
+
+        let (status, _) = post_nsql_to_openai_model(
+            &endpoint,
+            &[],
+            json!({ "query": "how many rows", "model": "nsql_model" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let errors = capture.nsql_task_history_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Error running NSQL model: "),
             "{errors:?}"
         );
     }
