@@ -2986,18 +2986,9 @@ jobs:
           # Scripts that pass: any failure fails the job. Each shard runs
           # its share of the scripts (--partition), balanced by their
           # recorded durations.
-          - { name: 'spicescript: diag 1', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 2', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 3', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 4', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 5', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 6', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 7', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 8', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 9', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 10', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 11', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
-          - { name: 'spicescript: diag 12', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 1', partition: 1/1, args: test/spicescript/diag-16625.yaml }
+          - { name: 'spicescript: diag 2', partition: 1/1, args: test/spicescript/diag-16625.yaml }
+          - { name: 'spicescript: diag 3', partition: 1/1, args: test/spicescript/diag-16625.yaml }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -3191,7 +3182,7 @@ jobs:
       # A directory per script with a failure: the script, what the run
       # printed for it, its source containers' output and its instances' logs.
       - name: Upload captured logs
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spicescript-logs-${{ strategy.job-index }}

@@ -1,0 +1,701 @@
+name: diag-16625
+description: >
+  TEMPORARY diagnostic for #16625, never merged. Loops the kill block of
+  postgres-cdc-parity (UPDATE, kill, DELETE while down, start, compare) with
+  the kill timed about 10 s after start, on the two variants that fail.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  sqlite-key:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key } } } }
+  object-native-local: object-native-local
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-parity
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: o_id
+        on_conflict: { o_id: upsert }
+    - from: postgres:public.customers
+      name: customers
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: c_id
+        on_conflict: { c_id: upsert }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE customers (
+          c_id      integer PRIMARY KEY,
+          c_name    text NOT NULL,
+          c_segment varchar(16),
+          c_balance numeric(15, 2),
+          c_active  boolean,
+          c_since   date
+        );
+        CREATE TABLE orders (
+          o_id       bigint PRIMARY KEY,
+          o_custkey  integer,
+          o_status   char(1),
+          o_total    numeric(15, 2),
+          o_qty      smallint,
+          o_weight   double precision,
+          o_ratio    real,
+          o_note     text,
+          o_placed   timestamp,
+          o_updated  timestamptz,
+          o_payload  bytea
+        );
+        INSERT INTO customers
+          SELECT i, 'Customer#' || i, (ARRAY['AUTO', 'BUILDING', 'FURNITURE', NULL])[1 + i % 4],
+                 (i * 37 % 10000) / 7.0, i % 3 <> 0, DATE '2020-01-01' + i
+          FROM generate_series(1, 500) AS i;
+        INSERT INTO orders
+          SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+                 (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+                 TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+                 TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+                 decode(lpad(to_hex(i), 8, '0'), 'hex')
+          FROM generate_series(1, 20000) AS i;
+
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  # Iteration 1: kill about 9.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 2: kill about 10 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 3: kill about 10.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 4: kill about 11 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 5: kill about 9.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 6: kill about 10 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 7: kill about 10.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 8: kill about 11 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 9: kill about 9.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 10: kill about 10 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 11: kill about 10.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 12: kill about 11 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 13: kill about 9.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 14: kill about 10 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 15: kill about 10.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 16: kill about 11 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 17: kill about 9.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 18: kill about 10 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 19: kill about 10.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 20: kill about 11 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 21: kill about 9.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 22: kill about 10 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 23: kill about 10.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 24: kill about 11 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 25: kill about 9.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 26: kill about 10 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 9500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 27: kill about 10.5 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10000ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Iteration 28: kill about 11 s after start returns.
+  - source-exec:
+      src: |
+        INSERT INTO orders
+        SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+               (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+               TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+               TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+               decode(lpad(to_hex(i), 8, '0'), 'hex')
+        FROM generate_series(1, 20000) AS i WHERE i % 11 = 0
+        ON CONFLICT (o_id) DO NOTHING;
+  - sleep: 10500ms
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - sleep: 500ms
+  - kill-spiced: {}
+  - source-exec:
+      src: DELETE FROM orders WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
