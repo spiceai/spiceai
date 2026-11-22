@@ -247,7 +247,8 @@ async fn test_file_watcher_atomic_replace_then_append() -> Result<(), anyhow::Er
         .scope(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let csv_path = dir.path().join("names.csv");
-            let store = dir.path().join("acceleration");
+            let store_dir = tempfile::tempdir().expect("create acceleration directory");
+            let store = store_dir.path().to_path_buf();
             let rt = start_watcher_runtime(&csv_path, &store).await?;
             wait_for_row_count(&rt, 10).await?;
 
@@ -277,7 +278,8 @@ async fn test_file_watcher_trailing_debounce_keeps_burst_appends() -> Result<(),
         .scope(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let csv_path = dir.path().join("names.csv");
-            let store = dir.path().join("acceleration");
+            let store_dir = tempfile::tempdir().expect("create acceleration directory");
+            let store = store_dir.path().to_path_buf();
             let rt = start_watcher_runtime(&csv_path, &store).await?;
             wait_for_row_count(&rt, 10).await?;
 
@@ -315,7 +317,8 @@ async fn test_file_watcher_large_inplace_rewrite() -> Result<(), anyhow::Error> 
         .scope(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let csv_path = dir.path().join("names.csv");
-            let store = dir.path().join("acceleration");
+            let store_dir = tempfile::tempdir().expect("create acceleration directory");
+            let store = store_dir.path().to_path_buf();
             let rt = start_watcher_runtime(&csv_path, &store).await?;
             wait_for_row_count(&rt, 10).await?;
 
@@ -343,7 +346,8 @@ async fn test_file_watcher_symlink_to_another_directory() -> Result<(), anyhow::
             std::fs::write(&real, NAMES_CSV).expect("write target");
             let csv_path = dir.path().join("names.csv");
             std::os::unix::fs::symlink(&real, &csv_path).expect("symlink dataset path");
-            let store = dir.path().join("acceleration");
+            let store_dir = tempfile::tempdir().expect("create acceleration directory");
+            let store = store_dir.path().to_path_buf();
             // `start_watcher_runtime` writes through the symlink onto the target.
             let rt = start_watcher_runtime(&csv_path, &store).await?;
             wait_for_row_count(&rt, 10).await?;
