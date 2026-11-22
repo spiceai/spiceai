@@ -1364,7 +1364,7 @@ mod data_path {
                 let armed =
                     lose_the_nth_commit(&faults, &dataset_head(&native, "facts"), nth, landed);
                 // A whole-table rewrite: its commits are the ones that lose.
-                let _ = placed.table.sort_and_rewrite_data(64 * 1024 * 1024).await;
+                let _ = placed.table.force_full_compaction().await;
                 fired += usize::from(armed.load(std::sync::atomic::Ordering::SeqCst));
                 faults.clear_rules();
                 eventually("the dataset accepts appends again", || async {

@@ -169,10 +169,10 @@ async fn seal_after_full_rewrite_then_restart(id_type: DataType, shards: usize) 
         .flush_pending_maintenance()
         .await
         .expect("drain maintenance");
-    table
-        .sort_and_rewrite_data(64 << 20)
-        .await
-        .expect("full rewrite");
+    assert!(
+        table.force_full_compaction().await.expect("full rewrite"),
+        "the full compaction must commit"
+    );
     let protected = table
         .catalog()
         .get_all_snapshot_sequences(table.table_id())
