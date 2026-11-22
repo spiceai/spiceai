@@ -2777,7 +2777,7 @@ fn parse_signal(v: Option<&Value>) -> Result<Option<KillSignal>> {
     }
 }
 
-/// A script's `tags` must be one line, `tags: [long]`: CI selects the changed
+/// A script's `tags` must be one line of plain names, `tags: [long]`: CI selects the changed
 /// scripts to run before merge by that line (`grep` for the tag, and
 /// `git diff -I'^tags:'` to ignore a change to it alone), which a block list or
 /// a flow list over several lines would slip past.
@@ -2793,13 +2793,25 @@ fn check_tags_on_one_line(text: &str) -> Result<()> {
                 .next()
                 .unwrap_or_default()
                 .trim();
-            value.starts_with('[') && value.ends_with(']')
+            // Plain names only: a quoted or escaped spelling (`"lo\u006eg"`)
+            // decodes to a tag the line does not spell out.
+            value
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .is_some_and(|names| {
+                    names.trim().is_empty()
+                        || names.split(',').all(|name| {
+                            let name = name.trim();
+                            !name.is_empty()
+                                && name.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                        })
+                })
         }
         _ => false,
     };
     ensure!(
         one_line,
-        "Write `tags` on one line, as `tags: [long]`: CI selects scripts to run before merge by that line"
+        "Write `tags` on one line with plain names, as `tags: [long]`: CI selects scripts to run before merge by that line"
     );
     Ok(())
 }
@@ -2991,7 +3003,7 @@ mod tests {
                 .map_err(|e| e.to_string())
         };
         let rejected = Err(
-            "Write `tags` on one line, as `tags: [long]`: CI selects scripts to run before merge by that line".to_string(),
+            "Write `tags` on one line with plain names, as `tags: [long]`: CI selects scripts to run before merge by that line".to_string(),
         );
         assert_eq!(
             ok("name: s\ntags: [long]\nspicepod: {}\nsteps: []"),
@@ -3014,6 +3026,18 @@ mod tests {
         assert_eq!(
             ok("{name: s, tags: [long], spicepod: {}, steps: []}"),
             rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: [\"lo\\u006eg\"]\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: ['long']\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: [ long ]\nspicepod: {}\nsteps: []"),
+            Ok(vec![Tag::Long])
         );
     }
 
