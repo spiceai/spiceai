@@ -12,6 +12,6 @@ description: "Query: tpch_simple_q1"
 | physical_plan | SchemaCastScanExec                                                                                                                                           |
 |               |   CooperativeExec                                                                                                                                            |
 |               |     BytesProcessedExec                                                                                                                                       |
-|               |       VirtualExecutionPlan name=databricks compute_context=2f4e22bff398fb84 base_sql=SELECT max(`lineitem`.`l_orderkey`) FROM `spiceai_ci`.`tpch`.`lineitem` |
+|               |       VirtualExecutionPlan name=databricks compute_context=c35ffd7c65b8e06e base_sql=SELECT max(`lineitem`.`l_orderkey`) FROM `spiceai_ci`.`tpch`.`lineitem` |
 |               |                                                                                                                                                              |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
