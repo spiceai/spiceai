@@ -9,9 +9,12 @@ inputs:
     required: false
     default: '.'
   url:
-    description: 'Readiness endpoint to poll'
+    description: |
+      Readiness endpoint to poll. Empty polls `/v1/ready` at the HTTP endpoint
+      `allocate-spice-ports` exported for this job (SPICE_HTTP_ENDPOINT), or at
+      spiced's default port 8090 on localhost when the job allocated none.
     required: false
-    default: 'http://localhost:8090/v1/ready'
+    default: ''
   timeout:
     description: 'Seconds to wait before failing'
     required: false
