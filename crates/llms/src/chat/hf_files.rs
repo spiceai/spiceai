@@ -63,7 +63,8 @@ pub enum Budget {
     /// No engine measures the memory: the default quantization.
     Unmeasured,
     /// The model is split across machines, which must all load the same files: the default
-    /// quantization, which depends on the repository alone, never on one machine's memory.
+    /// quantization, which depends on the repository's listing alone, never on one machine's
+    /// memory. With the Hub out of reach, a machine lists its own cache instead.
     Split,
 }
 

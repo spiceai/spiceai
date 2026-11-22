@@ -392,7 +392,8 @@ pub async fn create_hf_model(
     };
     // Every node of a split model resolves the files itself, so a split model never chooses by
     // one node's memory: with no `files`, every node takes the repository's default quantization,
-    // which depends on the repository alone.
+    // which depends on the repository's listing alone. With the Hub out of reach, a node lists
+    // its own cache instead.
     let budget = if distributed.is_some() {
         hf_files::Budget::Split
     } else {

@@ -34,8 +34,9 @@ use spicepod::component::model::ModelFile;
 
 /// `text` as a message prints a name that comes from a repository's file paths: printable ASCII
 /// as it is, and every other character, a backslash included, escaped as Rust escapes it (`\n`,
-/// `\\`, `\u{202e}`), so a repository's owner cannot break the message's line or disguise
-/// what it says.
+/// `\\`, `\u{202e}`), so a repository's owner cannot break the message's line, colour it, or
+/// hide or reorder its characters. ASCII punctuation prints as it is, so a name can still read
+/// like the text around it.
 #[must_use]
 pub fn printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -197,6 +198,7 @@ fn is_projector(path: &str) -> bool {
 
 /// A file that is not the model's weights though it is a GGUF file: an importance matrix, or a
 /// `dflash-`, `eagle3-` or `dspark-` drafter, as llama.cpp's `-hf` tells them apart by name.
+/// Spice matches the names in any case, where llama.cpp matches them as written.
 fn is_sidecar(path: &str) -> bool {
     let name = file_name(path).to_ascii_lowercase();
     ["imatrix", "dflash-", "eagle3-", "dspark-"]
@@ -534,9 +536,10 @@ pub fn weights_budget(memory: u64) -> u64 {
 /// llama.cpp's `-hf`, so a repository loads the file `llama-server -hf <repo>` loads.
 pub const DEFAULT_TAGS: [&str; 2] = ["Q4_K_M", "Q8_0"];
 
-/// The quantization a model with no `files` loads by default, as llama.cpp's `-hf` picks it:
-/// the first by path whose first file's path carries [`DEFAULT_TAGS`]' `Q4_K_M`, else `Q8_0`,
-/// else the first by path. A path carries a tag where the tag follows the path's start, `-`,
+/// The quantization a model with no `files` loads by default, as llama.cpp's `-hf` picks it
+/// from the Hub's listing, which lists a repository's files in path order: the first by path
+/// whose first file's path carries [`DEFAULT_TAGS`]' `Q4_K_M`, else `Q8_0`, else the first by
+/// path. A path carries a tag where the tag follows the path's start, `-`,
 /// `.` or `/` and comes before `.` or `-`, in any case, so `Model-UD-Q4_K_M.gguf` carries
 /// `Q4_K_M`, `Q4_K_M/model.gguf` does not (only its folder bears the tag), and `BF16` does not
 /// carry `F16`. `None` when there is none.
@@ -858,7 +861,8 @@ mod tests {
         // Q4_K_M where the repository offers it, whatever larger ones fit.
         assert_eq!(default_name(&glm47()).as_deref(), Some("Q4_K_M"));
         assert_eq!(default_name(&qwen3()).as_deref(), Some("Q4_K_M"));
-        // Else Q8_0: GLM-5.3's folders are UD-Q2_K_XL and Q8_0.
+        // Else Q8_0: GLM-5.3's complete quantizations are UD-Q2_K_XL and Q8_0, whose shards'
+        // file names carry the tag.
         assert_eq!(default_name(&glm()).as_deref(), Some("Q8_0"));
         // Else the first by path: Qwen3.8's UD-Q2_K_XL/ before UD-Q3_K_XL/. Its MTP heads carry
         // Q4_K_M and Q8_0 but are not quantizations of the model.
