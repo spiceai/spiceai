@@ -170,7 +170,9 @@ run before every merge, for what it catches there, so the merge queue skips it
 (`--exclude-tag long`) and it runs after merge, on trunk, in
 `trunk_tests.yml`. A script without it runs before every merge. Leave a new
 script untagged unless it is slow; tag it `long` when its CI time is high and
-its failure history low. Unknown and duplicate tags are rejected.
+its failure history low. A PR that edits a `long` script runs it in the merge
+queue too; a PR that only changes its `tags:` line does not. Unknown and
+duplicate tags are rejected.
 
 ### Sources
 

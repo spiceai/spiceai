@@ -2988,10 +2988,10 @@ jobs:
           # recorded durations.
           - { name: 'spicescript: scripts (1/2)', partition: 1/2 }
           - { name: 'spicescript: scripts (2/2)', partition: 2/2 }
-          # The scripts this run adds or changes, whatever their tags: a new
-          # regression script runs before it merges, and a fix whose
-          # known-failing script now passes learns it here rather than from the
-          # next trunk tests run.
+          # The `long` and known-failing scripts this run adds or changes (the
+          # others already run in the shards above): a new regression script
+          # runs before it merges, and a fix whose known-failing script now
+          # passes learns it here rather than from the next trunk tests run.
           - { name: 'spicescript: changed scripts', changed: true }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -3002,7 +3002,8 @@ jobs:
       # other directories under it are not run by CI (see its README), and the
       # live scripts need the provider tokens only trunk_tests.yml mints. A
       # changed known-failing ledger (a re-record) runs its whole group against
-      # the new ledger.
+      # the new ledger. An edit to a script's `tags:` line alone changes which
+      # run it belongs to, not what it does, so it selects nothing here.
       - name: Find changed scripts
         id: changed
         if: ${{ matrix.changed }}
@@ -3015,8 +3016,13 @@ jobs:
             exit 0
           fi
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          passing=$(git diff --name-only --diff-filter=AMR "$BASE_SHA" HEAD -- \
-            ':(glob)test/spicescript/*.yaml' ':(exclude)test/spicescript/variants.yaml' | xargs)
+          # Scripts without `tags: [long]` run in the script shards from this
+          # same commit, so only the changed `long` ones run again here.
+          passing=$(git diff --name-only --diff-filter=AMR -I'^tags:' "$BASE_SHA" HEAD -- \
+            ':(glob)test/spicescript/*.yaml' ':(exclude)test/spicescript/variants.yaml' |
+            while read -r script; do
+              if grep -qE '^tags:.*[^a-z_-]long([^a-z_-]|$)' "$script"; then echo "$script"; fi
+            done | xargs)
           groups=$(git diff --name-only --diff-filter=AMRD "$BASE_SHA" HEAD -- \
             ':(glob)test/spicescript/known-failing/*/recordings/expected-failures.json' \
             | sed 's#/recordings/expected-failures.json$##' | while read -r dir; do
@@ -3026,7 +3032,7 @@ jobs:
             done | sort -u)
           known=$( {
             echo "$groups"
-            git diff --name-only --diff-filter=AMR "$BASE_SHA" HEAD -- \
+            git diff --name-only --diff-filter=AMR -I'^tags:' "$BASE_SHA" HEAD -- \
               ':(glob)test/spicescript/known-failing/*/*.yaml' | while read -r script; do
                 # A script whose whole group already runs is not listed again.
                 grep -qx "$(dirname "$script")" <<<"$groups" || echo "$script"
