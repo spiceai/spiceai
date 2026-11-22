@@ -1127,7 +1127,11 @@ impl Script {
             .remove("steps")
             .context("A script needs `steps`")?;
         expand_shared_variants(&mut root, shared)?;
+        let has_tags = root.as_object().is_some_and(|map| map.contains_key("tags"));
         let mut script: Script = serde_json::from_value(root)?;
+        if has_tags {
+            check_tags_on_one_line(text)?;
+        }
         for (i, tag) in script.tags.iter().enumerate() {
             ensure!(
                 !script.tags[..i].contains(tag),
@@ -2773,6 +2777,33 @@ fn parse_signal(v: Option<&Value>) -> Result<Option<KillSignal>> {
     }
 }
 
+/// A script's `tags` must be one line, `tags: [long]`: CI selects the changed
+/// scripts to run before merge by that line (`grep` for the tag, and
+/// `git diff -I'^tags:'` to ignore a change to it alone), which a block list or
+/// a flow list over several lines would slip past.
+fn check_tags_on_one_line(text: &str) -> Result<()> {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("tags:"))
+        .collect();
+    let one_line = match lines.as_slice() {
+        [line] => {
+            let value = line["tags:".len()..]
+                .split(" #")
+                .next()
+                .unwrap_or_default()
+                .trim();
+            value.starts_with('[') && value.ends_with(']')
+        }
+        _ => false,
+    };
+    ensure!(
+        one_line,
+        "Write `tags` on one line, as `tags: [long]`: CI selects scripts to run before merge by that line"
+    );
+    Ok(())
+}
+
 pub fn parse_duration(v: &Value) -> Result<Duration> {
     match v {
         Value::String(s) => {
@@ -2950,6 +2981,40 @@ mod tests {
         let error = Script::parse("name: s\ntags: [slow]\nspicepod: {}\nsteps: []")
             .expect_err("unknown tag");
         assert_eq!(error.to_string(), "unknown variant `slow`, expected `long`");
+    }
+
+    #[test]
+    fn tags_must_be_one_line() {
+        let ok = |text: &str| {
+            Script::parse(text)
+                .map(|s| s.tags)
+                .map_err(|e| e.to_string())
+        };
+        let rejected = Err(
+            "Write `tags` on one line, as `tags: [long]`: CI selects scripts to run before merge by that line".to_string(),
+        );
+        assert_eq!(
+            ok("name: s\ntags: [long]\nspicepod: {}\nsteps: []"),
+            Ok(vec![Tag::Long])
+        );
+        assert_eq!(
+            ok("name: s\ntags: [long] # waits on a source's clock\nspicepod: {}\nsteps: []"),
+            Ok(vec![Tag::Long])
+        );
+        assert_eq!(ok("name: s\ntags: []\nspicepod: {}\nsteps: []"), Ok(vec![]));
+        assert_eq!(ok("name: s\nspicepod: {}\nsteps: []"), Ok(vec![]));
+        assert_eq!(
+            ok("name: s\ntags:\n  - long\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: [\n  long]\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("{name: s, tags: [long], spicepod: {}, steps: []}"),
+            rejected
+        );
     }
 
     #[test]
