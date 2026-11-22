@@ -38,7 +38,7 @@ on:
         required: false
         type: string
       branch:
-        description: 'A release branch (release/...) whose head to test, with that commit''s own build (default: trunk)'
+        description: 'A versioned release branch (release/X.Y) whose head to test, with that commit''s own build (default: trunk)'
         required: false
         type: string
 
@@ -91,7 +91,10 @@ jobs:
           set -euo pipefail
           if [ -n "$BRANCH" ]; then
             [ -z "$RUN_ID" ] || { echo "::error::Give run_id or branch, not both"; exit 1; }
-            [[ "$BRANCH" =~ ^release/[A-Za-z0-9._-]+$ ]] || { echo "::error::branch must be a release branch (release/...), not '$BRANCH'"; exit 1; }
+            # The versioned release branches only, the same pattern
+            # check-trusted-run accepts builds from: these jobs hold credentials,
+            # and an arbitrary release/* branch may not be protected.
+            [[ "$BRANCH" =~ ^release/[0-9]+\.[0-9]+(\.[0-9]+)?(-rc\.?[0-9]+)?$ ]] || { echo "::error::branch must be a versioned release branch (release/X.Y), not '$BRANCH'"; exit 1; }
           fi
           holds_build() {
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1/artifacts" \
@@ -499,7 +502,7 @@ jobs:
           set -euo pipefail
           cutoff=$(date -u -d '30 days ago' +%s)
           gh api --paginate "repos/$GITHUB_REPOSITORY/branches?per_page=100" \
-              -q '.[] | select(.name | startswith("release/")) | "\(.name) \(.commit.sha)"' |
+              -q '.[] | select(.name | test("^release/[0-9]+\\.[0-9]+(\\.[0-9]+)?(-rc\\.?[0-9]+)?$")) | "\(.name) \(.commit.sha)"' |
           while read -r branch sha; do
             when=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" -q .commit.committer.date)
             [ "$(date -u -d "$when" +%s)" -ge "$cutoff" ] || continue
