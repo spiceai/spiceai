@@ -343,21 +343,7 @@ impl DataConnector for GraphQL {
             }
             Err(e) => {
                 rate_controller.rollback().await;
-                if matches!(&e, graphql::Error::InvalidGraphQLQuery { .. }) {
-                    let message = format!("{e}");
-                    Err(DataConnectorError::InvalidConfiguration {
-                        dataconnector: "graphql".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: e.into(),
-                        message,
-                    })
-                } else {
-                    Err(DataConnectorError::InternalWithSource {
-                        dataconnector: "graphql".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: e.into(),
-                    })
-                }
+                Err(read_provider_error(e, ConnectorComponent::from(dataset)))
             }
         }
     }
@@ -382,6 +368,41 @@ pub const CONNECTOR_NAME: &str = "graphql";
 #[must_use]
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     GraphQLFactory::new_arc()
+}
+
+/// Maps a provider build failure to the connector error the runtime retries on.
+///
+/// An invalid query and a refusal the API named (HTTP 401/403, a `FORBIDDEN` or
+/// `UNAUTHENTICATED` GraphQL error) are permanent: retrying cannot change the answer.
+/// Everything else, including a refusal inferred from an ambiguous message, is retriable.
+fn read_provider_error(
+    e: graphql::Error,
+    connector_component: ConnectorComponent,
+) -> DataConnectorError {
+    match &e {
+        graphql::Error::InvalidGraphQLQuery { .. } => {
+            let message = format!("{e}");
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: "graphql".to_string(),
+                connector_component,
+                source: e.into(),
+                message,
+            }
+        }
+        graphql::Error::InvalidCredentialsOrPermissions {
+            kind: graphql::RefusalKind::Explicit,
+            ..
+        } => DataConnectorError::InsufficientPermissions {
+            dataconnector: "graphql".to_string(),
+            connector_component,
+            source: e.into(),
+        },
+        _ => DataConnectorError::InternalWithSource {
+            dataconnector: "graphql".to_string(),
+            connector_component,
+            source: e.into(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -692,6 +713,36 @@ mod tests {
                 .sum();
             assert_eq!(rows, 1);
         }
+    }
+
+    /// A refusal the API named stays permanent at the connector boundary, so startup
+    /// does not retry it; an inferred refusal stays retriable.
+    #[tokio::test]
+    async fn an_explicit_refusal_is_a_permanent_permission_error() {
+        let dataset = test_dataset("http://localhost:1/graphql").await;
+        let component = ConnectorComponent::from(&dataset);
+
+        let explicit = read_provider_error(
+            graphql::Error::InvalidCredentialsOrPermissions {
+                message: "FORBIDDEN".to_string(),
+                kind: graphql::RefusalKind::Explicit,
+            },
+            component.clone(),
+        );
+        assert!(
+            matches!(explicit, DataConnectorError::InsufficientPermissions { .. }),
+            "an explicit refusal maps to InsufficientPermissions, got {explicit:?}"
+        );
+        assert!(!explicit.is_retriable());
+
+        let inferred = read_provider_error(
+            graphql::Error::InvalidCredentialsOrPermissions {
+                message: "not authorized".to_string(),
+                kind: graphql::RefusalKind::Inferred,
+            },
+            component,
+        );
+        assert!(inferred.is_retriable());
     }
 }
 

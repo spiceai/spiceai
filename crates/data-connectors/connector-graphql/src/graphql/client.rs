@@ -5019,13 +5019,13 @@ mod graphql_errors_classification_tests {
     use crate::graphql::{Error, is_retriable_error};
     use serde_json::json;
 
-    fn classify(body: serde_json::Value) -> Error {
-        handle_graphql_query_error(&body, "{ items { id } }").expect_err("errors[] must fail")
+    fn classify(body: &serde_json::Value) -> Error {
+        handle_graphql_query_error(body, "{ items { id } }").expect_err("errors[] must fail")
     }
 
     #[test]
     fn errors_without_location_are_retriable() {
-        let err = classify(json!({
+        let err = classify(&json!({
             "data": null,
             "errors": [{"message": "upstream timeout, please retry"}]
         }));
@@ -5036,7 +5036,7 @@ mod graphql_errors_classification_tests {
 
     #[test]
     fn transient_code_with_location_is_retriable() {
-        let err = classify(json!({
+        let err = classify(&json!({
             "errors": [{
                 "message": "backend unavailable",
                 "locations": [{"line": 1, "column": 3}],
@@ -5048,7 +5048,7 @@ mod graphql_errors_classification_tests {
 
     #[test]
     fn errors_with_location_fail_clearly() {
-        let err = classify(json!({
+        let err = classify(&json!({
             "errors": [{
                 "message": "Cannot query field \"bogus\" on type \"Query\".",
                 "locations": [{"line": 1, "column": 3}]
@@ -5066,7 +5066,7 @@ mod graphql_errors_classification_tests {
             "GRAPHQL_PARSE_FAILED",
             "BAD_USER_INPUT",
         ] {
-            let err = classify(json!({
+            let err = classify(&json!({
                 "errors": [{"message": "bad query", "extensions": {"code": code}}]
             }));
             assert!(
@@ -5080,7 +5080,7 @@ mod graphql_errors_classification_tests {
     #[test]
     fn refusal_codes_are_permanent_without_location() {
         for code in ["UNAUTHENTICATED", "FORBIDDEN"] {
-            let err = classify(json!({
+            let err = classify(&json!({
                 "errors": [{"message": "nope", "extensions": {"code": code}}]
             }));
             assert!(
@@ -5093,7 +5093,7 @@ mod graphql_errors_classification_tests {
 
     #[test]
     fn later_validation_error_is_not_hidden_by_a_bare_first_entry() {
-        let err = classify(json!({
+        let err = classify(&json!({
             "errors": [
                 {"message": "upstream timeout"},
                 {"message": "bad field", "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}
