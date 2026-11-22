@@ -588,22 +588,13 @@ impl Model for Protocol {
                 Action::Respond => Event::on(source, label).to(reader),
                 Action::Start => Event::on(reader, label).tone(Tone::Actor),
                 Action::Get(o) => {
-                    let ok = before.replica & bit(o) != 0;
-                    // A miss is a violation only when this read raises a property's
-                    // flag; past the retention an error is an allowed outcome.
-                    let violated = (after.bad_availability && !before.bad_availability)
-                        || (after.bad_rows && !before.bad_rows);
-                    let (text, tone) = match (ok, violated) {
-                        (true, false) => (label, Tone::Actor),
-                        (_, true) => (
-                            format!("object {o} is MISSING within the retention"),
-                            Tone::Bad,
-                        ),
-                        (false, false) => (
-                            format!("object {o} is gone after the retention (allowed)"),
-                            Tone::Gone,
-                        ),
-                    };
+                    let (text, tone) = crate::explorer::fetch_event(
+                        o,
+                        before.replica & bit(o) != 0,
+                        after.bad_availability && !before.bad_availability,
+                        after.bad_rows && !before.bad_rows,
+                        label,
+                    );
                     Event::on(reader, text).to(replica).tone(tone)
                 }
                 Action::ReplicaRead | Action::ReplicaExpire(_) | Action::ReplicaSweep(_) => {
