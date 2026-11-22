@@ -877,6 +877,9 @@ mod tests {
             ("model-q4_k_m.gguf", "Q4_K_M", true),
             ("Model-UD-Q4_K_M.gguf", "Q4_K_M", true),
             ("Q4_K_M/Model-Q4_K_M-00001-of-00002.gguf", "Q4_K_M", true),
+            // A folder's name is followed by `/`, so a tag only a folder bears is not carried,
+            // as llama.cpp's `[.-]` after the tag does not match it.
+            ("Q4_K_M/model-00001-of-00002.gguf", "Q4_K_M", false),
             ("Q4_K_M.gguf", "Q4_K_M", true),
             ("Model.Q8_0.gguf", "Q8_0", true),
             ("Model-BF16.gguf", "F16", false),
