@@ -139,7 +139,7 @@ fn every_fixture_helper_waits_for_its_lock() {
     for (name, dir, worker) in workers {
         worker
             .join()
-            .unwrap_or_else(|_| panic!("the {name} helper after the lock was released"));
+            .unwrap_or_else(|_| panic!("the {name} helper panicked after the lock was released"));
         let revision = match name {
             "tpch" => generator_revision(include_str!("correctness/support/tpch_data.rs")),
             "ssb" => generator_revision(include_str!("correctness/support/ssb_data.rs")),
