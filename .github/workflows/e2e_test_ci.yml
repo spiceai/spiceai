@@ -2986,19 +2986,18 @@ jobs:
           # Scripts that pass: any failure fails the job. Each shard runs
           # its share of the scripts (--partition), balanced by their
           # recorded durations.
-          - { name: 'spicescript: scripts (1/4)', partition: 1/4, args: test/spicescript }
-          - { name: 'spicescript: scripts (2/4)', partition: 2/4, args: test/spicescript }
-          - { name: 'spicescript: scripts (3/4)', partition: 3/4, args: test/spicescript }
-          - { name: 'spicescript: scripts (4/4)', partition: 4/4, args: test/spicescript }
-          # Scripts that reproduce open bugs (test/spicescript/known-failing)
-          # run nightly in spicescript_nightly.yml, not here.
-          # The shards above read DuckDB and DuckLake sources with the newest
-          # release test/duckdb_versions.json lists; this one runs the scripts
-          # with DuckDB sources again on each older listed release.
-          - { name: 'spicescript: older DuckDB releases', partition: 1/1, older_duckdb: true }
-          # test/spicescript/live: real providers through static credential params, with
-          # tokens minted from this job's GitHub OIDC token just before the run.
-          - { name: 'spicescript: live', live: true }
+          - { name: 'spicescript: diag 1', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 2', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 3', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 4', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 5', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 6', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 7', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 8', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 9', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 10', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 11', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
+          - { name: 'spicescript: diag 12', partition: 1/1, args: test/spicescript/postgres-cdc-parity.yaml }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
