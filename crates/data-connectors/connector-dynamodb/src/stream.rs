@@ -52,6 +52,11 @@ pub enum StreamError {
     ))]
     FailedToStartStream { source: Error },
 
+    #[snafu(display(
+        "Failed to start the initial scan of the DynamoDB table, so the dataset has no data until Spice restarts: {source}"
+    ))]
+    FailedToStartInitialScan { source: Error },
+
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,
 

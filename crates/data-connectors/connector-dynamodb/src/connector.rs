@@ -776,7 +776,12 @@ async fn emit_overwrite_then_live(
                 error = %e,
                 "Failed to start DynamoDB overwrite bootstrap stream"
             );
-            return Some(stream_start_failed(e));
+            return Some(
+                stream::once(async move {
+                    Err(DynamoDBStreamError::FailedToStartInitialScan { source: e }.into())
+                })
+                .boxed(),
+            );
         }
     };
 
