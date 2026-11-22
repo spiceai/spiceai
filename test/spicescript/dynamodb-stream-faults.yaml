@@ -56,16 +56,21 @@ steps:
   - source-exec:
       ddb: |
         cat > /tmp/proxy.py <<'PY'
-        import json, threading, urllib.request, urllib.error
+        import json, os, threading, urllib.request, urllib.error
         from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+        # One proxy serves every instance that shares this container, so all of
+        # its state is kept per table (each instance's tables are namespaced).
         lock = threading.Lock()
-        state = {'injected': {}, 'redelivered': 0}
-        echo_iterators, cached = set(), None
+        state = {'injected': {}, 'redelivered': {}}
+        echo_iterators, cached = {}, {}  # iterator -> table; table -> first records
         def table_of(arn):
             return arn.split(':table/')[1].split('/')[0] if ':table/' in arn else ''
         def save():
-            with open('/tmp/proxy-state.json', 'w') as f:
+            # Called with `lock` held; published whole, so a reader never sees a
+            # partly written file.
+            with open('/tmp/proxy-state.json.tmp', 'w') as f:
                 json.dump(state, f)
+            os.replace('/tmp/proxy-state.json.tmp', '/tmp/proxy-state.json')
         class Proxy(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
@@ -78,7 +83,6 @@ steps:
                 self.end_headers()
                 self.wfile.write(data)
             def do_POST(self):
-                global cached
                 body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
                 op = self.headers.get('X-Amz-Target', '').rsplit('.', 1)[-1]
                 req = json.loads(body or b'{}')
@@ -102,25 +106,31 @@ steps:
                     status, rheaders, data = e.code, list(e.headers.items()), e.read()
                 if status == 200 and op == 'GetShardIterator' and table.startswith('echo_'):
                     with lock:
-                        echo_iterators.add(json.loads(data)['ShardIterator'])
+                        echo_iterators[json.loads(data)['ShardIterator']] = table
                 elif status == 200 and op == 'GetRecords' and req.get('ShardIterator') in echo_iterators:
                     doc = json.loads(data)
                     with lock:
+                        echo = echo_iterators[req['ShardIterator']]
                         if doc.get('NextShardIterator'):
-                            echo_iterators.add(doc['NextShardIterator'])
-                        if doc.get('Records') and cached is None:
-                            cached = doc['Records']
-                        elif not doc.get('Records') and cached is not None:
-                            doc['Records'] = cached
-                            state['redelivered'] += 1
+                            echo_iterators[doc['NextShardIterator']] = echo
+                        if doc.get('Records') and echo not in cached:
+                            cached[echo] = doc['Records']
+                        elif not doc.get('Records') and echo in cached:
+                            doc['Records'] = cached[echo]
+                            state['redelivered'][echo] = state['redelivered'].get(echo, 0) + 1
                             save()
                     data = json.dumps(doc).encode()
                 self.reply(status, data, rheaders)
-        save()
+        with lock:
+            save()
         ThreadingHTTPServer(('0.0.0.0', 4567), Proxy).serve_forever()
         PY
-        nohup python3 /tmp/proxy.py > /tmp/proxy.log 2>&1 < /dev/null &
-        sleep 1
+        # Instances that share the container share the proxy started first: start
+        # one only when nothing accepts connections on its port yet.
+        if ! python3 -c "import socket, sys; sys.exit(socket.socket().connect_ex(('127.0.0.1', 4567)))"; then
+          nohup python3 /tmp/proxy.py > /tmp/proxy.log 2>&1 < /dev/null &
+          sleep 1
+        fi
   - source-exec:
       ddb: |
         python3 - <<'PY'
@@ -189,6 +199,6 @@ steps:
         import json
         s = json.load(open('/tmp/proxy-state.json'))
         N = '${sources.ddb.namespace}'
-        print(s['injected'].get('flaky_' + N, 0), s['injected'].get('broken_' + N, 0) > 3, s['redelivered'] > 0)
+        print(s['injected'].get('flaky_' + N, 0), s['injected'].get('broken_' + N, 0) > 3, s['redelivered'].get('echo_' + N, 0) > 0)
         PY
     expect: { rows: [['3 True True']] }
