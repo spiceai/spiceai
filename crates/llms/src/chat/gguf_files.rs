@@ -150,13 +150,14 @@ pub enum ResolveError {
         listed(files)
     ))]
     NamedSidecar { name: String, files: Vec<String> },
-    /// `files` that name several quantizations, by name or by path, of which a model loads one.
+    /// `files` that name several sets of the model's weights, by name or by path, of which a
+    /// model loads one: each a quantization, or a file or shard series no quantization holds.
     #[snafu(display(
-        "`files` names {} quantizations, {}, and a model loads one; name one of them",
-        quantizations.len(),
-        listed(quantizations)
+        "`files` names {} sets of model weights, {}, and a model loads one; name one of them",
+        weights.len(),
+        listed(weights)
     ))]
-    SeveralQuantizations { quantizations: Vec<String> },
+    SeveralWeights { weights: Vec<String> },
 }
 
 /// What a listing holds: the repository's files, as the Hub lists them, or only those the
@@ -199,10 +200,10 @@ impl ResolveError {
                 printable(name),
                 listed(available)
             ),
-            (Self::SeveralQuantizations { quantizations }, ListedFrom::Cache) => format!(
-                "`files` names {} quantizations there, {}, and a model loads one; name one of them",
-                quantizations.len(),
-                listed(quantizations)
+            (Self::SeveralWeights { weights }, ListedFrom::Cache) => format!(
+                "`files` names {} sets of model weights there, {}, and a model loads one; name one of them",
+                weights.len(),
+                listed(weights)
             ),
             _ => self.to_string(),
         }
@@ -240,9 +241,10 @@ pub fn is_draft_head(path: &str) -> bool {
     file_name(path).to_ascii_lowercase().starts_with("mtp-")
 }
 
-/// A vision projector, which a text model does not load.
+/// A vision projector, which a text model does not load: a file whose name holds `mmproj`, as
+/// llama.cpp's `-hf` tells them apart.
 fn is_projector(path: &str) -> bool {
-    file_name(path).to_ascii_lowercase().starts_with("mmproj")
+    file_name(path).to_ascii_lowercase().contains("mmproj")
 }
 
 /// A file that is not the model's weights though it is a GGUF file: an importance matrix, or a
@@ -602,7 +604,8 @@ fn answers_to(quantization: &Quantization, entry: &str) -> bool {
 ///
 /// Returns an error when a named file is missing, a shard series is incomplete, a name matches
 /// several quantizations, a name only importance matrices or drafters answer to, a name is
-/// neither a file nor a quantization of the repository, or `files` name several quantizations.
+/// neither a file nor a quantization of the repository, or `files` name several sets of the
+/// model's weights.
 pub fn resolve(
     listing: &[ListedFile],
     files: &[&str],
@@ -681,15 +684,30 @@ pub fn resolve(
     let mut seen = BTreeSet::new();
     weights.retain(|w| seen.insert(w.clone()));
     draft.retain(|d| seen.insert(d.clone()));
-    // A model loads one quantization: with the weights of two, the engine would open the first's
-    // and take the second's draft head, while the load says the second is loaded.
-    let loaded: Vec<&Quantization> = quantizations
+    // A model loads one set of weights: given two, the engine would open the first and draft
+    // with the second's head, while the load says the second is loaded. Each lone file and each
+    // shard series is one set, whatever the listing names it, so the merged file and the shards
+    // of one quantization are two. A projector, an importance matrix or a drafter named beside
+    // the weights is none: the engine loads a drafter beside the model.
+    let names: BTreeMap<&str, &str> = quantizations
         .iter()
-        .filter(|q| q.files.iter().any(|f| weights.contains(f)))
+        .flat_map(|q| q.files.iter().map(|f| (f.as_str(), q.name.as_str())))
         .collect();
-    if let [_, _, ..] = loaded.as_slice() {
-        return Err(ResolveError::SeveralQuantizations {
-            quantizations: loaded.iter().map(|q| q.name.clone()).collect(),
+    let mut sets: BTreeMap<(String, Option<u32>), String> = BTreeMap::new();
+    for w in weights
+        .iter()
+        .filter(|w| !is_projector(w) && !is_sidecar(w))
+    {
+        let key = shard(w).map_or_else(|| (w.clone(), None), |(stem, _, n)| (stem, Some(n)));
+        sets.entry(key).or_insert_with(|| {
+            names
+                .get(w.as_str())
+                .map_or_else(|| w.clone(), |n| (*n).to_string())
+        });
+    }
+    if sets.len() > 1 {
+        return Err(ResolveError::SeveralWeights {
+            weights: sets.into_values().collect(),
         });
     }
     if weights.is_empty() && draft.is_empty() {
@@ -1140,7 +1158,7 @@ mod tests {
         assert_eq!(q8.weights, ["Model-Q8_0.gguf"]);
     }
 
-    /// A model loads one quantization, so `files` that name two, by name or by path, fail
+    /// A model loads one set of weights, so `files` that name two, by name or by path, fail
     /// rather than load the first's weights as the second's with the second's draft head.
     #[test]
     fn files_that_name_two_quantizations_are_refused() {
@@ -1151,7 +1169,7 @@ mod tests {
             ("mmproj-F16.gguf", GB / 2),
         ]);
         let refused = Err(
-            "`files` names 2 quantizations, Q4_K_M, Q8_0, and a model loads one; name one of them"
+            "`files` names 2 sets of model weights, Q4_K_M, Q8_0, and a model loads one; name one of them"
                 .to_string(),
         );
         for files in [
@@ -1190,6 +1208,71 @@ mod tests {
                 ],
                 Some("Q4_K_M".to_string())
             )
+        );
+        // a projector named as llama.cpp names some, with `mmproj` inside the name, and a
+        // drafter, which the engine loads beside the model
+        let llava = listing(&[
+            ("llava-v1.5-7b-Q4_K_M.gguf", GB),
+            ("llava-v1.5-7b-Q8_0.gguf", GB),
+            ("llava-v1.5-7b-mmproj-model-f16.gguf", GB / 2),
+            ("dspark-llava-v1.5-7b-Q8_0.gguf", GB / 5),
+        ]);
+        assert_eq!(
+            quantizations(&llava)
+                .iter()
+                .map(|q| q.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Q4_K_M", "Q8_0"]
+        );
+        let beside = resolve(
+            &llava,
+            &[
+                "Q4_K_M",
+                "llava-v1.5-7b-mmproj-model-f16.gguf",
+                "dspark-llava-v1.5-7b-Q8_0.gguf",
+            ],
+        )
+        .expect("Q4_K_M resolves")
+        .expect("Q4_K_M names weights");
+        assert_eq!(
+            (beside.weights, beside.quantization),
+            (
+                vec![
+                    "llava-v1.5-7b-Q4_K_M.gguf".to_string(),
+                    "llava-v1.5-7b-mmproj-model-f16.gguf".to_string(),
+                    "dspark-llava-v1.5-7b-Q8_0.gguf".to_string(),
+                ],
+                Some("Q4_K_M".to_string())
+            )
+        );
+        // the merged file and the shards of one quantization are two sets, though the
+        // repository's quantizations count them as one
+        let merged = listing(&[
+            ("Model-Q4_K_M.gguf", 2 * GB),
+            ("Model-Q4_K_M-00001-of-00002.gguf", GB),
+            ("Model-Q4_K_M-00002-of-00002.gguf", GB),
+            ("Model-Q8_0.gguf", GB),
+            ("mtp-Model-Q8_0.gguf", GB / 10),
+        ]);
+        assert_eq!(
+            resolve(&merged, &["Model-Q4_K_M-00001-of-00002.gguf", "Q8_0"])
+                .map_err(|e| e.to_string()),
+            Err("`files` names 2 sets of model weights, Model-Q4_K_M-00001-of-00002.gguf, Q8_0, and a model loads one; name one of them".to_string())
+        );
+        assert_eq!(
+            resolve(&merged, &["Model-Q4_K_M-00001-of-00002.gguf", "Model-Q4_K_M.gguf"])
+                .map_err(|e| e.to_string()),
+            Err("`files` names 2 sets of model weights, Model-Q4_K_M-00001-of-00002.gguf, Q4_K_M, and a model loads one; name one of them".to_string())
+        );
+        let shards = resolve(&merged, &["Model-Q4_K_M-00002-of-00002.gguf"])
+            .expect("the shards resolve")
+            .expect("the shards name weights");
+        assert_eq!(
+            shards.weights,
+            [
+                "Model-Q4_K_M-00001-of-00002.gguf",
+                "Model-Q4_K_M-00002-of-00002.gguf"
+            ]
         );
     }
 
